@@ -68,6 +68,33 @@ pub struct NodeBatchChecks {
     /// height-0-after-restart behaviour the old `height_established` guard was reaching for — by
     /// construction rather than by a separate condition, exactly as `round.rs` does.
     tier_bind_activation_round: Option<RoundId>,
+    /// The era decided by BLOCK HEIGHT rather than by a local round, for judging ANOTHER node's
+    /// shares.
+    ///
+    /// ⚠ The activation ROUNDS above are node-local: `RoundManager::start_round` increments a
+    /// counter seeded from that node's own database, so two nodes never agree on them. Comparing
+    /// our rounds against a peer's `share.round_id` is meaningless, and it fails CLOSED in the
+    /// accusing direction — a long-running node auditing a newly commissioned one sees every
+    /// `share.round_id < activation`, takes the pre-bind branch, and rejects shares that were
+    /// signed correctly. In §6 sampling that is not a rejected share but a published accusation
+    /// against an honest operator, which is the case multi-operator v1 consists of.
+    ///
+    /// Block height is the axis every node DOES agree on, and the gates are already defined in
+    /// height terms (`SHARE_ADDR_BIND_HEIGHT`, `SHARE_POW_VERIFY_HEIGHT`,
+    /// `SHARE_TIER_BIND_HEIGHT`) before ever being translated into local rounds. When this is
+    /// `Some`, the era is already decided and the round comparisons are not consulted.
+    ///
+    /// `None` keeps the round-based behaviour for OUR OWN shares, where the rounds are ours and
+    /// therefore meaningful.
+    era_by_height: Option<EraByHeight>,
+}
+
+/// An era decided from a height every node agrees on.
+#[derive(Debug, Clone, Copy)]
+struct EraByHeight {
+    addr_bound: bool,
+    pow_required: bool,
+    tier_bound: bool,
 }
 
 impl NodeBatchChecks {
@@ -81,6 +108,7 @@ impl NodeBatchChecks {
             pow_verify_activation_round: None,
             pow_preimage_required,
             tier_bind_activation_round,
+            era_by_height: None,
         }
     }
 
@@ -103,6 +131,28 @@ impl NodeBatchChecks {
             pow_verify_activation_round,
             pow_preimage_required: !height_established || height >= pow_verify_height,
             tier_bind_activation_round,
+            era_by_height: None,
+        }
+    }
+
+    /// Judge shares by the BLOCK HEIGHT they were mined at, not by any local round.
+    ///
+    /// This is the constructor to use for ANOTHER node's shares — §6 sampling above all. The
+    /// height comes from the epoch being audited (`epoch * EPOCH_BLOCKS`), which every node
+    /// derives identically from the chain, so both sides judge the same share by the same era.
+    /// Using the round-based constructors across nodes accuses honest operators; see
+    /// `era_by_height`.
+    pub fn at_shared_height(height: u64) -> Self {
+        Self {
+            addr_bind_activation_round: None,
+            pow_verify_activation_round: None,
+            pow_preimage_required: false,
+            tier_bind_activation_round: None,
+            era_by_height: Some(EraByHeight {
+                addr_bound: height >= crate::SHARE_ADDR_BIND_HEIGHT,
+                pow_required: height >= crate::SHARE_POW_VERIFY_HEIGHT,
+                tier_bound: height >= crate::SHARE_TIER_BIND_HEIGHT,
+            }),
         }
     }
 
@@ -112,9 +162,12 @@ impl NodeBatchChecks {
     /// change, and a share signed before it is older, not invalid. Same reasoning as
     /// `RoundManager::requires_bound_signature`.
     fn signature_ok(&self, share: &ShareProof) -> bool {
-        let bound = match self.addr_bind_activation_round {
-            Some(activation) => share.round_id >= activation,
-            None => false,
+        let bound = match self.era_by_height {
+            Some(era) => era.addr_bound,
+            None => match self.addr_bind_activation_round {
+                Some(activation) => share.round_id >= activation,
+                None => false,
+            },
         };
         if bound {
             share.has_valid_bound_signature()
@@ -153,9 +206,12 @@ impl NodeBatchChecks {
         // Judged by the SHARE's round, like `signature_ok` and the header predicate beside it. A
         // pre-gate share is judged by the numeric rule of its era; demanding a tier of it would
         // make it permanently unbatchable, and the proposer that carried it a quarantined node.
-        let tier_bound = match self.tier_bind_activation_round {
-            Some(activation) => share.round_id >= activation,
-            None => false,
+        let tier_bound = match self.era_by_height {
+            Some(era) => era.tier_bound,
+            None => match self.tier_bind_activation_round {
+                Some(activation) => share.round_id >= activation,
+                None => false,
+            },
         };
         if tier_bound {
             let Some(tier) = share.tier_log2 else {
@@ -190,9 +246,12 @@ impl BatchChecks for NodeBatchChecks {
         // Era-aware, like the live path (`RoundManager::requires_pow_header`): when the boundary
         // round is known the share's OWN round decides whether a header is demanded of it; the
         // height-derived fallback governs only the boundary-less case.
-        let pow_required = match self.pow_verify_activation_round {
-            Some(activation) => share.round_id >= activation,
-            None => self.pow_preimage_required,
+        let pow_required = match self.era_by_height {
+            Some(era) => era.pow_required,
+            None => match self.pow_verify_activation_round {
+                Some(activation) => share.round_id >= activation,
+                None => self.pow_preimage_required,
+            },
         };
         if pow_required && !self.pow_ok(share) {
             return false;
@@ -254,6 +313,51 @@ mod tests {
 
     fn checks() -> NodeBatchChecks {
         NodeBatchChecks::new(None, true, None)
+    }
+
+    /// The property §6 sampling depends on: two nodes with completely different round numbering
+    /// must reach the SAME verdict on the same share.
+    ///
+    /// This is what a round-based predicate cannot give. `RoundManager::start_round` increments a
+    /// counter seeded from each node's own database, so a long-running node and a newly
+    /// commissioned one share no round axis at all. Judging a peer's shares by our activation
+    /// rounds made the verdict depend on WHO WAS ASKING — and it failed closed in the accusing
+    /// direction, turning an honest operator's correctly-signed share into published evidence
+    /// against it.
+    ///
+    /// Height is the axis both nodes derive identically from the chain, so the verdict is a
+    /// property of the share and the era, not of the auditor.
+    #[test]
+    fn the_same_share_gets_the_same_verdict_whatever_the_auditors_round_numbering() {
+        let id = NodeIdentity::generate();
+
+        // The SAME share, presented to two auditors whose local rounds differ by six orders of
+        // magnitude — a veteran node against a freshly commissioned one.
+        let share_veteran_numbering = provable_share(&id, 1_100_000);
+        let share_new_numbering = provable_share(&id, 3);
+
+        // Height-decided era: below every gate, so both are judged by the pre-gate rules.
+        let early = NodeBatchChecks::at_shared_height(crate::SHARE_POW_VERIFY_HEIGHT - 1);
+        assert_eq!(
+            early.share_is_valid(&share_veteran_numbering),
+            early.share_is_valid(&share_new_numbering),
+            "a share's verdict must not depend on the auditor's round numbering"
+        );
+
+        // And the era itself must still bite: at/above the PoW gate a header is demanded.
+        let late = NodeBatchChecks::at_shared_height(crate::SHARE_POW_VERIFY_HEIGHT);
+        let mut headerless = provable_share(&id, 7);
+        headerless.header = None;
+        headerless.sign(&id);
+        assert!(
+            !late.share_is_valid(&headerless),
+            "the height era must still enforce the gate it encodes"
+        );
+        assert!(
+            early.share_is_valid(&headerless),
+            "and must NOT enforce it below the gate — that is the pre-gate share the round-based \
+             predicate condemned"
+        );
     }
 
     #[test]

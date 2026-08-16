@@ -3970,12 +3970,37 @@ async fn main() -> Result<()> {
         _ => shard,
     };
 
+    // The share checks in force right now, shared by the SBC handler and §6 sampling.
+    //
+    // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
+    // captured it once would keep applying the rules in force when the process started. ONE
+    // definition, used by both consumers — a second spelling is how a signer and a verifier
+    // drift apart, and here one of them decides who gets publicly accused.
+    let sbc_checks: ghost_pool::sbc_handler::ChecksFn = {
+        let rm_c = Arc::clone(&round_manager);
+        Arc::new(move || {
+            ghost_pool::sbc_checks::NodeBatchChecks::at_height(
+                rm_c.current_height(),
+                rm_c.addr_bind_activation_round(),
+                rm_c.pow_verify_activation_round(),
+                ghost_pool::share_pow_verify_height(),
+                rm_c.tier_bind_activation_round(),
+            )
+        })
+    };
+
     // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
     // no handler on the mesh at all — matching the flag's promise that deploying the binary
     // starts nothing.
     if let Some(ref rt) = shard {
         // Responder channel for whole-table syncs. The handler cannot send: it has no mesh
         // reference, so it hands the built response here and this task puts it on the wire.
+        // Served §6 sampling responses, same hand-off shape as the sync responder.
+        let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<(
+            ghost_common::types::NodeId,
+            ghost_consensus::message::ShardSampleResponseMessage,
+        )>(16);
+
         let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel::<(
             ghost_common::types::NodeId,
             ghost_consensus::message::ShardTableSyncMessage,
@@ -3983,9 +4008,164 @@ async fn main() -> Result<()> {
 
         let h = Arc::new(
             ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(rt))
-                .with_sync_responder(sync_tx),
+                .with_sync_responder(sync_tx)
+                .with_sample_responder(sample_tx)
+                .with_share_checks(Arc::clone(&sbc_checks)),
         );
         mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+        // §6 serve half: unicast a served audit answer back to the node that asked.
+        {
+            let mesh_c = Arc::clone(&mesh);
+            tokio::spawn(async move {
+                while let Some((requester, response)) = sample_rx.recv().await {
+                    // Same rule as every other shard transmit: the leaves carry whole
+                    // ShareProofs, including payout addresses, so this must not go out in clear.
+                    if !mesh_c.noise_available() {
+                        warn!("shard: Noise unavailable — §6 sampling response NOT served");
+                        continue;
+                    }
+                    let bytes = match serde_json::to_vec(&response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "shard: sampling response would not serialise");
+                            continue;
+                        }
+                    };
+                    let cap = ghost_consensus::message_validator::max_payload_size(
+                        ghost_consensus::MessageType::ShardSampleResponse,
+                    );
+                    if bytes.len() > cap {
+                        // §6 allows an honest SUBSET, so an oversized answer is a bug in how many
+                        // leaves were packed, not a reason to go silent without saying so.
+                        warn!(
+                            bytes = bytes.len(),
+                            cap,
+                            leaves = response.leaves.len(),
+                            "shard: sampling response exceeds the per-type cap — not sent; the \
+                             receiver would drop it silently"
+                        );
+                        continue;
+                    }
+                    let env = match mesh_c.create_envelope_raw(
+                        ghost_consensus::MessageType::ShardSampleResponse,
+                        bytes,
+                    ) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(error = %e, "shard: sampling response envelope failed");
+                            continue;
+                        }
+                    };
+                    match mesh_c.peers().get_peer(&requester) {
+                        Some(peer) => {
+                            if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
+                                debug!(error = %e, "shard: could not send sampling response");
+                            }
+                        }
+                        None => debug!("shard: sampling requester is not a known peer"),
+                    }
+                }
+            });
+        }
+
+        // §6 ask half: audit one ratified peer per interval.
+        //
+        // The verdict path judges a sampled share by BLOCK HEIGHT, not by our local rounds — see
+        // `NodeBatchChecks::at_shared_height`. Round numbers are node-local, so judging a peer's
+        // shares by ours accused honest operators; height is the axis every node agrees on, and
+        // the gates were always defined in height terms before being translated into rounds.
+        {
+            // §6 ask half: audit one ratified peer per interval.
+            //
+            // ⚠ The entropy is drawn HERE, fresh per audit, from the OS RNG, and never leaves this
+            // node until the request is sent. The ~10^-6 detection bound rests entirely on the sampled
+            // node being unable to predict which leaves will be pulled before it signs its summary: a
+            // node that can predict them fabricates work in the never-sampled leaves and the bound
+            // collapses to zero. Deriving it from the summary, chain data, a schedule or a per-node
+            // seed all break it.
+            {
+                let mesh_c = Arc::clone(&mesh);
+                let rt_c = Arc::clone(rt);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        // An unanswered audit is not a verdict (§6 leaves that to policy), but it
+                        // must not accumulate.
+                        let expired =
+                            rt_c.expire_pending_samples(std::time::Duration::from_secs(3600));
+                        if expired > 0 {
+                            debug!(expired, "shard: expired unanswered §6 audits");
+                        }
+                        if !mesh_c.noise_available() {
+                            continue;
+                        }
+                        // Pick a live ratified peer at random; `sample_request_for` refuses anything
+                        // outside the ratified set, ourselves, and epochs with nothing to sample.
+                        let self_id = rt_c.node_id();
+                        let candidates: Vec<_> = mesh_c
+                            .peers()
+                            .get_connected_peers(300)
+                            .into_iter()
+                            .filter(|p| p.node_id != self_id)
+                            .collect();
+                        let Some(target) = ({
+                            use rand::seq::SliceRandom;
+                            let mut rng = rand::thread_rng();
+                            candidates.choose(&mut rng).map(|p| p.node_id)
+                        }) else {
+                            continue;
+                        };
+                        let entropy: [u8; 32] = {
+                            use rand::Rng;
+                            rand::thread_rng().gen()
+                        };
+                        let req = match rt_c.sample_request_for(
+                            &target,
+                            &entropy,
+                            ghost_consensus::shard_handler::DEFAULT_SAMPLE_LAMBDA,
+                        ) {
+                            Ok(Some(r)) => r,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                warn!(error = %e, "shard: could not build a §6 sampling request");
+                                continue;
+                            }
+                        };
+                        let bytes = match serde_json::to_vec(&req) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "shard: sampling request would not serialise");
+                                continue;
+                            }
+                        };
+                        match mesh_c.create_envelope_raw(
+                            ghost_consensus::MessageType::ShardSampleRequest,
+                            bytes,
+                        ) {
+                            Ok(env) => match mesh_c.peers().get_peer(&target) {
+                                Some(peer) => {
+                                    if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
+                                        debug!(error = %e, "shard: could not send sampling request");
+                                    } else {
+                                        info!(
+                                            epoch = req.epoch,
+                                            peer = %hex::encode(&target[..4]),
+                                            leaves = req.leaf_indices.len(),
+                                            "shard: sent a §6 sampling request"
+                                        );
+                                    }
+                                }
+                                None => debug!("shard: sampling target is not a known peer"),
+                            },
+                            Err(e) => warn!(error = %e, "shard: sampling request envelope failed"),
+                        }
+                    }
+                });
+            }
+        }
 
         // Serve half: answer a peer's sync request, unicast back to whoever asked.
         {
@@ -4172,21 +4352,6 @@ async fn main() -> Result<()> {
                 // it up to three times per message, against the same SQLite already carrying
                 // #554's load.
                 chain_c.voter_ids()
-            })
-        };
-
-        // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
-        // captured it once would keep applying the rules in force when the process started.
-        let sbc_checks: ghost_pool::sbc_handler::ChecksFn = {
-            let rm_c = Arc::clone(&round_manager);
-            Arc::new(move || {
-                ghost_pool::sbc_checks::NodeBatchChecks::at_height(
-                    rm_c.current_height(),
-                    rm_c.addr_bind_activation_round(),
-                    rm_c.pow_verify_activation_round(),
-                    ghost_pool::share_pow_verify_height(),
-                    rm_c.tier_bind_activation_round(),
-                )
             })
         };
 
