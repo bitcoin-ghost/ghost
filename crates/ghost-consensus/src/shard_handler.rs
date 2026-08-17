@@ -68,22 +68,7 @@ pub type MerkleProofFn = fn(&[u8; 32], &[[u8; 32]], &[u8; 32], usize, usize) -> 
 /// was committed; without content binding, a malicious reporter could pair a genuine leaf hash
 /// with fabricated share fields and frame an honest node. The predicate spans several crates
 /// (`DifficultyCalculator`, `share_binding`), which is why it is injected rather than imported.
-///
-/// ⚠ **A closure, not a bare `fn`, because the real predicate is STATEFUL.** It must be judged by
-/// the share's own era — the addr-bind, pow-verify and tier-bind activation ROUNDS — not by the
-/// current height. `NodeBatchChecks::share_is_valid` carries those rounds on `&self`, so a bare
-/// `fn` pointer cannot express it.
-///
-/// That is not a stylistic point. A predicate derived from the current height condemns every
-/// pre-gate share the instant the fleet crosses a gate: on 2026-08-12 that quarantined vm5 on all
-/// eight nodes, terminally and operator-release-only, for a share mined ~7 hours before the gate
-/// fired. Sampling escalates the same mistake from a rejected share to a PUBLISHED accusation
-/// against an honest node, so the type must not force the stateless (wrong) shape.
-///
-/// Unlike [`MerkleProofFn`] there is no real function that "passes without an adapter" here — the
-/// bare-`fn` form was an assumption, not a constraint. A stateless predicate is still expressible:
-/// pass it by reference (`&my_fn`), which is the only change this widening asks of callers.
-pub type ShareValidityFn<'a> = &'a dyn Fn(&ShareProof) -> bool;
+pub type ShareValidityFn = fn(&ShareProof) -> bool;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Epoch summaries
@@ -1322,14 +1307,14 @@ mod tests {
         msg.reporter_signature = reporter.sign(&msg.signing_message());
 
         // Conclusive: the injected validity check fails the share, the path binds it.
-        let verdict = verify_shard_evidence(&msg, verify_merkle_proof, &share_never_valid)
+        let verdict = verify_shard_evidence(&msg, verify_merkle_proof, share_never_valid)
             .expect("evidence is conclusive");
         assert_eq!(verdict.accused, accused.node_id());
         assert_eq!(verdict.epoch, 5);
 
         // The same bytes exonerate when the share is actually valid.
         assert_eq!(
-            verify_shard_evidence(&msg, verify_merkle_proof, &share_always_valid),
+            verify_shard_evidence(&msg, verify_merkle_proof, share_always_valid),
             Err(ShardEvidenceRejection::ShareIsValid)
         );
 
@@ -1338,7 +1323,7 @@ mod tests {
         foreign.share = share(99, 0xEE, "bc1qmallory", 9.0);
         foreign.reporter_signature = reporter.sign(&foreign.signing_message());
         assert_eq!(
-            verify_shard_evidence(&foreign, verify_merkle_proof, &share_never_valid),
+            verify_shard_evidence(&foreign, verify_merkle_proof, share_never_valid),
             Err(ShardEvidenceRejection::ProofDoesNotBindShare)
         );
 
@@ -1347,7 +1332,7 @@ mod tests {
         out_of_range.leaf_index = summary.share_count;
         out_of_range.reporter_signature = reporter.sign(&out_of_range.signing_message());
         assert_eq!(
-            verify_shard_evidence(&out_of_range, verify_merkle_proof, &share_never_valid),
+            verify_shard_evidence(&out_of_range, verify_merkle_proof, share_never_valid),
             Err(ShardEvidenceRejection::LeafOutOfRange)
         );
 
@@ -1356,7 +1341,7 @@ mod tests {
         framed.summary.share_root = [0xEE; 32];
         framed.reporter_signature = reporter.sign(&framed.signing_message());
         assert_eq!(
-            verify_shard_evidence(&framed, verify_merkle_proof, &share_never_valid),
+            verify_shard_evidence(&framed, verify_merkle_proof, share_never_valid),
             Err(ShardEvidenceRejection::BadAccusedSignature)
         );
 
@@ -1364,7 +1349,7 @@ mod tests {
         let mut relayed = msg.clone();
         relayed.leaf_index = 0; // content changed, signature not re-made
         assert_eq!(
-            verify_shard_evidence(&relayed, verify_merkle_proof, &share_never_valid),
+            verify_shard_evidence(&relayed, verify_merkle_proof, share_never_valid),
             Err(ShardEvidenceRejection::BadReporterSignature)
         );
     }
@@ -1537,7 +1522,7 @@ mod tests {
             &reporter,
             1,
             verify_merkle_proof,
-            &share_always_valid,
+            share_always_valid,
         )
         .expect("an honest response verifies");
         assert_eq!(outcome.verified, request.leaf_indices);
@@ -1552,7 +1537,7 @@ mod tests {
                 &reporter,
                 1,
                 verify_merkle_proof,
-                &share_always_valid,
+                share_always_valid,
             )
         };
 
@@ -1603,7 +1588,7 @@ mod tests {
                 &reporter,
                 1,
                 verify_merkle_proof,
-                &share_always_valid,
+                share_always_valid,
             )
             .unwrap_err(),
             ShardSampleRejection::LeafOutOfRange
@@ -1655,7 +1640,7 @@ mod tests {
                 &reporter,
                 1,
                 verify_merkle_proof,
-                &share_always_valid,
+                share_always_valid,
             )
             .unwrap_err(),
             ShardSampleRejection::RequestSummaryMismatch
@@ -1672,7 +1657,7 @@ mod tests {
                 &reporter,
                 1,
                 verify_merkle_proof,
-                &share_always_valid,
+                share_always_valid,
             )
             .unwrap_err(),
             ShardSampleRejection::SummaryUnverifiable
@@ -1683,55 +1668,6 @@ mod tests {
     /// validity comes back as evidence that IS the `verify_shard_evidence` format — same
     /// bytes, same verdict, nothing translated. A subset response leaves the rest unanswered,
     /// not forgiven.
-    #[test]
-    fn the_validity_predicate_may_carry_state_so_it_can_judge_by_era() {
-        // The reason `ShareValidityFn` is a closure and not a bare `fn`.
-        //
-        // The real predicate (`NodeBatchChecks::share_is_valid`) is judged by the share's OWN era —
-        // the addr-bind, pow-verify and tier-bind activation ROUNDS it carries on `&self`. A bare
-        // `fn` pointer cannot express that, which would force the predicate to be derived from the
-        // CURRENT height instead. That is not a hypothetical: on 2026-08-12 a height-derived
-        // predicate condemned every pre-gate share the moment the fleet crossed a gate and
-        // quarantined vm5 on all eight nodes, terminally, for a share mined hours earlier.
-        // Sampling turns that from a rejected share into a PUBLISHED accusation, so the type must
-        // be able to hold the era.
-        //
-        // This pins the capability, not the policy: a capturing closure must be accepted, and its
-        // captured state must actually decide the verdict.
-        let accused = identity();
-        let reporter = identity();
-        let (summary, ordered, leaves) = sampled_epoch(&accused, 4);
-        let request = build_sample_request(reporter.node_id(), &summary, 2, &[0x5a; 32]);
-        let served: Vec<_> = request
-            .leaf_indices
-            .iter()
-            .map(|&i| sample_leaf(&ordered, &leaves, i as usize))
-            .collect();
-        let response = build_sample_response(&accused, &summary, served);
-
-        // Two predicates differing ONLY in captured state — the stand-in for "which era is this
-        // share judged under". A bare `fn` could not distinguish them.
-        for (gate_active, expect_evidence) in [(false, 0usize), (true, request.leaf_indices.len())]
-        {
-            let predicate = move |_: &ShareProof| !gate_active;
-            let outcome = verify_sample_response(
-                &summary,
-                &request,
-                &response,
-                &reporter,
-                99,
-                verify_merkle_proof,
-                &predicate,
-            )
-            .expect("structurally sound either way");
-            assert_eq!(
-                outcome.evidence.len(),
-                expect_evidence,
-                "captured state must decide the verdict (gate_active={gate_active})"
-            );
-        }
-    }
-
     #[test]
     fn a_failed_sample_becomes_evidence_the_evidence_path_accepts() {
         let accused = identity();
@@ -1754,7 +1690,7 @@ mod tests {
             &reporter,
             99,
             verify_merkle_proof,
-            &share_never_valid,
+            share_never_valid,
         )
         .expect("a structurally sound response verifies even when its shares are bad");
 
@@ -1776,7 +1712,7 @@ mod tests {
             assert_eq!(ev.timestamp, 99);
             // The one-format guarantee: the evidence handler reaches the conviction from these
             // exact bytes with the REAL Merkle verifier.
-            let verdict = verify_shard_evidence(ev, verify_merkle_proof, &share_never_valid)
+            let verdict = verify_shard_evidence(ev, verify_merkle_proof, share_never_valid)
                 .expect("sampling evidence must be exactly what the evidence path accepts");
             assert_eq!(verdict.accused, accused.node_id());
             assert_eq!(verdict.epoch, summary.epoch);
@@ -1819,7 +1755,7 @@ mod tests {
             &reporter,
             1,
             verify_merkle_proof,
-            &share_always_valid,
+            share_always_valid,
         )
         .expect("a round-tripped exchange still verifies");
         assert_eq!(outcome.verified, request.leaf_indices);

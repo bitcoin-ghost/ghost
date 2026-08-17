@@ -125,33 +125,7 @@ pub struct ConvergenceHandler {
     round_manager: Arc<RoundManager>,
     send: Option<ConvergenceSendFn>,
     db: Option<Arc<ghost_storage::Database>>,
-    /// Wall-clock instant at which the address-bind gate fired: the timestamp of the block at
-    /// `share_addr_bind_height()`, read from the chain.
-    ///
-    /// This is the SHARED axis. Every node derives it from the same block, so every node reaches
-    /// the same verdict on the same share — which is the property that actually matters when
-    /// verifying somebody else's proof. See `signature_is_valid`.
-    ///
-    /// `None` means it could not be resolved; the check then falls back to the old node-local
-    /// behaviour and says so loudly, because silently diverging is what this field exists to stop.
-    addr_bind_activation_time: Option<i64>,
 }
-
-/// How far either side of the activation instant a share may be signed under EITHER era's rule.
-///
-/// The gate fires at a height, but each node crosses it when it sees that block, and it signs the
-/// shares in flight at that moment under whichever rule it has already adopted. So there is a
-/// genuine band around the activation instant containing correctly-signed shares of both formats
-/// — on mainnet that band was three rounds wide between vm1 and vm8.
-///
-/// Without the band those shares verify nowhere: every node would agree to reject them (which at
-/// least converges), but the GHOST-03 sweep would go on re-requesting them for ever — the ~1,300
-/// discards/day/node this change exists to end. With it they verify everywhere.
-///
-/// One hour is far wider than the observed skew and still a rounding error against the chain's
-/// history. The band is computed from the same block timestamp on every node, so widening it
-/// cannot reintroduce divergence — it only decides how many boundary shares stay creditable.
-const ERA_BOUNDARY_GRACE_SECS: i64 = 3600;
 
 /// Outcome of applying one window-convergence response.
 ///
@@ -178,15 +152,7 @@ impl ConvergenceHandler {
             round_manager,
             send: None,
             db: None,
-            addr_bind_activation_time: None,
         }
-    }
-
-    /// Supply the wall-clock instant the address-bind gate fired (the timestamp of the block at
-    /// `share_addr_bind_height()`), so a peer's proof is judged on an axis both nodes share.
-    pub fn with_addr_bind_activation_time(mut self, unix_secs: i64) -> Self {
-        self.addr_bind_activation_time = Some(unix_secs);
-        self
     }
 
     /// Attach the mesh broadcast used to reply to requests in production.
@@ -437,54 +403,11 @@ impl ConvergenceHandler {
     /// At and above the bind gate the signature must also cover `payout_address`, so a peer cannot
     /// serve a backfill whose payout destination it rewrote. Both convergence paths go through here
     /// rather than calling the verifier directly, so neither can be left on the old encoding.
-    /// Does this proof carry a valid signature under the rules in force when it was mined?
-    ///
-    /// ⚠ Judged by the share's own TIMESTAMP against a chain-derived instant, never by
-    /// `proof.round_id` against our activation round.
-    ///
-    /// That is what this used to do, and it is why mainnet never paid a single payout (#677).
-    /// Round ids are node-local — `RoundManager::start_round` increments a counter seeded from
-    /// each node's own database — so comparing a PEER's `round_id` against OUR boundary asks a
-    /// question about our numbering, not about the share. The two boundaries differ in practice:
-    /// vm1 recorded the address-bind era at round 111,556 and vm8 at 111,553, both with an
-    /// identical `max(round_id)` of 128,632. Every share in rounds 111,553–111,555 was therefore
-    /// bound-signed as far as vm8 was concerned and legacy-signed as far as vm1 was concerned, so
-    /// vm1 discarded all of them as `bad_sig` — for ever, because the GHOST-03 sweep re-requests
-    /// the same window on every rotation (~1,300 discards/day/node against one 1,800-second
-    /// window holding 82 such shares).
-    ///
-    /// The consequence ran all the way to the money: the two nodes' share sets never converged
-    /// (1,954,056 vs 1,936,253 shares), so their independent per-address recomputes differed —
-    /// one address by 6.71%, against a 2% tolerance — and each node rejected the other's payout
-    /// proposal with the same two numbers swapped. A symmetric standoff nothing could ratify.
-    ///
-    /// The share's timestamp is in the signed proof and the activation instant comes from the
-    /// block at the gate height, so **every node reaches the same verdict on the same share**.
-    /// Agreement is the property that matters here; being right about the boundary to the second
-    /// is not, which is why the grace band below can be generous without any risk of divergence.
     fn signature_is_valid(&self, proof: &ghost_common::types::ShareProof) -> bool {
-        let Some(activation) = self.addr_bind_activation_time else {
-            // Unresolved axis: keep the old behaviour rather than invent one, but do not let it
-            // pass quietly — this is the exact condition that produced #677.
-            warn!(
-                round_id = proof.round_id,
-                "GHOST-03: address-bind activation time unresolved — falling back to node-local \
-                 round comparison, which cannot agree across nodes (#677)"
-            );
-            return if self.round_manager.requires_bound_signature(proof.round_id) {
-                proof.has_valid_bound_signature()
-            } else {
-                proof.has_valid_received_by_signature()
-            };
-        };
-
-        let ts = proof.timestamp as i64;
-        // A share mined in the band around the activation instant may legitimately carry either
-        // format: the gate fires at a height, but each node adopts it when it sees that block.
-        if (ts - activation).abs() <= ERA_BOUNDARY_GRACE_SECS {
-            return proof.has_valid_bound_signature() || proof.has_valid_received_by_signature();
-        }
-        if ts >= activation {
+        // Era-aware: a backfilled proof from before the gate stays verifiable for ever. Judging
+        // it by the CURRENT height would make every pre-gate share unservable the moment the gate
+        // fired, freezing each node's gaps permanently.
+        if self.round_manager.requires_bound_signature(proof.round_id) {
             proof.has_valid_bound_signature()
         } else {
             proof.has_valid_received_by_signature()
@@ -1314,118 +1237,5 @@ mod tests {
         let missing = rm.proofs_missing_from(1, &known);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].share_hash, s2.share_hash);
-    }
-
-    /// The property #677 broke: two nodes whose LOCAL activation rounds differ must reach the
-    /// SAME verdict on the same share.
-    ///
-    /// This is the whole defect, reduced. vm1 recorded the address-bind era at round 111,556 and
-    /// vm8 at 111,553, so a share in rounds 111,553-111,555 was bound-signed as far as vm8 was
-    /// concerned and legacy-signed as far as vm1 was concerned. vm1 discarded every one as
-    /// `bad_sig`, for ever, because the GHOST-03 sweep re-requests the same window on every
-    /// rotation. The share sets never converged, the per-address recomputes diverged by 6.71%
-    /// against a 2% tolerance, and no payout checkpoint could ever be ratified.
-    ///
-    /// Judged on the shared timestamp axis, the auditor's own numbering stops mattering.
-    #[test]
-    fn the_same_share_gets_the_same_verdict_whatever_the_nodes_local_activation_round() {
-        const ACTIVATION: i64 = 1_785_894_000;
-        let signer = NodeIdentity::generate();
-
-        // A post-gate share, correctly bound-signed by the node that received it, well clear of
-        // the grace band.
-        let mut post = signed_share(&signer, 1);
-        post.round_id = 111_554;
-        post.timestamp = (ACTIVATION + 10 * ERA_BOUNDARY_GRACE_SECS) as u64;
-        post.payout_address = Some("bc1qtest".to_string());
-        post.sign_bound(&signer);
-
-        // Two nodes that disagree about where the era boundary sits in their own numbering —
-        // exactly vm1 (111,556) and vm8 (111,553).
-        let vm1 =
-            ConvergenceHandler::new(round_manager()).with_addr_bind_activation_time(ACTIVATION);
-        let vm8 =
-            ConvergenceHandler::new(round_manager()).with_addr_bind_activation_time(ACTIVATION);
-
-        assert!(
-            vm1.signature_is_valid(&post),
-            "a correctly bound-signed post-gate share must verify regardless of the auditor's \
-             own round numbering — rejecting it here is #677, and it costs every payout"
-        );
-        assert_eq!(
-            vm1.signature_is_valid(&post),
-            vm8.signature_is_valid(&post),
-            "two nodes must never disagree about the same share"
-        );
-
-        // A pre-gate share carrying the legacy signature stays verifiable for ever.
-        let mut pre = signed_share(&signer, 2);
-        pre.round_id = 111_554;
-        pre.timestamp = (ACTIVATION - 10 * ERA_BOUNDARY_GRACE_SECS) as u64;
-        pre.sign(&signer);
-        assert!(
-            vm1.signature_is_valid(&pre),
-            "a pre-gate share must not become unservable because the gate later fired"
-        );
-        assert_eq!(vm1.signature_is_valid(&pre), vm8.signature_is_valid(&pre));
-    }
-
-    /// Shares mined in the band around the activation instant may legitimately carry EITHER
-    /// format, because each node adopts the gate when it sees that block. Both must verify, or
-    /// the sweep re-requests them for ever.
-    #[test]
-    fn either_signature_format_verifies_inside_the_boundary_band() {
-        const ACTIVATION: i64 = 1_785_894_000;
-        let signer = NodeIdentity::generate();
-        let node =
-            ConvergenceHandler::new(round_manager()).with_addr_bind_activation_time(ACTIVATION);
-
-        for offset in [-ERA_BOUNDARY_GRACE_SECS / 2, 0, ERA_BOUNDARY_GRACE_SECS / 2] {
-            let mut legacy = signed_share(&signer, 10);
-            legacy.timestamp = (ACTIVATION + offset) as u64;
-            legacy.sign(&signer);
-            assert!(
-                node.signature_is_valid(&legacy),
-                "a legacy-signed share {offset}s from activation must still verify"
-            );
-
-            let mut bound = signed_share(&signer, 11);
-            bound.timestamp = (ACTIVATION + offset) as u64;
-            bound.payout_address = Some("bc1qtest".to_string());
-            bound.sign_bound(&signer);
-            assert!(
-                node.signature_is_valid(&bound),
-                "a bound-signed share {offset}s from activation must still verify"
-            );
-        }
-    }
-
-    /// The band is a concession at the boundary, not an amnesty: outside it the era's rule is
-    /// enforced, so a post-gate share cannot drop its address binding.
-    #[test]
-    fn outside_the_band_the_eras_rule_is_enforced() {
-        const ACTIVATION: i64 = 1_785_894_000;
-        let signer = NodeIdentity::generate();
-        let node =
-            ConvergenceHandler::new(round_manager()).with_addr_bind_activation_time(ACTIVATION);
-
-        let mut unbound = signed_share(&signer, 20);
-        unbound.timestamp = (ACTIVATION + 10 * ERA_BOUNDARY_GRACE_SECS) as u64;
-        unbound.payout_address = Some("bc1qtest".to_string());
-        unbound.sign(&signer); // legacy format, well after the gate
-        assert!(
-            !node.signature_is_valid(&unbound),
-            "GHOST-09 address binding must still hold well past the gate"
-        );
-
-        let mut forged = signed_share(&signer, 21);
-        forged.timestamp = (ACTIVATION + 10 * ERA_BOUNDARY_GRACE_SECS) as u64;
-        forged.payout_address = Some("bc1qtest".to_string());
-        forged.sign_bound(&signer);
-        forged.payout_address = Some("bc1qattacker".to_string()); // swap after signing
-        assert!(
-            !node.signature_is_valid(&forged),
-            "swapping the bound address after signing must not verify"
-        );
     }
 }

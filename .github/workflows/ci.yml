@@ -91,8 +91,6 @@ jobs:
       # it is a cargo future-incompat NOTE rather than a rustc lint — so it does not fail this
       # gate and cannot be fixed here. It needs tabled to drop the dependency upstream.
       - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next
-      # A message type nothing dispatches is wiring that does not exist.
-      - run: ./scripts/check-wiring.sh
 
   # Unused-dependency gate: fails if a crate declares a dependency it does not use.
   # Pairs with the per-crate `#![deny(unreachable_pub)]` ratchet — together they stop

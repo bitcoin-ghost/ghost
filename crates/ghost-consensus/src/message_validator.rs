@@ -401,17 +401,16 @@ pub fn extract_message_type_fast(
         // Binary format - extract type from second byte
         let msg_type_byte = data[1];
         let msg_type = match msg_type_byte {
-            // ⚠ Gaps are deliberate and must STAY gaps. These are explicit byte literals, not
-            // enum positions, so removing a dead type leaves a hole rather than shifting its
-            // neighbours — which is what keeps a mixed fleet reading the same bytes the same way.
-            // Never renumber to close a gap: an old peer's byte would then decode as a different
-            // type entirely.
             0 => Some(MessageType::ShareProof),
+            1 => Some(MessageType::BlockFound),
             2 => Some(MessageType::PayoutProposal),
             3 => Some(MessageType::Vote),
             4 => Some(MessageType::HealthPing),
             5 => Some(MessageType::Discovery),
+            6 => Some(MessageType::ElderUpdate),
             7 => Some(MessageType::ShareConvergence),
+            8 => Some(MessageType::ZkBlockProposal),
+            9 => Some(MessageType::ZkVote),
             12 => Some(MessageType::VerificationResult),
             13 => Some(MessageType::EquivocationProof),
             _ => None,
@@ -471,10 +470,14 @@ pub fn extract_message_type_fast(
     let msg_type = match type_str {
         "ShareProof" => MessageType::ShareProof,
         "ShareConvergence" => MessageType::ShareConvergence,
+        "BlockFound" => MessageType::BlockFound,
         "Vote" => MessageType::Vote,
         "HealthPing" => MessageType::HealthPing,
         "Discovery" => MessageType::Discovery,
         "PayoutProposal" => MessageType::PayoutProposal,
+        "ElderUpdate" => MessageType::ElderUpdate,
+        "ZkBlockProposal" => MessageType::ZkBlockProposal,
+        "ZkVote" => MessageType::ZkVote,
         "VerificationResult" => MessageType::VerificationResult,
         "EquivocationProof" => MessageType::EquivocationProof,
         _ => return Ok(None), // Unknown type
@@ -520,13 +523,20 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
     match msg_type {
         MessageType::ShareProof => MAX_SHARE_PROOF_SIZE,
         MessageType::ShareConvergence => MAX_SHARE_CONVERGENCE_SIZE,
+        MessageType::BlockFound => MAX_BLOCK_FOUND_SIZE,
         MessageType::Vote => MAX_VOTE_SIZE,
         MessageType::HealthPing => MAX_HEALTH_PING_SIZE,
         MessageType::Discovery => MAX_DISCOVERY_SIZE,
         MessageType::PayoutProposal => MAX_PAYOUT_PROPOSAL_SIZE,
+        MessageType::ElderUpdate => MAX_ELDER_UPDATE_SIZE,
+        MessageType::ZkBlockProposal => MAX_ZK_PROPOSAL_SIZE,
+        MessageType::ZkVote => MAX_ZK_VOTE_SIZE,
         MessageType::VerificationResult => MAX_VERIFICATION_SIZE,
         MessageType::ChallengeConvergence => MAX_CHALLENGE_CONVERGENCE_SIZE,
         MessageType::EquivocationProof => MAX_EQUIVOCATION_PROOF_SIZE,
+        MessageType::ElderRegistrationProposal => MAX_ELDER_REGISTRATION_PROPOSAL_SIZE,
+        MessageType::ElderListProposal => MAX_ELDER_LIST_PROPOSAL_SIZE,
+        MessageType::ElderListApproval => MAX_ELDER_LIST_APPROVAL_SIZE,
         MessageType::MpcContribution => MAX_MPC_CONTRIBUTION_SIZE,
         MessageType::MpcVerificationVote => MAX_MPC_VERIFICATION_VOTE_SIZE,
         MessageType::MpcParametersRequest => MAX_MPC_PARAMS_REQUEST_SIZE,
