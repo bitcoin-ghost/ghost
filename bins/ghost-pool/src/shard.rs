@@ -53,7 +53,7 @@ use ghost_common::rpc::BitcoinRpc;
 use ghost_common::share_batch::{canonical_sort, creditable_difficulty};
 use ghost_common::share_shard::{
     discharged_micro_work, epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS,
-    NETWORK_TIER_LOG2, RETENTION_EPOCHS,
+    RETENTION_EPOCHS,
 };
 use ghost_common::types::ShareProof;
 use ghost_common::zmq::block_hash_to_display_order;
@@ -1177,7 +1177,7 @@ impl ShardRuntime {
             req.epoch,
             EPOCH_BLOCKS,
             &self.received_by,
-            NETWORK_TIER_LOG2,
+            crate::network_tier_log2(),
         )?;
         let (mut evidence, _screened) = screen(input.shares);
         canonical_sort(&mut evidence);
@@ -1610,7 +1610,7 @@ impl ShardRuntime {
             epoch,
             EPOCH_BLOCKS,
             &self.received_by,
-            NETWORK_TIER_LOG2,
+            crate::network_tier_log2(),
         )?;
         if input.undecodable > 0 {
             warn!(
@@ -1726,7 +1726,7 @@ impl ShardRuntime {
             expired,
             EPOCH_BLOCKS,
             &self.received_by,
-            NETWORK_TIER_LOG2,
+            crate::network_tier_log2(),
         )?;
         let (evidence, _) = screen(input.shares);
         Ok((
@@ -2131,8 +2131,11 @@ fn screen(shares: Vec<ShareProof>) -> (Vec<ShareProof>, usize) {
 
 #[cfg(test)]
 mod tests {
+    // Tests pin the SHIPPING floor deliberately: the rehearsal override must never change
+    // what the suite asserts about production behaviour.
     use super::*;
     use ghost_common::share_batch::micro_work;
+    use ghost_common::share_shard::NETWORK_TIER_LOG2;
     use ghost_storage::models::{PayoutStatus, RoundRecord, ShareRecord};
 
     /// One runtime over a fresh in-memory database, non-solo.

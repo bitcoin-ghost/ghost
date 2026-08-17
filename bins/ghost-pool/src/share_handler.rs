@@ -111,10 +111,10 @@ impl ShareProofHandler {
         // judged by the rules of its own era. Refusing it here would be M-6 again: a deterministic
         // receive-side rejection of what a peer legitimately sent, which retransmission can never
         // fix. Pre-gate shares are kept out of the shard by the fold's input query instead.
-        if !ghost_common::share_shard::crosses_network_tier(proof.tier_log2) {
+        if !crate::crosses_network_tier(proof.tier_log2) {
             debug!(
                 tier_log2 = ?proof.tier_log2,
-                floor = ghost_common::share_shard::NETWORK_TIER_LOG2,
+                floor = crate::network_tier_log2(),
                 "Rejecting gossiped share below the network tier"
             );
             return Ok(());
