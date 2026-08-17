@@ -21,11 +21,11 @@ echo "  node=$NODE  operator_identity=$OP  window=${WINDOW}s"
 SQL_PREFIX='sudo -u ghost sqlite3'
 ssh -o ConnectTimeout=10 "$NODE" "$SQL_PREFIX -separator '|' /home/ghost/.ghost/ghost.db \"
   select miner_id, count(*), round(sum(work),1), datetime(max(timestamp),'unixepoch')
-  from shares where timestamp > strftime('%s','now') - $WINDOW
+  from shares_all where timestamp > strftime('%s','now') - $WINDOW
   group by miner_id order by 2 desc;\"" 2>/dev/null | awk -F'|' '{printf "    %-62s %5s shares  work=%-14s %s\n",$1,$2,$3,$4}'
 
 BAD=$(ssh -o ConnectTimeout=10 "$NODE" "$SQL_PREFIX /home/ghost/.ghost/ghost.db \"
-  select count(*) from shares where miner_id like '${OP}%'
+  select count(*) from shares_all where miner_id like '${OP}%'
   and timestamp > strftime('%s','now') - $WINDOW;\"" 2>/dev/null)
 BAD="${BAD:-0}"
 
@@ -34,7 +34,7 @@ BAD="${BAD:-0}"
 # credited to anyone. Every canary (vm5-8) is in exactly that state, which is why a 60-minute
 # soak there proves nothing about attribution (#461, #464). Say so rather than reporting PASS.
 TOTAL=$(ssh -o ConnectTimeout=10 "$NODE" "$SQL_PREFIX /home/ghost/.ghost/ghost.db \
-  \"select count(*) from shares where timestamp > strftime('%s','now') - $WINDOW
+  \"select count(*) from shares_all where timestamp > strftime('%s','now') - $WINDOW
      and length(received_by) > 8;\"" 2>/dev/null)
 TOTAL="${TOTAL:-0}"
 

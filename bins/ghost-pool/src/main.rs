@@ -3854,10 +3854,16 @@ async fn main() -> Result<()> {
     // persists its own state and pays nobody yet, so taking the pool down because an observation
     // could not start would make the safer configuration the riskier one to deploy.
     //
-    // `owns_evidence` is passed FALSE explicitly rather than defaulted. Retention deletes from
-    // `shares`, which the legacy payout path still reads — it may only become true in the same
-    // change that renames that table out from under it (Stage 5). Spelled at the call site because
-    // a defaulted money-safety gate is one nobody reads.
+    // `owns_evidence` is passed TRUE explicitly rather than defaulted, and it is true only
+    // because migration v56 shipped in this same binary. Retention deletes from `shares`; until
+    // v56 that was also the table the legacy payout path computed unpaid balances from, so a
+    // delete took money out of a ledger that was still paying. v56 renamed that ledger to the
+    // frozen `shares_archive` and left `shares` holding this node's own post-cutover evidence
+    // and nothing else, which is what makes the delete safe. Spelled at the call site because a
+    // defaulted money-safety gate is one nobody reads.
+    //
+    // ⚠ Do not set this true in a binary that does not carry v56 — see `ShardRuntime`'s
+    // `owns_evidence` doc for what that costs and how long it stays invisible.
     let shard: Option<Arc<ghost_pool::shard::ShardRuntime>> = if config.pool.share_shard {
         let solo = matches!(
             config.network.mining_mode,
@@ -3867,7 +3873,7 @@ async fn main() -> Result<()> {
             Arc::clone(&identity),
             Arc::clone(&db),
             solo,
-            false,
+            true,
         ) {
             Ok(rt) => {
                 info!(

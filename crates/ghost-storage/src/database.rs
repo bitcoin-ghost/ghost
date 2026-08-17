@@ -1197,13 +1197,21 @@ impl Database {
             // Delete only terminal-status rounds past the window that have NO
             // remaining shares. Shares are NOT touched here — an unpaid share
             // keeps its round alive until Path A prunes that share.
+            //
+            // v56: the guard reads `shares_all`, not `shares`. The live table now holds a
+            // retention window of hours, so a `shares`-only guard would find almost every old
+            // round "empty" and delete it — orphaning the archived shares that still reference
+            // it. `rounds.block_height` is what binds a share to its epoch, so an archive whose
+            // rounds have been pruned can no longer be read back as a ledger, and the archive IS
+            // the rollback substrate. Keeping the round while ANY share references it is also
+            // exactly the pre-v56 behaviour, so nothing grows that was not already growing.
             let deleted = tx
                 .execute(
                     "DELETE FROM rounds
                      WHERE round_id < ?1
                        AND payout_status IN ('confirmed', 'orphaned', 'failed')
                        AND NOT EXISTS (
-                           SELECT 1 FROM shares s WHERE s.round_id = rounds.round_id
+                           SELECT 1 FROM shares_all s WHERE s.round_id = rounds.round_id
                        )",
                     [min_round_to_keep],
                 )

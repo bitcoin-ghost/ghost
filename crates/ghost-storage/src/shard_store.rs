@@ -304,6 +304,13 @@ impl Database {
     /// bounded chunks inside the one transaction; missing rows are not an error, because a
     /// retry after a partial failure legitimately finds some already gone.
     ///
+    /// ⚠ The DELETE target is the LIVE `shares`, never `shares_all` and never `shares_archive`.
+    /// Migration v56 renamed the legacy ledger out of the way and left a fresh `shares` in its
+    /// place, so this statement did not have to move: it already names exactly the table this
+    /// node's own post-cutover evidence is written to. `shares_archive` is frozen, and nothing
+    /// here may reach it — that is the precondition `ShardRuntime::owns_evidence` was waiting
+    /// on before it could be true.
+    ///
     /// Idempotent as a whole: a retry with the same summary replaces the column with the same
     /// contents, deletes nothing, and the summary guard accepts its own root again.
     ///

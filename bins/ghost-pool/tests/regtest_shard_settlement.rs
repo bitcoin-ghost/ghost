@@ -54,9 +54,10 @@ fn rpc() -> Option<Arc<BitcoinRpc>> {
 
 /// A shard runtime over a fresh in-memory database.
 ///
-/// `owns_evidence` is FALSE, matching production: settlement must not depend on the shard owning
-/// the shares table, and a rehearsal that quietly enabled it would prove something the fleet does
-/// not do.
+/// `owns_evidence` is FALSE, and deliberately still so after migration v56 flipped production to
+/// TRUE: settlement must not DEPEND on the shard owning the shares table. Keeping it false here
+/// means a settlement that only works once retention is deleting rows fails this rehearsal
+/// instead of passing it by coincidence.
 fn runtime() -> (Arc<Database>, ShardRuntime) {
     let db = Arc::new(Database::in_memory().expect("db"));
     db.set_encryption_key([0x42u8; 32]);

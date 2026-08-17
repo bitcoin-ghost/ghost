@@ -327,20 +327,25 @@ pub struct ShardRuntime {
     /// one missed call site would leak silently.
     solo: bool,
     /// Whether this node's shard OWNS the `shares` table — i.e. whether retention may delete from
-    /// it. **False until cutover, and that is a money-safety gate, not a tidiness one.**
+    /// it. **TRUE since step 7 (migration v56), and it was a money-safety gate, not a tidiness
+    /// one.**
     ///
-    /// Retention deletes evidence from `shares`, which is the same table the legacy payout path
-    /// still computes unpaid balances from. While both ledgers are live, a delete here removes
-    /// work the old machinery would have paid for — so enabling the shard would silently reduce
-    /// what miners are owed, roughly `RETENTION_EPOCHS` after the flag was set.
+    /// The gate existed because retention deletes evidence from `shares`, which was the same
+    /// table the legacy payout path computed unpaid balances from. While both ledgers read one
+    /// table, a delete here removed work the old machinery would have paid for — so enabling
+    /// retention would silently reduce what miners were owed, roughly `RETENTION_EPOCHS` after
+    /// the flag was set. That breaks the property the whole dark-ship approach rested on:
+    /// **dark must mean changes nothing.**
     ///
-    /// That breaks the property the whole dark-ship approach rests on: **dark must mean changes
-    /// nothing.** A feature that quietly deletes production rows is not dark, however carefully
-    /// the rest of it is gated.
+    /// Migration v56 removed the condition rather than accepting it. `shares` now holds this
+    /// node's own post-cutover evidence and nothing else; every row the legacy path could ever
+    /// have paid for lives in the frozen `shares_archive`, which retention cannot reach. So the
+    /// delete is confined to rows the shard itself created and has already folded into a signed
+    /// summary, and there is no longer a second ledger for it to take money out of.
     ///
-    /// Stage 5 renames `shares` to `shares_archive` and the shard becomes authoritative; this
-    /// flips there, in the same change, and not before. Until then retention still *computes* its
-    /// expiry and logs it, so the behaviour is observable without being destructive.
+    /// ⚠ Flipping this WITHOUT v56 under-credits miners about `EPOCH_BLOCKS * RETENTION_EPOCHS`
+    /// blocks later — six hours, quietly, with the fold logging a healthy `evidence_dropped`
+    /// count the whole time. The two halves are one change; do not separate them.
     owns_evidence: bool,
     /// The merged shard table. Guarded by one mutex and held across a fold — fold, persist and
     /// the in-memory credit must be a single observable step, and nothing else takes this lock
@@ -1658,10 +1663,12 @@ impl ShardRuntime {
 
         let (expired_epoch, expired_hashes) = self.expired_evidence(epoch)?;
 
-        // Retention is COMPUTED always and ACTED ON only when this shard owns the table. While
-        // the legacy payout path still reads `shares`, deleting from it would reduce what miners
-        // are owed by the machinery that is still paying them — see `owns_evidence`. Logging the
-        // count keeps the behaviour observable during the dark soak without being destructive.
+        // Retention is COMPUTED always and ACTED ON only when this shard owns the table — see
+        // `owns_evidence`, which is true from migration v56 onward because the legacy unpaid
+        // ledger no longer shares this table. The withheld branch is kept rather than deleted:
+        // `ShardRuntime::load` still takes the flag, the regtest settlement rehearsal pins the
+        // false case on purpose, and a node whose v56 has not applied yet must still be able to
+        // fold without deleting anything.
         let to_delete: &[[u8; 32]] = if self.owns_evidence {
             &expired_hashes
         } else {
@@ -2943,18 +2950,134 @@ mod tests {
     /// `note_height` reports each boundary crossing exactly once. The first observation ever
     /// initialises silently (there is no epoch to have crossed FROM), repeats inside an epoch
     /// are false, and a height that steps backwards neither reports nor rewinds the latch.
+    /// Copy a live share row into `shares_archive`, hash and all.
+    ///
+    /// `UNIQUE(share_hash)` is per-table since v56, so one hash can legitimately exist on both
+    /// sides — which is exactly the state a node is in the moment the cutover lands and the
+    /// convergence sweep serves it back something it already archived.
+    fn archive_a_twin_of(db: &Database, hash_byte: u8) {
+        // The hash is `hex::encode` of a fixed byte array, so inlining it is not a parameter this
+        // test declined to bind — `rusqlite` is not a dependency of this crate and importing one
+        // to interpolate 64 known hex characters would be the larger change.
+        let sql = format!(
+            "INSERT INTO shares_archive
+                (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+             SELECT round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid
+               FROM shares WHERE share_hash = '{}'",
+            hex::encode([hash_byte; 32])
+        );
+        db.with_connection(|c| {
+            c.execute(&sql, [])
+                .map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))
+        })
+        .expect("archive twin");
+    }
+
+    fn archive_count(db: &Database) -> i64 {
+        db.with_connection(|c| {
+            c.query_row("SELECT COUNT(*) FROM shares_archive", [], |r| r.get(0))
+                .map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))
+        })
+        .expect("count")
+    }
+
+    /// Retention deletes from the LIVE table and may never reach `shares_archive`.
+    ///
+    /// This is the destructive half of step 7, and the failure it guards is quiet and permanent:
+    /// `shard_fold_epoch` deletes `WHERE share_hash IN (…)`, and if that statement were ever
+    /// pointed at `shares_all` — or if the rename had been done by moving rows instead of moving
+    /// the table — every fold would erase a slice of the archive that nothing rebuilds. There is
+    /// no second copy: the archive IS the rollback substrate and the audit trail.
+    ///
+    /// Each archived row here is a byte-for-byte twin of a live one, same `share_hash`, so a
+    /// delete that matched on hash alone rather than on hash-within-a-table would take it. A test
+    /// that archived DIFFERENT hashes would pass without proving anything.
+    #[test]
+    fn retention_deletes_live_evidence_and_never_touches_the_archive() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+
+        for epoch in 100u64..=106 {
+            seed_round(&db, epoch, epoch * 6);
+            seed_share(
+                &db,
+                epoch,
+                epoch as u8,
+                "bc1qminer",
+                2.0,
+                Some(12),
+                &rx,
+                true,
+            );
+            archive_a_twin_of(&db, epoch as u8);
+        }
+        assert_eq!(archive_count(&db), 7, "seven archived twins to protect");
+
+        for epoch in 100u64..=105 {
+            rt.fold_epoch(epoch).expect("fold");
+        }
+        // Folding 106 expires 100 — the live row goes, its archived twin must not.
+        let FoldOutcome::Folded(r) = rt.fold_epoch(106).expect("fold") else {
+            panic!("must fold");
+        };
+        assert_eq!(r.expired_epoch, Some(106 - RETENTION_EPOCHS));
+        assert_eq!(
+            r.evidence_dropped, 1,
+            "retention must actually delete — `owns_evidence` is true from v56 onward"
+        );
+        assert_eq!(
+            evidence_count(&db, 100, &rx),
+            0,
+            "the expired epoch's LIVE evidence is gone"
+        );
+
+        assert_eq!(
+            archive_count(&db),
+            7,
+            "not one archived row may be deleted by retention"
+        );
+        let twin_sql = format!(
+            "SELECT 1 FROM shares_archive WHERE share_hash = '{}'",
+            hex::encode([100u8; 32])
+        );
+        let twin_survives: bool = db
+            .with_connection(|c| c.query_row(&twin_sql, [], |_| Ok(true)).or(Ok(false)))
+            .unwrap_or(false);
+        assert!(
+            twin_survives,
+            "the archived twin of the deleted live share must survive — the DELETE is scoped by \
+             TABLE, not by hash"
+        );
+
+        // And the view still sees the whole story, which is what every dashboard read depends on.
+        let via_view: i64 = db
+            .with_connection(|c| {
+                c.query_row("SELECT COUNT(*) FROM shares_all", [], |r| r.get(0))
+                    .map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))
+            })
+            .expect("view count");
+        assert_eq!(
+            via_view, 13,
+            "six live survivors plus seven archived rows — history outlives retention"
+        );
+    }
+
     #[test]
     fn retention_is_withheld_while_the_legacy_ledger_owns_shares() {
         // The failure this pins is a money bug wearing a tidiness costume. Retention deletes from
-        // `shares`, the same table the legacy payout path computes unpaid balances from. Delete
-        // there while both ledgers are live and miners are silently owed less — roughly
-        // RETENTION_EPOCHS after somebody set a flag they were told was dark. "Dark" has to mean
-        // changes nothing, so the fold must compute its expiry and act on none of it.
+        // `shares`, which BEFORE migration v56 was also the table the legacy payout path computed
+        // unpaid balances from. Delete there while both ledgers read one table and miners are
+        // silently owed less — roughly RETENTION_EPOCHS after somebody set a flag they were told
+        // was dark. "Dark" has to mean changes nothing, so the fold must compute its expiry and
+        // act on none of it.
+        //
+        // v56 removed the condition rather than the branch, and this test is why the branch
+        // stays: `owns_evidence = false` is what a node runs between installing this binary and
+        // its migration completing, and it must still fold without deleting.
         let identity = Arc::new(NodeIdentity::generate());
         let db = Arc::new(Database::in_memory().expect("db"));
         db.set_encryption_key([0x42u8; 32]);
-        // owns_evidence = false: the pre-cutover setting, and the only one that ships until
-        // `shares` has been renamed out from under the legacy path.
+        // owns_evidence = false: the pre-v56 setting.
         let rt =
             ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false, false).expect("load");
         let rx = our_received_by(&identity);
@@ -2993,7 +3116,7 @@ mod tests {
         assert_eq!(
             evidence_count(&db, 100, &rx),
             1,
-            "not one row may leave `shares` before cutover"
+            "not one row may leave `shares` while the flag is false"
         );
     }
 

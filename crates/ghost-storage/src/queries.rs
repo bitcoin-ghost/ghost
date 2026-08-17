@@ -427,6 +427,42 @@ fn i64_to_u64(value: i64, field_name: &str) -> Result<u64, rusqlite::Error> {
 
 // =============================================================================
 // SHARE QUERIES
+//
+// Since migration v56 (`SHARE_SHARD_BUILD.md` Stage 5, step 7) there are THREE
+// spellings, and picking the wrong one does not error — it silently returns
+// less:
+//
+//   `shares`         the LIVE table. Post-cutover evidence only. Ingest writes
+//                    it, `shard_fold_epoch` deletes from it once an epoch ages
+//                    out of the retention window (EPOCH_BLOCKS * RETENTION_EPOCHS
+//                    = 36 blocks, ~6 h), and `delete_old_shares` prunes it. So
+//                    it holds HOURS of history, not months.
+//
+//   `shares_archive` every share this node held at the cutover. FROZEN: nothing
+//                    writes it and nothing deletes from it. It is the rollback
+//                    substrate and the audit trail, and it is not payable —
+//                    the shard's genesis column already absorbed this work, so
+//                    anything that re-credits from here double-pays.
+//
+//   `shares_all`     a view, `shares UNION ALL shares_archive`. Read-only;
+//                    SQLite will not accept a write through it.
+//
+// The rule, and it is not "use the view when in doubt":
+//
+//   * anything that WRITES, or that computes what a miner is OWED, reads the
+//     live table. The unpaid ledger collapsing to a six-hour window is the
+//     POINT of the cutover, not a regression — the shard's `owed()` is what
+//     pays now, and a legacy path that could still see months of unpaid work
+//     would be a second, disagreeing answer to the same question.
+//
+//   * anything a HUMAN reads — leaderboards, hashrate, per-miner history and
+//     stats, pool records — reads `shares_all`, or the dashboard shows every
+//     miner's lifetime resetting to zero on the morning of the deploy.
+//
+//   * the two import dedup checks read `shares_all` on purpose. `UNIQUE(share_hash)`
+//     is per-table now, so it no longer stops a peer from serving us back a
+//     share that is sitting in the archive; without the view that share would
+//     be re-inserted into the live table and folded a second time.
 // =============================================================================
 
 impl Database {
@@ -684,6 +720,9 @@ impl Database {
     ///
     /// Bounded by construction: one epoch spans `epoch_blocks` heights, so the join walks
     /// `idx_rounds_height` to a handful of rounds and `idx_shares_round` to their shares.
+    /// v56: reads the LIVE `shares`, and that is the whole design. The fold's input is one
+    /// epoch of evidence this node received itself; `shares_archive` holds work the genesis
+    /// column already accrued, so folding it again would credit it twice.
     pub fn shard_epoch_shares(
         &self,
         epoch: u64,
@@ -831,6 +870,10 @@ impl Database {
         Ok(emitted)
     }
 
+    /// v56: LIVE `shares` only. Exporting the archive would hand a peer months of work its own
+    /// genesis column has already accrued, and `import_unpaid_shares` on the far side would
+    /// write it into that node's live table for the fold to credit a second time. The archive
+    /// is history, not a ledger to reconcile.
     pub fn export_unpaid_shares(&self) -> GhostResult<Vec<UnpaidShareExport>> {
         let rows: Vec<(u64, String, f64, f64, String, i64, String)> =
             self.with_connection(|conn| {
@@ -892,8 +935,8 @@ impl Database {
     /// Import unpaid shares this node is missing, re-encrypting each miner's address with THIS
     /// node's key. Returns (shares_inserted, miners_created).
     ///
-    /// Never deletes, never overwrites: `INSERT` relies on UNIQUE(share_hash) for dedup, and a
-    /// miner row is only created if absent. Safe to re-run.
+    /// Never deletes, never overwrites: dedup is an explicit `shares_all` check plus
+    /// UNIQUE(share_hash), and a miner row is only created if absent. Safe to re-run.
     pub fn import_unpaid_shares(
         &self,
         shares: &[UnpaidShareExport],
@@ -940,7 +983,7 @@ impl Database {
                 let have: bool = self
                     .with_connection(|conn| {
                         conn.query_row(
-                            "SELECT 1 FROM shares WHERE share_hash = ?1",
+                            "SELECT 1 FROM shares_all WHERE share_hash = ?1",
                             params![s.share_hash],
                             |_| Ok(true),
                         )
@@ -950,6 +993,25 @@ impl Database {
                 if !have {
                     inserted += 1;
                 }
+                continue;
+            }
+
+            // Same reason as the batch path below: since v56, UNIQUE(share_hash) is per-table,
+            // so it no longer refuses a share sitting in `shares_archive`. Re-importing one
+            // would make pre-cutover work foldable a second time. `insert_share` is the hot
+            // ingest path and stays a plain INSERT — the check belongs here, on the
+            // reconciliation path, which runs rarely and per-share already.
+            let already_held: bool = self
+                .with_connection(|conn| {
+                    conn.query_row(
+                        "SELECT 1 FROM shares_all WHERE share_hash = ?1",
+                        params![s.share_hash],
+                        |_| Ok(true),
+                    )
+                    .or(Ok(false))
+                })
+                .unwrap_or(false);
+            if already_held {
                 continue;
             }
 
@@ -970,8 +1032,9 @@ impl Database {
     /// the per-row autocommit made the import take tens of minutes and hammer the WAL). Miners
     /// are few and distinct, so they go through the encryption-aware `upsert_miner` helper
     /// (outside the transaction — nesting `self.*` inside `self.transaction` would deadlock on
-    /// the single write connection). `INSERT OR IGNORE` keeps it idempotent on UNIQUE(share_hash);
-    /// `execute` returns rows-affected (1 = new, 0 = already had it).
+    /// the single write connection). Idempotence is a `NOT EXISTS` against `shares_all` plus
+    /// `INSERT OR IGNORE` on UNIQUE(share_hash); `execute` returns rows-affected (1 = new,
+    /// 0 = already had it).
     pub fn import_unpaid_shares_batch(
         &self,
         chunk: &[UnpaidShareExport],
@@ -1011,7 +1074,7 @@ impl Database {
             let mut inserted = 0usize;
             self.with_connection(|conn| {
                 let mut stmt = conn
-                    .prepare("SELECT 1 FROM shares WHERE share_hash = ?1")
+                    .prepare("SELECT 1 FROM shares_all WHERE share_hash = ?1")
                     .map_err(|e| GhostError::Database(e.to_string()))?;
                 for s in chunk {
                     let exists = stmt
@@ -1031,9 +1094,17 @@ impl Database {
             {
                 let mut stmt = tx
                     .prepare(
+                        // `INSERT OR IGNORE` used to be the whole dedup, resting on
+                        // UNIQUE(share_hash). Since v56 that constraint is per-table and cannot
+                        // see `shares_archive`, so a peer serving us a pre-cutover share we
+                        // already hold would re-insert it as LIVE evidence and the next fold
+                        // would credit it a second time, on top of the genesis column that
+                        // already accrued it. The NOT EXISTS is what closes that; `OR IGNORE`
+                        // stays for the live-table race.
                         "INSERT OR IGNORE INTO shares
                          (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1
+                          WHERE NOT EXISTS (SELECT 1 FROM shares_all WHERE share_hash = ?5)",
                     )
                     .map_err(|e| GhostError::Database(e.to_string()))?;
                 for s in chunk {
@@ -1067,7 +1138,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid
-                     FROM shares WHERE round_id = ?1 ORDER BY timestamp LIMIT ?2",
+                     FROM shares_all WHERE round_id = ?1 ORDER BY timestamp LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
@@ -1101,7 +1172,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid
-                     FROM shares WHERE round_id = ?1 AND miner_id = ?2 ORDER BY timestamp LIMIT ?3",
+                     FROM shares_all WHERE round_id = ?1 AND miner_id = ?2 ORDER BY timestamp LIMIT ?3",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
@@ -1135,7 +1206,7 @@ impl Database {
         self.with_connection(|conn| {
             let work: f64 = conn
                 .query_row(
-                    "SELECT COALESCE(SUM(work), 0) FROM shares WHERE round_id = ?1 AND miner_id = ?2 AND valid = 1",
+                    "SELECT COALESCE(SUM(work), 0) FROM shares_all WHERE round_id = ?1 AND miner_id = ?2 AND valid = 1",
                     params![round_id, miner_id],
                     |row| row.get(0),
                 )
@@ -1152,7 +1223,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT miner_id, SUM(work) as total_work
-                     FROM shares WHERE round_id = ?1 AND valid = 1
+                     FROM shares_all WHERE round_id = ?1 AND valid = 1
                      GROUP BY miner_id ORDER BY total_work DESC LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -1184,7 +1255,7 @@ impl Database {
                         MIN(timestamp) as first_seen,
                         MAX(timestamp) as last_seen,
                         AVG(difficulty) as avg_difficulty
-                     FROM shares WHERE round_id = ?1
+                     FROM shares_all WHERE round_id = ?1
                      GROUP BY miner_id ORDER BY total_work DESC LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -1232,7 +1303,7 @@ impl Database {
                         MIN(timestamp) as first_seen,
                         MAX(timestamp) as last_seen,
                         AVG(difficulty) as avg_difficulty
-                     FROM shares
+                     FROM shares_all
                      WHERE timestamp >= ?1
                      GROUP BY miner_id ORDER BY total_work DESC LIMIT ?2",
                 )
@@ -1280,7 +1351,7 @@ impl Database {
                         MIN(timestamp) as first_seen,
                         MAX(timestamp) as last_seen,
                         AVG(difficulty) as avg_difficulty
-                     FROM shares
+                     FROM shares_all
                      WHERE timestamp >= ?1 AND received_by = ?2
                      GROUP BY miner_id ORDER BY total_work DESC LIMIT ?3",
                 )
@@ -1333,7 +1404,7 @@ impl Database {
                     // LEFT JOIN rounds resolves the share's block height from
                     // its round_id (NULL if the round row isn't persisted).
                     "SELECT s.share_hash, s.miner_id, s.timestamp, s.difficulty, r.block_height
-                     FROM shares s
+                     FROM shares_all s
                      LEFT JOIN rounds r ON r.round_id = s.round_id
                      WHERE s.timestamp >= ?1 AND s.valid = 1 AND instr(s.miner_id, '.') > 0
                      ORDER BY reverse_hex(s.share_hash) ASC
@@ -1365,7 +1436,7 @@ impl Database {
                     // Same real-miner filter as get_best_share_since; scoped
                     // to a single round instead of a time window.
                     "SELECT s.share_hash, s.miner_id, s.timestamp, s.difficulty, r.block_height
-                     FROM shares s
+                     FROM shares_all s
                      LEFT JOIN rounds r ON r.round_id = s.round_id
                      WHERE s.round_id = ?1 AND s.valid = 1 AND instr(s.miner_id, '.') > 0
                      ORDER BY reverse_hex(s.share_hash) ASC
@@ -1421,7 +1492,7 @@ impl Database {
                                     PARTITION BY miner_id
                                     ORDER BY reverse_hex(share_hash) ASC
                                 ) AS rn
-                         FROM shares
+                         FROM shares_all
                          WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                      ) s
                      WHERE s.rn = 1
@@ -1463,7 +1534,7 @@ impl Database {
                     // Only real `address.worker` miners; exclude the bare
                     // hex(SHA256(id)) gossip-ledger ids (see get_leaderboard_best_hash).
                     "SELECT miner_id, COUNT(*) AS share_count, SUM(work) AS total_work
-                     FROM shares
+                     FROM shares_all
                      WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                      GROUP BY miner_id
                      ORDER BY total_work DESC
@@ -1497,6 +1568,9 @@ impl Database {
     /// current payout: those belong to the next round's ledger.
     ///
     /// Returns `(miner_id, unpaid_work)` ordered by unpaid_work desc.
+    /// v56: LIVE `shares`, so this now sees hours rather than months. That is intended — see
+    /// the header. The shard's `owed()` pays; this is the legacy answer to the same question
+    /// and it must not be the louder one.
     pub fn get_top_unpaid_miners(
         &self,
         cutoff_ts: i64,
@@ -1716,7 +1790,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT miner_id, share_hash, timestamp, work
-                     FROM shares
+                     FROM shares_all
                      WHERE timestamp > ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                      ORDER BY timestamp ASC
                      LIMIT ?2",
@@ -2170,6 +2244,9 @@ impl Database {
     ///
     /// Everything else older than `cutoff_ts` is a proposal that armed a coinbase which never won.
     /// It has served its purpose and references nothing.
+    /// v56: the "still referenced" check reads `shares_all`. Archived rows carry
+    /// `paid_in_proposal_hash` too, and pruning a proposal they point at would leave
+    /// `reverse_settlement` unable to name what it was undoing.
     pub fn prune_payout_proposals(&self, cutoff_ts: i64) -> GhostResult<usize> {
         self.with_connection(|conn| {
             let removed = conn
@@ -2179,7 +2256,7 @@ impl Database {
                         AND is_approved = 0
                         AND proposal_hash NOT IN (SELECT proposal_hash FROM settled_blocks)
                         AND proposal_hash NOT IN (
-                            SELECT DISTINCT paid_in_proposal_hash FROM shares
+                            SELECT DISTINCT paid_in_proposal_hash FROM shares_all
                              WHERE paid_in_proposal_hash IS NOT NULL
                         )",
                     params![cutoff_ts],
@@ -2575,7 +2652,7 @@ impl Database {
                             SUM(s.work)       AS total_work,
                             COUNT(*)          AS share_count,
                             COALESCE(m.total_shares, 0) AS lifetime_shares
-                     FROM shares s
+                     FROM shares_all s
                      LEFT JOIN miners m ON s.miner_id = m.miner_id
                      WHERE s.timestamp >= ?1 AND s.valid = 1
                      GROUP BY s.miner_id
@@ -2661,7 +2738,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT miner_id, SUM(work) AS total_work, COUNT(*) AS share_count
-                     FROM shares WHERE round_id = ?1 AND valid = 1
+                     FROM shares_all WHERE round_id = ?1 AND valid = 1
                      GROUP BY miner_id ORDER BY total_work DESC LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -2699,7 +2776,7 @@ impl Database {
                     "SELECT (timestamp / ?3) * ?3 AS bucket,
                             COUNT(*) AS share_count,
                             SUM(work) AS total_work
-                     FROM shares
+                     FROM shares_all
                      WHERE miner_id = ?1 AND timestamp >= ?2 AND valid = 1
                      GROUP BY bucket
                      ORDER BY bucket ASC",
@@ -2759,21 +2836,25 @@ impl Database {
         })
     }
 
-    /// Delete shares older than `retention_secs` seconds.
-    ///
-    /// This is the SINGLE authority for the `shares` row lifecycle. It does
-    /// two distinct things:
+    /// Delete shares older than `retention_secs` seconds. It does two distinct things:
     ///   1. PAID shares (`paid_in_proposal_hash IS NOT NULL`) older than
     ///      `retention_secs` are pruned — a short audit tail, no ledger value.
     ///   2. UNPAID shares (`paid_in_proposal_hash IS NULL`) are NEVER pruned
     ///      by age. They are only reclaimed once their miner has been dark
-    ///      (no `last_seen` update) for over **one year**. An actively-mining
-    ///      miner therefore accumulates their unpaid ledger indefinitely and
-    ///      it carries forward across every block, exactly as promised.
+    ///      (no `last_seen` update) for over **one year**.
     ///
-    /// Uses the existing `idx_shares_timestamp` index for efficient deletion.
-    /// Returns the number of deleted rows.
-    /// Enforces a minimum retention of 1 hour to prevent accidental wipe.
+    /// ⚠ This used to describe itself as "the SINGLE authority for the `shares` row lifecycle".
+    /// Since step 7 it is not: `Database::shard_fold_epoch` also deletes, dropping each epoch's
+    /// evidence `RETENTION_EPOCHS` after folding it, and that is the reaper that actually bounds
+    /// the live table now. The promise in (2) — that an active miner's unpaid ledger accumulates
+    /// indefinitely — was true of the legacy ledger and is no longer true of `shares`. What
+    /// carries a miner's work forward is the shard's grow-only `accrued` counter, not a row here.
+    ///
+    /// Uses the existing timestamp index for efficient deletion. Returns the number of deleted
+    /// rows. Enforces a minimum retention of 1 hour to prevent accidental wipe.
+    ///
+    /// v56: deletes from the LIVE `shares` only. `shares_archive` is frozen — the point of no
+    /// return is dropping it, and retention is not allowed to walk there by accident.
     pub fn delete_old_shares(&self, retention_secs: i64) -> GhostResult<usize> {
         // Guard: minimum 1 hour retention to prevent accidental wipe
         let retention_secs = retention_secs.max(3600);
@@ -2865,7 +2946,7 @@ impl Database {
                         MIN(timestamp) as first_seen,
                         MAX(timestamp) as last_seen,
                         AVG(difficulty) as avg_difficulty
-                     FROM shares
+                     FROM shares_all
                      WHERE miner_id LIKE ?1 ESCAPE '\\'
                      GROUP BY miner_id
                      ORDER BY total_work DESC
@@ -2909,7 +2990,7 @@ impl Database {
                         MAX(timestamp) as last_seen,
                         AVG(difficulty) as avg_difficulty,
                         COUNT(DISTINCT round_id) as rounds_participated
-                     FROM shares
+                     FROM shares_all
                      WHERE miner_id = ?1
                      GROUP BY miner_id",
                     params![miner_id],
@@ -2936,7 +3017,7 @@ impl Database {
                 let mut stmt = conn
                     .prepare(
                         "SELECT round_id, difficulty, work, timestamp, valid
-                         FROM shares WHERE miner_id = ?1
+                         FROM shares_all WHERE miner_id = ?1
                          ORDER BY timestamp DESC LIMIT 10",
                     )
                     .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -3149,8 +3230,8 @@ impl Database {
             conn.execute(
                 "UPDATE rounds SET
                     end_time = ?1,
-                    total_shares = (SELECT COUNT(*) FROM shares WHERE round_id = ?2 AND valid = 1),
-                    total_work = (SELECT COALESCE(SUM(work), 0) FROM shares WHERE round_id = ?2 AND valid = 1)
+                    total_shares = (SELECT COUNT(*) FROM shares_all WHERE round_id = ?2 AND valid = 1),
+                    total_work = (SELECT COALESCE(SUM(work), 0) FROM shares_all WHERE round_id = ?2 AND valid = 1)
                  WHERE round_id = ?2",
                 params![end_time, round_id],
             )
@@ -3966,7 +4047,7 @@ impl Database {
             let total_work: f64 = conn
                 .query_row(
                     "SELECT COALESCE(SUM(work), 0.0)
-                     FROM shares
+                     FROM shares_all
                      WHERE timestamp >= ?1 AND valid = 1 AND received_by = ?2",
                     params![cutoff, received_by],
                     |row| row.get::<_, f64>(0),
@@ -5421,7 +5502,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid
-                     FROM shares ORDER BY timestamp DESC LIMIT ?1",
+                     FROM shares_all ORDER BY timestamp DESC LIMIT ?1",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
@@ -14337,6 +14418,162 @@ mod tests {
                 .len(),
             0,
             "a fully-synced peer is served nothing"
+        );
+    }
+
+    // ---- v56: the archive/live split, through the public API --------------------------------
+
+    /// Seed a share into a specific table. `shares_archive` is what every row looked like the
+    /// instant before the cutover; `shares` is what ingest writes after it.
+    fn seed_into(db: &Database, table: &str, miner: &str, hash: &str, ts: i64, work: f64) {
+        let sql = format!(
+            "INSERT INTO {table}
+                (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+             VALUES (1, ?1, 1.0, ?2, ?3, ?4, 'node0000', 1)"
+        );
+        db.with_connection(|c| {
+            c.execute(&sql, params![miner, work, hash, ts])
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed");
+    }
+
+    /// The single defect step 7 can introduce, and it does not error — it returns less.
+    ///
+    /// After `shares` is renamed to `shares_archive`, every history query that still says `FROM
+    /// shares` keeps compiling, keeps running, and starts answering from a table that holds a
+    /// few hours instead of a few months. On the morning of the deploy each miner's lifetime
+    /// work, best hash and hashrate would reset to whatever it had earned since the restart.
+    ///
+    /// So this asserts the split from both sides at once: the human-facing reads see the
+    /// archive, and the unpaid ledger does not.
+    #[test]
+    fn history_reads_see_the_archive_and_the_unpaid_ledger_does_not() {
+        let db = Database::in_memory().expect("in-memory db");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+
+        // Four shares before the cutover, one after. All recent enough for the windowed views.
+        for (i, w) in [(1u32, 10.0f64), (2, 10.0), (3, 10.0), (4, 10.0)] {
+            seed_into(
+                &db,
+                "shares_archive",
+                "bc1qminer.rig",
+                &format!("{i:064x}"),
+                now - 300,
+                w,
+            );
+        }
+        seed_into(
+            &db,
+            "shares",
+            "bc1qminer.rig",
+            &format!("{:064x}", 99u32),
+            now - 60,
+            10.0,
+        );
+
+        // Lifetime stats — what a miner sees on their own page.
+        let stats = db
+            .get_miner_stats("bc1qminer.rig")
+            .expect("stats")
+            .expect("miner must exist");
+        assert_eq!(
+            stats.total_shares, 5,
+            "lifetime share count must include pre-cutover history"
+        );
+        assert_eq!(
+            stats.total_work, 50.0,
+            "lifetime work must survive the deploy"
+        );
+
+        // Leaderboard — what everyone else sees.
+        let board = db.get_leaderboard_shares(0, 10).expect("leaderboard");
+        assert_eq!(
+            board,
+            vec![("bc1qminer.rig".to_string(), 5u64, 50.0f64)],
+            "the leaderboard must not restart at the cutover"
+        );
+
+        // Hashrate — the number the mesh gossips and the dashboard prints.
+        let live_only = 10.0 * 4294967296.0 / 600.0 / 1e12;
+        let hr = db.local_hashrate_th(600, "node0000").expect("hashrate");
+        assert!(
+            hr > live_only * 4.0,
+            "hashrate must be computed over the whole window, not just post-cutover shares: \
+             got {hr}, live-only would be {live_only}"
+        );
+
+        // Per-miner history — the chart behind the same page.
+        let history: u64 = db
+            .get_miner_history("bc1qminer.rig", 0, 86_400)
+            .expect("history")
+            .iter()
+            .map(|(_, count, _)| *count)
+            .sum();
+        assert_eq!(history, 5, "the history chart must span the cutover");
+
+        // And the half that must NOT change: the legacy unpaid ledger is scoped to the live
+        // table, so pre-cutover work is not offered to a payout path the shard has replaced.
+        // If this ever starts returning 50.0, two ledgers are answering "who is owed what".
+        let unpaid = db.get_top_unpaid_miners(now + 1, 10).expect("unpaid");
+        assert_eq!(
+            unpaid,
+            vec![("bc1qminer.rig".to_string(), 10.0f64)],
+            "the unpaid ledger must see only post-cutover work"
+        );
+    }
+
+    /// A peer serving us a share we already hold in the archive must not be able to re-insert
+    /// it. `UNIQUE(share_hash)` is per-table since v56, so it no longer refuses this on its own
+    /// — the dedup check has to read `shares_all`. Without it, convergence walks pre-cutover
+    /// history back into the live table and the fold credits it a second time on top of the
+    /// genesis column.
+    #[test]
+    fn an_archived_share_cannot_be_re_imported() {
+        let db = Database::in_memory().expect("in-memory db");
+        db.set_encryption_key([0x42u8; 32]);
+        let hash = format!("{:064x}", 7u32);
+        seed_into(&db, "shares_archive", "bc1qminer.rig", &hash, 1_000, 10.0);
+
+        let export = UnpaidShareExport {
+            round_id: 1,
+            miner_id: "bc1qminer.rig".to_string(),
+            difficulty: 1.0,
+            work: 10.0,
+            share_hash: hash.clone(),
+            timestamp: 1_000,
+            received_by: "node0000".to_string(),
+            payout_address: Some("bc1qminer".to_string()),
+        };
+
+        let (inserted, _) = db
+            .import_unpaid_shares(std::slice::from_ref(&export), false)
+            .expect("import");
+        assert_eq!(
+            inserted, 0,
+            "an archived share must not be re-imported into the live evidence table"
+        );
+
+        let (batched, _) = db
+            .import_unpaid_shares_batch(&[export], false)
+            .expect("batch import");
+        assert_eq!(
+            batched, 0,
+            "the batch path must dedup against the archive too"
+        );
+
+        let live: i64 = db
+            .with_connection(|c| {
+                c.query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("count");
+        assert_eq!(
+            live, 0,
+            "not one archived row may reappear as live evidence"
         );
     }
 }

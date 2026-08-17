@@ -1,0 +1,49 @@
+# Optional overlay: make a CPU miner's shares actually FOLDABLE on regtest.
+#
+# TWO things stop the fold here, and lowering only one of them looks like it
+# worked while `epoch folded ... shares=0` keeps scrolling past:
+#
+#   1. `NETWORK_TIER_LOG2` is 10 — a share must be 1024x diff1 to be network
+#      tier, which no CPU miner on a regtest chain reaches.
+#   2. `SHARE_TIER_BIND_HEIGHT` is a mainnet height this chain will never see,
+#      so `ShareProof.tier_log2` is `None` — and the fold's input query excludes
+#      an absent tier outright (a pre-gate share committed to no tier, so there
+#      is no `2^tier_log2` to credit). A share with no tier is unfoldable at ANY
+#      floor, so (1) alone changes nothing.
+#
+# Both overrides are escape hatches the binary already ships, both are ignored on
+# mainnet (`gates::from_env` returns the default there), and `clamp_tier_floor`
+# can only ever WEAKEN the tier filter — so neither can be used to fold a stricter
+# shard than production or to affect a real node.
+#
+#   cd docker/regtest-cluster
+#   docker compose -f docker-compose.yml -f docker-compose.tier-floor.yml up -d
+#
+# ⚠ A run under this overlay proves the fold PLUMBING — input query, screen,
+# summary, retention delete. It does NOT rehearse the mainnet tier filter, which
+# is exactly what the overlay switches off. Do not read a green run here as
+# evidence about which shares mainnet folds.
+#
+# ⚠ A THIRD blocker is still open, and it is not in this file (measured
+# 2026-08-18, step-7 rehearsal). Even with both overrides on, `epoch folded ...
+# shares=0` continued, because almost no share reaches the database to be folded:
+#
+#   - `translator.toml` sets `enable_vardiff = false`, but **pool_sv2 runs its own
+#     vardiff loop** ("Starting vardiff loop for downstreams") and raised the
+#     downstream target by ~256x within minutes of `sv1_miner.py` connecting. The
+#     python miner cannot sustain that, so submits stop;
+#   - recreating `pool1` also detaches `rc-poolsv2` and `rc-translator`, which run
+#     with `--network container:rc-pool1` and silently keep pointing at the DEAD
+#     namespace. Both must be recreated after every `compose up` that touches
+#     pool1, and the translator must start AFTER pool_sv2 is listening on :34256
+#     or it exhausts its 3 retries and exits.
+#
+# So: fixing the tier is necessary but not sufficient. Until pool_sv2's vardiff is
+# pinned for regtest, the fold's CREDITING path is proven in-process
+# (`shard::tests::retention_deletes_live_evidence_and_never_touches_the_archive`
+# and its siblings), not on this cluster.
+services:
+  pool1: { environment: &tier-floor-env { GHOST_NETWORK_TIER_LOG2: "0", GHOST_SHARE_TIER_BIND_HEIGHT: "1" } }
+  pool2: { environment: *tier-floor-env }
+  pool3: { environment: *tier-floor-env }
+  pool4: { environment: *tier-floor-env }

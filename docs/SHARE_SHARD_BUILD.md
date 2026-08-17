@@ -52,17 +52,28 @@ folded shares. That is the first thing to watch when a block is won.
 
 | # | item | state |
 |---|---|---|
-| 7 | rename `shares` → `shares_archive`, move the fold's DELETE target **in the same change**, then flip `owns_evidence` | **not started — see below** |
+| 7 | rename `shares` → `shares_archive`, move the fold's DELETE target **in the same change**, then flip `owns_evidence` | **DONE — migration v56; see “Step 7 as built” below** |
 | — | Stage 6 deletion release (~26–28k lines) | not started; must NOT ride the cutover binary |
 | — | §6 λ-sampling | built in `ghost-consensus`, and a hard precondition for admitting FOREIGN nodes (v1 multi-operator) |
 | — | MPC ceremony divergence under concurrent contribution | bootstrap-only (`< MPC_BFT_BOOTSTRAP_COUNT = 4`); mainnet has 8 contributors so a join needs 6 approvals and cannot apply unilaterally |
 
-⚠⚠ **`owns_evidence` must stay false until step 7 lands, and step 7 should wait for the first won
-block.** Retention deletes from `shares`, which is what the legacy path computes from and what any
-comparison against the shard depends on. Deleting it now — hours after the flip, with zero blocks
-won and `shard_settled_blocks = 0` — destroys the evidence needed to check that the flip pays what
-the old path would have, at exactly the moment that check is most valuable. The rollback note
-("the old ledger resumes where it froze") only holds while `shares` is intact.
+~~⚠⚠ **`owns_evidence` must stay false until step 7 lands, and step 7 should wait for the first won
+block.**~~ **Superseded 2026-08-18.** The first half held and is now satisfied: `owns_evidence`
+became true in the same change as the rename. The second half — waiting for a won block — was
+dropped deliberately, and the reasoning is worth keeping because it is the kind of gate that reads
+as caution and functions as a deadlock:
+
+- the pool's share of the network is 0.0000118% (107.7 TH/s against 912.5 EH/s), so "the first won
+  block" is a **~161-year** event. A precondition that cannot occur is not a safety margin, it is
+  a decision to keep the legacy path alive permanently;
+- what the gate was protecting — the ability to compare the shard's payout against the legacy
+  path's — is preserved anyway, because step 7 **quarantines** `shares` rather than deleting it.
+  Every row is still readable through `shares_archive` and `shares_all`;
+- and the drift that comparison would have measured has already been measured: **−0.12%**,
+  proportional across addresses, one-off (genesis truncation plus the epoch floor), not growing.
+  On a 3.125 BTC block that is 33,289 sats of 309,375,000 redistributed BETWEEN miners — the
+  coinbase splits `pool_sats` proportionally (`amount = pool_sats * work / top`), so a uniform
+  shortfall cancels and the pool pays out the same total either way.
 
 **Expect the first block after the flip to pay ~0.1% less than the legacy path would have.** Drift
 is −87e12 against 74.4e15 accrued — the shard owes slightly less, by design: the genesis conversion
@@ -399,6 +410,57 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
    payable state to it. ⚠ **`shard_fold_epoch` deletes evidence from `shares`** — Stage 1 defines no
    separate node-shard table, so the fold's DELETE target must move with the rename in the same
    change, or evidence stops being collected the moment the table is renamed.
+
+### Step 7 as built (migration v56, 2026-08-18)
+
+Three tables where there was one, and the whole change is which of them each query reads:
+
+| | who writes it | who deletes from it | who reads it |
+|---|---|---|---|
+| `shares` | ingest | `shard_fold_epoch` retention, `delete_old_shares` | the fold, the unpaid ledger, the payout writes |
+| `shares_archive` | **nothing, ever** | **nothing, ever** | only through the view |
+| `shares_all` (view) | — | — | every human-facing read: leaderboards, hashrate, miner stats and history, pool records |
+
+**The fold's DELETE target did not have to move.** The warning above assumed the rename left no
+`shares` behind. v56 leaves a fresh empty one, so ingest keeps writing to `shares` and the fold
+keeps deleting from `shares` — both now mean *live shard evidence* instead of *the legacy unpaid
+ledger*, which is exactly the separation `owns_evidence` was waiting for.
+
+**What actually needed deciding was the 66 `shares` statements**, because after the rename not one
+of them errors — they silently return less. The rule that settled every one: anything that WRITES,
+or that computes what a miner is OWED, reads the live table; anything a HUMAN reads goes through
+the view. The unpaid ledger collapsing to a six-hour window is the point of the cutover, not a
+regression, and a test pins it so that "the leaderboard went to zero, let's point the unpaid query
+at the view too" fails rather than quietly reviving a second answer to who is owed what.
+
+Two things fell out of the split that were not on the plan:
+
+- **`UNIQUE(share_hash)` is per-table now**, so it no longer stops a peer from serving back a share
+  sitting in the archive. Both import paths rested on that constraint alone; without an explicit
+  `shares_all` check, convergence would walk pre-cutover history into the live table and the fold
+  would credit it a second time on top of the genesis column. Caught by a test, not by review.
+- **`ALTER TABLE … RENAME` carries the `sqlite_sequence` row to the archive**, so a fresh `shares`
+  would restart `id` at 1 and collide with archived rows across the view. Seeded from
+  `MAX(shares_archive.id)`.
+
+**Why the archive keeps the `idx_shares_*` index names.** SQLite has no `ALTER INDEX … RENAME`, so
+freeing those names means `DROP` + `CREATE` — a rebuild of four indexes over millions of rows, at
+process startup, writing hundreds of MB of WAL on ghost-vm1, whose root filesystem is at 90%. The
+archive's indexes stay where the rename put them and the live table's are created under
+`idx_shares_live_*`. `sqlite_master.tbl_name` says which table an index serves; the name no longer
+does.
+
+**Ops scripts that step 7 would have broken silently**, all fixed in the same change:
+
+| script | what would have happened |
+|---|---|
+| `lib/ceremony-backup-remote.sh` | verified a backup by comparing `count(*) FROM shares` — 0 against 0 after the cutover, a check that cannot fail |
+| `shard-verify-fold.sh` | re-derives the cumulative column from raw rows retention now deletes, so it would report a designed deletion as a MISMATCH. Now exits 1 UNVERIFIABLE with the reason |
+| `reconcile-ledger.sh` | repairs a ledger nothing pays from. Refuses on a v56 node unless overridden |
+| `ops/verify_attribution.sh` | windowed counts straddling the cutover under-report. Reads the view |
+
+`deploy-node.sh`'s smoke probe (`count(*) FROM shares WHERE timestamp > $started`) is correct
+unchanged — it asks "are new shares landing", which is precisely what the live table answers.
 
 **Rollback:** before step 6, per node — restore the `.bak` binary and flag off; the old machinery
 never stopped. After step 6 — flip the source and the loops back on; the old ledger resumes where it

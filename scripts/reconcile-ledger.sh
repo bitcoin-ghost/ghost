@@ -37,8 +37,20 @@
 #   2. Every node's DB is backed up. This writes to the live ledger.
 #   3. Ideally the pool is quiet, so the ledger is not moving under you.
 #
-# It never deletes and never overwrites: dedup is UNIQUE(share_hash), miner rows are only
-# created when absent. Safe to re-run.
+# It never deletes and never overwrites: dedup is an explicit `shares_all` check plus
+# UNIQUE(share_hash), and miner rows are only created when absent. Safe to re-run.
+#
+# ⛔ OBSOLETE AFTER THE STEP-7 CUTOVER (schema v56).
+#
+# This repairs the LEGACY unpaid ledger, and since v56 that ledger decides nothing: the coinbase
+# is built from the share shard's `owed()`, and `shares` holds a retention window of post-cutover
+# evidence rather than months of unpaid work. Running it now would union eight nodes' live
+# evidence tables and cross-import rows that no node will fold (the fold filters
+# `received_by = self`), achieving nothing except a larger table for retention to churn.
+#
+# It refuses on a v56 node for that reason. Set GHOST_ALLOW_LEGACY_RECONCILE=1 to override —
+# which is only sensible when you are deliberately reconstructing the pre-cutover ledger from
+# backups as part of a rollback.
 #
 # Usage:
 #   ./scripts/reconcile-ledger.sh --dry-run     # report only, write nothing
@@ -57,6 +69,27 @@ MODE="${1:-}"
 if [[ "$MODE" != "--dry-run" && "$MODE" != "--apply" ]]; then
     echo "usage: $0 --dry-run | --apply" >&2
     exit 2
+fi
+
+# The cutover guard. Read from the first node rather than assumed: a rollback may legitimately
+# put a node back on a pre-v56 schema, and the tool is still the right one there.
+if [[ "${GHOST_ALLOW_LEGACY_RECONCILE:-0}" != "1" ]]; then
+    probe=$(ssh -o ConnectTimeout=10 "${NODES[0]}" \
+        "sudo -u ghost sqlite3 -noheader /home/ghost/.ghost/ghost.db 'PRAGMA user_version;'" \
+        2>/dev/null || echo 0)
+    if [[ "${probe:-0}" -ge 56 ]] 2>/dev/null; then
+        cat >&2 <<MSG
+ABORT: ${NODES[0]} is on schema v${probe} — the step-7 cutover has shipped.
+
+The legacy unpaid ledger this script repairs no longer decides what anyone is paid; the share
+shard's owed() builds the coinbase, and \`shares\` now holds only a retention window of
+post-cutover evidence. Unioning that across the fleet imports rows no node will fold.
+
+If you are reconstructing the pre-cutover ledger from backups as part of a rollback, re-run with
+GHOST_ALLOW_LEGACY_RECONCILE=1.
+MSG
+        exit 2
+    fi
 fi
 DRY=""
 [[ "$MODE" == "--dry-run" ]] && DRY="--dry-run"

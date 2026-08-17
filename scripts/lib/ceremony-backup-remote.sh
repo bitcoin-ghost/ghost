@@ -65,8 +65,16 @@ fi
 # --- source facts, read before the copy so they can be compared against it --------------------
 src_uv=$(sudo -u ghost sqlite3 "file:${DB}?mode=ro" "PRAGMA user_version;") || fail "cannot read source user_version"
 src_cp=$(sudo -u ghost sqlite3 "file:${DB}?mode=ro" "select count(*) from payout_ledger_checkpoints;") || fail "cannot count checkpoints"
-src_sh=$(sudo -u ghost sqlite3 "file:${DB}?mode=ro" "select count(*) from shares;") || fail "cannot count shares"
-echo "  source: user_version=${src_uv} checkpoints=${src_cp} shares=${src_sh}"
+# `shares_all` (v56), not `shares`. After the step-7 cutover the live `shares` table holds only a
+# retention window of evidence — often a few thousand rows, sometimes zero — so counting it here
+# would compare 0 against 0 and pass a backup that copied nothing. `shares_all` unions the frozen
+# `shares_archive` back in, which is the row count that actually proves the copy is complete.
+# Falls back to `shares` so this still runs against a pre-v56 database or backup.
+sh_src_table=shares_all
+sudo -u ghost sqlite3 "file:${DB}?mode=ro" "select 1 from shares_all limit 1;" >/dev/null 2>&1 \
+  || sh_src_table=shares
+src_sh=$(sudo -u ghost sqlite3 "file:${DB}?mode=ro" "select count(*) from ${sh_src_table};") || fail "cannot count shares"
+echo "  source: user_version=${src_uv} checkpoints=${src_cp} ${sh_src_table}=${src_sh}"
 
 # --- copy -------------------------------------------------------------------------------------
 # `.backup` is the online backup API: consistent against a running writer, and it copies the whole
@@ -114,14 +122,16 @@ fi
 [[ "$dst_cp" -gt 0 ]] || { sudo rm -f "$DEST"; fail "copy holds no payout checkpoints"; }
 
 # `shares` is the shard's evidence table and the gap-fold's input, so it is one of the tables the
-# ceremony depends on — it was being read and printed but never actually checked.
-dst_sh=$(sudo sqlite3 "file:${DEST}?mode=ro" "select count(*) from shares;") \
+# ceremony depends on — it was being read and printed but never actually checked. Counted through
+# the same table the source was counted through, or the comparison below is between two different
+# questions.
+dst_sh=$(sudo sqlite3 "file:${DEST}?mode=ro" "select count(*) from ${sh_src_table};") \
   || { sudo rm -f "$DEST"; fail "cannot count shares in copy"; }
 if [[ "$dst_sh" -lt "$src_sh" ]]; then
   sudo rm -f "$DEST"
   fail "copy has ${dst_sh} shares, source had ${src_sh} — the copy is short"
 fi
-echo "  verified: user_version=${dst_uv} quick_check=ok checkpoints=${dst_cp} shares=${dst_sh}"
+echo "  verified: user_version=${dst_uv} quick_check=ok checkpoints=${dst_cp} ${sh_src_table}=${dst_sh}"
 
 # --- compress ---------------------------------------------------------------------------------
 # Opening the copy read-only still creates `-wal`/`-shm` beside it (WAL mode does this even for a

@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 55;
+const SCHEMA_VERSION: u32 = 56;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -132,6 +132,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (53, migrate_v53),
         (54, migrate_v54),
         (55, migrate_v55),
+        (56, migrate_v56),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2686,6 +2687,184 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 ///
 /// A node whose DB already said 53 would never have received this table, and settlement there would
 /// have failed for ever with no signal. Append, never amend.
+/// v56: quarantine the legacy share ledger — `SHARE_SHARD_BUILD.md` Stage 5, **step 7**.
+///
+/// `shares` is renamed to `shares_archive` and a fresh, EMPTY `shares` takes its place. From here
+/// on:
+///
+/// | table | who owns it | who writes it | who deletes from it |
+/// |---|---|---|---|
+/// | `shares` | the share shard | ingest (`insert_share_with_proof`) | `shard_fold_epoch` retention, `delete_old_shares` |
+/// | `shares_archive` | nobody — it is frozen | nothing, ever | nothing, ever |
+/// | `shares_all` | a view: `shares UNION ALL shares_archive` | — | — |
+///
+/// **Why the fold's DELETE target does not move.** The build plan warned that
+/// `shard_fold_epoch`'s `DELETE FROM shares` "must move with the rename in the same change, or
+/// evidence stops being collected the moment the table is renamed". That warning assumed the
+/// rename left no `shares` behind. It does leave one: ingest keeps writing to `shares`, the fold
+/// keeps reading and deleting from `shares`, and both now mean *live shard evidence* rather than
+/// *the legacy unpaid ledger*. The requirement is met by construction, and this is the change in
+/// which `owns_evidence` may finally become true — retention can no longer reach a row the legacy
+/// payout path would have paid for, because every such row is in `shares_archive`.
+///
+/// **Why a rename and not a copy.** `INSERT INTO shares_archive SELECT * FROM shares` would
+/// duplicate a multi-GB table inside a startup transaction. ghost-vm1's root filesystem sits at
+/// 90%; a migration that needs 2x the ledger free is a migration that bricks a node. `ALTER TABLE
+/// … RENAME TO` is O(1) and touches no pages.
+///
+/// **Why the archive keeps the `idx_shares_*` index names.** SQLite has no `ALTER INDEX … RENAME`,
+/// so freeing those names for the live table would mean `DROP INDEX` + `CREATE INDEX` — a full
+/// rebuild of four indexes over millions of rows, at process startup, writing hundreds of MB of
+/// WAL on the node that has the least disk. So the archive's indexes stay exactly where the rename
+/// put them (SQLite rewrites their stored DDL to say `ON "shares_archive"` for us) and the live
+/// table's are created under `idx_shares_live_*`. `sqlite_master.tbl_name` is the authority on
+/// which table an index serves; the name is not.
+///
+/// **`AUTOINCREMENT` continuity.** The rename carries the `sqlite_sequence` row with it, so a
+/// fresh `shares` would restart `id` at 1 and collide with the archive across `shares_all` — which
+/// `get_recent_shares` and `get_shares_by_round` return to callers as an identity. The sequence is
+/// seeded from `MAX(shares_archive.id)` so ids stay globally unique across the union.
+///
+/// **Not reversible by another migration, and deliberately so.** Rollback is the pre-deploy
+/// database backup plus the `.bak` binary, exactly as Stage 0 specified. The point of no return
+/// is `DROP TABLE shares_archive`, which this migration does not do and nothing should until v1
+/// has shipped.
+fn migrate_v56(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v56: shares -> shares_archive, fresh `shares`, `shares_all` view");
+
+    // Same guard as v41/v48: a real pool database always has `shares` (v1), but partial-schema
+    // test fixtures do not, and there is nothing to quarantine in a ledger-less database.
+    let has_shares: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shares'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_shares {
+        debug!("v56: no `shares` table — nothing to quarantine");
+        return Ok(());
+    }
+
+    let already_archived: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shares_archive'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !already_archived {
+        // Capture the CURRENT shape before renaming. Read from `sqlite_master` rather than
+        // spelling the DDL out here: `shares` has been `ALTER`ed twice (v34's
+        // `paid_in_proposal_hash`, v41's `proof`) and a hand-written copy would silently drop a
+        // column the next time someone adds one. SQLite rewrites the stored `CREATE TABLE` text
+        // on `ADD COLUMN`, so what comes back is the whole truth.
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='shares'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| GhostError::Migration(format!("v56: cannot read `shares` DDL: {e}")))?;
+
+        // `sql IS NOT NULL` skips the implicit index behind `UNIQUE(share_hash)` — it has no DDL
+        // of its own and re-creating the table from `table_sql` re-creates it.
+        let index_sqls: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                      WHERE type='index' AND tbl_name='shares' AND sql IS NOT NULL
+                      ORDER BY name",
+                )
+                .map_err(|e| GhostError::Migration(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| GhostError::Migration(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| GhostError::Migration(e.to_string()))?);
+            }
+            out
+        };
+
+        conn.execute_batch("ALTER TABLE shares RENAME TO shares_archive;")
+            .map_err(|e| GhostError::Migration(format!("v56: rename failed: {e}")))?;
+
+        // The live table, byte-identical in shape to the one just archived.
+        conn.execute_batch(&table_sql)
+            .map_err(|e| GhostError::Migration(format!("v56: cannot re-create `shares`: {e}")))?;
+
+        for (name, sql) in &index_sqls {
+            let live_name = match name.strip_prefix("idx_shares_") {
+                Some(rest) => format!("idx_shares_live_{rest}"),
+                None => format!("live_{name}"),
+            };
+            // The captured SQL still reads `ON shares(…)` — it was read before the rename. The
+            // only edit needed is the index's own name, which is the first occurrence of `name`
+            // in `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON …`.
+            let live_sql = sql.replacen(name.as_str(), &live_name, 1);
+            conn.execute_batch(&live_sql).map_err(|e| {
+                GhostError::Migration(format!("v56: cannot create `{live_name}`: {e}"))
+            })?;
+        }
+
+        // Continue `id` past the archive so the two arms of `shares_all` never collide.
+        conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq)
+             SELECT 'shares', COALESCE(MAX(id), 0) FROM shares_archive
+              WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'shares')",
+            [],
+        )
+        .map_err(|e| GhostError::Migration(format!("v56: cannot seed the id sequence: {e}")))?;
+
+        let archived: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares_archive", [], |r| r.get(0))
+            .unwrap_or(-1);
+        info!(
+            archived_rows = archived,
+            live_indexes = index_sqls.len(),
+            "v56: `shares` quarantined as `shares_archive`; a fresh `shares` is now the shard's \
+             evidence table"
+        );
+    } else {
+        debug!("v56: `shares_archive` already exists — re-asserting the view only");
+    }
+
+    // Built from the live table's actual columns so the two arms of the union line up by
+    // construction. `DROP` first rather than `CREATE … IF NOT EXISTS`: a re-run after a column is
+    // added should replace a stale view, not skip past it.
+    let columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('shares') ORDER BY cid")
+            .map_err(|e| GhostError::Migration(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| GhostError::Migration(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| GhostError::Migration(e.to_string()))?);
+        }
+        out
+    };
+    if columns.is_empty() {
+        return Err(GhostError::Migration(
+            "v56: `shares` has no columns after the rename".into(),
+        ));
+    }
+    let cols = columns.join(", ");
+    conn.execute_batch(&format!(
+        "DROP VIEW IF EXISTS shares_all;
+         CREATE VIEW shares_all AS
+             SELECT {cols} FROM shares
+             UNION ALL
+             SELECT {cols} FROM shares_archive;"
+    ))
+    .map_err(|e| GhostError::Migration(format!("v56: cannot create `shares_all`: {e}")))?;
+
+    Ok(())
+}
+
 /// v55: index the gossip relay's pending-summary lookup.
 ///
 /// `shard_epochs`'s primary key is `(epoch, node_id)`, so
@@ -2924,6 +3103,12 @@ mod tests {
     /// The v48 index is only worth its ~126 MB if the planner actually chooses it for the
     /// unpaid-ledger aggregate. Assert the plan, not just that the index exists — an index
     /// the optimiser ignores is pure cost, and this one exists to stop a 55 s query.
+    ///
+    /// The name asserted is `idx_shares_live_unpaid_cover`, not `idx_shares_unpaid_cover`: v56
+    /// re-created the index on the fresh live `shares` under the `idx_shares_live_*` prefix, and
+    /// left the original name attached to `shares_archive` (SQLite cannot rename an index, and
+    /// rebuilding this one over the archive at startup is what v56 exists to avoid). The unpaid
+    /// scan reads the LIVE table, so the live index is the one that has to be chosen.
     #[test]
     fn v48_covering_index_is_used_by_the_unpaid_ledger_scan() {
         let conn = Connection::open_in_memory().expect("conn");
@@ -2945,7 +3130,7 @@ mod tests {
             .join(" | ");
 
         assert!(
-            plan.contains("idx_shares_unpaid_cover"),
+            plan.contains("idx_shares_live_unpaid_cover"),
             "planner did not choose the covering index; plan was: {plan}"
         );
     }
@@ -3984,5 +4169,303 @@ mod tests {
         run_migrations(&conn).expect("v53 must apply on a v52 database");
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         check_shape(&conn, "after migrating a v52 database");
+    }
+
+    // ---- v56: quarantine the legacy share ledger -------------------------------------------
+
+    /// The shape `shares` had at v55, written out rather than derived, so that a column added
+    /// later trips `v56_live_table_matches_the_real_schema` instead of silently changing what
+    /// this fixture means.
+    const V55_SHARES_DDL: &str = "CREATE TABLE shares (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            miner_id TEXT NOT NULL,
+            difficulty REAL NOT NULL,
+            work REAL NOT NULL,
+            share_hash TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            received_by TEXT NOT NULL,
+            valid INTEGER NOT NULL DEFAULT 1,
+            paid_in_proposal_hash BLOB,
+            proof BLOB,
+            UNIQUE(share_hash)
+         );
+         CREATE INDEX idx_shares_round ON shares(round_id);
+         CREATE INDEX idx_shares_timestamp ON shares(timestamp);
+         CREATE INDEX idx_shares_unpaid_cover ON shares(miner_id, timestamp, valid, work)
+             WHERE paid_in_proposal_hash IS NULL;";
+
+    /// A v55-shaped database holding `n` shares, timestamps 1000, 1001, …
+    fn v55_ledger(n: usize) -> Connection {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(V55_SHARES_DDL).expect("v55 fixture");
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO shares
+                    (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+                 VALUES (1, 'bc1qold.rig', 1.0, 2.0, ?1, ?2, 'node', 1)",
+                params![format!("{i:064x}"), 1000i64 + i as i64],
+            )
+            .expect("seed");
+        }
+        set_schema_version(&conn, 55).expect("stamp v55");
+        conn
+    }
+
+    fn table_of_index(conn: &Connection, index: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?1",
+            params![index],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// The whole point of step 7: history is QUARANTINED, not destroyed. Every row that was in
+    /// `shares` must still be readable afterwards, and `shares` itself must come back empty so
+    /// the shard's retention has nothing of the legacy ledger's to delete.
+    #[test]
+    fn v56_moves_history_to_the_archive_and_leaves_shares_empty() {
+        let conn = v55_ledger(5);
+        migrate_v56(&conn).expect("v56");
+
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+            .expect("live count");
+        let archived: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares_archive", [], |r| r.get(0))
+            .expect("archive count");
+        let all: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares_all", [], |r| r.get(0))
+            .expect("view count");
+
+        assert_eq!(live, 0, "the live evidence table must start empty");
+        assert_eq!(archived, 5, "not one historical share may be lost");
+        assert_eq!(all, 5, "`shares_all` must see the archive");
+
+        // The view is a view. If a future change makes it a table, every read below starts
+        // returning a stale copy instead of the union.
+        let kind: String = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name='shares_all'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("shares_all must exist");
+        assert_eq!(kind, "view");
+    }
+
+    /// `shares_all` hands `id` back to callers (`get_recent_shares`, `get_shares_by_round`) as an
+    /// identity. `ALTER TABLE … RENAME` carries the `sqlite_sequence` row to the archive, so a
+    /// fresh `shares` would restart at 1 and every early live share would collide with an
+    /// archived one across the union.
+    #[test]
+    fn v56_continues_share_ids_past_the_archive() {
+        let conn = v55_ledger(5);
+        migrate_v56(&conn).expect("v56");
+
+        conn.execute(
+            "INSERT INTO shares
+                (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+             VALUES (2, 'bc1qnew.rig', 1.0, 2.0, 'ff', 2000, 'node', 1)",
+            [],
+        )
+        .expect("insert a post-cutover share");
+
+        let new_id: i64 = conn
+            .query_row("SELECT id FROM shares", [], |r| r.get(0))
+            .expect("id");
+        assert_eq!(
+            new_id, 6,
+            "the live sequence must continue past the archive"
+        );
+
+        let distinct: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT id) FROM shares_all", [], |r| {
+                r.get(0)
+            })
+            .expect("distinct");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares_all", [], |r| r.get(0))
+            .expect("total");
+        assert_eq!(distinct, total, "ids must be unique across the union");
+    }
+
+    /// The archive keeps the `idx_shares_*` names and the live table gets `idx_shares_live_*`,
+    /// because SQLite cannot rename an index and rebuilding the archive's at startup is exactly
+    /// what v56 refuses to do (ghost-vm1's root filesystem is at 90%). This test pins WHICH
+    /// table each name serves, since the names themselves no longer say.
+    #[test]
+    fn v56_leaves_the_archive_indexed_and_indexes_the_live_table_separately() {
+        let conn = v55_ledger(1);
+        migrate_v56(&conn).expect("v56");
+
+        for archived in [
+            "idx_shares_round",
+            "idx_shares_timestamp",
+            "idx_shares_unpaid_cover",
+        ] {
+            assert_eq!(
+                table_of_index(&conn, archived).as_deref(),
+                Some("shares_archive"),
+                "{archived} must still serve the archive — dropping it makes every `shares_all` \
+                 read a full scan of the largest table in the database"
+            );
+        }
+        for live in [
+            "idx_shares_live_round",
+            "idx_shares_live_timestamp",
+            "idx_shares_live_unpaid_cover",
+        ] {
+            assert_eq!(
+                table_of_index(&conn, live).as_deref(),
+                Some("shares"),
+                "{live} must serve the live table"
+            );
+        }
+    }
+
+    /// A read through `shares_all` must use an index on BOTH arms. The dashboard's leaderboard
+    /// and hashrate queries run on every page load; a plan that scans `shares_archive` turns
+    /// each of them into a walk over the entire pre-cutover ledger.
+    #[test]
+    fn v56_view_pushes_predicates_into_both_arms() {
+        let conn = v55_ledger(1);
+        migrate_v56(&conn).expect("v56");
+
+        let plan: String = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COALESCE(SUM(work), 0.0) FROM shares_all
+                  WHERE timestamp >= 1 AND valid = 1 AND received_by = 'node'",
+            )
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(3))
+            .expect("plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows")
+            .join(" | ");
+
+        assert!(
+            plan.contains("idx_shares_live_timestamp"),
+            "the live arm must use its timestamp index; plan was: {plan}"
+        );
+        assert!(
+            plan.contains("idx_shares_timestamp"),
+            "the archive arm must use its timestamp index; plan was: {plan}"
+        );
+    }
+
+    /// The unpaid ledger reads the LIVE table, so after v56 it sees hours instead of months.
+    /// That collapse IS the cutover — the shard's `owed()` is what pays now — and it is pinned
+    /// here so that "the leaderboard went to zero, let's point the unpaid query at the view too"
+    /// fails a test instead of quietly reviving a second answer to who is owed what.
+    #[test]
+    fn v56_collapses_the_unpaid_ledger_while_history_stays_readable() {
+        let conn = v55_ledger(5);
+        migrate_v56(&conn).expect("v56");
+
+        let unpaid_live: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(work), 0.0) FROM shares
+                  WHERE paid_in_proposal_hash IS NULL AND valid = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("live unpaid");
+        assert_eq!(
+            unpaid_live, 0.0,
+            "the legacy unpaid ledger must not carry pre-cutover work forward"
+        );
+
+        let lifetime: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(work), 0.0) FROM shares_all WHERE valid = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("lifetime");
+        assert_eq!(
+            lifetime, 10.0,
+            "a miner's lifetime work must survive the deploy — this is what the dashboard reads"
+        );
+    }
+
+    /// Re-running v56 must be harmless. Migrations are applied inside a transaction and the
+    /// version is stamped on commit, but a node that crashed mid-deploy, or an operator running
+    /// the function by hand, must not end up with the archive archived twice.
+    #[test]
+    fn v56_is_idempotent() {
+        let conn = v55_ledger(3);
+        migrate_v56(&conn).expect("v56");
+        migrate_v56(&conn).expect("v56 must be idempotent");
+        migrate_v56(&conn).expect("v56 must be idempotent twice");
+
+        let archived: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares_archive", [], |r| r.get(0))
+            .expect("archive count");
+        assert_eq!(
+            archived, 3,
+            "a re-run must not re-archive or duplicate rows"
+        );
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+            .expect("live count");
+        assert_eq!(
+            live, 0,
+            "a re-run must not move live evidence into the archive"
+        );
+    }
+
+    /// A partial-schema fixture has no `shares`, and v56 must skip rather than fail — the same
+    /// guard v41 and v48 carry, for the same reason.
+    #[test]
+    fn v56_skips_a_database_with_no_share_ledger() {
+        let conn = Connection::open_in_memory().expect("conn");
+        migrate_v56(&conn).expect("v56 must tolerate a ledger-less database");
+        assert!(
+            table_of_index(&conn, "idx_shares_live_round").is_none(),
+            "nothing may be created where there was no ledger"
+        );
+    }
+
+    /// The fixture above is hand-written, so it can drift from what v1..v55 actually build.
+    /// This is the test that notices: it runs the REAL chain and asserts the live table came out
+    /// with the columns the query layer reads.
+    #[test]
+    fn v56_live_table_matches_the_real_schema() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let live = get_column_names(&conn, "shares");
+        let archive = get_column_names(&conn, "shares_archive");
+        assert_eq!(
+            live, archive,
+            "the two arms of `shares_all` must have identical columns, in the same order"
+        );
+        for col in [
+            "id",
+            "round_id",
+            "miner_id",
+            "difficulty",
+            "work",
+            "share_hash",
+            "timestamp",
+            "received_by",
+            "valid",
+            "paid_in_proposal_hash",
+            "proof",
+        ] {
+            assert!(
+                live.iter().any(|c| c == col),
+                "the live `shares` is missing `{col}`; found {live:?}"
+            );
+        }
+        assert!(
+            live.len() == 11,
+            "a column was added to `shares` — update V55_SHARES_DDL so the v56 fixtures still \
+             mean what they read as; found {live:?}"
+        );
     }
 }

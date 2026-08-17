@@ -41,7 +41,8 @@
 # Usage:
 #   scripts/shard-verify-fold.sh <node>            # e.g. ghost-vm5
 #
-# Exit codes: 0 balances agree exactly, 1 usage/precondition, 2 MISMATCH, 3 node unreadable.
+# Exit codes: 0 balances agree exactly, 1 usage/precondition (including "the evidence has been
+# reaped, so this cannot be checked here" — see the v56 note below), 2 MISMATCH, 3 node unreadable.
 
 set -uo pipefail
 
@@ -51,6 +52,9 @@ NODE="${1:-}"
 DB="/home/ghost/.ghost/ghost.db"
 EPOCH_BLOCKS=6
 NETWORK_TIER_LOG2=10
+# Must match ghost_common::share_shard::RETENTION_EPOCHS. Folding epoch M deletes the evidence of
+# epoch M - RETENTION_EPOCHS, so raw rows exist only for [M - RETENTION_EPOCHS + 1, M].
+RETENTION_EPOCHS=6
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
@@ -100,6 +104,16 @@ fi
 
 echo "  own column: ${received_by}  folded epochs: $(echo "$epochs" | tr ',' ' ' | wc -w)"
 
+# Schema v56 is the step-7 cutover, and it is the version at which this check stops being able to
+# see the whole story: from there the shard OWNS `shares` and reaps each epoch's evidence
+# RETENTION_EPOCHS later. The counters stay CUMULATIVE, so re-deriving them from rows that have
+# been deleted under-counts and looks exactly like a fold bug. Read the version now and use it
+# below to tell "the fold is wrong" apart from "the evidence is gone by design" — reporting the
+# second as the first is the wolf-crying this script's own header warns about.
+schema_v=$(timeout 60 ssh -o BatchMode=yes "$NODE" \
+  "sudo -u ghost sqlite3 -noheader \"file:${DB}?mode=ro\" 'PRAGMA user_version;'" 2>/dev/null) || schema_v=0
+schema_v="${schema_v:-0}"
+
 # Height range covered by the folded epochs.
 lo=$(echo "$epochs" | tr ',' '\n' | sort -n | head -1)
 hi=$(echo "$epochs" | tr ',' '\n' | sort -n | tail -1)
@@ -136,6 +150,7 @@ if [[ ! -s "$WORK/raw" ]]; then
 fi
 
 FOLDED_EPOCHS="$epochs" EPOCH_BLOCKS="$EPOCH_BLOCKS" TIER="$NETWORK_TIER_LOG2" \
+SCHEMA_V="$schema_v" RETENTION_EPOCHS="$RETENTION_EPOCHS" \
 python3 - "$WORK/raw" "$WORK/persisted" <<'PY'
 import math, os, sys
 from collections import defaultdict
@@ -203,6 +218,24 @@ print(f"  persisted   : {len(persisted)} addresses, total {sum(persisted):,}")
 if independent == persisted:
     print("\n  ✅ EXACT MATCH — the shard's own arithmetic is independently confirmed")
     sys.exit(0)
+
+# Before calling a mismatch a fold bug, rule out the one cause that is not one: since v56 the
+# shard deletes each epoch's evidence RETENTION_EPOCHS after folding it, while `shard_counters`
+# stays cumulative. If the folded range reaches further back than the retained window, the raw
+# side is re-deriving from rows that no longer exist and MUST come out short. Say so, and exit 1
+# (precondition) rather than 2 (mismatch) — a verifier that reports a designed deletion as a money
+# bug is worse than one that admits it cannot see.
+schema_v = int(os.environ.get("SCHEMA_V") or 0)
+retention = int(os.environ.get("RETENTION_EPOCHS") or 0)
+if schema_v >= 56 and folded and min(folded) < max(folded) - retention + 1:
+    print("\n  ⚠ UNVERIFIABLE — not a mismatch")
+    print(f"     independent: {sum(independent):,}   persisted: {sum(persisted):,}")
+    print(f"     schema v{schema_v} means retention is armed (owns_evidence = true). Evidence for")
+    print(f"     epochs at or below {max(folded) - retention} has been deleted by design, but")
+    print("     `shard_counters` is cumulative, so this re-derivation cannot reach the whole column.")
+    print("     Run this against a PRE-CUTOVER database backup (Stage 0 took one per node) — that")
+    print("     is where the Stage 4 gate was satisfied and where the full range is still readable.")
+    sys.exit(1)
 
 print("\n  ❌ MISMATCH")
 print(f"     independent: {independent}")
