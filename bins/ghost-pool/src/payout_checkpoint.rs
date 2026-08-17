@@ -910,6 +910,40 @@ impl PayoutCheckpointManager {
             reported_node_shares,
         };
         vote.signature = self.identity.sign(&vote.signing_message());
+
+        // Record our OWN report locally before broadcasting it (#646).
+        //
+        // A node never receives its own gossip, so `on_vote` — which is what files a report —
+        // only ever runs for PEERS. Our own approval was already recorded by both callers
+        // (`approvers.insert(me)`), but our own recomputation was built here, broadcast, and then
+        // forgotten. So every node's tally was missing exactly one report: its own.
+        //
+        // That is #646 in full. `approvals` reached 7 of 8 reliably while `reporting` sat at 5
+        // against `needed=6`, so ~80% of heights refused to finalise and re-proposed — the load
+        // described in #554, and ~6,400 WARN lines/day/node of #582. On vm1, 67 of 67 warnings in
+        // 12 hours named `approved_but_silent=fb71fee8`, which is vm1 itself.
+        //
+        // Counting it is what the design already says happens: "the per-address lower median of
+        // what the in-set approvers actually recomputed. The proposer's own report is one of them
+        // and carries no extra weight." It is one report among the median's inputs, keyed by node
+        // id like any other, and `maybe_finalize` still counts only reports from in-set voters.
+        if !vote.reported_miner_work.is_empty() || !vote.reported_node_shares.is_empty() {
+            let mut pending = self.pending.write();
+            let slot = pending
+                .entry(height)
+                .or_insert_with(Pending::new)
+                .entry(checkpoint_hash);
+            // Keyed by voter, exactly as `on_vote` does, so re-voting replaces rather than
+            // double-weights.
+            slot.reports.insert(
+                self.identity.node_id(),
+                (
+                    vote.reported_miner_work.clone(),
+                    vote.reported_node_shares.clone(),
+                ),
+            );
+        }
+
         self.broadcast(MessageType::PayoutLedgerCheckpointVote, &vote);
     }
 
@@ -2043,6 +2077,63 @@ mod tests {
             n.db.get_latest_payout_ledger_checkpoint()
                 .unwrap()
                 .expect("finalises despite one abstainer");
+        }
+    }
+
+    /// A node's OWN recomputation must count toward the median quorum (#646).
+    ///
+    /// `on_vote` is what files a report, and a node never receives its own gossip — so before the
+    /// fix only PEERS' reports were ever counted, while the node's own approval WAS counted by
+    /// `approvers.insert(me)`. Every tally was therefore short by exactly one: its own.
+    ///
+    /// On mainnet that was the whole of #646. `approvals` reached 7 of 8 reliably while
+    /// `reporting` sat at 5 against `needed=6`, so ~80% of heights refused to finalise and
+    /// re-proposed — the load in #554 and ~6,400 WARN lines/day/node in #582. Over 12 hours on
+    /// vm1, 67 of 67 warnings named `approved_but_silent=fb71fee8`, which is vm1 itself.
+    ///
+    /// The fixture puts peer reports exactly one short, as the fleet was: three voters approve
+    /// (needed=3) but only two PEERS can report, so the height finalises only if the node counts
+    /// its own.
+    #[tokio::test]
+    async fn a_nodes_own_report_counts_toward_the_median_quorum() {
+        // At/above the gate, so the median path (and its reporting quorum) is the one under test.
+        const H_MED: u64 = crate::PAYOUT_MEDIAN_ADOPTION_HEIGHT;
+        assert!(
+            crate::adopts_payout_median(H_MED),
+            "fixture must sit at/above the median gate or it tests the pre-#606 path"
+        );
+        assert_eq!(H_MED % 4, 0, "proposer selection expects sorted-elder[0]");
+
+        // Build the root AT this height: `cp()` hardcodes H, and the verifier recomputes the
+        // root from the proposal's own height, so a mismatched fixture is rejected before the
+        // reporting quorum is ever reached.
+        let a = {
+            let miner_payouts = vec![("bc1qaaa".to_string(), 1_000_000_000_000_000u128)];
+            let node_shares = node_set();
+            let root =
+                crate::payout::compute_ledger_root(&miner_payouts, &node_shares, CUTOFF, H_MED);
+            CanonicalPayout {
+                miner_payouts,
+                node_shares,
+                root,
+            }
+        };
+        // Three voters with a payout, one abstainer that can neither approve nor report — so at
+        // most TWO peers can ever report to any given node, against needed=3.
+        let nodes = build(4, &[Some(a.clone()), Some(a.clone()), Some(a), None]);
+        assert_eq!(quorum_for(4), 3, "67% of 4 = 3");
+
+        for n in &nodes {
+            n.mgr.maybe_propose(H_MED, CUTOFF).await;
+        }
+        gossip_until_quiet(&nodes).await;
+
+        for n in nodes.iter().take(3) {
+            n.db.get_latest_payout_ledger_checkpoint().unwrap().expect(
+                "#646: only two PEERS can report here, so this height finalises only if a \
+                     node counts its own recomputation — without that, reporting=2 < needed=3 \
+                     and the fleet stalls exactly as mainnet did",
+            );
         }
     }
 
