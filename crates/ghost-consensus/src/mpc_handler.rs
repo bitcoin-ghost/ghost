@@ -878,30 +878,11 @@ impl MpcHandler {
             broadcaster(MessageType::MpcVerificationVote, payload)?;
         }
 
-        // ⚠ The REASON is logged, not just the verdict.
-        //
-        // A rejection stops a contributor becoming an elder, and without three elders no payout
-        // proposal can ratify — so a silent `approve=false` halts the whole ceremony with nothing
-        // in the log to say why. Found on the regtest cluster 2026-08-16: every position-2
-        // contribution was rejected and the only way to tell "malformed proof" from "failed
-        // cryptographic verification" was to patch this line and rebuild.
-        //
-        // Rejections are deterministic (every node sees the same signed payload), so this cannot
-        // become per-node noise; an abstain is the non-deterministic case and warns separately.
-        match (approve, vote_msg.rejection_reason.as_deref()) {
-            (true, _) => info!(
-                position = msg.elder_position,
-                approve = true,
-                "Cast MPC verification vote"
-            ),
-            (false, reason) => warn!(
-                position = msg.elder_position,
-                approve = false,
-                reason = reason.unwrap_or("unspecified"),
-                candidate = %hex::encode(&msg.candidate[..8]),
-                "Cast MPC verification vote — REJECTED (blocks this contributor from becoming an elder)"
-            ),
-        }
+        info!(
+            position = msg.elder_position,
+            approve = approve,
+            "Cast MPC verification vote"
+        );
 
         // CRITICAL: Also count our own vote locally and check threshold.
         let contribution_hash = msg.contribution_hash();

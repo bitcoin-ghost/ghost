@@ -857,15 +857,6 @@ pub struct BlockFoundData {
     pub node_shares: Vec<(NodeId, i32)>,
     /// Current treasury state (for decay calculation)
     pub treasury_state: TreasuryState,
-
-    /// Stage 5 step 6: the shard's `owed()` balances, when the shard is authoritative.
-    ///
-    /// `None` keeps the legacy unpaid-ledger path, which is what every node runs until the
-    /// coinbase source is flipped. Passing it here rather than reaching for the shard inside
-    /// `create_proposal` keeps the proposal builder a pure function of its input — the money
-    /// decision is made by the caller that knows whether this node has been cut over, and is
-    /// visible in the type rather than hidden behind a global.
-    pub shard_owed: Option<std::collections::BTreeMap<String, i64>>,
 }
 
 /// Data for solo mining mode block found event
@@ -1026,64 +1017,8 @@ impl PayoutProposalCreator {
 
         // Calculate miner payouts (99% of subsidy, proportional to work)
         // Dust from miners below threshold is returned for redistribution to node pool
-        //
-        // ── Stage 5 step 6: where the money actually changes hands ──────────────────────────
-        //
-        // This is the ONLY substitution the cutover makes. `data.miner_work` is the legacy
-        // unpaid-ledger scan; `shard_owed` is the shard's `owed()`. Everything downstream —
-        // node payouts, the dust roll-in, treasury, the 99/1 split, the coinbase commitment and
-        // GHOST-02 recompute-reject — is byte-for-byte the same code on both paths.
-        //
-        // Keeping the substitution this narrow is deliberate. The commitment and its
-        // verification are the security-critical half, and a parallel constructor for them
-        // would be a second spelling of the thing that decides what a block pays.
-        //
-        // `shard_miner_payouts` mirrors `calculate_miner_payouts` exactly — same descending sort
-        // with ascending tie-break, same truncation, same dust floor — so the two differ only in
-        // WHICH balances they distribute, never in HOW.
-        let (miner_payouts, miner_dust) = match data.shard_owed.as_ref() {
-            Some(owed) => {
-                let mp = ghost_common::share_shard::shard_miner_payouts(
-                    owed,
-                    fee_dist.miner_pool,
-                    ghost_common::constants::MAX_MINER_OUTPUTS,
-                    LEDGER_DUST_SATS,
-                );
-                info!(
-                    source = "shard",
-                    payees = mp.payouts.len(),
-                    dust_sats = mp.dust_sats,
-                    remainder_sats = mp.remainder_sats,
-                    "coinbase: miner payouts from the SHARD"
-                );
-                // `recipient_id` is derived from the ADDRESS here, not from a miner_id, because
-                // the shard groups by payout address and has no miner_id to hash — that is the
-                // whole point of address grouping. It is an identifier carried alongside the
-                // payout, not an input to the coinbase: `from_proposal` hashes only address and
-                // amount, so this cannot change what a block pays.
-                let entries: Vec<PayoutEntry> = mp
-                    .payouts
-                    .iter()
-                    .map(|(addr, sats)| {
-                        let mut recipient_id = [0u8; 32];
-                        recipient_id.copy_from_slice(&ghost_common::identity::hash_message(
-                            addr.as_bytes(),
-                        ));
-                        PayoutEntry {
-                            address: addr.as_bytes().to_vec(),
-                            amount: *sats,
-                            recipient_id,
-                            payout_type: PayoutType::Mining,
-                        }
-                    })
-                    .collect();
-                // The remainder is floor-division leftover. It joins dust in the node pool for
-                // the same reason dust does: a satoshi that is tracked and re-homed is not lost,
-                // and silently dropping it is how a pool leaks money slowly.
-                (entries, mp.dust_sats.saturating_add(mp.remainder_sats))
-            }
-            None => self.calculate_miner_payouts(&data.miner_work, fee_dist.miner_pool)?,
-        };
+        let (miner_payouts, miner_dust) =
+            self.calculate_miner_payouts(&data.miner_work, fee_dist.miner_pool)?;
 
         // Add miner dust to node reward pool - no satoshis are lost!
         let augmented_node_pool = fee_dist.node_reward_pool.saturating_add(miner_dust);
@@ -3049,7 +2984,6 @@ mod tests {
 
         creator
             .create_proposal(BlockFoundData {
-                shard_owed: None,
                 round_id: LEDGER_ROUNDS,
                 ledger_cutoff_ts: cutoff_ts,
                 block_hash: [7u8; 32],
@@ -3093,7 +3027,6 @@ mod tests {
 
         let proposal = creator
             .create_proposal(BlockFoundData {
-                shard_owed: None,
                 round_id: LEDGER_ROUNDS,
                 ledger_cutoff_ts: cutoff_ts,
                 block_hash: [7u8; 32],
@@ -3391,7 +3324,6 @@ mod tests {
     #[test]
     fn test_block_found_data() {
         let data = BlockFoundData {
-            shard_owed: None,
             round_id: 1,
             ledger_cutoff_ts: 1_800_000_000,
             block_hash: [0u8; 32],
@@ -3428,7 +3360,6 @@ mod tests {
         );
 
         let data = BlockFoundData {
-            shard_owed: None,
             round_id: 1,
             ledger_cutoff_ts: now.timestamp(),
             block_hash: [0u8; 32],

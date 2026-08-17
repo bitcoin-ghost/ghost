@@ -543,7 +543,6 @@ fn test_pool_config_validate_success() {
         share_shard: false,
         // Stage 5 genesis ceremony: dark until the operator runs it deliberately.
         shard_arm_genesis: false,
-        shard_coinbase: false,
         node_payout_address: None,
         pool_name: None,
         coinbase_extra: None,

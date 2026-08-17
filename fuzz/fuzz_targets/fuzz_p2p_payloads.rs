@@ -54,6 +54,10 @@ fuzz_target!(|data: &[u8]| {
     // Byzantine evidence
     let _ = serde_json::from_slice::<EquivocationProofMessage>(data);
 
+    // ZK consensus
+    let _ = serde_json::from_slice::<ZkBlockProposalMessage>(data);
+    let _ = serde_json::from_slice::<ZkVoteMessage>(data);
+
     // MPC ceremony
     let _ = serde_json::from_slice::<MpcContributionMessage>(data);
     let _ = serde_json::from_slice::<MpcVerificationVoteMessage>(data);

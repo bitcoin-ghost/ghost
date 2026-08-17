@@ -221,6 +221,8 @@ impl MessageEnvelope {
 pub enum MessageType {
     /// Share proof propagation
     ShareProof,
+    /// Block found announcement
+    BlockFound,
     /// Payout proposal
     PayoutProposal,
     /// Vote on proposal
@@ -229,8 +231,14 @@ pub enum MessageType {
     HealthPing,
     /// Peer discovery
     Discovery,
+    /// Elder status update
+    ElderUpdate,
     /// Share convergence request
     ShareConvergence,
+    /// ZK block proposal (includes proof)
+    ZkBlockProposal,
+    /// ZK vote on block validity
+    ZkVote,
     /// Capability verification result
     VerificationResult,
     /// Challenge-ledger convergence request/response (backfill of signed
@@ -239,6 +247,12 @@ pub enum MessageType {
     ChallengeConvergence,
     /// P2P-H3: Equivocation proof broadcast for Byzantine behavior evidence
     EquivocationProof,
+    /// P2P-C1: Elder registration proposal (new elder candidate)
+    ElderRegistrationProposal,
+    /// P2P-C2: Elder list proposal (proposed canonical list for new epoch)
+    ElderListProposal,
+    /// P2P-C3: Elder list approval (vote for proposed list)
+    ElderListApproval,
     /// MPC-C1: MPC contribution (new elder's contribution to ceremony)
     MpcContribution,
     /// MPC-C2: MPC verification vote (elder's vote on contribution)
@@ -364,14 +378,21 @@ impl MessageType {
     pub fn topic(&self) -> &[u8] {
         match self {
             Self::ShareProof => topics::SHARE,
+            Self::BlockFound => topics::BLOCK,
             Self::PayoutProposal => topics::PAYOUT_PROPOSAL,
             Self::Vote => topics::VOTE,
             Self::HealthPing => topics::HEALTH,
             Self::Discovery => topics::DISCOVERY,
+            Self::ElderUpdate => topics::ELDER,
             Self::ShareConvergence => topics::SHARE,
+            Self::ZkBlockProposal => topics::ZK_PROPOSAL,
+            Self::ZkVote => topics::ZK_VOTE,
             Self::VerificationResult => topics::VERIFICATION,
             Self::ChallengeConvergence => topics::VERIFICATION,
             Self::EquivocationProof => topics::EQUIVOCATION,
+            Self::ElderRegistrationProposal => topics::ELDER,
+            Self::ElderListProposal => topics::ELDER,
+            Self::ElderListApproval => topics::ELDER,
             Self::MpcContribution => topics::MPC,
             Self::MpcVerificationVote => topics::MPC,
             Self::MpcParametersRequest => topics::MPC,
@@ -411,12 +432,19 @@ impl MessageType {
     pub fn topic_str(&self) -> &'static str {
         match self {
             Self::ShareProof | Self::ShareConvergence => "share",
+            Self::BlockFound => "block",
             Self::PayoutProposal => "payout",
             Self::Vote => "vote",
             Self::HealthPing => "health",
             Self::Discovery => "discovery",
+            Self::ElderUpdate => "elder",
+            Self::ZkBlockProposal => "zkproposal",
+            Self::ZkVote => "zkvote",
             Self::VerificationResult | Self::ChallengeConvergence => "verify",
             Self::EquivocationProof => "equivoc",
+            Self::ElderRegistrationProposal => "elder",
+            Self::ElderListProposal => "elder",
+            Self::ElderListApproval => "elder",
             Self::MpcContribution => "mpc",
             Self::MpcVerificationVote => "mpc",
             Self::MpcParametersRequest => "mpc",
@@ -658,6 +686,106 @@ impl VerificationResultMessage {
 // =============================================================================
 // ZK-BFT Message Types
 // =============================================================================
+
+/// ZK Block Proposal - includes the block data and validity proof
+///
+/// Proposers generate this every 10 seconds. The proof demonstrates
+/// that all transactions in the block are valid without validators
+/// needing to re-execute them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZkBlockProposalMessage {
+    /// L2 block height
+    pub height: u64,
+    /// Previous state root (merkle root of balances before block)
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub prev_state_root: [u8; 32],
+    /// New state root (merkle root of balances after block)
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub new_state_root: [u8; 32],
+    /// Number of transactions in the block
+    pub tx_count: u32,
+    /// Hash of the block transactions (for reference)
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub transactions_hash: [u8; 32],
+    /// Serialized block transactions (can be empty if not broadcasting full block)
+    pub transactions: Vec<u8>,
+    /// ZK validity proof bytes
+    pub proof: Vec<u8>,
+    /// Proposer's signature on the proposal
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub proposer_signature: [u8; 64],
+    /// Timestamp of proposal
+    pub timestamp: u64,
+}
+
+impl ZkBlockProposalMessage {
+    /// Compute the proposal hash (used for voting)
+    pub fn proposal_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"ZkBlockProposal/v1");
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.prev_state_root);
+        hasher.update(self.new_state_root);
+        hasher.update(self.tx_count.to_le_bytes());
+        hasher.update(self.transactions_hash);
+        hasher.finalize().into()
+    }
+}
+
+/// ZK Vote - validator's vote on a ZK block proposal
+///
+/// Validators verify the ZK proof (~10ms) and vote to approve or reject.
+/// Once 67% of validators approve, the block is finalized and the proof
+/// is discarded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZkVoteMessage {
+    /// Block height being voted on
+    pub height: u64,
+    /// Proposal hash (computed from ZkBlockProposalMessage)
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub proposal_hash: [u8; 32],
+    /// Vote (true = approve, false = reject)
+    pub approve: bool,
+    /// Rejection reason (if any)
+    pub rejection_reason: Option<ZkRejectionReason>,
+    /// Voter's signature on (height || proposal_hash || approve)
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+    /// Timestamp of vote
+    pub timestamp: u64,
+}
+
+impl ZkVoteMessage {
+    /// Create a new ZK vote
+    pub fn new(
+        height: u64,
+        proposal_hash: [u8; 32],
+        approve: bool,
+        rejection_reason: Option<ZkRejectionReason>,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            height,
+            proposal_hash,
+            approve,
+            rejection_reason,
+            signature,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        }
+    }
+
+    /// Get the message that was signed
+    pub fn signing_message(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"ZkVote/v1");
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.proposal_hash);
+        hasher.update([if self.approve { 1u8 } else { 0u8 }]);
+        hasher.finalize().into()
+    }
+}
 
 /// Reason for rejecting a ZK block proposal
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2355,24 +2483,6 @@ impl ShardSampleResponseMessage {
 
 #[cfg(test)]
 mod tests {
-    /// `MessageType` goes on the wire as its NAME, not a positional discriminant.
-    ///
-    /// This is what makes removing a dead variant safe. The enum has no explicit discriminants, so
-    /// if the encoding were positional, deleting `BlockFound` (position 1) would shift every later
-    /// variant down by one and a mixed fleet would silently reinterpret every message type during
-    /// a rolling deploy — `PayoutProposal` read as `Vote`, and so on.
-    ///
-    /// Because the form is the name, a removed variant simply fails to deserialise on a new node,
-    /// which for a type nothing dispatched is the same no-op it already was.
-    #[test]
-    fn message_type_encodes_by_name_not_by_position() {
-        assert_eq!(
-            serde_json::to_string(&MessageType::PayoutProposal).unwrap(),
-            "\"PayoutProposal\"",
-            "the wire form must be the variant NAME — deleting a dead variant is only safe \
-             because later variants do not shift"
-        );
-    }
 
     use ghost_common::identity::NodeIdentity;
 
@@ -2979,7 +3089,10 @@ mod tests {
     #[test]
     fn test_message_topics() {
         assert_eq!(MessageType::ShareProof.topic(), topics::SHARE);
+        assert_eq!(MessageType::BlockFound.topic(), topics::BLOCK);
         assert_eq!(MessageType::Vote.topic(), topics::VOTE);
+        assert_eq!(MessageType::ZkBlockProposal.topic(), topics::ZK_PROPOSAL);
+        assert_eq!(MessageType::ZkVote.topic(), topics::ZK_VOTE);
     }
 
     #[test]
@@ -2987,10 +3100,14 @@ mod tests {
         // M-P2P-1: Test that topic_str() returns correct string for each message type
         assert_eq!(MessageType::ShareProof.topic_str(), "share");
         assert_eq!(MessageType::ShareConvergence.topic_str(), "share");
+        assert_eq!(MessageType::BlockFound.topic_str(), "block");
         assert_eq!(MessageType::PayoutProposal.topic_str(), "payout");
         assert_eq!(MessageType::Vote.topic_str(), "vote");
         assert_eq!(MessageType::HealthPing.topic_str(), "health");
         assert_eq!(MessageType::Discovery.topic_str(), "discovery");
+        assert_eq!(MessageType::ElderUpdate.topic_str(), "elder");
+        assert_eq!(MessageType::ZkBlockProposal.topic_str(), "zkproposal");
+        assert_eq!(MessageType::ZkVote.topic_str(), "zkvote");
         assert_eq!(MessageType::VerificationResult.topic_str(), "verify");
     }
 
@@ -3000,10 +3117,14 @@ mod tests {
         // This ensures the validation logic works correctly
         let message_types = [
             MessageType::ShareProof,
+            MessageType::BlockFound,
             MessageType::PayoutProposal,
             MessageType::Vote,
             MessageType::HealthPing,
             MessageType::Discovery,
+            MessageType::ElderUpdate,
+            MessageType::ZkBlockProposal,
+            MessageType::ZkVote,
             MessageType::VerificationResult,
         ];
 
@@ -3017,6 +3138,48 @@ mod tests {
                 msg_type
             );
         }
+    }
+
+    #[test]
+    fn test_zk_proposal_hash() {
+        let proposal = ZkBlockProposalMessage {
+            height: 100,
+            prev_state_root: [1u8; 32],
+            new_state_root: [2u8; 32],
+            tx_count: 5,
+            transactions_hash: [3u8; 32],
+            transactions: vec![],
+            proof: vec![0u8; 72],
+            proposer_signature: [0u8; 64],
+            timestamp: 1700000000,
+        };
+
+        let hash1 = proposal.proposal_hash();
+        let hash2 = proposal.proposal_hash();
+        assert_eq!(hash1, hash2, "Proposal hash should be deterministic");
+    }
+
+    #[test]
+    fn test_zk_vote_message() {
+        let vote = ZkVoteMessage::new(100, [1u8; 32], true, None, [0u8; 64]);
+
+        assert_eq!(vote.height, 100);
+        assert!(vote.approve);
+        assert!(vote.rejection_reason.is_none());
+    }
+
+    #[test]
+    fn test_zk_vote_rejection() {
+        let vote = ZkVoteMessage::new(
+            100,
+            [1u8; 32],
+            false,
+            Some(ZkRejectionReason::InvalidProof),
+            [0u8; 64],
+        );
+
+        assert!(!vote.approve);
+        assert_eq!(vote.rejection_reason, Some(ZkRejectionReason::InvalidProof));
     }
 
     /// The list root is what makes every node derive the SAME `checkpoint_hash` from
