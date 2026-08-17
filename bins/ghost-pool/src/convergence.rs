@@ -153,6 +153,23 @@ pub struct ConvergenceHandler {
 /// cannot reintroduce divergence — it only decides how many boundary shares stay creditable.
 const ERA_BOUNDARY_GRACE_SECS: i64 = 3600;
 
+/// What happened to one backfilled proof.
+///
+/// Replaces a `bool` that could not distinguish "we already had it" from "we refused it" —
+/// the two have opposite meanings for whether convergence is working, and the old counter
+/// reported the second as the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AcceptOutcome {
+    /// Newly persisted.
+    Applied,
+    /// UNIQUE(share_hash) — we already held this share. Expected in normal operation.
+    AlreadyHeld,
+    /// `handle_share_proof` refused it, with the reason. A validly-signed proof landing here
+    /// means the serving node holds it as good and this one does not — a protocol-level
+    /// disagreement, not a no-op.
+    Rejected(String),
+}
+
 /// Outcome of applying one window-convergence response.
 ///
 /// Exists so the discard reasons are a VALUE, not just a log line: `applied` alone cannot
@@ -169,7 +186,15 @@ pub struct LedgerApplyOutcome {
     pub bad_sig: usize,
     /// Verified proofs we already held (UNIQUE(share_hash) dedup). Expected to be
     /// non-zero in normal operation.
+    ///
+    /// ⚠ This field used to carry BOTH dedup and policy refusals — see `rejected`.
     pub already_held: usize,
+    /// Verified proofs that `handle_share_proof` REFUSED on ingest policy.
+    ///
+    /// Distinct from `already_held` and the opposite signal: a validly-signed proof the serving
+    /// node holds as good and this node throws away. Non-zero here means convergence is running
+    /// and achieving nothing, which previously reported as `already_held` — i.e. as success.
+    pub rejected: usize,
 }
 
 impl ConvergenceHandler {
@@ -266,7 +291,9 @@ impl ConvergenceHandler {
         // undiagnosable from the logs alone.
         let mut bad_json = 0usize;
         let mut bad_sig = 0usize;
-        let mut not_accepted = 0usize;
+        let mut already_held = 0usize;
+        let mut rejected = 0usize;
+        let mut first_reject_reason: Option<String> = None;
         for blob in &resp.proofs {
             let Ok(proof) = serde_json::from_slice::<ghost_common::types::ShareProof>(blob) else {
                 bad_json += 1;
@@ -276,26 +303,42 @@ impl ConvergenceHandler {
                 bad_sig += 1;
                 continue; // never credit an unsigned or forged backfill
             }
-            if self.accept_proof(&proof) {
-                applied += 1;
-            } else {
-                not_accepted += 1;
+            match self.accept_proof(&proof) {
+                AcceptOutcome::Applied => applied += 1,
+                AcceptOutcome::AlreadyHeld => already_held += 1,
+                AcceptOutcome::Rejected(reason) => {
+                    rejected += 1;
+                    first_reject_reason.get_or_insert(reason);
+                }
             }
         }
         // Log whenever the peer sent anything, INCLUDING the all-rejected case — that is the
-        // interesting one. `not_accepted` is expected to be non-zero in normal operation
-        // (UNIQUE(share_hash) dedups a share we already hold); `bad_json` or `bad_sig` above
-        // zero means proofs that verify on the serving node do not verify here, which is a
-        // protocol bug rather than a no-op.
+        // interesting one.
+        //
+        // ⚠ `already_held` and `rejected` were ONE counter, labelled `already_held`, and the two
+        // mean opposite things. `accept_proof` returned false for ANY `Err` from
+        // `handle_share_proof` — both `DuplicateShare` (convergence working: the peer re-served
+        // something we hold) and every policy refusal (M-6 `template_id`, PoW-header rules,
+        // staleness). So "healthy dedup" and "rejecting every proof served" produced the same
+        // number, under a name that asserts the harmless one. The comment above this block used
+        // to say the count was "expected to be non-zero in normal operation", which is true of
+        // dedup and alarming of refusal, and there was no way to tell which you had.
+        //
+        // Not hypothetical: vm8 logged 725 of these in 6h on 2026-08-17 while sitting 17,822
+        // shares behind vm1 inside the very window the sweep was scanning. Whether those were
+        // duplicates or refusals decides whether a targeted repair would achieve anything, and
+        // the log could not say. `rejected` is now its own counter and carries the reason.
         if !resp.proofs.is_empty() {
-            let level_warn = bad_json > 0 || bad_sig > 0;
+            let level_warn = bad_json > 0 || bad_sig > 0 || rejected > 0;
             if level_warn {
                 warn!(
                     served = resp.proofs.len(),
                     applied,
                     bad_json,
                     bad_sig,
-                    already_held = not_accepted,
+                    already_held,
+                    rejected,
+                    reject_reason = %first_reject_reason.clone().unwrap_or_default(),
                     since = resp.since_ts,
                     until = resp.until_ts,
                     "GHOST-03: window convergence DISCARDED proofs the peer could serve"
@@ -304,7 +347,7 @@ impl ConvergenceHandler {
                 debug!(
                     served = resp.proofs.len(),
                     applied,
-                    already_held = not_accepted,
+                    already_held,
                     since = resp.since_ts,
                     until = resp.until_ts,
                     "GHOST-03: window convergence response"
@@ -324,7 +367,8 @@ impl ConvergenceHandler {
             applied,
             bad_json,
             bad_sig,
-            already_held: not_accepted,
+            already_held,
+            rejected,
         }
     }
 
@@ -332,7 +376,7 @@ impl ConvergenceHandler {
     ///
     /// The table is the only thing the payout ledger reads, so a backfill that lands only in
     /// memory repairs nothing that matters. Idempotent — UNIQUE(share_hash) is the dedup.
-    fn accept_proof(&self, proof: &ghost_common::types::ShareProof) -> bool {
+    fn accept_proof(&self, proof: &ghost_common::types::ShareProof) -> AcceptOutcome {
         let miner_hex = hex::encode(&proof.miner_id[..8]);
         let from_node = hex::encode(&proof.received_by[..4]);
         let share_hash = hex::encode(proof.share_hash);
@@ -340,16 +384,22 @@ impl ConvergenceHandler {
         let work = proof.work;
         let timestamp = proof.timestamp as i64;
 
-        if self
-            .round_manager
-            .handle_share_proof(proof.clone())
-            .is_err()
-        {
-            return false;
+        if let Err(e) = self.round_manager.handle_share_proof(proof.clone()) {
+            // Dedup and refusal both arrive here as an Err, and they mean opposite things:
+            // `DuplicateShare` is convergence working (the peer re-served something we hold),
+            // anything else is a validly-signed proof the SERVING node holds as good and this
+            // node throws away. The old counter lumped them together under `already_held`, so
+            // "healthy dedup" and "silently rejecting everything" were the same number — the
+            // ambiguity that let a stuck backfill look fine. C5 dedup fires before the DB's
+            // UNIQUE constraint is ever reached, so this is where the split has to happen.
+            return match e {
+                crate::round::ShareError::DuplicateShare => AcceptOutcome::AlreadyHeld,
+                other => AcceptOutcome::Rejected(format!("{other:?}")),
+            };
         }
 
         let Some(db) = &self.db else {
-            return true;
+            return AcceptOutcome::Applied;
         };
 
         let record = ghost_storage::models::ShareRecord {
@@ -365,6 +415,11 @@ impl ConvergenceHandler {
         };
         let blob = serde_json::to_vec(proof).unwrap_or_default();
 
+        // A UNIQUE violation means we ALREADY HELD this share. That is the genuine "already
+        // held" case, and it used to be swallowed here and counted as `applied` — so the
+        // applied figure was inflated by every duplicate a peer served, and real repair looked
+        // larger than it was.
+        let mut outcome = AcceptOutcome::Applied;
         match db.insert_share_with_proof(&record, &blob) {
             Ok(_) => {
                 if let Err(e) = db.increment_miner_stats(&miner_hex, 1, work) {
@@ -372,8 +427,11 @@ impl ConvergenceHandler {
                 }
             }
             Err(e) => {
-                if !e.to_string().contains("UNIQUE") {
+                if e.to_string().contains("UNIQUE") {
+                    outcome = AcceptOutcome::AlreadyHeld;
+                } else {
                     warn!(miner = %miner_hex, error = %e, "GHOST-03: backfill persist failed");
+                    outcome = AcceptOutcome::Rejected(format!("persist: {e}"));
                 }
             }
         }
@@ -381,7 +439,7 @@ impl ConvergenceHandler {
         if let Some(addr) = &proof.payout_address {
             let _ = db.adopt_miner_address(&miner_hex, addr);
         }
-        true
+        outcome
     }
 
     /// Build a convergence REQUEST advertising the shares we hold for `round_id`.
@@ -1314,6 +1372,57 @@ mod tests {
         let missing = rm.proofs_missing_from(1, &known);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].share_hash, s2.share_hash);
+    }
+
+    /// A duplicate is `already_held`, not `applied`; a refusal is `rejected`, not `already_held`.
+    ///
+    /// These were one counter labelled `already_held`, and it was backwards. `accept_proof`
+    /// returned false ONLY when `handle_share_proof` refused, while a UNIQUE violation — a share
+    /// we genuinely already hold — was swallowed and counted as `applied`. So a node refusing
+    /// thousands of validly-signed backfilled shares reported them as duplicates and looked
+    /// healthy, and `applied` was inflated by every duplicate a peer re-served. On 2026-08-17 vm8
+    /// logged 725 "already_held" in six hours while 17,822 shares behind vm1, and the log could
+    /// not say which it meant.
+    #[tokio::test]
+    async fn a_duplicate_is_already_held_and_a_refusal_is_rejected() {
+        let signer = NodeIdentity::generate();
+        let rm = round_manager();
+        let db = Arc::new(ghost_storage::Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        let h = ConvergenceHandler::new(Arc::clone(&rm)).with_db(Arc::clone(&db));
+
+        let proof = signed_share(&signer, 1);
+        let blob = serde_json::to_vec(&proof).expect("json");
+
+        let first = h.apply_ledger_response(&LedgerConvergenceResponse {
+            since_ts: 0,
+            until_ts: i64::MAX,
+            proofs: vec![blob.clone()],
+            unservable: 0,
+            more_available: false,
+        });
+        assert_eq!(first.applied, 1, "a new proof is applied");
+        assert_eq!(first.already_held, 0);
+        assert_eq!(first.rejected, 0);
+
+        // The same proof again: we hold it, so it is a duplicate — NOT new work, and not a refusal.
+        let second = h.apply_ledger_response(&LedgerConvergenceResponse {
+            since_ts: 0,
+            until_ts: i64::MAX,
+            proofs: vec![blob],
+            unservable: 0,
+            more_available: false,
+        });
+        assert_eq!(
+            second.already_held, 1,
+            "a re-served share we hold must count as already_held"
+        );
+        assert_eq!(
+            second.applied, 0,
+            "counting a duplicate as `applied` overstates repair — every re-served share looked \
+             like progress"
+        );
+        assert_eq!(second.rejected, 0, "holding a share is not a refusal");
     }
 
     /// The property #677 broke: two nodes whose LOCAL activation rounds differ must reach the
