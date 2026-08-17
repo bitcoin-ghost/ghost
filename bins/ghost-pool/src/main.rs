@@ -4674,14 +4674,44 @@ async fn main() -> Result<()> {
                                 agreeing = d.agreeing,
                                 "shard: balances agree with the legacy ledger exactly"
                             ),
-                            Ok(d) => warn!(
-                                agreeing = d.agreeing,
-                                differing = d.differing.len(),
-                                only_shard = d.only_shard.len(),
-                                only_ledger = d.only_ledger.len(),
-                                net_micro = d.net_micro,
-                                "shard: DRIFT against the legacy ledger"
-                            ),
+                            Ok(d) => {
+                                // Name WHICH addresses drift and by how much, largest first.
+                                //
+                                // `differing` has carried these deltas all along and only the
+                                // COUNT was logged, so "net_micro=-355e12" could not be attributed
+                                // to anything. The build doc records the drift as flat at
+                                // -87.3e12 (-0.117%); it is now -355e12 (-0.464%), a 4.1x growth
+                                // the documented causes — genesis truncation and the epoch floor —
+                                // are both one-off and bounded, so cannot explain. Four hypotheses
+                                // (tier filter, fold starvation, era boundary, sub-tier work) were
+                                // each killed by measurement while this line withheld the answer.
+                                //
+                                // Addresses are reported as the SHA-256 handle, never plaintext:
+                                // it is stable across nodes so a delta can be followed fleet-wide,
+                                // and it keeps the address↔miner link out of the log.
+                                use sha2::{Digest, Sha256};
+                                let mut worst = d.differing.clone();
+                                worst.sort_by_key(|(_, delta)| *delta);
+                                let detail: Vec<String> = worst
+                                    .iter()
+                                    .take(5)
+                                    .map(|(addr, delta)| {
+                                        format!(
+                                            "{}:{delta}",
+                                            hex::encode(&Sha256::digest(addr.as_bytes())[..6])
+                                        )
+                                    })
+                                    .collect();
+                                warn!(
+                                    agreeing = d.agreeing,
+                                    differing = d.differing.len(),
+                                    only_shard = d.only_shard.len(),
+                                    only_ledger = d.only_ledger.len(),
+                                    net_micro = d.net_micro,
+                                    worst_addresses = %detail.join(","),
+                                    "shard: DRIFT against the legacy ledger"
+                                );
+                            }
                             Err(e) => warn!(error = %e, "shard: drift comparison failed"),
                         }
                     }
