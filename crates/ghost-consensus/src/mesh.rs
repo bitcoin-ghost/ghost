@@ -1816,7 +1816,6 @@ impl MeshNetwork {
             | MessageType::ShareBatchPrecommit
             | MessageType::ShareProof
             | MessageType::ShareConvergence
-            | MessageType::BlockFound
             | MessageType::Vote
             | MessageType::PayoutProposal
             | MessageType::PayoutLedgerCheckpoint
@@ -1843,15 +1842,9 @@ impl MeshNetwork {
             | MessageType::ShardEvidence
             | MessageType::ShardSampleRequest
             | MessageType::ShardSampleResponse
-            | MessageType::ElderUpdate
-            | MessageType::ZkBlockProposal
-            | MessageType::ZkVote
             | MessageType::VerificationResult
             | MessageType::ChallengeConvergence
             | MessageType::EquivocationProof
-            | MessageType::ElderRegistrationProposal
-            | MessageType::ElderListProposal
-            | MessageType::ElderListApproval
             | MessageType::MpcContribution
             | MessageType::MpcVerificationVote
             | MessageType::MpcParametersRequest
@@ -2192,24 +2185,16 @@ impl MeshNetwork {
             MessageType::ShareBatchVote
             | MessageType::ShareBatchPrevote
             | MessageType::ShareBatchPrecommit => self.config.ports.consensus_voting,
-            MessageType::BlockFound => self.config.ports.block_announcement,
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            MessageType::ElderUpdate => self.config.ports.elder_management,
             // P2P-C1/C2/C3: Elder registration messages use elder management port
-            MessageType::ElderRegistrationProposal
-            | MessageType::ElderListProposal
-            | MessageType::ElderListApproval
-            // MPC ceremony messages also use elder management port
             | MessageType::MpcContribution
             | MessageType::MpcVerificationVote
             | MessageType::MpcParametersRequest
             | MessageType::MpcParametersResponse => self.config.ports.elder_management,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
             // ZK-BFT messages use consensus voting port
-            MessageType::ZkBlockProposal
-            | MessageType::ZkVote => self.config.ports.consensus_voting,
             // Verification results (and their convergence/backfill) use health monitoring port
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
                 self.config.ports.health_monitoring
@@ -3215,7 +3200,6 @@ impl MeshNetwork {
         match topic {
             "health" => Some(MessageType::HealthPing),
             "share" => Some(MessageType::ShareProof),
-            "block" => Some(MessageType::BlockFound),
             "vote" => Some(MessageType::Vote),
             "discovery" => Some(MessageType::Discovery),
             "verify" => Some(MessageType::VerificationResult),
@@ -3300,22 +3284,15 @@ impl MeshNetwork {
             MessageType::ShareBatchVote
             | MessageType::ShareBatchPrevote
             | MessageType::ShareBatchPrecommit => self.config.ports.consensus_voting,
-            MessageType::BlockFound => self.config.ports.block_announcement,
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            MessageType::ElderUpdate
-            | MessageType::ElderRegistrationProposal
-            | MessageType::ElderListProposal
-            | MessageType::ElderListApproval
-            | MessageType::MpcContribution
+            MessageType::MpcContribution
             | MessageType::MpcVerificationVote
             | MessageType::MpcParametersRequest
             | MessageType::MpcParametersResponse => self.config.ports.elder_management,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
-            MessageType::ZkBlockProposal
-            | MessageType::ZkVote
-            | MessageType::EquivocationProof
+            MessageType::EquivocationProof
             | MessageType::L2ConfidentialTransfer
             | MessageType::L2TransferConfirmation
             | MessageType::L2TransferBroadcast
@@ -4254,7 +4231,6 @@ mod tests {
                 MessageType::Discovery | MessageType::HealthPing => false,
                 MessageType::ShareProof
                 | MessageType::ShareConvergence
-                | MessageType::BlockFound
                 | MessageType::Vote
                 | MessageType::PayoutProposal
                 | MessageType::PayoutLedgerCheckpoint
@@ -4274,15 +4250,9 @@ mod tests {
                 | MessageType::ShardEvidence
                 | MessageType::ShardSampleRequest
                 | MessageType::ShardSampleResponse
-                | MessageType::ElderUpdate
-                | MessageType::ZkBlockProposal
-                | MessageType::ZkVote
                 | MessageType::VerificationResult
                 | MessageType::ChallengeConvergence
                 | MessageType::EquivocationProof
-                | MessageType::ElderRegistrationProposal
-                | MessageType::ElderListProposal
-                | MessageType::ElderListApproval
                 | MessageType::MpcContribution
                 | MessageType::MpcVerificationVote
                 | MessageType::MpcParametersRequest
@@ -4340,28 +4310,8 @@ mod tests {
         );
 
         // Block/mining messages (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::BlockFound),
-            "BlockFound must use Noise"
-        );
 
         // Elder management (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::ElderUpdate),
-            "ElderUpdate must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ElderRegistrationProposal),
-            "ElderRegistrationProposal must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ElderListProposal),
-            "ElderListProposal must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ElderListApproval),
-            "ElderListApproval must use Noise"
-        );
 
         // L2 messages (MUST use Noise — contain proofs and encrypted note data)
         assert!(
@@ -4390,14 +4340,6 @@ mod tests {
         );
 
         // ZK messages (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::ZkBlockProposal),
-            "ZkBlockProposal must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ZkVote),
-            "ZkVote must use Noise"
-        );
         // Verification and security (MUST use Noise)
         assert!(
             message_type_requires_noise(MessageType::VerificationResult),
