@@ -2455,6 +2455,24 @@ pub struct PoolConfig {
     /// silently doing nothing is the failure mode this whole design keeps running into.
     #[serde(default)]
     pub shard_arm_genesis: bool,
+
+    /// Stage 5 step 6: build the coinbase's MINER payouts from the shard, not the legacy ledger.
+    ///
+    /// ⛔ **This is the point of no return.** Every other shard flag is reversible — turn it off
+    /// and the shard stops observing. This one decides what a block actually pays. After it, the
+    /// `shares` rename follows and the legacy unpaid ledger stops being the source of truth.
+    ///
+    /// Requires `share_shard` AND an armed genesis: without the opening balances the shard owes
+    /// nobody the months of work the pool actually owes, and a block would pay only what has
+    /// accrued since the flag was set. The runtime refuses to use the shard source unless the
+    /// genesis column is installed, rather than trusting the operator to set three flags in the
+    /// right order.
+    ///
+    /// Substitutes ONLY the miner payouts. Node rewards, treasury, the 99/1 split, the dust
+    /// roll-in, the coinbase commitment and GHOST-02 recompute-reject are the same code on both
+    /// paths.
+    #[serde(default)]
+    pub shard_coinbase: bool,
     /// Payout address for node rewards (5-4-3-2-1 capability shares)
     /// Broadcast in health pings so peers know where to send node reward payouts.
     /// Must be a valid bech32 address for the configured network.
@@ -2545,6 +2563,7 @@ impl Default for PoolConfig {
             // Same rule: deploying the binary must not by itself start folding.
             share_shard: false,
             shard_arm_genesis: false,
+            shard_coinbase: false,
             node_payout_address: None,
             pool_name: None,
             coinbase_extra: None,

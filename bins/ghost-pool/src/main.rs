@@ -184,8 +184,42 @@ const MPC_READINESS_MAX_WAIT_SECS: u64 = 600;
 /// contribution was applied while we waited), our candidate is built on a stale
 /// head and MUST be regenerated (rebased) onto the new head — its
 /// `prev_params_hash` would otherwise fail hash-chain validation.
-fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> bool {
-    current_count == cached_count
+///
+/// ⚠ **The count is not sufficient on its own: the base parameters can move while it
+/// stands still.** The genesis node regenerates parameters when it re-runs genesis, and a
+/// re-fetch can replace the applied head, both without the authoritative count changing.
+/// A candidate cached across that is chained onto parameters nobody holds any more, so
+/// every voter answers
+///
+/// ```text
+/// Cryptographic verification failed: Contribution proof verification failed:
+/// tau proof verification failed
+/// ```
+///
+/// and — because the count never advances — the cache is never invalidated, so the node
+/// rebroadcasts the SAME doomed candidate for ever and can never become an elder. Observed
+/// on the regtest cluster 2026-08-16: a node rebroadcast a stale candidate for ~13 hours,
+/// was rejected every time, and only recovered when restarted.
+///
+/// Comparing the base hash as well closes it: `cached_prev` is what the candidate chained
+/// onto, `current_params` is what the ceremony holds now, and any difference means the
+/// candidate must be rebuilt. `None` for either (a legacy row, or state not yet readable)
+/// falls back to the count-only test rather than forcing a needless regeneration — the
+/// moving-target problem that stopped voters converging is real too, so this must not
+/// invalidate on anything less than positive evidence of a change.
+fn cached_contribution_still_valid(
+    cached_count: u32,
+    current_count: u32,
+    cached_prev: Option<[u8; 32]>,
+    current_params: Option<[u8; 32]>,
+) -> bool {
+    if current_count != cached_count {
+        return false;
+    }
+    match (cached_prev, current_params) {
+        (Some(prev), Some(now)) => prev == now,
+        _ => true,
+    }
 }
 
 /// Decide whether to advertise the Archive capability (+5 shares).
@@ -2249,6 +2283,34 @@ async fn ensure_mpc_params_present(
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// The shard's `owed()` balances for the coinbase, or `None` to keep the legacy ledger.
+///
+/// ⛔ Stage 5 step 6. Returns `Some` ONLY when all three hold: the shard is enabled, the operator
+/// set `shard_coinbase`, and **genesis is actually installed**.
+///
+/// That last condition is checked rather than assumed. Without the opening balances the shard owes
+/// nobody the months of work the pool actually owes, so a block would pay only what accrued since
+/// the flag was set — silently, and irreversibly, because a paid block cannot be unpaid. Trusting
+/// an operator to set three flags in the right order is not a safety property.
+fn shard_coinbase_owed(
+    shard: &Option<Arc<ghost_pool::shard::ShardRuntime>>,
+    enabled: bool,
+) -> Option<std::collections::BTreeMap<String, i64>> {
+    if !enabled {
+        return None;
+    }
+    let rt = shard.as_ref()?;
+    if !rt.genesis_installed() {
+        error!(
+            "coinbase: `shard_coinbase` is set but genesis is NOT installed — refusing to pay \
+             from the shard. It would pay only post-flag accrual and omit everything the pool \
+             already owes. Falling back to the legacy ledger."
+        );
+        return None;
+    }
+    Some(rt.owed_snapshot())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -3908,12 +3970,41 @@ async fn main() -> Result<()> {
         _ => shard,
     };
 
+    // The share checks in force right now, shared by the SBC handler and §6 sampling.
+    //
+    // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
+    // captured it once would keep applying the rules in force when the process started. ONE
+    // definition, used by both consumers — a second spelling is how a signer and a verifier
+    // drift apart, and here one of them decides who gets publicly accused.
+    let sbc_checks: ghost_pool::sbc_handler::ChecksFn = {
+        let rm_c = Arc::clone(&round_manager);
+        Arc::new(move || {
+            ghost_pool::sbc_checks::NodeBatchChecks::at_height(
+                rm_c.current_height(),
+                rm_c.addr_bind_activation_round(),
+                rm_c.pow_verify_activation_round(),
+                ghost_pool::share_pow_verify_height(),
+                rm_c.tier_bind_activation_round(),
+            )
+        })
+    };
+
     // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
     // no handler on the mesh at all — matching the flag's promise that deploying the binary
     // starts nothing.
     if let Some(ref rt) = shard {
         // Responder channel for whole-table syncs. The handler cannot send: it has no mesh
         // reference, so it hands the built response here and this task puts it on the wire.
+        // §12.4 evidence produced by our own audits, broadcast to every peer.
+        let (evidence_tx, mut evidence_rx) =
+            tokio::sync::mpsc::channel::<ghost_consensus::message::ShardEvidenceMessage>(16);
+
+        // Served §6 sampling responses, same hand-off shape as the sync responder.
+        let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<(
+            ghost_common::types::NodeId,
+            ghost_consensus::message::ShardSampleResponseMessage,
+        )>(16);
+
         let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel::<(
             ghost_common::types::NodeId,
             ghost_consensus::message::ShardTableSyncMessage,
@@ -3921,9 +4012,217 @@ async fn main() -> Result<()> {
 
         let h = Arc::new(
             ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(rt))
-                .with_sync_responder(sync_tx),
+                .with_sync_responder(sync_tx)
+                .with_sample_responder(sample_tx)
+                .with_evidence_publisher(evidence_tx)
+                .with_share_checks(Arc::clone(&sbc_checks)),
         );
         mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+        // §12.4 publish half: broadcast evidence our own audits produced.
+        //
+        // BROADCAST, not unicast: the verdict is re-derivable by every peer from the bytes alone,
+        // and a verdict one node keeps to itself protects only that node while the accused keeps
+        // being merged everywhere else.
+        {
+            let mesh_c = Arc::clone(&mesh);
+            tokio::spawn(async move {
+                while let Some(ev) = evidence_rx.recv().await {
+                    if !mesh_c.noise_available() {
+                        warn!("shard: Noise unavailable — §12.4 evidence NOT published");
+                        continue;
+                    }
+                    let bytes = match serde_json::to_vec(&ev) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "shard: evidence would not serialise");
+                            continue;
+                        }
+                    };
+                    let cap = ghost_consensus::message_validator::max_payload_size(
+                        ghost_consensus::MessageType::ShardEvidence,
+                    );
+                    if bytes.len() > cap {
+                        warn!(
+                            bytes = bytes.len(),
+                            cap, "shard: evidence exceeds the per-type cap — NOT published"
+                        );
+                        continue;
+                    }
+                    match mesh_c
+                        .create_envelope_raw(ghost_consensus::MessageType::ShardEvidence, bytes)
+                    {
+                        Ok(env) => match mesh_c.broadcast(env).await {
+                            Ok(0) => warn!(
+                                "shard: §12.4 evidence reached NO peers — the accused is \
+                                 quarantined here only"
+                            ),
+                            Ok(peers) => warn!(
+                                peers,
+                                accused = %hex::encode(&ev.summary.node_id[..4]),
+                                epoch = ev.summary.epoch,
+                                "shard: published §12.4 evidence"
+                            ),
+                            Err(e) => warn!(error = %e, "shard: evidence broadcast failed"),
+                        },
+                        Err(e) => warn!(error = %e, "shard: evidence envelope failed"),
+                    }
+                }
+            });
+        }
+
+        // §6 serve half: unicast a served audit answer back to the node that asked.
+        {
+            let mesh_c = Arc::clone(&mesh);
+            tokio::spawn(async move {
+                while let Some((requester, response)) = sample_rx.recv().await {
+                    // Same rule as every other shard transmit: the leaves carry whole
+                    // ShareProofs, including payout addresses, so this must not go out in clear.
+                    if !mesh_c.noise_available() {
+                        warn!("shard: Noise unavailable — §6 sampling response NOT served");
+                        continue;
+                    }
+                    let bytes = match serde_json::to_vec(&response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "shard: sampling response would not serialise");
+                            continue;
+                        }
+                    };
+                    let cap = ghost_consensus::message_validator::max_payload_size(
+                        ghost_consensus::MessageType::ShardSampleResponse,
+                    );
+                    if bytes.len() > cap {
+                        // §6 allows an honest SUBSET, so an oversized answer is a bug in how many
+                        // leaves were packed, not a reason to go silent without saying so.
+                        warn!(
+                            bytes = bytes.len(),
+                            cap,
+                            leaves = response.leaves.len(),
+                            "shard: sampling response exceeds the per-type cap — not sent; the \
+                             receiver would drop it silently"
+                        );
+                        continue;
+                    }
+                    let env = match mesh_c.create_envelope_raw(
+                        ghost_consensus::MessageType::ShardSampleResponse,
+                        bytes,
+                    ) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(error = %e, "shard: sampling response envelope failed");
+                            continue;
+                        }
+                    };
+                    match mesh_c.peers().get_peer(&requester) {
+                        Some(peer) => {
+                            if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
+                                debug!(error = %e, "shard: could not send sampling response");
+                            }
+                        }
+                        None => debug!("shard: sampling requester is not a known peer"),
+                    }
+                }
+            });
+        }
+
+        // §6 ask half: audit one ratified peer per interval.
+        //
+        // The verdict path judges a sampled share by BLOCK HEIGHT, not by our local rounds — see
+        // `NodeBatchChecks::at_shared_height`. Round numbers are node-local, so judging a peer's
+        // shares by ours accused honest operators; height is the axis every node agrees on, and
+        // the gates were always defined in height terms before being translated into rounds.
+        {
+            // §6 ask half: audit one ratified peer per interval.
+            //
+            // ⚠ The entropy is drawn HERE, fresh per audit, from the OS RNG, and never leaves this
+            // node until the request is sent. The ~10^-6 detection bound rests entirely on the sampled
+            // node being unable to predict which leaves will be pulled before it signs its summary: a
+            // node that can predict them fabricates work in the never-sampled leaves and the bound
+            // collapses to zero. Deriving it from the summary, chain data, a schedule or a per-node
+            // seed all break it.
+            {
+                let mesh_c = Arc::clone(&mesh);
+                let rt_c = Arc::clone(rt);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        // An unanswered audit is not a verdict (§6 leaves that to policy), but it
+                        // must not accumulate.
+                        let expired =
+                            rt_c.expire_pending_samples(std::time::Duration::from_secs(3600));
+                        if expired > 0 {
+                            debug!(expired, "shard: expired unanswered §6 audits");
+                        }
+                        if !mesh_c.noise_available() {
+                            continue;
+                        }
+                        // Pick a live ratified peer at random; `sample_request_for` refuses anything
+                        // outside the ratified set, ourselves, and epochs with nothing to sample.
+                        let self_id = rt_c.node_id();
+                        let candidates: Vec<_> = mesh_c
+                            .peers()
+                            .get_connected_peers(300)
+                            .into_iter()
+                            .filter(|p| p.node_id != self_id)
+                            .collect();
+                        let Some(target) = ({
+                            use rand::seq::SliceRandom;
+                            let mut rng = rand::thread_rng();
+                            candidates.choose(&mut rng).map(|p| p.node_id)
+                        }) else {
+                            continue;
+                        };
+                        let entropy: [u8; 32] = {
+                            use rand::Rng;
+                            rand::thread_rng().gen()
+                        };
+                        let req = match rt_c.sample_request_for(
+                            &target,
+                            &entropy,
+                            ghost_consensus::shard_handler::DEFAULT_SAMPLE_LAMBDA,
+                        ) {
+                            Ok(Some(r)) => r,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                warn!(error = %e, "shard: could not build a §6 sampling request");
+                                continue;
+                            }
+                        };
+                        let bytes = match serde_json::to_vec(&req) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "shard: sampling request would not serialise");
+                                continue;
+                            }
+                        };
+                        match mesh_c.create_envelope_raw(
+                            ghost_consensus::MessageType::ShardSampleRequest,
+                            bytes,
+                        ) {
+                            Ok(env) => match mesh_c.peers().get_peer(&target) {
+                                Some(peer) => {
+                                    if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
+                                        debug!(error = %e, "shard: could not send sampling request");
+                                    } else {
+                                        info!(
+                                            epoch = req.epoch,
+                                            peer = %hex::encode(&target[..4]),
+                                            leaves = req.leaf_indices.len(),
+                                            "shard: sent a §6 sampling request"
+                                        );
+                                    }
+                                }
+                                None => debug!("shard: sampling target is not a known peer"),
+                            },
+                            Err(e) => warn!(error = %e, "shard: sampling request envelope failed"),
+                        }
+                    }
+                });
+            }
+        }
 
         // Serve half: answer a peer's sync request, unicast back to whoever asked.
         {
@@ -4045,6 +4344,13 @@ async fn main() -> Result<()> {
         info!("shard: mesh handler registered (summaries + whole-table sync)");
     }
 
+    // Independent handles for the coinbase source. Made HERE, at top level, because each is
+    // captured by a different `async move` task further down and a single binding would be moved
+    // into whichever spawned first. Cheap: an Option<Arc> clone is a refcount bump.
+    let cb_enabled = config.pool.shard_coinbase;
+    let (shard_cb_a, shard_cb_b, shard_cb_c, shard_cb_d) =
+        (shard.clone(), shard.clone(), shard.clone(), shard.clone());
+
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
@@ -4103,21 +4409,6 @@ async fn main() -> Result<()> {
                 // it up to three times per message, against the same SQLite already carrying
                 // #554's load.
                 chain_c.voter_ids()
-            })
-        };
-
-        // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
-        // captured it once would keep applying the rules in force when the process started.
-        let sbc_checks: ghost_pool::sbc_handler::ChecksFn = {
-            let rm_c = Arc::clone(&round_manager);
-            Arc::new(move || {
-                ghost_pool::sbc_checks::NodeBatchChecks::at_height(
-                    rm_c.current_height(),
-                    rm_c.addr_bind_activation_round(),
-                    rm_c.pow_verify_activation_round(),
-                    ghost_pool::share_pow_verify_height(),
-                    rm_c.tier_bind_activation_round(),
-                )
             })
         };
 
@@ -4688,11 +4979,50 @@ async fn main() -> Result<()> {
             })
         })
     };
-    let convergence_handler = Arc::new(
-        ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
+    // The shared era axis for GHOST-03 backfill (#677).
+    //
+    // A peer's `proof.round_id` is in ITS numbering, so judging it against our activation round
+    // asks a question about us rather than about the share — and the fleet's boundaries genuinely
+    // differ (vm1 111,556 vs vm8 111,553), so every share in the gap was discarded as `bad_sig`
+    // for ever, the share sets never converged, and no payout checkpoint could ever be ratified.
+    // The gate's block timestamp is the one instant every node derives identically.
+    let addr_bind_activation_time: Option<i64> = {
+        let gate_height = ghost_pool::share_addr_bind_height();
+        match rpc.get_block_hash(gate_height).await {
+            Ok(hash) => match rpc.get_block_header(&hash).await {
+                Ok(hdr) => {
+                    info!(
+                        gate_height,
+                        activation_time = hdr.time,
+                        "GHOST-03: resolved the address-bind era axis from the chain"
+                    );
+                    Some(hdr.time as i64)
+                }
+                Err(e) => {
+                    warn!(gate_height, error = %e,
+                        "GHOST-03: could not read the gate block header — backfill falls back to \
+                         node-local rounds, which cannot agree across nodes (#677)");
+                    None
+                }
+            },
+            // Expected while the chain is still below the gate; there is no era to share yet.
+            Err(e) => {
+                warn!(gate_height, error = %e,
+                    "GHOST-03: gate height not on this chain yet — backfill falls back to \
+                     node-local rounds (#677)");
+                None
+            }
+        }
+    };
+    let convergence_handler = Arc::new({
+        let h = ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
             .with_send(conv_send)
-            .with_db(Arc::clone(&db)),
-    );
+            .with_db(Arc::clone(&db));
+        match addr_bind_activation_time {
+            Some(t) => h.with_addr_bind_activation_time(t),
+            None => h,
+        }
+    });
     mesh.register_handler(Arc::clone(&convergence_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
     {
@@ -7133,10 +7463,20 @@ async fn main() -> Result<()> {
                     let current_count = db_for_mpc
                         .mpc_contribution_count_authoritative()
                         .unwrap_or(db_count);
+                    // The base the ceremony holds NOW. A candidate chained onto anything
+                    // else can never verify, however many times it is rebroadcast.
+                    let current_params = db_for_mpc
+                        .get_mpc_ceremony_state()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.current_params_hash);
                     let position_advanced = match &cached_msg {
-                        Some((_, cached_count)) => {
-                            !cached_contribution_still_valid(*cached_count, current_count)
-                        }
+                        Some((msg, cached_count)) => !cached_contribution_still_valid(
+                            *cached_count,
+                            current_count,
+                            Some(msg.prev_params_hash),
+                            current_params,
+                        ),
                         // No cached candidate (generation failed this attempt): re-fetch
                         // so the next attempt regenerates on the freshest head.
                         None => true,
@@ -8395,7 +8735,7 @@ async fn main() -> Result<()> {
                 miner_id = %share.miner_id,
                 "Solo mode: share proof not broadcast (solo cannot touch the public ledger)"
             );
-        } else if !ghost_common::share_shard::crosses_network_tier(proof.tier_log2) {
+        } else if !ghost_pool::crosses_network_tier(proof.tier_log2) {
             // Stage 2, network tier. At R = 1 this arm is unreachable — the floor equals the
             // vardiff floor, so every share that exists today crosses — and that is the point:
             // the mechanism ships inert, and raising R later is a roll of one constant rather
@@ -8440,6 +8780,8 @@ async fn main() -> Result<()> {
         let tp_for_bf = Arc::clone(&template_processor);
         let payout_for_bf = Arc::clone(&payout_handler);
         let identity_for_bf = Arc::clone(&identity);
+        // Cloned per task: the coinbase source is consulted inside several spawned closures, and
+        // a single moved binding would be captured by whichever ran first.
         let db_for_bf = Arc::clone(&db);
         let solo_payout_address_for_bf = config.network.solo_payout_address.clone();
         let metrics_for_bf = Arc::clone(&metrics);
@@ -8626,6 +8968,7 @@ async fn main() -> Result<()> {
                     payout_for_bf.get_treasury_address_snapshot();
 
                 let block_data = BlockFoundData {
+                    shard_owed: shard_coinbase_owed(&shard_cb_a, cb_enabled),
                     round_id,
                     ledger_cutoff_ts: cutoff_ts,
                     block_hash,
@@ -8678,7 +9021,6 @@ async fn main() -> Result<()> {
         let mut block_rx = template_processor
             .take_block_submitted_rx()
             .expect("M-02: block_submitted_rx already taken — startup bug");
-
         tokio::spawn(async move {
             while let Some(info) = block_rx.recv().await {
                 let round_id = rm_for_block.current_round_id();
@@ -8861,6 +9203,7 @@ async fn main() -> Result<()> {
                         payout_for_block.get_treasury_address_snapshot();
 
                     let block_data = BlockFoundData {
+                        shard_owed: shard_coinbase_owed(&shard_cb_b, cb_enabled),
                         round_id,
                         ledger_cutoff_ts: cutoff_ts,
                         block_hash: info.block_hash,
@@ -10543,7 +10886,6 @@ async fn main() -> Result<()> {
     // against height 0 and falls back to a permissive default — see below.
     let vote_handler_for_tips = Arc::clone(&vote_handler);
     let shard_for_rounds = shard.clone();
-
     tokio::spawn(async move {
         // The last chain height we proposed a payout for. `NewWork` fires on every template
         // refresh (~30s), but the tip only moves on a new block, and a payout is per-block.
@@ -10766,6 +11108,10 @@ async fn main() -> Result<()> {
                                                 payout_for_tips.get_treasury_address_snapshot();
 
                                             let data = BlockFoundData {
+                                                shard_owed: shard_coinbase_owed(
+                                                    &shard_cb_c,
+                                                    cb_enabled,
+                                                ),
                                                 round_id,
                                                 ledger_cutoff_ts: cutoff_ts,
                                                 block_hash: tip,
@@ -11064,6 +11410,7 @@ async fn main() -> Result<()> {
                             payout_for_events.get_treasury_address_snapshot();
 
                         let block_data = BlockFoundData {
+                            shard_owed: shard_coinbase_owed(&shard_cb_d, cb_enabled),
                             round_id,
                             ledger_cutoff_ts: cutoff_ts,
                             block_hash,
@@ -12421,8 +12768,13 @@ mod tests {
         let cached_count = 6u32;
         let current_count = 6u32;
         assert!(
-            cached_contribution_still_valid(cached_count, current_count),
-            "unchanged position must NOT invalidate the cached candidate"
+            cached_contribution_still_valid(
+                cached_count,
+                current_count,
+                Some([1u8; 32]),
+                Some([1u8; 32])
+            ),
+            "unchanged position and unchanged base must NOT invalidate the cached candidate"
         );
     }
 
@@ -12434,7 +12786,12 @@ mod tests {
         let cached_count = 6u32;
         let current_count = 7u32;
         assert!(
-            !cached_contribution_still_valid(cached_count, current_count),
+            !cached_contribution_still_valid(
+                cached_count,
+                current_count,
+                Some([1u8; 32]),
+                Some([1u8; 32])
+            ),
             "advanced position MUST invalidate the cached candidate (rebase)"
         );
     }
@@ -12442,7 +12799,39 @@ mod tests {
     #[test]
     fn cached_contribution_invalid_on_multi_step_advance() {
         // Robust to more than one applied contribution during a long wait.
-        assert!(!cached_contribution_still_valid(6, 9));
+        assert!(!cached_contribution_still_valid(
+            6,
+            9,
+            Some([1u8; 32]),
+            Some([1u8; 32])
+        ));
+    }
+
+    #[test]
+    fn cached_contribution_invalid_when_base_params_moved_under_it() {
+        // THE STALL. The count stands still while the base parameters move — the genesis
+        // node re-runs genesis, or a re-fetch replaces the applied head. A candidate cached
+        // across that is chained onto parameters nobody holds, so every voter answers
+        // "tau proof verification failed"; and because the count never advances, a
+        // count-only test would keep the cache and rebroadcast the same doomed candidate
+        // for ever. Observed on the regtest cluster: ~13 hours of rejections, recovered
+        // only by restarting the node.
+        assert!(
+            !cached_contribution_still_valid(6, 6, Some([1u8; 32]), Some([2u8; 32])),
+            "a moved base MUST invalidate the cached candidate even at an unchanged position"
+        );
+    }
+
+    #[test]
+    fn cached_contribution_falls_back_to_count_when_hashes_unknown() {
+        // Missing hashes are not evidence of a change. Invalidating on absence would
+        // regenerate a fresh candidate every retry — the "moving target" that stopped
+        // voters converging, which is the failure the cache exists to prevent. So an
+        // unknown base keeps the count-only behaviour in BOTH directions.
+        assert!(cached_contribution_still_valid(6, 6, None, Some([2u8; 32])));
+        assert!(cached_contribution_still_valid(6, 6, Some([1u8; 32]), None));
+        assert!(cached_contribution_still_valid(6, 6, None, None));
+        assert!(!cached_contribution_still_valid(6, 7, None, None));
     }
 
     // ── should_claim_archive ─────────────────────────────────────────

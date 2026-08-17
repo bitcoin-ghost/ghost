@@ -241,6 +241,7 @@ fn propose(
     let hash = node
         .handler
         .handle_block_found(BlockFoundData {
+            shard_owed: None,
             round_id: ROUNDS,
             ledger_cutoff_ts: cutoff,
             block_hash: [0x33; 32],

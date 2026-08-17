@@ -335,6 +335,7 @@ fn propose_at(
     let hash = node
         .handler
         .handle_block_found(BlockFoundData {
+            shard_owed: None,
             round_id: WINNING_ROUND,
             ledger_cutoff_ts: cutoff_ts,
             block_hash: [0x11; 32],
