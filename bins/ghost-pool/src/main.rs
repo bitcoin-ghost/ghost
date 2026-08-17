@@ -4979,11 +4979,50 @@ async fn main() -> Result<()> {
             })
         })
     };
-    let convergence_handler = Arc::new(
-        ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
+    // The shared era axis for GHOST-03 backfill (#677).
+    //
+    // A peer's `proof.round_id` is in ITS numbering, so judging it against our activation round
+    // asks a question about us rather than about the share — and the fleet's boundaries genuinely
+    // differ (vm1 111,556 vs vm8 111,553), so every share in the gap was discarded as `bad_sig`
+    // for ever, the share sets never converged, and no payout checkpoint could ever be ratified.
+    // The gate's block timestamp is the one instant every node derives identically.
+    let addr_bind_activation_time: Option<i64> = {
+        let gate_height = ghost_pool::share_addr_bind_height();
+        match rpc.get_block_hash(gate_height).await {
+            Ok(hash) => match rpc.get_block_header(&hash).await {
+                Ok(hdr) => {
+                    info!(
+                        gate_height,
+                        activation_time = hdr.time,
+                        "GHOST-03: resolved the address-bind era axis from the chain"
+                    );
+                    Some(hdr.time as i64)
+                }
+                Err(e) => {
+                    warn!(gate_height, error = %e,
+                        "GHOST-03: could not read the gate block header — backfill falls back to \
+                         node-local rounds, which cannot agree across nodes (#677)");
+                    None
+                }
+            },
+            // Expected while the chain is still below the gate; there is no era to share yet.
+            Err(e) => {
+                warn!(gate_height, error = %e,
+                    "GHOST-03: gate height not on this chain yet — backfill falls back to \
+                     node-local rounds (#677)");
+                None
+            }
+        }
+    };
+    let convergence_handler = Arc::new({
+        let h = ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
             .with_send(conv_send)
-            .with_db(Arc::clone(&db)),
-    );
+            .with_db(Arc::clone(&db));
+        match addr_bind_activation_time {
+            Some(t) => h.with_addr_bind_activation_time(t),
+            None => h,
+        }
+    });
     mesh.register_handler(Arc::clone(&convergence_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
     {
