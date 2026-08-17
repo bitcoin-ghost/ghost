@@ -634,6 +634,158 @@ mod tests {
         );
     }
 
+    /// A share that was actually MINED: nonces are scanned until the header's hash genuinely
+    /// meets `REACHABLE_DIFFICULTY`, exactly as a miner does.
+    ///
+    /// `provable_share` fixes the header at `[0u8; 80]`, so every share it makes shares one hash —
+    /// fine for judging a single share, useless for a Merkle tree, where duplicate leaves are not
+    /// six leaves. But simply varying the nonce is not enough either: `REACHABLE_DIFFICULTY` sits
+    /// close enough to the edge that only about a third of arbitrary hashes clear it, so four of
+    /// six such "honest" shares were rejected for failing their own PoW. A fixture that cannot
+    /// pass the check is not evidence the check is wrong.
+    ///
+    /// Scanning for a qualifying preimage is what an honest miner does, and it keeps the share
+    /// self-proving rather than lowering the difficulty until the check stops meaning anything.
+    fn mined_share(identity: &NodeIdentity, round_id: RoundId, start_nonce: u32) -> ShareProof {
+        let era = NodeBatchChecks::at_shared_height(crate::share_addr_bind_height() - 1);
+        for nonce in start_nonce..start_nonce.saturating_add(100_000) {
+            let mut header = vec![0u8; 80];
+            header[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let real_hash = {
+                use bitcoin::hashes::{sha256d, Hash};
+                sha256d::Hash::hash(&header).to_byte_array()
+            };
+            let mut share = ShareProof {
+                round_id,
+                miner_id: [2u8; 32],
+                difficulty: REACHABLE_DIFFICULTY,
+                work: 1.0,
+                share_hash: real_hash,
+                timestamp: 0,
+                received_by: identity.node_id(),
+                template_id: Some([3u8; 32]),
+                payout_address: Some("bc1qtest".to_string()),
+                header: Some(header),
+                tier_log2: None,
+                signature: None,
+            };
+            share.sign(identity);
+            if era.share_is_valid(&share) {
+                return share;
+            }
+        }
+        panic!("no qualifying nonce in 100,000 tries — the fixture cannot mine a valid share");
+    }
+
+    /// An honest node's epoch must survive a full §6 audit and produce NO evidence.
+    ///
+    /// Every other sampling test drives the ACCUSING direction — `share_never_valid`, a mutated
+    /// leaf, a withheld answer. Those prove the machinery can convict. None of them proves it
+    /// declines to, and that is the half an operator's node depends on: §6 is wired to
+    /// `quarantine`, so a predicate that rejects honest work does not produce a warning, it
+    /// produces a fleet that mutually quarantines on the first sampling tick.
+    ///
+    /// This composes the real pieces — real signed shares, the real summary, the real λ selection,
+    /// the real Merkle verifier and the REAL era-aware predicate through
+    /// `NodeBatchChecks::at_shared_height` — and asserts the audit comes back clean.
+    ///
+    /// ⚠ It could not be shown on the regtest cluster, and that is not an oversight. The shard
+    /// only ingests shares at or above `NETWORK_TIER_LOG2` (1024x diff1) and a CPU miner cannot
+    /// make one, so every honest share the cluster produces is filtered out before it ever reaches
+    /// an epoch. The wire run proved the accusing direction against fabricated leaves; this proves
+    /// the other direction, which no reachable regtest share can.
+    #[test]
+    fn an_honest_epoch_survives_a_full_lambda_audit_with_no_evidence() {
+        use ghost_common::share_shard::EpochSummary;
+        use ghost_consensus::message::ShardSampleLeaf;
+        use ghost_consensus::shard_handler::{
+            build_sample_request, build_sample_response, verify_sample_response,
+        };
+        use ghost_reconciliation::batch::{
+            compute_merkle_proof, compute_merkle_root, verify_merkle_proof,
+        };
+
+        let accused = NodeIdentity::generate();
+        let reporter = NodeIdentity::generate();
+
+        // Six honestly mined, correctly signed shares of the PRE-bind era.
+        let shares: Vec<ShareProof> = (1..=6u32)
+            .map(|n| mined_share(&accused, 100 + u64::from(n), n * 10_000))
+            .collect();
+
+        let summary = EpochSummary::build(
+            7,
+            &accused,
+            &std::collections::BTreeMap::new(),
+            &shares,
+            compute_merkle_root,
+            None,
+        )
+        .expect("an honest epoch must summarise");
+        assert_eq!(
+            summary.share_count, 6,
+            "six distinct leaves, not one repeated six times"
+        );
+
+        // The canonical leaf order the responder serves from — the same sort the fold uses.
+        let leaves: Vec<[u8; 32]> = {
+            let mut sorted = shares.clone();
+            ghost_common::share_batch::canonical_sort(&mut sorted);
+            sorted.iter().map(|s| s.share_hash).collect()
+        };
+
+        let request = build_sample_request(reporter.node_id(), &summary, 20, &[0x5C; 32]);
+        assert_eq!(
+            request.leaf_indices.len(),
+            6,
+            "lambda past the tree asks for all of it"
+        );
+
+        let served: Vec<ShardSampleLeaf> = request
+            .leaf_indices
+            .iter()
+            .map(|&i| ShardSampleLeaf {
+                leaf_index: i,
+                share: shares
+                    .iter()
+                    .find(|s| s.share_hash == leaves[i as usize])
+                    .expect("every committed leaf is a share we hold")
+                    .clone(),
+                merkle_proof: compute_merkle_proof(&leaves, i as usize),
+            })
+            .collect();
+        let response = build_sample_response(&accused, &summary, served);
+
+        // Judged in the era these shares were actually signed for: below the addr-bind gate, so
+        // the legacy received_by signature is the rule in force.
+        let era = NodeBatchChecks::at_shared_height(crate::share_addr_bind_height() - 1);
+        let outcome = verify_sample_response(
+            &summary,
+            &request,
+            &response,
+            &reporter,
+            0,
+            verify_merkle_proof,
+            &|share| era.share_is_valid(share),
+        )
+        .expect("an honest response must verify");
+
+        assert_eq!(
+            outcome.verified.len(),
+            6,
+            "every honest leaf must be counted as verified"
+        );
+        assert!(
+            outcome.unanswered.is_empty(),
+            "every requested leaf was served"
+        );
+        assert!(
+            outcome.evidence.is_empty(),
+            "an honest epoch must produce NO evidence — §6 quarantines on what this returns, so a \
+             single spurious item here is an honest operator removed from the fleet"
+        );
+    }
+
     /// A dormant gate must not be armed by a restart: with no activation round known, no share of
     /// any era is asked for a tier.
     #[test]
