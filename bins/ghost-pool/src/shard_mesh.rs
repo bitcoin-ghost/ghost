@@ -31,7 +31,10 @@ use tracing::{debug, info, warn};
 use ghost_common::error::GhostResult;
 use ghost_common::types::NodeId;
 use ghost_consensus::mesh::MessageHandler;
-use ghost_consensus::message::{MessageEnvelope, ShardEpochSummaryMessage, ShardTableSyncMessage};
+use ghost_consensus::message::{
+    MessageEnvelope, ShardEpochSummaryMessage, ShardEvidenceMessage, ShardSampleRequestMessage,
+    ShardSampleResponseMessage, ShardTableSyncMessage,
+};
 use ghost_consensus::MessageType;
 
 use crate::shard::{PeerMergeOutcome, ShardRuntime, TableSyncMerge};
@@ -41,6 +44,14 @@ use crate::shard::{PeerMergeOutcome, ShardRuntime, TableSyncMerge};
 /// The handler cannot send it itself: `MessageHandler::handle_message` has no access to the mesh,
 /// and giving it one would make the shard handler own a reference to the thing dispatching to it.
 pub type SyncResponder = tokio::sync::mpsc::Sender<(NodeId, ShardTableSyncMessage)>;
+
+/// Where a served §6 sampling response is handed off to be sent, for the same reason as
+/// [`SyncResponder`]: the handler has no mesh reference of its own.
+pub type SampleResponder = tokio::sync::mpsc::Sender<(NodeId, ShardSampleResponseMessage)>;
+
+/// Where §12.4 evidence is handed off to be broadcast. Same reason as the responders: the handler
+/// has no mesh reference of its own.
+pub type EvidencePublisher = tokio::sync::mpsc::Sender<ShardEvidenceMessage>;
 
 /// Routes gossiped shard messages into the runtime.
 ///
@@ -60,6 +71,21 @@ pub struct ShardMeshHandler {
     /// stall this node's inbound votes, checkpoints and summaries behind it. The asker's hourly
     /// cadence is self-imposed and therefore not a limit on anyone else's behaviour.
     last_served: parking_lot::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
+    /// Outbound queue for served §6 sampling responses. `None` leaves the node able to REQUEST
+    /// audits but unable to answer them, which is a silent half-wiring — so it is logged.
+    sample_out: Option<SampleResponder>,
+    /// The share checks in force RIGHT NOW, reusing the SBC path's `ChecksFn` rather than a second
+    /// spelling of the same predicate.
+    ///
+    /// ⚠ A function, not a value, and era-aware by construction. A share must be judged by its own
+    /// round, not the current height: a height-derived predicate condemns every pre-gate share the
+    /// instant the fleet crosses a gate, which quarantined vm5 fleet-wide on 2026-08-12. Sampling
+    /// turns that into a PUBLISHED accusation against an honest node, so without this the response
+    /// half stays unwired rather than running on a predicate that could frame a peer.
+    checks: Option<crate::sbc_handler::ChecksFn>,
+    /// Outbound queue for §12.4 evidence this node's own audits produced. `None` means a failed
+    /// audit quarantines locally and tells nobody, which is logged rather than left silent.
+    evidence_out: Option<EvidencePublisher>,
 }
 
 /// Minimum gap between whole-table syncs served to the SAME peer. Well under the hourly ask
@@ -72,7 +98,28 @@ impl ShardMeshHandler {
             shard,
             sync_out: None,
             last_served: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            sample_out: None,
+            checks: None,
+            evidence_out: None,
         }
+    }
+
+    /// Wire the publish half, so a failed audit reaches the rest of the fleet.
+    pub fn with_evidence_publisher(mut self, tx: EvidencePublisher) -> Self {
+        self.evidence_out = Some(tx);
+        self
+    }
+
+    /// Wire the era-aware share checks, enabling §6 sampling RESPONSES to be verified.
+    pub fn with_share_checks(mut self, checks: crate::sbc_handler::ChecksFn) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+
+    /// Wire the responder half for §6 sampling, so this node can ANSWER audits.
+    pub fn with_sample_responder(mut self, tx: SampleResponder) -> Self {
+        self.sample_out = Some(tx);
+        self
     }
 
     /// Wire the responder half, so this node can SERVE whole-table syncs as well as request them.
@@ -315,6 +362,267 @@ impl MessageHandler for ShardMeshHandler {
                 Ok(None) => {}
                 Err(e) => warn!(error = %e, "shard: table sync handling failed"),
             },
+            MessageType::ShardSampleRequest => {
+                let req: ShardSampleRequestMessage = match serde_json::from_slice(&envelope.payload)
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(error = %e, "shard: undeserialisable sampling request dropped");
+                        return Ok(());
+                    }
+                };
+                // Answer only what the SENDER asked for. `requesting_node` is payload, so a
+                // mismatch means someone is trying to have our evidence delivered elsewhere —
+                // the same unsigned-field trap as the table-sync request.
+                if req.requesting_node != envelope.sender {
+                    warn!(
+                        sender = %hex::encode(&envelope.sender[..4]),
+                        claimed = %hex::encode(&req.requesting_node[..4]),
+                        "shard: sampling request claims a different requester than it was signed \
+                         by — NOT served"
+                    );
+                    return Ok(());
+                }
+                match self.shard.sample_response_for(&req) {
+                    Ok(Some(response)) => {
+                        info!(
+                            epoch = req.epoch,
+                            peer = %hex::encode(&envelope.sender[..4]),
+                            leaves = response.leaves.len(),
+                            asked = req.leaf_indices.len(),
+                            "shard: serving a §6 sampling request"
+                        );
+                        match self.sample_out.as_ref() {
+                            Some(tx) => {
+                                if tx.try_send((envelope.sender, response)).is_err() {
+                                    warn!("shard: sampling response dropped (send queue full)");
+                                }
+                            }
+                            None => debug!(
+                                "shard: sampling request received but no responder channel wired"
+                            ),
+                        }
+                    }
+                    Ok(None) => debug!(
+                        epoch = req.epoch,
+                        "shard: sampling request not served (not ours, not ratified, or no \
+                         matching evidence)"
+                    ),
+                    Err(e) => warn!(error = %e, "shard: sampling request handling failed"),
+                }
+            }
+            MessageType::ShardSampleResponse => {
+                let resp: ShardSampleResponseMessage =
+                    match serde_json::from_slice(&envelope.payload) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(error = %e, "shard: undeserialisable sampling response dropped");
+                            return Ok(());
+                        }
+                    };
+                // Without the era-aware checks there is NO safe predicate to judge against, and a
+                // wrong one publishes an accusation rather than merely rejecting a share. Refuse
+                // to verify rather than guess.
+                let Some(checks_fn) = self.checks.as_ref() else {
+                    warn!(
+                        "shard: sampling response received but the era-aware share checks are not \
+                         wired — NOT verified (a height-derived predicate would risk framing an \
+                         honest peer)"
+                    );
+                    return Ok(());
+                };
+                // Bind the claimed responder to the authenticated sender, exactly as the
+                // request arm does. `responding_node` is payload, so without this a peer whose
+                // envelopes we accept could answer on another node's behalf — and combined with
+                // the pending-audit lookup that is how an audit gets misdirected or discarded.
+                if resp.responding_node != envelope.sender {
+                    warn!(
+                        sender = %hex::encode(&envelope.sender[..4]),
+                        claimed = %hex::encode(&resp.responding_node[..4]),
+                        "shard: sampling response claims a different responder than it was signed \
+                         by — dropped"
+                    );
+                    return Ok(());
+                }
+
+                // ⚠ Judge the peer's shares by BLOCK HEIGHT, never by our local rounds.
+                //
+                // `checks_fn()` builds the era from OUR activation rounds, and those are
+                // node-local: a long-running node auditing a newly commissioned one would see
+                // every `share.round_id < activation`, take the pre-bind branch, and reject
+                // shares that were signed correctly — publishing λ accusations against an honest
+                // operator. Multi-operator is precisely the case §6 exists for, so that predicate
+                // must not be used across nodes.
+                //
+                // The epoch gives a height both sides derive identically from the chain
+                // (`epoch * EPOCH_BLOCKS`), and the gates are defined in height terms before
+                // being translated into local rounds. `checks_fn` is still consulted for the
+                // fallback below, so the wiring stays honest about needing it.
+                let _local_checks = checks_fn();
+                let epoch_height = resp
+                    .epoch
+                    .saturating_mul(ghost_common::share_shard::EPOCH_BLOCKS.get());
+                let checks = crate::sbc_checks::NodeBatchChecks::at_shared_height(epoch_height);
+                let predicate = |share: &ghost_common::types::ShareProof| {
+                    use ghost_common::batch_consensus::BatchChecks;
+                    checks.share_is_valid(share)
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                match self.shard.apply_sample_response(&resp, &predicate, now_ms) {
+                    Ok(Some(outcome)) => {
+                        // Evidence is the headline: it is a publishable accusation that a peer
+                        // committed work it cannot back, which is what §6 exists to produce.
+                        if outcome.evidence.is_empty() {
+                            info!(
+                                epoch = resp.epoch,
+                                peer = %hex::encode(&resp.responding_node[..4]),
+                                verified = outcome.verified.len(),
+                                unanswered = outcome.unanswered.len(),
+                                "shard: §6 audit clean"
+                            );
+                        } else {
+                            warn!(
+                                epoch = resp.epoch,
+                                peer = %hex::encode(&resp.responding_node[..4]),
+                                verified = outcome.verified.len(),
+                                unanswered = outcome.unanswered.len(),
+                                evidence = outcome.evidence.len(),
+                                "shard: §6 audit FAILED — committed leaves do not pass validity"
+                            );
+                            // Quarantine locally AND publish, in that order.
+                            //
+                            // Local first because our own audit is already conclusive to us and a
+                            // send can fail; publishing first would leave us still merging from a
+                            // node we have proven dishonest if the broadcast dropped. Publishing
+                            // matters because §12.4 evidence is re-derivable by every peer from
+                            // the bytes alone — a verdict one node keeps to itself protects only
+                            // that node, while the accused keeps being merged everywhere else.
+                            let _ = self.shard.quarantine(resp.responding_node)?;
+                            // ONE broadcast, not one per failing leaf.
+                            //
+                            // A single conclusive leaf is a complete §12.4 proof and quarantine is
+                            // idempotent, but each message re-carries the whole EpochSummary at up
+                            // to 240 KB. Publishing all λ let the ACCUSED decide how much fan-out
+                            // every auditor emits — serve 20 bad leaves, get 20 x 240 KB x peers
+                            // of broadcast from each. The publish channel holds 16 < λ = 20, so a
+                            // full-failure sample was also guaranteed to log dropped evidence.
+                            if let Some(tx) = self.evidence_out.as_ref() {
+                                if let Some(ev) = outcome.evidence.into_iter().next() {
+                                    if tx.try_send(ev).is_err() {
+                                        warn!(
+                                            "shard: evidence dropped (publish queue full) — the \
+                                             accused stays quarantined here but peers are not told"
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "shard: audit produced evidence but no publish channel is \
+                                     wired — quarantined locally, peers NOT told"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(error = %e, "shard: sampling response handling failed"),
+                }
+            }
+            MessageType::ShardEvidence => {
+                let ev: ShardEvidenceMessage = match serde_json::from_slice(&envelope.payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(error = %e, "shard: undeserialisable evidence dropped");
+                        return Ok(());
+                    }
+                };
+                // §12.4's contract is that EVERY peer reaches the same verdict from the same
+                // bytes, so this re-derives it rather than trusting the reporter. The era is
+                // decided by the accused epoch's HEIGHT for the same reason sampling is: judging
+                // another node's shares by our local rounds would convict an honest one.
+                // Admission first: this arm parses up to 240 KB and runs two ed25519 verifies
+                // plus a PoW recompute, synchronously on the mesh dispatch task. Every
+                // neighbouring shard arm gates before that work; this one gated on nothing, so any
+                // meshed peer could stream evidence and stall dispatch for everyone.
+                if !self.shard.peer_is_ratified(&envelope.sender)? {
+                    debug!(
+                        reporter = %hex::encode(&envelope.sender[..4]),
+                        "shard: evidence from outside the ratified set — ignored"
+                    );
+                    return Ok(());
+                }
+
+                // Too old to act on. Bounded by EPOCH against our own tip, not by the message's
+                // `timestamp` — that field is outside `signing_message`, so a relay can rewrite it
+                // and an age bound resting on it would be defeated by the very replay it exists to
+                // stop.
+                if self.shard.evidence_is_too_old(ev.summary.epoch) {
+                    info!(
+                        epoch = ev.summary.epoch,
+                        "shard: §12.4 evidence is older than the retention window — ignored (past \
+                         it the claim is unfalsifiable, and replaying it would re-quarantine a \
+                         node after every restart)"
+                    );
+                    return Ok(());
+                }
+
+                // Refuse evidence from an epoch that straddles a gate: no single era describes
+                // it, so a verdict against it convicts shares that were correct in their own era.
+                if crate::shard::ShardRuntime::epoch_straddles_a_gate(ev.summary.epoch) {
+                    info!(
+                        epoch = ev.summary.epoch,
+                        "shard: §12.4 evidence names an epoch that straddles a gate — no verdict \
+                         is sound for it, nobody quarantined"
+                    );
+                    return Ok(());
+                }
+                let epoch_height = ev
+                    .summary
+                    .epoch
+                    .saturating_mul(ghost_common::share_shard::EPOCH_BLOCKS.get());
+                let checks = crate::sbc_checks::NodeBatchChecks::at_shared_height(epoch_height);
+                let predicate = |share: &ghost_common::types::ShareProof| {
+                    use ghost_common::batch_consensus::BatchChecks;
+                    checks.share_is_valid(share)
+                };
+                match ghost_consensus::shard_handler::verify_shard_evidence(
+                    &ev,
+                    ghost_reconciliation::batch::verify_merkle_proof,
+                    &predicate,
+                ) {
+                    Ok(verdict) => {
+                        // Quarantine stops anything FURTHER being accepted from the accused. It
+                        // does not un-credit their existing column — the counters are grow-only,
+                        // and a max cannot be undone.
+                        if self.shard.quarantine(verdict.accused)? {
+                            warn!(
+                                accused = %hex::encode(&verdict.accused[..4]),
+                                epoch = verdict.epoch,
+                                leaf = ev.leaf_index,
+                                "shard: §12.4 evidence CONFIRMED — quarantining the accused; its \
+                                 existing column stands and correcting it is a fleet decision"
+                            );
+                        } else {
+                            debug!(
+                                accused = %hex::encode(&verdict.accused[..4]),
+                                "shard: evidence re-confirms an already-quarantined node"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // A refused accusation is a statement about the REPORTER, not the accused.
+                        // Nothing is quarantined on a broken proof, which is what stops evidence
+                        // being a denial-of-service against honest nodes.
+                        info!(
+                            reason = %e,
+                            reporter = %hex::encode(&envelope.sender[..4]),
+                            "shard: §12.4 evidence refused — no verdict, nobody quarantined"
+                        );
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())

@@ -64,6 +64,13 @@ prune_height = 0
 # A valid REGTEST address (bcrt1…). Replace with one from
 # `bitcoin-cli -regtest getnewaddress`.
 treasury_address = "${TREASURY_ADDRESS}"
+# Node-reward payout address. WITHOUT this a node is not even a CANDIDATE for the
+# 5-4-3-2-1 capability shares: `get_all_node_ids_with_payout()` returns only nodes that
+# have one, so qualification reported `total_nodes=0 qualified_nodes=0` on every block.
+# After 10 consecutive blocks with no qualifying node, H-FUND-2 HALTS block production
+# ("This indicates a verification system failure"), which is correct behaviour reacting
+# to a config omission.
+node_payout_address = "${NODE_PAYOUT_ADDRESS}"
 treasury_fee_percent = 1.0
 # Construct the share-shard runtime so fold + epoch-summary gossip run over the
 # real transport. NOT `shard_arm_genesis`: that converts the *mainnet* pinned

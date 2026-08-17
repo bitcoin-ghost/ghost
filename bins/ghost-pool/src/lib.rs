@@ -591,6 +591,10 @@ mod gates {
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
+    /// Not a height — the difficulty-tier floor the shard will ingest. Same reasoning as the
+    /// gates: a regtest fleet cannot mine one, so without an override the rehearsal exercises an
+    /// empty shard. See [`crate::network_tier_log2`].
+    pub(super) static NETWORK_TIER_FLOOR: OnceLock<u32> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -684,6 +688,24 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
     let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
 
+    // Not a height, but resolved here for the same reason and under the same mainnet lock, so
+    // there is one place to look for "what did this run actually enforce".
+    let tier_floor = gates::from_env(
+        "GHOST_NETWORK_TIER_LOG2",
+        network,
+        u64::from(ghost_common::share_shard::NETWORK_TIER_LOG2),
+    );
+    let tier_floor = clamp_tier_floor(tier_floor);
+    let _ = gates::NETWORK_TIER_FLOOR.set(tier_floor);
+    if tier_floor != ghost_common::share_shard::NETWORK_TIER_LOG2 {
+        tracing::warn!(
+            tier_floor,
+            shipping_floor = ghost_common::share_shard::NETWORK_TIER_LOG2,
+            "SHARD TIER FLOOR LOWERED — rehearsal only. This node will fold shares mainnet \
+             would never admit."
+        );
+    }
+
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
         || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
@@ -760,6 +782,53 @@ pub fn binds_difficulty_tier(height: u64) -> bool {
 /// Height at and above which the GHOST-09 share signature also binds `payout_address`.
 pub fn share_addr_bind_height() -> u64 {
     *gates::SHARE_ADDR_BIND.get_or_init(|| SHARE_ADDR_BIND_HEIGHT)
+}
+
+/// The difficulty tier at and above which a share enters the shard (§4). Mainnet is always
+/// [`ghost_common::share_shard::NETWORK_TIER_LOG2`]; off-mainnet it is overridable.
+///
+/// ⚠ Why this needs an override at all: the floor is 1024x diff1, and **no CPU miner can reach
+/// it**. So on a regtest fleet every honestly mined share is filtered out before it reaches an
+/// epoch — the fold reports `shares=0` while miners are actively submitting, and the shard under
+/// test is permanently empty. Anything proven against that fleet was proven against nothing.
+///
+/// That blocked the half of §6 λ-sampling that actually protects operators. The ACCUSING
+/// direction can be rehearsed by fabricating leaves, but the "an honest node is NOT convicted"
+/// direction needs real shares in a real epoch, and none can exist. §6 is wired to `quarantine`,
+/// so the failure mode it guards against is a fleet that mutually quarantines on the first
+/// sampling tick — worth being able to rehearse on the real shipping binary rather than only in
+/// a unit test.
+///
+/// Same discipline as the gates above: never on mainnet, and the binary under test stays the
+/// binary that ships.
+pub fn network_tier_log2() -> u32 {
+    *gates::NETWORK_TIER_FLOOR.get_or_init(|| ghost_common::share_shard::NETWORK_TIER_LOG2)
+}
+
+/// Clamp an environment-supplied tier floor to something that can only ever WEAKEN the filter.
+///
+/// Two ways this bites if left to a bare `as u32`. A value above the shipping floor is not a
+/// rehearsal of anything that ships — it would fold a stricter shard than mainnet and "prove"
+/// behaviour no node will ever have. And `u64 as u32` truncates rather than saturates, so
+/// `4294967306` (2^32 + 10) would silently arrive as `10` and read as a deliberate setting.
+fn clamp_tier_floor(raw: u64) -> u32 {
+    u32::try_from(raw)
+        .unwrap_or(ghost_common::share_shard::NETWORK_TIER_LOG2)
+        .min(ghost_common::share_shard::NETWORK_TIER_LOG2)
+}
+
+/// The shard's ingest predicate, reading the floor resolved for this run.
+///
+/// Mirrors [`ghost_common::share_shard::crosses_network_tier`] exactly, including that an absent
+/// tier passes (a pre-gate share committed to no tier and is judged by the rules of its own era).
+/// It exists so the fold's input query and the gossip receive filter cannot end up reading
+/// different floors — two spellings of one gossip rule is a partition that presents as a bug in
+/// something else entirely.
+pub fn crosses_network_tier(tier_log2: Option<u32>) -> bool {
+    match tier_log2 {
+        Some(tier) => tier >= network_tier_log2(),
+        None => true,
+    }
 }
 
 /// Height at and above which every node settles won blocks by observing them on-chain.
@@ -986,5 +1055,69 @@ mod tier_gate_tests {
             "config/sri/translator-config.toml must ship quantise_to_tiers = true in the arming \
              release — the translator has no chain view, so its flag is the third half of the gate"
         );
+    }
+}
+
+#[cfg(test)]
+mod tier_floor_tests {
+    use super::*;
+    use ghost_common::config::BitcoinNetwork;
+    use ghost_common::share_shard::NETWORK_TIER_LOG2;
+
+    /// Mainnet is not negotiable. The whole point of an override is that a test fleet runs the
+    /// SHIPPING binary — which is only true if that binary ignores the variable in production.
+    #[test]
+    fn the_tier_floor_override_is_ignored_on_mainnet() {
+        // SAFETY: single-threaded test, variable removed before returning.
+        unsafe { std::env::set_var("GHOST_TEST_TIER_FLOOR", "1") };
+        let mainnet = gates::from_env(
+            "GHOST_TEST_TIER_FLOOR",
+            &BitcoinNetwork::Mainnet,
+            u64::from(NETWORK_TIER_LOG2),
+        );
+        let regtest = gates::from_env(
+            "GHOST_TEST_TIER_FLOOR",
+            &BitcoinNetwork::Regtest,
+            u64::from(NETWORK_TIER_LOG2),
+        );
+        unsafe { std::env::remove_var("GHOST_TEST_TIER_FLOOR") };
+
+        assert_eq!(
+            mainnet,
+            u64::from(NETWORK_TIER_LOG2),
+            "mainnet must ignore the override entirely"
+        );
+        assert_eq!(
+            regtest, 1,
+            "off-mainnet must honour it, or there is no rehearsal"
+        );
+    }
+
+    /// The clamp may only ever WEAKEN the filter, and must not truncate.
+    #[test]
+    fn the_tier_floor_clamp_cannot_strengthen_or_wrap() {
+        assert_eq!(
+            clamp_tier_floor(0),
+            0,
+            "a floor of 0 folds everything — allowed"
+        );
+        assert_eq!(clamp_tier_floor(1), 1);
+        assert_eq!(
+            clamp_tier_floor(u64::from(NETWORK_TIER_LOG2) + 5),
+            NETWORK_TIER_LOG2,
+            "a floor STRICTER than mainnet rehearses behaviour no node will ever have"
+        );
+        assert_eq!(
+            clamp_tier_floor(u64::from(u32::MAX) + 1 + u64::from(NETWORK_TIER_LOG2)),
+            NETWORK_TIER_LOG2,
+            "2^32 + 10 must not truncate to 10 and read as a deliberate setting"
+        );
+    }
+
+    /// An absent tier still passes, matching `ghost_common`'s predicate — a pre-gate share
+    /// committed to no tier and is judged by the rules of its own era.
+    #[test]
+    fn an_absent_tier_passes_at_any_floor() {
+        assert!(crosses_network_tier(None));
     }
 }

@@ -2722,15 +2722,38 @@ impl Database {
         })
     }
 
-    /// Get the highest round_id from the shares table
+    /// Get the highest round_id this node has ever issued.
     ///
-    /// Returns 0 if no shares exist (fresh install).
+    /// Returns 0 only on a genuinely fresh install (no rounds and no shares).
+    ///
+    /// ⚠ This MUST consider `rounds`, not just `shares`. `RoundManager::reload_from_db` uses the
+    /// result to restore the round counter, and `start_round()` issues the next id from it — so a
+    /// value that is too low re-issues round ids that ALREADY EXIST in `rounds`, carrying the
+    /// block height they were created at. `create_round_if_not_exists` then leaves that stale
+    /// height in place, and since `shard_epoch_shares` binds a share to its epoch by
+    /// `rounds.block_height`, every share submitted against a re-issued id is filed under a
+    /// long-past epoch. That epoch is already folded, `fold_epoch` returns `AlreadyFolded`, and
+    /// the work is **silently never credited** — the fold just logs `shares=0` while miners are
+    /// actively submitting.
+    ///
+    /// Reading only `shares` made that inevitable rather than unlucky, because the shard's own
+    /// fold DELETES the shares it has folded (`shard_fold_epoch`), and `delete_old_shares` prunes
+    /// more. Both drag `MAX(round_id) FROM shares` backwards while `rounds` keeps climbing. It was
+    /// observed on the regtest cluster with `rounds` at 668 and `shares` at 450: a 218-round
+    /// rewind across a restart, after which eight real mined shares were bound to height 338
+    /// (epoch 56) and credited to nobody.
     pub fn get_max_round_id(&self) -> GhostResult<u64> {
         self.with_connection(|conn| {
             let max_id: u64 = conn
-                .query_row("SELECT COALESCE(MAX(round_id), 0) FROM shares", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT MAX(m) FROM (
+                         SELECT COALESCE(MAX(round_id), 0) AS m FROM rounds
+                         UNION ALL
+                         SELECT COALESCE(MAX(round_id), 0) AS m FROM shares
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(max_id)
         })
@@ -12355,6 +12378,66 @@ mod tests {
         assert_eq!(
             deleted, 0,
             "Recent share should survive minimum retention guard"
+        );
+    }
+
+    /// The round counter must not rewind when folded or pruned shares leave `rounds` ahead of
+    /// `shares`.
+    ///
+    /// This is the restart path. `RoundManager::reload_from_db` sets the counter from this value
+    /// and `start_round()` issues the next id, so a value taken from `shares` alone re-issues ids
+    /// that already exist in `rounds` at the height they were created — and because
+    /// `shard_epoch_shares` bins a share by `rounds.block_height`, the new work is filed under an
+    /// epoch that is already folded and is credited to nobody, silently.
+    ///
+    /// Observed live before the fix: `rounds` at 668, `shares` at 450 after the shard's fold
+    /// deleted what it had folded, and eight real mined shares bound to height 338.
+    #[test]
+    fn max_round_id_does_not_rewind_when_shares_lag_rounds() {
+        let db = Database::in_memory().expect("Failed to create in-memory database");
+
+        let round = |round_id: u64, block_height: u64| RoundRecord {
+            round_id,
+            block_height,
+            block_hash: None,
+            start_time: 1_700_000_000,
+            end_time: None,
+            total_shares: 0,
+            total_work: 0.0,
+            winning_miner: None,
+            found_by_node: None,
+            payout_status: PayoutStatus::Active,
+            subsidy_sats: None,
+            tx_fees_sats: None,
+        };
+
+        // An old round, and a much newer one — as a running pool accumulates.
+        db.create_round(&round(450, 338)).expect("create round 450");
+        db.create_round(&round(668, 370)).expect("create round 668");
+
+        // The only surviving share belongs to the OLD round: everything newer has been folded
+        // away by the shard or pruned by retention. This is the ordinary steady state, not a
+        // corrupted database.
+        db.insert_share(&ShareRecord {
+            id: None,
+            round_id: 450,
+            miner_id: "miner".to_string(),
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: "surviving_share".to_string(),
+            timestamp: 1_700_000_001,
+            received_by: "node1".to_string(),
+            valid: true,
+        })
+        .expect("insert share");
+
+        assert_eq!(
+            db.get_max_round_id().expect("max round id"),
+            668,
+            "the counter must come from the highest round ever ISSUED (668), not the highest \
+             round that still has a share (450) — restoring 450 re-issues 451.. over rounds that \
+             already exist at a stale height, and the shares filed against them are folded into a \
+             closed epoch and never credited"
         );
     }
 

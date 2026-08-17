@@ -33,6 +33,11 @@ echo "==> workflow line continuations"
 echo "==> inlined installer copies"
 ./scripts/check-inlined-copies.sh || { echo "FAILED: inlined copies drifted" >&2; exit 1; }
 
+# Every Shard message type must be dispatched by some handler. Four times on 2026-08-16 a piece of
+# ghost-consensus was complete, unit-tested, and wired to nothing — the tests could not see it
+# because the layer being tested and the layer being wired are different layers.
+./scripts/check-wiring.sh || { echo "FAILED: a message type has no dispatch arm" >&2; exit 1; }
+
 echo "==> stratum config agreement"
 ./scripts/check-stratum-config-agreement.sh || { echo "FAILED: stratum config sources disagree" >&2; exit 1; }
 

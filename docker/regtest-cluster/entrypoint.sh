@@ -42,6 +42,11 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-echo "[$NODE_NAME] starting ghost-pool (genesis='${GENESIS_ARG}') on regtest"
+# Extra flags, per-service. Used to enable the Template Distribution Protocol server on the
+# node that fronts the SV2 stack (`EXTRA_ARGS: "--tdp-enabled --tdp-port 8442"`), which is how
+# pool_sv2 gets templates. Left empty everywhere else.
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+echo "[$NODE_NAME] starting ghost-pool (genesis='${GENESIS_ARG}' extra='${EXTRA_ARGS}') on regtest"
 # shellcheck disable=SC2086
-exec /usr/local/bin/ghost-pool ${GENESIS_ARG} --config /etc/ghost/config.toml
+exec /usr/local/bin/ghost-pool ${GENESIS_ARG} ${EXTRA_ARGS} --config /etc/ghost/config.toml
