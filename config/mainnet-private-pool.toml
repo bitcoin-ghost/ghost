@@ -1,0 +1,104 @@
+# =============================================================================
+# Bitcoin Ghost - Mainnet Private Pool Configuration
+# =============================================================================
+#
+# A PRIVATE POOL: one operator, password-gated, not advertised in DNS, with
+# rewards aggregated across its miners and paid out in proportion to the work
+# each contributed.
+#
+# This is the "let my friends mine through my node" setup. You run it; they
+# point their miners at it with the password; everyone is paid their share.
+#
+# -----------------------------------------------------------------------------
+# TRUST MODEL — state this to anyone mining with you
+# -----------------------------------------------------------------------------
+#
+# A private pool has ONE operator, so its payout proposals are approved locally
+# rather than voted on. There is no quorum, and deliberately so: a quorum here
+# would be your own nodes agreeing with each other, which protects nobody.
+#
+# The consequence is honest and worth saying out loud: **your miners are trusting
+# you.** Nothing in the protocol stops a private-pool operator from paying
+# themselves. That is the same trust anyone extends to any centralised pool, and
+# it is the trade for not needing four machines to pay three friends.
+#
+# If you want payouts that are checked by parties who are NOT you, that is
+# `public_pool` — a genuinely multi-operator mesh where proposals go to a BFT
+# vote across independent operators.
+#
+# Choosing between the three modes:
+#
+#   public_pool   — many independent operators, BFT-voted payouts, in DNS
+#   private_pool  — YOU, several miners, no quorum, not in DNS   <- this file
+#   private_solo  — YOU, your hardware only, pays one address    (mainnet-solo.toml)
+#
+# =============================================================================
+
+[identity]
+key_path = "/etc/ghost/node.key"
+display_name = "Private Pool"
+
+[bitcoin]
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_user = "${BITCOIN_RPC_USER:-ghostrpc}"
+rpc_password = "${BITCOIN_RPC_PASSWORD}"
+network = "mainnet"
+zmq_hashblock = "tcp://127.0.0.1:28332"
+zmq_hashtx = "tcp://127.0.0.1:28333"
+
+[network]
+# Reachable by your miners. A LAN address is fine if they are all on your LAN.
+public_address = "${PUBLIC_ADDRESS:-127.0.0.1}"
+sv2_port = 34255
+sv1_port = 3333
+http_port = 8080
+max_miners = 1000
+
+# NOTE: there is no `public_mining` key. It was removed from the config — `mining_mode`
+# is the single source of truth for whether this node is publicly discoverable.
+# Setting `public_mining` here does nothing: unknown keys are silently ignored.
+mining_mode = "private_pool"           # Options: public_pool | private_pool | private_solo
+private_mining_password = "${PRIVATE_MINING_PASSWORD}"  # REQUIRED - min 8 chars
+# NOTE: there is no `pool_payout_address` key here. In a pool mode the coinbase pays the
+# aggregated miner ledger, and the pool/treasury side is taken from `[pool] treasury_address`
+# (main.rs builds TemplateConfig.pool_payout_address from it). Setting a
+# `pool_payout_address` in [network] would be silently ignored.
+
+# Security required for mainnet
+internal_api_secret = "${INTERNAL_API_SECRET}"
+noise_enabled = true
+
+# No seed nodes needed: a private pool does not join the public mesh and does not
+# need peers to approve its payouts.
+seed_nodes = []
+
+[network.p2p]
+share_propagation = 8555
+block_announcement = 8556
+consensus_voting = 8557
+health_monitoring = 8558
+discovery = 8559
+elder_management = 8560
+payout_proposal = 8561
+payout_transaction = 8562
+
+[policy]
+profile = "bitcoin_pure"
+
+[storage]
+db_path = "/var/lib/ghost/data"
+wal_mode = true
+archive_mode = false
+prune_height = 10000
+
+[pool]
+# The same 1% fee as every other mode (POOL_FEE_BASIS_POINTS = 100). There is one
+# fee model across all three modes by design — divergent fee paths are where
+# consensus bugs breed (#592).
+treasury_address = "${TREASURY_ADDRESS}"
+min_payout_sats = 50000
+payout_interval_blocks = 100
+
+[ghost_pay]
+enabled = false

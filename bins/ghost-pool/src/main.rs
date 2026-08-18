@@ -7797,6 +7797,7 @@ async fn main() -> Result<()> {
         Arc::clone(&vote_handler),
         Arc::clone(&template_processor),
         Arc::clone(&qualification_provider_for_health), // Reuse provider from health_handler
+        config.network.mining_mode,
     )?);
 
     // GHOST-02: install the ledger-recompute validator on the vote handler now

@@ -210,6 +210,10 @@ fn build_node(
             vote_handler,
             Arc::clone(&template),
             Arc::new(QualifiedCapabilityProvider::new(Arc::clone(&db))),
+            // PublicPool: these harnesses exercise the BFT-voted path, which is the
+            // mode with independent operators. A private mode here would approve
+            // locally and the test would stop covering voting at all.
+            ghost_common::config::MiningMode::PublicPool,
         )
         .expect("handler"),
     );
