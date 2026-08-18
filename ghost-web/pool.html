@@ -432,7 +432,8 @@
   }
 
   var POOL_NODES = [
-    { id: 'vm1' }, { id: 'vm2' }, { id: 'vm3' }, { id: 'vm4' }
+    { id: 'vm1' }, { id: 'vm2' }, { id: 'vm3' }, { id: 'vm4' },
+    { id: 'vm5' }, { id: 'vm6' }, { id: 'vm7' }, { id: 'vm8' }
   ];
   var lastStats = { hashrate: 0, miners: 0, blocks: 0, height: 0, nodes: [] };
 
@@ -821,9 +822,32 @@
   // Cache of last-good per-window best so a transient fetch failure
   // doesn't blank the record tiles.
   var lastRecords = {};
+  // `month` is refreshed once every RECORDS_MONTH_EVERY cycles, not every cycle.
+  //
+  // Measured 2026-08-18 through this exact proxy path: `records?window=month` costs 6.9s on
+  // vm1, 9.4s on vm4 and TIMES OUT on vm6 (504 at nginx's `proxy_read_timeout 10s`), against
+  // 0.03s for day and 0.25s for week. Ranking by rarity means `reverse_hex(share_hash)` over
+  // every row in the window, which no index can serve.
+  //
+  // At one cycle per 60s across 8 nodes that was ~8 x 8s of blocking query per minute, and
+  // until the API moved these reads onto a blocking pool it stalled every OTHER request on the
+  // same node — which is what made the whole page feel slow rather than one panel.
+  //
+  // Skipping it is safe because the caching below already handles a missing fresh value: it
+  // keeps `lastRecords[w]` unless the fresh one is genuinely rarer or the cached one has aged
+  // out, and the monotonicity pass propagates week's record outward into month. vm6 has been
+  // 504-ing on month for a while, so this path is already exercised in production.
+  //
+  // Cycle 0 still fetches month, so a fresh page load populates it immediately.
+  var RECORDS_MONTH_EVERY = 10;
+  var __recCycle = 0;
+
   async function refreshRecords() {
     var jobs = [];
-    REC_WINDOWS.forEach(function (w) {
+    var cycleWindows = (__recCycle++ % RECORDS_MONTH_EVERY === 0)
+      ? REC_WINDOWS
+      : REC_WINDOWS.filter(function (w) { return w !== 'month'; });
+    cycleWindows.forEach(function (w) {
       POOL_NODES.forEach(function (n) {
         jobs.push(
           fetch('/api/pool/' + n.id + '/api/v1/pool/records?window=' + w)
@@ -1563,7 +1587,7 @@ function sampleQuality() {
 // per real share with real quality). If the queue runs dry, it falls
 // back to hashrate-derived emission so the scene never looks frozen
 // during a fetch stall.
-const POOL_VMS = ['vm1', 'vm2', 'vm3', 'vm4'];
+const POOL_VMS = ['vm1', 'vm2', 'vm3', 'vm4', 'vm5', 'vm6', 'vm7', 'vm8'];
 const shareQueue = [];
 const lastTsByVm = {};
 const MAX_QUEUE = 2000;
