@@ -1273,6 +1273,16 @@ impl GhostdReaperApply {
     }
 }
 
+/// Memo store behind [`VerificationState::records_cache`]: window name -> (computed at, answer).
+///
+/// Factored out because clippy rightly refuses the inline form — three nested generics deep is
+/// unreadable at a field declaration.
+pub type RecordsCache = Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<String, (Instant, Option<ghost_storage::models::BestShare>)>,
+    >,
+>;
+
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -1335,6 +1345,22 @@ pub struct VerificationState {
     stratum_sv1_port: u16,
     /// Database for queries (optional)
     pub database: Option<Database>,
+    /// Memo for `GET /api/v1/pool/records`, keyed by window name.
+    ///
+    /// This endpoint is the hottest slow read in the product: ghost-web asks every node for four
+    /// windows, and `window=month` costs 7-20s because ranking by rarity means
+    /// `reverse_hex(share_hash)` over every row in the window — a function of the column, so no
+    /// index can serve the ORDER BY. Measured 2026-08-18: vm1 6.9s, vm4 9.4s, vm6 504 at nginx's
+    /// `proxy_read_timeout 10s`.
+    ///
+    /// The result barely moves between requests, so it is memoised rather than recomputed. The TTL
+    /// is per window (see `records_ttl`), because how fast the answer can change differs by three
+    /// orders of magnitude between `block` and `month`.
+    ///
+    /// `Option<BestShare>` is cached, not `Result`: a MISS is a legitimate answer worth caching
+    /// (a quiet window genuinely has no record), whereas an error must not be, or one transient
+    /// failure would be served for the whole TTL.
+    pub records_cache: RecordsCache,
     /// Ghost Core RPC client (optional)
     pub rpc: Option<Arc<BitcoinRpc>>,
     /// A-2b block-hash oracle for the consensus challenger draw. Injected from
@@ -1720,6 +1746,7 @@ impl VerificationState {
             policy_engine: parking_lot::Mutex::new(PolicyEngine::new(policy_profile)),
             capabilities,
             start_time: Instant::now(),
+            records_cache: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             get_block_height: Box::new(|| 0),
             share_tier_bind_height: u64::MAX,
             get_round_id: Box::new(|| 0),

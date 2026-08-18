@@ -3026,6 +3026,23 @@ async fn api_miner_history_handler(
 ///
 /// The miner ID is returned in redacted form to preserve privacy while
 /// still giving enough of a handle to recognise one's own worker.
+/// How long a `pool/records` answer stays fresh, by window.
+///
+/// Deliberately not one number. `block` is a 600s window that turns over constantly and is cheap
+/// to compute (6ms), so caching it hard would show users a stale record for no gain. `month` is a
+/// 30-day window whose record changes maybe once a week and costs 7-20s, so it is the opposite
+/// trade. Anything not recognised gets the shortest TTL — an unknown window is not a licence to
+/// serve stale data.
+fn records_ttl(window: &str) -> std::time::Duration {
+    use std::time::Duration;
+    match window {
+        "month" => Duration::from_secs(300),
+        "week" => Duration::from_secs(120),
+        "day" => Duration::from_secs(60),
+        _ => Duration::from_secs(15),
+    }
+}
+
 async fn api_pool_records_handler(
     State(state): State<Arc<VerificationState>>,
     Query(params): Query<PoolRecordsQuery>,
@@ -3090,25 +3107,54 @@ async fn api_pool_records_handler(
     // it queues behind. Demonstrated on vm6 — with one month query in flight, `/health` (which
     // touches no database at all) blocked for the full 40s probe cap, then answered in 0.04s the
     // moment it finished. That is why the whole page hangs rather than one panel being slow.
-    let db_best = db.clone();
-    let local_best =
-        match tokio::task::spawn_blocking(move || db_best.get_best_share_since(since_ts))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "pool records: best-share task failed");
-                Ok(None)
-            }) {
-            Ok(best) => best,
-            Err(e) => {
-                error!(error = %e, "Failed to query best share");
-                return Json(serde_json::json!({
-                    "window": window_name,
-                    "since_ts": since_ts,
-                    "found": false,
-                    "error": "Database error",
-                }));
-            }
-        };
+    // Memoised per window. The TTL is scaled to how fast each window's answer can actually
+    // change, which spans three orders of magnitude: a `block` record turns over in minutes,
+    // a `month` record almost never does. Caching `month` for 5 minutes takes the cost of the
+    // expensive scan from once per request to once per 5 minutes per node, while `block` stays
+    // near-live. A record can only ever IMPROVE within its window (a rarer share appears) or age
+    // out, so a slightly stale answer is a slightly conservative one, never a wrong kind of
+    // thing — and the client already tolerates that, because it caches records itself and
+    // enforces window monotonicity.
+    let ttl = records_ttl(&window_name);
+    let cache_hit = {
+        let cache = state.records_cache.read();
+        match cache.get(&window_name) {
+            Some((at, v)) if at.elapsed() < ttl => Some(v.clone()),
+            _ => None,
+        }
+    };
+
+    let local_best = match cache_hit {
+        Some(v) => v,
+        None => {
+            let db_best = db.clone();
+            let fresh =
+                match tokio::task::spawn_blocking(move || db_best.get_best_share_since(since_ts))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "pool records: best-share task failed");
+                        Ok(None)
+                    }) {
+                    Ok(best) => best,
+                    Err(e) => {
+                        error!(error = %e, "Failed to query best share");
+                        return Json(serde_json::json!({
+                            "window": window_name,
+                            "since_ts": since_ts,
+                            "found": false,
+                            "error": "Database error",
+                        }));
+                    }
+                };
+            // Only a successful read is cached — an error returns above without poisoning the
+            // memo, or one transient failure would be served for the whole TTL.
+            state.records_cache.write().insert(
+                window_name.clone(),
+                (std::time::Instant::now(), fresh.clone()),
+            );
+            fresh
+        }
+    };
 
     // Candidate winner so far: the rarest `share_hash` seen, held in DISPLAY
     // order (zeros at the front) so string `<` matches numeric order (smaller =
@@ -12125,6 +12171,38 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The records TTL must be ordered by how fast each window can actually change, and an
+    /// unrecognised window must get the SHORTEST one.
+    ///
+    /// The failure this guards is a plausible "simplification": collapsing these to one constant.
+    /// Pick the long end and `block` records go stale for minutes on a 600s window; pick the short
+    /// end and `month` — which costs 7-20s because no index can serve a rarity sort — is
+    /// recomputed on nearly every request, which is the behaviour that made the pool page hang.
+    #[test]
+    fn records_ttl_is_ordered_by_window_and_defaults_short() {
+        let month = records_ttl("month");
+        let week = records_ttl("week");
+        let day = records_ttl("day");
+        let block = records_ttl("block");
+        let unknown = records_ttl("decade");
+
+        assert!(month > week, "month must be cached longer than week");
+        assert!(week > day, "week must be cached longer than day");
+        assert!(day > block, "day must be cached longer than block");
+        assert_eq!(
+            unknown, block,
+            "an unrecognised window is not a licence to serve stale data"
+        );
+        assert!(
+            block <= std::time::Duration::from_secs(15),
+            "the block window is 600s and costs ~6ms — caching it hard is all downside"
+        );
+        assert!(
+            month >= std::time::Duration::from_secs(120),
+            "month is the whole reason this memo exists; a short TTL defeats it"
+        );
+    }
     use serial_test::serial;
 
     /// The URL and the signed body must name the same node.

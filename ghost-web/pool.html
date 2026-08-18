@@ -18,6 +18,15 @@
   <meta name="twitter:title" content="Ghost Pool · Bitcoin Ghost">
   <meta name="twitter:description" content="Decentralised mining pool on Bitcoin Ghost. Live leaderboard, ledger-model payouts, BFT-voted coinbase — no operator, no fee.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
+  <!-- The Quasar tab is the DEFAULT view and renders through three.js, which is fetched from
+       unpkg: 257 KB gzipped (1.27 MB raw) plus OrbitControls. Without these hints the browser
+       cannot even open the connection until it has parsed the importmap and reached the module
+       script near the end of the body. preconnect gets DNS+TLS out of the way immediately and
+       modulepreload starts the download in parallel with the rest of the page.
+       ⚠ This does not make it smaller — self-hosting or lazy-loading it behind the tab switch
+       would, and both are worth considering; this only stops it starting late. -->
+  <link rel="preconnect" href="https://unpkg.com" crossorigin>
+  <link rel="modulepreload" href="https://unpkg.com/three@0.160.0/build/three.module.js">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1621,7 +1630,9 @@ if (renderer) {
   // leaderboard, payout) drains first. The quasar can sit empty for a
   // couple of seconds without anyone noticing; the stats tiles can't.
   setTimeout(pollAll, 2000);
-  // 6s cadence × 4 VMs = 40 req/min for the share stream. Enough to make
+  // 6s cadence × 8 VMs = 80 req/min for the share stream (this said "4 VMs = 40" until
+  // 2026-08-18 — POOL_VMS was hand-edited to vm1-vm8 on the live host without the comment
+  // following, so the real rate was double what it claimed). Enough to make
   // the quasar feel live without dominating the rate-limit burst budget
   // alongside the other pool-page polls.
   setInterval(pollAll, 6000);
