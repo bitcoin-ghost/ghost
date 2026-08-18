@@ -30,8 +30,10 @@ http_port = 8080
 max_miners = 100
 
 # SOLO MINING MODE - requires password, 99% to your address
+# NOTE: there is no `public_mining` key. It was removed from the config — `mining_mode`
+# is the single source of truth for whether this node is publicly discoverable.
+# Setting `public_mining` here does nothing: unknown keys are silently ignored.
 mining_mode = "private_solo"           # Options: public_pool | private_pool | private_solo
-public_mining = false                  # Not discoverable via DNS
 private_mining_password = "${PRIVATE_MINING_PASSWORD}"  # REQUIRED - min 8 chars
 solo_payout_address = "${SOLO_PAYOUT_ADDRESS}"          # REQUIRED - your bc1... address
 

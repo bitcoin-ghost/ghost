@@ -30,8 +30,10 @@ sv2_port = 34255
 sv1_port = 3333
 http_port = 8080
 max_miners = 10000
+# NOTE: there is no `public_mining` key. It was removed from the config — `mining_mode`
+# is the single source of truth for whether this node is publicly discoverable.
+# Setting `public_mining` here does nothing: unknown keys are silently ignored.
 mining_mode = "public_pool"
-public_mining = true
 signing_key = "${SIGNING_KEY}"
 internal_api_secret = "${INTERNAL_API_SECRET}"
 noise_enabled = true

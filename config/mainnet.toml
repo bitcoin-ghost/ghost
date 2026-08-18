@@ -146,13 +146,15 @@ max_miners = 10000
 #   - "private_solo":  Password required, 99% to operator address
 # Default: "public_pool"
 # MUTABLE: Can be changed via dashboard API (triggers graceful restart)
+# NOTE: there is no `public_mining` key. It was removed from the config — `mining_mode`
+# is the single source of truth for whether this node is publicly discoverable.
+# Setting `public_mining` here does nothing: unknown keys are silently ignored.
 mining_mode = "public_pool"
 
 # Enable public mining (legacy, use mining_mode instead)
 # Options: true | false
 # Default: false
 # DEPRECATED: Set mining_mode = "public_pool" instead
-public_mining = true
 
 # Signing key for message authentication (REQUIRED for public mining)
 # Must be 64 hex characters (32 bytes)
