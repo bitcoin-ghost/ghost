@@ -490,6 +490,16 @@ impl ShardRuntime {
         })
     }
 
+    /// Whether this shard owns the `shares` table — see the field docs.
+    ///
+    /// Exposed because the GHOST-03 ledger sweep must switch itself off exactly when this
+    /// becomes true: from that moment `shares` is a retention window rather than the ledger,
+    /// and advertising it as if it were the ledger asks every peer to backfill history this
+    /// node deliberately archived.
+    pub fn owns_evidence(&self) -> bool {
+        self.owns_evidence
+    }
+
     /// Arm the shard from the pinned genesis checkpoint — Stage 5 step 4, the one-time ceremony.
     ///
     /// Converts this node's own copy of the byte-identical checkpoint, asserts the result against

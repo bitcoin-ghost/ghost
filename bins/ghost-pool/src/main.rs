@@ -5066,6 +5066,16 @@ async fn main() -> Result<()> {
         let rm_for_conv = Arc::clone(&round_manager);
         let conv_tx = conv_tx.clone();
         let db_for_conv = Arc::clone(&db);
+        // Latched once, here, rather than read per tick: `owns_evidence` is fixed for the life
+        // of the runtime, and a per-tick lock on the shard from the convergence loop would be a
+        // new lock-ordering edge for no benefit.
+        let shard_owns_evidence = shard.as_ref().is_some_and(|s| s.owns_evidence());
+        if shard_owns_evidence {
+            info!(
+                "GHOST-03: ledger sweep DISABLED — the shard owns `shares` (migration v56), so \
+                 the legacy unpaid ledger is no longer this node's to repair"
+            );
+        }
         tokio::spawn(async move {
             const CONVERGENCE_INTERVAL_SECS: u64 = 30;
 
@@ -5170,6 +5180,30 @@ async fn main() -> Result<()> {
                 let round_id = rm_for_conv.current_round_id();
                 if let Ok(bytes) = conv_handler.request_bytes(round_id) {
                     let _ = conv_tx.send(bytes).await;
+                }
+
+                // The ledger sweep repairs the LEGACY unpaid ledger, and since migration v56
+                // there is no longer one to repair: `shares_archive` is frozen and never
+                // advertised, while `shares` holds only the retention window.
+                //
+                // Leaving it running is not merely wasteful, it is actively harmful. The sweep
+                // advertises the unpaid hashes it can see — a few HOURS of them — across a span
+                // clamped to a 7-DAY minimum (`LEDGER_SPAN_MIN_SECS`). Every peer therefore
+                // concludes this node is missing a week of shares and tries to serve all of it
+                // back. Measured on 2026-08-18, the hour the cutover landed: inbound
+                // `ShareConvergence` went from 0/h to 691/h on ghost-vm7 and 322/h on ghost-vm6,
+                // saturating the convergence channel (#647) and pushing `/health` to 14-15s.
+                //
+                // Nothing was corrupted — the `shares_all` guard in `import_unpaid_shares*`
+                // refused every re-offered row, which is precisely why it exists — but the
+                // traffic bought nothing. `SHARE_SHARD_BUILD.md` always said the sweep switches
+                // off at the flip; this is that switch, and it is why it cannot wait for the
+                // Stage 6 deletion release.
+                //
+                // The round-in-flight repair above is deliberately KEPT: it is one request per
+                // tick, scoped to the current round, and is not what floods.
+                if shard_owns_evidence {
+                    continue;
                 }
 
                 // Repair one window of the unpaid ledger (the slow path that actually keeps the
