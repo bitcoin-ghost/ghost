@@ -3069,18 +3069,46 @@ async fn api_pool_records_handler(
     // stored vardiff target separately so the response can still expose
     // `assigned_difficulty` when the local share wins (peers only gossip the
     // achieved difficulty, so that field is null when a peer's record wins).
-    let local_best = match db.get_best_share_since(since_ts) {
-        Ok(best) => best,
-        Err(e) => {
-            error!(error = %e, "Failed to query best share");
-            return Json(serde_json::json!({
-                "window": window_name,
-                "since_ts": since_ts,
-                "found": false,
-                "error": "Database error",
-            }));
-        }
-    };
+    // Offloaded to the blocking pool. This is the single hottest slow query in the product:
+    // ghost-web calls `pool/records` for four windows on every page load (~270 hits per log
+    // rotation for `window=month` alone), and on the 4 GB nodes the month window measures ~20s
+    // because ranking by rarity means `reverse_hex(share_hash)` on every row in the window —
+    // a function of the column, so no index can serve the ORDER BY.
+    //
+    // ⚠ The ~20s is NOT new. Measured on ghost-vm6 against the month window:
+    //
+    //     shares_archive only (the exact pre-v56 shape)   30,455 ms
+    //     shares_all (what v56 made it)                   40,780 ms
+    //     live shares only                                    95 ms
+    //
+    // So the slow pool page predates the share-shard cutover; v56 made it ~34% worse, not 13x.
+    // Fixing the COST needs a structural change (a maintained records table, or an indexed
+    // display-order hash column) and is deliberately not attempted here.
+    //
+    // What this line does fix is the COLLATERAL damage, which is most of the symptom: run
+    // inline, a 20s synchronous query pins an async worker and every other request scheduled on
+    // it queues behind. Demonstrated on vm6 — with one month query in flight, `/health` (which
+    // touches no database at all) blocked for the full 40s probe cap, then answered in 0.04s the
+    // moment it finished. That is why the whole page hangs rather than one panel being slow.
+    let db_best = db.clone();
+    let local_best =
+        match tokio::task::spawn_blocking(move || db_best.get_best_share_since(since_ts))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "pool records: best-share task failed");
+                Ok(None)
+            }) {
+            Ok(best) => best,
+            Err(e) => {
+                error!(error = %e, "Failed to query best share");
+                return Json(serde_json::json!({
+                    "window": window_name,
+                    "since_ts": since_ts,
+                    "found": false,
+                    "error": "Database error",
+                }));
+            }
+        };
 
     // Candidate winner so far: the rarest `share_hash` seen, held in DISPLAY
     // order (zeros at the front) so string `<` matches numeric order (smaller =
@@ -3458,9 +3486,30 @@ async fn api_pool_leaderboard_handler(
     // and still return `limit` real rows.
     let over_fetch = (limit as usize).saturating_mul(3).max(30) as u32;
 
-    let best_hash = db
-        .get_leaderboard_best_hash(since_ts, over_fetch)
-        .unwrap_or_default()
+    // Both leaderboard reads are moved onto the blocking pool.
+    //
+    // They are synchronous SQLite calls that scan history, and on the 4 GB nodes the long
+    // windows take SECONDS even after the query rewrite. Run inline on an async worker, such a
+    // call pins that worker for its whole duration and every other request scheduled on it
+    // stalls behind it — which is why `/health` measured 12 s on ghost-vm6 while doing no
+    // database work of its own, and 0.004 s on ghost-vm8 where the same query was fast. That is
+    // the #554 shape: one worker in uninterruptible disk wait taking unrelated endpoints down
+    // with it.
+    //
+    // `spawn_blocking` is the fix for the collateral damage; the SQL rewrite in
+    // `get_leaderboard_*` is the fix for the cost. Both are needed — a fast query can still
+    // block, and an offloaded slow query is still slow.
+    let db_bh = db.clone();
+    let best_hash_rows =
+        tokio::task::spawn_blocking(move || db_bh.get_leaderboard_best_hash(since_ts, over_fetch))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "leaderboard: best-hash task failed");
+                Ok(Vec::new())
+            })
+            .unwrap_or_default();
+
+    let best_hash = best_hash_rows
         .into_iter()
         .filter(|(miner_id, _, _, _)| !is_system_miner(miner_id))
         .take(limit as usize)
@@ -3483,9 +3532,17 @@ async fn api_pool_leaderboard_handler(
         })
         .collect::<Vec<_>>();
 
-    let shares = db
-        .get_leaderboard_shares(since_ts, over_fetch)
-        .unwrap_or_default()
+    let db_sh = db.clone();
+    let shares_rows =
+        tokio::task::spawn_blocking(move || db_sh.get_leaderboard_shares(since_ts, over_fetch))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "leaderboard: shares task failed");
+                Ok(Vec::new())
+            })
+            .unwrap_or_default();
+
+    let shares = shares_rows
         .into_iter()
         .filter(|(miner_id, _, _)| !is_system_miner(miner_id))
         .take(limit as usize)

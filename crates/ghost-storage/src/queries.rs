@@ -1485,18 +1485,43 @@ impl Database {
                     // proofs keyed by the bare `hex(SHA256(id)[..8])` ledger id
                     // (no '.'); without this they appear as phantom leaderboard
                     // rows — the same miner duplicated under its gossip hash.
-                    "SELECT s.miner_id, s.share_hash, s.timestamp, s.difficulty
+                    // Two changes from the obvious form, both measured on ghost-vm6 over the
+                    // lifetime window (`since_ts = 0`, ~2M archived rows):
+                    //
+                    //   ROW_NUMBER() over shares_all          28,654 ms
+                    //   ROW_NUMBER() per arm, then across     44,803 ms   <- WORSE
+                    //   MIN() aggregate over shares_all       34,459 ms
+                    //   MIN() aggregate, pre-aggregated        2,206 ms   <- this
+                    //
+                    // So splitting the arms is necessary but not sufficient: the window function
+                    // has to go too. `ROW_NUMBER() OVER (PARTITION BY …)` needs a partitioned
+                    // sort of every candidate row; `MIN()` needs one aggregate pass. Splitting a
+                    // window function actually costs MORE, because each arm still sorts in full
+                    // and a second window pass is added on top — which is why this is not simply
+                    // the same edit as `get_leaderboard_shares`.
+                    //
+                    // ⚠ This relies on SQLite's documented "bare columns in an aggregate query"
+                    // rule: when the aggregate is `MIN()`/`MAX()`, the other selected columns
+                    // take their values from the row that produced it. That is a SQLite-specific
+                    // guarantee, not standard SQL, and it is the whole reason this can replace a
+                    // window function. Verified on vm6 across every miner group:
+                    // `lower(share_hash) = min(lower(share_hash))` matched for all of them.
+                    "SELECT miner_id, share_hash, timestamp, difficulty
                      FROM (
                          SELECT miner_id, share_hash, timestamp, difficulty,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY miner_id
-                                    ORDER BY reverse_hex(share_hash) ASC
-                                ) AS rn
-                         FROM shares_all
-                         WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
-                     ) s
-                     WHERE s.rn = 1
-                     ORDER BY reverse_hex(s.share_hash) ASC
+                                MIN(reverse_hex(share_hash)) AS k
+                           FROM shares
+                          WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
+                          GROUP BY miner_id
+                         UNION ALL
+                         SELECT miner_id, share_hash, timestamp, difficulty,
+                                MIN(reverse_hex(share_hash)) AS k
+                           FROM shares_archive
+                          WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
+                          GROUP BY miner_id
+                     )
+                     GROUP BY miner_id
+                     ORDER BY MIN(k) ASC
                      LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -1533,9 +1558,29 @@ impl Database {
                 .prepare(
                     // Only real `address.worker` miners; exclude the bare
                     // hex(SHA256(id)) gossip-ledger ids (see get_leaderboard_best_hash).
-                    "SELECT miner_id, COUNT(*) AS share_count, SUM(work) AS total_work
-                     FROM shares_all
-                     WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
+                    // ⚠ Aggregate each TABLE separately, then merge the per-miner rows — do
+                    // NOT `GROUP BY` across `shares_all` directly. Grouping over a UNION ALL
+                    // view forces SQLite to materialise the union through a co-routine and sort
+                    // every row, which throws away both tables' indexes. Measured on ghost-vm6
+                    // (4 GB RAM, 4.5 GB database, 1.7M archived rows in a 30-day window):
+                    //
+                    //     GROUP BY over shares_all      43,329 ms
+                    //     pre-aggregate then merge       3,289 ms   (identical results)
+                    //
+                    // The inner queries each produce one row per miner, so the outer merge is
+                    // over a handful of rows. `?1` is bound twice on purpose.
+                    "SELECT miner_id, SUM(c) AS share_count, SUM(w) AS total_work
+                     FROM (
+                         SELECT miner_id, COUNT(*) AS c, SUM(work) AS w
+                           FROM shares
+                          WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
+                          GROUP BY miner_id
+                         UNION ALL
+                         SELECT miner_id, COUNT(*) AS c, SUM(work) AS w
+                           FROM shares_archive
+                          WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
+                          GROUP BY miner_id
+                     )
                      GROUP BY miner_id
                      ORDER BY total_work DESC
                      LIMIT ?2",
@@ -14524,6 +14569,65 @@ mod tests {
             vec![("bc1qminer.rig".to_string(), 10.0f64)],
             "the unpaid ledger must see only post-cutover work"
         );
+    }
+
+    /// The best-hash leaderboard must pick the rarest share across BOTH tables, and must return
+    /// the row that actually owns that hash.
+    ///
+    /// This pins two things a faster query could silently break. `get_leaderboard_best_hash`
+    /// replaced `ROW_NUMBER() OVER (PARTITION BY …)` with `MIN(reverse_hex(share_hash))` for a
+    /// 13x speedup, which leans on SQLite's "bare columns take their value from the MIN row"
+    /// rule — so `timestamp` and `difficulty` must still belong to the winning share, not to an
+    /// arbitrary one. And the winner must be found whichever side of the cutover it is on.
+    ///
+    /// `share_hash` is stored INTERNAL byte order, so rarity is `reverse_hex(share_hash)`
+    /// ascending: zeros at the FRONT once reversed. The fixtures below are built so the rare one
+    /// is unambiguous under that ordering and NOT under raw lexicographic order — otherwise the
+    /// test would pass against a query that forgot to reverse.
+    #[test]
+    fn best_hash_leaderboard_spans_both_tables_and_keeps_the_winning_row() {
+        let db = Database::in_memory().expect("in-memory db");
+
+        // Internal order: rarity lives at the BACK. Reversed, "…0000" becomes "0000…".
+        let rare_hash = format!("{}{}", "ff".repeat(24), "00".repeat(8)); // reverses to 0000…
+        let dull_hash = format!("{}{}", "00".repeat(24), "ff".repeat(8)); // reverses to ffff…
+
+        // The RARE one is archived; the dull one is live. A query that only reads the live table,
+        // or that drops the archive arm, returns the dull hash and fails here.
+        seed_into(
+            &db,
+            "shares_archive",
+            "bc1qminer.rig",
+            &rare_hash,
+            1_000,
+            1.0,
+        );
+        seed_into(&db, "shares", "bc1qminer.rig", &dull_hash, 2_000, 1.0);
+
+        let board = db.get_leaderboard_best_hash(0, 10).expect("best hash");
+        assert_eq!(board.len(), 1, "one miner, one best share");
+        let (miner, hash, ts, _diff) = &board[0];
+        assert_eq!(miner, "bc1qminer.rig");
+        assert_eq!(
+            hash, &rare_hash,
+            "the rarest share is the ARCHIVED one; picking the live share means the archive arm \
+             was dropped, and picking by raw order means reverse_hex was lost"
+        );
+        assert_eq!(
+            *ts, 1_000,
+            "timestamp must come from the winning row — this is the SQLite bare-column guarantee \
+             the MIN() rewrite depends on"
+        );
+
+        // Now put an even rarer share on the LIVE side; it must take over.
+        let rarer_hash = format!("{}{}", "ee".repeat(24), "00".repeat(8));
+        seed_into(&db, "shares", "bc1qminer.rig", &rarer_hash, 3_000, 1.0);
+        let board = db.get_leaderboard_best_hash(0, 10).expect("best hash");
+        assert_eq!(
+            board[0].1, rarer_hash,
+            "a rarer LIVE share must beat the archived one — the merge is not archive-preferring"
+        );
+        assert_eq!(board[0].2, 3_000, "and its own timestamp travels with it");
     }
 
     /// A peer serving us a share we already hold in the archive must not be able to re-insert
