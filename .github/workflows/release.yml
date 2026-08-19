@@ -218,12 +218,22 @@ jobs:
           fi
 
           # Create archive only if dist has files
+          #
+          # ⚠ `github.ref_name` is slash-free for a tag (`v1.11.23`) but NOT for a branch,
+          # and this workflow is also dispatchable as a dry run. On `fix/release-apt-hang`
+          # the name became `bitcoin-ghost-fix/release-apt-hang-<target>.tar.gz`, so tar
+          # tried to write into a directory that does not exist and every target failed at
+          # this step. The dry run was added (#540) precisely so the workflow could be
+          # exercised without cutting a tag — and it could not be, on any branch named the
+          # way every branch in this repo is named. Slashes are replaced, so a tag build is
+          # byte-identical to before and a dispatch produces a usable artefact.
           cd dist
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
           if [ -n "$(ls -A .)" ]; then
             if [ "${{ runner.os }}" = "Windows" ]; then
-              7z a ../bitcoin-ghost-${{ github.ref_name }}-${{ matrix.target }}.zip *
+              7z a "../bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.zip" *
             else
-              tar czvf ../bitcoin-ghost-${{ github.ref_name }}-${{ matrix.target }}.tar.gz *
+              tar czvf "../bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.tar.gz" *
             fi
           else
             echo "No binaries found to package"
@@ -324,7 +334,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bitcoin-ghost-${{ matrix.target }}
-          path: bitcoin-ghost-${{ github.ref_name }}-${{ matrix.target }}.*
+          # Same slash-replacement as the Package step above, or a dispatch uploads nothing.
+          path: bitcoin-ghost-*-${{ matrix.target }}.*
 
   release:
     name: Create Release
