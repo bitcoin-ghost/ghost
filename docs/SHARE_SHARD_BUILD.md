@@ -53,7 +53,7 @@ folded shares. That is the first thing to watch when a block is won.
 | # | item | state |
 |---|---|---|
 | 7 | rename `shares` → `shares_archive`, move the fold's DELETE target **in the same change**, then flip `owns_evidence` | **DONE — migration v56; see “Step 7 as built” below** |
-| — | Stage 6 deletion release (~26–28k lines) | not started; must NOT ride the cutover binary |
+| — | Stage 6 deletion release (~26–28k lines, ⚠ now an overstatement — see the three settled decisions) | not started; must NOT ride the cutover binary |
 | — | §6 λ-sampling | built in `ghost-consensus`, and a hard precondition for admitting FOREIGN nodes (v1 multi-operator) |
 | — | MPC ceremony divergence under concurrent contribution | bootstrap-only (`< MPC_BFT_BOOTSTRAP_COUNT = 4`); mainnet has 8 contributors so a join needs 6 approvals and cannot apply unilaterally |
 
@@ -471,6 +471,41 @@ froze. **The point of no return is deleting `shares_archive`. Keep it until v1 h
 ~26–28k lines, roughly half tests. SBC layer ~10.4k · BFT payout path ~11–12k · sweep ~2.2k · dormant
 scaffolding ~1.4k · gate collapse ~600.
 
+⚠ **That total is stale as of 2026-08-19 and reads high, but by less than first thought.** Of the
+three open decisions, one resolved towards *keeping* code: the voting layer (4,578 lines) survives
+with elder revocation, so the BFT payout path's ~11–12k shrinks by up to that much. The mesh
+node-list checkpoint stays in the deletion budget — an earlier "keep it" correction was itself wrong
+and is retracted below. Re-count the payout path before quoting a Stage 6 size to anyone.
+
+**DONE 2026-08-19 — SBC layer deleted, net −8,600 lines.** ~9.6k of candidate files were counted;
+the delivered figure is lower because **the layer was not separable**. The shard was built ON TOP of
+the batch chain's primitives, so four things had to be rehomed before anything could be removed —
+and they are precisely the "rules that must survive their gate" list:
+
+| rehomed to | what | why it survives |
+|---|---|---|
+| `ghost_common::work_fold` | `fold_shares`, `micro_work`, `canonical_sort`, `creditable_difficulty` | `share_shard.rs`, `shard.rs` and `shard_handler.rs` all fold work with these — one fold, or the shard and its verifiers disagree about money |
+| `ghost_pool::share_checks` | `NodeShareChecks` (was `NodeBatchChecks`), `ChecksFn` | §6 sampling and the §12.4 evidence audits judge a PEER's share with it |
+| `ghost_accounting::genesis_balances` | `genesis_balances`, `GenesisRounding` | `shard_genesis` reuses the conversion verbatim; it decides opening money |
+| `ghost_storage::address_key` | `address_key`, `blob32` | `H(plaintext address)` keying — a ciphertext key silently splits one payee's balance into two rows |
+
+⚠ **Generalise this before Stage 6's later steps.** A superseded layer here is not a self-contained
+block to lift out: the replacement was built from its parts. Expect the same of the BFT payout path
+and the sweep — find what the shard inherited BEFORE deleting, or the delete takes working machinery
+with it.
+
+Deliberately left in place: the `sbc_*` tables and migrations v50–v52 (historical migrations must
+stay replayable, and migration v53 already promised exactly this), and the `MessageType::ShareBatch*`
+wire variants (dead protocol, but deleting message types is its own change — #675 is the precedent).
+Nothing in the workspace uses `deny_unknown_fields`, so live `pool.toml` files still carrying
+`share_batch_shadow = false` parse fine and ignore it.
+
+⚠ `share_batch_size` in the sv2, stratum-apps and vendor trees is an unrelated SV2 tuning knob and is
+NOT part of this; a naive grep for `share_batch` sweeps it in.
+
+The sweep's ~2.2k is unverified: it is not a module but spread through `convergence.rs`,
+`share_handler.rs` and `payout.rs`, so it needs reading rather than counting.
+
 Order: SBC layer → dormant scaffolding → BFT payout path (**this is the cutover release, carrying the
 replacement commitment constructor**) → sweep → tip-keyed gate collapse → round-keyed era machinery.
 
@@ -555,16 +590,64 @@ of magnitude past that (§12.6). Not needed for an 8-node fleet, so it is not a 
 it *is* a precondition for the network growing, and it should be designed before anyone advertises
 that it can.
 
-**One spelling of the summary predicate.** `ShardTable::apply_summary` requires full share evidence,
-but a gossiped summary carries none (§6), so `shard_handler.rs` re-spells the structure-and-signature
-half. Add `EpochSummary::verify_stateless()` in `share_shard.rs` and have both call it — two spellings
-of one predicate drift apart, and the drift is silent.
+**~~One spelling of the summary predicate.~~ DONE in Stage 1 — nothing left to decide.**
+`EpochSummary::verify_stateless()` is at `share_shard.rs:468`, and `verify()` calls it at :497, so the
+stateful path goes *through* the stateless one rather than beside it. The gossip path calls
+`verify_stateless()` directly (`shard_handler.rs:129`, :692). One spelling, two callers, as intended.
 
-**Elder revocation** currently rides the payout vote machinery. With voting deleted it needs a
-standalone home or an explicit decision to drop.
+**~~Elder revocation~~ SETTLED 2026-08-19 — it is KEPT, and it keeps the BFT vote with it.**
+Operator's position: a revoked position is burned and never reassigned, and that permanence is what
+makes an elder position scarce rather than a rotating seat. v1 ships multi-operator, where "one
+operator unilaterally burns another operator's slot" is exactly what a vote exists to prevent — so the
+capability is justified by the shipping model, not by whether it has fired yet. It has not:
+`burned_elder_numbers`, `elder_registration_votes` and `votes` are all empty on vm1.
 
-**Mesh node-list checkpoint** is deleted as dormant scaffolding, but §10's public-endpoint discovery
-eventually needs a successor.
+Consequences for Stage 6:
+
+- `voting.rs` (1,860) + `vote_handler.rs` (2,718) = **4,578 lines survive**, so the BFT payout path's
+  ~11–12k shrinks by up to that much. ⚠ Re-measure before quoting a new Stage 6 total — those two
+  files are not wholly payout-specific and the split has not been counted line by line.
+- `VoteType::PayoutApproval` goes and `ElderRevocation` becomes the sole live variant.
+  `ShareAllocation` is dead already — declared at `types.rs:212` and referenced nowhere but one
+  enumerating test — so it should go out with the payout variant.
+- The survivors must be **decoupled, not merely left compiling**. `verification_handler.rs`,
+  `nullifier_route_handler.rs`, `glyph_handler.rs`, `proposal_sync.rs` and `reorg.rs` import only
+  helper types (`RateLimiter`, `BroadcastFn`, `compute_proposal_hash`, `VoteHandler`) — three type
+  aliases and a hash function, not the BFT. Those want a small shared module.
+- The checker now runs **daily** with a 10-minute initial delay (`aea63b1ba`), not hourly.
+  ⚠ That initial delay is a `sleep`, not the old tick-and-discard: at a 24-hour period the old
+  pattern would have meant a node restarting more often than daily never runs the check at all.
+
+**~~Mesh node-list checkpoint~~ BLOCKED 2026-08-19 — it is neither deletable nor armable. Decide.**
+It is not scaffolding: it is the producing half of #402. The pool finalises the signed blob and serves
+it at `/api/v1/pool/mesh-node-list-checkpoint` (`routes.rs:244`, `main.rs:8069`); `ghost-miner-proxy`
+fetches that URL every refresh and verifies it offline against a baked-in genesis signer set
+(`checkpoint.rs:1-9`, "the security core of the shim"). Delete the producer and the shim has nothing
+to verify — #402's implementation dies with it.
+
+It cannot simply be armed either. #625: the node set comes from a per-node 120 s liveness view, so the
+blob cannot be byte-identical fleet-wide — which is exactly #402's acceptance criterion — and nothing
+is proposed below the gate, so convergence is unobservable until it is already live.
+
+So the options are (a) delete both halves and rebuild discovery later, (b) keep it dormant and let
+Stage 6 step around it, or (c) fix #625 first and arm it. That is an operator decision, not a
+mechanical cleanup, and Stage 6's "dormant scaffolding ~1.4k" line cannot be actioned until it is made.
+
+⚠ **Two retracted claims, recorded because both mistakes are repeatable.**
+1. "Keep it — 6 consumers in `ghost-miner-proxy`." A grep over that directory does return 6 hits, and
+   every one is a message *type* name resolved from `ghost_consensus::message`. The count was
+   verified; the referent was not. Count what the matches point AT.
+2. "Delete it — the proxy is independent, it has its own BFT." Also wrong, and wrong in the more
+   dangerous direction: the proxy's threshold is the *verification* side of the same protocol, and its
+   dependency on the pool module is a RUNTIME one over HTTP. **No code reference exists to grep for.**
+   A clean `grep -r` across the workspace is not evidence that nothing depends on a module — it is
+   evidence that nothing *links* against it. Check what serves the endpoints too.
+
+Consequence: `widen_voter_set` and `active_is_superset_of_elders` (`payout_checkpoint.rs:490`, `:499`)
+have **no consumer that survives Stage 6** — the payout checkpoint (deleted), the mesh checkpoint
+(deleted), and the `ACTIVE_VOTER_SET` convergence-proof endpoint (`main.rs:7959`), which exists to
+prove the payout gate's voter set before arming and goes with the gate. They are deleted, not
+rehomed. Do not extract them into a shared module first; that only adds a module to delete.
 
 ## Hazards to design against, not discover
 
