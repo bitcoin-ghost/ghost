@@ -3564,6 +3564,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-stats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "clap",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ghost-storage"
 version = "1.11.22"
 dependencies = [

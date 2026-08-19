@@ -1,0 +1,42 @@
+[Unit]
+Description=Ghost Stats - public pool-stats aggregator for bitcoinghost.org
+Documentation=https://github.com/bitcoin-ghost/ghost
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+
+ExecStart=/opt/ghost/bin/ghost-stats --config /etc/ghost/stats.toml
+
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+
+Environment=RUST_LOG=ghost_stats=info
+Environment=RUST_BACKTRACE=1
+
+# Security hardening. This process reads eight HTTP endpoints and serves one; it needs nothing
+# else, so it gets nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# The snapshot mirror. This is the ONLY writable path, and it is what lets a restart serve a warm
+# page instead of a blank one — see `snapshot_path` in stats.toml.
+StateDirectory=ghost-stats
+ReadWritePaths=/var/lib/ghost-stats
+
+LimitNOFILE=8192
+
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

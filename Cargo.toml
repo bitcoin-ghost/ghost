@@ -49,6 +49,7 @@ members = [
     "crates/ghost-gsp",
     # Node Binaries
     "bins/ghost-pool",
+    "bins/ghost-stats",
     "bins/ghost-pay",
     "bins/ghost-cli",
     "bins/ghost-gsp",
