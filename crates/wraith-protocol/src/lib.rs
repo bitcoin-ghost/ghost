@@ -50,8 +50,7 @@ pub use blind::{
 };
 pub use error::WraithError;
 pub use tier::{
-    LiteTier, LITE_BOND_BPS, LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS, VBYTES_PER_INPUT,
-    VBYTES_PER_OUTPUT,
+    LiteTier, LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
 };
 
 pub mod single_round;
@@ -59,12 +58,6 @@ pub use single_round::{
     per_participant_mining_share, round_vbytes, LiteOutputKind, LiteOutputProvenance,
     LiteParticipantInput, LiteRound, LiteRoundBuilder, CHANGE_DUST_THRESHOLD_SATS,
     DEFAULT_FEE_RATE_SATS_PER_VB,
-};
-
-pub mod bond;
-pub use bond::{
-    BondError, BondId, BondLedger, BondRecord, BondResolution, BondStatus, MockBondLedger,
-    RefundReason, SlashReason,
 };
 
 pub mod lite_session;

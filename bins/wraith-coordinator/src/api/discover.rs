@@ -1,7 +1,7 @@
 //! `GET /api/v1/pool/discover` — first call any wallet makes.
 //!
 //! Returns the coordinator's identity (network, supported tiers, fee
-//! schedule, bond rates) so the wallet can verify it's talking to a
+//! schedule, fee rates) so the wallet can verify it's talking to a
 //! coordinator that matches its expectations. From DESIGN_LITE.md §5
 //! step 1: `pool.discover()` → `{ active_url, standby_urls[],
 //! supported_tiers[] }`.
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::{extract::State, Json};
 use serde::Serialize;
 
-use wraith_protocol::{LITE_BOND_BPS, LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS};
+use wraith_protocol::{LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS};
 
 use crate::state::CoordinatorState;
 
@@ -33,8 +33,6 @@ pub struct DiscoverResponse {
     pub pool_id: String,
     /// Service fee rate (basis points). Pinned in `DESIGN_LITE.md` §11.
     pub service_fee_bps: u32,
-    /// Bond rate (basis points). Pinned in `DESIGN_LITE.md` §12.
-    pub bond_bps: u32,
     /// Fill window (seconds) — how long a session stays open accepting
     /// new participants after `min_participants` is reached.
     pub fill_window_secs: u64,
@@ -52,7 +50,6 @@ pub struct TierDescriptor {
     pub denomination_sats: u64,
     pub min_participants: u32,
     pub max_participants: u32,
-    pub bond_sats: u64,
     pub service_fee_sats: u64,
 }
 
@@ -65,7 +62,6 @@ pub async fn get(State(state): State<Arc<CoordinatorState>>) -> Json<DiscoverRes
             denomination_sats: t.denomination_sats(),
             min_participants: t.min_participants() as u32,
             max_participants: t.max_participants() as u32,
-            bond_sats: t.bond_sats(),
             service_fee_sats: t.service_fee_sats(),
         })
         .collect();
@@ -73,7 +69,6 @@ pub async fn get(State(state): State<Arc<CoordinatorState>>) -> Json<DiscoverRes
         network: state.network_name(),
         pool_id: format!("wraith-pool-{}", state.network_name()),
         service_fee_bps: LITE_SERVICE_FEE_BPS,
-        bond_bps: LITE_BOND_BPS,
         fill_window_secs: LITE_FILL_WINDOW_SECS,
         tiers,
     })

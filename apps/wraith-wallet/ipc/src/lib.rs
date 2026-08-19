@@ -403,11 +403,6 @@ pub enum Request {
     /// The daemon stashes the in-flight `PreparedMix` keyed by
     /// session_id; subsequent [`Request::WraithMixSubmit`] consumes it.
     ///
-    /// v1 limitation: the daemon takes bond escrow as a precondition
-    /// — the caller is responsible for arranging a real bond against
-    /// (ghost_id, session_id) via ghost-pay (or, in dev, via the
-    /// coordinator's MockBondLedger) before this call reaches
-    /// `/inputs`. Phase C wiring will move this into the daemon.
     WraithMixPrepare {
         coordinator_url: String,
         /// Optional SOCKS5 proxy URL for the /outputs anonymous
@@ -426,7 +421,6 @@ pub enum Request {
         coordinator_peers: Vec<String>,
         tier_id: String,
         ghost_id: String,
-        bond_id_placeholder: String,
         utxo_txid: String,
         utxo_vout: u32,
         utxo_value_sats: u64,
@@ -457,7 +451,7 @@ pub enum Request {
     /// index ≤ `bip86_scan_max`; if `bip86_scan_max` is `None` the
     /// daemon scans 0..1024 by default.
     /// Fetch the coordinator's `/api/v1/pool/discover` payload —
-    /// network, supported tiers, fee/bond rates. Mirrors the
+    /// network, supported tiers, fee rates. Mirrors the
     /// `Request::WraithMix*` shape (including `coordinator_peers`)
     /// so the discovery call participates in the same failover.
     WraithCoordinatorDiscover {
@@ -484,7 +478,6 @@ pub enum Request {
         coordinator_peers: Vec<String>,
         tier_id: String,
         ghost_id: String,
-        bond_id_placeholder: String,
         utxo_txid: String,
         utxo_vout: u32,
         utxo_value_sats: u64,
@@ -726,7 +719,6 @@ pub struct WraithDiscoverTier {
     pub denomination_sats: u64,
     pub min_participants: u32,
     pub max_participants: u32,
-    pub bond_sats: u64,
     pub service_fee_sats: u64,
 }
 
@@ -740,7 +732,6 @@ pub struct WraithDiscoverResponse {
     pub network: String,
     pub pool_id: String,
     pub service_fee_bps: u32,
-    pub bond_bps: u32,
     pub fill_window_secs: u64,
     pub tiers: Vec<WraithDiscoverTier>,
 }

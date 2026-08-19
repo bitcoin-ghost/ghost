@@ -69,9 +69,6 @@ enum Command {
     /// the unsigned transaction; the user signs out-of-band and
     /// invokes `submit` with the witness hex.
     ///
-    /// v1: bond escrow is the caller's responsibility — must be
-    /// arranged against the coordinator's BondLedger before
-    /// `prepare` is invoked. Phase C will move this into wraithd.
     Mix {
         #[command(subcommand)]
         sub: MixCommand,
@@ -116,13 +113,6 @@ enum MixCommand {
         /// only uses it to dedupe against double-enrolment.
         #[arg(long)]
         ghost_id: String,
-        /// Placeholder bond_id passed to /find_or_create. The real
-        /// bond is verified at /inputs time against the
-        /// (ghost_id, session_id, expected_sats) tuple in the
-        /// coordinator's BondLedger; the placeholder here is just
-        /// echoed back for diagnostic logs.
-        #[arg(long, default_value = "placeholder")]
-        bond_id_placeholder: String,
         /// UTXO outpoint as `txid:vout`.
         #[arg(long)]
         utxo: String,
@@ -143,7 +133,7 @@ enum MixCommand {
         mix_output_address: String,
     },
     /// Fetch the coordinator's `/api/v1/pool/discover` payload —
-    /// network, supported tiers, fee + bond rates. Useful for
+    /// network, supported tiers, fee rates. Useful for
     /// debugging "is this coordinator alive and serving the tiers
     /// I expect" before running a real mix.
     Discover {
@@ -184,8 +174,6 @@ enum MixCommand {
         tier: String,
         #[arg(long)]
         ghost_id: String,
-        #[arg(long, default_value = "placeholder")]
-        bond_id_placeholder: String,
         #[arg(long)]
         utxo: String,
         #[arg(long)]
@@ -341,9 +329,6 @@ enum LocksCommand {
     ///   2. WraithMixOneShot(mix_output=funding_addr) → broadcast_txid
     ///   3. LocksConfirm(lock_id, broadcast_txid)     → block_height
     ///
-    /// Operator-side bond escrow is the caller's responsibility (v1).
-    /// The coordinator's BondLedger must be configured to accept the
-    /// wallet's bond before the mix's /inputs phase.
     PrepareViaWraith {
         /// Lock capacity in satoshis. Must match a Wraith Lite tier
         /// denomination (100k_sats / 1m_sats / 10m_sats / 100m_sats).
@@ -362,9 +347,6 @@ enum LocksCommand {
         /// (e.g. `socks5h://127.0.0.1:9050` for Tor).
         #[arg(long)]
         socks5_proxy: Option<String>,
-        /// Bond placeholder echoed at /find_or_create.
-        #[arg(long, default_value = "placeholder")]
-        bond_id_placeholder: String,
         /// UTXO outpoint feeding the mix as `txid:vout`.
         #[arg(long)]
         utxo: String,
@@ -544,7 +526,6 @@ mod client {
                         tier,
                         ghost_id,
                         socks5_proxy,
-                        bond_id_placeholder,
                         utxo,
                         utxo_value,
                         utxo_scriptpubkey,
@@ -560,7 +541,6 @@ mod client {
                     tier,
                     ghost_id,
                     socks5_proxy,
-                    bond_id_placeholder,
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
@@ -710,7 +690,6 @@ mod client {
                     socks5_proxy,
                     tier,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
@@ -732,7 +711,6 @@ mod client {
                         socks5_proxy,
                         tier_id: tier,
                         ghost_id,
-                        bond_id_placeholder,
                         utxo_txid: txid,
                         utxo_vout: vout,
                         utxo_value_sats: utxo_value,
@@ -761,7 +739,6 @@ mod client {
                     socks5_proxy,
                     tier,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
@@ -785,7 +762,6 @@ mod client {
                         socks5_proxy,
                         tier_id: tier,
                         ghost_id,
-                        bond_id_placeholder,
                         utxo_txid: txid,
                         utxo_vout: vout,
                         utxo_value_sats: utxo_value,
@@ -1300,7 +1276,6 @@ mod client {
                 println!("network:          {}", d.network);
                 println!("pool_id:          {}", d.pool_id);
                 println!("service_fee_bps:  {}", d.service_fee_bps);
-                println!("bond_bps:         {}", d.bond_bps);
                 println!("fill_window_secs: {}", d.fill_window_secs);
                 if d.tiers.is_empty() {
                     println!("tiers:            (none)");
@@ -1308,12 +1283,8 @@ mod client {
                     println!("tiers:");
                     for t in &d.tiers {
                         println!(
-                            "  {:>10}  denom={:>12} sats  bond={:>9} sats  min={}  max={}",
-                            t.id,
-                            t.denomination_sats,
-                            t.bond_sats,
-                            t.min_participants,
-                            t.max_participants,
+                            "  {:>10}  denom={:>12} sats  min={}  max={}",
+                            t.id, t.denomination_sats, t.min_participants, t.max_participants,
                         );
                     }
                 }
@@ -1632,7 +1603,6 @@ mod client {
         tier: String,
         ghost_id: String,
         socks5_proxy: Option<String>,
-        bond_id_placeholder: String,
         utxo: String,
         utxo_value: u64,
         utxo_scriptpubkey: String,
@@ -1678,7 +1648,6 @@ mod client {
             socks5_proxy,
             tier_id: tier,
             ghost_id,
-            bond_id_placeholder,
             utxo_txid: txid,
             utxo_vout: vout,
             utxo_value_sats: utxo_value,

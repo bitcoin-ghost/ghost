@@ -97,7 +97,7 @@ REAPER="true"
 ARCHIVE="false"
 GHOST_PAY="false"
 # Wraith mixing coordinator. Empty = "auto": ON when Ghost Pay is on, OFF
-# otherwise (mixing rides on Ghost Pay's bond ledger). --wraith / --no-wraith
+# otherwise. --wraith / --no-wraith
 # pin it explicitly.
 WRAITH=""
 # Tor. OFF by default — a plain clearnet install is completely unchanged.
@@ -358,7 +358,7 @@ run_wizard() {
   GHOST_PAY="$(prompt_yes_no "  Enable Ghost Pay — L2 instant-payments service (+4 shares)?" N)"
 
   # Wraith mixing coordinator — only offered when Ghost Pay is on (it relies on
-  # ghost-pay's bond ledger). Defaults Y so a Ghost Pay node mixes by default.
+  # Defaults Y so a Ghost Pay node mixes by default.
   if [[ "$GHOST_PAY" == "true" ]]; then
     WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator (requires Ghost Pay)?" Y)"
   else
@@ -448,12 +448,11 @@ if [[ -n "$POOL_NAME" ]]; then
   fi
 fi
 
-# Wraith mixing rides on Ghost Pay's bond ledger (the coordinator verifies and
-# resolves participant bonds against ghost-pay on 127.0.0.1:8800). Resolve the
+# Wraith mixing needs no bond ledger. Resolve the
 # "auto" default — track Ghost Pay — and pull Ghost Pay in when Wraith was asked
 # for explicitly without it. We auto-enable Ghost Pay (rather than erroring) so a
 # non-interactive `--wraith` install can't half-provision a coordinator that has
-# no bond ledger to talk to.
+# nothing extra to talk to.
 if [[ -z "$WRAITH" ]]; then
   WRAITH="$GHOST_PAY"
 fi
@@ -553,7 +552,7 @@ if [[ -n "$cli_bin" ]]; then
 else
   log "ghost-cli not found in ${POOL_TARBALL} (older release?) — skipping."
 fi
-# ghost-pay (L2 + Wraith bond ledger) ships in the same signed tarball; install
+# ghost-pay (L2) ships in the same signed tarball; install
 # it only when Ghost Pay is enabled.
 if [[ "$GHOST_PAY" == "true" ]]; then
   install -m755 -o root -g root "$(find . -name ghost-pay -type f | head -1)" /opt/ghost/bin/ghost-pay
@@ -834,12 +833,10 @@ systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart gho
 # Wraith mixing coordinator. Keys are the `[coordinator]` (CoordinatorConfig)
 # fields read by ghost-pool: `coordinator_role_enabled` actually RUNS the
 # in-process coordinator when this node wins a seat; `coordinator_port` is the
-# listen port (0.0.0.0:<port>); `bond_ledger_url`/`bond_ledger_token` point at
-# the local ghost-pay bond ledger (the token MUST equal ghost-pay's
-# GHOST_PAY_BOND_LEDGER_TOKEN). The URL is `https://` — ghost-pay serves its
-# bond endpoints with an identity-derived TLS cert and the coordinator pins it
-# against this node's own node_id (cert pubkey == node_id), so plain HTTP would
-# be rejected. `wraith_election_enabled` + `coordinator_enabled`
+# listen port (0.0.0.0:<port>). Participation needs no bond — registration
+# proves control of the input and a disrupting coin goes into cooldown — so
+# the coordinator needs only the node's own ghostd RPC, which it already has.
+# `wraith_election_enabled` + `coordinator_enabled`
 # + `advertised_endpoint` make this node electable and let it compute the
 # per-epoch draw, so a single enabled node is enough and many are safe.
 if [[ "$WRAITH" == "true" ]]; then
@@ -851,8 +848,6 @@ coordinator_enabled = true
 advertised_endpoint = "${PUBIP}:9100"
 coordinator_port = 9100
 coordinator_role_enabled = true
-bond_ledger_url = "https://127.0.0.1:8800"
-bond_ledger_token = "${BOND_LEDGER_TOKEN}"
 EOF
 fi
 

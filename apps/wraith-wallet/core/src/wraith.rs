@@ -4,9 +4,8 @@
 //! HTTP endpoint:
 //!
 //! ```text
-//! /find_or_create   → enrol in a session (placeholder bond_id)
-//! (wallet escrows)  → bond is escrowed against (ghost_id, session_id)
-//! /inputs           → commit UTXO + change addr; coordinator verifies bond
+//! /find_or_create   → enrol in a session
+//! /inputs           → commit UTXO + change addr + BIP-322 ownership proof
 //! /nonce            → fetch coordinator pubkey + a fresh signing nonce
 //! /blind-sign       → coordinator blind-signs the wallet's mix-output addr
 //! /outputs          → wallet anonymously submits unblinded address + sig
@@ -20,11 +19,6 @@
 //!   - `WraithSessionClient` holds the base URL + an HTTP client.
 //!   - `execute_mix` runs the whole pipeline once, end-to-end, and
 //!     returns the broadcast txid.
-//!   - The bond escrow step is the caller's responsibility (a real
-//!     wallet calls ghost-pay; the integration test swaps in a
-//!     direct `MockBondLedger.escrow` call). Future iterations will
-//!     wire a `BondLedgerClient` trait so the wallet's bond
-//!     dependency is pluggable like the coordinator's `BondLedger`.
 //!   - Witness signing is supplied by the caller via a closure. The
 //!     wallet's keystore + signer modules will plug in here later;
 //!     for now any FnMut(&Transaction, usize) -> Witness works,
@@ -76,8 +70,6 @@ pub enum WraithClientError {
     Crypto(#[from] wraith_protocol::WraithError),
     #[error("signer rejected input {input_index}: {detail}")]
     Signer { input_index: usize, detail: String },
-    #[error("bond escrow: {0}")]
-    Bond(String),
     #[error("ownership proof: {0}")]
     OwnershipProof(String),
 }
@@ -103,11 +95,6 @@ pub struct ParticipantUtxo {
 pub struct MixRequest {
     pub tier_id: String,
     pub ghost_id: String,
-    /// Bond id placeholder echoed at /find_or_create time. The
-    /// coordinator verifies the actual bond against the
-    /// (ghost_id, session_id) tuple at /inputs time, so this is
-    /// purely cosmetic here.
-    pub bond_id_placeholder: String,
     pub utxo: ParticipantUtxo,
     /// Optional change address. Required when input.value_sats
     /// exceeds (denom + per-participant fee shares) by ≥ dust.
@@ -137,7 +124,6 @@ pub struct DiscoverTier {
     pub denomination_sats: u64,
     pub min_participants: u32,
     pub max_participants: u32,
-    pub bond_sats: u64,
     pub service_fee_sats: u64,
 }
 
@@ -149,7 +135,6 @@ pub struct DiscoverPayload {
     pub network: String,
     pub pool_id: String,
     pub service_fee_bps: u32,
-    pub bond_bps: u32,
     pub fill_window_secs: u64,
     pub tiers: Vec<DiscoverTier>,
 }
@@ -333,7 +318,7 @@ impl WraithSessionClient {
     /// `submit_witness`; equivalent to:
     ///
     /// ```ignore
-    /// let prepared = client.prepare_mix(req, bond_setup).await?;
+    /// let prepared = client.prepare_mix(req, prove_ownership).await?;
     /// let witness = signer.sign(&prepared.unsigned_tx,
     ///                            prepared.input_index,
     ///                            prepared.prev_amount_sats)?;
@@ -344,23 +329,18 @@ impl WraithSessionClient {
     /// remote signer service) or when the caller wants to inspect
     /// `prepared.unsigned_tx` before signing — e.g. the
     /// daemon-integrated CLI.
-    pub async fn execute_mix<S, B, BFut, P, PFut>(
+    pub async fn execute_mix<S, P, PFut>(
         &self,
         request: MixRequest,
         mut signer: S,
-        bond_setup: B,
         prove_ownership: P,
     ) -> Result<MixOutcome, WraithClientError>
     where
         S: WitnessSigner,
-        B: FnMut(&str, u64) -> BFut,
-        BFut: std::future::Future<Output = Result<(), WraithClientError>>,
         P: FnMut(&str) -> PFut,
         PFut: std::future::Future<Output = Result<String, WraithClientError>>,
     {
-        let prepared = self
-            .prepare_mix(request, bond_setup, prove_ownership)
-            .await?;
+        let prepared = self.prepare_mix(request, prove_ownership).await?;
         let witness = signer
             .sign(
                 &prepared.unsigned_tx,
@@ -383,10 +363,6 @@ impl WraithSessionClient {
     /// witness. The caller signs asynchronously (hardware wallet,
     /// remote signer, etc.) and then calls `submit_witness`.
     ///
-    /// `bond_setup` runs after /find_or_create returns the session_id
-    /// — the wallet's bond ledger client (or test-time MockBondLedger
-    /// escrow) plugs in here.
-    ///
     /// `prove_ownership` is handed the challenge string the coordinator
     /// will reconstruct, and must return a base64 BIP-322 signature made
     /// with the key controlling the input UTXO — the coordinator refuses
@@ -394,15 +370,12 @@ impl WraithSessionClient {
     /// `wraith_signer::prove_ownership` is the keystore-backed
     /// implementation. Async for the same reason `bond_setup` is: the
     /// key may live behind a lock, a daemon round-trip, or hardware.
-    pub async fn prepare_mix<B, BFut, P, PFut>(
+    pub async fn prepare_mix<P, PFut>(
         &self,
         request: MixRequest,
-        mut bond_setup: B,
         mut prove_ownership: P,
     ) -> Result<PreparedMix, WraithClientError>
     where
-        B: FnMut(&str, u64) -> BFut,
-        BFut: std::future::Future<Output = Result<(), WraithClientError>>,
         P: FnMut(&str) -> PFut,
         PFut: std::future::Future<Output = Result<String, WraithClientError>>,
     {
@@ -413,15 +386,11 @@ impl WraithSessionClient {
                 &serde_json::json!({
                     "tier_id": request.tier_id,
                     "ghost_id": request.ghost_id,
-                    "bond_id": request.bond_id_placeholder,
                 }),
             )
             .await?;
         let session_id = foc.session.session_id.clone();
         debug!(%session_id, "enrolled in session");
-
-        // 2. Caller-driven bond escrow against the now-known session.
-        bond_setup(&session_id, foc.session.bond_amount_sats).await?;
 
         // 2b. Wait for the coordinator to flip Filling → Locked. /inputs
         //     refuses Filling-state submissions, so we have to block
@@ -756,7 +725,7 @@ impl WraithSessionClient {
     }
 
     /// Fetch the coordinator's `/api/v1/pool/discover` payload —
-    /// network, supported tiers, fee + bond rates. Same connect-error
+    /// network, supported tiers, fee rates. Same connect-error
     /// rotation as the mix calls: HTTP errors propagate unchanged
     /// (a coordinator answered, even if it errored), only
     /// connection-level failures rotate to the next peer.
@@ -976,7 +945,6 @@ impl FromHex for Txid {
 struct FindOrCreateResponse {
     session: SessionDescriptor,
     joined: bool,
-    bond_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -986,7 +954,6 @@ struct SessionDescriptor {
     state: String,
     slots_filled: u32,
     slots_total: u32,
-    bond_amount_sats: u64,
     fill_window_expires_at: Option<u64>,
 }
 
@@ -1031,7 +998,6 @@ struct WitnessResponse {
     witnesses_collected: u32,
     enrolled_count: u32,
     broadcast_txid: Option<String>,
-    bonds_resolved: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

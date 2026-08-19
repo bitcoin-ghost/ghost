@@ -7,8 +7,7 @@
 # able to prove the wallet works end-to-end WITHOUT the GUI — the CLI
 # (`wraith`) talks to the daemon (`wraithd`) over a Unix socket, and
 # the daemon talks to ghostd + ghost-pay + ghost-gsp, exactly as in
-# production. Nothing here is mocked except the coordinator's bond
-# ledger (regtest only — refused on mainnet by the binary).
+# production. Nothing here is mocked.
 #
 # Flows exercised, in order:
 #   1.  create a BIP-39 wallet                  (wraith wallet create)
@@ -406,17 +405,15 @@ for i in $(seq 0 $((N-1))); do
     CHANGE_ADDRS[$i]=$(WRAITH --json light receive --index "$((210+i))" | jq -r '.LightReceive.address // .address')
 done
 
-# Start the coordinator with a real broadcast target (ghostd) + auto-
-# escrow mock bonds + a 30s fill window (collapses the 5-min default so
-# the round locks shortly after the 5th enrolment). All three flags are
-# refused on mainnet by the binary.
-step "starting wraith-coordinator (real broadcast, auto-escrow bonds)"
+# Start the coordinator with a real broadcast target (ghostd) and a 30s
+# fill window (collapses the 5-min default so the round locks shortly
+# after the 5th enrolment). The short window is refused on mainnet by
+# the binary.
+step "starting wraith-coordinator (real broadcast, no bonds)"
 "$BIN/wraith-coordinator" \
     --listen 127.0.0.1:9100 \
     --network regtest \
     --fee-address "$FEE_ADDR" \
-    --mock-bond-ledger \
-    --mock-bond-ledger-auto-escrow \
     --fill-window-secs 30 \
     --ghostd-url "$GHOSTD_RPC_URL" \
     --ghostd-user demo \
@@ -431,7 +428,7 @@ WRAITH --json mix discover --coordinator "$COORD_URL" \
     >/dev/null || fail "coordinator does not advertise the 100k_sats tier"
 
 # Fund one input UTXO per participant. 200,000 sats covers denom
-# (100,000) + bond (500) + per-input fee share + change.
+# (100,000) + per-input fee share + change.
 step "funding $N mix-input UTXOs at 200,000 sats each"
 for i in $(seq 0 $((N-1))); do
     FUND_TXIDS[$i]=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" 0.002)
@@ -459,7 +456,6 @@ for i in $(seq 0 $((N-1))); do
             --coordinator "$COORD_URL" \
             --tier 100k_sats \
             --ghost-id "smoke_participant_$i" \
-            --bond-id-placeholder "placeholder_$i" \
             --utxo "${FUND_TXIDS[$i]}:${UTXO_VOUTS[$i]}" \
             --utxo-value 200000 \
             --utxo-scriptpubkey "${UTXO_SPKS[$i]}" \

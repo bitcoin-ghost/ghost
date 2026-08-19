@@ -1,7 +1,7 @@
 //! End-to-end integration test: real wallet client driving a real
 //! `wraith-coordinator` over real HTTP.
 //!
-//! Sets up a coordinator with `MockBondLedger` + `StubBroadcaster`,
+//! Sets up a coordinator with a `MockUtxoSource` + `StubBroadcaster`,
 //! binds it to an ephemeral port via `axum::serve`, then spins up
 //! five `WraithSessionClient` runs concurrently — one per ghost_id.
 //! Each wallet drives the protocol on its own task; the test
@@ -17,14 +17,13 @@ use bitcoin::{secp256k1::SecretKey, Address, Network, Witness};
 use wraith_coordinator::broadcaster::{Broadcaster, StubBroadcaster};
 use wraith_coordinator::utxo_source::MockUtxoSource;
 use wraith_coordinator::{build_router, CoordinatorState};
-use wraith_protocol::{BondLedger, LiteSessionState, MockBondLedger, SessionGossipEvent};
+use wraith_protocol::{LiteSessionState, SessionGossipEvent};
 use wraith_wallet_core::wraith::{
     MixRequest, ParticipantUtxo, WraithClientError, WraithSessionClient,
 };
 
 const TIER_ID: &str = "100k_sats";
 const TIER_DENOM: u64 = 100_000;
-const TIER_BOND: u64 = 500;
 const N: usize = 5;
 
 /// Generate the i-th deterministic signet P2WPKH address. Same scheme
@@ -100,14 +99,12 @@ fn participant_utxos() -> MockUtxoSource {
 #[tokio::test]
 async fn five_wallets_complete_a_full_mix_round() {
     // 1. Stand up the coordinator.
-    let ledger: Arc<MockBondLedger> = Arc::new(MockBondLedger::new());
     let stub_broadcaster = StubBroadcaster::new();
     let state = Arc::new(
         CoordinatorState::with_components(
             Network::Signet,
             Arc::new(wraith_protocol::SystemClock),
             Arc::new(wraith_protocol::RandomSessionIdGenerator),
-            Some(ledger.clone() as Arc<dyn BondLedger>),
             Some(signet_addr(99)),
             Some(Arc::new(stub_broadcaster.clone()) as Arc<dyn Broadcaster>),
         )
@@ -124,12 +121,11 @@ async fn five_wallets_complete_a_full_mix_round() {
     let base_url = format!("http://127.0.0.1:{port}");
 
     // 2. Spawn 5 wallets concurrently. Each runs the full protocol
-    //    on its own task. The shared MockBondLedger is the bond
+    //    on its own task. The test
     //    source; the test coordinator-side state advances Filling →
     //    Locked once all 5 have enrolled (see step 3).
     let mut handles = Vec::with_capacity(N);
     for i in 0..N {
-        let ledger_for_task = ledger.clone();
         let base_url = base_url.clone();
         let handle = tokio::spawn(async move {
             let client = WraithSessionClient::new(base_url, Network::Signet);
@@ -143,21 +139,10 @@ async fn five_wallets_complete_a_full_mix_round() {
             let req = MixRequest {
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
-                bond_id_placeholder: format!("placeholder-{i}"),
                 utxo,
                 change_address: Some(signet_addr(50 + i as u8)),
                 // Mixed outputs are P2TR and nothing else (#696).
                 mix_output_address: participant_address(i as u8 + 10).to_string(),
-            };
-            let bond_setup = move |session_id: &str, expected: u64| {
-                let ledger = ledger_for_task.clone();
-                let ghost = ghost.clone();
-                let session_id = session_id.to_string();
-                async move {
-                    assert_eq!(expected, TIER_BOND);
-                    let _ = ledger.escrow(ghost, session_id, expected);
-                    Ok::<(), WraithClientError>(())
-                }
             };
             let signer = |_tx: &bitcoin::Transaction, _idx: usize, _amt: u64| {
                 let mut w = Witness::new();
@@ -174,7 +159,7 @@ async fn five_wallets_complete_a_full_mix_round() {
                     Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
                 }
             };
-            client.execute_mix(req, signer, bond_setup, prove).await
+            client.execute_mix(req, signer, prove).await
         });
         handles.push(handle);
     }
@@ -230,20 +215,6 @@ async fn five_wallets_complete_a_full_mix_round() {
             expected_addr.script_pubkey(),
             "wallet-{i} wrong scriptpubkey"
         );
-    }
-
-    // 8. All bonds resolved as Refund(RoundCompleted).
-    let bonds = ledger.snapshot_all();
-    assert_eq!(bonds.len(), N, "5 bonds");
-    use wraith_protocol::{BondResolution, BondStatus, RefundReason};
-    for b in &bonds {
-        match &b.status {
-            BondStatus::Resolved(BondResolution::Refund(RefundReason::RoundCompleted)) => {}
-            other => panic!(
-                "bond {} for {} not Refund(RoundCompleted): {:?}",
-                b.bond_id, b.ghost_id, other
-            ),
-        }
     }
 }
 
@@ -319,14 +290,12 @@ async fn prepare_then_submit_works_via_split_api() {
     // prepare_mix + submit_witness separately instead of the
     // execute_mix wrapper. Confirms the split API delivers the same
     // PreparedMix-shaped result and can be witness-signed asynchronously.
-    let ledger: Arc<MockBondLedger> = Arc::new(MockBondLedger::new());
     let stub_broadcaster = StubBroadcaster::new();
     let state = Arc::new(
         CoordinatorState::with_components(
             Network::Signet,
             Arc::new(wraith_protocol::SystemClock),
             Arc::new(wraith_protocol::RandomSessionIdGenerator),
-            Some(ledger.clone() as Arc<dyn BondLedger>),
             Some(signet_addr(99)),
             Some(Arc::new(stub_broadcaster.clone()) as Arc<dyn Broadcaster>),
         )
@@ -340,7 +309,6 @@ async fn prepare_then_submit_works_via_split_api() {
 
     let mut handles = Vec::with_capacity(N);
     for i in 0..N {
-        let ledger_for_task = ledger.clone();
         let base_url = base_url.clone();
         handles.push(tokio::spawn(async move {
             let client = WraithSessionClient::new(base_url, Network::Signet);
@@ -348,7 +316,6 @@ async fn prepare_then_submit_works_via_split_api() {
             let req = MixRequest {
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
-                bond_id_placeholder: format!("p-{i}"),
                 utxo: ParticipantUtxo {
                     txid: "11".repeat(32),
                     vout: i as u32,
@@ -357,15 +324,6 @@ async fn prepare_then_submit_works_via_split_api() {
                 },
                 change_address: Some(signet_addr(50 + i as u8)),
                 mix_output_address: participant_address(i as u8 + 10).to_string(),
-            };
-            let bond_setup = move |sid: &str, expected: u64| {
-                let ledger = ledger_for_task.clone();
-                let ghost = ghost.clone();
-                let sid = sid.to_string();
-                async move {
-                    let _ = ledger.escrow(ghost, sid, expected);
-                    Ok::<(), WraithClientError>(())
-                }
             };
 
             // Phase 1: prepare. Returns PreparedMix.
@@ -377,10 +335,7 @@ async fn prepare_then_submit_works_via_split_api() {
                     Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
                 }
             };
-            let prepared = client
-                .prepare_mix(req, bond_setup, prove)
-                .await
-                .expect("prepare_mix");
+            let prepared = client.prepare_mix(req, prove).await.expect("prepare_mix");
 
             // Inspect the unsigned tx — that's the whole point of the
             // split. A real signer would derive the sighash from
@@ -444,15 +399,12 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
     use bitcoin::{ScriptBuf, TxOut};
     use wraith_wallet_core::keystore::Keystore;
     use wraith_wallet_core::wraith_signer::{sign_taproot_key_path, DEFAULT_SCAN_INDEX_MAX};
-
-    let ledger: Arc<MockBondLedger> = Arc::new(MockBondLedger::new());
     let stub_broadcaster = StubBroadcaster::new();
     let state = Arc::new(
         CoordinatorState::with_components(
             Network::Signet,
             Arc::new(wraith_protocol::SystemClock),
             Arc::new(wraith_protocol::RandomSessionIdGenerator),
-            Some(ledger.clone() as Arc<dyn BondLedger>),
             Some(signet_addr(99)),
             Some(Arc::new(stub_broadcaster.clone()) as Arc<dyn Broadcaster>),
         )
@@ -500,7 +452,6 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
 
     let mut handles = Vec::with_capacity(N);
     for i in 0..N {
-        let ledger_for_task = ledger.clone();
         let base_url = base_url.clone();
         let handle = tokio::spawn(async move {
             let keystore = Keystore::from_mnemonic(mnemonic_for(i)).unwrap();
@@ -518,7 +469,6 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
             let req = MixRequest {
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
-                bond_id_placeholder: format!("p-{i}"),
                 utxo: ParticipantUtxo {
                     txid: format!("{:02x}", i + 1).repeat(32),
                     vout: 0,
@@ -527,15 +477,6 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                 },
                 change_address: Some(change_addr.to_string()),
                 mix_output_address: mix_addr.to_string(),
-            };
-            let bond_setup = move |sid: &str, expected: u64| {
-                let ledger = ledger_for_task.clone();
-                let ghost = ghost.clone();
-                let sid = sid.to_string();
-                async move {
-                    let _ = ledger.escrow(ghost, sid, expected);
-                    Ok::<(), WraithClientError>(())
-                }
             };
 
             // The real keystore-backed prover, so this test exercises
@@ -558,7 +499,7 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                     .map_err(|e| WraithClientError::OwnershipProof(e.to_string()))
                 }
             };
-            let prepared = client.prepare_mix(req, bond_setup, prove).await.unwrap();
+            let prepared = client.prepare_mix(req, prove).await.unwrap();
             // Real BIP-341 sign: scan idx 0..16 (we know it's 0).
             let witness = sign_taproot_key_path(
                 &keystore,

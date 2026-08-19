@@ -8,10 +8,6 @@
 //!
 //! ## What this commit (B/4a) covers
 //!
-//! - Pluggable `BondLedger` verification — the bond is checked against
-//!   `(ghost_id, session_id, expected_sats = tier.bond_sats)`. Without a
-//!   ledger configured, the endpoint returns 503 — see
-//!   `CoordinatorState::bond_ledger`.
 //! - Identity check: `ghost_id` must already be enrolled on the session.
 //! - **Chain check** (#699): the outpoint must be an unspent, confirmed,
 //!   mature output whose value and scriptPubKey match what the
@@ -68,14 +64,14 @@ use bitcoin::constants::COINBASE_MATURITY;
 use bitcoin::Address;
 
 use wraith_protocol::{
-    ownership_challenge, per_participant_mining_share, BondError, LiteSession, LiteSessionState,
-    SessionType, CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
+    ownership_challenge, per_participant_mining_share, LiteSession, LiteSessionState, SessionType,
+    CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 /// No-sign deadline for the Signing phase, in seconds. From the moment
 /// the round transitions Locked → Signing, every enrolled participant
 /// has this long to submit their /witness; past the deadline, the
-/// round fails and non-signers' bonds get slashed.
+/// round fails and the coins that never signed go into cooldown.
 ///
 /// Picked at 600s (10 min) to be generous: signing requires the wallet
 /// to derive a sighash, sign with a hardware wallet maybe, and post.
@@ -121,22 +117,9 @@ pub async fn post(
     Path(session_id): Path<String>,
     Json(req): Json<Request>,
 ) -> Response {
-    // 1. Bond ledger must be configured. Phase C wires the real one;
-    //    until then production binaries refuse commit-phase submissions.
-    let ledger = match state.bond_ledger.as_ref() {
-        Some(l) => l.clone(),
-        None => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ledger_not_configured",
-                "bond ledger backend is not yet wired (phase C)".into(),
-            );
-        }
-    };
-
-    // 1b. A UTXO source is equally non-optional. Without one the
-    //     coordinator would have to take the participant's word for
-    //     what its own input is, which is what #699 exists to stop.
+    // 1. A UTXO source is not optional. Without one the coordinator
+    //    would have to take the participant's word for what its own
+    //    input is, which is what #699 exists to stop.
     let utxo_source = match state.utxo_source.as_ref() {
         Some(u) => u.clone(),
         None => {
@@ -197,66 +180,7 @@ pub async fn post(
         );
     }
 
-    // 5. Verify the bond against the ledger. Bond amount comes from
-    //    the tier — the wallet doesn't get to negotiate this.
-    let expected_bond = session.tier.bond_sats();
-    let verified_bond_id = match ledger.verify_bond(&req.ghost_id, &session_id, expected_bond) {
-        Ok(id) => id,
-        Err(BondError::NotBonded { .. }) => {
-            return error(
-                StatusCode::PAYMENT_REQUIRED,
-                "bond_not_found",
-                format!(
-                    "no escrowed bond for ghost_id '{}' in session '{}'",
-                    req.ghost_id, session_id
-                ),
-            );
-        }
-        Err(BondError::AmountMismatch {
-            expected_sats,
-            actual_sats,
-            ..
-        }) => {
-            return error(
-                StatusCode::PAYMENT_REQUIRED,
-                "bond_amount_mismatch",
-                format!("bond is {actual_sats} sats; expected {expected_sats}"),
-            );
-        }
-        Err(BondError::AlreadyResolved { .. }) => {
-            return error(
-                StatusCode::CONFLICT,
-                "bond_already_resolved",
-                "this bond has already been resolved against another round".into(),
-            );
-        }
-        Err(BondError::LedgerUnreachable(detail)) => {
-            warn!(?detail, "bond ledger unreachable during /inputs");
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ledger_unreachable",
-                detail,
-            );
-        }
-        Err(other) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ledger_error",
-                other.to_string(),
-            );
-        }
-    };
-
-    // The ledger is authoritative for bond existence at /inputs time.
-    // The bond_id stored on `LiteSessionParticipant` at find_or_create
-    // time is an informational placeholder — wallets typically don't
-    // know the eventual session_id when first calling find_or_create,
-    // so they post the real bond against (ghost_id, session_id) AFTER
-    // the session exists, and `verify_bond` is what locks identity to
-    // the L2 escrow. No cross-check on the participant record's
-    // bond_id is meaningful here.
-
-    // 6. Check the input against the chain.
+    // 5. Check the input against the chain.
     //
     //    Everything in `req.input` is wallet-asserted. Until this
     //    existed the coordinator believed all of it, so the round
@@ -352,7 +276,7 @@ pub async fn post(
         );
     }
 
-    // 7. Prove the submitter controls the coin.
+    // 6. Prove the submitter controls the coin.
     //
     //    Everything above establishes what the coin *is*; none of it
     //    establishes whose it is. Without this, registering someone
@@ -403,7 +327,7 @@ pub async fn post(
         );
     }
 
-    // 8. Validate input arithmetic. Compute per-participant fee shares
+    // 7. Validate input arithmetic. Compute per-participant fee shares
     //    against the tier; reject inputs below the minimum or with
     //    surplus-over-dust missing a change address.
     let min_input = match minimum_participant_input(&session, &state) {
@@ -434,11 +358,10 @@ pub async fn post(
         );
     }
 
-    // 9. Stash the accepted submission. Idempotent: if this ghost_id
+    // 8. Stash the accepted submission. Idempotent: if this ghost_id
     //    already submitted, the entry is replaced (wallet retry path).
     let accepted = AcceptedInputs {
         ghost_id: req.ghost_id.clone(),
-        bond_id: verified_bond_id,
         input: req.input.clone(),
         change_address: req.change_address.clone(),
         accepted_at: now,
@@ -486,7 +409,7 @@ pub async fn post(
         "/inputs accepted submission",
     );
 
-    // 8. Advance Locked → Signing once every enrolled participant has
+    // 9. Advance Locked → Signing once every enrolled participant has
     //    submitted. The protocol crate's registry only exposes
     //    apply_event() and add_participant for state mutation — for
     //    Locked → Signing we use apply_event with StateChanged so

@@ -457,7 +457,7 @@ async fn light_l1_utxos(
 }
 
 /// Fetch the coordinator's `/api/v1/pool/discover` payload —
-/// network, supported tiers, fee + bond rates. Same
+/// network, supported tiers, fee rates. Same
 /// connect-error-rotation invariant as the mix calls: HTTP errors
 /// propagate, only connection-level failures rotate to a peer.
 #[tauri::command]
@@ -493,7 +493,6 @@ async fn wraith_mix_run(
     socks5_proxy: Option<String>,
     tier_id: String,
     ghost_id: String,
-    bond_id_placeholder: Option<String>,
     utxo_txid: String,
     utxo_vout: u32,
     utxo_value_sats: u64,
@@ -509,7 +508,6 @@ async fn wraith_mix_run(
         socks5_proxy,
         tier_id,
         ghost_id,
-        bond_id_placeholder: bond_id_placeholder.unwrap_or_else(|| "placeholder".to_string()),
         utxo_txid,
         utxo_vout,
         utxo_value_sats,

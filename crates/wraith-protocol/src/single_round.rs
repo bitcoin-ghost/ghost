@@ -93,7 +93,7 @@ pub struct LiteParticipantInput {
     pub vout: u32,
     /// On-chain value of this input. Must be ≥ `tier.denomination_sats() +
     /// per-participant fee share`. Coordinator validates this at registration
-    /// before the bond is escrowed.
+    /// before the input is registered.
     pub amount_sats: u64,
     /// Spending script for signature/witness validation. Coordinator checks
     /// it matches what's actually on-chain.
@@ -214,9 +214,9 @@ impl LiteRoundBuilder {
     /// many people end up in the round. Smaller rounds end up paying
     /// slightly more mining fee than strictly needed (the surplus goes
     /// into the implicit mining-fee bucket); the alternative — varying
-    /// per-participant share with `N` — would force participants to
-    /// re-bond when the round fills past where they joined, which is
-    /// nasty UX.
+    /// per-participant share with `N` — would move the amount a
+    /// participant already committed to when the round fills past where
+    /// they joined, which is nasty UX.
     pub fn min_participant_input(&self) -> u64 {
         self.tier.denomination_sats()
             + self.per_participant_mining_share()

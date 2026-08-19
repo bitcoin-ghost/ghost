@@ -617,7 +617,6 @@ export interface WraithDiscoverTier {
   denomination_sats: number;
   min_participants: number;
   max_participants: number;
-  bond_sats: number;
   service_fee_sats: number;
 }
 
@@ -629,7 +628,6 @@ export interface WraithDiscoverResult {
   network: string;
   pool_id: string;
   service_fee_bps: number;
-  bond_bps: number;
   fill_window_secs: number;
   tiers: WraithDiscoverTier[];
 }
@@ -680,7 +678,6 @@ export interface WraithMixRunArgs {
   socks5_proxy?: string;
   tier_id: string;
   ghost_id: string;
-  bond_id_placeholder?: string;
   utxo_txid: string;
   utxo_vout: number;
   utxo_value_sats: number;
@@ -703,7 +700,6 @@ export async function wraithMixRun(
     socks5Proxy: args.socks5_proxy,
     tierId: args.tier_id,
     ghostId: args.ghost_id,
-    bondIdPlaceholder: args.bond_id_placeholder,
     utxoTxid: args.utxo_txid,
     utxoVout: args.utxo_vout,
     utxoValueSats: args.utxo_value_sats,

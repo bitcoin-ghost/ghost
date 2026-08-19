@@ -30,19 +30,19 @@
 //! ## Backend wiring
 //!
 //! The coordinator depends on three pluggable backends:
-//!   - `BondLedger` — verifies and resolves L2 bonds. Real binding is
-//!     phase C (ghost-pay RPC client).
+//!   - `UtxoSource` — reads the UTXO set so registration can verify an
+//!     input rather than believe it. Bound by `--ghostd-url`; without
+//!     one, `/inputs` refuses every submission (#699).
 //!   - `Broadcaster` — pushes the merged tx to the bitcoin network.
-//!     Real binding is phase D (bitcoind RPC client).
+//!     Also bound by `--ghostd-url`, over the same RPC connection.
 //!   - `coordinator_fee_address` — destination for the per-Mix-round
 //!     service-fee output. Operator-supplied.
 //!
-//! Until phases C/D land, the binary supports `--mock-bond-ledger` and
-//! `--mock-broadcaster` flags that swap in `MockBondLedger` /
-//! `StubBroadcaster`. These are explicitly refused on `mainnet` — a
-//! mock ledger means no real bond escrow, a mock broadcaster means
-//! no actual broadcast, both of which would be a security disaster
-//! in production.
+//! `--mock-broadcaster` swaps in `StubBroadcaster` and is refused on
+//! mainnet: it means no actual broadcast, which would be a security
+//! disaster in production. It composes with `--ghostd-url`, which is how
+//! a dev stack verifies inputs against a real node while keeping its
+//! practice rounds off the network.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,12 +51,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{info, warn};
 
-use wraith_coordinator::bond_ledger_http::GhostPayBondLedger;
 use wraith_coordinator::broadcaster::{Broadcaster, GhostdBroadcaster, StubBroadcaster};
 use wraith_coordinator::rpc::RpcClient;
 use wraith_coordinator::utxo_source::{GhostdUtxoSource, UtxoSource};
 use wraith_coordinator::{build_router, CoordinatorState};
-use wraith_protocol::{BondLedger, MockBondLedger};
 
 /// CLI surface. Configuration that varies between dev, signet, and
 /// mainnet ships via env vars (`WRAITH_COORDINATOR_*`) just like
@@ -93,27 +91,6 @@ struct Cli {
     #[arg(long, env = "WRAITH_COORDINATOR_FEE_ADDRESS")]
     fee_address: Option<String>,
 
-    /// Use an in-memory MockBondLedger instead of a real backend.
-    /// Refused on mainnet — a mock ledger holds no real escrows, so
-    /// "verified" bonds aren't actually paid. Use only in dev /
-    /// signet / regtest. Mutually exclusive with --bond-ledger-url.
-    #[arg(long, env = "WRAITH_COORDINATOR_MOCK_BOND_LEDGER")]
-    mock_bond_ledger: bool,
-
-    /// Auto-escrow mode for the mock bond ledger: every
-    /// `verify_bond` call lazily creates a matching record on
-    /// first hit, so participants don't need to escrow before /inputs.
-    /// Only meaningful when --mock-bond-ledger is also set. Refused
-    /// on mainnet via the same gate (since mock-bond-ledger is
-    /// already refused there). Lets demo / regtest scripts run a
-    /// full mix without standing up the wallet's L2 escrow flow.
-    #[arg(
-        long,
-        env = "WRAITH_COORDINATOR_MOCK_BOND_LEDGER_AUTO_ESCROW",
-        requires = "mock_bond_ledger"
-    )]
-    mock_bond_ledger_auto_escrow: bool,
-
     /// Override the per-session fill window in seconds. Defaults to
     /// `LITE_FILL_WINDOW_SECS` (300s), the production-tuned value
     /// from DESIGN_LITE §11. Regtest demos drop this to ~2s so the
@@ -124,28 +101,7 @@ struct Cli {
     #[arg(long, env = "WRAITH_COORDINATOR_FILL_WINDOW_SECS")]
     fill_window_secs: Option<u64>,
 
-    /// Production ghost-pay BondLedger HTTPS endpoint, e.g.
-    /// `https://127.0.0.1:8800/`. Calls the `/api/v1/wraith/bond/*`
-    /// endpoint set defined in `bond_ledger_http.rs`. Auth via the
-    /// matching --bond-ledger-token (HTTP Bearer). MUST be `https://`:
-    /// the client pins ghost-pay's identity cert (see
-    /// --bond-ledger-node-id).
-    #[arg(long, env = "WRAITH_COORDINATOR_BOND_LEDGER_URL")]
-    bond_ledger_url: Option<String>,
-
-    /// Bearer token sent to ghost-pay's BondLedger endpoints. The
-    /// operator rotates this; the wraith-coordinator picks it up at
-    /// boot. Required when --bond-ledger-url is set.
-    #[arg(long, env = "WRAITH_COORDINATOR_BOND_LEDGER_TOKEN")]
-    bond_ledger_token: Option<String>,
-
     /// The ghost-pay node's `node_id` (64-hex Ed25519 pubkey) to pin its
-    /// TLS identity cert against. ghost-pay derives its bond-endpoint cert
-    /// from its `node.key`, so the cert's pubkey IS this node_id; the
-    /// client accepts that cert and no other (no CA, no DNS). Required when
-    /// --bond-ledger-url is set.
-    #[arg(long, env = "WRAITH_COORDINATOR_BOND_LEDGER_NODE_ID")]
-    bond_ledger_node_id: Option<String>,
 
     /// Use an in-memory StubBroadcaster instead of a real backend.
     /// Refused on mainnet — a stub broadcaster doesn't actually push
@@ -201,57 +157,14 @@ async fn main() -> Result<()> {
     let network =
         parse_network(&cli.network).with_context(|| format!("invalid network: {}", cli.network))?;
 
-    // Mainnet refuses any mock backend. Both mocks compromise the
-    // security model in different ways — refusing at boot beats
-    // surfacing a vulnerability later.
-    if matches!(network, bitcoin::Network::Bitcoin) {
-        if cli.mock_bond_ledger {
-            anyhow::bail!(
-                "MAINNET REFUSAL: --mock-bond-ledger implies no real bond escrow; \
-                 use the production ghost-pay BondLedger binding (phase C)."
-            );
-        }
-        if cli.mock_broadcaster {
-            anyhow::bail!(
-                "MAINNET REFUSAL: --mock-broadcaster does not actually push \
-                 transactions; use the production bitcoind broadcaster (phase D)."
-            );
-        }
+    // Mainnet refuses a mock backend — refusing at boot beats surfacing
+    // a vulnerability later.
+    if matches!(network, bitcoin::Network::Bitcoin) && cli.mock_broadcaster {
+        anyhow::bail!(
+            "MAINNET REFUSAL: --mock-broadcaster does not actually push \
+             transactions; point --ghostd-url at a real node instead."
+        );
     }
-
-    if cli.mock_bond_ledger && cli.bond_ledger_url.is_some() {
-        anyhow::bail!("--mock-bond-ledger and --bond-ledger-url are mutually exclusive; pick one.");
-    }
-    let bond_ledger: Option<Arc<dyn BondLedger>> = if cli.mock_bond_ledger {
-        if cli.mock_bond_ledger_auto_escrow {
-            warn!(
-                "using MockBondLedger with auto-escrow — verify_bond \
-                 lazily creates records, no real bond verification at all"
-            );
-            Some(Arc::new(MockBondLedger::with_auto_escrow()))
-        } else {
-            warn!("using MockBondLedger — bonds are NOT escrowed against real funds");
-            Some(Arc::new(MockBondLedger::new()))
-        }
-    } else if let Some(url) = cli.bond_ledger_url.as_deref() {
-        let token = cli
-            .bond_ledger_token
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--bond-ledger-url requires --bond-ledger-token"))?;
-        let node_id_hex = cli.bond_ledger_node_id.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--bond-ledger-url requires --bond-ledger-node-id (the ghost-pay \
-                 node_id to pin its identity TLS cert against)"
-            )
-        })?;
-        let node_id = parse_node_id(node_id_hex)?;
-        let ledger = GhostPayBondLedger::new(url, token, node_id)
-            .map_err(|e| anyhow::anyhow!("ghost-pay bond ledger: {e}"))?;
-        info!(endpoint = %url, "using GhostPayBondLedger (identity-pinned TLS)");
-        Some(Arc::new(ledger))
-    } else {
-        None
-    };
 
     // One node connection, two jobs: `sendrawtransaction` for the
     // broadcaster and `gettxout` for input verification (#699). Built
@@ -344,7 +257,6 @@ async fn main() -> Result<()> {
         network,
         Arc::new(wraith_protocol::SystemClock),
         Arc::new(wraith_protocol::RandomSessionIdGenerator),
-        bond_ledger,
         cli.fee_address.clone(),
         broadcaster,
     );
@@ -381,13 +293,6 @@ async fn main() -> Result<()> {
     info!(
         listen = %cli.listen,
         network = ?network,
-        bond_ledger = if cli.mock_bond_ledger {
-            "mock"
-        } else if cli.bond_ledger_url.is_some() {
-            "ghost-pay"
-        } else {
-            "none"
-        },
         broadcaster = if cli.mock_broadcaster {
             "stub"
         } else if cli.ghostd_url.is_some() {
@@ -419,20 +324,6 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-/// Parse a 64-hex Ed25519 `node_id` (the value the bond ledger client pins
-/// ghost-pay's identity TLS cert against) into raw bytes.
-fn parse_node_id(s: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(s.trim())
-        .with_context(|| format!("--bond-ledger-node-id must be 64-hex; got `{s}`"))?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "--bond-ledger-node-id must decode to exactly 32 bytes (got {})",
-            bytes.len()
-        )
-    })?;
-    Ok(arr)
 }
 
 fn parse_network(s: &str) -> Result<bitcoin::Network> {

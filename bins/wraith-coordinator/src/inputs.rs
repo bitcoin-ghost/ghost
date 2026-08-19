@@ -15,8 +15,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use wraith_protocol::BondId;
-
 /// One participant's accepted commit-phase submission. Records exactly
 /// the fields the coordinator needs to build the round transaction in
 /// `/sign` — txid + vout + value + spending script for the input, plus
@@ -25,9 +23,6 @@ use wraith_protocol::BondId;
 pub struct AcceptedInputs {
     /// Wallet's per-round identity (matches `LiteSessionParticipant.ghost_id`).
     pub ghost_id: String,
-    /// L2 bond record this input set is anchored to. Verified against
-    /// the BondLedger before acceptance.
-    pub bond_id: BondId,
     /// The participant's single input UTXO.
     pub input: TxInputRef,
     /// Where surplus over (denom + fee shares) goes. `None` is only

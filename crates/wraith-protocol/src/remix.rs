@@ -152,7 +152,7 @@ impl RemixStatus {
 pub struct RemixEnrolment {
     pub remix_id: RemixId,
     /// Identifies the wallet — same value the wallet uses in
-    /// `session.find_or_create()` and bond posting.
+    /// `session.find_or_create()` and input registration.
     pub owner_ghost_id: String,
     pub target_tier: LiteTier,
     pub max_remixes: u8,

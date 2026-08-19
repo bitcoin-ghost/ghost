@@ -56,17 +56,12 @@ pub(crate) const MAX_TX_VBYTES: usize = 90_000;
 //     practical even on launch day; the larger numbers only worked on paper.
 //   * `WraithMode` (Bootstrap/Growth/Mature) is gone — the floor of 5 is
 //     viable from network launch.
-//   * Carries the bond + service-fee rates directly on the tier so callers
+//   * Carries the service-fee rate directly on the tier so callers
 //     don't have to thread them separately.
 
 /// Service-fee rate as basis points (50 bps = 0.5%). Applied to total round
 /// notional value. Fee output goes to the coordinator pool's fee address.
 pub const LITE_SERVICE_FEE_BPS: u32 = 50;
-
-/// Bond rate as basis points (50 bps = 0.5%). Escrowed in ghost-pay L2 at
-/// session.bond(); refunded on completion or no-show during Filling; slashed
-/// on no-sign during Signing.
-pub const LITE_BOND_BPS: u32 = 50;
 
 /// How long a `Filling` session stays open after `min_participants` is
 /// reached, waiting for more arrivals up to `max_participants`. Default
@@ -81,7 +76,7 @@ pub const LITE_FILL_WINDOW_SECS: u64 = 300;
 ///     receive after the round),
 ///   * `min_participants` (5 universally — round won't start below this),
 ///   * `max_participants` (tier-specific cap so the on-chain tx stays small),
-///   * shared service-fee + bond rates (`LITE_SERVICE_FEE_BPS`, `LITE_BOND_BPS`).
+///   * a shared service-fee rate (`LITE_SERVICE_FEE_BPS`).
 ///
 /// Users select a tier by the denomination they want their post-mix outputs
 /// to be. A user with 0.5 BTC who wants a single 0.1 BTC mixed output picks
@@ -153,13 +148,6 @@ impl LiteTier {
         }
     }
 
-    /// Per-participant bond escrowed in ghost-pay L2 at registration.
-    /// Refunded on round completion; slashed on no-sign during Signing.
-    pub const fn bond_sats(&self) -> u64 {
-        // bond = denomination * BPS / 10_000
-        (self.denomination_sats() * LITE_BOND_BPS as u64) / 10_000
-    }
-
     /// Per-participant service fee included in the round transaction.
     /// Funds the coordinator pool operator.
     pub const fn service_fee_sats(&self) -> u64 {
@@ -192,7 +180,7 @@ impl LiteTier {
     }
 
     /// Suggest a tier for a user's available balance. Picks the largest
-    /// tier where `denomination + service_fee + bond ≤ balance`. Returns
+    /// tier where `denomination + service_fee ≤ balance`. Returns
     /// `None` if the user can't afford even the smallest tier.
     ///
     /// Note: this is suggestion only — the wallet may pick any tier the
@@ -200,7 +188,7 @@ impl LiteTier {
     /// for faster fill or upgrading via remix queue.
     pub fn suggest_for_balance(sats: u64) -> Option<Self> {
         for tier in Self::all().iter().rev() {
-            let needed = tier.denomination_sats() + tier.service_fee_sats() + tier.bond_sats();
+            let needed = tier.denomination_sats() + tier.service_fee_sats();
             if sats >= needed {
                 return Some(*tier);
             }
@@ -254,18 +242,17 @@ mod tests {
     }
 
     #[test]
-    fn lite_tier_fees_and_bonds_match_spec() {
-        // 0.5% service fee + 0.5% bond, applied per-tier.
+    fn lite_tier_fees_match_spec() {
+        // 0.5% service fee, applied per-tier.
         for tier in LiteTier::all() {
             let denom = tier.denomination_sats();
             assert_eq!(tier.service_fee_sats(), denom / 200, "tier {tier} fee");
-            assert_eq!(tier.bond_sats(), denom / 200, "tier {tier} bond");
         }
         // Concrete:
-        assert_eq!(LiteTier::Denom100kSats.bond_sats(), 500);
-        assert_eq!(LiteTier::Denom1mSats.bond_sats(), 5_000);
-        assert_eq!(LiteTier::Denom10mSats.bond_sats(), 50_000);
-        assert_eq!(LiteTier::Denom100mSats.bond_sats(), 500_000);
+        assert_eq!(LiteTier::Denom100kSats.service_fee_sats(), 500);
+        assert_eq!(LiteTier::Denom1mSats.service_fee_sats(), 5_000);
+        assert_eq!(LiteTier::Denom10mSats.service_fee_sats(), 50_000);
+        assert_eq!(LiteTier::Denom100mSats.service_fee_sats(), 500_000);
     }
 
     #[test]
@@ -307,18 +294,17 @@ mod tests {
 
     #[test]
     fn lite_tier_suggestion_picks_largest_affordable() {
-        // Just enough for the smallest tier: denom + fee + bond.
+        // Just enough for the smallest tier: denom + fee.
         let smallest_total = LiteTier::Denom100kSats.denomination_sats()
-            + LiteTier::Denom100kSats.service_fee_sats()
-            + LiteTier::Denom100kSats.bond_sats();
+            + LiteTier::Denom100kSats.service_fee_sats();
         assert_eq!(
             LiteTier::suggest_for_balance(smallest_total),
             Some(LiteTier::Denom100kSats)
         );
         // One sat short of the smallest → None.
         assert_eq!(LiteTier::suggest_for_balance(smallest_total - 1), None);
-        // 1 BTC exactly. denom (100m) + fee (500k) + bond (500k) = 101m sats.
-        // 100m sats is short by 1m sats. So we expect the 10m tier.
+        // 1 BTC exactly. The 100m tier needs denom (100m) + fee (500k),
+        // so 100m sats is short by 500k. Expect the 10m tier.
         assert_eq!(
             LiteTier::suggest_for_balance(100_000_000),
             Some(LiteTier::Denom10mSats)
@@ -344,7 +330,6 @@ mod tests {
         // pin them so a future "let's tune the rate" change has to
         // explicitly update the test.
         assert_eq!(LITE_SERVICE_FEE_BPS, 50);
-        assert_eq!(LITE_BOND_BPS, 50);
         assert_eq!(LITE_FILL_WINDOW_SECS, 300);
     }
 }

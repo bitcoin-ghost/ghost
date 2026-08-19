@@ -1,6 +1,6 @@
 //! `POST /api/v1/session/find_or_create` — wallet's session entry point.
 //!
-//! The wallet calls this once it has paid a bond and wants to mix at a
+//! The wallet calls this when it wants to mix at a
 //! specific tier. The coordinator either:
 //!   - returns an existing open session at that tier (fast path: the
 //!     wallet joins a partially-filled round), or
@@ -18,7 +18,8 @@
 //! attempt will spin up a brand-new session if no other open one exists.
 //! One retry is enough: under contention the registry will keep
 //! returning fresh ids, and a participant who races repeatedly is
-//! exhibiting Sybil behaviour the bond layer is supposed to handle.
+//! exhibiting the Sybil behaviour the ownership proof and outpoint
+//! cooldown are there to handle (#699).
 
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use wraith_protocol::{
-    find_or_create_session, BondId, LiteSessionError, LiteTier, SessionDescriptor, SessionType,
+    find_or_create_session, LiteSessionError, LiteTier, SessionDescriptor, SessionType,
 };
 
 use crate::state::CoordinatorState;
@@ -51,11 +52,6 @@ pub struct Request {
     /// `/inputs` and `/sign` so the coordinator can correlate. Must be
     /// non-empty.
     pub ghost_id: String,
-    /// Bond escrow id returned by the L2 bond contract. The coordinator
-    /// will validate this against the BondLedger at `/inputs` time —
-    /// here we just record it so subsequent calls in the same session
-    /// can look it up.
-    pub bond_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,10 +67,6 @@ struct ErrorBody {
 pub struct ResponseBody {
     pub session: SessionDescriptor,
     pub joined: bool,
-    /// Echo of the bond_id the wallet supplied. The coordinator does
-    /// NOT bind the bond to the session here — that happens at /inputs
-    /// time once the bond has been verified against the BondLedger.
-    pub bond_id: String,
 }
 
 pub async fn post(
@@ -104,15 +96,6 @@ pub async fn post(
             "ghost_id must be non-empty".into(),
         );
     }
-    if req.bond_id.trim().is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "missing_bond_id",
-            "bond_id must be non-empty".into(),
-        );
-    }
-
-    let bond_id = BondId::new(req.bond_id.clone());
 
     // Try once, retry once if the session we picked got filled out from
     // under us between discover and claim. See module docstring.
@@ -127,12 +110,10 @@ pub async fn post(
         );
         let pre_count = descriptor.slots_filled;
         let now = state.now();
-        match state.sessions.add_participant(
-            &descriptor.session_id,
-            &req.ghost_id,
-            bond_id.clone(),
-            now,
-        ) {
+        match state
+            .sessions
+            .add_participant(&descriptor.session_id, &req.ghost_id, now)
+        {
             Ok(updated) => {
                 debug!(
                     session_id = %updated.session_id,
@@ -147,7 +128,6 @@ pub async fn post(
                     // one participant before us; otherwise this call
                     // also created the session.
                     joined: pre_count > 0,
-                    bond_id: req.bond_id,
                 };
                 return (StatusCode::OK, Json(body)).into_response();
             }

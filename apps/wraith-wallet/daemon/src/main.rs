@@ -3820,7 +3820,6 @@ mod server {
                 coordinator_peers,
                 tier_id,
                 ghost_id,
-                bond_id_placeholder,
                 utxo_txid,
                 utxo_vout,
                 utxo_value_sats,
@@ -3858,10 +3857,6 @@ mod server {
                         );
                     }
                 };
-                // Build the ghost-pay client (carries the internal-auth
-                // secret) before `req` consumes `ghost_id`. The bond is
-                // escrowed against this participant's own L2 balance.
-                let bond_gid = ghost_id.clone();
                 // Same reason: `req` takes the scriptPubKey, and the
                 // ownership proof needs it to find the key that owns it.
                 let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
@@ -3870,7 +3865,6 @@ mod server {
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo: ParticipantUtxo {
                         txid: utxo_txid,
                         vout: utxo_vout,
@@ -3880,35 +3874,11 @@ mod server {
                     change_address,
                     mix_output_address,
                 };
-                let pay = match build_ghost_pay_client(state).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bond escrow client: {e}"),
-                            }),
-                        );
-                    }
-                };
-                // Escrow the bond against ghost-pay once the coordinator
-                // returns the real session_id + bond amount.
-                let bond_setup = |session_id: &str, amount: u64| {
-                    let session_id = session_id.to_string();
-                    let pay = &pay;
-                    let gid = bond_gid.clone();
-                    async move {
-                        pay.escrow_bond(&gid, &session_id, amount)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| WraithClientError::Bond(e.to_string()))
-                    }
-                };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
                 // outpoint, so it must come from the key that really owns
                 // the coin (#699). Async because the keystore sits behind
-                // the wallet lock, same as the bond escrow above.
+                // the wallet lock.
                 let proof_spk = utxo_scriptpubkey_hex_for_proof.clone();
                 let prove_ownership = |challenge: &str| {
                     let challenge = challenge.to_string();
@@ -3928,7 +3898,7 @@ mod server {
                         .map_err(WraithClientError::OwnershipProof)
                     }
                 };
-                match client.prepare_mix(req, bond_setup, prove_ownership).await {
+                match client.prepare_mix(req, prove_ownership).await {
                     Ok(prepared) => {
                         let resp = WraithMixPreparedResponse {
                             session_id: prepared.session_id.clone(),
@@ -4032,7 +4002,6 @@ mod server {
                             network: parsed.network,
                             pool_id: parsed.pool_id,
                             service_fee_bps: parsed.service_fee_bps,
-                            bond_bps: parsed.bond_bps,
                             fill_window_secs: parsed.fill_window_secs,
                             tiers: parsed
                                 .tiers
@@ -4042,7 +4011,6 @@ mod server {
                                     denomination_sats: t.denomination_sats,
                                     min_participants: t.min_participants,
                                     max_participants: t.max_participants,
-                                    bond_sats: t.bond_sats,
                                     service_fee_sats: t.service_fee_sats,
                                 })
                                 .collect(),
@@ -4085,7 +4053,6 @@ mod server {
                 coordinator_peers,
                 tier_id,
                 ghost_id,
-                bond_id_placeholder,
                 utxo_txid,
                 utxo_vout,
                 utxo_value_sats,
@@ -4128,9 +4095,6 @@ mod server {
                         );
                     }
                 };
-                // Build the ghost-pay client before `req` consumes
-                // `ghost_id`; escrow this participant's bond against it.
-                let bond_gid = ghost_id.clone();
                 // Same reason: `req` takes the scriptPubKey, and the
                 // ownership proof needs it to find the key that owns it.
                 let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
@@ -4139,7 +4103,6 @@ mod server {
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo: ParticipantUtxo {
                         txid: utxo_txid,
                         vout: utxo_vout,
@@ -4149,33 +4112,11 @@ mod server {
                     change_address,
                     mix_output_address,
                 };
-                let pay = match build_ghost_pay_client(state).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bond escrow client: {e}"),
-                            }),
-                        );
-                    }
-                };
-                let bond_setup = |session_id: &str, amount: u64| {
-                    let session_id = session_id.to_string();
-                    let pay = &pay;
-                    let gid = bond_gid.clone();
-                    async move {
-                        pay.escrow_bond(&gid, &session_id, amount)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| WraithClientError::Bond(e.to_string()))
-                    }
-                };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
                 // outpoint, so it must come from the key that really owns
                 // the coin (#699). Async because the keystore sits behind
-                // the wallet lock, same as the bond escrow above.
+                // the wallet lock.
                 let proof_spk = utxo_scriptpubkey_hex_for_proof.clone();
                 let prove_ownership = |challenge: &str| {
                     let challenge = challenge.to_string();
@@ -4195,7 +4136,7 @@ mod server {
                         .map_err(WraithClientError::OwnershipProof)
                     }
                 };
-                let prepared = match client.prepare_mix(req, bond_setup, prove_ownership).await {
+                let prepared = match client.prepare_mix(req, prove_ownership).await {
                     Ok(p) => p,
                     Err(e) => {
                         return Envelope::new(

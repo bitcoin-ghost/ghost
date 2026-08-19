@@ -21,7 +21,6 @@ interface Tier {
   id: string;
   label: string;
   denom_sats: number;
-  bond_sats: number;
   min_participants?: number;
 }
 
@@ -31,10 +30,10 @@ interface Tier {
 /// list — the coordinator may add tiers in future without a wallet
 /// rebuild.
 const FALLBACK_TIERS: Tier[] = [
-  { id: "100k_sats", label: "Tiny", denom_sats: 100_000, bond_sats: 500 },
-  { id: "1m_sats", label: "Small", denom_sats: 1_000_000, bond_sats: 5_000 },
-  { id: "10m_sats", label: "Medium", denom_sats: 10_000_000, bond_sats: 50_000 },
-  { id: "100m_sats", label: "Large", denom_sats: 100_000_000, bond_sats: 500_000 },
+  { id: "100k_sats", label: "Tiny", denom_sats: 100_000 },
+  { id: "1m_sats", label: "Small", denom_sats: 1_000_000 },
+  { id: "10m_sats", label: "Medium", denom_sats: 10_000_000 },
+  { id: "100m_sats", label: "Large", denom_sats: 100_000_000 },
 ];
 
 function tierLabelFor(denom_sats: number): string {
@@ -49,7 +48,6 @@ function tiersFromDiscover(rows: WraithDiscoverTier[]): Tier[] {
     id: t.id,
     label: tierLabelFor(t.denomination_sats),
     denom_sats: t.denomination_sats,
-    bond_sats: t.bond_sats,
     min_participants: t.min_participants,
   }));
 }
@@ -284,10 +282,10 @@ export function Mix({ activeWallet }: MixProps) {
       setErr("UTXO scriptPubKey (hex) is required for sighash.");
       return;
     }
-    if (value < tier.denom_sats + tier.bond_sats) {
+    if (value < tier.denom_sats) {
       setErr(
         `UTXO value (${value.toLocaleString()}) is below ` +
-          `tier denom + bond (${(tier.denom_sats + tier.bond_sats).toLocaleString()}).`,
+          `the tier denomination (${tier.denom_sats.toLocaleString()}).`,
       );
       return;
     }
@@ -474,7 +472,6 @@ export function Mix({ activeWallet }: MixProps) {
                   <span className="muted">sats</span>
                 </div>
                 <div className="tier-meta">
-                  bond {t.bond_sats.toLocaleString()}
                   {t.min_participants ? ` · min ${t.min_participants}` : ""}
                 </div>
               </button>
@@ -532,7 +529,7 @@ export function Mix({ activeWallet }: MixProps) {
             <tbody>
               {utxos.map((u) => {
                 const enough =
-                  u.amount_sats >= tier.denom_sats + tier.bond_sats;
+                  u.amount_sats >= tier.denom_sats;
                 return (
                   <tr key={`${u.txid}:${u.vout}`}>
                     <td className="mono">{u.bip86_index}</td>
@@ -545,7 +542,7 @@ export function Mix({ activeWallet }: MixProps) {
                         <span
                           className="pill warn"
                           title={`Needs ≥ ${(
-                            tier.denom_sats + tier.bond_sats
+                            tier.denom_sats
                           ).toLocaleString()} for current tier`}
                         >
                           too small
@@ -577,7 +574,7 @@ export function Mix({ activeWallet }: MixProps) {
 
       {/* Selected UTXO summary — shows once Use is clicked or
           fields are populated. Value-aware: highlights if the UTXO
-          covers denom + bond, warns otherwise. */}
+          covers the denomination, warns otherwise. */}
       {(utxoTxid || utxoValue) && (
         <div
           className="card"
@@ -613,11 +610,11 @@ export function Mix({ activeWallet }: MixProps) {
                 ? `${Number(utxoValue).toLocaleString()} sats`
                 : "—"}
               {Number(utxoValue) > 0 &&
-                Number(utxoValue) < tier.denom_sats + tier.bond_sats && (
+                Number(utxoValue) < tier.denom_sats && (
                   <span
                     className="pill warn"
                     style={{ marginLeft: 8 }}
-                    title={`needs ≥ ${(tier.denom_sats + tier.bond_sats).toLocaleString()} for ${tier.label}`}
+                    title={`needs ≥ ${(tier.denom_sats).toLocaleString()} for ${tier.label}`}
                   >
                     too small for {tier.label}
                   </span>
@@ -690,7 +687,7 @@ export function Mix({ activeWallet }: MixProps) {
         </summary>
         <p className="muted" style={{ margin: "12px 0", fontSize: 13 }}>
           Override the scanner for cross-wallet UTXOs or surgical
-          control. Value must cover denom + bond + dust for the
+          control. Value must cover the denomination + dust for the
           chosen tier.
         </p>
         <div className="row">

@@ -122,7 +122,7 @@ start_wraithd() {
 start_wraith_coordinator() {
   stop_one wraith-coordinator
   echo "starting wraith-coordinator → $LOG_DIR/wraith-coordinator.log"
-  # Mock bond + broadcaster: refused on mainnet by the binary, fine
+  # Mock broadcaster: refused on mainnet by the binary, fine
   # on signet/regtest. The coordinator binds 127.0.0.1:9100, which
   # matches the Mix screen's DEFAULT_COORDINATOR. Without this in
   # the stack the GUI Mix flow returns connection refused.
@@ -134,7 +134,6 @@ start_wraith_coordinator() {
   "$ROOT/target/debug/wraith-coordinator" \
       --listen 127.0.0.1:9100 \
       --network signet \
-      --mock-bond-ledger \
       --mock-broadcaster \
       --ghostd-url "$GHOSTD_RPC_URL" \
       --ghostd-user "$GHOSTD_RPC_USER" \

@@ -190,10 +190,11 @@ done
 
 # ---- wraith-coordinator -----------------------------------------------------
 # --ghostd-url so the assembled tx is broadcast to bitcoind for real
-# (no --mock-broadcaster). --mock-bond-ledger-auto-escrow so the
-# wallet doesn't need to pre-arrange L2 bonds (demo simplification —
+# (no --mock-broadcaster). Participation needs no escrow at all now:
+# registration proves control of the input and a coin that disrupts a
+# round goes into cooldown (#699). (demo note —
 # safe on regtest, refused on mainnet by the binary).
-step "starting wraith-coordinator (real broadcast, auto-escrow bonds)"
+step "starting wraith-coordinator (real broadcast, no bonds)"
 # --fill-window-secs 30 collapses the 5-minute Filling window so the
 # session locks ~30s after creation instead of waiting LITE_FILL_WINDOW_SECS
 # (300s). 30s is the smallest value that's still robustly larger than
@@ -204,8 +205,6 @@ step "starting wraith-coordinator (real broadcast, auto-escrow bonds)"
     --listen 127.0.0.1:9100 \
     --network regtest \
     --fee-address "$FEE_ADDR" \
-    --mock-bond-ledger \
-    --mock-bond-ledger-auto-escrow \
     --fill-window-secs 30 \
     --ghostd-url "$GHOSTD_RPC_URL" \
     --ghostd-user demo \
@@ -215,7 +214,7 @@ COORD_PID=$!
 sleep 2
 
 # ---- fund the 5 input UTXOs ------------------------------------------------
-# Each participant needs ≥ denom (100,000) + bond (500) + per-input
+# Each participant needs ≥ denom (100,000) + per-input
 # fee share + buffer. 200,000 sats covers everything with room to
 # spare — change goes back to the wallet.
 step "funding 5 input UTXOs at 200,000 sats each"
@@ -266,7 +265,6 @@ for i in $(seq 0 $((N-1))); do
             --coordinator "$COORD_URL" \
             --tier 100k_sats \
             --ghost-id "participant_$i" \
-            --bond-id-placeholder "placeholder_$i" \
             --utxo "${FUND_TXIDS[$i]}:${UTXO_VOUTS[$i]}" \
             --utxo-value 200000 \
             --utxo-scriptpubkey "${UTXO_SPKS[$i]}" \

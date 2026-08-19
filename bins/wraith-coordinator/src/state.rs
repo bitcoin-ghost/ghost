@@ -12,8 +12,8 @@ use std::time::SystemTime;
 use bitcoin::Network;
 
 use wraith_protocol::{
-    BondLedger, Clock, CoordinatorSigner, LiteSessionRegistry, LiteTier, RandomSessionIdGenerator,
-    RemixQueue, SessionIdGenerator, SystemClock,
+    Clock, CoordinatorSigner, LiteSessionRegistry, LiteTier, RandomSessionIdGenerator, RemixQueue,
+    SessionIdGenerator, SystemClock,
 };
 
 use crate::assembly::AssembledRound;
@@ -48,11 +48,6 @@ pub struct CoordinatorState {
     /// production; tests inject `DeterministicSessionIdGenerator` so they
     /// can pin exact session_id strings.
     pub id_gen: Arc<dyn SessionIdGenerator>,
-    /// L2 escrow ledger. `None` until phase C wires the real ghost-pay
-    /// client; tests inject `MockBondLedger`. `/inputs` returns
-    /// `503 ledger_not_configured` while this is None — the binary boots
-    /// fine without it but won't accept commit-phase submissions.
-    pub bond_ledger: Option<Arc<dyn BondLedger>>,
     /// Outpoints in disruption cooldown. Always present — it costs
     /// nothing and an empty list is the correct starting state, unlike
     /// the pluggable backends around it (#699).
@@ -91,8 +86,7 @@ pub struct CoordinatorState {
     /// Per-session no-sign deadline (unix seconds). Recorded by /inputs
     /// when it advances Locked → Signing. /witness checks it at the
     /// top: if `now >= deadline` and the round hasn't completed, the
-    /// round fails, non-signers' bonds get slashed, signers' bonds
-    /// get refunded as RoundVoided.
+    /// round fails and the coins that never signed go into cooldown.
     pub signing_deadlines: Mutex<HashMap<String, u64>>,
     /// Network broadcast backend. `None` until phase D wires the
     /// real bitcoind RPC client; tests inject `StubBroadcaster`. The
@@ -129,8 +123,8 @@ pub struct CoordinatorState {
 
 impl CoordinatorState {
     /// Production constructor — system clock, CSPRNG-based session ids,
-    /// no bond ledger (phase C wires it), no fee address (operator
-    /// configures it), no broadcaster (phase D wires it).
+    /// no fee address (the operator configures it), no broadcaster and no
+    /// UTXO source (both come from `--ghostd-url`).
     pub fn new(network: Network) -> Self {
         Self::with_components(
             network,
@@ -138,19 +132,17 @@ impl CoordinatorState {
             Arc::new(RandomSessionIdGenerator),
             None,
             None,
-            None,
         )
     }
 
     /// Test / advanced-config constructor — caller supplies clock, id
-    /// generator, bond ledger, fee address, and broadcaster. Used by
+    /// generator, fee address, and broadcaster. Used by
     /// integration tests under `tests/` to pin deterministic session
-    /// IDs and inject `MockBondLedger` + `StubBroadcaster`.
+    /// IDs and inject `StubBroadcaster` + `MockUtxoSource`.
     pub fn with_components(
         network: Network,
         clock: Arc<dyn Clock>,
         id_gen: Arc<dyn SessionIdGenerator>,
-        bond_ledger: Option<Arc<dyn BondLedger>>,
         coordinator_fee_address: Option<String>,
         broadcaster: Option<Arc<dyn Broadcaster>>,
     ) -> Self {
@@ -161,7 +153,6 @@ impl CoordinatorState {
             remix: RemixQueue::new(),
             clock,
             id_gen,
-            bond_ledger,
             bans: BanList::new(),
             utxo_source: None,
             coordinator_fee_address,

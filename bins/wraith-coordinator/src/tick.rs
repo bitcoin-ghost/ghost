@@ -4,8 +4,9 @@
 //! the coordinator past the deadline. That's enough in normal flow
 //! (at least one wallet always shows up to ask for status), but a
 //! pathological round where every wallet drops would otherwise sit
-//! in Signing forever and tie up the BondLedger escrows. This module
-//! plugs that hole: a tokio task scans every `SCAN_INTERVAL` for
+//! in Signing forever and never fail, so the coins that killed it would
+//! never go into cooldown. This module plugs that hole: a tokio task
+//! scans every `SCAN_INTERVAL` for
 //! sessions whose deadline has expired and runs the same sweep
 //! `/witness` would have run.
 //!
@@ -22,7 +23,7 @@ use tracing::{debug, warn};
 
 use wraith_protocol::LiteSessionState;
 
-use crate::bond_resolution::execute_no_sign_sweep;
+use crate::no_sign_sweep::execute_no_sign_sweep;
 use crate::state::CoordinatorState;
 
 /// How often to scan. Trades wakeup overhead against worst-case
@@ -87,10 +88,11 @@ pub fn run_one_pass(state: &CoordinatorState) {
             continue;
         }
         let summary = execute_no_sign_sweep(state, &sid);
-        if summary.ledger_missing {
+        if summary.unbannable > 0 {
             warn!(
                 session_id = %sid,
-                "background tick swept session but ledger absent — operator reconcile",
+                unbannable = summary.unbannable,
+                "swept session had non-signers whose outpoint could not be parsed",
             );
         }
     }
