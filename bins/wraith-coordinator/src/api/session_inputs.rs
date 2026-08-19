@@ -21,6 +21,17 @@
 //!   a signature over a wallet-supplied script says nothing about the
 //!   real outpoint. Without a source configured, the endpoint returns
 //!   503 rather than falling back to trust.
+//! - **Ownership proof** (#699): a BIP-322 signature over
+//!   `ownership_challenge(session_id, txid, vout)`, checked against the
+//!   scriptPubKey the *chain* reports. Everything above establishes what
+//!   the coin is; only this establishes whose it is. The challenge binds
+//!   the session (so a proof cannot be replayed into another round) and
+//!   the outpoint (so proving you own one coin does not authorise
+//!   registering another).
+//! - **One outpoint, one participant** (#701): two participants
+//!   registering the same coin builds a transaction with duplicate
+//!   inputs, which cannot broadcast — killing the round at broadcast,
+//!   where the no-sign deadline cannot catch the disruptor.
 //! - Input arithmetic: chain value ≥ denom + per-participant
 //!   service share + per-participant mining share. Surplus over that
 //!   total goes to the change output; if the surplus is ≥ dust, a
@@ -50,10 +61,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use bitcoin::constants::COINBASE_MATURITY;
+use bitcoin::Address;
 
 use wraith_protocol::{
-    per_participant_mining_share, BondError, LiteSession, LiteSessionState, SessionType,
-    CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
+    ownership_challenge, per_participant_mining_share, BondError, LiteSession, LiteSessionState,
+    SessionType, CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 /// No-sign deadline for the Signing phase, in seconds. From the moment
@@ -78,6 +90,12 @@ pub struct Request {
     /// (denom + fee shares) by ≥ dust threshold.
     #[serde(default)]
     pub change_address: Option<String>,
+    /// BIP-322 simple signature over `ownership_challenge(session_id,
+    /// txid, vout)`, base64-encoded exactly as the BIP specifies —
+    /// proof that the submitter controls the coin it is registering
+    /// (#699). Without it, anyone could register anyone's coin.
+    #[serde(default)]
+    pub ownership_proof: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -314,7 +332,58 @@ pub async fn post(
         );
     }
 
-    // 7. Validate input arithmetic. Compute per-participant fee shares
+    // 7. Prove the submitter controls the coin.
+    //
+    //    Everything above establishes what the coin *is*; none of it
+    //    establishes whose it is. Without this, registering someone
+    //    else's outpoint is free — which kills their round, and once
+    //    outpoint banning lands would get their coin banned on their
+    //    behalf (#699).
+    //
+    //    Verified against the scriptPubKey the *chain* reports, never
+    //    the one the submission claims; that ordering is the whole
+    //    point, since a proof against a script the submitter chose
+    //    proves only that they can sign for a script they made up.
+    let proof = match req.ownership_proof.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_ownership_proof",
+                "ownership_proof is required: a BIP-322 signature over the \
+                 session's ownership challenge, made with the input's key"
+                    .into(),
+            );
+        }
+    };
+    let address = match Address::from_script(&chain_utxo.script_pubkey, state.network) {
+        Ok(a) => a,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_input_script",
+                format!("{outpoint} has a scriptPubKey with no address form: {e}"),
+            );
+        }
+    };
+    let witness = match decode_bip322_witness(proof) {
+        Ok(w) => w,
+        Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_ownership_proof", detail),
+    };
+    let challenge = ownership_challenge(&session_id, &req.input.txid, req.input.vout);
+    if let Err(e) = bip322::verify_simple(&address, challenge.as_bytes(), witness) {
+        // Deliberately terse to the caller. The failure detail is a
+        // description of someone else's key material as often as it is
+        // of a wallet bug, and the operator can read the log.
+        debug!(%outpoint, error = %e, "ownership proof rejected");
+        return error(
+            StatusCode::FORBIDDEN,
+            "ownership_proof_failed",
+            format!("ownership proof does not verify against {outpoint}'s scriptPubKey"),
+        );
+    }
+
+    // 8. Validate input arithmetic. Compute per-participant fee shares
     //    against the tier; reject inputs below the minimum or with
     //    surplus-over-dust missing a change address.
     let min_input = match minimum_participant_input(&session, &state) {
@@ -345,7 +414,7 @@ pub async fn post(
         );
     }
 
-    // 8. Stash the accepted submission. Idempotent: if this ghost_id
+    // 9. Stash the accepted submission. Idempotent: if this ghost_id
     //    already submitted, the entry is replaced (wallet retry path).
     let accepted = AcceptedInputs {
         ghost_id: req.ghost_id.clone(),
@@ -468,6 +537,24 @@ fn minimum_participant_input(
         SessionType::Jump => 0,
     };
     Ok(tier.denomination_sats() + mining_share + service_share)
+}
+
+/// Decode a base64 BIP-322 simple signature into the witness it encodes.
+///
+/// The BIP specifies base64 of the consensus-serialised witness, which is
+/// what `verify_simple_encoded` expects — we decode it ourselves because
+/// the address is derived from the chain's scriptPubKey rather than parsed
+/// from a string the submitter supplied.
+fn decode_bip322_witness(proof: &str) -> Result<bitcoin::Witness, String> {
+    use base64::Engine;
+    use bitcoin::consensus::Decodable;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(proof)
+        .map_err(|e| format!("ownership_proof is not valid base64: {e}"))?;
+    let mut cursor = bitcoin::io::Cursor::new(bytes);
+    bitcoin::Witness::consensus_decode_from_finite_reader(&mut cursor)
+        .map_err(|e| format!("ownership_proof is not a consensus-encoded witness: {e}"))
 }
 
 fn error(status: StatusCode, code: &'static str, detail: String) -> Response {

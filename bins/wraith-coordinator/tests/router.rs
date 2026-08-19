@@ -129,20 +129,98 @@ fn deterministic_router_full(
 /// A UTXO source holding exactly the outpoints the `make_*` helpers
 /// register. Any test that claims a different value must add its own
 /// entry.
+///
+/// `11…:i` is participant `i`'s coin — that is the shape
+/// `make_signing_session` submits. `00…:0` is wallet-0's coin, used by
+/// the single-participant tests.
 fn fixture_utxo_source() -> MockUtxoSource {
     let utxos = MockUtxoSource::new();
-    for vout in 0..MIN_5 as u32 {
-        utxos.insert(fixture_outpoint(0x11, vout), 200_000, fixture_spk());
+    for i in 0..MIN_5 as u32 {
+        utxos.insert(fixture_outpoint(0x11, i), 200_000, fixture_spk(i as u8));
     }
-    utxos.insert(fixture_outpoint(0x00, 0), MIN_INPUT_100K_MIX, fixture_spk());
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        MIN_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
     utxos
 }
 
-/// The scriptPubKey every input fixture uses. Registration compares the
+/// Fixture participant `i`'s key. Deterministic (`[i + 1; 32]`, since
+/// zero is not a valid secret key) so every derived address and every
+/// signature is stable across runs.
+fn fixture_key(i: u8) -> bitcoin::PrivateKey {
+    let inner = secp256k1::SecretKey::from_slice(&[i + 1; 32]).expect("valid fixture secret key");
+    bitcoin::PrivateKey::new(inner, Network::Signet)
+}
+
+/// Fixture participant `i`'s BIP86 key-path P2TR address — what its coin
+/// pays to, and what its ownership proof is checked against.
+fn fixture_address(i: u8) -> bitcoin::Address {
+    let secp = secp256k1::Secp256k1::new();
+    let (xonly, _) = fixture_key(i).public_key(&secp).inner.x_only_public_key();
+    bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet)
+}
+
+/// The scriptPubKey of participant `i`'s coin. Registration compares the
 /// claim against the chain, so the two must agree — this is the single
 /// place that decides what both say.
-fn fixture_spk() -> bitcoin::ScriptBuf {
-    bitcoin::ScriptBuf::from_hex(FIXTURE_SPK_HEX).expect("valid fixture script")
+fn fixture_spk(i: u8) -> bitcoin::ScriptBuf {
+    fixture_address(i).script_pubkey()
+}
+
+/// A complete `/inputs` body for fixture participant `i`, carrying a real
+/// BIP-322 proof over this session's ownership challenge.
+///
+/// Real rather than canned: the coordinator checks the proof against the
+/// scriptPubKey the *chain* reports, so a canned blob would only ever
+/// prove that the check ran, not that it verifies what it claims to.
+fn signed_inputs_body(
+    session_id: &str,
+    ghost_id: &str,
+    i: u8,
+    txid_byte: u8,
+    vout: u32,
+    value_sats: u64,
+    change_address: Option<&str>,
+) -> serde_json::Value {
+    let txid = format!("{txid_byte:02x}").repeat(32);
+    let mut body = serde_json::json!({
+        "ghost_id": ghost_id,
+        "input": {
+            "txid": txid,
+            "vout": vout,
+            "value_sats": value_sats,
+            "scriptpubkey_hex": fixture_spk(i).to_hex_string(),
+        },
+        "ownership_proof": fixture_ownership_proof(session_id, i, &txid, vout),
+    });
+    if let Some(addr) = change_address {
+        body["change_address"] = serde_json::Value::String(addr.into());
+    }
+    body
+}
+
+/// Sign the session's ownership challenge with participant `i`'s key and
+/// encode it the way the BIP specifies: base64 of the witness.
+fn fixture_ownership_proof(session_id: &str, i: u8, txid: &str, vout: u32) -> String {
+    use base64::Engine;
+    use bitcoin::consensus::Encodable;
+
+    let challenge = wraith_protocol::ownership_challenge(session_id, txid, vout);
+    let witness = bip322::sign_simple(
+        &fixture_address(i),
+        challenge.as_bytes(),
+        &[fixture_key(i)],
+        None,
+    )
+    .expect("sign fixture ownership proof");
+
+    let mut encoded = Vec::new();
+    witness
+        .consensus_encode(&mut encoded)
+        .expect("encode witness");
+    base64::engine::general_purpose::STANDARD.encode(encoded)
 }
 
 /// `<byte repeated 32 times>:vout` — the shape every input fixture uses.
@@ -602,10 +680,10 @@ const MIN_5: usize = 5;
 /// = 100_000 + 500 + 1612 = 102_112. Same number the handler computes.
 const MIN_INPUT_100K_MIX: u64 = 102_112;
 
-/// scriptPubKey shared by every input fixture. Nonsense as a script,
-/// but valid hex — registration only compares it to what the chain
-/// reports, and the mock reports this.
-const FIXTURE_SPK_HEX: &str = "deadbeef";
+/// A scriptPubKey with no address form at all. Registration has to
+/// refuse it rather than panic deriving an address to check a proof
+/// against.
+const NONSTANDARD_SPK_HEX: &str = "deadbeef";
 
 /// Drive 5 wallets through /find_or_create, escrow a bond per wallet,
 /// then advance the clock past the fill window so the registry's tick
@@ -835,6 +913,204 @@ async fn inputs_returns_402_when_bond_missing_in_ledger() {
     assert_eq!(json["error"], "bond_not_found");
 }
 
+/// Ownership proofs are not optional. Without one, registering someone
+/// else's coin is free (#699).
+#[tokio::test]
+async fn inputs_rejects_a_missing_ownership_proof() {
+    let (router, state, ledger, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "missing_ownership_proof");
+}
+
+/// A proof that is not a base64 witness is a wallet bug, and says so,
+/// rather than being reported as a failed proof.
+#[tokio::test]
+async fn inputs_rejects_a_malformed_ownership_proof() {
+    let (router, state, ledger, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                "ownership_proof": "not base64 at all!!",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "bad_ownership_proof");
+}
+
+/// **The attack this is all for.** Register a coin belonging to someone
+/// else, and prove ownership with a key of your own.
+///
+/// It fails because the proof is checked against the scriptPubKey the
+/// chain reports for that outpoint, not the one the submission names.
+/// Without the chain lookup underneath, this test would pass.
+#[tokio::test]
+async fn inputs_rejects_a_proof_made_with_the_wrong_key() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    // The coin at 00…:0 belongs to participant 1.
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(1));
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": 200_000,
+                    // Names the true script, as it must to get this far.
+                    "scriptpubkey_hex": fixture_spk(1).to_hex_string(),
+                },
+                // ...but signs with participant 0's key.
+                "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 0),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ownership_proof_failed");
+}
+
+/// A proof is bound to its session, so one captured from an earlier
+/// round cannot be replayed into a round its owner never joined.
+#[tokio::test]
+async fn inputs_rejects_a_proof_bound_to_another_session() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": 200_000,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                // Right key, right coin, wrong round.
+                "ownership_proof": fixture_ownership_proof("some-other-session", 0, &txid, 0),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ownership_proof_failed");
+}
+
+/// A proof is bound to its outpoint, so proving you own one coin does
+/// not authorise registering another.
+#[tokio::test]
+async fn inputs_rejects_a_proof_bound_to_another_outpoint() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": 200_000,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                // Same key and session, but a proof over vout 1.
+                "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 1),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ownership_proof_failed");
+}
+
+/// A scriptPubKey with no address form has nothing to check a proof
+/// against, so registration refuses it rather than failing obscurely.
+#[tokio::test]
+async fn inputs_rejects_an_input_with_no_address_form() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        200_000,
+        bitcoin::ScriptBuf::from_hex(NONSTANDARD_SPK_HEX).unwrap(),
+    );
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": 200_000,
+                    "scriptpubkey_hex": NONSTANDARD_SPK_HEX,
+                },
+                "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 0),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "unsupported_input_script");
+}
+
 /// One outpoint, one participant (#701).
 ///
 /// Two participants registering the same coin builds a transaction with
@@ -845,19 +1121,22 @@ async fn inputs_returns_402_when_bond_missing_in_ledger() {
 async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
     let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
 
+    // One person, two enrolments, one coin — which is what the attack
+    // reduces to once ownership is proved: you can no longer register a
+    // coin you do not control, but you can still register your own twice
+    // and kill the round.
     let body = |ghost_id: &str| {
-        serde_json::json!({
-            "ghost_id": ghost_id,
-            "input": {
-                "txid": "00".repeat(32),
-                "vout": 0,
-                "value_sats": 200_000,
-                "scriptpubkey_hex": FIXTURE_SPK_HEX,
-            },
-            "change_address": TEST_FEE_ADDRESS,
-        })
+        signed_inputs_body(
+            &session_id,
+            ghost_id,
+            0,
+            0x00,
+            0,
+            200_000,
+            Some(TEST_FEE_ADDRESS),
+        )
     };
 
     let first = router
@@ -889,18 +1168,17 @@ async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
 async fn inputs_still_accepts_a_participant_resubmitting_its_own_outpoint() {
     let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
 
-    let body = serde_json::json!({
-        "ghost_id": "wallet-0",
-        "input": {
-            "txid": "00".repeat(32),
-            "vout": 0,
-            "value_sats": 200_000,
-            "scriptpubkey_hex": FIXTURE_SPK_HEX,
-        },
-        "change_address": TEST_FEE_ADDRESS,
-    });
+    let body = signed_inputs_body(
+        &session_id,
+        "wallet-0",
+        0,
+        0x00,
+        0,
+        200_000,
+        Some(TEST_FEE_ADDRESS),
+    );
 
     for attempt in 0..2 {
         let resp = router
@@ -943,7 +1221,7 @@ async fn inputs_returns_503_when_no_utxo_source_is_configured() {
                     "txid": "00".repeat(32),
                     "vout": 0,
                     "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -973,7 +1251,7 @@ async fn inputs_rejects_an_outpoint_that_is_not_unspent() {
                     "txid": "00".repeat(32),
                     "vout": 0,
                     "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -993,7 +1271,7 @@ async fn inputs_rejects_an_outpoint_that_is_not_unspent() {
 async fn inputs_rejects_a_value_the_chain_disagrees_with() {
     let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 150_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x00, 0), 150_000, fixture_spk(0));
 
     let response = router
         .oneshot(post_json(
@@ -1005,7 +1283,7 @@ async fn inputs_rejects_a_value_the_chain_disagrees_with() {
                     "vout": 0,
                     // Claims nearly seven times what the chain holds.
                     "value_sats": 1_000_000,
-                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
                 "change_address": TEST_FEE_ADDRESS,
             }),
@@ -1041,7 +1319,7 @@ async fn inputs_rejects_a_scriptpubkey_the_chain_disagrees_with() {
                     "vout": 0,
                     "value_sats": MIN_INPUT_100K_MIX,
                     // A script the submitter controls, for a coin it does not.
-                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -1064,7 +1342,7 @@ async fn inputs_rejects_an_unconfirmed_input() {
         fixture_outpoint(0x00, 0),
         Utxo {
             value_sats: MIN_INPUT_100K_MIX,
-            script_pubkey: fixture_spk(),
+            script_pubkey: fixture_spk(0),
             confirmations: 0,
             coinbase: false,
         },
@@ -1079,7 +1357,7 @@ async fn inputs_rejects_an_unconfirmed_input() {
                     "txid": "00".repeat(32),
                     "vout": 0,
                     "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -1102,7 +1380,7 @@ async fn inputs_rejects_an_immature_coinbase() {
         fixture_outpoint(0x00, 0),
         Utxo {
             value_sats: MIN_INPUT_100K_MIX,
-            script_pubkey: fixture_spk(),
+            script_pubkey: fixture_spk(0),
             confirmations: 99,
             coinbase: true,
         },
@@ -1117,7 +1395,7 @@ async fn inputs_rejects_an_immature_coinbase() {
                     "txid": "00".repeat(32),
                     "vout": 0,
                     "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -1135,20 +1413,12 @@ async fn inputs_rejects_input_below_minimum_with_400() {
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
     // The chain says this outpoint really is worth 1,000 sats, so the
     // refusal is about the tier minimum and not about a stale claim.
-    utxos.insert(fixture_outpoint(0x00, 0), 1_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x00, 0), 1_000, fixture_spk(0));
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            serde_json::json!({
-                "ghost_id": "wallet-0",
-                "input": {
-                    "txid": "00".repeat(32),
-                    "vout": 0,
-                    // 1000 sats well below the minimum 102_112.
-                    "value_sats": 1_000,
-                    "scriptpubkey_hex": "deadbeef",
-                },
-            }),
+            // 1000 sats well below the minimum 102_112.
+            signed_inputs_body(&session_id, "wallet-0", 0, 0x00, 0, 1_000, None),
         ))
         .await
         .unwrap();
@@ -1162,20 +1432,12 @@ async fn inputs_rejects_input_below_minimum_with_400() {
 async fn inputs_rejects_surplus_above_dust_without_change_address() {
     let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            serde_json::json!({
-                "ghost_id": "wallet-0",
-                "input": {
-                    "txid": "00".repeat(32),
-                    "vout": 0,
-                    // Big surplus (~98k sats over min) but no change address.
-                    "value_sats": 200_000,
-                    "scriptpubkey_hex": "deadbeef",
-                },
-            }),
+            // Big surplus (~98k sats over min) but no change address.
+            signed_inputs_body(&session_id, "wallet-0", 0, 0x00, 0, 200_000, None),
         ))
         .await
         .unwrap();
@@ -1193,15 +1455,15 @@ async fn inputs_accepts_exact_minimum_without_change_address() {
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            serde_json::json!({
-                "ghost_id": "wallet-0",
-                "input": {
-                    "txid": "00".repeat(32),
-                    "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": "deadbeef",
-                },
-            }),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                MIN_INPUT_100K_MIX,
+                None,
+            ),
         ))
         .await
         .unwrap();
@@ -1223,16 +1485,15 @@ async fn inputs_advances_session_to_signing_when_all_submit() {
             .clone()
             .oneshot(post_json(
                 &format!("/api/v1/session/{session_id}/inputs"),
-                serde_json::json!({
-                    "ghost_id": format!("wallet-{i}"),
-                    "input": {
-                        "txid": "11".repeat(32),
-                        "vout": i as u32,
-                        "value_sats": 200_000,
-                        "scriptpubkey_hex": "deadbeef",
-                    },
-                    "change_address": TEST_FEE_ADDRESS,
-                }),
+                signed_inputs_body(
+                    &session_id,
+                    &format!("wallet-{i}"),
+                    i as u8,
+                    0x11,
+                    i as u32,
+                    200_000,
+                    Some(TEST_FEE_ADDRESS),
+                ),
             ))
             .await
             .unwrap();
@@ -1261,19 +1522,18 @@ async fn inputs_idempotent_on_resubmission() {
     // one outpoint is a stale claim, not a retry.
     let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
-    utxos.insert(fixture_outpoint(0x22, 0), 300_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+    utxos.insert(fixture_outpoint(0x22, 0), 300_000, fixture_spk(0));
     let body = |txid_byte: u8, sats: u64| {
-        serde_json::json!({
-            "ghost_id": "wallet-0",
-            "input": {
-                "txid": format!("{txid_byte:02x}").repeat(32),
-                "vout": 0,
-                "value_sats": sats,
-                "scriptpubkey_hex": FIXTURE_SPK_HEX,
-            },
-            "change_address": TEST_FEE_ADDRESS,
-        })
+        signed_inputs_body(
+            &session_id,
+            "wallet-0",
+            0,
+            txid_byte,
+            0,
+            sats,
+            Some(TEST_FEE_ADDRESS),
+        )
     };
     let first = router
         .clone()
@@ -1598,16 +1858,15 @@ async fn make_signing_session(
             .clone()
             .oneshot(post_json(
                 &format!("/api/v1/session/{session_id}/inputs"),
-                serde_json::json!({
-                    "ghost_id": format!("wallet-{i}"),
-                    "input": {
-                        "txid": "11".repeat(32),
-                        "vout": i as u32,
-                        "value_sats": 200_000,
-                        "scriptpubkey_hex": "deadbeef",
-                    },
-                    "change_address": TEST_FEE_ADDRESS,
-                }),
+                signed_inputs_body(
+                    &session_id,
+                    &format!("wallet-{i}"),
+                    i as u8,
+                    0x11,
+                    i as u32,
+                    200_000,
+                    Some(TEST_FEE_ADDRESS),
+                ),
             ))
             .await
             .unwrap();

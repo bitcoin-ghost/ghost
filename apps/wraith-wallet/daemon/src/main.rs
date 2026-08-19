@@ -3862,6 +3862,11 @@ mod server {
                 // secret) before `req` consumes `ghost_id`. The bond is
                 // escrowed against this participant's own L2 balance.
                 let bond_gid = ghost_id.clone();
+                // Same reason: `req` takes the scriptPubKey, and the
+                // ownership proof needs it to find the key that owns it.
+                let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
+                let network_for_proof = state.network;
+                let scan_max_for_proof = wraith_wallet_core::wraith_signer::DEFAULT_SCAN_INDEX_MAX;
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
@@ -3899,7 +3904,31 @@ mod server {
                             .map_err(|e| WraithClientError::Bond(e.to_string()))
                     }
                 };
-                match client.prepare_mix(req, bond_setup).await {
+                // Prove control of the input UTXO. The coordinator checks
+                // this against the scriptPubKey the chain reports for the
+                // outpoint, so it must come from the key that really owns
+                // the coin (#699). Async because the keystore sits behind
+                // the wallet lock, same as the bond escrow above.
+                let proof_spk = utxo_scriptpubkey_hex_for_proof.clone();
+                let prove_ownership = |challenge: &str| {
+                    let challenge = challenge.to_string();
+                    let spk = proof_spk.clone();
+                    async move {
+                        with_active_wallet(state, move |_, ks| {
+                            wraith_wallet_core::wraith_signer::prove_ownership(
+                                ks,
+                                network_for_proof,
+                                &spk,
+                                &challenge,
+                                scan_max_for_proof,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(WraithClientError::OwnershipProof)
+                    }
+                };
+                match client.prepare_mix(req, bond_setup, prove_ownership).await {
                     Ok(prepared) => {
                         let resp = WraithMixPreparedResponse {
                             session_id: prepared.session_id.clone(),
@@ -4102,6 +4131,11 @@ mod server {
                 // Build the ghost-pay client before `req` consumes
                 // `ghost_id`; escrow this participant's bond against it.
                 let bond_gid = ghost_id.clone();
+                // Same reason: `req` takes the scriptPubKey, and the
+                // ownership proof needs it to find the key that owns it.
+                let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
+                let network_for_proof = state.network;
+                let scan_max_for_proof = bip86_scan_max.unwrap_or(DEFAULT_SCAN_INDEX_MAX);
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
@@ -4137,7 +4171,31 @@ mod server {
                             .map_err(|e| WraithClientError::Bond(e.to_string()))
                     }
                 };
-                let prepared = match client.prepare_mix(req, bond_setup).await {
+                // Prove control of the input UTXO. The coordinator checks
+                // this against the scriptPubKey the chain reports for the
+                // outpoint, so it must come from the key that really owns
+                // the coin (#699). Async because the keystore sits behind
+                // the wallet lock, same as the bond escrow above.
+                let proof_spk = utxo_scriptpubkey_hex_for_proof.clone();
+                let prove_ownership = |challenge: &str| {
+                    let challenge = challenge.to_string();
+                    let spk = proof_spk.clone();
+                    async move {
+                        with_active_wallet(state, move |_, ks| {
+                            wraith_wallet_core::wraith_signer::prove_ownership(
+                                ks,
+                                network_for_proof,
+                                &spk,
+                                &challenge,
+                                scan_max_for_proof,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(WraithClientError::OwnershipProof)
+                    }
+                };
+                let prepared = match client.prepare_mix(req, bond_setup, prove_ownership).await {
                     Ok(p) => p,
                     Err(e) => {
                         return Envelope::new(

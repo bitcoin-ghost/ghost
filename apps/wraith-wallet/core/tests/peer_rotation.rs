@@ -95,6 +95,14 @@ fn bond_setup_noop(
     async { Ok(()) }
 }
 
+/// Likewise unreached: the stub never gets far enough to ask for an
+/// ownership proof.
+fn prove_ownership_noop(
+    _: &str,
+) -> impl std::future::Future<Output = Result<String, WraithClientError>> {
+    async { Ok(String::new()) }
+}
+
 #[tokio::test]
 async fn rotates_to_peer_when_primary_unreachable() {
     let (addr, counter) = spawn_stub().await;
@@ -106,7 +114,9 @@ async fn rotates_to_peer_when_primary_unreachable() {
 
     // We expect this to FAIL — the stub only answers find_or_create —
     // but it must reach find_or_create on the peer at least once.
-    let _ = client.prepare_mix(fixture_request(), bond_setup_noop).await;
+    let _ = client
+        .prepare_mix(fixture_request(), bond_setup_noop, prove_ownership_noop)
+        .await;
 
     assert!(
         counter.load(Ordering::SeqCst) >= 1,
@@ -136,7 +146,9 @@ async fn does_not_rotate_on_http_error() {
 
     let client = WraithSessionClient::with_peers(primary, vec![peer_url], Network::Signet);
 
-    let result = client.prepare_mix(fixture_request(), bond_setup_noop).await;
+    let result = client
+        .prepare_mix(fixture_request(), bond_setup_noop, prove_ownership_noop)
+        .await;
 
     assert!(
         matches!(

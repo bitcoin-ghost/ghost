@@ -46,6 +46,7 @@ ghost-common = { workspace = true }
 
 # Bitcoin (just needed for Network enum + re-exports)
 bitcoin = { workspace = true }
+bip322 = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }

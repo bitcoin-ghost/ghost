@@ -78,6 +78,8 @@ pub enum WraithClientError {
     Signer { input_index: usize, detail: String },
     #[error("bond escrow: {0}")]
     Bond(String),
+    #[error("ownership proof: {0}")]
+    OwnershipProof(String),
 }
 
 /// Caller-supplied input commitment. The wallet picks the UTXO it
@@ -342,18 +344,23 @@ impl WraithSessionClient {
     /// remote signer service) or when the caller wants to inspect
     /// `prepared.unsigned_tx` before signing — e.g. the
     /// daemon-integrated CLI.
-    pub async fn execute_mix<S, B, BFut>(
+    pub async fn execute_mix<S, B, BFut, P, PFut>(
         &self,
         request: MixRequest,
         mut signer: S,
         bond_setup: B,
+        prove_ownership: P,
     ) -> Result<MixOutcome, WraithClientError>
     where
         S: WitnessSigner,
         B: FnMut(&str, u64) -> BFut,
         BFut: std::future::Future<Output = Result<(), WraithClientError>>,
+        P: FnMut(&str) -> PFut,
+        PFut: std::future::Future<Output = Result<String, WraithClientError>>,
     {
-        let prepared = self.prepare_mix(request, bond_setup).await?;
+        let prepared = self
+            .prepare_mix(request, bond_setup, prove_ownership)
+            .await?;
         let witness = signer
             .sign(
                 &prepared.unsigned_tx,
@@ -379,14 +386,25 @@ impl WraithSessionClient {
     /// `bond_setup` runs after /find_or_create returns the session_id
     /// — the wallet's bond ledger client (or test-time MockBondLedger
     /// escrow) plugs in here.
-    pub async fn prepare_mix<B, BFut>(
+    ///
+    /// `prove_ownership` is handed the challenge string the coordinator
+    /// will reconstruct, and must return a base64 BIP-322 signature made
+    /// with the key controlling the input UTXO — the coordinator refuses
+    /// the registration without one (#699).
+    /// `wraith_signer::prove_ownership` is the keystore-backed
+    /// implementation. Async for the same reason `bond_setup` is: the
+    /// key may live behind a lock, a daemon round-trip, or hardware.
+    pub async fn prepare_mix<B, BFut, P, PFut>(
         &self,
         request: MixRequest,
         mut bond_setup: B,
+        mut prove_ownership: P,
     ) -> Result<PreparedMix, WraithClientError>
     where
         B: FnMut(&str, u64) -> BFut,
         BFut: std::future::Future<Output = Result<(), WraithClientError>>,
+        P: FnMut(&str) -> PFut,
+        PFut: std::future::Future<Output = Result<String, WraithClientError>>,
     {
         // 1. Enrol.
         let foc: FindOrCreateResponse = self
@@ -415,6 +433,15 @@ impl WraithSessionClient {
         // 3. Commit UTXO. The 5th /inputs auto-advances the round to
         //    Signing on the coordinator side. Earlier submitters
         //    leave the session in Locked until the 5th lands.
+        //    The coordinator verifies the proof against the scriptPubKey
+        //    the chain reports for this outpoint, so it has to be made
+        //    with the key that really controls the coin (#699).
+        let challenge = wraith_protocol::ownership_challenge(
+            &session_id,
+            &request.utxo.txid,
+            request.utxo.vout,
+        );
+        let ownership_proof = prove_ownership(&challenge).await?;
         let _inputs: serde_json::Value = self
             .post_json(
                 &format!("/api/v1/session/{session_id}/inputs"),
@@ -427,6 +454,7 @@ impl WraithSessionClient {
                         "scriptpubkey_hex": request.utxo.scriptpubkey_hex,
                     },
                     "change_address": request.change_address,
+                    "ownership_proof": ownership_proof,
                 }),
             )
             .await?;

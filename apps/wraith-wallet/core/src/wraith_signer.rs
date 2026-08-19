@@ -225,6 +225,67 @@ pub fn sign_taproot_key_path_at_index(
     Ok(witness)
 }
 
+/// Prove control of the UTXO the wallet is registering, per BIP-322.
+///
+/// The coordinator refuses a registration without this (#699): everything
+/// else it checks establishes what the coin *is*, and none of it
+/// establishes whose it is. It verifies the proof against the scriptPubKey
+/// the chain reports for the outpoint, so the signature has to come from
+/// the key that really controls the coin — which is exactly the key this
+/// scans for.
+///
+/// `challenge` must be `wraith_protocol::ownership_challenge(session_id,
+/// txid, vout)`. Returns the signature base64-encoded as the BIP
+/// specifies.
+///
+/// Only BIP86 key-path P2TR is covered, which is every address the light
+/// module emits. A vault input spent through a script leaf would need a
+/// script-path proof, which neither this nor the `bip322` crate does yet.
+pub fn prove_ownership(
+    keystore: &Keystore,
+    network: Network,
+    scriptpubkey_hex: &str,
+    challenge: &str,
+    scan_max: u32,
+) -> Result<String, WraithSignerError> {
+    let target_spk = ScriptBuf::from_bytes(hex::decode(scriptpubkey_hex.trim())?);
+
+    let mut found: Option<(u32, bitcoin::Address)> = None;
+    for idx in 0..=scan_max {
+        let derived = crate::light::receive_address(keystore, idx, network)
+            .map_err(|e| WraithSignerError::Light(e.to_string()))?;
+        if derived.script_pubkey() == target_spk {
+            found = Some((idx, derived));
+            break;
+        }
+    }
+    let (idx, address) = found.ok_or_else(|| WraithSignerError::KeyNotFound {
+        scriptpubkey_hex: scriptpubkey_hex.to_string(),
+        coin_type: crate::light::GHOST_COIN_TYPE,
+        max: scan_max,
+    })?;
+
+    let path = format!("m/86'/{}'/0'/0/{}", crate::light::GHOST_COIN_TYPE, idx);
+    let xprv = keystore.derive_xprv(&path)?;
+    let sk = SecretKey::from_slice(&xprv.private_key().to_bytes())
+        .map_err(|e| WraithSignerError::Secp(format!("from_slice: {e}")))?;
+    // Untweaked: bip322 applies the BIP86 tap tweak itself when it signs
+    // a key-path input, so handing it a pre-tweaked key would sign under
+    // a key that is tweaked twice and verify against nothing.
+    let private_key = bitcoin::PrivateKey::new(sk, network);
+
+    let witness = bip322::sign_simple(&address, challenge.as_bytes(), &[private_key], None)
+        .map_err(|e| WraithSignerError::Bitcoin(format!("bip322 sign: {e}")))?;
+
+    use base64::Engine;
+    use bitcoin::consensus::Encodable;
+    let mut encoded = Vec::new();
+    witness
+        .consensus_encode(&mut encoded)
+        .map_err(|e| WraithSignerError::Bitcoin(format!("witness encode: {e}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

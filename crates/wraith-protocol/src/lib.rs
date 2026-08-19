@@ -75,6 +75,9 @@ pub use lite_session::{
     SessionGossipEvent, SessionIdGenerator, SystemClock,
 };
 
+pub mod ownership;
+pub use ownership::{ownership_challenge, OWNERSHIP_CHALLENGE_TAG};
+
 pub mod remix;
 
 pub mod epoch;

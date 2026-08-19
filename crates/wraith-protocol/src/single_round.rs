@@ -63,8 +63,8 @@ use std::str::FromStr;
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
 use bitcoin::{
-    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction,
-    TxIn, TxOut, Txid, Witness,
+    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness,
 };
 
 use crate::error::WraithError;
@@ -850,7 +850,11 @@ mod tests {
         let round = happy_mix_round(&addrs, &[0u8; 32]);
 
         assert!(
-            !round.tx.output.iter().any(|o| o.script_pubkey.is_op_return()),
+            !round
+                .tx
+                .output
+                .iter()
+                .any(|o| o.script_pubkey.is_op_return()),
             "round tx must contain no OP_RETURN output"
         );
         assert!(
