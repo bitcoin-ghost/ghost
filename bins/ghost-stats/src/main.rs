@@ -44,7 +44,10 @@ use clap::Parser;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "ghost-stats", about = "Public pool-stats aggregator for bitcoinghost.org")]
+#[command(
+    name = "ghost-stats",
+    about = "Public pool-stats aggregator for bitcoinghost.org"
+)]
 struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, default_value = "/etc/ghost/stats.toml")]

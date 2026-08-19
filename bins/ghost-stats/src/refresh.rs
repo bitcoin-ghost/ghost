@@ -110,7 +110,11 @@ where
             ticker.tick().await;
             let started = std::time::Instant::now();
             task().await;
-            tracing::debug!(task = name, elapsed_ms = started.elapsed().as_millis(), "cycle complete");
+            tracing::debug!(
+                task = name,
+                elapsed_ms = started.elapsed().as_millis(),
+                "cycle complete"
+            );
         }
     });
 }
@@ -121,52 +125,62 @@ pub fn spawn_all(cfg: Arc<Config>, snap: SharedSnapshot, fetcher: Arc<Fetcher>) 
     // ── status ──
     {
         let (f, s) = (fetcher.clone(), snap.clone());
-        spawn_cycle("status", Duration::from_secs(r.status_secs), Duration::ZERO, move || {
-            let (f, s) = (f.clone(), s.clone());
-            async move {
-                let responses = f.fan_out("api/v1/mining/status").await;
-                let merged: StatusSummary = merge::merge_status(&responses);
-                if merged.ok_nodes == 0 {
-                    tracing::warn!("status: every node failed — keeping the previous snapshot");
-                    return;
+        spawn_cycle(
+            "status",
+            Duration::from_secs(r.status_secs),
+            Duration::ZERO,
+            move || {
+                let (f, s) = (f.clone(), s.clone());
+                async move {
+                    let responses = f.fan_out("api/v1/mining/status").await;
+                    let merged: StatusSummary = merge::merge_status(&responses);
+                    if merged.ok_nodes == 0 {
+                        tracing::warn!("status: every node failed — keeping the previous snapshot");
+                        return;
+                    }
+                    s.update(|snap| {
+                        snap.status = Some(Section {
+                            updated_at: now_secs(),
+                            ok_nodes: merged.ok_nodes,
+                            total_nodes: merged.total_nodes,
+                            data: merged,
+                        });
+                    })
+                    .await;
                 }
-                s.update(|snap| {
-                    snap.status = Some(Section {
-                        updated_at: now_secs(),
-                        ok_nodes: merged.ok_nodes,
-                        total_nodes: merged.total_nodes,
-                        data: merged,
-                    });
-                })
-                .await;
-            }
-        });
+            },
+        );
     }
 
     // ── next payout ──
     {
         let (f, s) = (fetcher.clone(), snap.clone());
-        spawn_cycle("payout", Duration::from_secs(r.payout_secs), Duration::from_secs(2), move || {
-            let (f, s) = (f.clone(), s.clone());
-            async move {
-                let responses = f.fan_out("api/v1/pool/next_payout").await;
-                // `None` means every node failed, which is NOT the same as "nobody is owed
-                // anything" — keep the previous view rather than painting an empty table.
-                let Some(merged) = merge::merge_payout(&responses) else {
-                    tracing::warn!("payout: every node failed — keeping the previous snapshot");
-                    return;
-                };
-                s.update(|snap| {
-                    snap.payout = Some(Section {
-                        updated_at: now_secs(),
-                        ok_nodes: merged.ok_nodes,
-                        total_nodes: merged.total_nodes,
-                        data: merged,
-                    });
-                })
-                .await;
-            }
-        });
+        spawn_cycle(
+            "payout",
+            Duration::from_secs(r.payout_secs),
+            Duration::from_secs(2),
+            move || {
+                let (f, s) = (f.clone(), s.clone());
+                async move {
+                    let responses = f.fan_out("api/v1/pool/next_payout").await;
+                    // `None` means every node failed, which is NOT the same as "nobody is owed
+                    // anything" — keep the previous view rather than painting an empty table.
+                    let Some(merged) = merge::merge_payout(&responses) else {
+                        tracing::warn!("payout: every node failed — keeping the previous snapshot");
+                        return;
+                    };
+                    s.update(|snap| {
+                        snap.payout = Some(Section {
+                            updated_at: now_secs(),
+                            ok_nodes: merged.ok_nodes,
+                            total_nodes: merged.total_nodes,
+                            data: merged,
+                        });
+                    })
+                    .await;
+                }
+            },
+        );
     }
 
     // ── records, one task per window ──
@@ -184,13 +198,18 @@ pub fn spawn_all(cfg: Arc<Config>, snap: SharedSnapshot, fetcher: Arc<Fetcher>) 
             move || {
                 let (f, s) = (f.clone(), s.clone());
                 async move {
-                    let responses = f.fan_out(&format!("api/v1/pool/records?window={window}")).await;
-                    let any_ok = responses.iter().any(|(_, v)| v.as_ref().is_some_and(merge::usable));
+                    let responses = f
+                        .fan_out(&format!("api/v1/pool/records?window={window}"))
+                        .await;
+                    let any_ok = responses
+                        .iter()
+                        .any(|(_, v)| v.as_ref().is_some_and(merge::usable));
                     let fresh = merge::merge_records(&responses);
                     s.update(|snap| {
                         let cached = snap.records.get(window).cloned().flatten();
                         // The latch decides; a failed cycle simply cannot beat a valid record.
-                        let latched = merge::latch_record(window, cached.as_ref(), fresh, now_secs());
+                        let latched =
+                            merge::latch_record(window, cached.as_ref(), fresh, now_secs());
                         snap.records.insert(window.to_string(), latched);
                         if any_ok {
                             snap.records_updated.insert(window.to_string(), now_secs());
@@ -206,10 +225,20 @@ pub fn spawn_all(cfg: Arc<Config>, snap: SharedSnapshot, fetcher: Arc<Fetcher>) 
 
     // ── leaderboards, one task per category+window the UI can request ──
     for (key, query, secs, offset) in [
-        ("shares:lifetime", "lifetime", r.leaderboard_shares_secs, 12u64),
+        (
+            "shares:lifetime",
+            "lifetime",
+            r.leaderboard_shares_secs,
+            12u64,
+        ),
         ("best_hash:day", "day", r.leaderboard_best_day_secs, 14),
         ("best_hash:week", "week", r.leaderboard_best_week_secs, 16),
-        ("best_hash:month", "month", r.leaderboard_best_month_secs, 18),
+        (
+            "best_hash:month",
+            "month",
+            r.leaderboard_best_month_secs,
+            18,
+        ),
     ] {
         let (f, s) = (fetcher.clone(), snap.clone());
         spawn_cycle(
@@ -219,11 +248,16 @@ pub fn spawn_all(cfg: Arc<Config>, snap: SharedSnapshot, fetcher: Arc<Fetcher>) 
             move || {
                 let (f, s) = (f.clone(), s.clone());
                 async move {
-                    let path = format!("api/v1/pool/leaderboard?window={query}&limit={LEADERBOARD_LIMIT}");
+                    let path =
+                        format!("api/v1/pool/leaderboard?window={query}&limit={LEADERBOARD_LIMIT}");
                     let responses = f.fan_out(&path).await;
-                    let merged: LeaderboardMerged = merge::merge_leaderboard(&responses, LEADERBOARD_LIMIT);
+                    let merged: LeaderboardMerged =
+                        merge::merge_leaderboard(&responses, LEADERBOARD_LIMIT);
                     if merged.ok_nodes == 0 {
-                        tracing::warn!(key, "leaderboard: every node failed — keeping the previous snapshot");
+                        tracing::warn!(
+                            key,
+                            "leaderboard: every node failed — keeping the previous snapshot"
+                        );
                         return;
                     }
                     s.update(|snap| {

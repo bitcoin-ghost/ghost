@@ -82,7 +82,10 @@ pub struct StatusSummary {
 }
 
 pub fn merge_status(responses: &[(String, Option<serde_json::Value>)]) -> StatusSummary {
-    let mut out = StatusSummary { total_nodes: responses.len(), ..Default::default() };
+    let mut out = StatusSummary {
+        total_nodes: responses.len(),
+        ..Default::default()
+    };
 
     let mut mesh_hashrate: Option<f64> = None;
     let mut sum_local = 0.0f64;
@@ -90,7 +93,9 @@ pub fn merge_status(responses: &[(String, Option<serde_json::Value>)]) -> Status
     let mut max_active = 0u64;
 
     for (id, resp) in responses {
-        let Some(v) = resp.as_ref().filter(|v| usable(v)) else { continue };
+        let Some(v) = resp.as_ref().filter(|v| usable(v)) else {
+            continue;
+        };
         out.ok_nodes += 1;
 
         // Mesh totals: every node reports the same figure, so take the max. Summing would
@@ -140,16 +145,27 @@ pub fn window_secs(window: &str) -> u64 {
 }
 
 /// Rarest `best` across the nodes that answered, or `None` if nobody had one.
-pub fn merge_records(responses: &[(String, Option<serde_json::Value>)]) -> Option<serde_json::Value> {
+pub fn merge_records(
+    responses: &[(String, Option<serde_json::Value>)],
+) -> Option<serde_json::Value> {
     let mut best: Option<serde_json::Value> = None;
     for (_, resp) in responses {
-        let Some(v) = resp.as_ref().filter(|v| usable(v)) else { continue };
+        let Some(v) = resp.as_ref().filter(|v| usable(v)) else {
+            continue;
+        };
         if v.get("found").and_then(|f| f.as_bool()) != Some(true) {
             continue;
         }
-        let Some(candidate) = v.get("best").filter(|b| b.is_object()) else { continue };
-        let Some(hash) = str_of(candidate, "share_hash") else { continue };
-        let replace = match best.as_ref().and_then(|b| str_of(b, "share_hash").map(|s| s.to_string())) {
+        let Some(candidate) = v.get("best").filter(|b| b.is_object()) else {
+            continue;
+        };
+        let Some(hash) = str_of(candidate, "share_hash") else {
+            continue;
+        };
+        let replace = match best
+            .as_ref()
+            .and_then(|b| str_of(b, "share_hash").map(|s| s.to_string()))
+        {
             None => true,
             Some(prev) => rarer(hash, &prev),
         };
@@ -173,7 +189,9 @@ pub fn latch_record(
     now_secs: u64,
 ) -> Option<serde_json::Value> {
     let Some(cached) = cached else { return fresh };
-    let Some(cached_ts) = u64_of(cached, "timestamp") else { return fresh };
+    let Some(cached_ts) = u64_of(cached, "timestamp") else {
+        return fresh;
+    };
     if now_secs.saturating_sub(cached_ts) >= window_secs(window) {
         return fresh; // aged out of its window
     }
@@ -196,9 +214,14 @@ pub fn enforce_monotonicity(records: &mut BTreeMap<String, Option<serde_json::Va
     for i in 1..ORDER.len() {
         let narrower = records.get(ORDER[i - 1]).cloned().flatten();
         let Some(narrow) = narrower else { continue };
-        let Some(narrow_hash) = str_of(&narrow, "share_hash").map(|s| s.to_string()) else { continue };
+        let Some(narrow_hash) = str_of(&narrow, "share_hash").map(|s| s.to_string()) else {
+            continue;
+        };
         let wider = records.get(ORDER[i]).cloned().flatten();
-        let replace = match wider.as_ref().and_then(|w| str_of(w, "share_hash").map(|s| s.to_string())) {
+        let replace = match wider
+            .as_ref()
+            .and_then(|w| str_of(w, "share_hash").map(|s| s.to_string()))
+        {
             None => true,
             Some(wide_hash) => rarer(&narrow_hash, &wide_hash),
         };
@@ -222,7 +245,10 @@ pub fn merge_leaderboard(
     responses: &[(String, Option<serde_json::Value>)],
     limit: usize,
 ) -> LeaderboardMerged {
-    let mut out = LeaderboardMerged { total_nodes: responses.len(), ..Default::default() };
+    let mut out = LeaderboardMerged {
+        total_nodes: responses.len(),
+        ..Default::default()
+    };
     // BTreeMap keyed by redacted miner id keeps the merge deterministic across cycles; the
     // original used a JS Map, whose iteration order is insertion order and therefore depended on
     // which node happened to answer first.
@@ -230,12 +256,26 @@ pub fn merge_leaderboard(
     let mut shares_by_miner: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
     for (_, resp) in responses {
-        let Some(v) = resp.as_ref().filter(|v| usable(v)) else { continue };
+        let Some(v) = resp.as_ref().filter(|v| usable(v)) else {
+            continue;
+        };
         out.ok_nodes += 1;
 
-        for row in v.get("best_hash").and_then(|a| a.as_array()).into_iter().flatten() {
-            let (Some(miner), Some(hash)) = (str_of(row, "miner_id_redacted"), str_of(row, "share_hash")) else { continue };
-            let replace = match best_by_miner.get(miner).and_then(|p| str_of(p, "share_hash").map(|s| s.to_string())) {
+        for row in v
+            .get("best_hash")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let (Some(miner), Some(hash)) =
+                (str_of(row, "miner_id_redacted"), str_of(row, "share_hash"))
+            else {
+                continue;
+            };
+            let replace = match best_by_miner
+                .get(miner)
+                .and_then(|p| str_of(p, "share_hash").map(|s| s.to_string()))
+            {
                 None => true,
                 Some(prev) => rarer(hash, &prev),
             };
@@ -244,8 +284,15 @@ pub fn merge_leaderboard(
             }
         }
 
-        for row in v.get("shares").and_then(|a| a.as_array()).into_iter().flatten() {
-            let Some(miner) = str_of(row, "miner_id_redacted") else { continue };
+        for row in v
+            .get("shares")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(miner) = str_of(row, "miner_id_redacted") else {
+                continue;
+            };
             match shares_by_miner.get_mut(miner) {
                 None => {
                     shares_by_miner.insert(miner.to_string(), row.clone());
@@ -267,12 +314,17 @@ pub fn merge_leaderboard(
     }
 
     let mut best: Vec<_> = best_by_miner.into_values().collect();
-    best.sort_by(|a, b| str_of(a, "share_hash").unwrap_or("").cmp(str_of(b, "share_hash").unwrap_or("")));
+    best.sort_by(|a, b| {
+        str_of(a, "share_hash")
+            .unwrap_or("")
+            .cmp(str_of(b, "share_hash").unwrap_or(""))
+    });
     best.truncate(limit);
 
     let mut shares: Vec<_> = shares_by_miner.into_values().collect();
     shares.sort_by(|a, b| {
-        f64_of(b, "total_work").unwrap_or(0.0)
+        f64_of(b, "total_work")
+            .unwrap_or(0.0)
             .partial_cmp(&f64_of(a, "total_work").unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
@@ -305,20 +357,33 @@ pub struct PayoutMerged {
 }
 
 pub fn merge_payout(responses: &[(String, Option<serde_json::Value>)]) -> Option<PayoutMerged> {
-    let mut out = PayoutMerged { total_nodes: responses.len(), ..Default::default() };
+    let mut out = PayoutMerged {
+        total_nodes: responses.len(),
+        ..Default::default()
+    };
     let mut base: Option<serde_json::Value> = None;
     let mut by_miner: BTreeMap<String, f64> = BTreeMap::new();
 
     for (_, resp) in responses {
-        let Some(v) = resp.as_ref().filter(|v| usable(v)) else { continue };
+        let Some(v) = resp.as_ref().filter(|v| usable(v)) else {
+            continue;
+        };
         out.ok_nodes += 1;
         if base.is_none() {
             base = Some(v.clone());
         }
         out.total_on_ledger += u64_of(v, "total_unpaid_miners").unwrap_or(0);
-        for row in v.get("miners").and_then(|a| a.as_array()).into_iter().flatten() {
-            let Some(miner) = str_of(row, "miner_id_redacted") else { continue };
-            *by_miner.entry(miner.to_string()).or_insert(0.0) += f64_of(row, "unpaid_work").unwrap_or(0.0);
+        for row in v
+            .get("miners")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(miner) = str_of(row, "miner_id_redacted") else {
+                continue;
+            };
+            *by_miner.entry(miner.to_string()).or_insert(0.0) +=
+                f64_of(row, "unpaid_work").unwrap_or(0.0);
         }
     }
 
@@ -388,11 +453,23 @@ mod tests {
     fn mesh_hashrate_is_max_not_sum() {
         // Every node reports the same mesh-wide figure. Summing was the "sometimes 8x" bug.
         let r = merge_status(&[
-            ok("vm1", json!({"total_hashrate": 115.9, "mesh_active_miners": 4})),
-            ok("vm2", json!({"total_hashrate": 115.9, "mesh_active_miners": 4})),
-            ok("vm3", json!({"total_hashrate": 115.9, "mesh_active_miners": 4})),
+            ok(
+                "vm1",
+                json!({"total_hashrate": 115.9, "mesh_active_miners": 4}),
+            ),
+            ok(
+                "vm2",
+                json!({"total_hashrate": 115.9, "mesh_active_miners": 4}),
+            ),
+            ok(
+                "vm3",
+                json!({"total_hashrate": 115.9, "mesh_active_miners": 4}),
+            ),
         ]);
-        assert_eq!(r.hashrate_th, 115.9, "mesh hashrate must not be multiplied by responder count");
+        assert_eq!(
+            r.hashrate_th, 115.9,
+            "mesh hashrate must not be multiplied by responder count"
+        );
         assert_eq!(r.miners, 4, "mesh miner count is a max, not a sum");
         assert_eq!(r.ok_nodes, 3);
     }
@@ -403,7 +480,10 @@ mod tests {
             ok("vm1", json!({"local_hashrate_th": 2.0})),
             ok("vm2", json!({"local_hashrate_th": 3.0})),
         ]);
-        assert_eq!(r.hashrate_th, 5.0, "pre-PR#27 fallback sums the per-node figure");
+        assert_eq!(
+            r.hashrate_th, 5.0,
+            "pre-PR#27 fallback sums the per-node figure"
+        );
     }
 
     #[test]
@@ -412,19 +492,25 @@ mod tests {
             ok("vm1", json!({"blocks_found": 1, "block_height": 963155})),
             ok("vm2", json!({"blocks_found": 2, "block_height": 963158})),
         ]);
-        assert_eq!(r.blocks_found, 3, "blocks_found is a genuine per-node counter");
-        assert_eq!(r.block_height, 963158, "height is a max — nodes lag each other");
+        assert_eq!(
+            r.blocks_found, 3,
+            "blocks_found is a genuine per-node counter"
+        );
+        assert_eq!(
+            r.block_height, 963158,
+            "height is a max — nodes lag each other"
+        );
     }
 
     #[test]
     fn a_down_node_does_not_drag_the_totals_down() {
-        let r = merge_status(&[
-            ok("vm1", json!({"total_hashrate": 115.9})),
-            down("vm2"),
-        ]);
+        let r = merge_status(&[ok("vm1", json!({"total_hashrate": 115.9})), down("vm2")]);
         assert_eq!(r.hashrate_th, 115.9);
         assert_eq!(r.ok_nodes, 1);
-        assert_eq!(r.total_nodes, 2, "the caller can see it was a partial answer");
+        assert_eq!(
+            r.total_nodes, 2,
+            "the caller can see it was a partial answer"
+        );
     }
 
     #[test]
@@ -433,7 +519,10 @@ mod tests {
         assert!(!usable(&json!({"error": "Database not available"})));
         assert!(usable(&json!({"shares": []})));
         let r = merge_status(&[ok("vm1", json!({"error": "Database not available"}))]);
-        assert_eq!(r.ok_nodes, 0, "an error body must not count as a healthy node");
+        assert_eq!(
+            r.ok_nodes, 0,
+            "an error body must not count as a healthy node"
+        );
     }
 
     // ── records ──
@@ -446,7 +535,10 @@ mod tests {
             ok("vm3", json!({"found": false})),
         ])
         .expect("some node had a record");
-        assert_eq!(best["share_hash"], "0000000000000001bb", "lowest display-order hash is rarest");
+        assert_eq!(
+            best["share_hash"], "0000000000000001bb",
+            "lowest display-order hash is rarest"
+        );
     }
 
     #[test]
@@ -455,7 +547,10 @@ mod tests {
         let cached = json!({"share_hash": "0000000000000001bb", "timestamp": 1_000_000});
         let fresh = Some(json!({"share_hash": "0000000000000009ff", "timestamp": 1_000_500}));
         let out = latch_record("day", Some(&cached), fresh, 1_000_600).expect("latched");
-        assert_eq!(out["share_hash"], "0000000000000001bb", "a worse fresh value must not clobber a valid record");
+        assert_eq!(
+            out["share_hash"], "0000000000000001bb",
+            "a worse fresh value must not clobber a valid record"
+        );
     }
 
     #[test]
@@ -471,7 +566,10 @@ mod tests {
         let fresh = Some(json!({"share_hash": "0000000000000009ff", "timestamp": 1_086_000}));
         // day window is 86_400s; the cached record is now older than that.
         let out = latch_record("day", Some(&cached), fresh, 1_000_000 + 86_401).expect("fresh");
-        assert_eq!(out["share_hash"], "0000000000000009ff", "an aged-out record must yield to fresh data");
+        assert_eq!(
+            out["share_hash"], "0000000000000009ff",
+            "an aged-out record must yield to fresh data"
+        );
     }
 
     #[test]
@@ -488,11 +586,18 @@ mod tests {
         let mut recs: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
         recs.insert("block".into(), None);
         recs.insert("day".into(), None);
-        recs.insert("week".into(), Some(json!({"share_hash": "0000000000000001bb"})));
-        recs.insert("month".into(), Some(json!({"share_hash": "0000000000000009ff"})));
+        recs.insert(
+            "week".into(),
+            Some(json!({"share_hash": "0000000000000001bb"})),
+        );
+        recs.insert(
+            "month".into(),
+            Some(json!({"share_hash": "0000000000000009ff"})),
+        );
         enforce_monotonicity(&mut recs);
         assert_eq!(
-            recs["month"].as_ref().unwrap()["share_hash"], "0000000000000001bb",
+            recs["month"].as_ref().unwrap()["share_hash"],
+            "0000000000000001bb",
             "month must inherit week's better record"
         );
     }
@@ -501,24 +606,45 @@ mod tests {
     fn monotonicity_fills_an_empty_wider_window() {
         let mut recs: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
         recs.insert("block".into(), None);
-        recs.insert("day".into(), Some(json!({"share_hash": "0000000000000003cc"})));
+        recs.insert(
+            "day".into(),
+            Some(json!({"share_hash": "0000000000000003cc"})),
+        );
         recs.insert("week".into(), None);
         recs.insert("month".into(), None);
         enforce_monotonicity(&mut recs);
-        assert_eq!(recs["week"].as_ref().unwrap()["share_hash"], "0000000000000003cc");
-        assert_eq!(recs["month"].as_ref().unwrap()["share_hash"], "0000000000000003cc",
-            "propagation carries through successive windows in one pass");
+        assert_eq!(
+            recs["week"].as_ref().unwrap()["share_hash"],
+            "0000000000000003cc"
+        );
+        assert_eq!(
+            recs["month"].as_ref().unwrap()["share_hash"],
+            "0000000000000003cc",
+            "propagation carries through successive windows in one pass"
+        );
     }
 
     #[test]
     fn monotonicity_leaves_an_already_better_wider_window_alone() {
         let mut recs: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
         recs.insert("block".into(), None);
-        recs.insert("day".into(), Some(json!({"share_hash": "0000000000000009ff"})));
-        recs.insert("week".into(), Some(json!({"share_hash": "0000000000000001bb"})));
-        recs.insert("month".into(), Some(json!({"share_hash": "0000000000000001bb"})));
+        recs.insert(
+            "day".into(),
+            Some(json!({"share_hash": "0000000000000009ff"})),
+        );
+        recs.insert(
+            "week".into(),
+            Some(json!({"share_hash": "0000000000000001bb"})),
+        );
+        recs.insert(
+            "month".into(),
+            Some(json!({"share_hash": "0000000000000001bb"})),
+        );
         enforce_monotonicity(&mut recs);
-        assert_eq!(recs["week"].as_ref().unwrap()["share_hash"], "0000000000000001bb");
+        assert_eq!(
+            recs["week"].as_ref().unwrap()["share_hash"],
+            "0000000000000001bb"
+        );
     }
 
     // ── leaderboard ──
@@ -527,8 +653,14 @@ mod tests {
     fn leaderboard_sums_shares_per_miner_across_nodes() {
         let r = merge_leaderboard(
             &[
-                ok("vm1", json!({"best_hash": [], "shares": [{"miner_id_redacted": "bc1q7z…y492", "share_count": 10, "total_work": 100.0}]})),
-                ok("vm2", json!({"best_hash": [], "shares": [{"miner_id_redacted": "bc1q7z…y492", "share_count": 5, "total_work": 50.0}]})),
+                ok(
+                    "vm1",
+                    json!({"best_hash": [], "shares": [{"miner_id_redacted": "bc1q7z…y492", "share_count": 10, "total_work": 100.0}]}),
+                ),
+                ok(
+                    "vm2",
+                    json!({"best_hash": [], "shares": [{"miner_id_redacted": "bc1q7z…y492", "share_count": 5, "total_work": 50.0}]}),
+                ),
             ],
             10,
         );
@@ -541,25 +673,40 @@ mod tests {
     fn leaderboard_keeps_only_the_rarest_hash_per_miner_and_sorts_by_rarity() {
         let r = merge_leaderboard(
             &[
-                ok("vm1", json!({"best_hash": [{"miner_id_redacted": "a", "share_hash": "0000ff"}], "shares": []})),
-                ok("vm2", json!({"best_hash": [{"miner_id_redacted": "a", "share_hash": "000011"}], "shares": []})),
-                ok("vm3", json!({"best_hash": [{"miner_id_redacted": "b", "share_hash": "000005"}], "shares": []})),
+                ok(
+                    "vm1",
+                    json!({"best_hash": [{"miner_id_redacted": "a", "share_hash": "0000ff"}], "shares": []}),
+                ),
+                ok(
+                    "vm2",
+                    json!({"best_hash": [{"miner_id_redacted": "a", "share_hash": "000011"}], "shares": []}),
+                ),
+                ok(
+                    "vm3",
+                    json!({"best_hash": [{"miner_id_redacted": "b", "share_hash": "000005"}], "shares": []}),
+                ),
             ],
             10,
         );
         assert_eq!(r.best_hash.len(), 2, "one row per miner");
         assert_eq!(r.best_hash[0]["miner_id_redacted"], "b", "rarest first");
-        assert_eq!(r.best_hash[1]["share_hash"], "000011", "miner a keeps its rarer hash");
+        assert_eq!(
+            r.best_hash[1]["share_hash"], "000011",
+            "miner a keeps its rarer hash"
+        );
     }
 
     #[test]
     fn leaderboard_shares_sort_by_work_descending_and_respect_the_limit() {
         let r = merge_leaderboard(
-            &[ok("vm1", json!({"best_hash": [], "shares": [
-                {"miner_id_redacted": "small", "share_count": 1, "total_work": 1.0},
-                {"miner_id_redacted": "big", "share_count": 1, "total_work": 900.0},
-                {"miner_id_redacted": "mid", "share_count": 1, "total_work": 50.0}
-            ]}))],
+            &[ok(
+                "vm1",
+                json!({"best_hash": [], "shares": [
+                    {"miner_id_redacted": "small", "share_count": 1, "total_work": 1.0},
+                    {"miner_id_redacted": "big", "share_count": 1, "total_work": 900.0},
+                    {"miner_id_redacted": "mid", "share_count": 1, "total_work": 50.0}
+                ]}),
+            )],
             2,
         );
         assert_eq!(r.shares.len(), 2);
@@ -582,12 +729,21 @@ mod tests {
 
         let r = merge_payout(&[ok("vm1", a), ok("vm2", b)]).expect("a node answered");
         assert_eq!(r.miners.len(), 2);
-        assert_eq!(r.miners[0]["miner_id_redacted"], "y", "ranked by merged work");
-        assert_eq!(r.miners[1]["unpaid_work"], 150.0, "x's work summed across both nodes");
+        assert_eq!(
+            r.miners[0]["miner_id_redacted"], "y",
+            "ranked by merged work"
+        );
+        assert_eq!(
+            r.miners[1]["unpaid_work"], 150.0,
+            "x's work summed across both nodes"
+        );
         assert_eq!(r.miners[0]["rank"], 1);
         assert_eq!(r.total_work, 1050.0);
         assert_eq!(r.total_on_ledger, 4, "ledger entries sum across nodes");
-        assert_eq!(r.unique_miners, 2, "x appears on both nodes but is one miner");
+        assert_eq!(
+            r.unique_miners, 2,
+            "x appears on both nodes but is one miner"
+        );
     }
 
     #[test]
@@ -602,9 +758,20 @@ mod tests {
             ]
         });
         let r = merge_payout(&[ok("vm1", v)]).expect("answered");
-        let ids: Vec<_> = r.miners.iter().map(|m| m["miner_id_redacted"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["whale"], "the dust entry is filtered against the merged total");
-        assert_eq!(r.unique_miners, 2, "the ledger count is taken before dust filtering");
+        let ids: Vec<_> = r
+            .miners
+            .iter()
+            .map(|m| m["miner_id_redacted"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["whale"],
+            "the dust entry is filtered against the merged total"
+        );
+        assert_eq!(
+            r.unique_miners, 2,
+            "the ledger count is taken before dust filtering"
+        );
     }
 
     #[test]
@@ -624,7 +791,14 @@ mod tests {
             ]
         });
         let r = merge_payout(&[ok("vm1", v)]).expect("answered");
-        let total: f64 = r.miners.iter().map(|m| m["share_pct"].as_f64().unwrap()).sum();
-        assert!((total - 100.0).abs() < 1e-9, "percentages are of the merged total, got {total}");
+        let total: f64 = r
+            .miners
+            .iter()
+            .map(|m| m["share_pct"].as_f64().unwrap())
+            .sum();
+        assert!(
+            (total - 100.0).abs() < 1e-9,
+            "percentages are of the merged total, got {total}"
+        );
     }
 }

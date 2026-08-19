@@ -49,9 +49,14 @@ pub fn router(snap: SharedSnapshot) -> Router {
 /// Attach a request-time age to a section so the client does not have to trust its own clock
 /// against the server's.
 fn with_age(value: &mut serde_json::Value, now: u64) {
-    let Some(obj) = value.as_object_mut() else { return };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
     let updated = obj.get("updated_at").and_then(|u| u.as_u64()).unwrap_or(0);
-    obj.insert("age_secs".into(), serde_json::json!(now.saturating_sub(updated)));
+    obj.insert(
+        "age_secs".into(),
+        serde_json::json!(now.saturating_sub(updated)),
+    );
 }
 
 async fn summary(State(snap): State<SharedSnapshot>) -> impl IntoResponse {
@@ -63,7 +68,11 @@ async fn summary(State(snap): State<SharedSnapshot>) -> impl IntoResponse {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "could not serialise snapshot");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot serialisation failed").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot serialisation failed",
+            )
+                .into_response();
         }
     };
 

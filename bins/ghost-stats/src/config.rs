@@ -96,11 +96,21 @@ pub struct RefreshConfig {
     pub node_timeout_secs: u64,
 }
 
-fn d_30() -> u64 { 30 }
-fn d_60() -> u64 { 60 }
-fn d_120() -> u64 { 120 }
-fn d_300() -> u64 { 300 }
-fn d_600() -> u64 { 600 }
+fn d_30() -> u64 {
+    30
+}
+fn d_60() -> u64 {
+    60
+}
+fn d_120() -> u64 {
+    120
+}
+fn d_300() -> u64 {
+    300
+}
+fn d_600() -> u64 {
+    600
+}
 
 impl Default for RefreshConfig {
     fn default() -> Self {
@@ -124,7 +134,9 @@ pub struct Config {
 }
 
 fn default_server() -> ServerConfig {
-    ServerConfig { listen: default_listen() }
+    ServerConfig {
+        listen: default_listen(),
+    }
 }
 
 fn default_cache_path() -> String {
@@ -135,8 +147,8 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path}: {e}"))?;
-        let cfg: Config = toml::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("parsing config {path}: {e}"))?;
+        let cfg: Config =
+            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing config {path}: {e}"))?;
         if cfg.nodes.is_empty() {
             anyhow::bail!("config {path} lists no [[nodes]] -- nothing to aggregate");
         }
@@ -182,6 +194,9 @@ mod tests {
         )
         .expect("partial refresh config parses");
         assert_eq!(cfg.refresh.records_month_secs, 1800);
-        assert_eq!(cfg.refresh.status_secs, 30, "untouched fields keep their default");
+        assert_eq!(
+            cfg.refresh.status_secs, 30,
+            "untouched fields keep their default"
+        );
     }
 }

@@ -101,8 +101,11 @@ impl SharedSnapshot {
         let snap = match std::fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<Snapshot>(&raw) {
                 Ok(s) => {
-                    tracing::info!(path, age_secs = now_secs().saturating_sub(s.generated_at),
-                        "restored snapshot from disk");
+                    tracing::info!(
+                        path,
+                        age_secs = now_secs().saturating_sub(s.generated_at),
+                        "restored snapshot from disk"
+                    );
                     s
                 }
                 Err(e) => {
@@ -115,7 +118,10 @@ impl SharedSnapshot {
                 Snapshot::default()
             }
         };
-        Self { inner: Arc::new(RwLock::new(snap)), path: Arc::new(path.to_string()) }
+        Self {
+            inner: Arc::new(RwLock::new(snap)),
+            path: Arc::new(path.to_string()),
+        }
     }
 
     pub async fn read(&self) -> Snapshot {
@@ -140,7 +146,9 @@ impl SharedSnapshot {
                 if let Some(dir) = std::path::Path::new(path.as_str()).parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
-                if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path.as_str())) {
+                if let Err(e) =
+                    std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path.as_str()))
+                {
                     tracing::warn!(error = %e, "could not persist snapshot");
                 }
             });
@@ -160,15 +168,24 @@ mod tests {
     #[test]
     fn a_snapshot_with_one_loaded_record_is_ready() {
         let mut s = Snapshot::default();
-        s.records.insert("day".into(), Some(serde_json::json!({"share_hash": "0000"})));
-        assert!(s.ready(), "one loaded section is enough to stop showing the loading state");
+        s.records.insert(
+            "day".into(),
+            Some(serde_json::json!({"share_hash": "0000"})),
+        );
+        assert!(
+            s.ready(),
+            "one loaded section is enough to stop showing the loading state"
+        );
     }
 
     #[test]
     fn a_snapshot_whose_records_are_all_empty_is_not_ready() {
         let mut s = Snapshot::default();
         s.records.insert("day".into(), None);
-        assert!(!s.ready(), "a present-but-empty window must not count as loaded");
+        assert!(
+            !s.ready(),
+            "a present-but-empty window must not count as loaded"
+        );
     }
 
     #[tokio::test]
@@ -178,16 +195,22 @@ mod tests {
         let path = dir.join("snapshot.json");
         let shared = SharedSnapshot::load_or_empty(path.to_str().unwrap());
 
-        shared.update(|s| {
-            s.records.insert("day".into(), Some(serde_json::json!({"share_hash": "0000aa"})));
-        }).await;
+        shared
+            .update(|s| {
+                s.records.insert(
+                    "day".into(),
+                    Some(serde_json::json!({"share_hash": "0000aa"})),
+                );
+            })
+            .await;
 
         // A cycle where every node failed: the refresh task simply does not touch the section.
         shared.update(|_s| {}).await;
 
         let after = shared.read().await;
         assert_eq!(
-            after.records["day"].as_ref().unwrap()["share_hash"], "0000aa",
+            after.records["day"].as_ref().unwrap()["share_hash"],
+            "0000aa",
             "a failed cycle must leave the previous answer standing"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -201,18 +224,28 @@ mod tests {
         let p = path.to_str().unwrap();
 
         let first = SharedSnapshot::load_or_empty(p);
-        first.update(|s| {
-            s.records.insert("month".into(), Some(serde_json::json!({"share_hash": "0000beef"})));
-        }).await;
+        first
+            .update(|s| {
+                s.records.insert(
+                    "month".into(),
+                    Some(serde_json::json!({"share_hash": "0000beef"})),
+                );
+            })
+            .await;
         // The mirror is written on a blocking task; give it a moment to land.
         for _ in 0..50 {
-            if path.exists() { break }
+            if path.exists() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         let restarted = SharedSnapshot::load_or_empty(p).read().await;
         assert!(restarted.ready(), "a restart must not serve a blank page");
-        assert_eq!(restarted.records["month"].as_ref().unwrap()["share_hash"], "0000beef");
+        assert_eq!(
+            restarted.records["month"].as_ref().unwrap()["share_hash"],
+            "0000beef"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
