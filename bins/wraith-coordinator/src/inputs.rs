@@ -47,8 +47,72 @@ pub struct TxInputRef {
     pub txid: String,
     pub vout: u32,
     pub value_sats: u64,
-    /// Hex-encoded scriptPubKey of the spending output. Coordinator
-    /// will validate this against the on-chain UTXO at /sign time;
-    /// for B/4a we just store what the wallet supplied.
+    /// Hex-encoded scriptPubKey of the spending output. Checked against
+    /// the on-chain UTXO at registration (#699) — a submission whose
+    /// script or value disagrees with the chain is refused, so by the
+    /// time a record lands here every field matches the chain.
     pub scriptpubkey_hex: String,
+}
+
+impl TxInputRef {
+    /// Do these two references name the same coin?
+    ///
+    /// Compares the outpoint only — value and scriptPubKey are derived
+    /// from it, so two references to one outpoint that disagree on
+    /// those are two accounts of the same coin, not two coins.
+    ///
+    /// `txid` is compared case-insensitively after trimming: both sides
+    /// parsed as a txid before being stored, so they name the same
+    /// bytes even when they differ in presentation.
+    pub fn same_outpoint(&self, other: &TxInputRef) -> bool {
+        self.vout == other.vout && self.txid.trim().eq_ignore_ascii_case(other.txid.trim())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(txid: &str, vout: u32, value_sats: u64) -> TxInputRef {
+        TxInputRef {
+            txid: txid.into(),
+            vout,
+            value_sats,
+            scriptpubkey_hex: "deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn same_outpoint_ignores_presentation() {
+        let lower = input(&"ab".repeat(32), 1, 100);
+        let upper = input(&"AB".repeat(32), 1, 100);
+        let padded = input(&format!("  {}  ", "ab".repeat(32)), 1, 100);
+        assert!(lower.same_outpoint(&upper));
+        assert!(lower.same_outpoint(&padded));
+    }
+
+    #[test]
+    fn same_outpoint_ignores_value_and_script() {
+        // Two accounts of one coin are still one coin — which is the
+        // point: a disruptor must not evade the duplicate check by
+        // misstating what the coin is worth.
+        let a = input(&"ab".repeat(32), 0, 100);
+        let mut b = input(&"ab".repeat(32), 0, 999_999);
+        b.scriptpubkey_hex = "00".into();
+        assert!(a.same_outpoint(&b));
+    }
+
+    #[test]
+    fn a_different_vout_is_a_different_coin() {
+        let a = input(&"ab".repeat(32), 0, 100);
+        let b = input(&"ab".repeat(32), 1, 100);
+        assert!(!a.same_outpoint(&b));
+    }
+
+    #[test]
+    fn a_different_txid_is_a_different_coin() {
+        let a = input(&"ab".repeat(32), 0, 100);
+        let b = input(&"cd".repeat(32), 0, 100);
+        assert!(!a.same_outpoint(&b));
+    }
 }

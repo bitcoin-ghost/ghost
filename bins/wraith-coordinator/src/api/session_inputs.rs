@@ -357,6 +357,30 @@ pub async fn post(
     let (submitted_count, enrolled_count) = {
         let mut store = state.inputs_store.lock().expect("inputs_store poisoned");
         let entry = store.entry(session_id.clone()).or_default();
+
+        // One outpoint, one participant (#701). Two participants
+        // registering the same coin builds a transaction with duplicate
+        // inputs, which cannot broadcast — the round dies for everyone
+        // at a cost of one enrolment, and it dies at *broadcast* rather
+        // than at signing, so the no-sign deadline never fires and
+        // there is nothing to hold the disruptor to.
+        //
+        // Checked under the same lock as the insert, or two concurrent
+        // submissions could each find the outpoint free.
+        if entry
+            .iter()
+            .any(|a| a.ghost_id != req.ghost_id && a.input.same_outpoint(&req.input))
+        {
+            return error(
+                StatusCode::CONFLICT,
+                "duplicate_outpoint",
+                format!(
+                    "{}:{} is already registered on session '{session_id}'",
+                    req.input.txid, req.input.vout
+                ),
+            );
+        }
+
         if let Some(existing) = entry.iter_mut().find(|a| a.ghost_id == req.ghost_id) {
             *existing = accepted;
         } else {

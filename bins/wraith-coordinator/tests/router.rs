@@ -835,6 +835,89 @@ async fn inputs_returns_402_when_bond_missing_in_ledger() {
     assert_eq!(json["error"], "bond_not_found");
 }
 
+/// One outpoint, one participant (#701).
+///
+/// Two participants registering the same coin builds a transaction with
+/// duplicate inputs, which cannot broadcast — so the round dies for
+/// everyone at a cost of one enrolment, and it dies at broadcast rather
+/// than at signing, where the no-sign deadline would have caught it.
+#[tokio::test]
+async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
+
+    let body = |ghost_id: &str| {
+        serde_json::json!({
+            "ghost_id": ghost_id,
+            "input": {
+                "txid": "00".repeat(32),
+                "vout": 0,
+                "value_sats": 200_000,
+                "scriptpubkey_hex": FIXTURE_SPK_HEX,
+            },
+            "change_address": TEST_FEE_ADDRESS,
+        })
+    };
+
+    let first = router
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            body("wallet-0"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            body("wallet-1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = to_bytes(second.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "duplicate_outpoint");
+}
+
+/// The duplicate rule must not break the retry path: a participant
+/// resubmitting its *own* outpoint is a wallet retry, not a collision.
+#[tokio::test]
+async fn inputs_still_accepts_a_participant_resubmitting_its_own_outpoint() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
+
+    let body = serde_json::json!({
+        "ghost_id": "wallet-0",
+        "input": {
+            "txid": "00".repeat(32),
+            "vout": 0,
+            "value_sats": 200_000,
+            "scriptpubkey_hex": FIXTURE_SPK_HEX,
+        },
+        "change_address": TEST_FEE_ADDRESS,
+    });
+
+    for attempt in 0..2 {
+        let resp = router
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/session/{session_id}/inputs"),
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "attempt {attempt}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(json["submitted_count"], 1, "attempt {attempt}");
+    }
+}
+
 /// Registration must refuse rather than fall back to trusting the
 /// wallet's own account of its input (#699).
 #[tokio::test]
