@@ -444,6 +444,50 @@
     { id: 'vm1' }, { id: 'vm2' }, { id: 'vm3' }, { id: 'vm4' },
     { id: 'vm5' }, { id: 'vm6' }, { id: 'vm7' }, { id: 'vm8' }
   ];
+  // ───────── Server-side snapshot ─────────
+  // Every panel on this page used to fan out to all eight nodes itself: status, records,
+  // leaderboard and payout, at roughly 145 requests per minute PER VIEWER. The cost scaled with
+  // the number of people watching rather than with the data, and several of the underlying
+  // queries take seconds — `records?window=month` costs 7-20s and 504s at the proxy — so tiles
+  // arrived late, blanked on a transient failure, or never arrived at all.
+  //
+  // `ghost-stats` now does that fan-out once, server-side, on a cadence matched to each query's
+  // cost, and holds the merged result in memory. This page asks it one question a minute.
+  //
+  // The snapshot is ALWAYS last-good: a refresh that fails upstream leaves the previous answer
+  // standing rather than emptying it, and it survives a service restart via disk. So `summary`
+  // here can be treated as "the best answer that exists", never as "nothing yet" — which is why
+  // the panels below no longer need their own per-node failure handling.
+  var SUMMARY_URL = '/api/pool/summary';
+  var lastSummary = null;
+  var summaryInflight = null;
+
+  // One fetch per cycle shared by all four panels. Without this, four refreshers firing on the
+  // same interval would each issue their own request for the identical payload.
+  var lastSummaryAt = 0;
+  var SUMMARY_REUSE_MS = 5000;
+  function fetchSummary(force) {
+    if (summaryInflight && !force) return summaryInflight;
+    // The four panels are refreshed together. On the timer they share the in-flight promise, but
+    // at page load they are called one after another, so a short reuse window is what keeps a
+    // cold load to a single request instead of four identical ones.
+    if (!force && lastSummary && (Date.now() - lastSummaryAt) < SUMMARY_REUSE_MS) {
+      return Promise.resolve(lastSummary);
+    }
+    summaryInflight = fetch(SUMMARY_URL, { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (d && d.ready) { lastSummary = d; lastSummaryAt = Date.now(); setRateLimited(false); }
+        return lastSummary;
+      })
+      .catch(function () {
+        // Keep whatever we last had. A failed poll is not evidence the pool is empty.
+        return lastSummary;
+      })
+      .then(function (d) { summaryInflight = null; return d; });
+    return summaryInflight;
+  }
+
   var lastStats = { hashrate: 0, miners: 0, blocks: 0, height: 0, nodes: [] };
 
   // History + charts — 24h window at 30s polling = 2880 points
@@ -637,14 +681,6 @@
     }
   }
 
-  function fetchNode(node) {
-    var ctl = new AbortController();
-    var t = setTimeout(function () { ctl.abort(); }, 5000);
-    return fetch('/api/pool/' + node.id + '/api/v1/mining/status', { signal: ctl.signal })
-      .then(function (r) { clearTimeout(t); if (r.status === 429) return { __rl: true }; return r.ok ? r.json() : null; })
-      .catch(function () { clearTimeout(t); return null; });
-  }
-
   function renderMetrics() {
     // Smoothed values for the rate/count tiles (jittery underlying metrics).
     // Block height and blocks-found stay raw — those are exact counters.
@@ -670,14 +706,16 @@
 
   async function refreshPool() {
     try {
-      dbg('polling 4 nodes…');
-      var results = await Promise.all(POOL_NODES.map(fetchNode));
-      // Split the throttle markers out from real data. `good` is every node
-      // that returned usable JSON; a rate-limited (HTTP 429) poll left a
-      // { __rl: true } marker instead.
-      var rateLimited = results.some(function (r) { return r && r.__rl; });
-      var good = results.filter(function (r) { return r && !r.__rl; });
-      var okCount = good.length;
+      dbg('reading pool snapshot…');
+      var summary = await fetchSummary();
+      // `good` is the per-node status array exactly as the nodes reported it — the aggregator
+      // passes it through untouched, so every merge rule below (mesh hashrate is a MAX, blocks
+      // found is a SUM, height is a MAX) still runs here, unchanged and on the same shape it
+      // always did. Moving the fan-out server-side deliberately did NOT move this arithmetic.
+      var rateLimited = false;
+      var good = (summary && summary.status && summary.status.data.nodes) || [];
+      var okCount = (summary && summary.status) ? summary.status.ok_nodes : 0;
+      var nodeTotal = (summary && summary.status) ? summary.status.total_nodes : POOL_NODES.length;
       // Clear the notice the instant any node answers cleanly; raise it when
       // we were throttled this tick and have no fresh data to show.
       if (okCount > 0) setRateLimited(false);
@@ -703,7 +741,7 @@
           // Nothing measured yet AND nobody answered. Distinguish "still connecting"
           // from "every node is unreachable" rather than showing a bare dash forever.
           failedPolls++;
-          dbg('poll skip · 0/' + POOL_NODES.length + ' nodes, no data yet (attempt ' + failedPolls + ')');
+          dbg('poll skip · 0/' + nodeTotal + ' nodes, no data yet (attempt ' + failedPolls + ')');
           if (failedPolls >= 3) setPoolUnreachable(true);
         }
         return;
@@ -779,13 +817,12 @@
         window.__ghostPool.onBlockEvent(blockEvent, height);
       }
 
-      dbg('poll ok · ' + okCount + '/4 nodes · ' + hashrate.toFixed(2) + ' TH/s · ' + lastStats.miners + ' miners · history ' + chartHistory.hashrate.length);
+      dbg('poll ok · ' + okCount + '/' + nodeTotal + ' nodes · ' + hashrate.toFixed(2) + ' TH/s · ' + lastStats.miners + ' miners · history ' + chartHistory.hashrate.length);
     } catch (e) {
       dbg('POLL ERROR: ' + (e && e.message ? e.message : e));
     }
   }
   refreshPool();
-  setInterval(refreshPool, 30000);
   renderCharts();
 
   window.__ghostPool = {
@@ -831,87 +868,22 @@
   // Cache of last-good per-window best so a transient fetch failure
   // doesn't blank the record tiles.
   var lastRecords = {};
-  // `month` is refreshed once every RECORDS_MONTH_EVERY cycles, not every cycle.
-  //
-  // Measured 2026-08-18 through this exact proxy path: `records?window=month` costs 6.9s on
-  // vm1, 9.4s on vm4 and TIMES OUT on vm6 (504 at nginx's `proxy_read_timeout 10s`), against
-  // 0.03s for day and 0.25s for week. Ranking by rarity means `reverse_hex(share_hash)` over
-  // every row in the window, which no index can serve.
-  //
-  // At one cycle per 60s across 8 nodes that was ~8 x 8s of blocking query per minute, and
-  // until the API moved these reads onto a blocking pool it stalled every OTHER request on the
-  // same node — which is what made the whole page feel slow rather than one panel.
-  //
-  // Skipping it is safe because the caching below already handles a missing fresh value: it
-  // keeps `lastRecords[w]` unless the fresh one is genuinely rarer or the cached one has aged
-  // out, and the monotonicity pass propagates week's record outward into month. vm6 has been
-  // 504-ing on month for a while, so this path is already exercised in production.
-  //
-  // Cycle 0 still fetches month, so a fresh page load populates it immediately.
-  var RECORDS_MONTH_EVERY = 10;
-  var __recCycle = 0;
-
   async function refreshRecords() {
-    var jobs = [];
-    var cycleWindows = (__recCycle++ % RECORDS_MONTH_EVERY === 0)
-      ? REC_WINDOWS
-      : REC_WINDOWS.filter(function (w) { return w !== 'month'; });
-    cycleWindows.forEach(function (w) {
-      POOL_NODES.forEach(function (n) {
-        jobs.push(
-          fetch('/api/pool/' + n.id + '/api/v1/pool/records?window=' + w)
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .catch(function () { return null; })
-            .then(function (d) { return { window: w, node: n.id, data: d }; })
-        );
-      });
-    });
-    var results = await Promise.all(jobs);
-    // Reduce to best per window (lowest share_hash lex string wins)
+    var summary = await fetchSummary();
+    // The cross-node reduce, the temporal latch and the window-monotonicity pass all used to run
+    // here, once per viewer, on top of a 32-request fan-out. They now run once server-side against
+    // every node, on a cadence matched to each window's cost, and each rule is unit-tested in
+    // `bins/ghost-stats/src/merge.rs`. What arrives here is already the answer.
     var bestPerWindow = {};
     var windowSawAny = {};
-    results.forEach(function (r) {
-      if (!r.data) return;
-      windowSawAny[r.window] = true;
-      if (!r.data.found || !r.data.best) return;
-      var prev = bestPerWindow[r.window];
-      if (!prev || r.data.best.share_hash < prev.share_hash) {
-        bestPerWindow[r.window] = r.data.best;
-      }
-    });
-    // Temporal latch — fixes the records flicker. A "best in window" record can
-    // only IMPROVE until it ages out of its window. Each node holds only its own
-    // miners' shares, so a given record (e.g. the 1.63G on vm3) lives on ONE
-    // node; when that node is rate-limited in a 60s cycle the 16-way fan-out
-    // returns a worse value, which must NOT clobber a still-valid record. Keep
-    // the cached best unless the fresh one is genuinely rarer, or the cached one
-    // has aged out of its window (then let fresh data legitimately replace it).
-    var __nowSec = Math.floor(Date.now() / 1000);
-    var REC_WINDOW_SECS = { block: 600, day: 86400, week: 604800, month: 2592000 };
     REC_WINDOWS.forEach(function (w) {
-      var cached = lastRecords[w];
-      if (!cached || cached.timestamp == null) return;
-      if ((__nowSec - cached.timestamp) >= (REC_WINDOW_SECS[w] || 2592000)) return; // aged out
-      var fresh = bestPerWindow[w];
-      if (!fresh || cached.share_hash < fresh.share_hash) {
-        bestPerWindow[w] = cached; // fresh missing or worse → keep the valid record
-      }
+      var rec = (summary && summary.records) ? summary.records[w] : null;
+      if (rec) bestPerWindow[w] = rec;
+      // `records_updated` holds a timestamp only for a window at least one node has answered for.
+      // That is what separates "this window genuinely has no shares" from "we have not read it
+      // yet" — two states that look identical in the record itself and must not render the same.
+      if (summary && summary.records_updated && summary.records_updated[w]) windowSawAny[w] = true;
     });
-    // Enforce window monotonicity: wider windows are supersets of narrower
-    // ones, so a wider window's best can never be worse than a narrower
-    // one's. If a single rate-limited fetch leaves month with stale cache
-    // while week has fresh data, propagate the better result outward so
-    // the user never sees "last week better than last month".
-    // REC_WINDOWS = ['block', 'day', 'week', 'month'] — in increasing-window order.
-    for (var __wi = 1; __wi < REC_WINDOWS.length; __wi++) {
-      var __wider = REC_WINDOWS[__wi];
-      var __narrower = REC_WINDOWS[__wi - 1];
-      var __wb = bestPerWindow[__wider];
-      var __nb = bestPerWindow[__narrower];
-      if (__nb && (!__wb || __nb.share_hash < __wb.share_hash)) {
-        bestPerWindow[__wider] = __nb;
-      }
-    }
     REC_WINDOWS.forEach(function (w) {
       var v = document.getElementById('rec-' + w);
       var m = document.getElementById('rec-' + w + '-meta');
@@ -934,7 +906,6 @@
     });
   }
   refreshRecords();
-  setInterval(refreshRecords, 60000); // every minute
 
   // ───────── Leaderboards ─────────
   // `shares` tab is lifetime by default (stable, matches per-miner pages);
@@ -950,48 +921,30 @@
   async function refreshLeaderboard() {
     try {
       var win = lbCurrentWindow();
-      var results = await Promise.all(POOL_NODES.map(function (n) {
-        return fetch('/api/pool/' + n.id + '/api/v1/pool/leaderboard?window=' + win + '&limit=10')
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .catch(function (e) { console.warn('[lb] fetch failed for', n.id, e); return null; });
-      }));
-      var ok = results.filter(function (r) { return r !== null; }).length;
-      console.log('[lb] fetched window=' + win + ' ok=' + ok + '/' + results.length);
-      var bestByMiner = new Map();
-      var sharesByMiner = new Map();
-      results.forEach(function (d) {
-        if (!d) return;
-        (d.best_hash || []).forEach(function (row) {
-          var prev = bestByMiner.get(row.miner_id_redacted);
-          if (!prev || row.share_hash < prev.share_hash) {
-            bestByMiner.set(row.miner_id_redacted, row);
-          }
-        });
-        (d.shares || []).forEach(function (row) {
-          var prev = sharesByMiner.get(row.miner_id_redacted);
-          if (!prev) {
-            sharesByMiner.set(row.miner_id_redacted, Object.assign({}, row));
-          } else {
-            prev.share_count += row.share_count;
-            prev.total_work += row.total_work;
-          }
-        });
-      });
-      var bestList = Array.from(bestByMiner.values())
-        .sort(function (a, b) { return a.share_hash < b.share_hash ? -1 : 1; })
-        .slice(0, 10);
-      var sharesList = Array.from(sharesByMiner.values())
-        .sort(function (a, b) { return b.total_work - a.total_work; })
-        .slice(0, 10);
-      // If every VM failed AND we still have a good view, keep it. Otherwise
-      // update — even to empty — so a legitimate "no miners yet" state shows
-      // honestly instead of sticking on stale content.
-      if (ok === 0 && lbState.data && (lbState.data.best_hash.length || lbState.data.shares.length)) {
-        console.warn('[lb] all fetches failed — keeping previous view');
+      // The aggregator keeps one merged leaderboard per category+window the UI can ask for, each
+      // on its own cadence: `shares:lifetime` is cheap and refreshes every minute, while the
+      // best-hash windows cost seconds upstream (day 6.7s, week and month over 10s) and refresh
+      // every 2-10 minutes. A best hash can only improve within its window, so a slower cadence
+      // makes the answer older, never wrong.
+      var key = lbState.category + ':' + win;
+      var summary = await fetchSummary();
+      var section = (summary && summary.leaderboards) ? summary.leaderboards[key] : null;
+      if (!section) {
+        // Nothing for this combination yet. Keep any view we already have rather than replacing
+        // real rows with an empty table; only show the honest empty state on a cold start.
+        console.warn('[lb] no snapshot section for', key);
+        if (lbState.data) return;
+        lbState.data = { best_hash: [], shares: [] };
+        renderLeaderboard();
         return;
       }
-      lbState.data = { best_hash: bestList, shares: sharesList };
-      console.log('[lb] merged', { best: bestList.length, shares: sharesList.length, category: lbState.category });
+      lbState.data = { best_hash: section.data.best_hash || [], shares: section.data.shares || [] };
+      console.log('[lb] snapshot', key, {
+        best: lbState.data.best_hash.length,
+        shares: lbState.data.shares.length,
+        nodes: section.ok_nodes + '/' + section.total_nodes,
+        age_secs: section.age_secs,
+      });
       renderLeaderboard();
     } catch (err) {
       console.error('[lb] refresh failed:', err);
@@ -1072,7 +1025,6 @@
   })();
   renderLeaderboard(); // show "loading…" row while the first fetch is in flight
   refreshLeaderboard();
-  setInterval(refreshLeaderboard, 60000);
 
   // ───────── Next block payout projection ─────────
   // Pulls the current round's top miners from every VM, merges by
@@ -1089,16 +1041,16 @@
 
   var lastPayoutMiners = null;
   async function refreshPayout() {
-    var results = await Promise.all(POOL_NODES.map(function (n) {
-      return fetch('/api/pool/' + n.id + '/api/v1/pool/next_payout')
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .catch(function () { return null; });
-    }));
-
-    // Subsidy / fee split values are derived from the current block height
-    // and are consensus-wide — first non-null response wins. If every
-    // fetch failed this cycle we keep whatever's currently rendered.
-    var base = results.find(function (r) { return !!r; });
+    var summary = await fetchSummary();
+    var section = summary ? summary.payout : null;
+    // No section means every node failed this cycle, or none has been read yet. Keep whatever is
+    // already rendered: an empty payout table asserts that nobody is owed anything, which is a
+    // different claim from "we do not know", and only one of them is ours to make.
+    if (!section) return;
+    var payout = section.data;
+    // Subsidy and fee split are consensus-wide values derived from the block height, so the
+    // aggregator takes them from the first node that answered.
+    var base = payout.base;
     if (!base) return;
 
     // Paint the summary tiles first (miners list may still be merging)
@@ -1108,56 +1060,18 @@
     document.getElementById('py-node-pool').innerHTML = fmtBtc(base.node_reward_pool_sats);
     document.getElementById('py-height').textContent = base.block_height.toLocaleString();
 
-    // Merge the ledger across nodes. Each VM has its own local view of
-    // which shares it has seen; summing unpaid_work per miner gives the
-    // pool-wide ledger used for the next coinbase. Unpaid-miner counts
-    // SUM across VMs (a miner on multiple nodes IS multiple ledger
-    // entries from the database's perspective; close enough for the
-    // header tile).
-    var byMiner = new Map();
-    var totalOnLedger = 0;
-    results.forEach(function (r) {
-      if (!r) return;
-      totalOnLedger += r.total_unpaid_miners || 0;
-      if (!Array.isArray(r.miners)) return;
-      r.miners.forEach(function (m) {
-        var prev = byMiner.get(m.miner_id_redacted);
-        if (!prev) {
-          byMiner.set(m.miner_id_redacted, {
-            miner_id_redacted: m.miner_id_redacted,
-            unpaid_work: m.unpaid_work,
-          });
-        } else {
-          prev.unpaid_work += m.unpaid_work;
-        }
-      });
-    });
-
-    // Re-rank + re-dust-filter after merging. The per-node responses
-    // were already dust-filtered against their own totals; merging may
-    // pull a miner above dust against the combined pool, so we filter
-    // iteratively against the merged totals too.
-    var miners = Array.from(byMiner.values())
-      .sort(function (a, b) { return b.unpaid_work - a.unpaid_work; });
+    // The ledger merge, the iterative dust filter and the re-rank all run server-side now, in
+    // `merge_payout`. The iteration matters and is easy to miss: each node dust-filtered against
+    // its OWN total, but merging changes the denominator, so removing one duster raises everyone
+    // else's share and can pull the next miner over the line. What arrives here is the final list
+    // that would go into the next block's coinbase.
+    var miners = payout.miners || [];
     var minerPool = base.miner_pool_sats;
-    for (var iters = 0; iters < 10; iters++) {
-      var total = miners.reduce(function (s, m) { return s + m.unpaid_work; }, 0);
-      if (total <= 0) break;
-      var preLen = miners.length;
-      miners = miners.filter(function (m) {
-        return Math.floor(minerPool * m.unpaid_work / total) >= 546;
-      });
-      if (miners.length === preLen) break;
-    }
-    miners = miners.slice(0, base.ledger_cap || 1000);
-    var totalWork = miners.reduce(function (s, m) { return s + m.unpaid_work; }, 0);
-
-    // "In next coinbase" = dust-filtered merged count (what actually
-    // goes into the next block's outputs). "On the ledger" = every
-    // unique miner carrying unpaid shares right now. At current scale
-    // these match since all active miners clear dust; the gap widens
-    // once the pool is large enough that some miners fall below dust.
-    var mergedUnique = byMiner.size;
+    var totalWork = payout.total_work || 0;
+    // "On the ledger" counts DISTINCT miners carrying unpaid shares, before dust filtering — a
+    // miner active on three nodes is three ledger rows but one miner. "In next coinbase" is the
+    // dust-filtered count. At current scale they match; the gap widens as the pool grows.
+    var mergedUnique = payout.unique_miners || 0;
     document.getElementById('py-paid-this').textContent = miners.length.toLocaleString();
     document.getElementById('py-miners').textContent = mergedUnique.toLocaleString();
 
@@ -1183,7 +1097,20 @@
     }).join('');
   }
   refreshPayout();
-  setInterval(refreshPayout, 30000);
+
+  // ───────── One timer for every stats panel ─────────
+  // All four panels read the same server-side snapshot, so they refresh together on a single 60s
+  // tick and share one request between them. This replaces four independent timers that between
+  // them issued roughly 145 requests per minute, per viewer.
+  //
+  // Polling faster than this would not make the page fresher: the snapshot's own cadence is what
+  // decides how current each section is, and every section reports its `age_secs` so the page can
+  // say so rather than imply the numbers are live.
+  function refreshAllStats() {
+    return Promise.all([refreshPool(), refreshRecords(), refreshLeaderboard(), refreshPayout()])
+      .catch(function (e) { console.warn('[pool] stats refresh failed', e); });
+  }
+  setInterval(refreshAllStats, 60000);
 
   // Miner lookup (client-side fan-out — aggregator endpoint is next up)
   (function () {
@@ -1691,12 +1618,34 @@ const bannerText = document.getElementById('q-banner-text');
 const bannerSub  = document.getElementById('q-banner-sub');
 let blocksFound = 0, blocksMissed = 0;
 
+// The block banner clears on a wall-clock timer, NOT on the render loop.
+//
+// It used to be timed only by `tickRound`, which decrements `flashRemaining` by the frame delta
+// and calls `endFlash` at zero. That made the reset depend on the render loop still running, and
+// the loop does not always run:
+//
+//   - `animate()` returns immediately when there is no WebGL context, but `onBlockEvent` sets the
+//     banner regardless. On a browser without WebGL the banner appeared and NOTHING ever cleared
+//     it — `endFlash` was unreachable.
+//   - `requestAnimationFrame(animate)` is the last statement of `animate()`, so any exception
+//     anywhere in that function stopped the loop for good, freezing the banner with it.
+//   - rAF is throttled to a stop in a backgrounded tab, so the "20 seconds" were 20 seconds of
+//     RENDERED time, not elapsed time.
+//
+// The visual fade still runs per-frame — it is a colour lerp, it has to — but the RESET is now
+// guaranteed independently of it.
+var flashTimer = null;
+function armFlashReset() {
+  if (flashTimer) clearTimeout(flashTimer);
+  flashTimer = setTimeout(function () { flashTimer = null; endFlash(); }, FLASH_SECONDS * 1000);
+}
 function triggerBlockFound() {
   flashState = 'block'; flashRemaining = FLASH_SECONDS;
   lastBlockTs = performance.now() / 1000; blocksFound++;
   bannerText.textContent = 'Block found.';
   bannerSub.textContent = 'ghost pool · we did it';
   banner.className = 'qbanner block-found show';
+  armFlashReset();
 }
 function triggerNoBlock() {
   flashState = 'miss'; flashRemaining = FLASH_SECONDS;
@@ -1704,8 +1653,11 @@ function triggerNoBlock() {
   bannerText.textContent = 'Block found elsewhere.';
   bannerSub.textContent = 'someone else this round · ghost keeps hashing';
   banner.className = 'qbanner no-block show';
+  armFlashReset();
 }
 function endFlash() {
+  // Idempotent: reachable from the timer AND from `tickRound`, whichever gets there first.
+  if (flashTimer) { clearTimeout(flashTimer); flashTimer = null; }
   flashState = null; banner.classList.remove('show');
   sphereWire.material.color.copy(BASE_SPHERE_COLOR); sphereWire.material.opacity = 0.28;
   // Wipe the scene and start the next round with an empty field.
@@ -1789,6 +1741,19 @@ const qHud = {
 
 function animate() {
   if (!renderer) return; // no WebGL context — fallback message is shown instead
+  // `requestAnimationFrame` is re-armed in a `finally`, so an exception in one frame costs that
+  // frame and nothing more. Previously the rAF call was simply the last statement of the function,
+  // which meant any throw ended the animation permanently and silently.
+  try {
+    animateFrame();
+  } catch (e) {
+    console.error('[quasar] frame failed', e);
+  } finally {
+    requestAnimationFrame(animate);
+  }
+}
+
+function animateFrame() {
   const dt = Math.min(clock.getDelta(), 0.05);
   tickEmitter(dt);
   tickRound(dt);
@@ -1843,8 +1808,6 @@ function animate() {
   qHud.miners.textContent = (window.__ghostPool && window.__ghostPool.getMiners ? window.__ghostPool.getMiners() : 0).toString();
   const sinceSec = (performance.now() / 1000) - lastBlockTs;
   qHud.clock.textContent  = flashState ? '—' : formatClock(sinceSec);
-
-  requestAnimationFrame(animate);
 }
 
 sizeRenderer();
