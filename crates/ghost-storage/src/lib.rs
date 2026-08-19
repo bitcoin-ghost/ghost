@@ -35,6 +35,7 @@
 
 #![deny(unreachable_pub)]
 
+pub mod address_key;
 pub mod audit_log;
 pub mod database;
 pub mod encryption;
@@ -42,7 +43,6 @@ pub mod migrations;
 pub mod models;
 pub mod mpc_lineage;
 pub mod queries;
-pub mod sbc_store;
 pub mod shard_store;
 pub mod snapshot;
 

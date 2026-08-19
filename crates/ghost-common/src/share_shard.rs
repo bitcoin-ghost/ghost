@@ -34,8 +34,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::identity::{verify_signature, NodeIdentity};
-use crate::share_batch::{canonical_sort, creditable_difficulty, fold_shares};
 use crate::types::{NodeId, ShareProof};
+use crate::work_fold::{canonical_sort, creditable_difficulty, fold_shares};
 
 /// Domain tag for the table commitment. Bump the version on ANY encoding change — a root computed
 /// under a different encoding is not comparable, and a silent change would split the fleet rather

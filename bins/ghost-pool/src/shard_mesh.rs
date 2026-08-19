@@ -74,7 +74,7 @@ pub struct ShardMeshHandler {
     /// Outbound queue for served §6 sampling responses. `None` leaves the node able to REQUEST
     /// audits but unable to answer them, which is a silent half-wiring — so it is logged.
     sample_out: Option<SampleResponder>,
-    /// The share checks in force RIGHT NOW, reusing the SBC path's `ChecksFn` rather than a second
+    /// The share checks in force RIGHT NOW, reusing the one `ChecksFn` rather than a second
     /// spelling of the same predicate.
     ///
     /// ⚠ A function, not a value, and era-aware by construction. A share must be judged by its own
@@ -82,7 +82,7 @@ pub struct ShardMeshHandler {
     /// instant the fleet crosses a gate, which quarantined vm5 fleet-wide on 2026-08-12. Sampling
     /// turns that into a PUBLISHED accusation against an honest node, so without this the response
     /// half stays unwired rather than running on a predicate that could frame a peer.
-    checks: Option<crate::sbc_handler::ChecksFn>,
+    checks: Option<crate::share_checks::ChecksFn>,
     /// Outbound queue for §12.4 evidence this node's own audits produced. `None` means a failed
     /// audit quarantines locally and tells nobody, which is logged rather than left silent.
     evidence_out: Option<EvidencePublisher>,
@@ -111,7 +111,7 @@ impl ShardMeshHandler {
     }
 
     /// Wire the era-aware share checks, enabling §6 sampling RESPONSES to be verified.
-    pub fn with_share_checks(mut self, checks: crate::sbc_handler::ChecksFn) -> Self {
+    pub fn with_share_checks(mut self, checks: crate::share_checks::ChecksFn) -> Self {
         self.checks = Some(checks);
         self
     }
@@ -462,11 +462,9 @@ impl MessageHandler for ShardMeshHandler {
                 let epoch_height = resp
                     .epoch
                     .saturating_mul(ghost_common::share_shard::EPOCH_BLOCKS.get());
-                let checks = crate::sbc_checks::NodeBatchChecks::at_shared_height(epoch_height);
-                let predicate = |share: &ghost_common::types::ShareProof| {
-                    use ghost_common::batch_consensus::BatchChecks;
-                    checks.share_is_valid(share)
-                };
+                let checks = crate::share_checks::NodeShareChecks::at_shared_height(epoch_height);
+                let predicate =
+                    |share: &ghost_common::types::ShareProof| checks.share_is_valid(share);
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -582,11 +580,9 @@ impl MessageHandler for ShardMeshHandler {
                     .summary
                     .epoch
                     .saturating_mul(ghost_common::share_shard::EPOCH_BLOCKS.get());
-                let checks = crate::sbc_checks::NodeBatchChecks::at_shared_height(epoch_height);
-                let predicate = |share: &ghost_common::types::ShareProof| {
-                    use ghost_common::batch_consensus::BatchChecks;
-                    checks.share_is_valid(share)
-                };
+                let checks = crate::share_checks::NodeShareChecks::at_shared_height(epoch_height);
+                let predicate =
+                    |share: &ghost_common::types::ShareProof| checks.share_is_valid(share);
                 match ghost_consensus::shard_handler::verify_shard_evidence(
                     &ev,
                     ghost_reconciliation::batch::verify_merkle_proof,

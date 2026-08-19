@@ -1300,7 +1300,7 @@ mod tests {
         // Canonical leaf order is what the root was computed over.
         let leaves: Vec<[u8; 32]> = {
             let mut sorted = ordered.clone();
-            ghost_common::share_batch::canonical_sort(&mut sorted);
+            ghost_common::work_fold::canonical_sort(&mut sorted);
             sorted.iter().map(|s| s.share_hash).collect()
         };
         let idx = 1usize;
@@ -1412,7 +1412,7 @@ mod tests {
         let (summary, ordered) = summarise(5, accused, &BTreeMap::new(), shares);
         let leaves: Vec<[u8; 32]> = {
             let mut sorted = ordered.clone();
-            ghost_common::share_batch::canonical_sort(&mut sorted);
+            ghost_common::work_fold::canonical_sort(&mut sorted);
             sorted.iter().map(|s| s.share_hash).collect()
         };
         (summary, ordered, leaves)

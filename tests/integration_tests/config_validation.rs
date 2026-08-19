@@ -538,7 +538,6 @@ fn test_pool_config_validate_success() {
         min_payout_sats: 10000,
         payout_interval_blocks: 100,
         // WP-5 share-batch chain: dark unless a node opts in.
-        share_batch_shadow: false,
         // Share shard (docs/SHARE_SHARD.md): same precedent, dark unless a node opts in.
         share_shard: false,
         // Stage 5 genesis ceremony: dark until the operator runs it deliberately.
