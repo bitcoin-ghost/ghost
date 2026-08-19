@@ -45,8 +45,9 @@ mod error;
 mod tier;
 
 pub use blind::{
-    BlindSignature, BlindSignatureResponse, BlindedAddress, BlindedChallenge, BlindingContext,
-    CoordinatorSigner, CoordinatorSignerConfig, PublicNonce, TokenVerifier, UnblindedToken,
+    ensure_os_rng_available, BlindSignature, BlindSignatureResponse, BlindedAddress,
+    BlindedChallenge, BlindingContext, CoordinatorSigner, CoordinatorSignerConfig, PublicNonce,
+    TokenVerifier, UnblindedToken,
 };
 pub use error::WraithError;
 pub use tier::{

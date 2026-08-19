@@ -157,6 +157,14 @@ async fn main() -> Result<()> {
     let network =
         parse_network(&cli.network).with_context(|| format!("invalid network: {}", cli.network))?;
 
+    // Fail closed if the OS random source cannot be read. This is the
+    // whole of the RNG health check the spec permits (§6A E-5) — every
+    // blind-signature nonce and per-round signing key comes from it, and a
+    // host that cannot produce randomness must refuse to serve rather than
+    // discover the problem at the first signature.
+    wraith_protocol::ensure_os_rng_available()
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+
     // Mainnet refuses a mock backend — refusing at boot beats surfacing
     // a vulnerability later.
     if matches!(network, bitcoin::Network::Bitcoin) && cli.mock_broadcaster {
