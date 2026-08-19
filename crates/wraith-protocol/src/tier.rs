@@ -154,19 +154,18 @@ impl LiteTier {
         (self.denomination_sats() * LITE_SERVICE_FEE_BPS as u64) / 10_000
     }
 
-    /// Worst-case round transaction size in vbytes — used to sanity-check
-    /// every tier still fits inside Bitcoin's 100 KB standardness limit.
-    /// Conservatively assumes every participant has a change output.
+    /// Round transaction size in vbytes — used to sanity-check every tier
+    /// still fits inside Bitcoin's 100 KB standardness limit, and to derive
+    /// each participant's share of the mining fee.
+    ///
+    /// Exact rather than worst-case since #698: a round has no change
+    /// outputs, so the shape is fully determined by the participant count.
     pub const fn estimated_tx_vbytes(&self) -> usize {
         let n = self.max_participants();
         // n inputs (one per participant)
         // + n mixed outputs (one per participant)
-        // + n change outputs (worst case: every input is larger than denom + fee_share)
         // + 1 fee output (to coordinator)
-        (n * VBYTES_PER_INPUT)
-            + (n * VBYTES_PER_OUTPUT)
-            + (n * VBYTES_PER_OUTPUT)
-            + VBYTES_PER_OUTPUT
+        (n * VBYTES_PER_INPUT) + (n * VBYTES_PER_OUTPUT) + VBYTES_PER_OUTPUT
     }
 
     /// All four tiers, in ascending denomination order.
@@ -283,12 +282,14 @@ mod tests {
                 "tier {tier}: {vb} vbytes exceeds {MAX_TX_VBYTES}"
             );
         }
-        // The 100m tier's worst-case sanity-check (100 inputs + 100 mixed +
-        // 100 change + 1 fee = 301 io-units × ~50 vB ≈ 14.4 KB).
+        // The 100m tier is the largest: 100 inputs + 100 mixed + 1 fee =
+        // 201 io-units. Change outputs are gone (#698), which took roughly a
+        // third off every round — the band is pinned so their reintroduction
+        // would have to be deliberate.
         let big = LiteTier::Denom100mSats.estimated_tx_vbytes();
         assert!(
-            (14_000..=15_000).contains(&big),
-            "100m tier tx size ({big}) outside expected ~14.4KB band"
+            (10_000..=10_500).contains(&big),
+            "100m tier tx size ({big}) outside expected ~10.1KB band"
         );
     }
 

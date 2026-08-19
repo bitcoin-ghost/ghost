@@ -31,14 +31,35 @@
 //!
 //! ```text
 //! inputs (N, one per participant):
-//!   txid, vout, script_pubkey, amount ≥ denom + fee_share
+//!   txid, vout, script_pubkey, amount == denom + fee_share EXACTLY
 //!
 //! outputs (shuffled with ChaCha20Rng seeded from session_id + entropy):
 //!   N × mixed output     value = tier.denomination_sats()
-//!   M × change output    value = input - denom - fee_share, where M ≤ N
-//!                        (omitted when input == denom + fee_share exactly)
 //!   1 × service fee      value = N × tier.service_fee_sats()  [Mix only]
 //! ```
+//!
+//! ## Why there is no change output (#698)
+//!
+//! A change output is linkable. It pays back to an address the participant
+//! controls, in an amount derived from their own input, in the same
+//! transaction as their mixed output — which hands an observer the
+//! input → participant → round association the round exists to break. Equal
+//! values are what buy the anonymity set, and a per-participant remainder of
+//! a distinctive size is the one output in the transaction that is not equal
+//! to anything.
+//!
+//! So inputs must be exact. Master spec §7.1: "the solver composes entries
+//! to exact denominations … Change is never a vault output of a different
+//! value in the same round."
+//!
+//! The cost is stated rather than hidden: a wallet whose coin is not already
+//! exact must first make a **preparatory split** — an ordinary transaction
+//! producing one output of exactly `min_participant_input()`, with the
+//! remainder going back to the wallet's own everyday funds. That transaction
+//! is visible and marks the wallet as preparing to mix. That is a known,
+//! accepted cost, and it is a smaller one than carrying the link into the
+//! round itself, because the prep transaction does not reveal *which* output
+//! of the round is theirs.
 //!
 //! Jump rounds (`SessionType::Jump`) skip the service-fee output entirely —
 //! they pay only mining cost. Existing test machinery for Jump rounds
@@ -92,7 +113,8 @@ pub struct LiteParticipantInput {
     pub txid: Txid,
     pub vout: u32,
     /// On-chain value of this input. Must be ≥ `tier.denomination_sats() +
-    /// per-participant fee share`. Coordinator validates this at registration
+    /// per-participant fee share`, **exactly** — see the module docs on why
+    /// there is no change output. Coordinator validates this at registration
     /// before the input is registered.
     pub amount_sats: u64,
     /// Spending script for signature/witness validation. Coordinator checks
@@ -102,10 +124,6 @@ pub struct LiteParticipantInput {
     /// (presented via unblinded token, never linked to participant_id at
     /// submission time).
     pub mixed_output_address: String,
-    /// Optional change-output address. Required when the input is larger
-    /// than `denomination + fee_share`; ignored otherwise. The wallet picks
-    /// a fresh address it controls.
-    pub change_address: Option<String>,
     /// Internal participant index. NOT visible on chain — used only for
     /// diagnostics / claim accounting.
     pub participant_id: u32,
@@ -173,9 +191,12 @@ impl LiteRoundBuilder {
         }
     }
 
-    /// Register a participant's input + destination addresses. Validates:
-    /// - Input amount ≥ `min_participant_input()` (denom + fee shares).
-    /// - If surplus exceeds dust, change_address is set.
+    /// Register a participant's input + destination address.
+    ///
+    /// The input must be worth **exactly** `min_participant_input()`. Not
+    /// "at least": a round has no change output, so any surplus would have
+    /// nowhere to go but the mining fee, and any shortfall would unbalance
+    /// the transaction (#698).
     pub fn add_participant(&mut self, input: LiteParticipantInput) -> Result<(), WraithError> {
         if self.participants.len() >= self.tier.max_participants() {
             return Err(WraithError::InvalidInput(format!(
@@ -185,18 +206,11 @@ impl LiteRoundBuilder {
             )));
         }
         let needed = self.min_participant_input();
-        if input.amount_sats < needed {
+        if input.amount_sats != needed {
             return Err(WraithError::InvalidInput(format!(
-                "participant {} input {} sats < required {} sats",
+                "participant {} input is {} sats; a round input must be exactly {} sats \
+                 (denomination + fee shares) because rounds have no change output",
                 input.participant_id, input.amount_sats, needed
-            )));
-        }
-        let surplus = input.amount_sats - needed;
-        if surplus >= CHANGE_DUST_THRESHOLD_SATS && input.change_address.is_none() {
-            return Err(WraithError::InvalidInput(format!(
-                "participant {}: input has {surplus} sats above min, \
-                 change_address is required",
-                input.participant_id
             )));
         }
         self.participants.push(input);
@@ -313,7 +327,6 @@ impl LiteRoundBuilder {
         // output with provenance so we can shuffle (kind, idx, address, sats)
         // tuples and rebuild TxOuts after.
         let denom = self.tier.denomination_sats();
-        let min_input = self.min_participant_input();
         let mut outputs: Vec<LiteOutputItem> = Vec::new();
 
         // Mixed (denom-sized) outputs — one per participant.
@@ -327,29 +340,6 @@ impl LiteRoundBuilder {
         }
 
         // Change outputs — only when the participant's surplus exceeds dust.
-        // Surplus = input - (denom + mining_share + service_share). The
-        // mining_share + service_share already cover the participant's
-        // contribution to the fee output and the implicit mining fee.
-        for p in &self.participants {
-            let surplus = p.amount_sats - min_input;
-            if surplus < CHANGE_DUST_THRESHOLD_SATS {
-                continue;
-            }
-            let change_addr = p.change_address.as_ref().ok_or_else(|| {
-                WraithError::InvalidInput(format!(
-                    "participant {} has surplus {} but no change_address \
-                     (validated at add_participant; should not happen here)",
-                    p.participant_id, surplus
-                ))
-            })?;
-            outputs.push(LiteOutputItem {
-                kind: LiteOutputKind::Change,
-                participant_id: Some(p.participant_id),
-                address: change_addr.clone(),
-                amount_sats: surplus,
-            });
-        }
-
         // Service-fee output (Mix only). Sum of every participant's fee
         // share, paid to the coordinator's fee address.
         if self.session_type == SessionType::Mix {
@@ -466,10 +456,6 @@ pub enum LiteOutputKind {
     /// output — participants want their input → this mapping to be
     /// unrecoverable.
     Mixed,
-    /// A participant's change. Linkable to that participant on chain (it
-    /// goes back to an address they control); the privacy guarantee covers
-    /// only the Mixed outputs.
-    Change,
     /// Coordinator's service-fee aggregate. Mix rounds only.
     ServiceFee,
 }
@@ -533,15 +519,17 @@ impl LiteRound {
 /// overcharges. This function existed twice — once here, once in the
 /// coordinator — and the copies diverged when #695 removed an output.
 ///
-/// Worst case assumes every participant also takes a change output.
+/// No change outputs exist any more (#698), so this is exact rather than
+/// worst-case in that dimension.
 pub fn round_vbytes(n: usize, session_type: SessionType) -> u64 {
-    // n inputs + n mixed outputs + n change outputs + (1 service fee if Mix)
-    let outputs = n
-        + n
-        + match session_type {
-            SessionType::Mix => 1,
-            SessionType::Jump => 0,
-        };
+    // n inputs + n mixed outputs + (1 service fee if Mix). The second `n`
+    // that used to be here was the change outputs, and it was still being
+    // charged for after they were removed — every participant pre-paying
+    // mining fee for an output the round no longer builds (#698).
+    let outputs = n + match session_type {
+        SessionType::Mix => 1,
+        SessionType::Jump => 0,
+    };
     ((n * VBYTES_PER_INPUT) + (outputs * VBYTES_PER_OUTPUT)) as u64
 }
 
@@ -624,9 +612,21 @@ mod tests {
             amount_sats,
             script_pubkey: script,
             mixed_output_address: mixed_addr.into(),
-            change_address: None,
             participant_id,
         }
+    }
+
+    /// The exact input every participant must bring, for the fixture tier.
+    /// Rounds have no change output, so this is the only acceptable value.
+    fn exact_input_sats() -> u64 {
+        mix_builder_with_addrs(&test_addrs()).min_participant_input()
+    }
+
+    /// The exact input for a Jump round, which differs from a Mix round's:
+    /// Jump rounds have no service-fee output, so no service-fee share.
+    fn jump_exact_input_sats() -> u64 {
+        LiteRoundBuilder::new_jump("sizing".into(), LiteTier::Denom100kSats, Network::Signet)
+            .min_participant_input()
     }
 
     fn mix_builder_with_addrs(addrs: &[String; 7]) -> LiteRoundBuilder {
@@ -638,15 +638,14 @@ mod tests {
         )
     }
 
-    /// Build a 5-participant Mix round with all participants holding
-    /// surplus (so all 5 emit a change output too). Used as the canonical
-    /// "happy path" fixture across multiple tests.
+    /// Build a 5-participant Mix round. Every participant brings exactly
+    /// the required input, which is the only shape a round accepts (#698).
+    /// The canonical "happy path" fixture across multiple tests.
     fn happy_mix_round(addrs: &[String; 7], entropy: &[u8; 32]) -> LiteRound {
         let mut b = mix_builder_with_addrs(addrs);
         for i in 0..5 {
-            let mut p = fake_input(i as u32, 110_000, &addrs[i]);
-            p.change_address = Some(addrs[5].clone());
-            b.add_participant(p).unwrap();
+            b.add_participant(fake_input(i as u32, exact_input_sats(), &addrs[i]))
+                .unwrap();
         }
         b.build_with_entropy(entropy).unwrap()
     }
@@ -662,26 +661,39 @@ mod tests {
         let err = b.add_participant(too_small).unwrap_err();
         match err {
             WraithError::InvalidInput(msg) => {
-                assert!(msg.contains("required"), "msg = {msg}");
+                assert!(msg.contains("exactly"), "msg = {msg}");
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
     }
 
+    /// An input worth *more* than the requirement is refused, not trimmed
+    /// (#698). There is nowhere for the surplus to go: a change output is
+    /// linkable, and silently donating it to miners would take a
+    /// participant's money without telling them.
     #[test]
-    fn add_participant_rejects_overflow_without_change_addr() {
+    fn add_participant_rejects_an_input_above_the_exact_amount() {
         let addrs = test_addrs();
         let mut b = mix_builder_with_addrs(&addrs);
-        // Denomination + fee_share + 10k = surplus > dust, but no change addr.
-        let mut p = fake_input(0, 200_000, &addrs[0]);
-        p.change_address = None;
-        let err = b.add_participant(p).unwrap_err();
+        let err = b
+            .add_participant(fake_input(0, exact_input_sats() + 10_000, &addrs[0]))
+            .unwrap_err();
         match err {
             WraithError::InvalidInput(msg) => {
-                assert!(msg.contains("change_address"), "msg = {msg}");
+                assert!(msg.contains("exactly"), "msg = {msg}");
             }
-            other => panic!("expected change_address error, got {other:?}"),
+            other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    /// One sat short is still short.
+    #[test]
+    fn add_participant_rejects_an_input_one_sat_below() {
+        let addrs = test_addrs();
+        let mut b = mix_builder_with_addrs(&addrs);
+        assert!(b
+            .add_participant(fake_input(0, exact_input_sats() - 1, &addrs[0]))
+            .is_err());
     }
 
     #[test]
@@ -690,14 +702,13 @@ mod tests {
         let mut b = mix_builder_with_addrs(&addrs);
         // Fill to max (20).
         for i in 0..LiteTier::Denom100kSats.max_participants() as u32 {
-            let mut p = fake_input(i, 110_000, &addrs[0]);
-            p.change_address = Some(addrs[1].clone());
-            b.add_participant(p).unwrap();
+            b.add_participant(fake_input(i, exact_input_sats(), &addrs[0]))
+                .unwrap();
         }
         // The 21st must reject.
-        let mut overflow = fake_input(99, 110_000, &addrs[0]);
-        overflow.change_address = Some(addrs[1].clone());
-        let err = b.add_participant(overflow).unwrap_err();
+        let err = b
+            .add_participant(fake_input(99, exact_input_sats(), &addrs[0]))
+            .unwrap_err();
         assert!(matches!(err, WraithError::InvalidInput(_)));
     }
 
@@ -707,9 +718,8 @@ mod tests {
         let mut b = mix_builder_with_addrs(&addrs);
         // Only 4 participants, min is 5.
         for i in 0..4 {
-            let mut p = fake_input(i, 110_000, &addrs[i as usize]);
-            p.change_address = Some(addrs[5].clone());
-            b.add_participant(p).unwrap();
+            b.add_participant(fake_input(i, exact_input_sats(), &addrs[i as usize]))
+                .unwrap();
         }
         let err = b.build_with_entropy(&[0u8; 32]).unwrap_err();
         match err {
@@ -727,9 +737,8 @@ mod tests {
         let mut b = mix_builder_with_addrs(&addrs);
         let p_amt = b.min_participant_input();
         for (i, addr) in addrs.iter().enumerate().take(5) {
-            let mut p = fake_input(i as u32, p_amt, addr);
-            p.change_address = None; // exact amount, no surplus
-            b.add_participant(p).unwrap();
+            b.add_participant(fake_input(i as u32, p_amt, addr))
+                .unwrap();
         }
         let round = b.build_with_entropy(&[0u8; 32]).unwrap();
         assert_eq!(round.mixed_output_count(), 5);
@@ -739,12 +748,9 @@ mod tests {
             .filter(|p| p.kind == LiteOutputKind::ServiceFee)
             .count();
         assert_eq!(fees, 1);
-        let changes = round
-            .output_provenance
-            .iter()
-            .filter(|p| p.kind == LiteOutputKind::Change)
-            .count();
-        assert_eq!(changes, 0);
+        // Every output is either a mixed output or the single fee output.
+        // There is no third kind any more, and the count proves it (#698).
+        assert_eq!(round.output_provenance.len(), 6);
     }
 
     #[test]
@@ -756,9 +762,8 @@ mod tests {
             Network::Signet,
         );
         for i in 0..5 {
-            let mut p = fake_input(i as u32, 110_000, &addrs[i]);
-            p.change_address = Some(addrs[5].clone());
-            b.add_participant(p).unwrap();
+            b.add_participant(fake_input(i as u32, jump_exact_input_sats(), &addrs[i]))
+                .unwrap();
         }
         let round = b.build_with_entropy(&[0u8; 32]).unwrap();
         assert_eq!(round.mixed_output_count(), 5);
@@ -816,8 +821,7 @@ mod tests {
         let mut b2 = mix_builder_with_addrs(&addrs);
         for i in 0..6 {
             let addr = if i < 6 { &addrs[i % 6] } else { &addrs[0] };
-            let mut p = fake_input(i as u32, 110_000, addr);
-            p.change_address = Some(addrs[5].clone());
+            let p = fake_input(i as u32, exact_input_sats(), addr);
             b1.add_participant(p.clone()).unwrap();
             b2.add_participant(p).unwrap();
         }
@@ -875,31 +879,39 @@ mod tests {
         }
     }
 
+    /// Every output in a Mix round is either one of the equal-value mixed
+    /// outputs or the single fee output. There is no per-participant
+    /// remainder, because a remainder is linkable to the participant who
+    /// produced it and is the one output in the transaction that is not
+    /// equal to anything else (#698).
     #[test]
-    fn change_outputs_match_surpluses() {
+    fn a_round_produces_only_equal_mixed_outputs_and_one_fee_output() {
         let addrs = test_addrs();
-        let mut b = mix_builder_with_addrs(&addrs);
-        // Participant 0: exact (no change). Participant 1-4: surplus 50k each.
-        let p0_amt = b.min_participant_input();
-        let mut p0 = fake_input(0, p0_amt, &addrs[0]);
-        p0.change_address = None;
-        b.add_participant(p0).unwrap();
+        let round = happy_mix_round(&addrs, &[0u8; 32]);
 
-        for i in 1..5u32 {
-            let mut p = fake_input(i, p0_amt + 50_000, &addrs[i as usize]);
-            p.change_address = Some(addrs[5].clone());
-            b.add_participant(p).unwrap();
-        }
-        let round = b.build_with_entropy(&[0u8; 32]).unwrap();
-        let changes: Vec<&LiteOutputProvenance> = round
+        let denom = LiteTier::Denom100kSats.denomination_sats();
+        let mixed: Vec<_> = round
             .output_provenance
             .iter()
-            .filter(|p| p.kind == LiteOutputKind::Change)
+            .filter(|p| p.kind == LiteOutputKind::Mixed)
             .collect();
-        assert_eq!(changes.len(), 4, "expected 4 change outputs");
-        for c in &changes {
-            assert_eq!(c.amount_sats, 50_000);
+        assert_eq!(mixed.len(), 5);
+        for m in &mixed {
+            assert_eq!(m.amount_sats, denom, "mixed outputs must be equal");
         }
+
+        let fees: Vec<_> = round
+            .output_provenance
+            .iter()
+            .filter(|p| p.kind == LiteOutputKind::ServiceFee)
+            .collect();
+        assert_eq!(fees.len(), 1);
+
+        assert_eq!(
+            round.output_provenance.len(),
+            mixed.len() + fees.len(),
+            "no output may be anything other than a mixed output or the fee"
+        );
     }
 
     #[test]
@@ -908,9 +920,8 @@ mod tests {
         let mut b = mix_builder_with_addrs(&addrs);
         let p_amt = b.min_participant_input();
         for i in 0..5u32 {
-            let mut p = fake_input(i, p_amt, &addrs[i as usize]);
-            p.change_address = None;
-            b.add_participant(p).unwrap();
+            b.add_participant(fake_input(i, p_amt, &addrs[i as usize]))
+                .unwrap();
         }
         let round = b.build_with_entropy(&[0u8; 32]).unwrap();
         let total_in = p_amt * 5;
@@ -926,5 +937,52 @@ mod tests {
         let r1 = happy_mix_round(&addrs, &[0xAA; 32]);
         let r2 = happy_mix_round(&addrs, &[0xAA; 32]);
         assert_eq!(r1.txid(), r2.txid());
+    }
+}
+
+#[cfg(test)]
+mod seat_price {
+    use super::*;
+
+    /// The exact input a seat costs, pinned per tier and round type.
+    ///
+    /// Rounds have no change output (#698), so this is the single value a
+    /// participant must bring — a wallet computes it, splits its coin to
+    /// match, and the coordinator refuses anything else. Pinning it means a
+    /// change to the fee maths has to be deliberate, and gives the
+    /// coordinator's fixtures a derived number instead of a guessed one.
+    #[test]
+    fn seat_prices_are_pinned() {
+        let price = |tier: LiteTier, st: SessionType| {
+            tier.denomination_sats()
+                + per_participant_mining_share(tier, st, DEFAULT_FEE_RATE_SATS_PER_VB)
+                + match st {
+                    SessionType::Mix => tier.service_fee_sats(),
+                    SessionType::Jump => 0,
+                }
+        };
+
+        assert_eq!(price(LiteTier::Denom100kSats, SessionType::Mix), 101_596);
+        assert_eq!(price(LiteTier::Denom100kSats, SessionType::Jump), 101_010);
+        assert_eq!(price(LiteTier::Denom1mSats, SessionType::Mix), 1_006_096);
+        assert_eq!(price(LiteTier::Denom10mSats, SessionType::Mix), 10_051_096);
+        assert_eq!(
+            price(LiteTier::Denom100mSats, SessionType::Mix),
+            100_501_096
+        );
+
+        // A Jump seat is cheaper than a Mix seat by the service fee itself
+        // plus each participant's share of the mining cost of the fee
+        // output that Jump rounds do not build.
+        let fee_output_share = (VBYTES_PER_OUTPUT as u64 * DEFAULT_FEE_RATE_SATS_PER_VB)
+            .div_ceil(LiteTier::Denom100kSats.min_participants() as u64);
+        for tier in LiteTier::all() {
+            let tier = *tier;
+            assert_eq!(
+                price(tier, SessionType::Mix) - price(tier, SessionType::Jump),
+                tier.service_fee_sats() + fee_output_share,
+                "tier {tier}: the gap is the service fee plus its output's mining cost"
+            );
+        }
     }
 }

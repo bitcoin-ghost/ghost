@@ -116,11 +116,15 @@ fn deterministic_router_full(
 fn fixture_utxo_source() -> MockUtxoSource {
     let utxos = MockUtxoSource::new();
     for i in 0..MIN_5 as u32 {
-        utxos.insert(fixture_outpoint(0x11, i), 200_000, fixture_spk(i as u8));
+        utxos.insert(
+            fixture_outpoint(0x11, i),
+            EXACT_INPUT_100K_MIX,
+            fixture_spk(i as u8),
+        );
     }
     utxos.insert(
         fixture_outpoint(0x00, 0),
-        MIN_INPUT_100K_MIX,
+        EXACT_INPUT_100K_MIX,
         fixture_spk(0),
     );
     utxos
@@ -644,7 +648,10 @@ const MIN_5: usize = 5;
 /// Per-participant minimum input for 100k_sats Mix at the default fee rate.
 /// Computed from: denom 100_000 + service_fee 500 + ceil((5*58 + 12*43)*10/5)
 /// = 100_000 + 500 + 1612 = 102_112. Same number the handler computes.
-const MIN_INPUT_100K_MIX: u64 = 102_112;
+/// The exact input a 100k-tier Mix seat costs: denomination + mining-fee
+/// share + service-fee share. Rounds have no change output (#698), so this
+/// is the only acceptable value, not a floor.
+const EXACT_INPUT_100K_MIX: u64 = 101_596;
 
 /// A scriptPubKey with no address form at all. Registration has to
 /// refuse it rather than panic deriving an address to check a proof
@@ -709,7 +716,7 @@ async fn inputs_returns_404_for_unknown_session() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": "deadbeef",
                 },
             }),
@@ -735,7 +742,7 @@ async fn inputs_returns_409_when_session_still_filling() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": "deadbeef",
                 },
             }),
@@ -761,7 +768,7 @@ async fn inputs_returns_403_for_unenrolled_ghost_id() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": "deadbeef",
                 },
             }),
@@ -789,7 +796,7 @@ async fn inputs_rejects_a_missing_ownership_proof() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
@@ -817,7 +824,7 @@ async fn inputs_rejects_a_malformed_ownership_proof() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
                 "ownership_proof": "not base64 at all!!",
@@ -842,7 +849,11 @@ async fn inputs_rejects_a_proof_made_with_the_wrong_key() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
     // The coin at 00…:0 belongs to participant 1.
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(1));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(1),
+    );
 
     let txid = "00".repeat(32);
     let response = router
@@ -853,7 +864,7 @@ async fn inputs_rejects_a_proof_made_with_the_wrong_key() {
                 "input": {
                     "txid": txid,
                     "vout": 0,
-                    "value_sats": 200_000,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     // Names the true script, as it must to get this far.
                     "scriptpubkey_hex": fixture_spk(1).to_hex_string(),
                 },
@@ -876,7 +887,11 @@ async fn inputs_rejects_a_proof_made_with_the_wrong_key() {
 async fn inputs_rejects_a_proof_bound_to_another_session() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
 
     let txid = "00".repeat(32);
     let response = router
@@ -887,7 +902,7 @@ async fn inputs_rejects_a_proof_bound_to_another_session() {
                 "input": {
                     "txid": txid,
                     "vout": 0,
-                    "value_sats": 200_000,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
                 // Right key, right coin, wrong round.
@@ -909,7 +924,11 @@ async fn inputs_rejects_a_proof_bound_to_another_session() {
 async fn inputs_rejects_a_proof_bound_to_another_outpoint() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
 
     let txid = "00".repeat(32);
     let response = router
@@ -920,7 +939,7 @@ async fn inputs_rejects_a_proof_bound_to_another_outpoint() {
                 "input": {
                     "txid": txid,
                     "vout": 0,
-                    "value_sats": 200_000,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
                 // Same key and session, but a proof over vout 1.
@@ -944,7 +963,7 @@ async fn inputs_rejects_an_input_with_no_address_form() {
     let session_id = make_locked_session(router.clone(), &state).await;
     utxos.insert(
         fixture_outpoint(0x00, 0),
-        200_000,
+        EXACT_INPUT_100K_MIX,
         bitcoin::ScriptBuf::from_hex(NONSTANDARD_SPK_HEX).unwrap(),
     );
 
@@ -957,7 +976,7 @@ async fn inputs_rejects_an_input_with_no_address_form() {
                 "input": {
                     "txid": txid,
                     "vout": 0,
-                    "value_sats": 200_000,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": NONSTANDARD_SPK_HEX,
                 },
                 "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 0),
@@ -982,7 +1001,11 @@ async fn inputs_rejects_an_input_with_no_address_form() {
 async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
 
     // One person, two enrolments, one coin — which is what the attack
     // reduces to once ownership is proved: you can no longer register a
@@ -995,7 +1018,7 @@ async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
             0,
             0x00,
             0,
-            200_000,
+            EXACT_INPUT_100K_MIX,
             Some(TEST_FEE_ADDRESS),
         )
     };
@@ -1029,7 +1052,11 @@ async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
 async fn inputs_still_accepts_a_participant_resubmitting_its_own_outpoint() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
 
     let body = signed_inputs_body(
         &session_id,
@@ -1037,7 +1064,7 @@ async fn inputs_still_accepts_a_participant_resubmitting_its_own_outpoint() {
         0,
         0x00,
         0,
-        200_000,
+        EXACT_INPUT_100K_MIX,
         Some(TEST_FEE_ADDRESS),
     );
 
@@ -1079,7 +1106,7 @@ async fn inputs_returns_503_when_no_utxo_source_is_configured() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
@@ -1109,7 +1136,7 @@ async fn inputs_rejects_an_outpoint_that_is_not_unspent() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
@@ -1164,7 +1191,7 @@ async fn inputs_rejects_a_scriptpubkey_the_chain_disagrees_with() {
     let session_id = make_locked_session(router.clone(), &state).await;
     utxos.insert(
         fixture_outpoint(0x00, 0),
-        MIN_INPUT_100K_MIX,
+        EXACT_INPUT_100K_MIX,
         bitcoin::ScriptBuf::from_hex("0014aabbccddeeff00112233445566778899aabbccdd").unwrap(),
     );
 
@@ -1176,7 +1203,7 @@ async fn inputs_rejects_a_scriptpubkey_the_chain_disagrees_with() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     // A script the submitter controls, for a coin it does not.
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
@@ -1200,7 +1227,7 @@ async fn inputs_rejects_an_unconfirmed_input() {
     utxos.insert_utxo(
         fixture_outpoint(0x00, 0),
         Utxo {
-            value_sats: MIN_INPUT_100K_MIX,
+            value_sats: EXACT_INPUT_100K_MIX,
             script_pubkey: fixture_spk(0),
             confirmations: 0,
             coinbase: false,
@@ -1215,7 +1242,7 @@ async fn inputs_rejects_an_unconfirmed_input() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
@@ -1238,7 +1265,7 @@ async fn inputs_rejects_an_immature_coinbase() {
     utxos.insert_utxo(
         fixture_outpoint(0x00, 0),
         Utxo {
-            value_sats: MIN_INPUT_100K_MIX,
+            value_sats: EXACT_INPUT_100K_MIX,
             script_pubkey: fixture_spk(0),
             confirmations: 99,
             coinbase: true,
@@ -1253,7 +1280,7 @@ async fn inputs_rejects_an_immature_coinbase() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
@@ -1267,7 +1294,7 @@ async fn inputs_rejects_an_immature_coinbase() {
 }
 
 #[tokio::test]
-async fn inputs_rejects_input_below_minimum_with_400() {
+async fn inputs_rejects_an_input_below_the_exact_amount() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
     // The chain says this outpoint really is worth 1,000 sats, so the
@@ -1276,7 +1303,7 @@ async fn inputs_rejects_input_below_minimum_with_400() {
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            // 1000 sats well below the minimum 102_112.
+            // 1000 sats, nowhere near a seat.
             signed_inputs_body(&session_id, "wallet-0", 0, 0x00, 0, 1_000, None),
         ))
         .await
@@ -1284,26 +1311,39 @@ async fn inputs_rejects_input_below_minimum_with_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "insufficient_input");
+    assert_eq!(json["error"], "input_not_exact");
 }
 
 #[tokio::test]
-async fn inputs_rejects_surplus_above_dust_without_change_address() {
+async fn inputs_rejects_an_input_above_the_exact_amount() {
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX + 50_000,
+        fixture_spk(0),
+    );
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            // Big surplus (~98k sats over min) but no change address.
-            signed_inputs_body(&session_id, "wallet-0", 0, 0x00, 0, 200_000, None),
+            // A surplus has nowhere to go: rounds build no change output,
+            // so an over-large input is refused rather than trimmed (#698).
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX + 50_000,
+                None,
+            ),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "missing_change_address");
+    assert_eq!(json["error"], "input_not_exact");
 }
 
 #[tokio::test]
@@ -1320,7 +1360,7 @@ async fn inputs_accepts_exact_minimum_without_change_address() {
                 0,
                 0x00,
                 0,
-                MIN_INPUT_100K_MIX,
+                EXACT_INPUT_100K_MIX,
                 None,
             ),
         ))
@@ -1350,14 +1390,20 @@ async fn inputs_advances_session_to_signing_when_all_submit() {
                     i as u8,
                     0x11,
                     i as u32,
-                    200_000,
+                    EXACT_INPUT_100K_MIX,
                     Some(TEST_FEE_ADDRESS),
                 ),
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "submission #{i}");
+        let status = response.status();
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "submission #{i}: {}",
+            String::from_utf8_lossy(&body)
+        );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let expected_state = if i + 1 == MIN_5 { "signing" } else { "locked" };
         assert_eq!(json["state"], expected_state, "after submission {i}");
@@ -1381,8 +1427,16 @@ async fn inputs_idempotent_on_resubmission() {
     // one outpoint is a stale claim, not a retry.
     let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state).await;
-    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk(0));
-    utxos.insert(fixture_outpoint(0x22, 0), 300_000, fixture_spk(0));
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+    utxos.insert(
+        fixture_outpoint(0x22, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
     let body = |txid_byte: u8, sats: u64| {
         signed_inputs_body(
             &session_id,
@@ -1398,7 +1452,7 @@ async fn inputs_idempotent_on_resubmission() {
         .clone()
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            body(0x00, 200_000),
+            body(0x00, EXACT_INPUT_100K_MIX),
         ))
         .await
         .unwrap();
@@ -1410,7 +1464,7 @@ async fn inputs_idempotent_on_resubmission() {
     let second = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            body(0x22, 300_000),
+            body(0x22, EXACT_INPUT_100K_MIX),
         ))
         .await
         .unwrap();
@@ -1719,7 +1773,7 @@ async fn make_signing_session(router: axum::Router, state: &Arc<CoordinatorState
                     i as u8,
                     0x11,
                     i as u32,
-                    200_000,
+                    EXACT_INPUT_100K_MIX,
                     Some(TEST_FEE_ADDRESS),
                 ),
             ))
@@ -2229,15 +2283,15 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
     assert_eq!(json["txid"].as_str().unwrap().len(), 64);
     assert!(json["mining_fee_sats"].as_u64().unwrap() > 0);
 
-    // Output provenance: must include 5 Mixed outputs (one per
-    // participant), 5 Change outputs, and 1 ServiceFee output.
+    // Output provenance: 5 Mixed outputs (one per participant) and 1
+    // ServiceFee output. Nothing else — a change output would be linkable
+    // to the participant who produced it (#698).
     let prov = json["output_provenance"].as_array().expect("array");
     let mixed = prov.iter().filter(|p| p["kind"] == "mixed").count();
-    let change = prov.iter().filter(|p| p["kind"] == "change").count();
     let service = prov.iter().filter(|p| p["kind"] == "service_fee").count();
     assert_eq!(mixed, 5, "5 mixed outputs");
-    assert_eq!(change, 5, "5 change outputs");
     assert_eq!(service, 1, "1 service-fee output");
+    assert_eq!(prov.len(), 6, "no output may be anything else");
 
     // Mixed outputs must all be at the tier denomination (100k_sats).
     for p in prov.iter().filter(|p| p["kind"] == "mixed") {
@@ -2297,10 +2351,11 @@ async fn round_tx_decodes_to_a_valid_bitcoin_transaction() {
     // Round-trip the hex through bitcoin's deserializer. If it
     // parses, the consensus encoding is sound.
     let tx: bitcoin::Transaction = deserialize_hex(tx_hex).expect("valid consensus encoding");
-    // 5 inputs, 5 mixed + 5 change + 1 service-fee = 11 outputs.
-    // No marker output: the `WL01` OP_RETURN was removed in #695.
+    // 5 inputs, 5 mixed + 1 service-fee = 6 outputs. No change outputs
+    // (#698) and no marker output (#695) — every output is either one of
+    // the five equal mixed outputs or the single fee.
     assert_eq!(tx.input.len(), 5);
-    assert_eq!(tx.output.len(), 11);
+    assert_eq!(tx.output.len(), 6);
     assert!(
         !tx.output.iter().any(|o| o.script_pubkey.is_op_return()),
         "round tx must carry no OP_RETURN marker (#695)"
@@ -2849,7 +2904,7 @@ async fn inputs_rejects_a_banned_outpoint() {
                 0,
                 0x00,
                 0,
-                MIN_INPUT_100K_MIX,
+                EXACT_INPUT_100K_MIX,
                 None,
             ),
         ))
@@ -2889,7 +2944,7 @@ async fn a_banned_outpoint_is_accepted_again_once_its_cooldown_passes() {
                 0,
                 0x00,
                 0,
-                MIN_INPUT_100K_MIX,
+                EXACT_INPUT_100K_MIX,
                 None,
             ),
         ))

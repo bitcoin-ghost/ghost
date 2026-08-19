@@ -24,6 +24,9 @@ use wraith_wallet_core::wraith::{
 
 const TIER_ID: &str = "100k_sats";
 const TIER_DENOM: u64 = 100_000;
+/// The exact input a 100k-tier Mix seat costs. Rounds have no change output
+/// (#698), so a participant brings this to the satoshi or is refused.
+const SEAT_PRICE: u64 = 101_596;
 const N: usize = 5;
 
 /// Generate the i-th deterministic signet P2WPKH address. Same scheme
@@ -89,7 +92,7 @@ fn participant_utxos() -> MockUtxoSource {
                 txid: bitcoin::Txid::from_str(&"11".repeat(32)).unwrap(),
                 vout: i as u32,
             },
-            200_000,
+            SEAT_PRICE,
             participant_address(i as u8).script_pubkey(),
         );
     }
@@ -133,7 +136,7 @@ async fn five_wallets_complete_a_full_mix_round() {
             let utxo = ParticipantUtxo {
                 txid: "11".repeat(32),
                 vout: i as u32,
-                value_sats: 200_000,
+                value_sats: SEAT_PRICE,
                 scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
             };
             let req = MixRequest {
@@ -319,7 +322,7 @@ async fn prepare_then_submit_works_via_split_api() {
                 utxo: ParticipantUtxo {
                     txid: "11".repeat(32),
                     vout: i as u32,
-                    value_sats: 200_000,
+                    value_sats: SEAT_PRICE,
                     scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
                 },
                 change_address: Some(signet_addr(50 + i as u8)),
@@ -430,7 +433,7 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                     txid: bitcoin::Txid::from_str(&format!("{:02x}", i + 1).repeat(32)).unwrap(),
                     vout: 0,
                 },
-                200_000,
+                SEAT_PRICE,
                 addr.script_pubkey(),
             );
         }
@@ -472,7 +475,7 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                 utxo: ParticipantUtxo {
                     txid: format!("{:02x}", i + 1).repeat(32),
                     vout: 0,
-                    value_sats: 200_000,
+                    value_sats: SEAT_PRICE,
                     scriptpubkey_hex: my_spk_hex,
                 },
                 change_address: Some(change_addr.to_string()),

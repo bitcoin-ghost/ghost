@@ -174,7 +174,6 @@ pub async fn get(
 fn kind_str(k: LiteOutputKind) -> &'static str {
     match k {
         LiteOutputKind::Mixed => "mixed",
-        LiteOutputKind::Change => "change",
         LiteOutputKind::ServiceFee => "service_fee",
     }
 }

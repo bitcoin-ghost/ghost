@@ -17,17 +17,14 @@ use serde::{Deserialize, Serialize};
 
 /// One participant's accepted commit-phase submission. Records exactly
 /// the fields the coordinator needs to build the round transaction in
-/// `/sign` — txid + vout + value + spending script for the input, plus
-/// the change address (None when the input is exact change).
+/// `/sign` — txid + vout + value + spending script for the input. There
+/// is no change address: a round input is exact (#698).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedInputs {
     /// Wallet's per-round identity (matches `LiteSessionParticipant.ghost_id`).
     pub ghost_id: String,
     /// The participant's single input UTXO.
     pub input: TxInputRef,
-    /// Where surplus over (denom + fee shares) goes. `None` is only
-    /// legal when surplus < dust threshold; the handler enforces this.
-    pub change_address: Option<String>,
     /// Unix-seconds the submission was accepted by the coordinator.
     /// Used for diagnostic / audit logging; the round-tx itself has no
     /// per-input timestamp.

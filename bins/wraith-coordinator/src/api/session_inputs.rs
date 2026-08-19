@@ -32,10 +32,11 @@
 //!   registering the same coin builds a transaction with duplicate
 //!   inputs, which cannot broadcast — killing the round at broadcast,
 //!   where the no-sign deadline cannot catch the disruptor.
-//! - Input arithmetic: chain value ≥ denom + per-participant
-//!   service share + per-participant mining share. Surplus over that
-//!   total goes to the change output; if the surplus is ≥ dust, a
-//!   change address is required.
+//! - **Exact input** (#698): chain value == denom + per-participant service
+//!   share + per-participant mining share, to the satoshi. Rounds have no
+//!   change output — one would be linkable to the participant who produced
+//!   it — so a surplus has nowhere to go and is refused rather than
+//!   silently donated to miners.
 //! - Idempotent acceptance: submitting again with the same `ghost_id`
 //!   replaces the previous record (covers wallet retries).
 //! - Locked → Signing transition once all enrolled have submitted.
@@ -65,7 +66,7 @@ use bitcoin::Address;
 
 use wraith_protocol::{
     ownership_challenge, per_participant_mining_share, LiteSession, LiteSessionState, SessionType,
-    CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
+    DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 /// No-sign deadline for the Signing phase, in seconds. From the moment
@@ -86,10 +87,6 @@ use crate::utxo_source::parse_outpoint;
 pub struct Request {
     pub ghost_id: String,
     pub input: TxInputRef,
-    /// Optional change address. Required when input value exceeds
-    /// (denom + fee shares) by ≥ dust threshold.
-    #[serde(default)]
-    pub change_address: Option<String>,
     /// BIP-322 simple signature over `ownership_challenge(session_id,
     /// txid, vout)`, base64-encoded exactly as the BIP specifies —
     /// proof that the submitter controls the coin it is registering
@@ -327,33 +324,36 @@ pub async fn post(
         );
     }
 
-    // 7. Validate input arithmetic. Compute per-participant fee shares
-    //    against the tier; reject inputs below the minimum or with
-    //    surplus-over-dust missing a change address.
-    let min_input = match minimum_participant_input(&session, &state) {
+    // 7. The input must be worth exactly what a round seat costs.
+    //
+    //    Not "at least". A round has no change output, because a change
+    //    output is linkable: it pays back to an address the participant
+    //    controls, in an amount derived from their own input, in the same
+    //    transaction as their mixed output — handing an observer the
+    //    association the round exists to break (#698). So a surplus has
+    //    nowhere to go, and refusing is the only honest answer: silently
+    //    donating it to miners would take a participant's money without
+    //    telling them.
+    //
+    //    A wallet whose coin is not already exact makes a preparatory split
+    //    first. That transaction is visible and marks them as preparing to
+    //    mix, which is a stated cost — and a smaller one than carrying the
+    //    link into the round, because it does not reveal which output of
+    //    the round is theirs.
+    let required = match required_participant_input(&session, &state) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
 
-    if chain_utxo.value_sats < min_input {
+    if chain_utxo.value_sats != required {
         return error(
             StatusCode::BAD_REQUEST,
-            "insufficient_input",
+            "input_not_exact",
             format!(
-                "input {} sats < required {} sats (denom + fee shares)",
-                chain_utxo.value_sats, min_input
-            ),
-        );
-    }
-
-    let surplus = chain_utxo.value_sats - min_input;
-    if surplus >= CHANGE_DUST_THRESHOLD_SATS && req.change_address.is_none() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "missing_change_address",
-            format!(
-                "input has {} sats surplus over minimum; change_address required",
-                surplus
+                "input is {} sats; a round seat costs exactly {} sats \
+                 (denomination + fee shares). Split the coin first: rounds have no \
+                 change output, because a change output would identify you.",
+                chain_utxo.value_sats, required
             ),
         );
     }
@@ -363,7 +363,6 @@ pub async fn post(
     let accepted = AcceptedInputs {
         ghost_id: req.ghost_id.clone(),
         input: req.input.clone(),
-        change_address: req.change_address.clone(),
         accepted_at: now,
     };
     let (submitted_count, enrolled_count) = {
@@ -444,22 +443,16 @@ pub async fn post(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// Compute the minimum acceptable per-participant input for the round
-/// described by `session`. Mirrors `LiteRoundBuilder::min_participant_input`
-/// without instantiating a builder — keeps the validation path
-/// allocation-free and avoids needing the coordinator_fee_address for
-/// Mix rounds at /inputs time.
+/// The exact input a participant must bring: denomination + mining-fee
+/// share + service-fee share. Rounds have no change output (#698), so this
+/// is a single acceptable value rather than a floor.
 ///
-/// Returns either the minimum sat value or a pre-built error response
-/// for the conditions the caller can't recover from (Mix round with no
-/// fee address configured — the round can't be built later, so we fail
-/// the input now).
 // `Err = axum::http::Response` is the idiomatic axum early-return: the helper hands back the
 // exact response the caller should send. Boxing it to satisfy result_large_err would make
 // every call site unwrap a Box to return a Response, which is worse code for 128 bytes on a
 // path that is already building an HTTP response.
 #[allow(clippy::result_large_err)]
-fn minimum_participant_input(
+fn required_participant_input(
     session: &LiteSession,
     state: &CoordinatorState,
 ) -> Result<u64, Response> {
