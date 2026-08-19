@@ -12,11 +12,11 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_glyph::{GhostGlyph, GLYPH_SIZE};
 use ghost_storage::Database;
 
+use ghost_consensus::broadcast::BroadcastFn;
 use ghost_consensus::mesh::MessageHandler;
 use ghost_consensus::message::{
     GhostGlyphClaimMessage, GhostGlyphRegisteredMessage, MessageEnvelope, MessageType,
 };
-use ghost_consensus::vote_handler::BroadcastFn;
 
 /// Maximum ghost_id length (bech32m addresses are typically ~62-90 chars).
 const MAX_GHOST_ID_LEN: usize = 128;

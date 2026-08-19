@@ -189,7 +189,7 @@ const RATE_LIMIT_MAX_TOKENS: u32 = 10;
 const RATE_LIMIT_REFILL_RATE: u32 = 2; // 2 per second
 
 /// Callback for broadcasting MPC messages to the network
-pub type MpcBroadcastFn = Arc<dyn Fn(MessageType, Vec<u8>) -> GhostResult<()> + Send + Sync>;
+pub use crate::broadcast::BroadcastFn as MpcBroadcastFn;
 
 /// Callback invoked when parameters are updated.
 /// Arguments: (new_params_hash, contributor_node_id)

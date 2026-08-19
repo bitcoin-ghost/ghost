@@ -38,6 +38,7 @@
 #![deny(unreachable_pub)]
 
 pub mod ban_manager;
+pub mod broadcast;
 pub mod discovery_handler;
 pub mod epoch;
 #[cfg(feature = "zk-consensus")]
