@@ -20,6 +20,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use bip39::{Language, Mnemonic};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::{Zeroize, Zeroizing};
@@ -44,6 +45,11 @@ pub enum KeystoreError {
     Bip39(String),
     #[error("bip32 derivation error: {0}")]
     Bip32(String),
+    /// The OS random source could not be read. Fails closed: a wallet is
+    /// never created, and a keystore is never written, from randomness we
+    /// could not obtain (master spec §6A E-1/E-5).
+    #[error("OS random source unavailable: {0}")]
+    Rng(String),
 }
 
 /// In-memory unlocked wallet seed. Mnemonic is zeroized on drop.
@@ -54,9 +60,19 @@ pub struct Keystore {
 impl Keystore {
     /// Generate a new wallet with a fresh 24-word BIP39 mnemonic.
     /// Returns the keystore and the mnemonic string (display once at create time).
+    ///
+    /// Entropy comes straight from the OS source. Master spec §6A rule E-1
+    /// requires it for wallet seeds specifically, and forbids seeded PRNGs —
+    /// `thread_rng()` is one (ChaCha12 seeded from the OS), and while its
+    /// 256-bit seed makes it sound in practice, seed generation running
+    /// through a userspace PRNG instead of the OS source is precisely where
+    /// the Coldcard downgrade hid for five years. There is nothing to gain
+    /// from the indirection on a once-per-wallet call.
     pub fn create() -> Result<(Self, String), KeystoreError> {
         let mut entropy = [0u8; 32]; // 256 bits → 24 words
-        rand::thread_rng().fill_bytes(&mut entropy);
+        OsRng
+            .try_fill_bytes(&mut entropy)
+            .map_err(|e| KeystoreError::Rng(e.to_string()))?;
         let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
             .map_err(|e| KeystoreError::Bip39(e.to_string()))?;
         let words = mnemonic.to_string();
@@ -83,8 +99,12 @@ impl Keystore {
     pub fn save(&self, path: &Path, passphrase: &SecretString) -> Result<(), KeystoreError> {
         let mut salt = [0u8; SALT_LEN];
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        OsRng
+            .try_fill_bytes(&mut salt)
+            .map_err(|e| KeystoreError::Rng(e.to_string()))?;
+        OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .map_err(|e| KeystoreError::Rng(e.to_string()))?;
 
         let key = derive_key(passphrase, &salt)?;
         let cipher = Aes256Gcm::new_from_slice(&key.0)
