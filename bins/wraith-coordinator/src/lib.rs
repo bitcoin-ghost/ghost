@@ -19,8 +19,10 @@ pub mod gossip_auth;
 pub mod gossip_http;
 pub mod inputs;
 pub mod outputs;
+pub mod rpc;
 pub mod state;
 pub mod tick;
+pub mod utxo_source;
 pub mod witnesses;
 
 pub use state::CoordinatorState;

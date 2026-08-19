@@ -12,6 +12,7 @@ use axum::{
 use bitcoin::Network;
 use tower::ServiceExt;
 use wraith_coordinator::broadcaster::{Broadcaster, StubBroadcaster};
+use wraith_coordinator::utxo_source::MockUtxoSource;
 use wraith_coordinator::{build_router, CoordinatorState};
 use wraith_protocol::{DeterministicSessionIdGenerator, MockBondLedger, MockClock};
 
@@ -69,7 +70,9 @@ fn deterministic_router(
     Arc<MockBondLedger>,
     StubBroadcaster,
 ) {
-    deterministic_router_full(initial_unix, true, true, true)
+    let (router, state, ledger, stub, _utxos) =
+        deterministic_router_full(initial_unix, true, true, true);
+    (router, state, ledger, stub)
 }
 
 /// Variant that lets tests opt out of the bond ledger (503 path), the
@@ -85,6 +88,7 @@ fn deterministic_router_full(
     Arc<CoordinatorState>,
     Arc<MockBondLedger>,
     StubBroadcaster,
+    MockUtxoSource,
 ) {
     // Always construct a ledger Arc so the test helper can return it;
     // when `install_ledger == false` the state simply doesn't hold a
@@ -101,15 +105,68 @@ fn deterministic_router_full(
     } else {
         None
     };
-    let state = Arc::new(CoordinatorState::with_components(
-        Network::Signet,
-        Arc::new(MockClock::new(initial_unix)),
-        Arc::new(DeterministicSessionIdGenerator::new()),
-        bond_ledger,
-        install_fee_address.then(|| TEST_FEE_ADDRESS.to_string()),
-        broadcaster,
-    ));
-    (build_router(state.clone()), state, ledger, stub)
+    // Registration reads the input from the chain, not from the
+    // request (#699), so every router needs a UTXO source. This one is
+    // preloaded with exactly the outpoints the `make_*` helpers
+    // register; a test that claims some other value must add its own
+    // entry via `deterministic_router_with_utxos`.
+    let utxos = fixture_utxo_source();
+
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(MockClock::new(initial_unix)),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            bond_ledger,
+            install_fee_address.then(|| TEST_FEE_ADDRESS.to_string()),
+            broadcaster,
+        )
+        .with_utxo_source(Arc::new(utxos.clone())),
+    );
+    (build_router(state.clone()), state, ledger, stub, utxos)
+}
+
+/// A UTXO source holding exactly the outpoints the `make_*` helpers
+/// register. Any test that claims a different value must add its own
+/// entry.
+fn fixture_utxo_source() -> MockUtxoSource {
+    let utxos = MockUtxoSource::new();
+    for vout in 0..MIN_5 as u32 {
+        utxos.insert(fixture_outpoint(0x11, vout), 200_000, fixture_spk());
+    }
+    utxos.insert(fixture_outpoint(0x00, 0), MIN_INPUT_100K_MIX, fixture_spk());
+    utxos
+}
+
+/// The scriptPubKey every input fixture uses. Registration compares the
+/// claim against the chain, so the two must agree — this is the single
+/// place that decides what both say.
+fn fixture_spk() -> bitcoin::ScriptBuf {
+    bitcoin::ScriptBuf::from_hex(FIXTURE_SPK_HEX).expect("valid fixture script")
+}
+
+/// `<byte repeated 32 times>:vout` — the shape every input fixture uses.
+fn fixture_outpoint(txid_byte: u8, vout: u32) -> bitcoin::OutPoint {
+    use std::str::FromStr;
+    bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_str(&format!("{txid_byte:02x}").repeat(32))
+            .expect("valid fixture txid"),
+        vout,
+    }
+}
+
+/// Router plus its UTXO source, for tests that register an input the
+/// preloaded set doesn't cover.
+fn deterministic_router_with_utxos(
+    initial_unix: u64,
+) -> (
+    axum::Router,
+    Arc<CoordinatorState>,
+    Arc<MockBondLedger>,
+    StubBroadcaster,
+    MockUtxoSource,
+) {
+    deterministic_router_full(initial_unix, true, true, true)
 }
 
 /// Build a JSON POST request — small ergonomics helper for the
@@ -545,6 +602,11 @@ const MIN_5: usize = 5;
 /// = 100_000 + 500 + 1612 = 102_112. Same number the handler computes.
 const MIN_INPUT_100K_MIX: u64 = 102_112;
 
+/// scriptPubKey shared by every input fixture. Nonsense as a script,
+/// but valid hex — registration only compares it to what the chain
+/// reports, and the mock reports this.
+const FIXTURE_SPK_HEX: &str = "deadbeef";
+
 /// Drive 5 wallets through /find_or_create, escrow a bond per wallet,
 /// then advance the clock past the fill window so the registry's tick
 /// transitions Filling → Locked. Returns the session_id.
@@ -606,7 +668,7 @@ async fn make_locked_session(
 async fn inputs_returns_503_when_bond_ledger_not_configured() {
     // No ledger configured; even submitting against an existing locked
     // session fails fast with a clear error.
-    let (router, state, _unused_ledger, _broadcaster) =
+    let (router, state, _unused_ledger, _broadcaster, _utxos) =
         deterministic_router_full(1_000_000, false, true, true);
     // Manually create a locked session via gossip — same shortcut
     // make_locked_session uses, but inline because no real bond
@@ -773,10 +835,224 @@ async fn inputs_returns_402_when_bond_missing_in_ledger() {
     assert_eq!(json["error"], "bond_not_found");
 }
 
+/// Registration must refuse rather than fall back to trusting the
+/// wallet's own account of its input (#699).
+#[tokio::test]
+async fn inputs_returns_503_when_no_utxo_source_is_configured() {
+    let ledger = Arc::new(MockBondLedger::new());
+    let state = Arc::new(CoordinatorState::with_components(
+        Network::Signet,
+        Arc::new(MockClock::new(1_000_000)),
+        Arc::new(DeterministicSessionIdGenerator::new()),
+        Some(ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
+        Some(TEST_FEE_ADDRESS.to_string()),
+        Some(Arc::new(StubBroadcaster::new())),
+    ));
+    let router = build_router(state.clone());
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "utxo_source_not_configured");
+}
+
+/// An outpoint that is not in the UTXO set — never existed, or already
+/// spent. Both answer the same way on purpose: distinguishing them
+/// would answer a question about the chain the submitter did not ask.
+#[tokio::test]
+async fn inputs_rejects_an_outpoint_that_is_not_unspent() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.remove(&fixture_outpoint(0x00, 0));
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "utxo_not_found");
+}
+
+/// The chain decides what an input is worth. A wallet claiming
+/// otherwise is refused rather than silently corrected, so a stale
+/// wallet learns it is stale instead of having its arithmetic changed
+/// underneath it.
+#[tokio::test]
+async fn inputs_rejects_a_value_the_chain_disagrees_with() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 150_000, fixture_spk());
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    // Claims nearly seven times what the chain holds.
+                    "value_sats": 1_000_000,
+                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                },
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "value_mismatch");
+}
+
+/// The scriptPubKey matters more than the value: it is what an
+/// ownership proof will be checked against, so a submitter must not be
+/// able to name a script it chose for a coin it does not control.
+#[tokio::test]
+async fn inputs_rejects_a_scriptpubkey_the_chain_disagrees_with() {
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        MIN_INPUT_100K_MIX,
+        bitcoin::ScriptBuf::from_hex("0014aabbccddeeff00112233445566778899aabbccdd").unwrap(),
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    // A script the submitter controls, for a coin it does not.
+                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "scriptpubkey_mismatch");
+}
+
+/// An unconfirmed input can be replaced out from under the round by its
+/// own parent, invalidating the transaction after everyone has signed.
+#[tokio::test]
+async fn inputs_rejects_an_unconfirmed_input() {
+    use wraith_coordinator::utxo_source::Utxo;
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert_utxo(
+        fixture_outpoint(0x00, 0),
+        Utxo {
+            value_sats: MIN_INPUT_100K_MIX,
+            script_pubkey: fixture_spk(),
+            confirmations: 0,
+            coinbase: false,
+        },
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "input_unconfirmed");
+}
+
+/// A coinbase output is unspendable until 100 confirmations, so a round
+/// built on an immature one cannot broadcast.
+#[tokio::test]
+async fn inputs_rejects_an_immature_coinbase() {
+    use wraith_coordinator::utxo_source::Utxo;
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert_utxo(
+        fixture_outpoint(0x00, 0),
+        Utxo {
+            value_sats: MIN_INPUT_100K_MIX,
+            script_pubkey: fixture_spk(),
+            confirmations: 99,
+            coinbase: true,
+        },
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": MIN_INPUT_100K_MIX,
+                    "scriptpubkey_hex": FIXTURE_SPK_HEX,
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "immature_coinbase");
+}
+
 #[tokio::test]
 async fn inputs_rejects_input_below_minimum_with_400() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    // The chain says this outpoint really is worth 1,000 sats, so the
+    // refusal is about the tier minimum and not about a stale claim.
+    utxos.insert(fixture_outpoint(0x00, 0), 1_000, fixture_spk());
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
@@ -801,8 +1077,9 @@ async fn inputs_rejects_input_below_minimum_with_400() {
 
 #[tokio::test]
 async fn inputs_rejects_surplus_above_dust_without_change_address() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
@@ -895,16 +1172,22 @@ async fn inputs_advances_session_to_signing_when_all_submit() {
 async fn inputs_idempotent_on_resubmission() {
     // Wallet retries with a different input; the latest submission
     // wins and the count doesn't double-up.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
+    //
+    // The retry names a *different coin* rather than a different value
+    // for the same one: value comes from the chain now, so re-pricing
+    // one outpoint is a stale claim, not a retry.
+    let (router, state, ledger, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
     let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    let body = |sats: u64| {
+    utxos.insert(fixture_outpoint(0x00, 0), 200_000, fixture_spk());
+    utxos.insert(fixture_outpoint(0x22, 0), 300_000, fixture_spk());
+    let body = |txid_byte: u8, sats: u64| {
         serde_json::json!({
             "ghost_id": "wallet-0",
             "input": {
-                "txid": "00".repeat(32),
+                "txid": format!("{txid_byte:02x}").repeat(32),
                 "vout": 0,
                 "value_sats": sats,
-                "scriptpubkey_hex": "deadbeef",
+                "scriptpubkey_hex": FIXTURE_SPK_HEX,
             },
             "change_address": TEST_FEE_ADDRESS,
         })
@@ -913,7 +1196,7 @@ async fn inputs_idempotent_on_resubmission() {
         .clone()
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            body(200_000),
+            body(0x00, 200_000),
         ))
         .await
         .unwrap();
@@ -925,7 +1208,7 @@ async fn inputs_idempotent_on_resubmission() {
     let second = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            body(300_000),
+            body(0x22, 300_000),
         ))
         .await
         .unwrap();
@@ -2032,7 +2315,8 @@ async fn witness_returns_400_when_input_index_does_not_match_ghost_id() {
 async fn witness_returns_503_on_final_submission_when_broadcaster_missing() {
     // Ledger + fee address installed; broadcaster NOT installed.
     // The final witness submission tries to broadcast and fails.
-    let (router, state, ledger, _stub) = deterministic_router_full(1_000_000, true, true, false);
+    let (router, state, ledger, _stub, _utxos) =
+        deterministic_router_full(1_000_000, true, true, false);
     let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
     for i in 0..MIN_5 {
         let idx = find_input_index(&state, &session_id, &format!("wallet-{i}"));
@@ -2271,14 +2555,17 @@ async fn bonds_refund_coordinator_aborted_when_witness_merge_fails() {
     let rejecting = Arc::new(RejectingBroadcaster(StdMutex::new(0)));
     let mock_clock = Arc::new(MockClock::new(1_000_000));
     let fresh_ledger = Arc::new(MockBondLedger::new());
-    let fresh_state = Arc::new(CoordinatorState::with_components(
-        Network::Signet,
-        mock_clock.clone(),
-        Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(fresh_ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
-        Some(TEST_FEE_ADDRESS.to_string()),
-        Some(rejecting.clone() as Arc<dyn Broadcaster>),
-    ));
+    let fresh_state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            mock_clock.clone(),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(fresh_ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            Some(rejecting.clone() as Arc<dyn Broadcaster>),
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source())),
+    );
     let fresh_router = build_router(fresh_state.clone());
     let (fresh_sid, _) =
         make_assembled_session(fresh_router.clone(), &fresh_state, &fresh_ledger).await;
@@ -2343,14 +2630,17 @@ async fn deadline_test_setup(
 ) {
     let mock_clock = Arc::new(MockClock::new(initial_unix));
     let ledger = Arc::new(MockBondLedger::new());
-    let state = Arc::new(CoordinatorState::with_components(
-        Network::Signet,
-        mock_clock.clone(),
-        Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
-        Some(TEST_FEE_ADDRESS.to_string()),
-        Some(Arc::new(StubBroadcaster::new())),
-    ));
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            mock_clock.clone(),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            Some(Arc::new(StubBroadcaster::new())),
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source())),
+    );
     let router = build_router(state.clone());
     (router, state, ledger, mock_clock)
 }

@@ -53,6 +53,8 @@ use tracing::{info, warn};
 
 use wraith_coordinator::bond_ledger_http::GhostPayBondLedger;
 use wraith_coordinator::broadcaster::{Broadcaster, GhostdBroadcaster, StubBroadcaster};
+use wraith_coordinator::rpc::RpcClient;
+use wraith_coordinator::utxo_source::{GhostdUtxoSource, UtxoSource};
 use wraith_coordinator::{build_router, CoordinatorState};
 use wraith_protocol::{BondLedger, MockBondLedger};
 
@@ -251,37 +253,61 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Broadcaster: mock OR bitcoind, never both. Both absent → /witness
-    // returns 503 broadcaster_not_configured on the round-completing
-    // submission (same as before phase D landed).
-    if cli.mock_broadcaster && cli.ghostd_url.is_some() {
-        anyhow::bail!("--mock-broadcaster and --ghostd-url are mutually exclusive; pick one.");
-    }
+    // One node connection, two jobs: `sendrawtransaction` for the
+    // broadcaster and `gettxout` for input verification (#699). Built
+    // once and shared, so an operator who can broadcast can also verify
+    // inputs with no second set of credentials to get wrong.
+    let rpc = match cli.ghostd_url.as_deref() {
+        None => None,
+        Some(url) => Some(
+            match (
+                cli.ghostd_cookie.as_ref(),
+                cli.ghostd_user.as_deref(),
+                cli.ghostd_pass.as_deref(),
+            ) {
+                (Some(cookie), None, None) => RpcClient::from_cookie(url, cookie)
+                    .map_err(|e| anyhow::anyhow!("bitcoind RPC: {e}"))?,
+                (None, Some(u), Some(p)) => RpcClient::new(url, u, p),
+                (None, None, None) => anyhow::bail!(
+                    "--ghostd-url requires either --ghostd-cookie or \
+                     --ghostd-user + --ghostd-pass for authentication"
+                ),
+                _ => anyhow::bail!(
+                    "--ghostd-cookie is mutually exclusive with \
+                     --ghostd-user / --ghostd-pass"
+                ),
+            },
+        ),
+    };
+
+    // The UTXO source is not optional in effect: without it `/inputs`
+    // refuses every submission, because registration must never fall
+    // back to believing a wallet's account of its own input.
+    let utxo_source: Option<Arc<dyn UtxoSource>> = match rpc.as_ref() {
+        Some(rpc) => Some(Arc::new(GhostdUtxoSource::new(rpc.clone()))),
+        None => {
+            warn!(
+                "no --ghostd-url: /inputs will refuse every submission with \
+                 utxo_source_not_configured, because input UTXOs cannot be verified"
+            );
+            None
+        }
+    };
+
+    // Broadcaster: mock OR bitcoind. Both absent → /witness returns 503
+    // broadcaster_not_configured on the round-completing submission.
+    //
+    // `--mock-broadcaster` alongside `--ghostd-url` is allowed and
+    // useful: a dev stack wants inputs verified against a real node
+    // without putting its practice rounds on the network.
     let broadcaster: Option<Arc<dyn Broadcaster>> = if cli.mock_broadcaster {
         warn!("using StubBroadcaster — round transactions are NOT actually broadcast");
         Some(Arc::new(StubBroadcaster::new()))
-    } else if let Some(url) = cli.ghostd_url.as_deref() {
-        let bb = match (
-            cli.ghostd_cookie.as_ref(),
-            cli.ghostd_user.as_deref(),
-            cli.ghostd_pass.as_deref(),
-        ) {
-            (Some(cookie), None, None) => GhostdBroadcaster::from_cookie(url, cookie),
-            (None, Some(u), Some(p)) => GhostdBroadcaster::new(url, u, p),
-            (None, None, None) => anyhow::bail!(
-                "--ghostd-url requires either --ghostd-cookie or \
-                 --ghostd-user + --ghostd-pass for authentication"
-            ),
-            _ => anyhow::bail!(
-                "--ghostd-cookie is mutually exclusive with \
-                 --ghostd-user / --ghostd-pass"
-            ),
-        }
-        .map_err(|e| anyhow::anyhow!("bitcoind broadcaster: {e}"))?;
-        info!(endpoint = %url, "using GhostdBroadcaster");
-        Some(Arc::new(bb))
     } else {
-        None
+        rpc.map(|rpc| {
+            info!(endpoint = %rpc.endpoint(), "using GhostdBroadcaster");
+            Arc::new(GhostdBroadcaster::from_rpc(rpc)) as Arc<dyn Broadcaster>
+        })
     };
 
     // Mainnet refusal: if the operator configured peers without a
@@ -322,6 +348,7 @@ async fn main() -> Result<()> {
         cli.fee_address.clone(),
         broadcaster,
     );
+    state.utxo_source = utxo_source;
     state.gossip_peer_secret = cli.peer_secret.clone();
     if let Some(secs) = cli.fill_window_secs {
         state.fill_window_secs = secs;

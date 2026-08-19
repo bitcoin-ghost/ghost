@@ -20,6 +20,7 @@ use crate::assembly::AssembledRound;
 use crate::broadcaster::Broadcaster;
 use crate::inputs::AcceptedInputs;
 use crate::outputs::AcceptedOutput;
+use crate::utxo_source::UtxoSource;
 use crate::witnesses::AcceptedWitness;
 
 /// One Schnorr blind-signature signer per active round, lazily created
@@ -51,6 +52,11 @@ pub struct CoordinatorState {
     /// `503 ledger_not_configured` while this is None — the binary boots
     /// fine without it but won't accept commit-phase submissions.
     pub bond_ledger: Option<Arc<dyn BondLedger>>,
+    /// UTXO-set lookup. `None` until an operator configures a node
+    /// connection; `/inputs` returns `503 utxo_source_not_configured`
+    /// while it is, because registration must never fall back to
+    /// trusting the wallet's own account of its input (#699).
+    pub utxo_source: Option<Arc<dyn UtxoSource>>,
     /// Coordinator's fee-collection address. Used as the destination for
     /// the per-Mix-round service-fee output. `None` until the operator
     /// supplies one (CLI flag / config). `/inputs` returns
@@ -151,6 +157,7 @@ impl CoordinatorState {
             clock,
             id_gen,
             bond_ledger,
+            utxo_source: None,
             coordinator_fee_address,
             inputs_store: Mutex::new(HashMap::new()),
             outputs_store: Mutex::new(HashMap::new()),
@@ -163,6 +170,14 @@ impl CoordinatorState {
             started_at,
             fill_window_secs: wraith_protocol::LITE_FILL_WINDOW_SECS,
         }
+    }
+
+    /// Attach a UTXO source. Separate from `with_components` because it
+    /// is the seventh knob and the positional list is already long —
+    /// callers chain it: `with_components(..).with_utxo_source(src)`.
+    pub fn with_utxo_source(mut self, source: Arc<dyn UtxoSource>) -> Self {
+        self.utxo_source = Some(source);
+        self
     }
 
     /// Get-or-create the per-round signer. Idempotent under concurrent

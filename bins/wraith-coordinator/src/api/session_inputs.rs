@@ -13,7 +13,15 @@
 //!   ledger configured, the endpoint returns 503 — see
 //!   `CoordinatorState::bond_ledger`.
 //! - Identity check: `ghost_id` must already be enrolled on the session.
-//! - Input arithmetic: `input.value_sats` ≥ denom + per-participant
+//! - **Chain check** (#699): the outpoint must be an unspent, confirmed,
+//!   mature output whose value and scriptPubKey match what the
+//!   submission claims. Everything in `TxInputRef` is wallet-asserted,
+//!   so without this the round's arithmetic is computed from a number
+//!   the participant chose, and any later ownership proof is worthless —
+//!   a signature over a wallet-supplied script says nothing about the
+//!   real outpoint. Without a source configured, the endpoint returns
+//!   503 rather than falling back to trust.
+//! - Input arithmetic: chain value ≥ denom + per-participant
 //!   service share + per-participant mining share. Surplus over that
 //!   total goes to the change output; if the surplus is ≥ dust, a
 //!   change address is required.
@@ -41,6 +49,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use bitcoin::constants::COINBASE_MATURITY;
+
 use wraith_protocol::{
     per_participant_mining_share, BondError, LiteSession, LiteSessionState, SessionType,
     CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
@@ -58,6 +68,7 @@ pub const WITNESS_DEADLINE_SECS: u64 = 600;
 
 use crate::inputs::{AcceptedInputs, TxInputRef};
 use crate::state::CoordinatorState;
+use crate::utxo_source::parse_outpoint;
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -97,6 +108,20 @@ pub async fn post(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ledger_not_configured",
                 "bond ledger backend is not yet wired (phase C)".into(),
+            );
+        }
+    };
+
+    // 1b. A UTXO source is equally non-optional. Without one the
+    //     coordinator would have to take the participant's word for
+    //     what its own input is, which is what #699 exists to stop.
+    let utxo_source = match state.utxo_source.as_ref() {
+        Some(u) => u.clone(),
+        None => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "utxo_source_not_configured",
+                "no UTXO source is configured; registration cannot verify inputs".into(),
             );
         }
     };
@@ -209,7 +234,87 @@ pub async fn post(
     // the L2 escrow. No cross-check on the participant record's
     // bond_id is meaningful here.
 
-    // 6. Validate input arithmetic. Compute per-participant fee shares
+    // 6. Check the input against the chain.
+    //
+    //    Everything in `req.input` is wallet-asserted. Until this
+    //    existed the coordinator believed all of it, so the round
+    //    arithmetic was computed from a number the participant chose and
+    //    the input might have been spent, or never have existed. One
+    //    `gettxout` settles existence, value, scriptPubKey and
+    //    unspent-ness together (#699).
+    let outpoint = match parse_outpoint(&req.input.txid, req.input.vout) {
+        Ok(o) => o,
+        Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_outpoint", detail),
+    };
+    let chain_utxo = match utxo_source.get_utxo(&outpoint) {
+        Ok(Some(u)) => u,
+        // Absent or spent. Deliberately one error for both: saying
+        // which would answer a question about the chain that the
+        // submitter did not ask.
+        Ok(None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "utxo_not_found",
+                format!("{outpoint} is not an unspent output"),
+            );
+        }
+        Err(e) => {
+            warn!(%outpoint, error = %e, "utxo lookup failed");
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "utxo_source_unreachable",
+                e.to_string(),
+            );
+        }
+    };
+
+    // An unconfirmed input can still be replaced out from under the
+    // round by its own parent, which would invalidate the whole
+    // transaction after everyone has signed.
+    if chain_utxo.confirmations == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "input_unconfirmed",
+            format!("{outpoint} is unconfirmed; a round input must be confirmed"),
+        );
+    }
+    if chain_utxo.coinbase && chain_utxo.confirmations < COINBASE_MATURITY {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "immature_coinbase",
+            format!(
+                "{outpoint} is a coinbase output with {} of {} confirmations",
+                chain_utxo.confirmations, COINBASE_MATURITY
+            ),
+        );
+    }
+
+    // The chain is authoritative. A mismatch is refused rather than
+    // silently corrected, so a wallet working from a stale view learns
+    // that it is stale instead of having its arithmetic quietly changed.
+    if chain_utxo.value_sats != req.input.value_sats {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "value_mismatch",
+            format!(
+                "{outpoint} is worth {} sats on-chain; submission claims {}",
+                chain_utxo.value_sats, req.input.value_sats
+            ),
+        );
+    }
+    let claimed_spk = req.input.scriptpubkey_hex.trim();
+    if !claimed_spk.eq_ignore_ascii_case(&chain_utxo.script_pubkey.to_hex_string()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "scriptpubkey_mismatch",
+            format!(
+                "{outpoint} has scriptPubKey {}; submission claims {claimed_spk}",
+                chain_utxo.script_pubkey.to_hex_string()
+            ),
+        );
+    }
+
+    // 7. Validate input arithmetic. Compute per-participant fee shares
     //    against the tier; reject inputs below the minimum or with
     //    surplus-over-dust missing a change address.
     let min_input = match minimum_participant_input(&session, &state) {
@@ -217,18 +322,18 @@ pub async fn post(
         Err(resp) => return resp,
     };
 
-    if req.input.value_sats < min_input {
+    if chain_utxo.value_sats < min_input {
         return error(
             StatusCode::BAD_REQUEST,
             "insufficient_input",
             format!(
                 "input {} sats < required {} sats (denom + fee shares)",
-                req.input.value_sats, min_input
+                chain_utxo.value_sats, min_input
             ),
         );
     }
 
-    let surplus = req.input.value_sats - min_input;
+    let surplus = chain_utxo.value_sats - min_input;
     if surplus >= CHANGE_DUST_THRESHOLD_SATS && req.change_address.is_none() {
         return error(
             StatusCode::BAD_REQUEST,
@@ -240,7 +345,7 @@ pub async fn post(
         );
     }
 
-    // 7. Stash the accepted submission. Idempotent: if this ghost_id
+    // 8. Stash the accepted submission. Idempotent: if this ghost_id
     //    already submitted, the entry is replaced (wallet retry path).
     let accepted = AcceptedInputs {
         ghost_id: req.ghost_id.clone(),
