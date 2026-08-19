@@ -8,7 +8,7 @@
 //! So genesis **converts** a fleet-ratified `PayoutLedgerCheckpoint`; it never recomputes from
 //! local shares. Recomputation is what the checkpoint exists to have already settled — eight
 //! divergent share ledgers would yield eight divergent opening tables, which is precisely the
-//! failure the old design died of. This is the same discipline as [`crate::batch_genesis`], whose
+//! failure the old design died of. This is the same discipline as [`crate::genesis_balances`], whose
 //! `genesis_balances` conversion is reused verbatim rather than re-spelled: two spellings of one
 //! conversion drift apart, and the drift is silent.
 //!
@@ -48,7 +48,7 @@ use std::collections::BTreeMap;
 use ghost_common::share_shard::ShardTable;
 use sha2::{Digest, Sha256};
 
-use crate::batch_genesis::{genesis_balances, GenesisRounding};
+use crate::genesis_balances::{genesis_balances, GenesisRounding};
 
 /// The reserved opening-balance column.
 ///

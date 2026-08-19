@@ -31,10 +31,6 @@
 
 #![deny(unreachable_pub)]
 
-/// Commitments stamped into the coinbase scriptsig (payout identity, node identity).
-pub mod batch_consensus;
-pub mod batch_driver;
-pub mod batch_quarantine;
 pub mod batch_two_phase;
 pub mod circuit_breaker;
 pub mod clock;
@@ -54,8 +50,6 @@ pub mod rpc;
 pub mod sanitize;
 pub mod serde_hex;
 pub mod setup;
-/// Share-batch chain: deterministic core (canonical order, integer fold, state root).
-pub mod share_batch;
 
 /// Proving a share was mined to the node that claims it.
 pub mod share_binding;
@@ -67,6 +61,7 @@ pub mod signer;
 pub mod template_verifier;
 pub mod tls;
 pub mod types;
+pub mod work_fold;
 /// Bitcoin Core ZMQ subscriber. Gated behind the default `zmq` feature: it
 /// depends on the UNIX-only `tmq` crate, so wallet builds targeting Windows
 /// disable it via `default-features = false`.

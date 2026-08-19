@@ -765,22 +765,6 @@ struct Args {
     /// With --ledger-import: report what WOULD change and write nothing.
     #[arg(long)]
     dry_run: bool,
-
-    /// List every node this one has quarantined from the share-batch chain, and exit.
-    #[arg(long)]
-    sbc_quarantined: bool,
-
-    /// Release a node from share-batch-chain quarantine, and exit.
-    ///
-    /// Quarantine is a TERMINAL fault — a peer that proposed a structurally invalid batch is
-    /// excluded from consensus and, by design, never readmits itself. That design is only
-    /// coherent if an operator can actually let it back in, and until this flag existed the
-    /// release function had no caller anywhere: quarantine was a one-way door and the only
-    /// recovery was hand-editing an encrypted database.
-    ///
-    /// Takes the 32-byte node id as hex. `--sbc-quarantined` prints the ids to pass here.
-    #[arg(long, value_name = "NODE_ID_HEX")]
-    sbc_release: Option<String>,
 }
 
 /// Handle `--status`: report what THIS node can establish about itself (B4).
@@ -2592,46 +2576,6 @@ async fn main() -> Result<()> {
     // the same operator. New shares (v41 onward) carry their proof and converge verifiably.
     // SHARE-BATCH-CHAIN QUARANTINE (runs after DB encryption is configured, and exits).
     //
-    // Quarantine is deliberately terminal and deliberately persistent: a peer that proposed a
-    // structurally invalid batch stays out of consensus across restarts until an operator looks
-    // at it. Both halves of that contract need an operator-facing command — without one, the
-    // "operator releases it" half is a comment rather than a behaviour.
-    if args.sbc_quarantined {
-        let quarantined = db.sbc_quarantined()?;
-        if quarantined.is_empty() {
-            println!("No nodes are quarantined from the share-batch chain.");
-        } else {
-            println!(
-                "{} node(s) quarantined from the share-batch chain:",
-                quarantined.len()
-            );
-            for (node_id, reason) in &quarantined {
-                println!("  {}  {}", hex::encode(node_id), reason);
-            }
-            println!("\nRelease one with: ghost-pool --sbc-release <NODE_ID_HEX>");
-        }
-        return Ok(());
-    }
-
-    if let Some(node_hex) = &args.sbc_release {
-        let raw = hex::decode(node_hex.trim())
-            .map_err(|e| anyhow::anyhow!("node id must be hex: {e}"))?;
-        let node_id: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!("node id must be 32 bytes (64 hex chars), got {}", raw.len())
-        })?;
-        if db.sbc_release(node_id)? {
-            println!(
-                "Released {} from share-batch-chain quarantine.",
-                hex::encode(node_id)
-            );
-        } else {
-            println!(
-                "{} was not quarantined; nothing to do.",
-                hex::encode(node_id)
-            );
-        }
-        return Ok(());
-    }
 
     if let Some(path) = &args.ledger_export {
         // STREAMING export. The previous version called `export_unpaid_shares()` (which
@@ -3808,49 +3752,9 @@ async fn main() -> Result<()> {
         .with_diag(compute_ledger_root_diag_fn)
         .with_active_voter_set_fn(active_voter_set_fn.clone()),
     );
-    // WP-5: the share-batch chain, in shadow. Dark unless `pool.share_batch_shadow` is set — see
-    // docs/archive/SHARE_BATCH_CHAIN.md. It computes, folds and persists its own state and pays nobody;
-    // the coinbase still reads the ratified checkpoint until WP-6.
-    //
-    // Constructed here so the share recorder below can hand it what THIS node received. A failure
-    // to load is not fatal to the pool: the shadow chain is an observation, and taking the node
-    // down because an observation could not start would make the safer configuration the riskier
-    // one to deploy.
-    let sbc_chain: Option<Arc<ghost_pool::sbc_shadow::ShadowChain>> =
-        if config.pool.share_batch_shadow {
-            match ghost_pool::sbc_shadow::ShadowChain::load(Arc::clone(&identity), Arc::clone(&db))
-            {
-                Ok(chain) => {
-                    info!("SBC shadow: enabled");
-                    // Bootstrap seq 0 from the ratified checkpoint if the chain has not started.
-                    // Idempotent: a restart RESUMES rather than re-genesising, which would discard
-                    // every batch adopted since. Every node converts the SAME adopted bytes
-                    // independently and must reach the same genesis — see `bootstrap_genesis` for
-                    // why that is safe and why the genesis proposer is zero.
-                    match chain.bootstrap_genesis(
-                        ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT,
-                        chrono::Utc::now().timestamp(),
-                    ) {
-                        Ok(Some(h)) => info!(anchor_height = h, "SBC genesis: chain started"),
-                        Ok(None) => {
-                            debug!("SBC genesis: already started, or nothing ratified to convert")
-                        }
-                        Err(e) => error!(error = %e, "SBC genesis: bootstrap failed"),
-                    }
-                    Some(Arc::new(chain))
-                }
-                Err(e) => {
-                    error!(error = %e, "SBC shadow: could not load — continuing without it");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
     // The network shard (docs/SHARE_SHARD.md). Dark unless `pool.share_shard` is set.
     //
-    // A load failure is deliberately NOT fatal, same as the SBC shadow above: the shard folds and
+    // A load failure is deliberately NOT fatal: the shard folds and
     // persists its own state and pays nobody yet, so taking the pool down because an observation
     // could not start would make the safer configuration the riskier one to deploy.
     //
@@ -3976,16 +3880,16 @@ async fn main() -> Result<()> {
         _ => shard,
     };
 
-    // The share checks in force right now, shared by the SBC handler and §6 sampling.
+    // The share checks in force right now: §6 sampling and the §12.4 evidence audits.
     //
     // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
     // captured it once would keep applying the rules in force when the process started. ONE
     // definition, used by both consumers — a second spelling is how a signer and a verifier
     // drift apart, and here one of them decides who gets publicly accused.
-    let sbc_checks: ghost_pool::sbc_handler::ChecksFn = {
+    let share_checks: ghost_pool::share_checks::ChecksFn = {
         let rm_c = Arc::clone(&round_manager);
         Arc::new(move || {
-            ghost_pool::sbc_checks::NodeBatchChecks::at_height(
+            ghost_pool::share_checks::NodeShareChecks::at_height(
                 rm_c.current_height(),
                 rm_c.addr_bind_activation_round(),
                 rm_c.pow_verify_activation_round(),
@@ -4021,7 +3925,7 @@ async fn main() -> Result<()> {
                 .with_sync_responder(sync_tx)
                 .with_sample_responder(sample_tx)
                 .with_evidence_publisher(evidence_tx)
-                .with_share_checks(Arc::clone(&sbc_checks)),
+                .with_share_checks(Arc::clone(&share_checks)),
         );
         mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
@@ -4360,205 +4264,13 @@ async fn main() -> Result<()> {
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
-    // WP-5: the share-batch chain in shadow. Registered and ticked only when
-    // `pool.share_batch_shadow` is set, so a deployed binary puts no batch traffic on the mesh
-    // until a node is deliberately opted in. See docs/archive/SHARE_BATCH_CHAIN.md.
-    if let Some(ref chain) = sbc_chain {
-        // Same channel-plus-relay shape as the checkpoint path: the handler is synchronous and
-        // must not await a broadcast while holding consensus state.
-        let (sbc_tx, mut sbc_rx) =
-            tokio::sync::mpsc::channel::<(ghost_consensus::MessageType, Vec<u8>)>(256);
-        {
-            let mesh_c = Arc::clone(&mesh);
-            tokio::spawn(async move {
-                while let Some((ty, bytes)) = sbc_rx.recv().await {
-                    match mesh_c.create_envelope_raw(ty, bytes) {
-                        Ok(env) => {
-                            if let Err(e) = mesh_c.broadcast(env).await {
-                                tracing::debug!(error = %e, "SBC broadcast failed");
-                            }
-                        }
-                        Err(e) => tracing::warn!(error = %e, "SBC envelope failed"),
-                    }
-                }
-            });
-        }
-        let sbc_send: ghost_pool::sbc_handler::BroadcastFn = {
-            let tx = sbc_tx.clone();
-            Arc::new(move |ty, bytes| {
-                tx.try_send((ty, bytes)).map_err(|e| {
-                    ghost_common::error::GhostError::P2PMessage(format!("SBC channel: {e}"))
-                })
-            })
-        };
-
-        // The voter set is the SAME scoped query the checkpoint root uses, so the two systems
-        // cannot disagree about who is entitled to vote while both are live.
-        let sbc_voters: ghost_pool::sbc_handler::VoterSetFn = {
-            let chain_c = Arc::clone(chain);
-            Arc::new(move || {
-                // READ FROM THE CHAIN, NOT THE DATABASE.
-                //
-                // This was a live per-node qualification query, and that single fact defeated four
-                // successive mechanisms for proving a sequence had committed. Quorum is
-                // `bft_threshold(view)`, so nodes disagreed on the bar; a commit certificate hashes
-                // the voter set, so it could never match. You cannot prove a quorum over a
-                // membership the two parties do not share.
-                //
-                // Anchoring the query's CUTOFF to consensus data was not enough — identical input
-                // still gave different output, because the query scans local eventually-consistent
-                // tables that are also pruned on each node's own clock. So the query is gone from
-                // the consensus path: membership is seeded at genesis from the ratified payout
-                // checkpoint and carried forward by every batch, with any change a terminal fault.
-                //
-                // It also takes the heaviest synchronous scan off the hot path — `schedule()` ran
-                // it up to three times per message, against the same SQLite already carrying
-                // #554's load.
-                chain_c.voter_ids()
-            })
-        };
-
-        let sbc_handler = Arc::new(ghost_pool::sbc_handler::ShareBatchHandler::new(
-            Arc::clone(chain),
-            Arc::clone(&identity),
-            sbc_send.clone(),
-            sbc_voters.clone(),
-            sbc_checks.clone(),
-        ));
-        // Kept typed before the cast: the propose loop must run our OWN batch through the same
-        // judging path a received proposal takes, or the proposer never prevotes what it proposed.
-        let sbc_handler_for_propose = Arc::clone(&sbc_handler);
-        mesh.register_handler(
-            sbc_handler as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>,
-        );
-
-        // Propose cadence. Independent of block arrival by design: share agreement runs on its own
-        // clock and a tip change CONSUMES the latest agreed batch rather than triggering agreement.
-        {
-            let chain_c = Arc::clone(chain);
-            let voters_c = sbc_voters.clone();
-            let send_c = sbc_send.clone();
-            let handler_c = Arc::clone(&sbc_handler_for_propose);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                // One status line every STATUS_EVERY ticks (~5 min). The escalation clock is the
-                // input to whose-turn-it-is and was previously unobservable in production — a fix
-                // to it could only be INFERRED from the database, never seen. If nodes disagree
-                // about the rota during the soak, this is the line that says why.
-                //
-                // Five minutes, not every tick: eight nodes logging every 30 s is ~960 lines/hour
-                // for values that change slowly, and this module has already caused one
-                // log-volume incident.
-                const STATUS_EVERY: u32 = 10;
-                let mut ticks: u32 = 0;
-                loop {
-                    interval.tick().await;
-                    let now = chrono::Utc::now().timestamp();
-                    let schedule = ghost_common::batch_consensus::ProposerSchedule::new(voters_c());
-
-                    ticks = ticks.wrapping_add(1);
-                    if ticks % STATUS_EVERY == 1 {
-                        let opened = chain_c.seq_opened();
-                        let head = chain_c.head();
-                        tracing::info!(
-                            seq = head.as_ref().map(|h| h.seq),
-                            state_root = head
-                                .as_ref()
-                                .map(|h| hex::encode(&h.state_root[..8]))
-                                .unwrap_or_else(|| "none".into()),
-                            seq_opened = opened,
-                            escalation = schedule.escalation_at(opened, now),
-                            voters = schedule.len(),
-                            quorum = schedule.quorum(),
-                            pending = chain_c.pending_count(),
-                            balances = chain_c.balance_count(),
-                            "SBC status"
-                        );
-                    }
-
-                    // Genesis is otherwise ONE-SHOT at startup. A node that comes up before
-                    // the anchor checkpoint has reached its database never genesises, holds no
-                    // head, has no membership, and is silently inert until someone restarts it —
-                    // with nothing to say so. Retrying here costs a cheap `head()` check per tick
-                    // and is a no-op once the chain has started.
-                    if chain_c.head().is_none() {
-                        match chain_c.bootstrap_genesis(ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT, now)
-                        {
-                            Ok(Some(h)) => {
-                                tracing::info!(
-                                    anchor_height = h,
-                                    "SBC genesis: chain started (retry)"
-                                )
-                            }
-                            // Reported on a slow cadence rather than every tick: a node waiting
-                            // for its anchor checkpoint would otherwise emit ~120 lines an hour
-                            // saying nothing new.
-                            Ok(None) => {
-                                if ticks % STATUS_EVERY == 1 {
-                                    tracing::warn!(
-                                        anchor = ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT,
-                                        "SBC genesis: waiting for the ratified checkpoint at the \
-                                         anchor — this node is SBC-inert until it arrives"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::warn!(error = %e, "SBC genesis: retry failed"),
-                        }
-                        continue;
-                    }
-
-                    if schedule.is_empty() {
-                        continue;
-                    }
-                    let budget = ghost_consensus::message_validator::share_batch_pack_budget();
-                    let Some(batch) = chain_c.try_propose(&schedule, now, budget) else {
-                        continue;
-                    };
-                    match serde_json::to_vec(&batch) {
-                        Ok(payload) => {
-                            if let Err(e) =
-                                send_c(ghost_consensus::MessageType::ShareBatchProposal, payload)
-                            {
-                                tracing::debug!(error = %e, "SBC: could not enqueue proposal");
-                            } else {
-                                tracing::info!(
-                                    seq = batch.seq,
-                                    shares = batch.shares.len(),
-                                    "SBC: proposed"
-                                );
-                                // Judge our own batch exactly as a peer would. Without this the
-                                // proposer is a silent abstainer every round it leads, so only
-                                // N-1 nodes ever prevote and the fleet cannot make a polka at
-                                // f=2 — the very tolerance the design claims.
-                                if let Err(e) = handler_c.judge_and_vote(&batch, now) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "SBC: could not prevote our own proposal"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => tracing::warn!(error = %e, "SBC: proposal would not serialise"),
-                    }
-                }
-            });
-        }
-    }
-    // The shard's epoch task. Folds each epoch once it has CLOSED.
-    //
-    // Shaped on the tip-6 loop below, which it eventually replaces. `MissedTickBehavior::Skip` is
-    // load-bearing rather than decoration: without it a fold that runs long queues ticks, and the
-    // backlog then folds back-to-back against the same `Mutex<Connection>` that share ingest uses.
-    // Skipping costs nothing here because the work is idempotent and driven by height, not by how
-    // many times we looked.
     if let Some(ref rt) = shard {
         // Two handles: one for the relay task, one for the tick task that owns the fold.
         let rt_publish = Arc::clone(rt);
         let rt = Arc::clone(rt);
         let rpc_c = Arc::clone(&rpc);
         // Broadcast relay for this node's own summaries. Channel-plus-relay, the same shape the
-        // SBC and checkpoint paths use: the fold holds the storage lock and must never await a
+        // checkpoint path uses: the fold holds the storage lock and must never await a
         // network send while holding it.
         let (shard_tx, mut shard_rx) =
             tokio::sync::mpsc::channel::<ghost_common::share_shard::EpochSummary>(64);
@@ -8523,7 +8235,6 @@ async fn main() -> Result<()> {
     let rm_for_shares = Arc::clone(&round_manager);
     let identity_for_shares = Arc::clone(&identity);
     let db_for_shares = Arc::clone(&db);
-    let sbc_for_shares = sbc_chain.clone();
     verification_state = verification_state.with_share_recorder(move |share| {
         // Get current round ID for database record
         let round_id = rm_for_shares.current_round_id();
@@ -8789,18 +8500,6 @@ async fn main() -> Result<()> {
         // broadcast went nowhere. That is a property of how solo happens to be deployed, not an
         // invariant: `config/mainnet-solo.toml` says no seed nodes are *needed*, not that peers
         // are forbidden. Suppress at the source so reachability cannot change the answer.
-        // WP-5: hand the shadow chain what THIS node received, before the broadcast consumes the
-        // proof. Only own shares: a gossiped share was received by a peer and belongs in that
-        // peer's batch, so taking it here would credit the same work twice.
-        //
-        // Solo is excluded for the same reason it does not broadcast — a solo node's work is its
-        // own and must not enter a shared chain.
-        if !rm_for_shares.is_solo_mode() {
-            if let Some(ref chain) = sbc_for_shares {
-                chain.record_received(proof.clone());
-            }
-        }
-
         if rm_for_shares.is_solo_mode() {
             tracing::trace!(
                 miner_id = %share.miner_id,

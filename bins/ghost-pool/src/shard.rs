@@ -50,12 +50,12 @@ use ghost_common::coinbase_tags::extract_payout_tag;
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::share_batch::{canonical_sort, creditable_difficulty};
 use ghost_common::share_shard::{
     discharged_micro_work, epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS,
     RETENTION_EPOCHS,
 };
 use ghost_common::types::ShareProof;
+use ghost_common::work_fold::{canonical_sort, creditable_difficulty};
 use ghost_common::zmq::block_hash_to_display_order;
 use ghost_reconciliation::batch::{compute_merkle_proof, compute_merkle_root};
 
@@ -838,7 +838,7 @@ impl ShardRuntime {
     /// Compares in integer micro-work, converted the same way [`micro_work`] converts, so a
     /// difference here is a real difference and not a rounding artefact of the comparison.
     ///
-    /// [`micro_work`]: ghost_common::share_batch::micro_work
+    /// [`micro_work`]: ghost_common::work_fold::micro_work
     /// Build this node's §12.6 whole-table sync REQUEST.
     ///
     /// Carries our own root so the responder can see the drift too — either side can log it.
@@ -1455,7 +1455,7 @@ impl ShardRuntime {
         let ledger = self.db.get_top_unpaid_addresses(cutoff_ts, u32::MAX)?;
         let ledger: BTreeMap<String, i64> = ledger
             .into_iter()
-            .map(|(addr, work, _)| (addr, ghost_common::share_batch::micro_work(work)))
+            .map(|(addr, work, _)| (addr, ghost_common::work_fold::micro_work(work)))
             .collect();
 
         let owed = self.table.lock().owed();
@@ -2151,8 +2151,8 @@ mod tests {
     // Tests pin the SHIPPING floor deliberately: the rehearsal override must never change
     // what the suite asserts about production behaviour.
     use super::*;
-    use ghost_common::share_batch::micro_work;
     use ghost_common::share_shard::NETWORK_TIER_LOG2;
+    use ghost_common::work_fold::micro_work;
     use ghost_storage::models::{PayoutStatus, RoundRecord, ShareRecord};
 
     /// One runtime over a fresh in-memory database, non-solo.
