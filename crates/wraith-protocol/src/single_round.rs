@@ -643,8 +643,8 @@ mod tests {
     /// The canonical "happy path" fixture across multiple tests.
     fn happy_mix_round(addrs: &[String; 7], entropy: &[u8; 32]) -> LiteRound {
         let mut b = mix_builder_with_addrs(addrs);
-        for i in 0..5 {
-            b.add_participant(fake_input(i as u32, exact_input_sats(), &addrs[i]))
+        for (i, addr) in addrs.iter().enumerate().take(5) {
+            b.add_participant(fake_input(i as u32, exact_input_sats(), addr))
                 .unwrap();
         }
         b.build_with_entropy(entropy).unwrap()
@@ -761,8 +761,8 @@ mod tests {
             LiteTier::Denom100kSats,
             Network::Signet,
         );
-        for i in 0..5 {
-            b.add_participant(fake_input(i as u32, jump_exact_input_sats(), &addrs[i]))
+        for (i, addr) in addrs.iter().enumerate().take(5) {
+            b.add_participant(fake_input(i as u32, jump_exact_input_sats(), addr))
                 .unwrap();
         }
         let round = b.build_with_entropy(&[0u8; 32]).unwrap();
