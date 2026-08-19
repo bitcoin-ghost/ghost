@@ -12,6 +12,7 @@ use axum::Router;
 
 pub mod api;
 pub mod assembly;
+pub mod bans;
 pub mod bond_ledger_http;
 pub mod bond_resolution;
 pub mod broadcaster;

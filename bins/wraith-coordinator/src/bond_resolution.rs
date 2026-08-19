@@ -170,6 +170,29 @@ pub fn execute_no_sign_sweep(state: &CoordinatorState, session_id: &str) -> NoSi
         .into_iter()
         .partition(|i| signers.contains(&i.ghost_id));
 
+    // Ban the coins that killed the round, before anything that depends
+    // on a backend being configured. This is what replaces the bond
+    // (#699): a disruptor must buy a fresh coin on-chain to try again,
+    // and that holds whether or not any ledger is wired.
+    let now = state.now();
+    for entry in &absent {
+        match crate::utxo_source::parse_outpoint(&entry.input.txid, entry.input.vout) {
+            Ok(outpoint) => {
+                state.bans.ban(outpoint, now);
+            }
+            // Unreachable in practice: /inputs parses the outpoint before
+            // accepting the record. Log rather than panic — a stored
+            // record we cannot parse must not stop the sweep resolving
+            // everyone else.
+            Err(detail) => warn!(
+                %session_id,
+                ghost_id = %entry.ghost_id,
+                %detail,
+                "could not ban a non-signer's outpoint",
+            ),
+        }
+    }
+
     let summary = match state.bond_ledger.as_ref() {
         Some(ledger) => {
             let slashed = resolve_round_bonds(

@@ -94,4 +94,9 @@ pub fn run_one_pass(state: &CoordinatorState) {
             );
         }
     }
+
+    // 3. Drop expired disruption cooldowns. Purely to bound memory:
+    //    `banned_until` already judges expiry itself, so a tick that
+    //    never runs cannot leave a coin banned past its time (#699).
+    state.bans.sweep_expired(now);
 }

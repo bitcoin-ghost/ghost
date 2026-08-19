@@ -17,6 +17,7 @@ use wraith_protocol::{
 };
 
 use crate::assembly::AssembledRound;
+use crate::bans::BanList;
 use crate::broadcaster::Broadcaster;
 use crate::inputs::AcceptedInputs;
 use crate::outputs::AcceptedOutput;
@@ -52,6 +53,10 @@ pub struct CoordinatorState {
     /// `503 ledger_not_configured` while this is None — the binary boots
     /// fine without it but won't accept commit-phase submissions.
     pub bond_ledger: Option<Arc<dyn BondLedger>>,
+    /// Outpoints in disruption cooldown. Always present — it costs
+    /// nothing and an empty list is the correct starting state, unlike
+    /// the pluggable backends around it (#699).
+    pub bans: BanList,
     /// UTXO-set lookup. `None` until an operator configures a node
     /// connection; `/inputs` returns `503 utxo_source_not_configured`
     /// while it is, because registration must never fall back to
@@ -157,6 +162,7 @@ impl CoordinatorState {
             clock,
             id_gen,
             bond_ledger,
+            bans: BanList::new(),
             utxo_source: None,
             coordinator_fee_address,
             inputs_store: Mutex::new(HashMap::new()),

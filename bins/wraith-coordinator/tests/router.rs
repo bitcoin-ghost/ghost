@@ -3108,6 +3108,126 @@ async fn witness_partitions_signers_and_non_signers_at_deadline() {
     assert_eq!(slashed, 2);
 }
 
+/// Disruption puts the coin in cooldown, and only the coin that
+/// disrupted (#699).
+///
+/// This is what replaces the bond: an attacker who wants another go must
+/// buy a fresh coin on-chain, while the participants who did sign keep
+/// theirs usable.
+#[tokio::test]
+async fn a_non_signer_has_its_outpoint_banned_and_a_signer_does_not() {
+    use wraith_coordinator::bans::DISRUPTION_BAN_SECS;
+
+    let (router, state, ledger, clock) = deadline_test_setup(1_000_000).await;
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+
+    // wallet-0 signs; wallet-1..4 do not.
+    let idx = find_input_index(&state, &session_id, "wallet-0");
+    let resp = router
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/witness"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input_index": idx,
+                "witness_hex": placeholder_witness_hex(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert!(state.bans.is_empty(), "nothing banned before the deadline");
+
+    // Past the deadline, the sweep runs.
+    clock.advance(700);
+    wraith_coordinator::tick::run_one_pass(&state);
+
+    let now = state.now();
+    // The four who never signed are in cooldown...
+    for i in 1..MIN_5 {
+        let outpoint = fixture_outpoint(0x11, i as u32);
+        let until = state
+            .bans
+            .banned_until(&outpoint, now)
+            .unwrap_or_else(|| panic!("wallet-{i} should be banned"));
+        assert_eq!(until, now + DISRUPTION_BAN_SECS);
+    }
+    // ...and the one who signed is not.
+    assert!(
+        state
+            .bans
+            .banned_until(&fixture_outpoint(0x11, 0), now)
+            .is_none(),
+        "a participant who signed must not be punished for the round failing"
+    );
+}
+
+/// A banned coin is refused at registration, and told when it may return.
+#[tokio::test]
+async fn inputs_rejects_a_banned_outpoint() {
+    let (router, state, ledger, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    state.bans.ban(fixture_outpoint(0x00, 0), state.now());
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                MIN_INPUT_100K_MIX,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "outpoint_banned");
+    assert!(
+        json["detail"].as_str().unwrap().contains("cooldown"),
+        "the refusal must say when the coin can be used again: {}",
+        json["detail"]
+    );
+}
+
+/// The cooldown ends by itself. Nothing has to run for a coin to become
+/// usable again — expiry is judged at the point of the check.
+#[tokio::test]
+async fn a_banned_outpoint_is_accepted_again_once_its_cooldown_passes() {
+    use wraith_coordinator::bans::DISRUPTION_BAN_SECS;
+
+    let (router, state, ledger, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    // Banned an hour and a second ago, so the cooldown has just passed.
+    state.bans.ban(
+        fixture_outpoint(0x00, 0),
+        state.now() - DISRUPTION_BAN_SECS - 1,
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                MIN_INPUT_100K_MIX,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 // ---------------------------------------------------------------------------
 // Background tick — deadline sweep without anyone pinging /witness
 // ---------------------------------------------------------------------------

@@ -28,6 +28,10 @@
 //!   the session (so a proof cannot be replayed into another round) and
 //!   the outpoint (so proving you own one coin does not authorise
 //!   registering another).
+//! - **Disruption cooldown** (#699): an outpoint that killed a round by
+//!   never signing is refused for `DISRUPTION_BAN_SECS`. Honest
+//!   participants pay nothing; a disruptor must buy a fresh coin on-chain
+//!   for each attempt.
 //! - **One outpoint, one participant** (#701): two participants
 //!   registering the same coin builds a transaction with duplicate
 //!   inputs, which cannot broadcast — killing the round at broadcast,
@@ -264,6 +268,22 @@ pub async fn post(
         Ok(o) => o,
         Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_outpoint", detail),
     };
+
+    //    A coin that killed a round is in cooldown. Checked before the
+    //    chain lookup so a banned outpoint costs the coordinator no RPC
+    //    round trip, and stated with its expiry so an honest wallet whose
+    //    last round died knows exactly when it can use the coin again.
+    if let Some(until) = state.bans.banned_until(&outpoint, now) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "outpoint_banned",
+            format!(
+                "{outpoint} disrupted a round and is in cooldown for another {} seconds",
+                until.saturating_sub(now)
+            ),
+        );
+    }
+
     let chain_utxo = match utxo_source.get_utxo(&outpoint) {
         Ok(Some(u)) => u,
         // Absent or spent. Deliberately one error for both: saying
