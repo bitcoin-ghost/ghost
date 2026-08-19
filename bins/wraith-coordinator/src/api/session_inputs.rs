@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use wraith_protocol::{
-    BondError, LiteSession, LiteSessionState, LiteTier, SessionType, CHANGE_DUST_THRESHOLD_SATS,
-    DEFAULT_FEE_RATE_SATS_PER_VB, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
+    per_participant_mining_share, BondError, LiteSession, LiteSessionState, SessionType,
+    CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 /// No-sign deadline for the Signing phase, in seconds. From the moment
@@ -332,30 +332,13 @@ fn minimum_participant_input(
         ));
     }
     let tier = session.tier;
-    let mining_share = per_participant_mining_share(tier, session.session_type);
+    let mining_share =
+        per_participant_mining_share(tier, session.session_type, DEFAULT_FEE_RATE_SATS_PER_VB);
     let service_share = match session.session_type {
         SessionType::Mix => tier.service_fee_sats(),
         SessionType::Jump => 0,
     };
     Ok(tier.denomination_sats() + mining_share + service_share)
-}
-
-/// Worst-case mining-fee share per participant. Mirrors
-/// `LiteRoundBuilder::per_participant_mining_share`: computed against
-/// `tier.min_participants()` (smallest N — fixed overhead amortised
-/// across fewest participants → highest per-share).
-fn per_participant_mining_share(tier: LiteTier, session_type: SessionType) -> u64 {
-    let n = tier.min_participants() as u64;
-    let outputs = (n as usize)
-        + (n as usize)
-        + match session_type {
-            SessionType::Mix => 1,
-            SessionType::Jump => 0,
-        }
-        + 1; // OP_RETURN
-    let vbytes = ((n as usize * VBYTES_PER_INPUT) + (outputs * VBYTES_PER_OUTPUT)) as u64;
-    let total = vbytes * DEFAULT_FEE_RATE_SATS_PER_VB;
-    total.div_ceil(n)
 }
 
 fn error(status: StatusCode, code: &'static str, detail: String) -> Response {

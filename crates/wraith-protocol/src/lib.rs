@@ -56,8 +56,9 @@ pub use tier::{
 
 pub mod single_round;
 pub use single_round::{
-    LiteOutputKind, LiteOutputProvenance, LiteParticipantInput, LiteRound, LiteRoundBuilder,
-    CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
+    per_participant_mining_share, round_vbytes, LiteOutputKind, LiteOutputProvenance,
+    LiteParticipantInput, LiteRound, LiteRoundBuilder, CHANGE_DUST_THRESHOLD_SATS,
+    DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 pub mod bond;

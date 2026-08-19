@@ -38,7 +38,6 @@
 //!   M × change output    value = input - denom - fee_share, where M ≤ N
 //!                        (omitted when input == denom + fee_share exactly)
 //!   1 × service fee      value = N × tier.service_fee_sats()  [Mix only]
-//!   1 × OP_RETURN        version + session_id (no fee_pad, no phase markers)
 //! ```
 //!
 //! Jump rounds (`SessionType::Jump`) skip the service-fee output entirely —
@@ -62,10 +61,9 @@
 use std::str::FromStr;
 
 use bitcoin::absolute::LockTime;
-use bitcoin::script::{Builder, PushBytesBuf};
 use bitcoin::transaction::Version;
 use bitcoin::{
-    opcodes::all::OP_RETURN, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction,
+    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction,
     TxIn, TxOut, Txid, Witness,
 };
 
@@ -121,7 +119,7 @@ pub struct LiteParticipantInput {
 #[derive(Debug)]
 pub struct LiteRoundBuilder {
     /// Unique session identifier. Used as the ChaCha20Rng output-shuffle
-    /// seed input + as the OP_RETURN marker payload.
+    /// seed input.
     pub session_id: String,
     /// Tier for this round. Determines denomination, service fee, and
     /// participant caps.
@@ -229,16 +227,13 @@ impl LiteRoundBuilder {
     ///
     /// Computed against `tier.min_participants()` (not max), because the
     /// per-participant share is *highest* at the smallest N: the fixed
-    /// overhead (OP_RETURN + service-fee-output) is divided across fewer
+    /// overhead (the service-fee output) is divided across fewer
     /// participants. This way every participant pre-pays enough that the
     /// round's mining fee is covered even if it broadcasts at the floor.
     /// Larger rounds end up slightly overpaying mining fee — which is
     /// fine, the surplus just makes the tx more attractive to miners.
     pub fn per_participant_mining_share(&self) -> u64 {
-        let n = self.tier.min_participants() as u64;
-        let total = self.estimate_vbytes_for_count(self.tier.min_participants())
-            * self.fee_rate_sats_per_vb;
-        total.div_ceil(n)
+        per_participant_mining_share(self.tier, self.session_type, self.fee_rate_sats_per_vb)
     }
 
     /// Service-fee share per participant. Mix rounds: equals
@@ -396,17 +391,6 @@ impl LiteRoundBuilder {
             });
         }
 
-        // OP_RETURN marker. Single-round shape:
-        //   <2-byte version> || <session_id_bytes>
-        // Where version = WRAITH_LITE_OP_RETURN_VERSION (0x0001 for v1).
-        // No fee_pad data, no phase indicator — single-round means single
-        // marker, single confirmation.
-        let op_return = build_op_return(&self.session_id);
-        tx_outputs.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: op_return,
-        });
-
         // Sanity: total_in must cover total_out + estimated mining fee.
         let total_in: u64 = self.participants.iter().map(|p| p.amount_sats).sum();
         let total_out: u64 = tx_outputs.iter().map(|o| o.value.to_sat()).sum();
@@ -447,16 +431,7 @@ impl LiteRoundBuilder {
     }
 
     fn estimate_vbytes_for_count(&self, n: usize) -> u64 {
-        // Worst-case: every participant has a change output too.
-        // n inputs + n mixed outputs + n change outputs + (1 fee if Mix) + 1 OP_RETURN
-        let outputs = n
-            + n
-            + match self.session_type {
-                SessionType::Mix => 1,
-                SessionType::Jump => 0,
-            }
-            + 1; // OP_RETURN
-        ((n * VBYTES_PER_INPUT) + (outputs * VBYTES_PER_OUTPUT)) as u64
+        round_vbytes(n, self.session_type)
     }
 
     /// Derive a 32-byte ChaCha20Rng seed from session_id + caller entropy.
@@ -523,7 +498,7 @@ pub struct LiteRound {
     pub tier: LiteTier,
     pub session_type: SessionType,
     pub tx: Transaction,
-    /// One entry per non-OP_RETURN output, in TxOut order. Lets a
+    /// One entry per output, in TxOut order. Lets a
     /// participant locate their mixed output and verify its amount
     /// without trusting the coordinator's word.
     pub output_provenance: Vec<LiteOutputProvenance>,
@@ -547,21 +522,45 @@ impl LiteRound {
     }
 }
 
-/// Build the OP_RETURN script for a single-round Wraith Lite tx. Carries
-/// version + session_id so chain analysis tools that want to identify
-/// Wraith txs can do so cheaply, but doesn't reveal participant count or
-/// any per-participant data.
+/// Worst-case round size in vbytes for `n` participants.
 ///
-/// Format: `OP_RETURN <push: WL01 || session_id_bytes>`.
-fn build_op_return(session_id: &str) -> ScriptBuf {
-    let mut payload = Vec::with_capacity(4 + session_id.len());
-    payload.extend_from_slice(b"WL01"); // 'W'raith 'L'ite, version 01
-    payload.extend_from_slice(session_id.as_bytes());
-    let push = PushBytesBuf::try_from(payload).expect("session_id < 80 bytes");
-    Builder::new()
-        .push_opcode(OP_RETURN)
-        .push_slice(push)
-        .into_script()
+/// **Single source of truth.** The coordinator's minimum-input check and the
+/// builder's fee computation must agree exactly: the coordinator admits a
+/// participant only if their input covers `denom + service share + mining
+/// share`, and the builder then spends against the real transaction. If the
+/// two calculations drift, participants are admitted having paid the wrong
+/// amount and the round either underpays its mining fee or silently
+/// overcharges. This function existed twice — once here, once in the
+/// coordinator — and the copies diverged when #695 removed an output.
+///
+/// Worst case assumes every participant also takes a change output.
+pub fn round_vbytes(n: usize, session_type: SessionType) -> u64 {
+    // n inputs + n mixed outputs + n change outputs + (1 service fee if Mix)
+    let outputs = n
+        + n
+        + match session_type {
+            SessionType::Mix => 1,
+            SessionType::Jump => 0,
+        };
+    ((n * VBYTES_PER_INPUT) + (outputs * VBYTES_PER_OUTPUT)) as u64
+}
+
+/// Per-participant mining-fee share, in sats.
+///
+/// Computed against `tier.min_participants()` rather than the actual count,
+/// because the per-participant share is *highest* at the smallest N — fixed
+/// overhead amortised across fewest participants. Every participant therefore
+/// pre-pays enough to cover the round even if it broadcasts at the floor;
+/// larger rounds overpay slightly, which only makes the tx more attractive to
+/// miners.
+pub fn per_participant_mining_share(
+    tier: LiteTier,
+    session_type: SessionType,
+    fee_rate_sats_per_vb: u64,
+) -> u64 {
+    let n = tier.min_participants() as u64;
+    let total = round_vbytes(tier.min_participants(), session_type) * fee_rate_sats_per_vb;
+    total.div_ceil(n)
 }
 
 /// ChaCha20Rng output shuffle. Same construction as the legacy
@@ -837,26 +836,39 @@ mod tests {
         assert_ne!(order1, order2, "shuffle should change with entropy");
     }
 
+    /// A round transaction must carry no marker of any kind (#695).
+    ///
+    /// The `WL01` OP_RETURN existed so "chain analysis tools that want to
+    /// identify Wraith txs can do so cheaply" — which labelled every
+    /// participant as having used a mixer, permanently and publicly, and made
+    /// the round transaction self-identifying. Structure is still
+    /// recognisable (equal-value outputs are the anonymity set); an explicit
+    /// tag is not, and must never come back.
     #[test]
-    fn op_return_carries_session_id() {
+    fn round_tx_carries_no_marker() {
         let addrs = test_addrs();
         let round = happy_mix_round(&addrs, &[0u8; 32]);
-        let zero_outs: Vec<&TxOut> = round
-            .tx
-            .output
-            .iter()
-            .filter(|o| o.value == Amount::ZERO)
-            .collect();
-        assert_eq!(zero_outs.len(), 1, "exactly one OP_RETURN output");
-        let bytes = zero_outs[0].script_pubkey.as_bytes();
-        assert_eq!(bytes[0], 0x6a, "first byte must be OP_RETURN");
-        // Concatenate the printable bytes so we can search for our markers.
-        let s: String = bytes.iter().map(|&b| b as char).collect();
-        assert!(s.contains("WL01"), "expected WL01 marker in {s:?}");
+
         assert!(
-            s.contains("test-session-001"),
-            "expected session_id in marker: {s:?}"
+            !round.tx.output.iter().any(|o| o.script_pubkey.is_op_return()),
+            "round tx must contain no OP_RETURN output"
         );
+        assert!(
+            !round.tx.output.iter().any(|o| o.value == Amount::ZERO),
+            "round tx must contain no zero-value output"
+        );
+        for o in &round.tx.output {
+            let bytes = o.script_pubkey.as_bytes();
+            let printable: String = bytes.iter().map(|&b| b as char).collect();
+            assert!(
+                !printable.contains("WL01"),
+                "WL01 marker must not appear in any output: {printable:?}"
+            );
+            assert!(
+                !printable.contains("test-session-001"),
+                "session_id must never appear on-chain: {printable:?}"
+            );
+        }
     }
 
     #[test]
