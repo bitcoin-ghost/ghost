@@ -42,7 +42,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bitcoin::Address;
+use bitcoin::{Address, AddressType};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -138,6 +138,30 @@ pub async fn post(
             format!(
                 "address is not valid for network '{}'",
                 state.network_name()
+            ),
+        );
+    }
+
+    // Every mixed output in a round is P2TR (#696).
+    //
+    // Equal values are what buy the anonymity set, but not across mixed
+    // script types: a lone P2WPKH output among P2TR ones is trivially
+    // separable inside the round, and its owner gains nothing while
+    // believing they did. Spec §5.1 makes the vault Taproot with a NUMS
+    // key-path, and §7.1 makes round outputs "fresh equal vaults" — so
+    // there is exactly one legitimate output type, and anything else is
+    // refused rather than accommodated.
+    //
+    // Registration is the only place this can be caught: by round-build
+    // time the outputs are committed, and the blind signature means the
+    // coordinator cannot tell whose they are.
+    if parsed.clone().assume_checked().address_type() != Some(AddressType::P2tr) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "not_p2tr",
+            format!(
+                "'{}' is not a P2TR address; every output in a round is P2TR",
+                req.address
             ),
         );
     }

@@ -18,22 +18,35 @@ use wraith_protocol::{DeterministicSessionIdGenerator, MockBondLedger, MockClock
 /// Signet P2WPKH address used as the placeholder coordinator fee
 /// destination + change destination in tests. Real bech32 with a
 /// valid checksum so /outputs's address parser accepts it.
+///
+/// Deliberately **not** P2TR: neither the fee output nor a change
+/// output is a mixed output, so neither is subject to the P2TR-only
+/// rule (#696). It doubles as the wrong-type fixture for
+/// `outputs_rejects_a_non_p2tr_address`.
 const TEST_FEE_ADDRESS: &str = "tb1q0xcqpzrky6eff2g52qdye53xkk9jxkvraulyla";
 
-/// Five distinct valid signet P2WPKH addresses for the
-/// outputs-over-submission test. Generated from `[i; 32]` secret keys
-/// 1..=5 — deterministic so the strings are stable.
+/// Five distinct valid signet **P2TR** addresses for the
+/// outputs-over-submission test. BIP86 key-path outputs derived from
+/// `[i; 32]` secret keys 1..=5 — deterministic so the strings are
+/// stable.
+///
+/// Mixed outputs are P2TR and nothing else (#696), so these are what a
+/// wallet may register at /outputs.
 const FIVE_SIGNET_ADDRS: [&str; 5] = [
-    "tb1q0xcqpzrky6eff2g52qdye53xkk9jxkvraulyla",
-    "tb1qa0qwuze2h85zw7nqpsj3ga0z9geyrgwptrz29s",
-    "tb1qg975h6gdx5mryeac72h6lj2nzygugxhyk6dnhr",
-    "tb1q3zxmh4ue370cp48c9d8eeek43qhnzzhvz4t84j",
-    "tb1qn454ga9rqwkx6ax309knw5hs0z2erz7jg4x4y7",
+    "tb1p33wm0auhr9kkahzd6l0kqj85af4cswn276hsxg6zpz85xe2r0y8snwrkwy",
+    "tb1p5e6v9v2j5wp3y6c79gaqdqltq7jdv45fswnnm7exmmp2020mqepsvssqqw",
+    "tb1p6wsds2al4cnjx209fcangy80exryd6hsddakha72mnhwqkapg3lqfsl44e",
+    "tb1p770cds92gkjrjfu7cr76fyj82snvp6jadyre7xen6mrx2y52vphsp5shce",
+    "tb1pngylwuvf9ud79em6cvp0lzx48t7ujn36670kdfsxt08ngvmc59xsuh0yev",
 ];
 
-/// A sixth distinct valid signet P2WPKH address for the
-/// outputs-full over-submission test (key = [6; 32]).
-const SIXTH_SIGNET_ADDR: &str = "tb1q6jlzchtg6pl8sstn4m42uaz7xmnkhv3606kk9z";
+/// A sixth distinct valid signet P2TR address for the outputs-full
+/// over-submission test (key = [6; 32]).
+const SIXTH_SIGNET_ADDR: &str = "tb1pweq8jyw0sgtx6jure6mqpalmx5wsupexu5vtwz69gjnz99mt8a2qwxedl7";
+
+/// The address single-submission tests register at /outputs. Must be
+/// P2TR like any other mixed output.
+const TEST_OUTPUT_ADDRESS: &str = FIVE_SIGNET_ADDRS[0];
 
 fn router() -> axum::Router {
     build_router(Arc::new(CoordinatorState::new(Network::Signet)))
@@ -1321,7 +1334,7 @@ async fn outputs_returns_404_for_unknown_session() {
         .oneshot(post_json(
             "/api/v1/session/no-such-session/outputs",
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 "blinded_nonce_point": "00".repeat(33),
                 "unblinded_signature_scalar": "00".repeat(32),
             }),
@@ -1344,7 +1357,7 @@ async fn outputs_returns_409_when_session_still_locked() {
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/outputs"),
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 "blinded_nonce_point": "00".repeat(33),
                 "unblinded_signature_scalar": "00".repeat(32),
             }),
@@ -1382,6 +1395,41 @@ async fn outputs_rejects_address_for_wrong_network() {
     assert_eq!(json["error"], "wrong_network");
 }
 
+/// Every mixed output in a round is P2TR (#696).
+///
+/// Equal values buy the anonymity set; equal values across *mixed*
+/// script types do not — a lone P2WPKH output among P2TR ones is
+/// trivially separable inside the round, and its owner gains nothing
+/// while believing they did. Registration is the only place this can be
+/// caught: by round-build time the outputs are committed, and the blind
+/// signature means the coordinator cannot tell whose they are.
+///
+/// The refusal must land *before* the signature check, so a wallet
+/// learns the type is wrong rather than getting a generic verification
+/// failure.
+#[tokio::test]
+async fn outputs_rejects_a_non_p2tr_address() {
+    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/outputs"),
+            serde_json::json!({
+                // Valid signet address, right network, wrong type.
+                "address": TEST_FEE_ADDRESS,
+                "blinded_nonce_point": "00".repeat(33),
+                "unblinded_signature_scalar": "00".repeat(32),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "not_p2tr");
+}
+
 #[tokio::test]
 async fn outputs_rejects_when_no_signer_initialised() {
     // Session in Signing but nobody ever called /nonce, so no signer
@@ -1395,7 +1443,7 @@ async fn outputs_rejects_when_no_signer_initialised() {
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/outputs"),
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 "blinded_nonce_point": "00".repeat(33),
                 "unblinded_signature_scalar": "00".repeat(32),
             }),
@@ -1426,7 +1474,7 @@ async fn outputs_rejects_invalid_signature_with_403() {
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/outputs"),
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 // 33-byte point that's actually a valid SEC1 generator-G
                 // serialisation (not zero, which from_slice rejects).
                 "blinded_nonce_point": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
@@ -1446,7 +1494,7 @@ async fn outputs_full_round_trip_accepts_valid_signature() {
     let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
     let session_id = make_signing_session(router.clone(), &state, &ledger).await;
 
-    let address = TEST_FEE_ADDRESS.to_string();
+    let address = TEST_OUTPUT_ADDRESS.to_string();
     let (blinded_nonce_hex, unblinded_sig_hex) = run_blind_sig_for(
         router.clone(),
         &session_id,
@@ -1480,7 +1528,7 @@ async fn outputs_rejects_duplicate_address_with_409() {
     let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
     let session_id = make_signing_session(router.clone(), &state, &ledger).await;
 
-    let address = TEST_FEE_ADDRESS.to_string();
+    let address = TEST_OUTPUT_ADDRESS.to_string();
     let (n1, s1) = run_blind_sig_for(
         router.clone(),
         &session_id,
@@ -1769,9 +1817,14 @@ async fn round_tx_decodes_to_a_valid_bitcoin_transaction() {
     // Round-trip the hex through bitcoin's deserializer. If it
     // parses, the consensus encoding is sound.
     let tx: bitcoin::Transaction = deserialize_hex(tx_hex).expect("valid consensus encoding");
-    // 5 inputs, 5 mixed + 5 change + 1 service-fee + 1 OP_RETURN = 12 outputs.
+    // 5 inputs, 5 mixed + 5 change + 1 service-fee = 11 outputs.
+    // No marker output: the `WL01` OP_RETURN was removed in #695.
     assert_eq!(tx.input.len(), 5);
-    assert_eq!(tx.output.len(), 12);
+    assert_eq!(tx.output.len(), 11);
+    assert!(
+        !tx.output.iter().any(|o| o.script_pubkey.is_op_return()),
+        "round tx must carry no OP_RETURN marker (#695)"
+    );
 
     // Reported txid in the response must match the deserialised tx.
     let computed_txid = tx.compute_txid().to_string();
