@@ -548,6 +548,20 @@ mod server {
 
     /// Reject names that would let a caller traverse outside `wallets_dir` or
     /// produce ambiguous on-disk paths.
+    /// Decode the hex user-entropy digest a front-end collected.
+    ///
+    /// Strict about the shape and indifferent to the content: any 32 bytes
+    /// are acceptable because mixing is one-directional. What is refused is
+    /// a value that is not a digest at all, which would be a caller bug
+    /// worth surfacing rather than silently ignoring.
+    fn decode_entropy_digest(hex_digest: &str) -> Result<[u8; 32], String> {
+        let bytes = hex::decode(hex_digest.trim())
+            .map_err(|e| format!("user_entropy_digest is not hex: {e}"))?;
+        bytes
+            .try_into()
+            .map_err(|_| "user_entropy_digest must be exactly 32 bytes".to_string())
+    }
+
     fn validate_wallet_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("wallet name must not be empty".into());
@@ -3208,7 +3222,11 @@ mod server {
                     },
                 }
             }
-            Request::WalletCreate { name, passphrase } => {
+            Request::WalletCreate {
+                name,
+                passphrase,
+                user_entropy_digest,
+            } => {
                 if let Some(refused) = refuse_in_kiosk_mode(state, "wallet create") {
                     return Envelope::new(id, refused);
                 }
@@ -3225,7 +3243,23 @@ mod server {
                         })
                     } else {
                         let pass = SecretString::new(passphrase);
-                        match Keystore::create() {
+                        // User entropy is mixed with the OS source, never
+                        // substituted for it, so a malformed or hostile
+                        // digest cannot weaken the seed below what the OS
+                        // alone would have given.
+                        let mixed = match user_entropy_digest.as_deref() {
+                            None => None,
+                            Some(hex_digest) => match decode_entropy_digest(hex_digest) {
+                                Ok(d) => Some(d),
+                                Err(message) => {
+                                    return Envelope::new(
+                                        id,
+                                        Response::Error(ErrorResponse { message }),
+                                    )
+                                }
+                            },
+                        };
+                        match Keystore::create_with_mixed_digest(mixed.as_ref()) {
                             Ok((ks, mnemonic)) => match ks.save(&path, &pass) {
                                 Ok(()) => {
                                     state.wallets.write().await.insert(name.clone(), ks);
@@ -4785,6 +4819,7 @@ mod server {
                 Request::WalletCreate {
                     name: "doomed".into(),
                     passphrase: "hunter2hunter2".into(),
+                    user_entropy_digest: None,
                 },
             ))
             .unwrap();

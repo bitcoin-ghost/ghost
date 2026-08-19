@@ -10695,11 +10695,13 @@ version = "1.11.22"
 dependencies = [
  "clap",
  "clap_complete",
+ "hex",
  "interprocess",
  "libc",
  "rpassword",
  "serde_json",
  "tokio",
+ "wraith-wallet-core",
  "wraith-wallet-ipc",
 ]
 

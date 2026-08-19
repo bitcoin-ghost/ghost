@@ -267,6 +267,13 @@ pub enum Request {
     WalletCreate {
         name: String,
         passphrase: String,
+        /// Optional hex-encoded 32-byte digest of user-supplied entropy
+        /// (dice, coin flips), *mixed* into the seed alongside the OS
+        /// source — never used instead of it, so it can only raise the
+        /// floor. The raw roll sequence never leaves the front-end that
+        /// collected it; see `wraith_wallet_core::user_entropy`.
+        #[serde(default)]
+        user_entropy_digest: Option<String>,
     },
     /// Restore a wallet from an existing BIP-39 mnemonic. Equivalent to
     /// `WalletCreate` but with the seed supplied by the caller. The new

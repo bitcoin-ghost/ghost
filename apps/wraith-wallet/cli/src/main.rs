@@ -386,7 +386,19 @@ enum LocksCommand {
 #[derive(Subcommand)]
 enum WalletCommand {
     /// Create a fresh wallet under the given name (generates a new BIP39 mnemonic).
-    Create { name: String },
+    Create {
+        name: String,
+        /// Roll your own dice (or flip coins) and mix them into the seed.
+        ///
+        /// Your rolls are combined with this computer's randomness, never
+        /// used instead of it, so they can only help: if the operating
+        /// system's random source were ever weak, your rolls still stand
+        /// between an attacker and your coins. 99 die rolls or 256 coin
+        /// flips is a full-strength contribution; 50 rolls / 128 flips is
+        /// the minimum accepted.
+        #[arg(long)]
+        dice: bool,
+    },
     /// Import a wallet from an existing BIP-39 mnemonic. Prompts for the words
     /// and a new passphrase. Refuses to overwrite an existing wallet of the
     /// same name.
@@ -634,13 +646,24 @@ mod client {
                 UpdateCommand::Check { manifest_url } => Request::CheckForUpdate { manifest_url },
             },
             Command::Wallet { sub } => match sub {
-                WalletCommand::Create { name } => match prompt_new_passphrase() {
-                    Ok(pass) => Request::WalletCreate {
-                        name,
-                        passphrase: pass,
-                    },
-                    Err(e) => return io_err(e),
-                },
+                WalletCommand::Create { name, dice } => {
+                    let user_entropy_digest = if dice {
+                        match collect_user_entropy() {
+                            Ok(d) => Some(d),
+                            Err(e) => return io_err(e),
+                        }
+                    } else {
+                        None
+                    };
+                    match prompt_new_passphrase() {
+                        Ok(pass) => Request::WalletCreate {
+                            name,
+                            passphrase: pass,
+                            user_entropy_digest,
+                        },
+                        Err(e) => return io_err(e),
+                    }
+                }
                 WalletCommand::Import { name } => {
                     let mnemonic = match prompt_mnemonic() {
                         Ok(m) => m,
@@ -1524,6 +1547,94 @@ mod client {
                 .trim_end_matches('\r')
                 .to_string())
         }
+    }
+
+    /// Collect dice rolls / coin flips and reduce them to a digest.
+    ///
+    /// The raw sequence never leaves this process: only the digest is sent
+    /// to the daemon. The minimum-contribution floor is enforced here, where
+    /// the rolls are, which is safe because mixing is one-directional — a
+    /// small contribution cannot weaken the seed, it just cannot honestly be
+    /// called protection.
+    fn collect_user_entropy() -> std::io::Result<String> {
+        use std::io::{BufRead, Write};
+        use wraith_wallet_core::user_entropy::{UserEntropy, MIN_USER_BITS, RECOMMENDED_USER_BITS};
+
+        println!("{}", wraith_wallet_core::user_entropy::guidance());
+        println!();
+        println!(
+            "Enter die rolls as digits 1-6, or coin flips as h/t. Spaces are fine, and you can\n\
+             paste a whole line at once. Type `done` when you have enough, or `cancel` to stop.\n"
+        );
+
+        let mut entropy = UserEntropy::new();
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        loop {
+            print!(
+                "  {:.0}/{:.0} bits ({} rolls, {} flips) > ",
+                entropy.bits(),
+                RECOMMENDED_USER_BITS,
+                entropy.die_rolls(),
+                entropy.coin_flips()
+            );
+            std::io::stdout().flush()?;
+
+            let line = match lines.next() {
+                Some(l) => l?,
+                None => break,
+            };
+            let trimmed = line.trim().to_ascii_lowercase();
+            if trimmed == "cancel" {
+                return Err(std::io::Error::other("cancelled"));
+            }
+            if trimmed == "done" {
+                break;
+            }
+
+            for ch in trimmed.chars().filter(|c| !c.is_whitespace()) {
+                match ch {
+                    '1'..='6' => {
+                        entropy
+                            .push_die(ch as u8 - b'0')
+                            .map_err(std::io::Error::other)?;
+                    }
+                    'h' => entropy.push_coin(true),
+                    't' => entropy.push_coin(false),
+                    other => {
+                        println!("  ignoring '{other}' — expected 1-6, h or t");
+                    }
+                }
+            }
+        }
+
+        // Report before refusing, so a user who stopped early can see how
+        // close they were rather than just being told no.
+        if entropy.bits() < MIN_USER_BITS {
+            let (rolls, flips) = entropy.remaining_for(MIN_USER_BITS);
+            return Err(std::io::Error::other(format!(
+                "only {:.0} bits supplied; {:.0} is the minimum ({rolls} more rolls or \
+                 {flips} more flips). Re-run without --dice to create the wallet from the \
+                 operating system's randomness alone, which is what happens by default.",
+                entropy.bits(),
+                MIN_USER_BITS
+            )));
+        }
+        if entropy.bits() < RECOMMENDED_USER_BITS {
+            println!(
+                "  note: {:.0} bits is accepted, but {:.0} matches the strength of the seed \
+                 it mixes into.",
+                entropy.bits(),
+                RECOMMENDED_USER_BITS
+            );
+        }
+
+        let digest = entropy.digest().map_err(std::io::Error::other)?;
+        println!(
+            "  mixing {:.0} bits of your own entropy into the seed.\n",
+            entropy.bits()
+        );
+        Ok(hex::encode(digest))
     }
 
     fn prompt_new_passphrase() -> std::io::Result<String> {
