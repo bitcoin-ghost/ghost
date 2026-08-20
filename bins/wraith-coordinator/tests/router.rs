@@ -1003,6 +1003,92 @@ async fn inputs_rejects_an_input_with_no_address_form() {
     assert_eq!(json["error"], "unsupported_input_script");
 }
 
+/// **The guard for the defect that kept recurring** (#713).
+///
+/// A seat's price is computed twice: by the coordinator, to decide what to
+/// accept, and by the round builder, to decide what to construct. Those were
+/// separate computations and they disagreed — 102,026 sats against 101,440 —
+/// for as long as both only checked `>=`, because the larger silently won and
+/// the difference went to miners. Requiring exactness (#698) turned a
+/// tolerated gap into a round nobody could join.
+///
+/// The guard has to cross the two *implementations*, not restate one of them.
+/// An earlier version of this test derived both sides from
+/// `per_participant_mining_share` and passed happily while that function was
+/// mutated — it could not fail, which makes it worse than no test. So this
+/// takes the price the **builder** would construct against and submits it to
+/// the **endpoint**, which runs the coordinator's own
+/// `required_participant_input`. If either side moves, registration refuses
+/// and this goes red.
+#[tokio::test]
+async fn a_seat_priced_by_the_builder_is_accepted_by_the_coordinator() {
+    use wraith_protocol::{LiteRoundBuilder, LiteTier};
+
+    // What the round builder will construct against, for the fixture tier.
+    let builder_price = LiteRoundBuilder::new_mix(
+        "price-check".into(),
+        LiteTier::Denom100kSats,
+        Network::Signet,
+        TEST_FEE_ADDRESS.to_string(),
+    )
+    .min_participant_input();
+
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(fixture_outpoint(0x00, 0), builder_price, fixture_spk(0));
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(&session_id, "wallet-0", 0, 0x00, 0, builder_price, None),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the builder prices a seat at {builder_price} sats and the coordinator refused it: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// The price the coordinator publishes must be the price it enforces —
+/// otherwise a wallet splits its coin to a figure that is then refused.
+#[tokio::test]
+async fn the_published_seat_price_is_the_enforced_one() {
+    let router = router();
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pool/discover")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tier = json["tiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "100k_sats")
+        .expect("100k tier");
+    // Compared against the builder, not a constant: a constant would drift
+    // with both of them and prove nothing.
+    let builder_price = wraith_protocol::LiteRoundBuilder::new_mix(
+        "price-check".into(),
+        wraith_protocol::LiteTier::Denom100kSats,
+        Network::Signet,
+        TEST_FEE_ADDRESS.to_string(),
+    )
+    .min_participant_input();
+    assert_eq!(tier["mix_seat_price_sats"], builder_price);
+    assert_eq!(tier["mix_seat_price_sats"], EXACT_INPUT_100K_MIX);
+}
+
 /// One outpoint, one participant (#701).
 ///
 /// Two participants registering the same coin builds a transaction with
