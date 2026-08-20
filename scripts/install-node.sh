@@ -826,26 +826,46 @@ systemctl daemon-reload 2>/dev/null || true
 # (safe: the dashboard is non-consensus). No-op when the unit isn't installed.
 systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart ghost-dashboard || true
 
-# Wraith mixing coordinator. Keys are the `[coordinator]` (CoordinatorConfig)
-# fields read by ghost-pool: `coordinator_role_enabled` actually RUNS the
-# in-process coordinator when this node wins a seat; `coordinator_port` is the
-# listen port (0.0.0.0:<port>). Participation needs no bond — registration
-# proves control of the input and a disrupting coin goes into cooldown — so
-# the coordinator needs only the node's own ghostd RPC, which it already has.
-# `wraith_election_enabled` + `coordinator_enabled`
-# + `advertised_endpoint` make this node electable and let it compute the
-# per-epoch draw, so a single enabled node is enough and many are safe.
+# Wraith mixing coordinator — the `[coordinator]` (CoordinatorConfig) keys
+# ghost-pool reads.
+#
+# The section is written on EVERY node, not only coordinating ones, because an
+# operator cannot opt in to a setting they cannot see. Nodes installed before
+# this had no `[coordinator]` block at all, so the only way to learn the option
+# existed was to read the source — and the live roster ended up with a single
+# member as a result.
+#
+# Opting in is two values:
+#   coordinator_enabled = true   → advertises the capability, so peers put this
+#                                  node in the roster and it can be drawn
+#   coordinator_role_enabled     → actually RUNS the coordinator when drawn
+#
+# Both default false. A node also needs `advertised_endpoint` reachable, or it
+# is skipped: a seat nobody can dial is worse than one seat fewer.
+#
+# Participation needs no bond — registration proves control of the input and a
+# disrupting coin goes into cooldown — so a coordinator needs only the node's
+# own ghostd RPC, which it already has.
+COORD_ENABLED=false
+COORD_ROLE=false
 if [[ "$WRAITH" == "true" ]]; then
+  COORD_ENABLED=true
+  COORD_ROLE=true
+fi
 cat >> /etc/ghost/pool.toml <<EOF
 
 [coordinator]
+# Take a coordinator seat when the per-epoch draw picks this node.
+# Set BOTH to true to opt in; see the install notes above.
+coordinator_enabled = ${COORD_ENABLED}
+coordinator_role_enabled = ${COORD_ROLE}
+# Compute and publish the election view (safe to leave on: read-only).
 wraith_election_enabled = true
-coordinator_enabled = true
+# Where wallets dial this node's coordinator. Must be reachable or the node
+# is skipped when seats are drawn.
 advertised_endpoint = "${PUBIP}:9100"
 coordinator_port = 9100
-coordinator_role_enabled = true
 EOF
-fi
 
 # H-11: configs with secrets must be 0600.
 chown ghost:ghost /etc/bitcoin/bitcoin.conf /etc/ghost/pool.toml

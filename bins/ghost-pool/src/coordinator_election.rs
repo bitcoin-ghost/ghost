@@ -51,6 +51,13 @@ use wraith_protocol::sortition::CoordinatorNodeId;
 /// different anchor and reject every election.
 pub const COORDINATOR_EPOCH_BLOCKS: u64 = wraith_protocol::EPOCH_BLOCKS;
 
+/// Below this many opted-in candidates, the election is reported as
+/// `degraded`: the draw still runs and still seats someone, but with one or
+/// two candidates it cannot deliver rotation or resistance to
+/// self-nomination, and saying so is better than publishing a seat list that
+/// looks like an election.
+pub const MIN_MEANINGFUL_ROSTER: usize = 3;
+
 /// Target number of concurrent coordinator seats per epoch. Sessions are
 /// sharded across these seats so no single coordinator owns every round.
 /// (Demand-driven sizing replaces this fixed target in a later increment.)
@@ -332,6 +339,8 @@ impl CoordinatorElection {
                 "beacon": serde_json::Value::Null,
                 "anchor_height": serde_json::Value::Null,
                 "roster": [],
+                "roster_size": 0,
+                "degraded": true,
             });
         };
 
@@ -363,6 +372,12 @@ impl CoordinatorElection {
             "beacon": hex::encode(c.beacon),
             "anchor_height": c.anchor_height,
             "roster": c.roster.iter().map(hex::encode).collect::<Vec<_>>(),
+            // A draw over one candidate is not a draw. Reported so a reader
+            // cannot mistake a single opted-in node for an election that
+            // rotated, and so "no single party is the operator" is checkable
+            // rather than assumed (#708).
+            "roster_size": c.roster.len(),
+            "degraded": c.roster.len() < MIN_MEANINGFUL_ROSTER,
         })
     }
 }
@@ -388,6 +403,21 @@ mod tests {
     // the unit tests don't need a live mesh/RPC. The wiring-specific logic under
     // test here is: epoch maths, beacon derivation, the disabled path, and the
     // hex/seat reporting shape.
+
+    /// A roster of one is not an election, and the view says so. Filed as
+    /// #708 after the live fleet turned out to have exactly that.
+    #[test]
+    fn a_thin_roster_is_reported_as_degraded() {
+        assert!(1 < MIN_MEANINGFUL_ROSTER, "one candidate cannot rotate");
+        assert!(
+            2 < MIN_MEANINGFUL_ROSTER,
+            "two cannot resist self-nomination"
+        );
+        assert!(
+            MIN_MEANINGFUL_ROSTER <= MAX_SEATS,
+            "the threshold must be reachable"
+        );
+    }
 
     #[test]
     fn epoch_and_anchor_height_maths() {
