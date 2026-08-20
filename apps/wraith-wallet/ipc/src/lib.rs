@@ -549,6 +549,39 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         selected_outpoints: Vec<OutpointRef>,
     },
+    /// Build the split that turns an ordinary coin into exactly one round
+    /// seat.
+    ///
+    /// A round has no change output, so a participant's input must be worth
+    /// precisely the seat price — denomination + mining-fee share +
+    /// service-fee share (#698). This asks the coordinator what that is,
+    /// derives a fresh address to receive it at, and builds the PSBT.
+    ///
+    /// It stops at the unsigned PSBT on purpose. Signing and broadcasting are
+    /// already verbs (`PsbtSign`, `PsbtBroadcast`); what was missing was
+    /// knowing the exact amount and having somewhere clean to put it. Keeping
+    /// them separate also means this never moves money on its own.
+    ///
+    /// ⚠ The resulting transaction is visible on-chain and marks the wallet
+    /// as preparing to mix. That is a stated cost, and a smaller one than a
+    /// change output inside the round, which would identify *which* output of
+    /// the round was theirs.
+    WraithPrepareCoin {
+        /// Tier to buy a seat in, e.g. `100k_sats`.
+        tier_id: String,
+        coordinator_url: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        coordinator_peers: Vec<String>,
+        /// BIP86 index for the address that will receive the seat. `None`
+        /// picks one well clear of the everyday range so the seat coin does
+        /// not collide with ordinary receive addresses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receive_index: Option<u32>,
+        #[serde(default = "default_fee_rate")]
+        fee_rate_sats_per_vb: u64,
+        #[serde(default = "default_l1_scan_max_index")]
+        bip86_scan_max: u32,
+    },
     /// Broadcast a finalized PSBT (or finalized raw tx hex) via
     /// ghost-pay → bitcoind's `sendrawtransaction`. The daemon
     /// extracts the tx from the PSBT before forwarding, so the
@@ -705,6 +738,7 @@ pub enum Response {
     PsbtInspected(PsbtInspectResponse),
     PsbtSigned(PsbtSignResponse),
     PsbtCreated(PsbtCreateResponse),
+    WraithCoinPrepared(WraithCoinPreparedResponse),
     PsbtBroadcast(PsbtBroadcastResponse),
     PsbtBumped(PsbtBumpFeeResponse),
     Error(ErrorResponse),
@@ -837,6 +871,26 @@ pub struct PsbtInspectResponse {
     /// Convenience flag — at least one input was signable but is
     /// not yet finalized, i.e. `PsbtSign` would do work.
     pub has_signable_inputs: bool,
+}
+
+/// The split that produces exactly one seat, ready to sign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WraithCoinPreparedResponse {
+    /// Unsigned PSBT, base64. Feed to `PsbtSign` then `PsbtBroadcast`.
+    pub psbt: String,
+    /// What a seat costs, as the coordinator published it.
+    pub seat_price_sats: u64,
+    /// Where the seat coin lands — the address to register as the round
+    /// input once this is confirmed.
+    pub destination_address: String,
+    /// BIP86 index of that address.
+    pub destination_index: u32,
+    pub input_count: u32,
+    pub total_input_sats: u64,
+    /// Residual going back to the wallet's ordinary funds. Linkable to the
+    /// wallet, which is precisely why it lives here and not in the round.
+    pub change_sats: u64,
+    pub fee_sats: u64,
 }
 
 /// Reply to [`Request::PsbtCreate`].

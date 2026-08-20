@@ -86,6 +86,40 @@ enum Command {
 
 #[derive(Subcommand)]
 enum MixCommand {
+    /// Turn an ordinary coin into exactly one round seat.
+    ///
+    /// A round has no change output, because a change output would identify
+    /// you inside it — so your input has to be worth precisely what a seat
+    /// costs. This asks the coordinator that price, picks a fresh address for
+    /// the seat coin, and builds the split.
+    ///
+    /// It stops at an unsigned PSBT. Sign it with `wraith psbt sign` and send
+    /// it with `wraith psbt broadcast`, then mix using the resulting output
+    /// once it has confirmed.
+    ///
+    /// Note the split transaction is visible on-chain and marks you as
+    /// preparing to mix. That is the cost of not carrying the link into the
+    /// round itself, where it would reveal which output was yours.
+    PrepareCoin {
+        /// HTTP URL of the wraith-coordinator endpoint.
+        #[arg(long)]
+        coordinator: String,
+        /// Fallback coordinator URLs, repeatable.
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Tier to buy a seat in, e.g. `100k_sats`.
+        #[arg(long)]
+        tier: String,
+        /// BIP86 index for the address that receives the seat.
+        #[arg(long)]
+        index: Option<u32>,
+        /// Mining fee rate for the split, sats/vB.
+        #[arg(long, default_value_t = 5)]
+        fee_rate: u64,
+        /// Highest BIP86 index to scan for spendable UTXOs.
+        #[arg(long, default_value_t = 32)]
+        scan_max: u32,
+    },
     /// Step 1: enrol in a Wraith Lite mix session against
     /// `coordinator_url`, commit the supplied UTXO, run the blind-
     /// sig protocol over `mix_output_address`, and fetch the
@@ -694,6 +728,21 @@ mod client {
                 },
             },
             Command::Mix { sub } => match sub {
+                MixCommand::PrepareCoin {
+                    coordinator,
+                    peers,
+                    tier,
+                    index,
+                    fee_rate,
+                    scan_max,
+                } => Request::WraithPrepareCoin {
+                    tier_id: tier,
+                    coordinator_url: coordinator,
+                    coordinator_peers: peers,
+                    receive_index: index,
+                    fee_rate_sats_per_vb: fee_rate,
+                    bip86_scan_max: scan_max,
+                },
                 MixCommand::Prepare {
                     coordinator,
                     coordinator_peers,
@@ -795,6 +844,38 @@ mod client {
         }
 
         match result {
+            Ok(Response::WraithCoinPrepared(p)) => {
+                println!(
+                    "seat price:   {} sats — exact, a round has no change output",
+                    p.seat_price_sats
+                );
+                println!(
+                    "destination:  {} (index {})",
+                    p.destination_address, p.destination_index
+                );
+                println!(
+                    "inputs:       {} totalling {} sats",
+                    p.input_count, p.total_input_sats
+                );
+                println!("change back:  {} sats", p.change_sats);
+                println!("mining fee:   {} sats", p.fee_sats);
+                println!();
+                println!("psbt:");
+                println!("{}", p.psbt);
+                println!();
+                println!("Next: `wraith psbt sign` then `wraith psbt broadcast`.");
+                println!(
+                    "Once it confirms, mix using the output at {} — that coin is exactly one seat.",
+                    p.destination_address
+                );
+                println!();
+                println!(
+                    "This split is visible on-chain and marks you as preparing to mix. It does\n\
+                     not reveal which output of the round is yours, which carrying the change\n\
+                     into the round would."
+                );
+                std::process::ExitCode::SUCCESS
+            }
             Ok(Response::Doctor(d)) => {
                 for c in &d.checks {
                     let mark = match c.status.as_str() {

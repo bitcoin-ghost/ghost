@@ -1755,6 +1755,77 @@ mod server {
     /// dispatch arm wraps that into a `Response::Error`. Pulled
     /// out of the dispatch closure so error-paths can use `?` and
     /// the lock holds stay scoped.
+    /// Default BIP86 index for a seat coin, chosen well clear of the
+    /// everyday receive range so a prepared seat never collides with an
+    /// address the wallet hands out for ordinary payments.
+    const SEAT_RECEIVE_INDEX: u32 = 900;
+
+    /// Build the split that turns an ordinary coin into exactly one seat.
+    ///
+    /// Asks the coordinator what a seat costs rather than deriving it — the
+    /// coordinator, the round builder and the wallet computing that number
+    /// separately is how it came to disagree with itself (#698). Stops at the
+    /// unsigned PSBT: signing and broadcasting are existing verbs, and
+    /// keeping them separate means this never moves money by itself.
+    async fn wraith_prepare_coin_handler(
+        state: &DaemonState,
+        tier_id: &str,
+        coordinator_url: String,
+        coordinator_peers: Vec<String>,
+        receive_index: Option<u32>,
+        fee_rate_sats_per_vb: u64,
+        bip86_scan_max: u32,
+    ) -> Result<wraith_wallet_ipc::WraithCoinPreparedResponse, String> {
+        use wraith_wallet_core::wraith::WraithSessionClient;
+
+        let client =
+            WraithSessionClient::with_peers(coordinator_url, coordinator_peers, state.network);
+        let (_answered_by, discover) = client
+            .discover()
+            .await
+            .map_err(|e| format!("could not ask the coordinator what a seat costs: {e}"))?;
+        let tier = discover
+            .tiers
+            .iter()
+            .find(|t| t.id == tier_id)
+            .ok_or_else(|| {
+                let known: Vec<&str> = discover.tiers.iter().map(|t| t.id.as_str()).collect();
+                format!("coordinator does not offer tier '{tier_id}'; it offers {known:?}")
+            })?;
+        let seat_price_sats = tier.mix_seat_price_sats;
+
+        let destination_index = receive_index.unwrap_or(SEAT_RECEIVE_INDEX);
+        let network = state.network;
+        let destination_address = with_active_wallet(state, move |_, ks| {
+            wraith_wallet_core::light::receive_address(ks, destination_index, network)
+                .map(|a| a.to_string())
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+
+        let created = psbt_create_handler(
+            state,
+            &destination_address,
+            seat_price_sats,
+            fee_rate_sats_per_vb,
+            None,
+            bip86_scan_max,
+            &[],
+        )
+        .await?;
+
+        Ok(wraith_wallet_ipc::WraithCoinPreparedResponse {
+            psbt: created.psbt,
+            seat_price_sats,
+            destination_address,
+            destination_index,
+            input_count: created.input_count,
+            total_input_sats: created.total_input_sats,
+            change_sats: created.change_sats,
+            fee_sats: created.fee_sats,
+        })
+    }
+
     async fn psbt_create_handler(
         state: &DaemonState,
         recipient_address: &str,
@@ -4443,6 +4514,27 @@ mod server {
             .await
             {
                 Ok(r) => Response::PsbtCreated(r),
+                Err(e) => Response::Error(ErrorResponse { message: e }),
+            },
+            Request::WraithPrepareCoin {
+                tier_id,
+                coordinator_url,
+                coordinator_peers,
+                receive_index,
+                fee_rate_sats_per_vb,
+                bip86_scan_max,
+            } => match wraith_prepare_coin_handler(
+                state,
+                &tier_id,
+                coordinator_url,
+                coordinator_peers,
+                receive_index,
+                fee_rate_sats_per_vb,
+                bip86_scan_max,
+            )
+            .await
+            {
+                Ok(r) => Response::WraithCoinPrepared(r),
                 Err(e) => Response::Error(ErrorResponse { message: e }),
             },
             Request::PsbtBroadcast { psbt_or_tx_hex } => {
