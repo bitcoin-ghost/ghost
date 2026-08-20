@@ -562,6 +562,57 @@ mod server {
             .map_err(|_| "user_entropy_digest must be exactly 32 bytes".to_string())
     }
 
+    /// Re-derive the election's beacon from the wallet's own node.
+    ///
+    /// Returns `true` when the beacon matches the anchor block's hash, and
+    /// also when this wallet has no node configured — in that case there is
+    /// nothing to pin against, and the weaker guarantee (`election_is_honest`
+    /// alone) is what the caller gets. Refusing outright would leave every
+    /// node-less wallet unable to use an election at all, which is a worse
+    /// answer than a stated-weaker check.
+    ///
+    /// A node that is configured but unreachable is also not a refusal: an
+    /// operator's election is not made dishonest by the wallet's own bitcoind
+    /// being down, and treating it as such would hand anyone who can knock
+    /// out a wallet's node the power to force it onto a manual coordinator.
+    fn beacon_pinned_to_chain(state: &DaemonState, election: &serde_json::Value) -> bool {
+        use wraith_wallet_core::ghostd::GhostdRpc;
+
+        let Some((anchor_height, _)) =
+            crate::coordinator_resolve::beacon_anchor_expectation(election)
+        else {
+            // No beacon published at all — `election_is_honest` refuses this
+            // on its own, so there is nothing to add here.
+            return true;
+        };
+        let Some(url) = state.ghostd_url.as_deref() else {
+            tracing::debug!("no bitcoind configured; election beacon not pinned to the chain");
+            return true;
+        };
+        let rpc = match (
+            state.ghostd_cookie_path.as_ref(),
+            state.ghostd_user.as_deref(),
+            state.ghostd_pass.as_deref(),
+        ) {
+            (Some(cookie), None, None) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(error = %e, "bitcoind auth unusable; beacon not pinned");
+                    return true;
+                }
+            },
+            (None, Some(u), Some(p)) => GhostdRpc::new(url, u, p),
+            _ => return true,
+        };
+        match rpc.get_block_hash(anchor_height) {
+            Ok(hash) => crate::coordinator_resolve::beacon_matches_chain(election, &hash),
+            Err(e) => {
+                tracing::debug!(error = %e, anchor_height, "anchor block unreachable; beacon not pinned");
+                true
+            }
+        }
+    }
+
     fn validate_wallet_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("wallet name must not be empty".into());
@@ -4066,9 +4117,24 @@ mod server {
                         None,
                     ) {
                         Ok(client) => match client.coordinator_election().await {
-                            Ok(election) => crate::coordinator_resolve::resolve_from_election(
-                                &election, &tier_id,
-                            ),
+                            Ok(election) => {
+                                // Pin the beacon to the chain if this wallet has
+                                // its own node. Verifying the draw against the
+                                // beacon published beside it only proves internal
+                                // consistency; the block hash is a fact the
+                                // operator does not get to state (#697).
+                                if !beacon_pinned_to_chain(state, &election) {
+                                    tracing::warn!(
+                                        "resolve coordinator: published beacon does not match \
+                                         the anchor block; refusing the election"
+                                    );
+                                    (None, election.get("epoch").and_then(|e| e.as_u64()))
+                                } else {
+                                    crate::coordinator_resolve::resolve_from_election(
+                                        &election, &tier_id,
+                                    )
+                                }
+                            }
                             Err(e) => {
                                 tracing::debug!(error = %e, "resolve coordinator: election fetch failed");
                                 (None, None)

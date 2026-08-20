@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use wraith_protocol::sortition::{
     shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,
 };
+use wraith_protocol::{derive_beacon, snapshot_height_for_epoch};
 
 /// Domain separator for the coordinator shard key.
 const SHARD_KEY_DOMAIN: &[u8] = b"ghost/wraith/coordinator-shard/v1";
@@ -89,6 +90,49 @@ fn election_is_honest(election: &serde_json::Value) -> bool {
     claimed.sort_by_key(|c| c.seat);
 
     verify_election(&beacon, epoch, &roster, seats as usize, &claimed)
+}
+
+/// The block height whose hash must anchor this election's beacon, and the
+/// beacon it claims. `None` if the document does not carry both.
+///
+/// The height is computed from the epoch rather than read from the document.
+/// Reading it would let a publisher name whichever block produced a beacon it
+/// liked and stay self-consistent; deriving it means the anchor is whatever
+/// the protocol says it is. The published `anchor_height` is therefore a
+/// convenience for humans, not an input to the check.
+pub fn beacon_anchor_expectation(election: &serde_json::Value) -> Option<(u64, [u8; 32])> {
+    let epoch = election.get("epoch")?.as_u64()?;
+    let claimed = election.get("beacon")?.as_str().and_then(decode_32)?;
+    Some((snapshot_height_for_epoch(epoch), claimed))
+}
+
+/// Does the claimed beacon actually follow from the anchor block's hash?
+///
+/// This is the half of the trust gap that can be closed. `election_is_honest`
+/// proves the seat list follows from the beacon and roster published beside
+/// it — but those arrive from the same place as the result, so a publisher
+/// lying about all of them consistently still verifies. The beacon is
+/// pinnable: it is `SHA256(domain ‖ epoch ‖ anchor_block_hash)`, and the
+/// anchor block hash is a fact about the chain that the wallet's own node can
+/// state. A fabricated beacon cannot survive it.
+///
+/// `anchor_hash_hex` is the hash exactly as the node's `getblockhash`
+/// returned it, decoded without byte reversal — matching how the deriving
+/// node reads it.
+///
+/// The roster remains trusted after this: closing that needs the qualified
+/// set to come from consensus rather than from whoever answered.
+pub fn beacon_matches_chain(election: &serde_json::Value, anchor_hash_hex: &str) -> bool {
+    let Some((_, claimed)) = beacon_anchor_expectation(election) else {
+        return false;
+    };
+    let Some(epoch) = election.get("epoch").and_then(|e| e.as_u64()) else {
+        return false;
+    };
+    let Some(anchor) = decode_32(anchor_hash_hex) else {
+        return false;
+    };
+    derive_beacon(epoch, &anchor) == claimed
 }
 
 /// Decode a 32-byte hex string, rejecting anything else.
@@ -247,6 +291,46 @@ mod tests {
         e.as_object_mut().unwrap().remove("beacon");
         assert!(!election_is_honest(&e));
         assert_eq!(resolve_from_election(&e, "100k_sats").0, None);
+    }
+
+    /// The anchor height is derived from the epoch, never read from the
+    /// document — otherwise a publisher could name whichever block produced
+    /// a beacon it liked and stay perfectly self-consistent.
+    #[test]
+    fn the_anchor_height_comes_from_the_epoch_not_the_document() {
+        let mut e = honest_election(7, 6, 3);
+        e["anchor_height"] = json!(999_999);
+        let (height, _) = beacon_anchor_expectation(&e).expect("has a beacon");
+        assert_eq!(height, snapshot_height_for_epoch(7));
+        assert_ne!(height, 999_999);
+    }
+
+    /// A beacon that really is derived from the anchor block passes.
+    #[test]
+    fn a_chain_derived_beacon_is_accepted() {
+        let epoch = 11u64;
+        let mut e = honest_election(epoch, 6, 3);
+        e["beacon"] = json!(hex::encode(derive_beacon(epoch, &[3u8; 32])));
+        assert!(beacon_matches_chain(&e, &hex::encode([3u8; 32])));
+    }
+
+    /// **The attack this closes.** A publisher invents a beacon, then builds a
+    /// seat list that follows from it perfectly — so `election_is_honest`
+    /// passes. It cannot survive contact with the chain: the anchor block's
+    /// hash is not something the publisher gets to state.
+    #[test]
+    fn a_fabricated_beacon_is_caught_by_the_chain_even_though_it_is_self_consistent() {
+        let e = honest_election(11, 6, 3);
+        assert!(election_is_honest(&e), "internally consistent");
+        assert!(!beacon_matches_chain(&e, &hex::encode([3u8; 32])));
+    }
+
+    /// A malformed anchor hash is a refusal, not an accident that passes.
+    #[test]
+    fn a_malformed_anchor_hash_does_not_verify() {
+        let e = honest_election(11, 6, 3);
+        assert!(!beacon_matches_chain(&e, "not-hex"));
+        assert!(!beacon_matches_chain(&e, ""));
     }
 
     /// A disabled election is not a failed one: nothing to verify, and the
