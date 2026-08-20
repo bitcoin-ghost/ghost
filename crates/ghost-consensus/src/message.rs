@@ -86,6 +86,12 @@ pub mod topics {
     pub const MESH_NODE_LIST_VOTE: &[u8] = b"mnlvote";
     /// Mesh node-list checkpoint sync (on-demand backfill of missed checkpoints)
     pub const MESH_NODE_LIST_SYNC: &[u8] = b"mnlsync";
+    /// A node's own signed endpoint advert, feeding the node-list checkpoint.
+    ///
+    /// `mnladv` shares no prefix relation with `mnlchk`/`mnlvote`/`mnlsync` — they diverge at
+    /// the fourth byte — which matters because ZMQ subscriptions match by PREFIX, so a topic
+    /// that extended an existing one would be silently delivered to its subscribers too.
+    pub const MESH_ENDPOINT_ADVERT: &[u8] = b"mnladv";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -317,6 +323,13 @@ pub enum MessageType {
     MeshNodeListCheckpointVote,
     /// Mesh node-list checkpoint sync request/response (node ↔ peer): on-demand backfill.
     MeshNodeListCheckpointSync,
+    /// A node's own signed endpoint advert (node → all): where miners reach it.
+    ///
+    /// Broadcast rather than requested, and self-signed rather than observed, because the
+    /// checkpoint's whole determinism rests on every node holding the SAME bytes for a peer's
+    /// endpoint. An address learned by observation differs per observer, which is what made
+    /// the node list unable to converge (#625).
+    MeshEndpointAdvertisement,
     /// Share shard: a node's signed epoch summary (node → all).
     ///
     /// Carries an `EpochSummary` — per-address `delta_micro` (evidenced by the epoch's Merkle
@@ -393,6 +406,7 @@ impl MessageType {
             Self::MeshNodeListCheckpoint => topics::MESH_NODE_LIST_CHECKPOINT,
             Self::MeshNodeListCheckpointVote => topics::MESH_NODE_LIST_VOTE,
             Self::MeshNodeListCheckpointSync => topics::MESH_NODE_LIST_SYNC,
+            Self::MeshEndpointAdvertisement => topics::MESH_ENDPOINT_ADVERT,
             Self::ShardEpochSummary => topics::SHARD_EPOCH_SUMMARY,
             Self::ShardTableSync => topics::SHARD_TABLE_SYNC,
             Self::ShardEvidence => topics::SHARD_EVIDENCE,
@@ -438,6 +452,7 @@ impl MessageType {
             Self::MeshNodeListCheckpoint => "mnlchk",
             Self::MeshNodeListCheckpointVote => "mnlvote",
             Self::MeshNodeListCheckpointSync => "mnlsync",
+            Self::MeshEndpointAdvertisement => "mnladv",
             Self::ShardEpochSummary => "shdsum",
             Self::ShardTableSync => "shdsync",
             Self::ShardEvidence => "shdevid",
@@ -2013,6 +2028,15 @@ pub struct MeshNodeListCheckpointSyncEntry {
     /// Canonical public-mining node set as of `cutoff_ts`.
     #[serde(default)]
     pub nodes: Vec<MeshNodeEntry>,
+    /// The self-signed adverts the checkpoint adopted. Carried through sync so a lagging peer
+    /// — or a shim — re-derives and re-verifies rather than trusting the serving node's
+    /// rendering of `nodes`.
+    #[serde(default)]
+    pub adverts: Vec<MeshEndpointAdvert>,
+    /// `mesh_advert_set_root(adverts)`. Part of `checkpoint_hash`, so it must survive sync or
+    /// the proposer signature cannot be reconstructed.
+    #[serde(with = "ghost_common::serde_hex::bytes32", default)]
+    pub advert_root: [u8; 32],
     /// `mesh_node_list_root(nodes)`.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub list_root: [u8; 32],
@@ -3361,6 +3385,144 @@ mod tests {
         assert_eq!(back.checkpoint_hash(), cp.checkpoint_hash());
         assert_eq!(back.nodes, cp.nodes);
         assert_eq!(back.signer_set_delta, cp.signer_set_delta);
+    }
+
+    /// ZMQ subscriptions match by PREFIX, so a topic that extends another is silently
+    /// delivered to that other topic's subscribers as well — a cross-wiring with no error and
+    /// no log line.
+    ///
+    /// The `topics` module has always documented this invariant and claimed it was "pinned by
+    /// a test". It was not. `test_message_topics` asserts two topics and
+    /// `test_topic_str_matches_topic_bytes` walks six hardcoded types; neither compares topics
+    /// against each other. The rule was enforced by whoever remembered to check by hand.
+    ///
+    /// ⚠ If a new topic makes this fail, RENAME IT. Do not relax the assertion: the failure is
+    /// telling you two message streams would land in one subscriber.
+    #[test]
+    fn no_topic_is_a_prefix_of_another() {
+        let all: &[(&str, &[u8])] = &[
+            ("SHARE", topics::SHARE),
+            ("BLOCK", topics::BLOCK),
+            ("PAYOUT_PROPOSAL", topics::PAYOUT_PROPOSAL),
+            ("VOTE", topics::VOTE),
+            ("HEALTH", topics::HEALTH),
+            ("DISCOVERY", topics::DISCOVERY),
+            ("ELDER", topics::ELDER),
+            ("ZK_PROPOSAL", topics::ZK_PROPOSAL),
+            ("ZK_VOTE", topics::ZK_VOTE),
+            ("VERIFICATION", topics::VERIFICATION),
+            ("EQUIVOCATION", topics::EQUIVOCATION),
+            ("MPC", topics::MPC),
+            ("L2_TRANSFER", topics::L2_TRANSFER),
+            ("L2_CHECKPOINT", topics::L2_CHECKPOINT),
+            ("L2_VOTE", topics::L2_VOTE),
+            ("L2_SYNC", topics::L2_SYNC),
+            ("PAYOUT_LEDGER_CHECKPOINT", topics::PAYOUT_LEDGER_CHECKPOINT),
+            ("PAYOUT_LEDGER_VOTE", topics::PAYOUT_LEDGER_VOTE),
+            ("PAYOUT_LEDGER_SYNC", topics::PAYOUT_LEDGER_SYNC),
+            ("PAYOUT_PROPOSAL_SYNC", topics::PAYOUT_PROPOSAL_SYNC),
+            ("SHARE_BATCH", topics::SHARE_BATCH),
+            ("SHARE_BATCH_VOTE", topics::SHARE_BATCH_VOTE),
+            ("SHARE_BATCH_SYNC", topics::SHARE_BATCH_SYNC),
+            ("SHARE_BATCH_PREVOTE", topics::SHARE_BATCH_PREVOTE),
+            ("SHARE_BATCH_PRECOMMIT", topics::SHARE_BATCH_PRECOMMIT),
+            (
+                "MESH_NODE_LIST_CHECKPOINT",
+                topics::MESH_NODE_LIST_CHECKPOINT,
+            ),
+            ("MESH_NODE_LIST_VOTE", topics::MESH_NODE_LIST_VOTE),
+            ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
+            ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
+            ("L2_SHIELD", topics::L2_SHIELD),
+            ("GLYPH", topics::GLYPH),
+            ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
+            ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
+            ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),
+            ("SHARD_SAMPLE_REQUEST", topics::SHARD_SAMPLE_REQUEST),
+            ("SHARD_SAMPLE_RESPONSE", topics::SHARD_SAMPLE_RESPONSE),
+        ];
+
+        // The count is pinned so a new topic cannot be added without visiting this test and
+        // being confronted with the invariant.
+        assert_eq!(
+            all.len(),
+            36,
+            "a topic was added or removed — extend `all` above, then check the invariant still holds"
+        );
+
+        for (name_a, a) in all {
+            for (name_b, b) in all {
+                if name_a == name_b {
+                    continue;
+                }
+                assert!(
+                    !b.starts_with(a),
+                    "topic {} ({}) is a prefix of {} ({}) — ZMQ would deliver {} to {} subscribers",
+                    name_a,
+                    String::from_utf8_lossy(a),
+                    name_b,
+                    String::from_utf8_lossy(b),
+                    name_b,
+                    name_a
+                );
+            }
+        }
+    }
+
+    /// Two message types sharing one topic is legitimate (the glyph pair does it), but two
+    /// DIFFERENT topics with identical bytes would make `validate_topic` ambiguous.
+    #[test]
+    fn no_two_distinct_topics_share_bytes() {
+        let all: &[(&str, &[u8])] = &[
+            ("SHARE", topics::SHARE),
+            ("BLOCK", topics::BLOCK),
+            ("PAYOUT_PROPOSAL", topics::PAYOUT_PROPOSAL),
+            ("VOTE", topics::VOTE),
+            ("HEALTH", topics::HEALTH),
+            ("DISCOVERY", topics::DISCOVERY),
+            ("ELDER", topics::ELDER),
+            ("ZK_PROPOSAL", topics::ZK_PROPOSAL),
+            ("ZK_VOTE", topics::ZK_VOTE),
+            ("VERIFICATION", topics::VERIFICATION),
+            ("EQUIVOCATION", topics::EQUIVOCATION),
+            ("MPC", topics::MPC),
+            ("L2_TRANSFER", topics::L2_TRANSFER),
+            ("L2_CHECKPOINT", topics::L2_CHECKPOINT),
+            ("L2_VOTE", topics::L2_VOTE),
+            ("L2_SYNC", topics::L2_SYNC),
+            ("PAYOUT_LEDGER_CHECKPOINT", topics::PAYOUT_LEDGER_CHECKPOINT),
+            ("PAYOUT_LEDGER_VOTE", topics::PAYOUT_LEDGER_VOTE),
+            ("PAYOUT_LEDGER_SYNC", topics::PAYOUT_LEDGER_SYNC),
+            ("PAYOUT_PROPOSAL_SYNC", topics::PAYOUT_PROPOSAL_SYNC),
+            ("SHARE_BATCH", topics::SHARE_BATCH),
+            ("SHARE_BATCH_VOTE", topics::SHARE_BATCH_VOTE),
+            ("SHARE_BATCH_SYNC", topics::SHARE_BATCH_SYNC),
+            ("SHARE_BATCH_PREVOTE", topics::SHARE_BATCH_PREVOTE),
+            ("SHARE_BATCH_PRECOMMIT", topics::SHARE_BATCH_PRECOMMIT),
+            (
+                "MESH_NODE_LIST_CHECKPOINT",
+                topics::MESH_NODE_LIST_CHECKPOINT,
+            ),
+            ("MESH_NODE_LIST_VOTE", topics::MESH_NODE_LIST_VOTE),
+            ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
+            ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
+            ("L2_SHIELD", topics::L2_SHIELD),
+            ("GLYPH", topics::GLYPH),
+            ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
+            ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
+            ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),
+            ("SHARD_SAMPLE_REQUEST", topics::SHARD_SAMPLE_REQUEST),
+            ("SHARD_SAMPLE_RESPONSE", topics::SHARD_SAMPLE_RESPONSE),
+        ];
+        for (i, (name_a, a)) in all.iter().enumerate() {
+            for (name_b, b) in all.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "topics {} and {} have identical bytes",
+                    name_a, name_b
+                );
+            }
+        }
     }
 
     #[test]

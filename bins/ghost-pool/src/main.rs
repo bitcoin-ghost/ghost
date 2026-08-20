@@ -4529,60 +4529,104 @@ async fn main() -> Result<()> {
             })
         })
     };
-    // compute_nodes: THIS node's view of the public-mining node set (self + connected
-    // public-mining peers), sorted+deduped by node_id. Stratum ports are the fixed
-    // well-known values; the shim appends them. Exact-set agreement means a divergent view
-    // simply doesn't reach quorum that round, so a transient mesh gap self-heals.
-    let compute_nodes_fn: ghost_pool::mesh_node_checkpoint::ComputeNodeListFn = {
-        let mesh_c = Arc::clone(&mesh);
-        let self_id = identity.node_id();
-        let self_addr = config.network.public_address.clone();
-        let self_public = is_public_mining;
-        Arc::new(move |_cutoff_ts, _height| {
-            use ghost_consensus::MeshNodeEntry;
-            const SV1_PORT: u16 = 3333;
-            const SV2_PORT: u16 = 34255;
-            let mut entries: Vec<MeshNodeEntry> = mesh_c
-                .peers()
-                .get_connected_peers(120)
-                .into_iter()
-                .filter(|p| p.capabilities.public_mining && !p.public_address.is_empty())
-                .map(|p| MeshNodeEntry {
-                    node_id: p.node_id,
-                    host: extract_peer_host(&p.public_address).to_string(),
-                    sv1_port: SV1_PORT,
-                    sv2_port: SV2_PORT,
-                })
-                .collect();
-            if self_public {
-                if let Some(addr) = self_addr.as_deref().filter(|a| !a.is_empty()) {
-                    entries.push(MeshNodeEntry {
-                        node_id: self_id,
-                        host: extract_peer_host(addr).to_string(),
-                        sv1_port: SV1_PORT,
-                        sv2_port: SV2_PORT,
-                    });
-                }
-            }
-            entries.sort_by_key(|n| n.node_id);
-            entries.dedup_by(|a, b| a.node_id == b.node_id);
-            if entries.is_empty() {
-                return None; // nothing to checkpoint yet
-            }
-            Some(entries)
-        })
+    // ONE store, shared by the inbound handler (which writes) and the propose path (which
+    // reads). See `with_advert_store` for why a second copy would fail silently.
+    let advert_store = Arc::new(ghost_pool::mesh_node_checkpoint::AdvertStore::new());
+
+    // The adverts covering a given qualified set, or None if we are missing any of them.
+    //
+    // This REPLACES a derivation that read `get_connected_peers(120)` and each peer's
+    // locally-observed address. That was the whole of #625: three node-local inputs feeding an
+    // exact-set agreement, which measured six distinct sets across seven reporters. Nothing
+    // here consults connectivity — an advert is held because its subject signed and broadcast
+    // it, not because we happen to have a socket open to them.
+    let compute_adverts_fn: ghost_pool::mesh_node_checkpoint::ComputeAdvertsFn = {
+        let store = Arc::clone(&advert_store);
+        Arc::new(move |qualified: &[ghost_common::types::NodeId]| store.covering(qualified))
     };
     let mesh_node_checkpoint_mgr = Arc::new(
         ghost_pool::mesh_node_checkpoint::MeshNodeListCheckpointManager::new(
             Arc::clone(&identity),
             Arc::clone(&db),
             mnlchk_send,
-            compute_nodes_fn,
+            compute_adverts_fn,
         )
-        .with_active_voter_set_fn(active_voter_set_fn),
+        .with_active_voter_set_fn(active_voter_set_fn.clone())
+        .with_advert_store(Arc::clone(&advert_store)),
     );
     mesh.register_handler(Arc::clone(&mesh_node_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+    // Publish THIS node's endpoint advert, and re-publish it on a cadence.
+    //
+    // Nothing else can say where this node lives: the advert is signed by our own key, so a
+    // peer that has never met us can still carry it into a proposal and every voter can check
+    // it. Without this task a node is simply absent from the qualified set's coverage, and
+    // `derive_mesh_node_list` refuses the whole list rather than quietly omitting it.
+    //
+    // ⚠ The advert is built ONCE, not per tick. `seq` is inside the signed bytes, so a fresh
+    // timestamp each cycle would make every re-broadcast look like news: peers would accept it,
+    // the advert root would move, and the checkpoint's "has the set changed?" test would be
+    // comparing against a value that never settles. Process start time is monotonic enough —
+    // a restart supersedes, an idle process does not.
+    //
+    // The immediate first tick IS wanted here, unlike the elder-revocation checker: publishing
+    // at once means a restarting node re-enters coverage in seconds rather than after a full
+    // period of everyone else being unable to propose.
+    {
+        let tx = mnlchk_tx.clone();
+        let store = Arc::clone(&advert_store);
+        let id = Arc::clone(&identity);
+        let addr = config.network.public_address.clone();
+        let public = is_public_mining;
+        tokio::spawn(async move {
+            let Some(raw) = addr.as_deref().filter(|a| !a.is_empty()) else {
+                warn!(
+                    "no network.public_address — this node cannot advertise a mining endpoint, \
+                     so the node-list checkpoint cannot cover it"
+                );
+                return;
+            };
+            let advert = ghost_pool::mesh_node_checkpoint::build_self_advert(
+                &id,
+                extract_peer_host(raw),
+                ghost_pool::MESH_ADVERT_SV1_PORT,
+                ghost_pool::MESH_ADVERT_SV2_PORT,
+                public,
+                chrono::Utc::now().timestamp().max(0) as u64,
+            );
+            // Seed our own before anything is sent: a single-node fleet must still be able to
+            // derive a list covering itself.
+            store.accept(advert.clone());
+            let Ok(bytes) = serde_json::to_vec(&advert) else {
+                error!("endpoint advert would not serialise — not advertising");
+                return;
+            };
+            info!(
+                host = %advert.host,
+                public_mining = advert.public_mining,
+                "mesh endpoint advert: publishing"
+            );
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                ghost_pool::MESH_ADVERT_REPUBLISH_SECS,
+            ));
+            // No shutdown branch, matching the checkpoint relay beside it: the task holds no
+            // resource that needs releasing and ends with the runtime. `shutdown_tx` is not
+            // even in scope this early in `main`.
+            loop {
+                interval.tick().await;
+                if tx
+                    .try_send((
+                        ghost_consensus::MessageType::MeshEndpointAdvertisement,
+                        bytes.clone(),
+                    ))
+                    .is_err()
+                {
+                    tracing::debug!("endpoint advert: relay channel full — will retry next cycle");
+                }
+            }
+        });
+    }
     {
         let mgr = Arc::clone(&mesh_node_checkpoint_mgr);
         let rpc_c = Arc::clone(&rpc);
@@ -7630,6 +7674,40 @@ async fn main() -> Result<()> {
     // use once the gate is armed — the widened set (active-qualified set floored to a superset
     // of the elders), from the SAME scoped query the consensus resolver uses. Ignores the gate
     // height so the go-live value is provable identical fleet-wide BEFORE arming.
+    // MESH_NODE_LIST convergence proof — the gate is IGNORED on purpose.
+    //
+    // #625's first problem was that this could not be checked at all: nothing is proposed
+    // below `MESH_NODE_LIST_CHECKPOINT_HEIGHT`, so proving the blob byte-identical fleet-wide
+    // required arming first. Deriving it here, gate or no gate, makes #402's acceptance
+    // criterion something an operator can run against all eight nodes and compare.
+    verification_state = verification_state.with_mesh_node_list_fn({
+        let store = Arc::clone(&advert_store);
+        let resolve = active_voter_set_fn.clone();
+        Arc::new(move |cutoff_ts: i64, height: u64| {
+            let mut qualified = resolve(cutoff_ts, height);
+            qualified.sort_unstable();
+            qualified.dedup();
+            if qualified.is_empty() {
+                return None;
+            }
+            // Report the gap rather than a bare failure: without full coverage the derivation
+            // refuses, and "which node has not advertised" is the only actionable part of that.
+            let missing: Vec<String> = store
+                .missing(&qualified)
+                .iter()
+                .map(|id| hex::encode(&id[..8]))
+                .collect();
+            let adverts = store.covering(&qualified)?;
+            let nodes = ghost_consensus::derive_mesh_node_list(&qualified, &adverts).ok()?;
+            Some((
+                nodes.len(),
+                hex::encode(ghost_consensus::mesh_node_list_root(&nodes)),
+                hex::encode(ghost_consensus::mesh_advert_set_root(&adverts)),
+                missing,
+            ))
+        })
+    });
+
     verification_state = verification_state.with_checkpoint_voter_set_fn({
         let db_c = Arc::clone(&db);
         let oracle_c = block_hash_oracle.clone();
