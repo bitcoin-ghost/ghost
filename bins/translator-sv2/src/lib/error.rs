@@ -46,7 +46,17 @@ pub struct Downstream;
 
 #[derive(Debug)]
 pub struct TproxyError<Owner> {
-    pub kind: TproxyErrorKind,
+    /// Boxed deliberately.
+    ///
+    /// `TproxyErrorKind` is a wide enum — its largest variants carry `std::io::Error`,
+    /// `SetDifficulty` and several library error types — which put `TproxyError` at 128 bytes,
+    /// exactly clippy's `result_large_err` threshold. Every `TproxyResult<T, _>` in this crate
+    /// was that wide, on success paths too, because a `Result` is as large as its larger arm.
+    ///
+    /// Boxing HERE rather than at each `TproxyResult` keeps all ~21 function signatures
+    /// unchanged: the indirection is an implementation detail of the error, not something
+    /// every caller has to name.
+    pub kind: Box<TproxyErrorKind>,
     pub action: Action,
     _owner: PhantomData<Owner>,
 }
@@ -75,7 +85,7 @@ impl<Owner> TproxyError<Owner> {
     pub fn is_expected_disconnect(&self) -> bool {
         matches!(self.action, Action::Disconnect(_))
             && matches!(
-                self.kind,
+                *self.kind,
                 TproxyErrorKind::ChannelErrorReceiver(_)
                     | TproxyErrorKind::ChannelErrorSender
                     | TproxyErrorKind::Io(_)
@@ -99,7 +109,7 @@ impl CanShutdown for Upstream {}
 impl<O> TproxyError<O> {
     pub fn log<E: Into<TproxyErrorKind>>(kind: E) -> Self {
         Self {
-            kind: kind.into(),
+            kind: Box::new(kind.into()),
             action: Action::Log,
             _owner: PhantomData,
         }
@@ -112,7 +122,7 @@ where
 {
     pub fn disconnect<E: Into<TproxyErrorKind>>(kind: E, downstream_id: DownstreamId) -> Self {
         Self {
-            kind: kind.into(),
+            kind: Box::new(kind.into()),
             action: Action::Disconnect(downstream_id),
             _owner: PhantomData,
         }
@@ -125,7 +135,7 @@ where
 {
     pub fn fallback<E: Into<TproxyErrorKind>>(kind: E) -> Self {
         Self {
-            kind: kind.into(),
+            kind: Box::new(kind.into()),
             action: Action::Fallback,
             _owner: PhantomData,
         }
@@ -138,7 +148,7 @@ where
 {
     pub fn shutdown<E: Into<TproxyErrorKind>>(kind: E) -> Self {
         Self {
-            kind: kind.into(),
+            kind: Box::new(kind.into()),
             action: Action::Shutdown,
             _owner: PhantomData,
         }
@@ -147,7 +157,7 @@ where
 
 impl<Owner> From<TproxyError<Owner>> for TproxyErrorKind {
     fn from(value: TproxyError<Owner>) -> Self {
-        value.kind
+        *value.kind
     }
 }
 
@@ -418,7 +428,7 @@ impl HandlerErrorType for TproxyErrorKind {
 impl<Owner> HandlerErrorType for TproxyError<Owner> {
     fn parse_error(error: ParserError) -> Self {
         Self {
-            kind: TproxyErrorKind::ParserError(error),
+            kind: Box::new(TproxyErrorKind::ParserError(error)),
             action: Action::Log,
             _owner: PhantomData,
         }
@@ -426,7 +436,10 @@ impl<Owner> HandlerErrorType for TproxyError<Owner> {
 
     fn unexpected_message(extension_type: ExtensionType, message_type: MessageType) -> Self {
         Self {
-            kind: TproxyErrorKind::UnexpectedMessage(extension_type, message_type),
+            kind: Box::new(TproxyErrorKind::UnexpectedMessage(
+                extension_type,
+                message_type,
+            )),
             action: Action::Log,
             _owner: PhantomData,
         }

@@ -488,7 +488,7 @@ impl TranslatorSv2 {
                             .await
                         {
                             error!("SV1 server startup failed: {e:?}");
-                            return Err(e.kind);
+                            return Err(*e.kind);
                         }
 
                         upstream_entry.tried_or_flagged = true;
