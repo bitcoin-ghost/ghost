@@ -10911,6 +10911,9 @@ mod tests {
             ],
             signer_set_delta: (vec![[2u8; 32]], vec![]),
             approvals: vec![([1u8; 32], vec![5u8; 64]), ([2u8; 32], vec![6u8; 64])],
+            // Round-tripped verbatim: `advert_root` is inside `checkpoint_hash`, so adverts
+            // that do not survive storage make the proposer signature unverifiable.
+            adverts_json: r#"[{"node_id":"aa","host":"h"}]"#.to_string(),
         };
         db.upsert_mesh_node_list_checkpoint(&rec).unwrap();
 
@@ -10924,6 +10927,10 @@ mod tests {
         assert_eq!(got.signer_set_delta.0, vec![[2u8; 32]]);
         assert_eq!(got.approvals.len(), 2);
         assert_eq!(got.approvals[1].1, vec![6u8; 64]);
+        // Verbatim, not merely present: the adverts are hashed into `advert_root`, which is
+        // inside `checkpoint_hash`, so a byte lost here makes the proposer signature
+        // unverifiable for ever after.
+        assert_eq!(got.adverts_json, r#"[{"node_id":"aa","host":"h"}]"#);
 
         // Idempotent by height (INSERT OR REPLACE), and range reads behave.
         db.upsert_mesh_node_list_checkpoint(&rec).unwrap();

@@ -1063,15 +1063,6 @@ mod tests {
         }
     }
 
-    fn entry(id: u8, host: &str) -> MeshNodeEntry {
-        MeshNodeEntry {
-            node_id: [id; 32],
-            host: host.to_string(),
-            sv1_port: 3333,
-            sv2_port: 34255,
-        }
-    }
-
     /// The shared "converged" public-mining set every node computes.
     /// A fixed advert set for tests that only care about "some coherent list", built from
     /// throwaway identities so every advert is genuinely self-signed.
@@ -1339,7 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_node_set_is_not_re_proposed() {
-        let (nodes, _, adverts) = build(4, &[Hold::All; 4]);
+        let (nodes, _, _) = build(4, &[Hold::All; 4]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
@@ -1360,7 +1351,7 @@ mod tests {
     async fn changed_node_set_is_re_proposed() {
         // Pre-seed a stale finalised checkpoint whose list_root differs from the current set, so
         // the proposer sees a change and DOES propose (the other direction of the cadence gate).
-        let (nodes, _, adverts) = build(4, &[Hold::All; 4]);
+        let (nodes, _, _) = build(4, &[Hold::All; 4]);
         let stale = MeshNodeListCheckpointRecord {
             height: 96,
             cutoff_ts: CUTOFF,
@@ -1391,7 +1382,7 @@ mod tests {
     async fn missed_checkpoint_backfills_via_signed_sync() {
         // Build a fleet, finalise H with real signatures, then hand the finalised checkpoint to a
         // BYSTANDER that missed it. It adopts only after verifying the full signed blob.
-        let (nodes, elders, adverts) = build(4, &[Hold::All; 4]);
+        let (nodes, elders, _) = build(4, &[Hold::All; 4]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
