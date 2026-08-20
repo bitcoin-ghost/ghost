@@ -97,7 +97,7 @@ REAPER="true"
 ARCHIVE="false"
 GHOST_PAY="false"
 # Wraith mixing coordinator. Empty = "auto": ON when Ghost Pay is on, OFF
-# otherwise (mixing rides on Ghost Pay's bond ledger). --wraith / --no-wraith
+# otherwise. --wraith / --no-wraith
 # pin it explicitly.
 WRAITH=""
 # Tor. OFF by default — a plain clearnet install is completely unchanged.
@@ -358,7 +358,7 @@ run_wizard() {
   GHOST_PAY="$(prompt_yes_no "  Enable Ghost Pay — L2 instant-payments service (+4 shares)?" N)"
 
   # Wraith mixing coordinator — only offered when Ghost Pay is on (it relies on
-  # ghost-pay's bond ledger). Defaults Y so a Ghost Pay node mixes by default.
+  # Defaults Y so a Ghost Pay node mixes by default.
   if [[ "$GHOST_PAY" == "true" ]]; then
     WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator (requires Ghost Pay)?" Y)"
   else
@@ -448,12 +448,11 @@ if [[ -n "$POOL_NAME" ]]; then
   fi
 fi
 
-# Wraith mixing rides on Ghost Pay's bond ledger (the coordinator verifies and
-# resolves participant bonds against ghost-pay on 127.0.0.1:8800). Resolve the
+# Resolve the
 # "auto" default — track Ghost Pay — and pull Ghost Pay in when Wraith was asked
 # for explicitly without it. We auto-enable Ghost Pay (rather than erroring) so a
 # non-interactive `--wraith` install can't half-provision a coordinator that has
-# no bond ledger to talk to.
+# nothing extra to talk to.
 if [[ -z "$WRAITH" ]]; then
   WRAITH="$GHOST_PAY"
 fi
@@ -553,7 +552,7 @@ if [[ -n "$cli_bin" ]]; then
 else
   log "ghost-cli not found in ${POOL_TARBALL} (older release?) — skipping."
 fi
-# ghost-pay (L2 + Wraith bond ledger) ships in the same signed tarball; install
+# ghost-pay (L2) ships in the same signed tarball; install
 # it only when Ghost Pay is enabled.
 if [[ "$GHOST_PAY" == "true" ]]; then
   install -m755 -o root -g root "$(find . -name ghost-pay -type f | head -1)" /opt/ghost/bin/ghost-pay
@@ -594,7 +593,7 @@ RPCPW="$(openssl rand -hex 32)"
 # internal_api_secret: the shared HMAC secret between ghost-pool and the node
 # dashboard. Generate ONCE and REUSE any existing value on re-runs, so an
 # upgrade/re-provision never rotates it out from under the dashboard (a rotated
-# secret 401s every internal dashboard request). Mirrors the BOND_LEDGER_TOKEN
+# secret 401s every internal dashboard request).
 # share-once pattern below. Change B (after pool.toml is written) mirrors this
 # same value into the dashboard's INTERNAL_AUTH_KEY so the two can never drift.
 if [[ -f /etc/ghost/pool.toml ]] && grep -qE '^internal_api_secret[[:space:]]*=' /etc/ghost/pool.toml; then
@@ -612,15 +611,11 @@ PRIVATE_MINING_PASSWORD=""
 if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
   PRIVATE_MINING_PASSWORD="$(openssl rand -hex 16)"
 fi
-# Ghost Pay secrets. On mainnet ghost-pay refuses to start without all three of
-# these (key-encryption password, API HMAC secret, coordinator bond-ledger
-# token). BOND_LEDGER_TOKEN is generated ONCE here and shared verbatim between
-# ghost-pay (GHOST_PAY_BOND_LEDGER_TOKEN) and the ghost-pool coordinator
-# ([coordinator] bond_ledger_token) so the two always match.
+# Ghost Pay secrets. On mainnet ghost-pay refuses to start without both of
+# these (key-encryption password, API HMAC secret).
 if [[ "$GHOST_PAY" == "true" ]]; then
   PAY_KEY_PASSWORD="$(openssl rand -hex 32)"
   PAY_API_SECRET="$(openssl rand -hex 32)"
-  BOND_LEDGER_TOKEN="$(openssl rand -hex 32)"
 fi
 
 # ───────────────────────── 5. ghostd config (sync) ───────────────────────────
@@ -831,30 +826,56 @@ systemctl daemon-reload 2>/dev/null || true
 # (safe: the dashboard is non-consensus). No-op when the unit isn't installed.
 systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart ghost-dashboard || true
 
-# Wraith mixing coordinator. Keys are the `[coordinator]` (CoordinatorConfig)
-# fields read by ghost-pool: `coordinator_role_enabled` actually RUNS the
-# in-process coordinator when this node wins a seat; `coordinator_port` is the
-# listen port (0.0.0.0:<port>); `bond_ledger_url`/`bond_ledger_token` point at
-# the local ghost-pay bond ledger (the token MUST equal ghost-pay's
-# GHOST_PAY_BOND_LEDGER_TOKEN). The URL is `https://` — ghost-pay serves its
-# bond endpoints with an identity-derived TLS cert and the coordinator pins it
-# against this node's own node_id (cert pubkey == node_id), so plain HTTP would
-# be rejected. `wraith_election_enabled` + `coordinator_enabled`
-# + `advertised_endpoint` make this node electable and let it compute the
-# per-epoch draw, so a single enabled node is enough and many are safe.
+# Wraith mixing coordinator — the `[coordinator]` (CoordinatorConfig) keys
+# ghost-pool reads.
+#
+# The section is written on EVERY node, not only coordinating ones, because an
+# operator cannot opt in to a setting they cannot see. Nodes installed before
+# this had no `[coordinator]` block at all, so the only way to learn the option
+# existed was to read the source — and the live roster ended up with a single
+# member as a result.
+#
+# Opting in is two values:
+#   coordinator_enabled = true   → advertises the capability, so peers put this
+#                                  node in the roster and it can be drawn
+#   coordinator_role_enabled     → actually RUNS the coordinator when drawn
+#
+# Both default false. A node also needs:
+#   - `advertised_endpoint` reachable, or it is skipped when seats are drawn:
+#     a seat nobody can dial is worse than one seat fewer;
+#   - `coordinator_fee_address` set, or every Mix round refuses its inputs
+#     with 503 fee_address_not_configured — seated but unable to coordinate.
+#
+# Participation needs no bond — registration proves control of the input and a
+# disrupting coin goes into cooldown — so a coordinator needs only the node's
+# own ghostd RPC, which it already has.
+COORD_ENABLED=false
+COORD_ROLE=false
 if [[ "$WRAITH" == "true" ]]; then
+  COORD_ENABLED=true
+  COORD_ROLE=true
+fi
 cat >> /etc/ghost/pool.toml <<EOF
 
 [coordinator]
+# Take a coordinator seat when the per-epoch draw picks this node.
+# Set BOTH to true to opt in; see the install notes above.
+coordinator_enabled = ${COORD_ENABLED}
+coordinator_role_enabled = ${COORD_ROLE}
+# Compute and publish the election view (safe to leave on: read-only).
 wraith_election_enabled = true
-coordinator_enabled = true
+# Where wallets dial this node's coordinator. Must be reachable or the node
+# is skipped when seats are drawn. The 9100 firewall rule follows
+# coordinator_role_enabled automatically (ghost-mining-firewall).
 advertised_endpoint = "${PUBIP}:9100"
 coordinator_port = 9100
-coordinator_role_enabled = true
-bond_ledger_url = "https://127.0.0.1:8800"
-bond_ledger_token = "${BOND_LEDGER_TOKEN}"
+# Destination for this coordinator's per-round service fee. NOT optional in
+# practice: a Mix round refuses every input with 503
+# fee_address_not_configured while this is unset, so a coordinator without
+# one is seated and cannot run a round. Defaults to this node's payout
+# address; change it if mixing revenue should land somewhere else.
+coordinator_fee_address = "${PAYOUT_ADDRESS}"
 EOF
-fi
 
 # H-11: configs with secrets must be 0600.
 chown ghost:ghost /etc/bitcoin/bitcoin.conf /etc/ghost/pool.toml
@@ -1237,16 +1258,14 @@ cat > /etc/systemd/system/ghost-pool.service.d/journal-access.conf <<EOF
 SupplementaryGroups=systemd-journal
 EOF
 
-# ghost-pay L2 service (also serves the Wraith bond ledger on 8800). Only
-# installed when Ghost Pay is enabled. GHOST_PAY_BOND_LEDGER_TOKEN is the SAME
-# secret written into pool.toml's [coordinator] bond_ledger_token above, so the
-# coordinator authenticates to this bond ledger. MPC verification keys default
+# ghost-pay L2 service on 8800. Only
+# MPC verification keys default
 # to the sibling of --data-dir (/home/ghost/.ghost/mpc_params), where ghost-pool
 # fetches them. The unit carries secrets, so it is locked to 0600.
 if [[ "$GHOST_PAY" == "true" ]]; then
 cat > /etc/systemd/system/ghost-pay.service <<EOF
 [Unit]
-Description=Ghost Pay L2 service (Wraith bond ledger)
+Description=Ghost Pay L2 service
 After=network-online.target ghostd.service ghost-pool.service
 Wants=network-online.target
 [Service]
@@ -1260,7 +1279,6 @@ Environment=BITCOIN_RPC_USER=ghostrpc_mainnet
 Environment=BITCOIN_RPC_PASSWORD=${RPCPW}
 Environment=GHOST_PAY_PASSWORD=${PAY_KEY_PASSWORD}
 Environment=GHOST_PAY_API_SECRET=${PAY_API_SECRET}
-Environment=GHOST_PAY_BOND_LEDGER_TOKEN=${BOND_LEDGER_TOKEN}
 Restart=on-failure
 RestartSec=15
 LimitNOFILE=65536
@@ -1325,9 +1343,9 @@ ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
 ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications + MPC contribution/vote exchange)
 ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS (peers fetch MPC params + votes)
-# Ghost Pay L2 / Wraith bond ledger (peers issue Ghost Pay verification
-# challenges here, and wallets escrow Wraith bonds here) — only when enabled.
-[[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay / bond ledger
+# Ghost Pay L2 (peers issue Ghost Pay verification challenges here) — only
+# when enabled.
+[[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
@@ -1634,7 +1652,7 @@ health_ghost_pool() {
 }
 
 health_ghost_pay() {
-  # Only meaningful when ghost-pay is installed. Bond ledger serves TLS with an
+  # Only meaningful when ghost-pay is installed. It serves TLS with an
   # identity-derived cert, so -k (we are localhost, integrity is the binary swap
   # we just verified, not the transport).
   unit_present ghost-pay.service || { log "health: ghost-pay not installed — skipped"; return 0; }

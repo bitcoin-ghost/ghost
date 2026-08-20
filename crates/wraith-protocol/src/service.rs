@@ -33,6 +33,10 @@ pub struct SeatedCoordinator {
     pub node_id: CoordinatorNodeId,
     /// Seat index `0..seats`; sessions shard onto seats via `shard_for`.
     pub seat: u32,
+    /// The sortition hash that won the seat. Published so a consumer can
+    /// recompute the draw and see *why* this node holds it, rather than
+    /// taking the seat list on trust (#697).
+    pub rank: [u8; 32],
     /// The endpoint a wallet dials for this seat, or `None` if the owner hasn't
     /// advertised one yet (the wallet then waits or picks another epoch).
     pub endpoint: Option<String>,
@@ -91,6 +95,7 @@ impl CoordinatorView {
             .map(|c| SeatedCoordinator {
                 node_id: c.node_id,
                 seat: c.seat,
+                rank: c.rank,
                 endpoint: self.endpoints.get(&c.node_id).cloned(),
             })
             .collect();
@@ -110,27 +115,27 @@ impl CoordinatorView {
         self.coords.seat_of(self_id)
     }
 
-    /// Whether `self_id` owns `session_id` this epoch — the node's check for "is
-    /// this session mine to coordinate?".
-    pub fn owns_session(&self, self_id: &CoordinatorNodeId, session_id: &[u8; 32]) -> bool {
-        self.coordinator_node_for_session(session_id).as_ref() == Some(self_id)
+    /// Whether `self_id` owns the sessions for `tier_id` this epoch — the
+    /// node's check for "are these sessions mine to coordinate?".
+    pub fn owns_tier(&self, self_id: &CoordinatorNodeId, tier_id: &str) -> bool {
+        self.coordinator_node_for_tier(tier_id).as_ref() == Some(self_id)
     }
 
     // ── wallet-side ──────────────────────────────────────────────────────────
 
-    /// The coordinator *node* that owns `session_id` this epoch (`None` when no
-    /// coordinators are seated).
-    pub fn coordinator_node_for_session(&self, session_id: &[u8; 32]) -> Option<CoordinatorNodeId> {
+    /// The coordinator *node* that owns `tier_id`'s sessions this epoch
+    /// (`None` when no coordinators are seated).
+    pub fn coordinator_node_for_tier(&self, tier_id: &str) -> Option<CoordinatorNodeId> {
         self.coords
-            .coordinator_for_session(session_id)
+            .coordinator_for_tier(tier_id, self.coords.epoch)
             .map(|c| c.node_id)
     }
 
-    /// The endpoint a wallet should connect to for `session_id`. `None` if no
+    /// The endpoint a wallet should connect to for `tier_id`. `None` if no
     /// coordinator is seated, or the owning coordinator has no known endpoint
     /// (the wallet then waits for discovery to catch up, or picks another epoch).
-    pub fn endpoint_for_session(&self, session_id: &[u8; 32]) -> Option<&str> {
-        let node = self.coordinator_node_for_session(session_id)?;
+    pub fn endpoint_for_tier(&self, tier_id: &str) -> Option<&str> {
+        let node = self.coordinator_node_for_tier(tier_id)?;
         self.endpoints.get(&node).map(String::as_str)
     }
 }
@@ -185,30 +190,27 @@ mod tests {
     }
 
     #[test]
-    fn wallet_resolves_a_real_endpoint_for_every_session() {
+    fn wallet_resolves_a_real_endpoint_for_every_tier() {
         let (v, _q) = view(5);
-        for i in 0u32..400 {
-            let mut sid = [0u8; 32];
-            sid[..4].copy_from_slice(&i.to_le_bytes());
+        for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
             let ep = v
-                .endpoint_for_session(&sid)
-                .expect("an endpoint for every session");
+                .endpoint_for_tier(tier)
+                .expect("an endpoint for every tier");
             assert!(ep.starts_with("https://node"));
         }
     }
 
+    /// The node's "is this mine?" answer and the wallet's "who do I dial?"
+    /// answer are the same function, so they cannot disagree. They used to be
+    /// two different functions keyed on different things.
     #[test]
     fn node_and_wallet_agree_on_the_owner() {
         let (v, _q) = view(5);
-        for i in 0u32..200 {
-            let mut sid = [0u8; 32];
-            sid[..4].copy_from_slice(&i.to_le_bytes());
-            let owner = v.coordinator_node_for_session(&sid).unwrap();
-            // the node that owns it agrees it owns it
-            assert!(v.owns_session(&owner, &sid));
-            // and no other seated node claims it
+        for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
+            let owner = v.coordinator_node_for_tier(tier).unwrap();
+            assert!(v.owns_tier(&owner, tier));
             for other in (0..12u8).map(node).filter(|x| *x != owner) {
-                assert!(!v.owns_session(&other, &sid));
+                assert!(!v.owns_tier(&other, tier));
             }
         }
     }
@@ -216,17 +218,16 @@ mod tests {
     #[test]
     fn missing_endpoint_yields_none_but_owner_still_known() {
         let q = qualified(12);
-        // endpoints for everyone EXCEPT whoever ends up owning session 0
+        // endpoints for everyone EXCEPT whoever ends up owning the tier
         let mut eps = endpoints(&q);
         let v_full = CoordinatorView::build(3, &beacon(7), &q, eps.clone(), 5);
-        let sid = [0u8; 32];
-        let owner = v_full.coordinator_node_for_session(&sid).unwrap();
+        let owner = v_full.coordinator_node_for_tier("100k_sats").unwrap();
         eps.remove(&owner);
         let v = CoordinatorView::build(3, &beacon(7), &q, eps, 5);
         // owner still known…
-        assert_eq!(v.coordinator_node_for_session(&sid), Some(owner));
+        assert_eq!(v.coordinator_node_for_tier("100k_sats"), Some(owner));
         // …but no endpoint to dial
-        assert_eq!(v.endpoint_for_session(&sid), None);
+        assert_eq!(v.endpoint_for_tier("100k_sats"), None);
     }
 
     #[test]
@@ -234,7 +235,7 @@ mod tests {
         let v = CoordinatorView::build(1, &beacon(1), &[], EndpointMap::new(), 4);
         assert_eq!(v.seats(), 0);
         assert!(!v.am_i_coordinator(&node(0)));
-        assert_eq!(v.endpoint_for_session(&[9u8; 32]), None);
+        assert_eq!(v.endpoint_for_tier("100k_sats"), None);
     }
 
     #[test]

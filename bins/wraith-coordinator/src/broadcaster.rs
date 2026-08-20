@@ -9,12 +9,12 @@
 //! the round-state machine.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::Transaction;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::rpc::{RpcClient, RpcError};
 
 /// Errors any [`Broadcaster`] implementation may surface to the
 /// coordinator. The state machine in `/witness` decides whether to
@@ -93,15 +93,11 @@ impl Broadcaster for StubBroadcaster {
 // Production: bitcoind JSON-RPC broadcaster
 // ---------------------------------------------------------------------------
 
-/// Thin JSON-RPC `sendrawtransaction` client. Talks to a bitcoind /
-/// any RPC backend that speaks the same wire shape.
+/// `sendrawtransaction` over the node's JSON-RPC interface.
 ///
-/// Authentication uses HTTP Basic — caller supplies either
-/// `(user, password)` from `bitcoin.conf`'s `rpcuser=` / `rpcpassword=`
-/// or a pre-loaded `__cookie__:<secret>` from `~/.bitcoin/.cookie`.
-/// Either way it lands in an `Authorization: Basic …` header on every
-/// call. TLS termination is the operator's job (e.g. via stunnel /
-/// nginx); the broadcaster's `endpoint` is the post-TLS URL.
+/// The transport, auth and request shapes live in [`crate::rpc`] — the
+/// coordinator talks to one node and `GhostdUtxoSource` needs the same
+/// connection, so only the method and the error mapping are here.
 ///
 /// Synchronous request because:
 ///   - the surrounding `Broadcaster` trait is sync,
@@ -109,126 +105,63 @@ impl Broadcaster for StubBroadcaster {
 ///   - we explicitly want the HTTP handler to block briefly until the
 ///     network has accepted the tx so the `/witness` response carries
 ///     the truth and can transition the session correctly.
-///
-/// HTTP transport is `ureq` — pure-sync with no internal tokio
-/// runtime. `reqwest::blocking` would panic on Drop inside the
-/// surrounding axum/tokio runtime (it tries to drop its own runtime
-/// from within ours).
 pub struct GhostdBroadcaster {
-    endpoint: String,
-    auth_header: String,
-    agent: ureq::Agent,
+    rpc: RpcClient,
 }
 
 impl GhostdBroadcaster {
-    /// Construct from a bitcoind RPC URL + (user, password). The pair
-    /// is base64-encoded into the Authorization header at construction
-    /// so we don't repeat the work on every call.
+    /// Construct from a bitcoind RPC URL + (user, password), as found
+    /// in `bitcoin.conf`'s `rpcuser=` / `rpcpassword=`.
     pub fn new(
         endpoint: impl Into<String>,
         user: &str,
         password: &str,
     ) -> Result<Self, BroadcastError> {
-        use base64::Engine;
-        let creds = format!("{user}:{password}");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(30))
-            .build();
         Ok(Self {
-            endpoint: endpoint.into(),
-            auth_header: format!("Basic {encoded}"),
-            agent,
+            rpc: RpcClient::new(endpoint, user, password),
         })
     }
 
-    /// Convenience: read `~/.bitcoin/.cookie` (or another path) and
-    /// build from the contents. Cookie is `__cookie__:<random>`; we
-    /// split on the first colon.
+    /// Convenience: build from bitcoind's `.cookie` file.
     pub fn from_cookie(
         endpoint: impl Into<String>,
         cookie_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, BroadcastError> {
-        let raw = std::fs::read_to_string(cookie_path.as_ref())
-            .map_err(|e| BroadcastError::Unreachable(format!("cookie read: {e}")))?;
-        let raw = raw.trim();
-        let (user, password) = raw
-            .split_once(':')
-            .ok_or_else(|| BroadcastError::Unreachable("malformed cookie file".into()))?;
-        Self::new(endpoint, user, password)
+        RpcClient::from_cookie(endpoint, cookie_path)
+            .map(|rpc| Self { rpc })
+            .map_err(|e| BroadcastError::Unreachable(e.to_string()))
     }
-}
 
-#[derive(Serialize)]
-struct RpcRequest<'a> {
-    jsonrpc: &'a str,
-    id: &'a str,
-    method: &'a str,
-    params: Vec<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct RpcResponse {
-    result: Option<serde_json::Value>,
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize, Debug)]
-struct RpcError {
-    code: i32,
-    message: String,
+    /// Build from an already-constructed client, so the same node
+    /// connection can also serve `gettxout` for input verification
+    /// without a second set of credentials.
+    pub fn from_rpc(rpc: RpcClient) -> Self {
+        Self { rpc }
+    }
 }
 
 impl Broadcaster for GhostdBroadcaster {
     fn broadcast(&self, tx: &Transaction) -> Result<bitcoin::Txid, BroadcastError> {
         let raw_hex = serialize_hex(tx);
-        let body = RpcRequest {
-            jsonrpc: "1.0",
-            id: "wraith-coordinator",
-            method: "sendrawtransaction",
-            params: vec![serde_json::Value::String(raw_hex.clone())],
-        };
-        debug!(endpoint = %self.endpoint, txid = %tx.compute_txid(), "sending sendrawtransaction");
+        debug!(endpoint = %self.rpc.endpoint(), txid = %tx.compute_txid(), "sending sendrawtransaction");
 
-        let resp = self
-            .agent
-            .post(&self.endpoint)
-            .set("Authorization", &self.auth_header)
-            .send_json(&body);
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(ureq::Error::Status(_, response)) => response,
-            Err(ureq::Error::Transport(t)) => {
-                let kind = t.kind();
-                let msg = format!("{t}");
-                let detail = format!("{kind:?}: {msg}");
-                return Err(BroadcastError::Unreachable(detail));
-            }
-        };
-        let status = resp.status();
-        let parsed: RpcResponse = resp
-            .into_json()
-            .map_err(|e| BroadcastError::Unreachable(format!("parse: {e}")))?;
-
-        if let Some(err) = parsed.error {
+        let result = match self.rpc.call(
+            "sendrawtransaction",
+            vec![serde_json::Value::String(raw_hex)],
+        ) {
+            Ok(v) => v,
             // bitcoind RPC errors have well-known codes; most of them
             // mean the tx is bad (already-spent, low-fee, etc.) — that's
             // a Rejected, not Unreachable. We intentionally don't try
             // to retry — the tx won't succeed elsewhere either.
-            warn!(code = err.code, msg = %err.message, "bitcoind rejected tx");
-            return Err(BroadcastError::Rejected(format!(
-                "code {}: {}",
-                err.code, err.message
-            )));
-        }
-
-        // 2xx + no `error` field but no `result` either is malformed
-        // bitcoind output — treat as Unreachable so the round can
-        // potentially be retried by an operator after diagnosis.
-        let result = parsed.result.ok_or_else(|| {
-            BroadcastError::Unreachable(format!("RPC {} returned neither result nor error", status))
-        })?;
+            Err(RpcError::Rpc { code, message }) => {
+                warn!(code, %message, "bitcoind rejected tx");
+                return Err(BroadcastError::Rejected(format!("code {code}: {message}")));
+            }
+            // Malformed output is treated as Unreachable so the round can
+            // potentially be retried by an operator after diagnosis.
+            Err(e) => return Err(BroadcastError::Unreachable(e.to_string())),
+        };
 
         // Result is a JSON string of the txid (64-char hex).
         let txid_hex = result

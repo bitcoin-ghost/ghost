@@ -17,7 +17,7 @@ use std::time::Duration;
 use bitcoin::Network;
 use wraith_coordinator::gossip_http::HttpGossipSink;
 use wraith_coordinator::{build_router, CoordinatorState};
-use wraith_protocol::{DeterministicSessionIdGenerator, MockBondLedger, MockClock};
+use wraith_protocol::{DeterministicSessionIdGenerator, MockClock};
 
 const TEST_FEE_ADDRESS: &str = "tb1q0xcqpzrky6eff2g52qdye53xkk9jxkvraulyla";
 
@@ -34,7 +34,6 @@ async fn spawn_active_with_peer_secret(
         Network::Signet,
         Arc::new(MockClock::new(1_700_000_000)),
         Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(Arc::new(MockBondLedger::new())),
         Some(TEST_FEE_ADDRESS.to_string()),
         None,
     );
@@ -66,7 +65,6 @@ async fn spawn_standby_with_secret(secret: Option<String>) -> (String, Arc<Coord
         Network::Signet,
         Arc::new(MockClock::new(1_700_000_000)),
         Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(Arc::new(MockBondLedger::new())),
         Some(TEST_FEE_ADDRESS.to_string()),
         None,
     );
@@ -367,7 +365,6 @@ async fn solo_coordinator_with_no_peers_runs_fine() {
         Network::Signet,
         Arc::new(MockClock::new(1_700_000_000)),
         Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(Arc::new(MockBondLedger::new())),
         Some(TEST_FEE_ADDRESS.to_string()),
         None,
     ));

@@ -296,11 +296,24 @@ export interface WalletCreateResult {
   path: string;
 }
 
+/**
+ * Create a wallet.
+ *
+ * `userEntropyDigest` is the hex digest of dice or coin flips the user rolled,
+ * mixed into the seed alongside the operating system's randomness and never
+ * used instead of it — so supplying none costs nothing, and supplying some can
+ * only raise the floor. Omitted until the dice screen lands (#705).
+ */
 export async function walletCreate(
   name: string,
   passphrase: string,
+  userEntropyDigest?: string,
 ): Promise<WalletCreateResult> {
-  const resp = await invoke("wallet_create", { name, passphrase });
+  const resp = await invoke("wallet_create", {
+    name,
+    passphrase,
+    userEntropyDigest,
+  });
   return unwrap<WalletCreateResult>(resp).payload;
 }
 
@@ -617,8 +630,9 @@ export interface WraithDiscoverTier {
   denomination_sats: number;
   min_participants: number;
   max_participants: number;
-  bond_sats: number;
   service_fee_sats: number;
+  mix_seat_price_sats: number;
+  jump_seat_price_sats: number;
 }
 
 export interface WraithDiscoverResult {
@@ -629,7 +643,6 @@ export interface WraithDiscoverResult {
   network: string;
   pool_id: string;
   service_fee_bps: number;
-  bond_bps: number;
   fill_window_secs: number;
   tiers: WraithDiscoverTier[];
 }
@@ -680,12 +693,10 @@ export interface WraithMixRunArgs {
   socks5_proxy?: string;
   tier_id: string;
   ghost_id: string;
-  bond_id_placeholder?: string;
   utxo_txid: string;
   utxo_vout: number;
   utxo_value_sats: number;
   utxo_scriptpubkey_hex: string;
-  change_address?: string;
   mix_output_address: string;
   bip86_index?: number;
   bip86_scan_max?: number;
@@ -703,12 +714,10 @@ export async function wraithMixRun(
     socks5Proxy: args.socks5_proxy,
     tierId: args.tier_id,
     ghostId: args.ghost_id,
-    bondIdPlaceholder: args.bond_id_placeholder,
     utxoTxid: args.utxo_txid,
     utxoVout: args.utxo_vout,
     utxoValueSats: args.utxo_value_sats,
     utxoScriptpubkeyHex: args.utxo_scriptpubkey_hex,
-    changeAddress: args.change_address,
     mixOutputAddress: args.mix_output_address,
     bip86Index: args.bip86_index,
     bip86ScanMax: args.bip86_scan_max,

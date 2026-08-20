@@ -131,7 +131,6 @@ pub fn assemble_round(ctx: RoundContext<'_>) -> Result<AssembledRound, AssembleE
             amount_sats: input.input.value_sats,
             script_pubkey,
             mixed_output_address: output.address.clone(),
-            change_address: input.change_address.clone(),
             participant_id: i as u32,
         };
         builder

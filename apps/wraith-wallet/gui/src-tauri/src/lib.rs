@@ -189,9 +189,22 @@ async fn wallet_delete(name: String) -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
+/// `user_entropy_digest` is the hex digest of dice or coin flips the user
+/// supplied, mixed into the seed alongside the OS source and never used
+/// instead of it. `None` is the ordinary case and costs the user nothing —
+/// see `wraith_wallet_core::user_entropy`.
 #[tauri::command]
-async fn wallet_create(name: String, passphrase: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletCreate { name, passphrase }).await?;
+async fn wallet_create(
+    name: String,
+    passphrase: String,
+    user_entropy_digest: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletCreate {
+        name,
+        passphrase,
+        user_entropy_digest,
+    })
+    .await?;
     to_value(&resp)
 }
 
@@ -457,7 +470,7 @@ async fn light_l1_utxos(
 }
 
 /// Fetch the coordinator's `/api/v1/pool/discover` payload —
-/// network, supported tiers, fee + bond rates. Same
+/// network, supported tiers, fee rates. Same
 /// connect-error-rotation invariant as the mix calls: HTTP errors
 /// propagate, only connection-level failures rotate to a peer.
 #[tauri::command]
@@ -493,12 +506,10 @@ async fn wraith_mix_run(
     socks5_proxy: Option<String>,
     tier_id: String,
     ghost_id: String,
-    bond_id_placeholder: Option<String>,
     utxo_txid: String,
     utxo_vout: u32,
     utxo_value_sats: u64,
     utxo_scriptpubkey_hex: String,
-    change_address: Option<String>,
     mix_output_address: String,
     bip86_index: Option<u32>,
     bip86_scan_max: Option<u32>,
@@ -509,12 +520,10 @@ async fn wraith_mix_run(
         socks5_proxy,
         tier_id,
         ghost_id,
-        bond_id_placeholder: bond_id_placeholder.unwrap_or_else(|| "placeholder".to_string()),
         utxo_txid,
         utxo_vout,
         utxo_value_sats,
         utxo_scriptpubkey_hex,
-        change_address,
         mix_output_address,
         bip86_index,
         bip86_scan_max,

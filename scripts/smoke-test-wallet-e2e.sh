@@ -7,8 +7,7 @@
 # able to prove the wallet works end-to-end WITHOUT the GUI — the CLI
 # (`wraith`) talks to the daemon (`wraithd`) over a Unix socket, and
 # the daemon talks to ghostd + ghost-pay + ghost-gsp, exactly as in
-# production. Nothing here is mocked except the coordinator's bond
-# ledger (regtest only — refused on mainnet by the binary).
+# production. Nothing here is mocked.
 #
 # Flows exercised, in order:
 #   1.  create a BIP-39 wallet                  (wraith wallet create)
@@ -387,7 +386,7 @@ pass "L2 send recorded in ghost-pay ledger (payment_id $PAYMENT_ID, -5000 send)"
 # ============================================================================
 step "FLOW 9 — single-round Wraith mix ($N participants → one CoinJoin tx)"
 
-declare -a INPUT_ADDRS MIX_OUT_ADDRS CHANGE_ADDRS
+declare -a INPUT_ADDRS MIX_OUT_ADDRS
 declare -a FUND_TXIDS UTXO_VOUTS UTXO_SPKS MIX_PIDS
 
 # Fee-collection address at a high BIP86 index so it can't collide with
@@ -403,20 +402,17 @@ echo "fee-collection address: $FEE_ADDR"
 for i in $(seq 0 $((N-1))); do
     INPUT_ADDRS[$i]=$(WRAITH --json light receive --index "$((10+i))"  | jq -r '.LightReceive.address // .address')
     MIX_OUT_ADDRS[$i]=$(WRAITH --json light receive --index "$((110+i))" | jq -r '.LightReceive.address // .address')
-    CHANGE_ADDRS[$i]=$(WRAITH --json light receive --index "$((210+i))" | jq -r '.LightReceive.address // .address')
 done
 
-# Start the coordinator with a real broadcast target (ghostd) + auto-
-# escrow mock bonds + a 30s fill window (collapses the 5-min default so
-# the round locks shortly after the 5th enrolment). All three flags are
-# refused on mainnet by the binary.
-step "starting wraith-coordinator (real broadcast, auto-escrow bonds)"
+# Start the coordinator with a real broadcast target (ghostd) and a 30s
+# fill window (collapses the 5-min default so the round locks shortly
+# after the 5th enrolment). The short window is refused on mainnet by
+# the binary.
+step "starting wraith-coordinator (real broadcast, no bonds)"
 "$BIN/wraith-coordinator" \
     --listen 127.0.0.1:9100 \
     --network regtest \
     --fee-address "$FEE_ADDR" \
-    --mock-bond-ledger \
-    --mock-bond-ledger-auto-escrow \
     --fill-window-secs 30 \
     --ghostd-url "$GHOSTD_RPC_URL" \
     --ghostd-user demo \
@@ -430,11 +426,19 @@ WRAITH --json mix discover --coordinator "$COORD_URL" \
     | jq -e '[(.WraithCoordinatorDiscover.tiers // .tiers)[] | select(.id == "100k_sats")] | length == 1' \
     >/dev/null || fail "coordinator does not advertise the 100k_sats tier"
 
-# Fund one input UTXO per participant. 200,000 sats covers denom
-# (100,000) + bond (500) + per-input fee share + change.
-step "funding $N mix-input UTXOs at 200,000 sats each"
+# Fund one input UTXO per participant with EXACTLY the seat price. Rounds
+# have no change output (#698), so an over-funded UTXO is refused — and the
+# figure is read from the coordinator rather than hardcoded, because a
+# second copy of that calculation is what went wrong last time.
+SEAT_PRICE=$(WRAITH --json mix discover --coordinator "$COORD_URL" \
+    | jq -r '[(.WraithCoordinatorDiscover.tiers // .tiers)[]
+              | select(.id == "100k_sats")][0].mix_seat_price_sats')
+[ -n "$SEAT_PRICE" ] && [ "$SEAT_PRICE" != "null" ] \
+    || fail "coordinator did not publish mix_seat_price_sats for the 100k tier"
+SEAT_PRICE_BTC=$(awk -v s="$SEAT_PRICE" 'BEGIN { printf "%.8f", s / 100000000 }')
+step "funding $N mix-input UTXOs at exactly $SEAT_PRICE sats each"
 for i in $(seq 0 $((N-1))); do
-    FUND_TXIDS[$i]=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" 0.002)
+    FUND_TXIDS[$i]=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" "$SEAT_PRICE_BTC")
 done
 $BCLI -rpcwallet=demo generatetoaddress 6 "$DEMO_ADDR" >/dev/null
 
@@ -459,11 +463,9 @@ for i in $(seq 0 $((N-1))); do
             --coordinator "$COORD_URL" \
             --tier 100k_sats \
             --ghost-id "smoke_participant_$i" \
-            --bond-id-placeholder "placeholder_$i" \
             --utxo "${FUND_TXIDS[$i]}:${UTXO_VOUTS[$i]}" \
-            --utxo-value 200000 \
+            --utxo-value "$SEAT_PRICE" \
             --utxo-scriptpubkey "${UTXO_SPKS[$i]}" \
-            --change-address "${CHANGE_ADDRS[$i]}" \
             --mix-output-address "${MIX_OUT_ADDRS[$i]}" \
             --bip86-index "$((10+i))" \
             > "$DATADIR/mix-$i.out" 2>&1

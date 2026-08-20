@@ -12,91 +12,222 @@ use axum::{
 use bitcoin::Network;
 use tower::ServiceExt;
 use wraith_coordinator::broadcaster::{Broadcaster, StubBroadcaster};
+use wraith_coordinator::utxo_source::MockUtxoSource;
 use wraith_coordinator::{build_router, CoordinatorState};
-use wraith_protocol::{DeterministicSessionIdGenerator, MockBondLedger, MockClock};
+use wraith_protocol::{DeterministicSessionIdGenerator, MockClock};
 
 /// Signet P2WPKH address used as the placeholder coordinator fee
 /// destination + change destination in tests. Real bech32 with a
 /// valid checksum so /outputs's address parser accepts it.
+///
+/// Deliberately **not** P2TR: neither the fee output nor a change
+/// output is a mixed output, so neither is subject to the P2TR-only
+/// rule (#696). It doubles as the wrong-type fixture for
+/// `outputs_rejects_a_non_p2tr_address`.
 const TEST_FEE_ADDRESS: &str = "tb1q0xcqpzrky6eff2g52qdye53xkk9jxkvraulyla";
 
-/// Five distinct valid signet P2WPKH addresses for the
-/// outputs-over-submission test. Generated from `[i; 32]` secret keys
-/// 1..=5 — deterministic so the strings are stable.
+/// Five distinct valid signet **P2TR** addresses for the
+/// outputs-over-submission test. BIP86 key-path outputs derived from
+/// `[i; 32]` secret keys 1..=5 — deterministic so the strings are
+/// stable.
+///
+/// Mixed outputs are P2TR and nothing else (#696), so these are what a
+/// wallet may register at /outputs.
 const FIVE_SIGNET_ADDRS: [&str; 5] = [
-    "tb1q0xcqpzrky6eff2g52qdye53xkk9jxkvraulyla",
-    "tb1qa0qwuze2h85zw7nqpsj3ga0z9geyrgwptrz29s",
-    "tb1qg975h6gdx5mryeac72h6lj2nzygugxhyk6dnhr",
-    "tb1q3zxmh4ue370cp48c9d8eeek43qhnzzhvz4t84j",
-    "tb1qn454ga9rqwkx6ax309knw5hs0z2erz7jg4x4y7",
+    "tb1p33wm0auhr9kkahzd6l0kqj85af4cswn276hsxg6zpz85xe2r0y8snwrkwy",
+    "tb1p5e6v9v2j5wp3y6c79gaqdqltq7jdv45fswnnm7exmmp2020mqepsvssqqw",
+    "tb1p6wsds2al4cnjx209fcangy80exryd6hsddakha72mnhwqkapg3lqfsl44e",
+    "tb1p770cds92gkjrjfu7cr76fyj82snvp6jadyre7xen6mrx2y52vphsp5shce",
+    "tb1pngylwuvf9ud79em6cvp0lzx48t7ujn36670kdfsxt08ngvmc59xsuh0yev",
 ];
 
-/// A sixth distinct valid signet P2WPKH address for the
-/// outputs-full over-submission test (key = [6; 32]).
-const SIXTH_SIGNET_ADDR: &str = "tb1q6jlzchtg6pl8sstn4m42uaz7xmnkhv3606kk9z";
+/// A sixth distinct valid signet P2TR address for the outputs-full
+/// over-submission test (key = [6; 32]).
+const SIXTH_SIGNET_ADDR: &str = "tb1pweq8jyw0sgtx6jure6mqpalmx5wsupexu5vtwz69gjnz99mt8a2qwxedl7";
+
+/// The address single-submission tests register at /outputs. Must be
+/// P2TR like any other mixed output.
+const TEST_OUTPUT_ADDRESS: &str = FIVE_SIGNET_ADDRS[0];
 
 fn router() -> axum::Router {
     build_router(Arc::new(CoordinatorState::new(Network::Signet)))
 }
 
 /// Router backed by deterministic clock + session-id generator,
-/// MockBondLedger, a placeholder fee address, and `StubBroadcaster`.
+/// a placeholder fee address, and `StubBroadcaster`.
 /// Returns:
 ///   - the router
 ///   - the shared `Arc<CoordinatorState>` for direct inspection
-///   - the `Arc<MockBondLedger>` so tests can pre-escrow bonds before
-///     hitting `/inputs`. The same Arc lives inside `state.bond_ledger`.
 ///   - the `StubBroadcaster` so tests can assert that broadcast was
 ///     called once /witness collected the final submission.
 fn deterministic_router(
     initial_unix: u64,
-) -> (
-    axum::Router,
-    Arc<CoordinatorState>,
-    Arc<MockBondLedger>,
-    StubBroadcaster,
-) {
-    deterministic_router_full(initial_unix, true, true, true)
+) -> (axum::Router, Arc<CoordinatorState>, StubBroadcaster) {
+    let (router, state, stub, _utxos) = deterministic_router_full(initial_unix, true, true);
+    (router, state, stub)
 }
 
-/// Variant that lets tests opt out of the bond ledger (503 path), the
-/// fee address (Mix-needs-fee-address path), or the broadcaster
+/// Variant that lets tests opt out of the fee address
+/// (Mix-needs-fee-address path) or the broadcaster
 /// (broadcaster_not_configured path).
 fn deterministic_router_full(
     initial_unix: u64,
-    install_ledger: bool,
     install_fee_address: bool,
     install_broadcaster: bool,
 ) -> (
     axum::Router,
     Arc<CoordinatorState>,
-    Arc<MockBondLedger>,
     StubBroadcaster,
+    MockUtxoSource,
 ) {
-    // Always construct a ledger Arc so the test helper can return it;
-    // when `install_ledger == false` the state simply doesn't hold a
-    // reference to it.
-    let ledger = Arc::new(MockBondLedger::new());
-    let bond_ledger = if install_ledger {
-        Some(ledger.clone() as Arc<dyn wraith_protocol::BondLedger>)
-    } else {
-        None
-    };
     let stub = StubBroadcaster::new();
     let broadcaster = if install_broadcaster {
         Some(Arc::new(stub.clone()) as Arc<dyn Broadcaster>)
     } else {
         None
     };
-    let state = Arc::new(CoordinatorState::with_components(
-        Network::Signet,
-        Arc::new(MockClock::new(initial_unix)),
-        Arc::new(DeterministicSessionIdGenerator::new()),
-        bond_ledger,
-        install_fee_address.then(|| TEST_FEE_ADDRESS.to_string()),
-        broadcaster,
-    ));
-    (build_router(state.clone()), state, ledger, stub)
+    // Registration reads the input from the chain, not from the
+    // request (#699), so every router needs a UTXO source. This one is
+    // preloaded with exactly the outpoints the `make_*` helpers
+    // register; a test that claims some other value must add its own
+    // entry via `deterministic_router_with_utxos`.
+    let utxos = fixture_utxo_source();
+
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(MockClock::new(initial_unix)),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            install_fee_address.then(|| TEST_FEE_ADDRESS.to_string()),
+            broadcaster,
+        )
+        .with_utxo_source(Arc::new(utxos.clone())),
+    );
+    (build_router(state.clone()), state, stub, utxos)
+}
+
+/// A UTXO source holding exactly the outpoints the `make_*` helpers
+/// register. Any test that claims a different value must add its own
+/// entry.
+///
+/// `11…:i` is participant `i`'s coin — that is the shape
+/// `make_signing_session` submits. `00…:0` is wallet-0's coin, used by
+/// the single-participant tests.
+fn fixture_utxo_source() -> MockUtxoSource {
+    let utxos = MockUtxoSource::new();
+    for i in 0..MIN_5 as u32 {
+        utxos.insert(
+            fixture_outpoint(0x11, i),
+            EXACT_INPUT_100K_MIX,
+            fixture_spk(i as u8),
+        );
+    }
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+    utxos
+}
+
+/// Fixture participant `i`'s key. Deterministic (`[i + 1; 32]`, since
+/// zero is not a valid secret key) so every derived address and every
+/// signature is stable across runs.
+fn fixture_key(i: u8) -> bitcoin::PrivateKey {
+    let inner = secp256k1::SecretKey::from_slice(&[i + 1; 32]).expect("valid fixture secret key");
+    bitcoin::PrivateKey::new(inner, Network::Signet)
+}
+
+/// Fixture participant `i`'s BIP86 key-path P2TR address — what its coin
+/// pays to, and what its ownership proof is checked against.
+fn fixture_address(i: u8) -> bitcoin::Address {
+    let secp = secp256k1::Secp256k1::new();
+    let (xonly, _) = fixture_key(i).public_key(&secp).inner.x_only_public_key();
+    bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet)
+}
+
+/// The scriptPubKey of participant `i`'s coin. Registration compares the
+/// claim against the chain, so the two must agree — this is the single
+/// place that decides what both say.
+fn fixture_spk(i: u8) -> bitcoin::ScriptBuf {
+    fixture_address(i).script_pubkey()
+}
+
+/// A complete `/inputs` body for fixture participant `i`, carrying a real
+/// BIP-322 proof over this session's ownership challenge.
+///
+/// Real rather than canned: the coordinator checks the proof against the
+/// scriptPubKey the *chain* reports, so a canned blob would only ever
+/// prove that the check ran, not that it verifies what it claims to.
+fn signed_inputs_body(
+    session_id: &str,
+    ghost_id: &str,
+    i: u8,
+    txid_byte: u8,
+    vout: u32,
+    value_sats: u64,
+    change_address: Option<&str>,
+) -> serde_json::Value {
+    let txid = format!("{txid_byte:02x}").repeat(32);
+    let mut body = serde_json::json!({
+        "ghost_id": ghost_id,
+        "input": {
+            "txid": txid,
+            "vout": vout,
+            "value_sats": value_sats,
+            "scriptpubkey_hex": fixture_spk(i).to_hex_string(),
+        },
+        "ownership_proof": fixture_ownership_proof(session_id, i, &txid, vout),
+    });
+    if let Some(addr) = change_address {
+        body["change_address"] = serde_json::Value::String(addr.into());
+    }
+    body
+}
+
+/// Sign the session's ownership challenge with participant `i`'s key and
+/// encode it the way the BIP specifies: base64 of the witness.
+fn fixture_ownership_proof(session_id: &str, i: u8, txid: &str, vout: u32) -> String {
+    use base64::Engine;
+    use bitcoin::consensus::Encodable;
+
+    let challenge = wraith_protocol::ownership_challenge(session_id, txid, vout);
+    let witness = bip322::sign_simple(
+        &fixture_address(i),
+        challenge.as_bytes(),
+        &[fixture_key(i)],
+        None,
+    )
+    .expect("sign fixture ownership proof");
+
+    let mut encoded = Vec::new();
+    witness
+        .consensus_encode(&mut encoded)
+        .expect("encode witness");
+    base64::engine::general_purpose::STANDARD.encode(encoded)
+}
+
+/// `<byte repeated 32 times>:vout` — the shape every input fixture uses.
+fn fixture_outpoint(txid_byte: u8, vout: u32) -> bitcoin::OutPoint {
+    use std::str::FromStr;
+    bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_str(&format!("{txid_byte:02x}").repeat(32))
+            .expect("valid fixture txid"),
+        vout,
+    }
+}
+
+/// Router plus its UTXO source, for tests that register an input the
+/// preloaded set doesn't cover.
+fn deterministic_router_with_utxos(
+    initial_unix: u64,
+) -> (
+    axum::Router,
+    Arc<CoordinatorState>,
+    StubBroadcaster,
+    MockUtxoSource,
+) {
+    deterministic_router_full(initial_unix, true, true)
 }
 
 /// Build a JSON POST request — small ergonomics helper for the
@@ -148,8 +279,19 @@ async fn discover_endpoint_returns_full_tier_table() {
     assert_eq!(json["network"], "signet");
     assert_eq!(json["pool_id"], "wraith-pool-signet");
     assert_eq!(json["service_fee_bps"], 50);
-    assert_eq!(json["bond_bps"], 50);
     assert_eq!(json["fill_window_secs"], 300);
+
+    // The seat price the wallet must split its coin to match. Published so
+    // the wallet does not compute it independently — the coordinator and
+    // the round builder each doing that already disagreed once (#698).
+    let smallest_tier = json["tiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "100k_sats")
+        .expect("100k tier");
+    assert_eq!(smallest_tier["mix_seat_price_sats"], EXACT_INPUT_100K_MIX);
+    assert_eq!(smallest_tier["jump_seat_price_sats"], 101_010);
 
     let tiers = json["tiers"].as_array().expect("tiers must be an array");
     assert_eq!(tiers.len(), 4, "all four Lite tiers advertised");
@@ -163,7 +305,6 @@ async fn discover_endpoint_returns_full_tier_table() {
     assert_eq!(smallest["denomination_sats"], 100_000);
     assert_eq!(smallest["min_participants"], 5);
     assert_eq!(smallest["max_participants"], 20);
-    assert_eq!(smallest["bond_sats"], 500);
     assert_eq!(smallest["service_fee_sats"], 500);
 }
 
@@ -205,14 +346,13 @@ async fn unknown_path_returns_404() {
 
 #[tokio::test]
 async fn find_or_create_creates_a_new_session_when_registry_is_empty() {
-    let (router, state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
             serde_json::json!({
                 "tier_id": "100k_sats",
                 "ghost_id": "wallet-alice",
-                "bond_id": "bond-aaaa",
             }),
         ))
         .await
@@ -228,7 +368,6 @@ async fn find_or_create_creates_a_new_session_when_registry_is_empty() {
     assert_eq!(json["session"]["slots_total"], 20);
     assert_eq!(json["session"]["fill_window_expires_at"], 1_000_000 + 300);
     assert_eq!(json["joined"], false, "creating, not joining");
-    assert_eq!(json["bond_id"], "bond-aaaa");
 
     // Registry should now hold exactly one session.
     assert_eq!(state.sessions.len(), 1);
@@ -236,13 +375,12 @@ async fn find_or_create_creates_a_new_session_when_registry_is_empty() {
 
 #[tokio::test]
 async fn find_or_create_joins_an_existing_open_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
 
-    let body_for = |ghost: &str, bond: &str| {
+    let body_for = |ghost: &str| {
         serde_json::json!({
             "tier_id": "100k_sats",
             "ghost_id": ghost,
-            "bond_id": bond,
         })
     };
 
@@ -250,7 +388,7 @@ async fn find_or_create_joins_an_existing_open_session() {
         .clone()
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
-            body_for("wallet-alice", "bond-a"),
+            body_for("wallet-alice"),
         ))
         .await
         .unwrap();
@@ -265,7 +403,7 @@ async fn find_or_create_joins_an_existing_open_session() {
     let bob = router
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
-            body_for("wallet-bob", "bond-b"),
+            body_for("wallet-bob"),
         ))
         .await
         .unwrap();
@@ -284,7 +422,7 @@ async fn find_or_create_joins_an_existing_open_session() {
 
 #[tokio::test]
 async fn find_or_create_separates_distinct_tiers_into_distinct_sessions() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
 
     let small = router
         .clone()
@@ -293,7 +431,6 @@ async fn find_or_create_separates_distinct_tiers_into_distinct_sessions() {
             serde_json::json!({
                 "tier_id": "100k_sats",
                 "ghost_id": "wallet-small",
-                "bond_id": "bond-small",
             }),
         ))
         .await
@@ -307,7 +444,6 @@ async fn find_or_create_separates_distinct_tiers_into_distinct_sessions() {
             serde_json::json!({
                 "tier_id": "1m_sats",
                 "ghost_id": "wallet-big",
-                "bond_id": "bond-big",
             }),
         ))
         .await
@@ -325,14 +461,13 @@ async fn find_or_create_separates_distinct_tiers_into_distinct_sessions() {
 
 #[tokio::test]
 async fn find_or_create_rejects_unknown_tier_id_with_400() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
             serde_json::json!({
                 "tier_id": "not_a_tier",
                 "ghost_id": "wallet-alice",
-                "bond_id": "bond-x",
             }),
         ))
         .await
@@ -345,7 +480,7 @@ async fn find_or_create_rejects_unknown_tier_id_with_400() {
 
 #[tokio::test]
 async fn find_or_create_rejects_unknown_session_type_with_400() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
@@ -353,7 +488,6 @@ async fn find_or_create_rejects_unknown_session_type_with_400() {
                 "tier_id": "100k_sats",
                 "session_type": "blender",
                 "ghost_id": "wallet-alice",
-                "bond_id": "bond-x",
             }),
         ))
         .await
@@ -366,12 +500,11 @@ async fn find_or_create_rejects_unknown_session_type_with_400() {
 
 #[tokio::test]
 async fn find_or_create_rejects_duplicate_ghost_id_with_409() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
 
     let body = serde_json::json!({
         "tier_id": "100k_sats",
         "ghost_id": "wallet-alice",
-        "bond_id": "bond-a",
     });
     let first = router
         .clone()
@@ -394,14 +527,13 @@ async fn find_or_create_rejects_duplicate_ghost_id_with_409() {
 
 #[tokio::test]
 async fn find_or_create_rejects_blank_ghost_id_with_400() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
             serde_json::json!({
                 "tier_id": "100k_sats",
                 "ghost_id": "   ",
-                "bond_id": "bond-a",
             }),
         ))
         .await
@@ -418,14 +550,13 @@ async fn find_or_create_rejects_blank_ghost_id_with_400() {
 
 /// Helper — runs find_or_create on the given router and returns the
 /// session_id from the response.
-async fn create_session_via_router(router: axum::Router, ghost: &str, bond: &str) -> String {
+async fn create_session_via_router(router: axum::Router, ghost: &str) -> String {
     let response = router
         .oneshot(post_json(
             "/api/v1/session/find_or_create",
             serde_json::json!({
                 "tier_id": "100k_sats",
                 "ghost_id": ghost,
-                "bond_id": bond,
             }),
         ))
         .await
@@ -438,8 +569,8 @@ async fn create_session_via_router(router: axum::Router, ghost: &str, bond: &str
 
 #[tokio::test]
 async fn session_status_returns_200_with_descriptor_for_known_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = create_session_via_router(router.clone(), "wallet-a", "bond-a").await;
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = create_session_via_router(router.clone(), "wallet-a").await;
 
     let response = router
         .oneshot(
@@ -462,7 +593,7 @@ async fn session_status_returns_200_with_descriptor_for_known_session() {
 
 #[tokio::test]
 async fn session_status_returns_404_for_unknown_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(
             Request::builder()
@@ -488,13 +619,12 @@ async fn session_status_reflects_fill_window_expiry_after_clock_advance() {
         Network::Signet,
         mock_clock.clone(),
         Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(Arc::new(MockBondLedger::new())),
         Some(TEST_FEE_ADDRESS.to_string()),
         Some(Arc::new(StubBroadcaster::new())),
     ));
     let router = build_router(state.clone());
 
-    let session_id = create_session_via_router(router.clone(), "lonely-wallet", "bond-x").await;
+    let session_id = create_session_via_router(router.clone(), "lonely-wallet").await;
     // Clock advances past the fill window (300s) without enough joiners.
     mock_clock.advance(301);
 
@@ -530,16 +660,20 @@ const MIN_5: usize = 5;
 /// Per-participant minimum input for 100k_sats Mix at the default fee rate.
 /// Computed from: denom 100_000 + service_fee 500 + ceil((5*58 + 12*43)*10/5)
 /// = 100_000 + 500 + 1612 = 102_112. Same number the handler computes.
-const MIN_INPUT_100K_MIX: u64 = 102_112;
+/// The exact input a 100k-tier Mix seat costs: denomination + mining-fee
+/// share + service-fee share. Rounds have no change output (#698), so this
+/// is the only acceptable value, not a floor.
+const EXACT_INPUT_100K_MIX: u64 = 101_596;
 
-/// Drive 5 wallets through /find_or_create, escrow a bond per wallet,
+/// A scriptPubKey with no address form at all. Registration has to
+/// refuse it rather than panic deriving an address to check a proof
+/// against.
+const NONSTANDARD_SPK_HEX: &str = "deadbeef";
+
+/// Drive 5 wallets through /find_or_create,
 /// then advance the clock past the fill window so the registry's tick
 /// transitions Filling → Locked. Returns the session_id.
-async fn make_locked_session(
-    router: axum::Router,
-    state: &Arc<CoordinatorState>,
-    ledger: &Arc<MockBondLedger>,
-) -> String {
+async fn make_locked_session(router: axum::Router, state: &Arc<CoordinatorState>) -> String {
     // Enrol 5 distinct wallets.
     let mut session_id: Option<String> = None;
     for i in 0..MIN_5 {
@@ -550,7 +684,6 @@ async fn make_locked_session(
                 serde_json::json!({
                     "tier_id": "100k_sats",
                     "ghost_id": format!("wallet-{i}"),
-                    "bond_id": format!("placeholder-{i}"),
                 }),
             ))
             .await
@@ -566,11 +699,6 @@ async fn make_locked_session(
         }
     }
     let session_id = session_id.expect("at least one find_or_create succeeded");
-
-    // Escrow a real bond per wallet against this session.
-    for i in 0..MIN_5 {
-        ledger.escrow(format!("wallet-{i}"), &session_id, 500);
-    }
 
     // 100k_sats has min=5 but max=20, so 5 joiners doesn't auto-lock —
     // the registry would normally wait for the fill window to expire
@@ -590,56 +718,8 @@ async fn make_locked_session(
 }
 
 #[tokio::test]
-async fn inputs_returns_503_when_bond_ledger_not_configured() {
-    // No ledger configured; even submitting against an existing locked
-    // session fails fast with a clear error.
-    let (router, state, _unused_ledger, _broadcaster) =
-        deterministic_router_full(1_000_000, false, true, true);
-    // Manually create a locked session via gossip — same shortcut
-    // make_locked_session uses, but inline because no real bond
-    // ledger is available to escrow against.
-    state
-        .sessions
-        .apply_event(wraith_protocol::SessionGossipEvent::SessionCreated {
-            session: wraith_protocol::LiteSession {
-                session_id: "manual-session".into(),
-                tier: wraith_protocol::LiteTier::Denom100kSats,
-                session_type: wraith_protocol::SessionType::Mix,
-                created_at: 1_000_000,
-                state: wraith_protocol::LiteSessionState::Locked,
-                participants: vec![wraith_protocol::LiteSessionParticipant {
-                    ghost_id: "wallet-x".into(),
-                    bond_id: wraith_protocol::BondId::new("placeholder"),
-                    registered_at: 1_000_000,
-                }],
-            },
-        })
-        .unwrap();
-
-    let response = router
-        .oneshot(post_json(
-            "/api/v1/session/manual-session/inputs",
-            serde_json::json!({
-                "ghost_id": "wallet-x",
-                "input": {
-                    "txid": "00".repeat(32),
-                    "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": "deadbeef",
-                },
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "ledger_not_configured");
-}
-
-#[tokio::test]
 async fn inputs_returns_404_for_unknown_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/no-such-session/inputs",
@@ -648,7 +728,7 @@ async fn inputs_returns_404_for_unknown_session() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": "deadbeef",
                 },
             }),
@@ -663,8 +743,8 @@ async fn inputs_returns_404_for_unknown_session() {
 
 #[tokio::test]
 async fn inputs_returns_409_when_session_still_filling() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = create_session_via_router(router.clone(), "wallet-a", "bond-a").await;
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = create_session_via_router(router.clone(), "wallet-a").await;
     // Session is in Filling. /inputs should reject.
     let response = router
         .oneshot(post_json(
@@ -674,7 +754,7 @@ async fn inputs_returns_409_when_session_still_filling() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": "deadbeef",
                 },
             }),
@@ -689,8 +769,8 @@ async fn inputs_returns_409_when_session_still_filling() {
 
 #[tokio::test]
 async fn inputs_returns_403_for_unenrolled_ghost_id() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
     // wallet-99 is not on the participant list.
     let response = router
         .oneshot(post_json(
@@ -700,7 +780,7 @@ async fn inputs_returns_403_for_unenrolled_ghost_id() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
+                    "value_sats": EXACT_INPUT_100K_MIX,
                     "scriptpubkey_hex": "deadbeef",
                 },
             }),
@@ -713,57 +793,13 @@ async fn inputs_returns_403_for_unenrolled_ghost_id() {
     assert_eq!(json["error"], "not_enrolled");
 }
 
+/// Ownership proofs are not optional. Without one, registering someone
+/// else's coin is free (#699).
 #[tokio::test]
-async fn inputs_returns_402_when_bond_missing_in_ledger() {
-    // A locked session with all 5 enrolled but NO ledger escrows.
-    // /inputs should fail with bond_not_found.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    // Manually construct a locked session whose enrolled wallet has
-    // no bond escrowed in the (initially-empty) ledger.
-    state
-        .sessions
-        .apply_event(wraith_protocol::SessionGossipEvent::SessionCreated {
-            session: wraith_protocol::LiteSession {
-                session_id: "no-bond-session".into(),
-                tier: wraith_protocol::LiteTier::Denom100kSats,
-                session_type: wraith_protocol::SessionType::Mix,
-                created_at: 1_000_000,
-                state: wraith_protocol::LiteSessionState::Locked,
-                participants: vec![wraith_protocol::LiteSessionParticipant {
-                    ghost_id: "wallet-no-bond".into(),
-                    bond_id: wraith_protocol::BondId::new("placeholder"),
-                    registered_at: 1_000_000,
-                }],
-            },
-        })
-        .unwrap();
-    assert!(ledger.is_empty(), "test sanity: ledger really has no bonds");
+async fn inputs_rejects_a_missing_ownership_proof() {
+    let (router, state, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
 
-    let response = router
-        .oneshot(post_json(
-            "/api/v1/session/no-bond-session/inputs",
-            serde_json::json!({
-                "ghost_id": "wallet-no-bond",
-                "input": {
-                    "txid": "00".repeat(32),
-                    "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": "deadbeef",
-                },
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "bond_not_found");
-}
-
-#[tokio::test]
-async fn inputs_rejects_input_below_minimum_with_400() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
@@ -772,9 +808,8 @@ async fn inputs_rejects_input_below_minimum_with_400() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    // 1000 sats well below the minimum 102_112.
-                    "value_sats": 1_000,
-                    "scriptpubkey_hex": "deadbeef",
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -783,13 +818,16 @@ async fn inputs_rejects_input_below_minimum_with_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "insufficient_input");
+    assert_eq!(json["error"], "missing_ownership_proof");
 }
 
+/// A proof that is not a base64 witness is a wallet bug, and says so,
+/// rather than being reported as a failed proof.
 #[tokio::test]
-async fn inputs_rejects_surplus_above_dust_without_change_address() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+async fn inputs_rejects_a_malformed_ownership_proof() {
+    let (router, state, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
@@ -798,9 +836,320 @@ async fn inputs_rejects_surplus_above_dust_without_change_address() {
                 "input": {
                     "txid": "00".repeat(32),
                     "vout": 0,
-                    // Big surplus (~98k sats over min) but no change address.
-                    "value_sats": 200_000,
-                    "scriptpubkey_hex": "deadbeef",
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                "ownership_proof": "not base64 at all!!",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "bad_ownership_proof");
+}
+
+/// **The attack this is all for.** Register a coin belonging to someone
+/// else, and prove ownership with a key of your own.
+///
+/// It fails because the proof is checked against the scriptPubKey the
+/// chain reports for that outpoint, not the one the submission names.
+/// Without the chain lookup underneath, this test would pass.
+#[tokio::test]
+async fn inputs_rejects_a_proof_made_with_the_wrong_key() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    // The coin at 00…:0 belongs to participant 1.
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(1),
+    );
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    // Names the true script, as it must to get this far.
+                    "scriptpubkey_hex": fixture_spk(1).to_hex_string(),
+                },
+                // ...but signs with participant 0's key.
+                "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 0),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ownership_proof_failed");
+}
+
+/// A proof is bound to its session, so one captured from an earlier
+/// round cannot be replayed into a round its owner never joined.
+#[tokio::test]
+async fn inputs_rejects_a_proof_bound_to_another_session() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                // Right key, right coin, wrong round.
+                "ownership_proof": fixture_ownership_proof("some-other-session", 0, &txid, 0),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ownership_proof_failed");
+}
+
+/// A proof is bound to its outpoint, so proving you own one coin does
+/// not authorise registering another.
+#[tokio::test]
+async fn inputs_rejects_a_proof_bound_to_another_outpoint() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                // Same key and session, but a proof over vout 1.
+                "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 1),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ownership_proof_failed");
+}
+
+/// A scriptPubKey with no address form has nothing to check a proof
+/// against, so registration refuses it rather than failing obscurely.
+#[tokio::test]
+async fn inputs_rejects_an_input_with_no_address_form() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        bitcoin::ScriptBuf::from_hex(NONSTANDARD_SPK_HEX).unwrap(),
+    );
+
+    let txid = "00".repeat(32);
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": txid,
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": NONSTANDARD_SPK_HEX,
+                },
+                "ownership_proof": fixture_ownership_proof(&session_id, 0, &txid, 0),
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "unsupported_input_script");
+}
+
+/// One outpoint, one participant (#701).
+///
+/// Two participants registering the same coin builds a transaction with
+/// duplicate inputs, which cannot broadcast — so the round dies for
+/// everyone at a cost of one enrolment, and it dies at broadcast rather
+/// than at signing, where the no-sign deadline would have caught it.
+#[tokio::test]
+async fn inputs_rejects_an_outpoint_another_participant_already_registered() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+
+    // One person, two enrolments, one coin — which is what the attack
+    // reduces to once ownership is proved: you can no longer register a
+    // coin you do not control, but you can still register your own twice
+    // and kill the round.
+    let body = |ghost_id: &str| {
+        signed_inputs_body(
+            &session_id,
+            ghost_id,
+            0,
+            0x00,
+            0,
+            EXACT_INPUT_100K_MIX,
+            Some(TEST_FEE_ADDRESS),
+        )
+    };
+
+    let first = router
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            body("wallet-0"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            body("wallet-1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = to_bytes(second.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "duplicate_outpoint");
+}
+
+/// The duplicate rule must not break the retry path: a participant
+/// resubmitting its *own* outpoint is a wallet retry, not a collision.
+#[tokio::test]
+async fn inputs_still_accepts_a_participant_resubmitting_its_own_outpoint() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+
+    let body = signed_inputs_body(
+        &session_id,
+        "wallet-0",
+        0,
+        0x00,
+        0,
+        EXACT_INPUT_100K_MIX,
+        Some(TEST_FEE_ADDRESS),
+    );
+
+    for attempt in 0..2 {
+        let resp = router
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/session/{session_id}/inputs"),
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "attempt {attempt}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(json["submitted_count"], 1, "attempt {attempt}");
+    }
+}
+
+/// Registration must refuse rather than fall back to trusting the
+/// wallet's own account of its input (#699).
+#[tokio::test]
+async fn inputs_returns_503_when_no_utxo_source_is_configured() {
+    let state = Arc::new(CoordinatorState::with_components(
+        Network::Signet,
+        Arc::new(MockClock::new(1_000_000)),
+        Arc::new(DeterministicSessionIdGenerator::new()),
+        Some(TEST_FEE_ADDRESS.to_string()),
+        Some(Arc::new(StubBroadcaster::new())),
+    ));
+    let router = build_router(state.clone());
+    let session_id = make_locked_session(router.clone(), &state).await;
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "utxo_source_not_configured");
+}
+
+/// An outpoint that is not in the UTXO set — never existed, or already
+/// spent. Both answer the same way on purpose: distinguishing them
+/// would answer a question about the chain the submitter did not ask.
+#[tokio::test]
+async fn inputs_rejects_an_outpoint_that_is_not_unspent() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.remove(&fixture_outpoint(0x00, 0));
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
                 },
             }),
         ))
@@ -809,26 +1158,223 @@ async fn inputs_rejects_surplus_above_dust_without_change_address() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "missing_change_address");
+    assert_eq!(json["error"], "utxo_not_found");
+}
+
+/// The chain decides what an input is worth. A wallet claiming
+/// otherwise is refused rather than silently corrected, so a stale
+/// wallet learns it is stale instead of having its arithmetic changed
+/// underneath it.
+#[tokio::test]
+async fn inputs_rejects_a_value_the_chain_disagrees_with() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(fixture_outpoint(0x00, 0), 150_000, fixture_spk(0));
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    // Claims nearly seven times what the chain holds.
+                    "value_sats": 1_000_000,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+                "change_address": TEST_FEE_ADDRESS,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "value_mismatch");
+}
+
+/// The scriptPubKey matters more than the value: it is what an
+/// ownership proof will be checked against, so a submitter must not be
+/// able to name a script it chose for a coin it does not control.
+#[tokio::test]
+async fn inputs_rejects_a_scriptpubkey_the_chain_disagrees_with() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        bitcoin::ScriptBuf::from_hex("0014aabbccddeeff00112233445566778899aabbccdd").unwrap(),
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    // A script the submitter controls, for a coin it does not.
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "scriptpubkey_mismatch");
+}
+
+/// An unconfirmed input can be replaced out from under the round by its
+/// own parent, invalidating the transaction after everyone has signed.
+#[tokio::test]
+async fn inputs_rejects_an_unconfirmed_input() {
+    use wraith_coordinator::utxo_source::Utxo;
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert_utxo(
+        fixture_outpoint(0x00, 0),
+        Utxo {
+            value_sats: EXACT_INPUT_100K_MIX,
+            script_pubkey: fixture_spk(0),
+            confirmations: 0,
+            coinbase: false,
+        },
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "input_unconfirmed");
+}
+
+/// A coinbase output is unspendable until 100 confirmations, so a round
+/// built on an immature one cannot broadcast.
+#[tokio::test]
+async fn inputs_rejects_an_immature_coinbase() {
+    use wraith_coordinator::utxo_source::Utxo;
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert_utxo(
+        fixture_outpoint(0x00, 0),
+        Utxo {
+            value_sats: EXACT_INPUT_100K_MIX,
+            script_pubkey: fixture_spk(0),
+            confirmations: 99,
+            coinbase: true,
+        },
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input": {
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "value_sats": EXACT_INPUT_100K_MIX,
+                    "scriptpubkey_hex": fixture_spk(0).to_hex_string(),
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "immature_coinbase");
+}
+
+#[tokio::test]
+async fn inputs_rejects_an_input_below_the_exact_amount() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    // The chain says this outpoint really is worth 1,000 sats, so the
+    // refusal is about the tier minimum and not about a stale claim.
+    utxos.insert(fixture_outpoint(0x00, 0), 1_000, fixture_spk(0));
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            // 1000 sats, nowhere near a seat.
+            signed_inputs_body(&session_id, "wallet-0", 0, 0x00, 0, 1_000, None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "input_not_exact");
+}
+
+#[tokio::test]
+async fn inputs_rejects_an_input_above_the_exact_amount() {
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX + 50_000,
+        fixture_spk(0),
+    );
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            // A surplus has nowhere to go: rounds build no change output,
+            // so an over-large input is refused rather than trimmed (#698).
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX + 50_000,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "input_not_exact");
 }
 
 #[tokio::test]
 async fn inputs_accepts_exact_minimum_without_change_address() {
     // Exact-minimum input (no surplus) is fine without a change address.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            serde_json::json!({
-                "ghost_id": "wallet-0",
-                "input": {
-                    "txid": "00".repeat(32),
-                    "vout": 0,
-                    "value_sats": MIN_INPUT_100K_MIX,
-                    "scriptpubkey_hex": "deadbeef",
-                },
-            }),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX,
+                None,
+            ),
         ))
         .await
         .unwrap();
@@ -843,28 +1389,33 @@ async fn inputs_accepts_exact_minimum_without_change_address() {
 
 #[tokio::test]
 async fn inputs_advances_session_to_signing_when_all_submit() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
     for i in 0..MIN_5 {
         let response = router
             .clone()
             .oneshot(post_json(
                 &format!("/api/v1/session/{session_id}/inputs"),
-                serde_json::json!({
-                    "ghost_id": format!("wallet-{i}"),
-                    "input": {
-                        "txid": "11".repeat(32),
-                        "vout": i as u32,
-                        "value_sats": 200_000,
-                        "scriptpubkey_hex": "deadbeef",
-                    },
-                    "change_address": TEST_FEE_ADDRESS,
-                }),
+                signed_inputs_body(
+                    &session_id,
+                    &format!("wallet-{i}"),
+                    i as u8,
+                    0x11,
+                    i as u32,
+                    EXACT_INPUT_100K_MIX,
+                    Some(TEST_FEE_ADDRESS),
+                ),
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "submission #{i}");
+        let status = response.status();
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "submission #{i}: {}",
+            String::from_utf8_lossy(&body)
+        );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let expected_state = if i + 1 == MIN_5 { "signing" } else { "locked" };
         assert_eq!(json["state"], expected_state, "after submission {i}");
@@ -882,25 +1433,38 @@ async fn inputs_advances_session_to_signing_when_all_submit() {
 async fn inputs_idempotent_on_resubmission() {
     // Wallet retries with a different input; the latest submission
     // wins and the count doesn't double-up.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
-    let body = |sats: u64| {
-        serde_json::json!({
-            "ghost_id": "wallet-0",
-            "input": {
-                "txid": "00".repeat(32),
-                "vout": 0,
-                "value_sats": sats,
-                "scriptpubkey_hex": "deadbeef",
-            },
-            "change_address": TEST_FEE_ADDRESS,
-        })
+    //
+    // The retry names a *different coin* rather than a different value
+    // for the same one: value comes from the chain now, so re-pricing
+    // one outpoint is a stale claim, not a retry.
+    let (router, state, _broadcaster, utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    utxos.insert(
+        fixture_outpoint(0x00, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+    utxos.insert(
+        fixture_outpoint(0x22, 0),
+        EXACT_INPUT_100K_MIX,
+        fixture_spk(0),
+    );
+    let body = |txid_byte: u8, sats: u64| {
+        signed_inputs_body(
+            &session_id,
+            "wallet-0",
+            0,
+            txid_byte,
+            0,
+            sats,
+            Some(TEST_FEE_ADDRESS),
+        )
     };
     let first = router
         .clone()
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            body(200_000),
+            body(0x00, EXACT_INPUT_100K_MIX),
         ))
         .await
         .unwrap();
@@ -912,7 +1476,7 @@ async fn inputs_idempotent_on_resubmission() {
     let second = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/inputs"),
-            body(300_000),
+            body(0x22, EXACT_INPUT_100K_MIX),
         ))
         .await
         .unwrap();
@@ -931,8 +1495,8 @@ async fn inputs_idempotent_on_resubmission() {
 /// 200 with hex-encoded crypto material that's the right length.
 #[tokio::test]
 async fn nonce_returns_200_with_valid_shape() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/nonce"),
@@ -956,8 +1520,8 @@ async fn nonce_returns_200_with_valid_shape() {
 
 #[tokio::test]
 async fn nonce_returns_403_for_unenrolled_ghost_id() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/nonce"),
@@ -973,8 +1537,8 @@ async fn nonce_returns_403_for_unenrolled_ghost_id() {
 
 #[tokio::test]
 async fn nonce_returns_409_for_filling_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = create_session_via_router(router.clone(), "wallet-a", "bond-a").await;
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = create_session_via_router(router.clone(), "wallet-a").await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/nonce"),
@@ -990,7 +1554,7 @@ async fn nonce_returns_409_for_filling_session() {
 
 #[tokio::test]
 async fn nonce_returns_404_for_unknown_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/no-such-session/nonce",
@@ -1007,8 +1571,8 @@ async fn nonce_returns_404_for_unknown_session() {
 #[tokio::test]
 async fn blind_sign_returns_400_when_no_signer_for_round() {
     // /blind-sign before any /nonce on this round → 400 no_active_signer.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/blind-sign"),
@@ -1028,8 +1592,8 @@ async fn blind_sign_returns_400_when_no_signer_for_round() {
 
 #[tokio::test]
 async fn blind_sign_returns_400_for_bad_hex() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     // Prime a signer so we get past the no_active_signer gate.
     let _ = router
         .clone()
@@ -1058,8 +1622,8 @@ async fn blind_sign_returns_400_for_bad_hex() {
 
 #[tokio::test]
 async fn blind_sign_rejects_cross_participant_nonce_hijack() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
 
     // wallet-0 requests a nonce.
     let nonce_resp = router
@@ -1104,8 +1668,8 @@ async fn blind_sign_full_round_trip_produces_valid_signature() {
     use secp256k1::PublicKey;
     use wraith_protocol::{BlindSignatureResponse, BlindingContext, PublicNonce, TokenVerifier};
 
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
 
     // Step 1 — wallet asks coordinator for a fresh nonce.
     let nonce_resp = router
@@ -1207,28 +1771,23 @@ async fn blind_sign_full_round_trip_produces_valid_signature() {
 /// Drive a session all the way through to Signing state with all 5
 /// participants having submitted /inputs. Returns the session_id; the
 /// session is ready for /nonce + /blind-sign + /outputs.
-async fn make_signing_session(
-    router: axum::Router,
-    state: &Arc<CoordinatorState>,
-    ledger: &Arc<MockBondLedger>,
-) -> String {
-    let session_id = make_locked_session(router.clone(), state, ledger).await;
+async fn make_signing_session(router: axum::Router, state: &Arc<CoordinatorState>) -> String {
+    let session_id = make_locked_session(router.clone(), state).await;
     // 5 participants submit /inputs → session advances to Signing.
     for i in 0..MIN_5 {
         let resp = router
             .clone()
             .oneshot(post_json(
                 &format!("/api/v1/session/{session_id}/inputs"),
-                serde_json::json!({
-                    "ghost_id": format!("wallet-{i}"),
-                    "input": {
-                        "txid": "11".repeat(32),
-                        "vout": i as u32,
-                        "value_sats": 200_000,
-                        "scriptpubkey_hex": "deadbeef",
-                    },
-                    "change_address": TEST_FEE_ADDRESS,
-                }),
+                signed_inputs_body(
+                    &session_id,
+                    &format!("wallet-{i}"),
+                    i as u8,
+                    0x11,
+                    i as u32,
+                    EXACT_INPUT_100K_MIX,
+                    Some(TEST_FEE_ADDRESS),
+                ),
             ))
             .await
             .unwrap();
@@ -1316,12 +1875,12 @@ async fn run_blind_sig_for(
 
 #[tokio::test]
 async fn outputs_returns_404_for_unknown_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/no-such-session/outputs",
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 "blinded_nonce_point": "00".repeat(33),
                 "unblinded_signature_scalar": "00".repeat(32),
             }),
@@ -1338,13 +1897,13 @@ async fn outputs_returns_404_for_unknown_session() {
 async fn outputs_returns_409_when_session_still_locked() {
     // /outputs only accepts in Signing state. A session in Locked
     // (post-/nonce, pre-all-/inputs) is not yet accepting outputs.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/outputs"),
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 "blinded_nonce_point": "00".repeat(33),
                 "unblinded_signature_scalar": "00".repeat(32),
             }),
@@ -1359,8 +1918,8 @@ async fn outputs_returns_409_when_session_still_locked() {
 
 #[tokio::test]
 async fn outputs_rejects_address_for_wrong_network() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     // Need a signer to exist before signature checks would matter,
     // but address parsing happens first — exercise that path with
     // a mainnet-format address against this signet coordinator.
@@ -1382,12 +1941,47 @@ async fn outputs_rejects_address_for_wrong_network() {
     assert_eq!(json["error"], "wrong_network");
 }
 
+/// Every mixed output in a round is P2TR (#696).
+///
+/// Equal values buy the anonymity set; equal values across *mixed*
+/// script types do not — a lone P2WPKH output among P2TR ones is
+/// trivially separable inside the round, and its owner gains nothing
+/// while believing they did. Registration is the only place this can be
+/// caught: by round-build time the outputs are committed, and the blind
+/// signature means the coordinator cannot tell whose they are.
+///
+/// The refusal must land *before* the signature check, so a wallet
+/// learns the type is wrong rather than getting a generic verification
+/// failure.
+#[tokio::test]
+async fn outputs_rejects_a_non_p2tr_address() {
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/outputs"),
+            serde_json::json!({
+                // Valid signet address, right network, wrong type.
+                "address": TEST_FEE_ADDRESS,
+                "blinded_nonce_point": "00".repeat(33),
+                "unblinded_signature_scalar": "00".repeat(32),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "not_p2tr");
+}
+
 #[tokio::test]
 async fn outputs_rejects_when_no_signer_initialised() {
     // Session in Signing but nobody ever called /nonce, so no signer
     // exists. /outputs has nothing to verify against.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     // Sanity: signers map is empty.
     assert!(state.signers.lock().unwrap().get(&session_id).is_none());
 
@@ -1395,7 +1989,7 @@ async fn outputs_rejects_when_no_signer_initialised() {
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/outputs"),
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 "blinded_nonce_point": "00".repeat(33),
                 "unblinded_signature_scalar": "00".repeat(32),
             }),
@@ -1410,8 +2004,8 @@ async fn outputs_rejects_when_no_signer_initialised() {
 
 #[tokio::test]
 async fn outputs_rejects_invalid_signature_with_403() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     // Prime the signer so the no_active_signer gate doesn't fire.
     let _ = router
         .clone()
@@ -1426,7 +2020,7 @@ async fn outputs_rejects_invalid_signature_with_403() {
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/outputs"),
             serde_json::json!({
-                "address": TEST_FEE_ADDRESS,
+                "address": TEST_OUTPUT_ADDRESS,
                 // 33-byte point that's actually a valid SEC1 generator-G
                 // serialisation (not zero, which from_slice rejects).
                 "blinded_nonce_point": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
@@ -1443,10 +2037,10 @@ async fn outputs_rejects_invalid_signature_with_403() {
 
 #[tokio::test]
 async fn outputs_full_round_trip_accepts_valid_signature() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
 
-    let address = TEST_FEE_ADDRESS.to_string();
+    let address = TEST_OUTPUT_ADDRESS.to_string();
     let (blinded_nonce_hex, unblinded_sig_hex) = run_blind_sig_for(
         router.clone(),
         &session_id,
@@ -1477,10 +2071,10 @@ async fn outputs_full_round_trip_accepts_valid_signature() {
 
 #[tokio::test]
 async fn outputs_rejects_duplicate_address_with_409() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
 
-    let address = TEST_FEE_ADDRESS.to_string();
+    let address = TEST_OUTPUT_ADDRESS.to_string();
     let (n1, s1) = run_blind_sig_for(
         router.clone(),
         &session_id,
@@ -1534,8 +2128,8 @@ async fn outputs_rejects_duplicate_address_with_409() {
 async fn outputs_rejects_over_submission_with_409() {
     // 5 distinct outputs accepted, then a sixth with a fresh address
     // fails because the round set is full.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
 
     // Five distinct signet P2WPKH addresses to accept.
     let addrs = FIVE_SIGNET_ADDRS;
@@ -1596,7 +2190,7 @@ async fn outputs_rejects_over_submission_with_409() {
 
 #[tokio::test]
 async fn round_tx_returns_404_for_unknown_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(
             Request::builder()
@@ -1614,8 +2208,8 @@ async fn round_tx_returns_404_for_unknown_session() {
 
 #[tokio::test]
 async fn round_tx_returns_409_when_session_still_filling() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = create_session_via_router(router.clone(), "wallet-a", "bond-a").await;
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = create_session_via_router(router.clone(), "wallet-a").await;
     let response = router
         .oneshot(
             Request::builder()
@@ -1633,8 +2227,8 @@ async fn round_tx_returns_409_when_session_still_filling() {
 
 #[tokio::test]
 async fn round_tx_returns_404_when_session_signing_but_no_outputs() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     // No /outputs called yet — assembly hasn't fired.
     let response = router
         .oneshot(
@@ -1657,8 +2251,8 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
     //   find_or_create × 5 → lock → inputs × 5 (Signing) →
     //   nonce + blind-sign + outputs × 5 → assembly fires →
     //   GET /round-tx returns a sane unsigned tx.
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
 
     for (i, addr) in FIVE_SIGNET_ADDRS.iter().enumerate() {
         let (bn, sg) = run_blind_sig_for(
@@ -1701,15 +2295,15 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
     assert_eq!(json["txid"].as_str().unwrap().len(), 64);
     assert!(json["mining_fee_sats"].as_u64().unwrap() > 0);
 
-    // Output provenance: must include 5 Mixed outputs (one per
-    // participant), 5 Change outputs, and 1 ServiceFee output.
+    // Output provenance: 5 Mixed outputs (one per participant) and 1
+    // ServiceFee output. Nothing else — a change output would be linkable
+    // to the participant who produced it (#698).
     let prov = json["output_provenance"].as_array().expect("array");
     let mixed = prov.iter().filter(|p| p["kind"] == "mixed").count();
-    let change = prov.iter().filter(|p| p["kind"] == "change").count();
     let service = prov.iter().filter(|p| p["kind"] == "service_fee").count();
     assert_eq!(mixed, 5, "5 mixed outputs");
-    assert_eq!(change, 5, "5 change outputs");
     assert_eq!(service, 1, "1 service-fee output");
+    assert_eq!(prov.len(), 6, "no output may be anything else");
 
     // Mixed outputs must all be at the tier denomination (100k_sats).
     for p in prov.iter().filter(|p| p["kind"] == "mixed") {
@@ -1728,8 +2322,8 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
 async fn round_tx_decodes_to_a_valid_bitcoin_transaction() {
     use bitcoin::consensus::encode::deserialize_hex;
 
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_signing_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
     for (i, addr) in FIVE_SIGNET_ADDRS.iter().enumerate() {
         let (bn, sg) = run_blind_sig_for(
             router.clone(),
@@ -1769,9 +2363,15 @@ async fn round_tx_decodes_to_a_valid_bitcoin_transaction() {
     // Round-trip the hex through bitcoin's deserializer. If it
     // parses, the consensus encoding is sound.
     let tx: bitcoin::Transaction = deserialize_hex(tx_hex).expect("valid consensus encoding");
-    // 5 inputs, 5 mixed + 5 change + 1 service-fee + 1 OP_RETURN = 12 outputs.
+    // 5 inputs, 5 mixed + 1 service-fee = 6 outputs. No change outputs
+    // (#698) and no marker output (#695) — every output is either one of
+    // the five equal mixed outputs or the single fee.
     assert_eq!(tx.input.len(), 5);
-    assert_eq!(tx.output.len(), 12);
+    assert_eq!(tx.output.len(), 6);
+    assert!(
+        !tx.output.iter().any(|o| o.script_pubkey.is_op_return()),
+        "round tx must carry no OP_RETURN marker (#695)"
+    );
 
     // Reported txid in the response must match the deserialised tx.
     let computed_txid = tx.compute_txid().to_string();
@@ -1799,9 +2399,8 @@ fn placeholder_witness_hex() -> String {
 async fn make_assembled_session(
     router: axum::Router,
     state: &Arc<CoordinatorState>,
-    ledger: &Arc<MockBondLedger>,
 ) -> (String, serde_json::Value) {
-    let session_id = make_signing_session(router.clone(), state, ledger).await;
+    let session_id = make_signing_session(router.clone(), state).await;
     for (i, addr) in FIVE_SIGNET_ADDRS.iter().enumerate() {
         let (bn, sg) = run_blind_sig_for(
             router.clone(),
@@ -1874,7 +2473,7 @@ fn find_input_index(state: &CoordinatorState, session_id: &str, ghost_id: &str) 
 
 #[tokio::test]
 async fn witness_returns_404_for_unknown_session() {
-    let (router, _state, _ledger, _broadcaster) = deterministic_router(1_000_000);
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
     let response = router
         .oneshot(post_json(
             "/api/v1/session/no-such-session/witness",
@@ -1891,8 +2490,8 @@ async fn witness_returns_404_for_unknown_session() {
 
 #[tokio::test]
 async fn witness_returns_409_when_session_still_locked() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let session_id = make_locked_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/witness"),
@@ -1912,8 +2511,8 @@ async fn witness_returns_409_when_session_still_locked() {
 
 #[tokio::test]
 async fn witness_returns_403_for_unenrolled_ghost_id() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
     let response = router
         .oneshot(post_json(
             &format!("/api/v1/session/{session_id}/witness"),
@@ -1930,8 +2529,8 @@ async fn witness_returns_403_for_unenrolled_ghost_id() {
 
 #[tokio::test]
 async fn witness_returns_400_for_bad_hex() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
     let idx = find_input_index(&state, &session_id, "wallet-0");
     let response = router
         .oneshot(post_json(
@@ -1952,8 +2551,8 @@ async fn witness_returns_400_for_bad_hex() {
 
 #[tokio::test]
 async fn witness_returns_400_when_input_index_does_not_match_ghost_id() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
     let mine = find_input_index(&state, &session_id, "wallet-0");
     // Pick the index of a DIFFERENT participant.
     let theirs = find_input_index(&state, &session_id, "wallet-1");
@@ -1979,8 +2578,8 @@ async fn witness_returns_400_when_input_index_does_not_match_ghost_id() {
 async fn witness_returns_503_on_final_submission_when_broadcaster_missing() {
     // Ledger + fee address installed; broadcaster NOT installed.
     // The final witness submission tries to broadcast and fails.
-    let (router, state, ledger, _stub) = deterministic_router_full(1_000_000, true, true, false);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, _stub, _utxos) = deterministic_router_full(1_000_000, true, false);
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
     for i in 0..MIN_5 {
         let idx = find_input_index(&state, &session_id, &format!("wallet-{i}"));
         let resp = router
@@ -2012,8 +2611,8 @@ async fn witness_returns_503_on_final_submission_when_broadcaster_missing() {
 
 #[tokio::test]
 async fn witness_full_pipeline_advances_to_complete_and_broadcasts() {
-    let (router, state, ledger, broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, broadcaster) = deterministic_router(1_000_000);
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
 
     let mut last_resp: Option<serde_json::Value> = None;
     for i in 0..MIN_5 {
@@ -2072,8 +2671,8 @@ async fn witness_full_pipeline_advances_to_complete_and_broadcasts() {
 
 #[tokio::test]
 async fn witness_idempotent_on_resubmission() {
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
     let idx = find_input_index(&state, &session_id, "wallet-0");
     let body = serde_json::json!({
         "ghost_id": "wallet-0",
@@ -2108,171 +2707,8 @@ async fn witness_idempotent_on_resubmission() {
 }
 
 // ---------------------------------------------------------------------------
-// Bond resolution on round terminal transitions (B/5d)
+// No-sign deadline: failing the round and cooling down the coins
 // ---------------------------------------------------------------------------
-
-/// Assert every bond in the ledger is in `Resolved(expected)` state.
-/// Uses MockBondLedger::snapshot_all so callers don't have to track
-/// every BondId returned from `escrow`.
-fn assert_all_bonds_resolved(
-    ledger: &Arc<MockBondLedger>,
-    expected: wraith_protocol::BondResolution,
-) {
-    let bonds = ledger.snapshot_all();
-    assert!(!bonds.is_empty(), "ledger has no bonds — test setup wrong");
-    for b in &bonds {
-        match &b.status {
-            wraith_protocol::BondStatus::Escrowed => {
-                panic!(
-                    "bond {} for {} still Escrowed; expected resolved as {:?}",
-                    b.bond_id, b.ghost_id, expected
-                );
-            }
-            wraith_protocol::BondStatus::Resolved(actual) => {
-                assert_eq!(
-                    actual, &expected,
-                    "bond {} resolution mismatch (ghost_id={})",
-                    b.bond_id, b.ghost_id
-                );
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn bonds_refund_round_completed_after_successful_broadcast() {
-    use wraith_protocol::{BondResolution, RefundReason};
-
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
-
-    // 5 enrolled wallets → 5 escrowed bonds.
-    assert_eq!(ledger.len(), 5);
-
-    // Drive all 5 witnesses to completion.
-    let mut last: Option<serde_json::Value> = None;
-    for i in 0..MIN_5 {
-        let idx = find_input_index(&state, &session_id, &format!("wallet-{i}"));
-        let resp = router
-            .clone()
-            .oneshot(post_json(
-                &format!("/api/v1/session/{session_id}/witness"),
-                serde_json::json!({
-                    "ghost_id": format!("wallet-{i}"),
-                    "input_index": idx,
-                    "witness_hex": placeholder_witness_hex(),
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
-        last = Some(serde_json::from_slice(&body).unwrap());
-    }
-    let final_json = last.unwrap();
-    assert_eq!(final_json["state"], "complete");
-    assert_eq!(
-        final_json["bonds_resolved"], 5,
-        "all five bonds resolved on the round-completing /witness"
-    );
-
-    assert_all_bonds_resolved(
-        &ledger,
-        BondResolution::Refund(RefundReason::RoundCompleted),
-    );
-}
-
-#[tokio::test]
-async fn bonds_refund_coordinator_aborted_when_witness_merge_fails() {
-    use wraith_protocol::{BondResolution, RefundReason};
-
-    let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (_session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
-    assert_eq!(ledger.len(), 5);
-
-    // 4 valid submissions, 1 with a stored witness that's malformed
-    // upon retry. To force the merge-time failure we doctor the
-    // witnesses_store directly between submissions: the 5th wallet's
-    // submission stores valid bytes, then we corrupt the entry, then
-    // a subsequent /witness retry triggers the merge that fails.
-    //
-    // Simpler approach: just submit 4 normally + 1 valid one. All 5
-    // valid submissions trigger the merge with valid bytes — that
-    // path doesn't actually fail. To exercise the failure branch
-    // here we need a different angle.
-    //
-    // Use the broadcaster-rejection path instead: replace the
-    // broadcaster with one that always rejects.
-    use std::sync::Mutex as StdMutex;
-    use wraith_coordinator::broadcaster::{BroadcastError, Broadcaster};
-    struct RejectingBroadcaster(StdMutex<u32>);
-    impl Broadcaster for RejectingBroadcaster {
-        fn broadcast(&self, _tx: &bitcoin::Transaction) -> Result<bitcoin::Txid, BroadcastError> {
-            *self.0.lock().unwrap() += 1;
-            Err(BroadcastError::Rejected("simulated rejection".into()))
-        }
-    }
-    // We need to reach into the test state to swap the broadcaster.
-    // Easier path: build a fresh state with the rejecting broadcaster
-    // from the start, and re-run setup against it.
-    let rejecting = Arc::new(RejectingBroadcaster(StdMutex::new(0)));
-    let mock_clock = Arc::new(MockClock::new(1_000_000));
-    let fresh_ledger = Arc::new(MockBondLedger::new());
-    let fresh_state = Arc::new(CoordinatorState::with_components(
-        Network::Signet,
-        mock_clock.clone(),
-        Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(fresh_ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
-        Some(TEST_FEE_ADDRESS.to_string()),
-        Some(rejecting.clone() as Arc<dyn Broadcaster>),
-    ));
-    let fresh_router = build_router(fresh_state.clone());
-    let (fresh_sid, _) =
-        make_assembled_session(fresh_router.clone(), &fresh_state, &fresh_ledger).await;
-    assert_eq!(fresh_ledger.len(), 5);
-
-    // Drive 5 witnesses; the final one triggers the rejecting broadcast.
-    let mut last: Option<serde_json::Value> = None;
-    for i in 0..MIN_5 {
-        let idx = find_input_index(&fresh_state, &fresh_sid, &format!("wallet-{i}"));
-        let resp = fresh_router
-            .clone()
-            .oneshot(post_json(
-                &format!("/api/v1/session/{fresh_sid}/witness"),
-                serde_json::json!({
-                    "ghost_id": format!("wallet-{i}"),
-                    "input_index": idx,
-                    "witness_hex": placeholder_witness_hex(),
-                }),
-            ))
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        if i + 1 < MIN_5 {
-            assert_eq!(status, StatusCode::OK, "non-final");
-        } else {
-            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "final rejected");
-            assert_eq!(json["error"], "broadcast_rejected");
-        }
-        last = Some(json);
-    }
-    let _ = last;
-
-    // Session is in Failed; bonds were refunded with CoordinatorAborted.
-    let snapshot = fresh_state.sessions.get(&fresh_sid).expect("present");
-    assert!(matches!(
-        snapshot.state,
-        wraith_protocol::LiteSessionState::Failed { .. }
-    ));
-    assert_all_bonds_resolved(
-        &fresh_ledger,
-        BondResolution::Refund(RefundReason::CoordinatorAborted),
-    );
-    // Broadcaster was tried exactly once.
-    assert_eq!(*rejecting.0.lock().unwrap(), 1);
-}
 
 // ---------------------------------------------------------------------------
 // No-sign deadline + slashing (B/5e)
@@ -2282,33 +2718,26 @@ async fn bonds_refund_coordinator_aborted_when_witness_merge_fails() {
 /// caller can advance time and trip the no-sign deadline.
 async fn deadline_test_setup(
     initial_unix: u64,
-) -> (
-    axum::Router,
-    Arc<CoordinatorState>,
-    Arc<MockBondLedger>,
-    Arc<MockClock>,
-) {
+) -> (axum::Router, Arc<CoordinatorState>, Arc<MockClock>) {
     let mock_clock = Arc::new(MockClock::new(initial_unix));
-    let ledger = Arc::new(MockBondLedger::new());
-    let state = Arc::new(CoordinatorState::with_components(
-        Network::Signet,
-        mock_clock.clone(),
-        Arc::new(DeterministicSessionIdGenerator::new()),
-        Some(ledger.clone() as Arc<dyn wraith_protocol::BondLedger>),
-        Some(TEST_FEE_ADDRESS.to_string()),
-        Some(Arc::new(StubBroadcaster::new())),
-    ));
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            mock_clock.clone(),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            Some(Arc::new(StubBroadcaster::new())),
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source())),
+    );
     let router = build_router(state.clone());
-    (router, state, ledger, mock_clock)
+    (router, state, mock_clock)
 }
 
 #[tokio::test]
 async fn witness_returns_410_when_no_one_signed_before_deadline() {
-    use wraith_protocol::{BondResolution, SlashReason};
-
-    let (router, state, ledger, clock) = deadline_test_setup(1_000_000).await;
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
-    assert_eq!(ledger.len(), 5);
+    let (router, state, clock) = deadline_test_setup(1_000_000).await;
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
 
     // Advance well past the 600s deadline.
     clock.advance(700);
@@ -2338,28 +2767,23 @@ async fn witness_returns_410_when_no_one_signed_before_deadline() {
         wraith_protocol::LiteSessionState::Failed { .. }
     ));
 
-    // Every bond slashed (nobody signed before the deadline).
-    let bonds = ledger.snapshot_all();
-    assert_eq!(bonds.len(), 5);
-    for b in &bonds {
-        match &b.status {
-            wraith_protocol::BondStatus::Resolved(BondResolution::Slash(
-                SlashReason::NoSignDuringSigning,
-            )) => {}
-            other => panic!(
-                "bond {} for {} expected slashed-no-sign; got {:?}",
-                b.bond_id, b.ghost_id, other
-            ),
-        }
+    // Every coin in cooldown — nobody signed before the deadline.
+    let now = state.now();
+    for i in 0..MIN_5 {
+        assert!(
+            state
+                .bans
+                .banned_until(&fixture_outpoint(0x11, i as u32), now)
+                .is_some(),
+            "wallet-{i}'s coin should be in cooldown"
+        );
     }
 }
 
 #[tokio::test]
 async fn witness_partitions_signers_and_non_signers_at_deadline() {
-    use wraith_protocol::{BondResolution, BondStatus, RefundReason, SlashReason};
-
-    let (router, state, ledger, clock) = deadline_test_setup(1_000_000).await;
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (router, state, clock) = deadline_test_setup(1_000_000).await;
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
 
     // Three wallets sign within the deadline window.
     for i in 0..3 {
@@ -2397,30 +2821,148 @@ async fn witness_partitions_signers_and_non_signers_at_deadline() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::GONE);
 
-    // Signers (0/1/2) refunded as RoundVoided; non-signers (3/4)
-    // slashed as NoSignDuringSigning.
-    let bonds = ledger.snapshot_all();
-    assert_eq!(bonds.len(), 5);
-    let mut refunded = 0u32;
-    let mut slashed = 0u32;
-    for b in &bonds {
-        let signer = matches!(b.ghost_id.as_str(), "wallet-0" | "wallet-1" | "wallet-2");
-        match (&b.status, signer) {
-            (BondStatus::Resolved(BondResolution::Refund(RefundReason::RoundVoided)), true) => {
-                refunded += 1
-            }
-            (
-                BondStatus::Resolved(BondResolution::Slash(SlashReason::NoSignDuringSigning)),
-                false,
-            ) => slashed += 1,
-            (other, signer) => panic!(
-                "bond {} (ghost={}, signer={}) unexpected status {:?}",
-                b.bond_id, b.ghost_id, signer, other
-            ),
-        }
+    // The round failed for everyone, but only the coins that failed to
+    // sign are in cooldown. Signing and losing the round anyway is not a
+    // punishable act.
+    let now = state.now();
+    for i in 0..3 {
+        assert!(
+            state
+                .bans
+                .banned_until(&fixture_outpoint(0x11, i), now)
+                .is_none(),
+            "wallet-{i} signed in time and must not be in cooldown"
+        );
     }
-    assert_eq!(refunded, 3);
-    assert_eq!(slashed, 2);
+    for i in 3..MIN_5 as u32 {
+        assert!(
+            state
+                .bans
+                .banned_until(&fixture_outpoint(0x11, i), now)
+                .is_some(),
+            "wallet-{i} never signed and must be in cooldown"
+        );
+    }
+}
+
+/// Disruption puts the coin in cooldown, and only the coin that
+/// disrupted (#699).
+///
+/// This is what replaces the bond: an attacker who wants another go must
+/// buy a fresh coin on-chain, while the participants who did sign keep
+/// theirs usable.
+#[tokio::test]
+async fn a_non_signer_has_its_outpoint_banned_and_a_signer_does_not() {
+    use wraith_coordinator::bans::DISRUPTION_BAN_SECS;
+
+    let (router, state, clock) = deadline_test_setup(1_000_000).await;
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
+
+    // wallet-0 signs; wallet-1..4 do not.
+    let idx = find_input_index(&state, &session_id, "wallet-0");
+    let resp = router
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/witness"),
+            serde_json::json!({
+                "ghost_id": "wallet-0",
+                "input_index": idx,
+                "witness_hex": placeholder_witness_hex(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert!(state.bans.is_empty(), "nothing banned before the deadline");
+
+    // Past the deadline, the sweep runs.
+    clock.advance(700);
+    wraith_coordinator::tick::run_one_pass(&state);
+
+    let now = state.now();
+    // The four who never signed are in cooldown...
+    for i in 1..MIN_5 {
+        let outpoint = fixture_outpoint(0x11, i as u32);
+        let until = state
+            .bans
+            .banned_until(&outpoint, now)
+            .unwrap_or_else(|| panic!("wallet-{i} should be banned"));
+        assert_eq!(until, now + DISRUPTION_BAN_SECS);
+    }
+    // ...and the one who signed is not.
+    assert!(
+        state
+            .bans
+            .banned_until(&fixture_outpoint(0x11, 0), now)
+            .is_none(),
+        "a participant who signed must not be punished for the round failing"
+    );
+}
+
+/// A banned coin is refused at registration, and told when it may return.
+#[tokio::test]
+async fn inputs_rejects_a_banned_outpoint() {
+    let (router, state, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    state.bans.ban(fixture_outpoint(0x00, 0), state.now());
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "outpoint_banned");
+    assert!(
+        json["detail"].as_str().unwrap().contains("cooldown"),
+        "the refusal must say when the coin can be used again: {}",
+        json["detail"]
+    );
+}
+
+/// The cooldown ends by itself. Nothing has to run for a coin to become
+/// usable again — expiry is judged at the point of the check.
+#[tokio::test]
+async fn a_banned_outpoint_is_accepted_again_once_its_cooldown_passes() {
+    use wraith_coordinator::bans::DISRUPTION_BAN_SECS;
+
+    let (router, state, _broadcaster, _utxos) = deterministic_router_with_utxos(1_000_000);
+    let session_id = make_locked_session(router.clone(), &state).await;
+    // Banned an hour and a second ago, so the cooldown has just passed.
+    state.bans.ban(
+        fixture_outpoint(0x00, 0),
+        state.now() - DISRUPTION_BAN_SECS - 1,
+    );
+
+    let response = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -2430,11 +2972,9 @@ async fn witness_partitions_signers_and_non_signers_at_deadline() {
 #[tokio::test]
 async fn background_tick_sweeps_expired_signing_sessions_without_a_witness_ping() {
     use wraith_coordinator::tick::run_one_pass;
-    use wraith_protocol::{BondResolution, BondStatus, SlashReason};
 
-    let (router, state, ledger, clock) = deadline_test_setup(1_000_000).await;
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
-    assert_eq!(ledger.len(), 5);
+    let (router, state, clock) = deadline_test_setup(1_000_000).await;
+    let (session_id, _rt) = make_assembled_session(router.clone(), &state).await;
 
     // Advance past the 600s deadline.
     clock.advance(700);
@@ -2449,17 +2989,16 @@ async fn background_tick_sweeps_expired_signing_sessions_without_a_witness_ping(
         wraith_protocol::LiteSessionState::Failed { .. }
     ));
 
-    // All 5 bonds slashed (nobody signed before the deadline).
-    let bonds = ledger.snapshot_all();
-    assert_eq!(bonds.len(), 5);
-    for b in &bonds {
-        match &b.status {
-            BondStatus::Resolved(BondResolution::Slash(SlashReason::NoSignDuringSigning)) => {}
-            other => panic!(
-                "bond {} for {} not slashed-no-sign: {:?}",
-                b.bond_id, b.ghost_id, other
-            ),
-        }
+    // All 5 coins in cooldown — nobody signed before the deadline.
+    let now = state.now();
+    for i in 0..MIN_5 as u32 {
+        assert!(
+            state
+                .bans
+                .banned_until(&fixture_outpoint(0x11, i), now)
+                .is_some(),
+            "wallet-{i}'s coin should be in cooldown"
+        );
     }
 
     // Deadline entry was cleaned up so a second tick is a no-op.
@@ -2467,5 +3006,5 @@ async fn background_tick_sweeps_expired_signing_sessions_without_a_witness_ping(
         state.signing_deadlines.lock().unwrap().is_empty(),
         "deadline entry should be removed after sweep"
     );
-    run_one_pass(&state); // second pass: no panic, no double-resolve
+    run_one_pass(&state); // second pass: no panic, no double-sweep
 }

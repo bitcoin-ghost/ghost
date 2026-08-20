@@ -63,8 +63,8 @@
 //!   - The state-transition helpers + their validity checks.
 //!
 //! Defers (other modules):
-//!   - Bond verification: handled by `BondLedger` from `bond.rs`. We just
-//!     hold the `BondId` per participant.
+//!   - Anti-DoS: handled by the coordinator's ownership proof + outpoint
+//!     cooldown (#699). The registry holds no economic state at all.
 //!   - Round transaction construction: handled by `LiteRoundBuilder` from
 //!     `single_round.rs`, called once a session transitions to `Signing`.
 //!   - Standby gossip: task #38 (`coordinator_redundancy.rs` extension).
@@ -77,7 +77,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bond::BondId;
 #[allow(unused_imports)] // LITE_FILL_WINDOW_SECS is used only in #[cfg(test)] code
 use crate::tier::{LiteTier, LITE_FILL_WINDOW_SECS};
 use crate::SessionType;
@@ -130,9 +129,9 @@ pub enum LiteSessionState {
     /// gossip and the wallet's user-facing surface can distinguish e.g.
     /// "fill window expired without quorum" from "coordinator aborted
     /// for protocol error" from "round-wide no-sign". The granular
-    /// taxonomy of bond-resolution reasons lives in `bond.rs`'s
-    /// `RefundReason`/`SlashReason`. `String` (not `&'static str`) so
-    /// the variant survives serde round-trip.
+    /// reason strings are set by the coordinator at the point of
+    /// failure. `String` (not `&'static str`) so the variant survives
+    /// serde round-trip.
     Failed { reason: String },
 }
 
@@ -151,12 +150,10 @@ impl LiteSessionState {
     }
 }
 
-/// One participant's slot in a session. The bond_id is the link between
-/// the on-chain participant and the L2 escrow record.
+/// One participant's slot in a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiteSessionParticipant {
     pub ghost_id: String,
-    pub bond_id: BondId,
     /// Unix seconds of registration. Used for diagnostics and to detect
     /// extremely-late arrivals (e.g. a participant who somehow registered
     /// after the fill window — defensive logging).
@@ -205,7 +202,6 @@ pub struct SessionDescriptor {
     pub state: String,
     pub slots_filled: u32,
     pub slots_total: u32,
-    pub bond_amount_sats: u64,
     pub fill_window_expires_at: Option<u64>,
 }
 
@@ -223,7 +219,6 @@ impl SessionDescriptor {
             state: s.state.as_str().to_string(),
             slots_filled: s.participants.len() as u32,
             slots_total: s.tier.max_participants() as u32,
-            bond_amount_sats: s.tier.bond_sats(),
             fill_window_expires_at,
         }
     }
@@ -676,7 +671,6 @@ impl LiteSessionRegistry {
         &self,
         session_id: &str,
         ghost_id: &str,
-        bond_id: BondId,
         now: u64,
     ) -> Result<SessionDescriptor, LiteSessionError> {
         let (descriptor, event) = {
@@ -717,7 +711,6 @@ impl LiteSessionRegistry {
             }
             let participant = LiteSessionParticipant {
                 ghost_id: ghost_id.to_string(),
-                bond_id,
                 registered_at: now,
             };
             session.participants.push(participant.clone());
@@ -957,7 +950,6 @@ mod tests {
         assert_eq!(d.state, "filling");
         assert_eq!(d.slots_filled, 0);
         assert_eq!(d.slots_total, 20);
-        assert_eq!(d.bond_amount_sats, 500);
         assert_eq!(d.fill_window_expires_at, Some(1_000_000 + 300));
         assert_eq!(reg.len(), 1);
     }
@@ -1100,8 +1092,7 @@ mod tests {
         );
         // Fill it to the max (20 for 100k tier).
         for i in 0..20 {
-            let bond = BondId::new(format!("bond-{i}"));
-            reg.add_participant(&d.session_id, &format!("ghost-{i}"), bond, 1_000_000)
+            reg.add_participant(&d.session_id, &format!("ghost-{i}"), 1_000_000)
                 .expect("add up to max");
         }
         // Should be Locked now.
@@ -1159,7 +1150,7 @@ mod tests {
         );
         assert_eq!(d.slots_filled, 0);
         let d2 = reg
-            .add_participant(&d.session_id, "alice", BondId::new("bond-alice"), 1_000_000)
+            .add_participant(&d.session_id, "alice", 1_000_000)
             .unwrap();
         assert_eq!(d2.slots_filled, 1);
     }
@@ -1175,20 +1166,10 @@ mod tests {
             &gen,
             LITE_FILL_WINDOW_SECS,
         );
-        reg.add_participant(
-            &d.session_id,
-            "alice",
-            BondId::new("bond-alice-1"),
-            1_000_000,
-        )
-        .unwrap();
+        reg.add_participant(&d.session_id, "alice", 1_000_000)
+            .unwrap();
         let err = reg
-            .add_participant(
-                &d.session_id,
-                "alice",
-                BondId::new("bond-alice-2"),
-                1_000_000,
-            )
+            .add_participant(&d.session_id, "alice", 1_000_000)
             .expect_err("duplicate registration should fail");
         assert!(matches!(err, LiteSessionError::AlreadyRegistered(_, _)));
     }
@@ -1208,16 +1189,11 @@ mod tests {
             LITE_FILL_WINDOW_SECS,
         );
         for i in 0..20 {
-            reg.add_participant(
-                &d.session_id,
-                &format!("g-{i}"),
-                BondId::new(format!("b-{i}")),
-                1_000_000,
-            )
-            .unwrap();
+            reg.add_participant(&d.session_id, &format!("g-{i}"), 1_000_000)
+                .unwrap();
         }
         let err = reg
-            .add_participant(&d.session_id, "late", BondId::new("bond-late"), 1_000_000)
+            .add_participant(&d.session_id, "late", 1_000_000)
             .expect_err("locked round should reject new participants");
         match err {
             LiteSessionError::NotAcceptingParticipants(_, why) => {
@@ -1240,12 +1216,7 @@ mod tests {
         );
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let err = reg
-            .add_participant(
-                &d.session_id,
-                "tardy",
-                BondId::new("bond-tardy"),
-                clock.unix_secs(),
-            )
+            .add_participant(&d.session_id, "tardy", clock.unix_secs())
             .expect_err("expired fill window should reject");
         match err {
             LiteSessionError::NotAcceptingParticipants(_, why) => {
@@ -1268,13 +1239,8 @@ mod tests {
         );
         // 5 participants is exactly min — enough for quorum.
         for i in 0..5 {
-            reg.add_participant(
-                &d.session_id,
-                &format!("g-{i}"),
-                BondId::new(format!("b-{i}")),
-                clock.unix_secs(),
-            )
-            .unwrap();
+            reg.add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
+                .unwrap();
         }
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let changed = reg.tick(clock.unix_secs());
@@ -1296,13 +1262,8 @@ mod tests {
         );
         // 4 < min participants of 5.
         for i in 0..4 {
-            reg.add_participant(
-                &d.session_id,
-                &format!("g-{i}"),
-                BondId::new(format!("b-{i}")),
-                clock.unix_secs(),
-            )
-            .unwrap();
+            reg.add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
+                .unwrap();
         }
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         reg.tick(clock.unix_secs());
@@ -1349,13 +1310,8 @@ mod tests {
         );
         // Fill to max → Locked.
         for i in 0..20 {
-            reg.add_participant(
-                &d.session_id,
-                &format!("g-{i}"),
-                BondId::new(format!("b-{i}")),
-                clock.unix_secs(),
-            )
-            .unwrap();
+            reg.add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
+                .unwrap();
         }
         // Locked → Signing → Broadcasting → Complete.
         let r = reg.transition_to_signing(&d.session_id).unwrap();
@@ -1512,7 +1468,7 @@ mod tests {
             LITE_FILL_WINDOW_SECS,
         );
         active
-            .add_participant(&d.session_id, "alice", BondId::new("bond-a"), 1_000_000)
+            .add_participant(&d.session_id, "alice", 1_000_000)
             .unwrap();
         let events = sink.events();
         assert_eq!(events.len(), 2);
@@ -1543,12 +1499,7 @@ mod tests {
         );
         for i in 0..LiteTier::Denom100kSats.max_participants() {
             active
-                .add_participant(
-                    &d.session_id,
-                    &format!("g-{i}"),
-                    BondId::new(format!("b-{i}")),
-                    1_000_000,
-                )
+                .add_participant(&d.session_id, &format!("g-{i}"), 1_000_000)
                 .unwrap();
         }
         // Last ParticipantAdded should carry Locked.
@@ -1576,12 +1527,7 @@ mod tests {
         );
         for i in 0..LiteTier::Denom100kSats.min_participants() {
             active
-                .add_participant(
-                    &d_quorum.session_id,
-                    &format!("g-{i}"),
-                    BondId::new(format!("b-{i}")),
-                    clock.unix_secs(),
-                )
+                .add_participant(&d_quorum.session_id, &format!("g-{i}"), clock.unix_secs())
                 .unwrap();
         }
         let _d_empty = find_or_create_session(
@@ -1624,12 +1570,7 @@ mod tests {
         // Fill to max so we're Locked.
         for i in 0..LiteTier::Denom100kSats.max_participants() {
             active
-                .add_participant(
-                    &d.session_id,
-                    &format!("g-{i}"),
-                    BondId::new(format!("b-{i}")),
-                    clock.unix_secs(),
-                )
+                .add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
                 .unwrap();
         }
         let baseline = sink.len();
@@ -1707,7 +1648,7 @@ mod tests {
             LITE_FILL_WINDOW_SECS,
         );
         active
-            .add_participant(&d.session_id, "alice", BondId::new("bond-a"), 1_000_000)
+            .add_participant(&d.session_id, "alice", 1_000_000)
             .unwrap();
         for ev in sink.events() {
             standby.apply_event(ev).unwrap();
@@ -1731,7 +1672,6 @@ mod tests {
             session_id: "ghost-session".into(),
             participant: LiteSessionParticipant {
                 ghost_id: "alice".into(),
-                bond_id: BondId::new("bond-a"),
                 registered_at: 1_000_000,
             },
             new_state: LiteSessionState::Locked,
@@ -1772,12 +1712,7 @@ mod tests {
         );
         for i in 0..5 {
             active
-                .add_participant(
-                    &d_a.session_id,
-                    &format!("alice-{i}"),
-                    BondId::new(format!("a-{i}")),
-                    clock.unix_secs(),
-                )
+                .add_participant(&d_a.session_id, &format!("alice-{i}"), clock.unix_secs())
                 .unwrap();
         }
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
@@ -1796,12 +1731,7 @@ mod tests {
         );
         for i in 0..3 {
             active
-                .add_participant(
-                    &d_b.session_id,
-                    &format!("bob-{i}"),
-                    BondId::new(format!("b-{i}")),
-                    clock.unix_secs(),
-                )
+                .add_participant(&d_b.session_id, &format!("bob-{i}"), clock.unix_secs())
                 .unwrap();
         }
         active
@@ -1871,7 +1801,6 @@ mod tests {
                 session_id: "test".into(),
                 participant: LiteSessionParticipant {
                     ghost_id: "alice".into(),
-                    bond_id: BondId::new("bond-a"),
                     registered_at: 1_000_000,
                 },
                 new_state: LiteSessionState::Locked,
@@ -1911,13 +1840,8 @@ mod tests {
         );
         // Fill the second one to max so it locks.
         for i in 0..LiteTier::Denom1mSats.max_participants() {
-            reg.add_participant(
-                &other_tier.session_id,
-                &format!("g-{i}"),
-                BondId::new(format!("b-{i}")),
-                clock.unix_secs(),
-            )
-            .unwrap();
+            reg.add_participant(&other_tier.session_id, &format!("g-{i}"), clock.unix_secs())
+                .unwrap();
         }
         // Asking for 1m_sats should NOT find the locked one — should
         // create a new session.

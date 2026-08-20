@@ -20,6 +20,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use bip39::{Language, Mnemonic};
+use rand::rngs::OsRng;
+
+use crate::user_entropy::{mix_seed_entropy, UserEntropy};
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::{Zeroize, Zeroizing};
@@ -44,6 +47,11 @@ pub enum KeystoreError {
     Bip39(String),
     #[error("bip32 derivation error: {0}")]
     Bip32(String),
+    /// The OS random source could not be read. Fails closed: a wallet is
+    /// never created, and a keystore is never written, from randomness we
+    /// could not obtain (master spec §6A E-1/E-5).
+    #[error("OS random source unavailable: {0}")]
+    Rng(String),
 }
 
 /// In-memory unlocked wallet seed. Mnemonic is zeroized on drop.
@@ -55,8 +63,53 @@ impl Keystore {
     /// Generate a new wallet with a fresh 24-word BIP39 mnemonic.
     /// Returns the keystore and the mnemonic string (display once at create time).
     pub fn create() -> Result<(Self, String), KeystoreError> {
-        let mut entropy = [0u8; 32]; // 256 bits → 24 words
-        rand::thread_rng().fill_bytes(&mut entropy);
+        Self::create_with_user_entropy(None)
+    }
+
+    /// Generate a new wallet, optionally mixing in entropy the user produced
+    /// themselves (dice, coin flips).
+    ///
+    /// The OS source is always used and is always in the result. A user
+    /// contribution is *mixed*, never substituted, so it can only raise the
+    /// floor: an attacker must break the OS source and guess the rolls. A
+    /// user who supplies nothing gets exactly the seed they would have got.
+    ///
+    /// Master spec §6A rule E-1 requires the OS CSPRNG for wallet seeds and
+    /// forbids seeded PRNGs. It also once forbade user-supplied entropy
+    /// outright; that was amended to permit mixing after the Coldcard
+    /// incident, where a single silently-degraded source produced ~40-72 bit
+    /// seeds for five years with nothing able to detect it. See
+    /// [`crate::user_entropy`].
+    pub fn create_with_user_entropy(
+        user: Option<&UserEntropy>,
+    ) -> Result<(Self, String), KeystoreError> {
+        let user_digest = match user {
+            Some(u) => Some(u.digest().map_err(|e| KeystoreError::Rng(e.to_string()))?),
+            None => None,
+        };
+        Self::create_with_mixed_digest(user_digest.as_ref())
+    }
+
+    /// As [`create_with_user_entropy`](Self::create_with_user_entropy), but
+    /// taking the already-reduced digest.
+    ///
+    /// This is what the daemon uses: the raw roll sequence never leaves the
+    /// process that collected it, and the minimum-contribution floor is
+    /// enforced there. That split is safe precisely because mixing is
+    /// one-directional — a caller supplying a weak or attacker-chosen digest
+    /// cannot drag the seed below the OS bytes, so the floor is a matter of
+    /// not misleading the user rather than of security.
+    pub fn create_with_mixed_digest(
+        user_digest: Option<&[u8; 32]>,
+    ) -> Result<(Self, String), KeystoreError> {
+        let mut os_bytes = [0u8; 32]; // 256 bits → 24 words
+        OsRng
+            .try_fill_bytes(&mut os_bytes)
+            .map_err(|e| KeystoreError::Rng(e.to_string()))?;
+
+        let mut entropy = mix_seed_entropy(&os_bytes, user_digest);
+        os_bytes.zeroize();
+
         let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
             .map_err(|e| KeystoreError::Bip39(e.to_string()))?;
         let words = mnemonic.to_string();
@@ -83,8 +136,12 @@ impl Keystore {
     pub fn save(&self, path: &Path, passphrase: &SecretString) -> Result<(), KeystoreError> {
         let mut salt = [0u8; SALT_LEN];
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        OsRng
+            .try_fill_bytes(&mut salt)
+            .map_err(|e| KeystoreError::Rng(e.to_string()))?;
+        OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .map_err(|e| KeystoreError::Rng(e.to_string()))?;
 
         let key = derive_key(passphrase, &salt)?;
         let cipher = Aes256Gcm::new_from_slice(&key.0)
@@ -458,5 +515,52 @@ mod tests {
             Err(other) => panic!("expected Format error, got {other:?}"),
             Ok(_) => panic!("expected Format error, got Ok"),
         }
+    }
+}
+
+#[cfg(test)]
+mod user_entropy_tests {
+    use super::*;
+    use crate::user_entropy::UserEntropy;
+
+    fn fifty_rolls() -> UserEntropy {
+        let mut e = UserEntropy::new();
+        for i in 0..50 {
+            e.push_die((i % 6 + 1) as u8).unwrap();
+        }
+        e
+    }
+
+    #[test]
+    fn a_wallet_can_be_created_with_user_entropy() {
+        let (_ks, words) = Keystore::create_with_user_entropy(Some(&fifty_rolls())).unwrap();
+        assert_eq!(words.split_whitespace().count(), 24);
+    }
+
+    #[test]
+    fn identical_rolls_still_produce_different_wallets() {
+        // The OS contribution is always mixed in, so a user who rolls the
+        // same sequence twice — or copies someone else's — does not land on
+        // the same seed. This is the property that makes mixing safe.
+        let (_a, first) = Keystore::create_with_user_entropy(Some(&fifty_rolls())).unwrap();
+        let (_b, second) = Keystore::create_with_user_entropy(Some(&fifty_rolls())).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn too_little_user_entropy_refuses_rather_than_quietly_accepting() {
+        let mut e = UserEntropy::new();
+        for _ in 0..5 {
+            e.push_die(4).unwrap();
+        }
+        assert!(Keystore::create_with_user_entropy(Some(&e)).is_err());
+    }
+
+    #[test]
+    fn supplying_none_is_still_a_full_strength_wallet() {
+        let (_ks, words) = Keystore::create_with_user_entropy(None).unwrap();
+        assert_eq!(words.split_whitespace().count(), 24);
+        let (_ks2, words2) = Keystore::create().unwrap();
+        assert_ne!(words, words2);
     }
 }

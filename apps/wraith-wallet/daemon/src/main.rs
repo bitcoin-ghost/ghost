@@ -548,6 +548,71 @@ mod server {
 
     /// Reject names that would let a caller traverse outside `wallets_dir` or
     /// produce ambiguous on-disk paths.
+    /// Decode the hex user-entropy digest a front-end collected.
+    ///
+    /// Strict about the shape and indifferent to the content: any 32 bytes
+    /// are acceptable because mixing is one-directional. What is refused is
+    /// a value that is not a digest at all, which would be a caller bug
+    /// worth surfacing rather than silently ignoring.
+    fn decode_entropy_digest(hex_digest: &str) -> Result<[u8; 32], String> {
+        let bytes = hex::decode(hex_digest.trim())
+            .map_err(|e| format!("user_entropy_digest is not hex: {e}"))?;
+        bytes
+            .try_into()
+            .map_err(|_| "user_entropy_digest must be exactly 32 bytes".to_string())
+    }
+
+    /// Re-derive the election's beacon from the wallet's own node.
+    ///
+    /// Returns `true` when the beacon matches the anchor block's hash, and
+    /// also when this wallet has no node configured — in that case there is
+    /// nothing to pin against, and the weaker guarantee (`election_is_honest`
+    /// alone) is what the caller gets. Refusing outright would leave every
+    /// node-less wallet unable to use an election at all, which is a worse
+    /// answer than a stated-weaker check.
+    ///
+    /// A node that is configured but unreachable is also not a refusal: an
+    /// operator's election is not made dishonest by the wallet's own bitcoind
+    /// being down, and treating it as such would hand anyone who can knock
+    /// out a wallet's node the power to force it onto a manual coordinator.
+    fn beacon_pinned_to_chain(state: &DaemonState, election: &serde_json::Value) -> bool {
+        use wraith_wallet_core::ghostd::GhostdRpc;
+
+        let Some((anchor_height, _)) =
+            crate::coordinator_resolve::beacon_anchor_expectation(election)
+        else {
+            // No beacon published at all — `election_is_honest` refuses this
+            // on its own, so there is nothing to add here.
+            return true;
+        };
+        let Some(url) = state.ghostd_url.as_deref() else {
+            tracing::debug!("no bitcoind configured; election beacon not pinned to the chain");
+            return true;
+        };
+        let rpc = match (
+            state.ghostd_cookie_path.as_ref(),
+            state.ghostd_user.as_deref(),
+            state.ghostd_pass.as_deref(),
+        ) {
+            (Some(cookie), None, None) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(error = %e, "bitcoind auth unusable; beacon not pinned");
+                    return true;
+                }
+            },
+            (None, Some(u), Some(p)) => GhostdRpc::new(url, u, p),
+            _ => return true,
+        };
+        match rpc.get_block_hash(anchor_height) {
+            Ok(hash) => crate::coordinator_resolve::beacon_matches_chain(election, &hash),
+            Err(e) => {
+                tracing::debug!(error = %e, anchor_height, "anchor block unreachable; beacon not pinned");
+                true
+            }
+        }
+    }
+
     fn validate_wallet_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("wallet name must not be empty".into());
@@ -1690,6 +1755,77 @@ mod server {
     /// dispatch arm wraps that into a `Response::Error`. Pulled
     /// out of the dispatch closure so error-paths can use `?` and
     /// the lock holds stay scoped.
+    /// Default BIP86 index for a seat coin, chosen well clear of the
+    /// everyday receive range so a prepared seat never collides with an
+    /// address the wallet hands out for ordinary payments.
+    const SEAT_RECEIVE_INDEX: u32 = 900;
+
+    /// Build the split that turns an ordinary coin into exactly one seat.
+    ///
+    /// Asks the coordinator what a seat costs rather than deriving it — the
+    /// coordinator, the round builder and the wallet computing that number
+    /// separately is how it came to disagree with itself (#698). Stops at the
+    /// unsigned PSBT: signing and broadcasting are existing verbs, and
+    /// keeping them separate means this never moves money by itself.
+    async fn wraith_prepare_coin_handler(
+        state: &DaemonState,
+        tier_id: &str,
+        coordinator_url: String,
+        coordinator_peers: Vec<String>,
+        receive_index: Option<u32>,
+        fee_rate_sats_per_vb: u64,
+        bip86_scan_max: u32,
+    ) -> Result<wraith_wallet_ipc::WraithCoinPreparedResponse, String> {
+        use wraith_wallet_core::wraith::WraithSessionClient;
+
+        let client =
+            WraithSessionClient::with_peers(coordinator_url, coordinator_peers, state.network);
+        let (_answered_by, discover) = client
+            .discover()
+            .await
+            .map_err(|e| format!("could not ask the coordinator what a seat costs: {e}"))?;
+        let tier = discover
+            .tiers
+            .iter()
+            .find(|t| t.id == tier_id)
+            .ok_or_else(|| {
+                let known: Vec<&str> = discover.tiers.iter().map(|t| t.id.as_str()).collect();
+                format!("coordinator does not offer tier '{tier_id}'; it offers {known:?}")
+            })?;
+        let seat_price_sats = tier.mix_seat_price_sats;
+
+        let destination_index = receive_index.unwrap_or(SEAT_RECEIVE_INDEX);
+        let network = state.network;
+        let destination_address = with_active_wallet(state, move |_, ks| {
+            wraith_wallet_core::light::receive_address(ks, destination_index, network)
+                .map(|a| a.to_string())
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+
+        let created = psbt_create_handler(
+            state,
+            &destination_address,
+            seat_price_sats,
+            fee_rate_sats_per_vb,
+            None,
+            bip86_scan_max,
+            &[],
+        )
+        .await?;
+
+        Ok(wraith_wallet_ipc::WraithCoinPreparedResponse {
+            psbt: created.psbt,
+            seat_price_sats,
+            destination_address,
+            destination_index,
+            input_count: created.input_count,
+            total_input_sats: created.total_input_sats,
+            change_sats: created.change_sats,
+            fee_sats: created.fee_sats,
+        })
+    }
+
     async fn psbt_create_handler(
         state: &DaemonState,
         recipient_address: &str,
@@ -3208,7 +3344,11 @@ mod server {
                     },
                 }
             }
-            Request::WalletCreate { name, passphrase } => {
+            Request::WalletCreate {
+                name,
+                passphrase,
+                user_entropy_digest,
+            } => {
                 if let Some(refused) = refuse_in_kiosk_mode(state, "wallet create") {
                     return Envelope::new(id, refused);
                 }
@@ -3225,7 +3365,23 @@ mod server {
                         })
                     } else {
                         let pass = SecretString::new(passphrase);
-                        match Keystore::create() {
+                        // User entropy is mixed with the OS source, never
+                        // substituted for it, so a malformed or hostile
+                        // digest cannot weaken the seed below what the OS
+                        // alone would have given.
+                        let mixed = match user_entropy_digest.as_deref() {
+                            None => None,
+                            Some(hex_digest) => match decode_entropy_digest(hex_digest) {
+                                Ok(d) => Some(d),
+                                Err(message) => {
+                                    return Envelope::new(
+                                        id,
+                                        Response::Error(ErrorResponse { message }),
+                                    )
+                                }
+                            },
+                        };
+                        match Keystore::create_with_mixed_digest(mixed.as_ref()) {
                             Ok((ks, mnemonic)) => match ks.save(&path, &pass) {
                                 Ok(()) => {
                                     state.wallets.write().await.insert(name.clone(), ks);
@@ -3820,12 +3976,10 @@ mod server {
                 coordinator_peers,
                 tier_id,
                 ghost_id,
-                bond_id_placeholder,
                 utxo_txid,
                 utxo_vout,
                 utxo_value_sats,
                 utxo_scriptpubkey_hex,
-                change_address,
                 mix_output_address,
             } => {
                 use wraith_wallet_core::wraith::{
@@ -3858,48 +4012,47 @@ mod server {
                         );
                     }
                 };
-                // Build the ghost-pay client (carries the internal-auth
-                // secret) before `req` consumes `ghost_id`. The bond is
-                // escrowed against this participant's own L2 balance.
-                let bond_gid = ghost_id.clone();
+                // Same reason: `req` takes the scriptPubKey, and the
+                // ownership proof needs it to find the key that owns it.
+                let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
+                let network_for_proof = state.network;
+                let scan_max_for_proof = wraith_wallet_core::wraith_signer::DEFAULT_SCAN_INDEX_MAX;
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo: ParticipantUtxo {
                         txid: utxo_txid,
                         vout: utxo_vout,
                         value_sats: utxo_value_sats,
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
-                    change_address,
                     mix_output_address,
                 };
-                let pay = match build_ghost_pay_client(state).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bond escrow client: {e}"),
-                            }),
-                        );
-                    }
-                };
-                // Escrow the bond against ghost-pay once the coordinator
-                // returns the real session_id + bond amount.
-                let bond_setup = |session_id: &str, amount: u64| {
-                    let session_id = session_id.to_string();
-                    let pay = &pay;
-                    let gid = bond_gid.clone();
+                // Prove control of the input UTXO. The coordinator checks
+                // this against the scriptPubKey the chain reports for the
+                // outpoint, so it must come from the key that really owns
+                // the coin (#699). Async because the keystore sits behind
+                // the wallet lock.
+                let proof_spk = utxo_scriptpubkey_hex_for_proof.clone();
+                let prove_ownership = |challenge: &str| {
+                    let challenge = challenge.to_string();
+                    let spk = proof_spk.clone();
                     async move {
-                        pay.escrow_bond(&gid, &session_id, amount)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| WraithClientError::Bond(e.to_string()))
+                        with_active_wallet(state, move |_, ks| {
+                            wraith_wallet_core::wraith_signer::prove_ownership(
+                                ks,
+                                network_for_proof,
+                                &spk,
+                                &challenge,
+                                scan_max_for_proof,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(WraithClientError::OwnershipProof)
                     }
                 };
-                match client.prepare_mix(req, bond_setup).await {
+                match client.prepare_mix(req, prove_ownership).await {
                     Ok(prepared) => {
                         let resp = WraithMixPreparedResponse {
                             session_id: prepared.session_id.clone(),
@@ -4003,7 +4156,6 @@ mod server {
                             network: parsed.network,
                             pool_id: parsed.pool_id,
                             service_fee_bps: parsed.service_fee_bps,
-                            bond_bps: parsed.bond_bps,
                             fill_window_secs: parsed.fill_window_secs,
                             tiers: parsed
                                 .tiers
@@ -4013,8 +4165,9 @@ mod server {
                                     denomination_sats: t.denomination_sats,
                                     min_participants: t.min_participants,
                                     max_participants: t.max_participants,
-                                    bond_sats: t.bond_sats,
                                     service_fee_sats: t.service_fee_sats,
+                                    mix_seat_price_sats: t.mix_seat_price_sats,
+                                    jump_seat_price_sats: t.jump_seat_price_sats,
                                 })
                                 .collect(),
                         })
@@ -4035,9 +4188,24 @@ mod server {
                         None,
                     ) {
                         Ok(client) => match client.coordinator_election().await {
-                            Ok(election) => crate::coordinator_resolve::resolve_from_election(
-                                &election, &tier_id,
-                            ),
+                            Ok(election) => {
+                                // Pin the beacon to the chain if this wallet has
+                                // its own node. Verifying the draw against the
+                                // beacon published beside it only proves internal
+                                // consistency; the block hash is a fact the
+                                // operator does not get to state (#697).
+                                if !beacon_pinned_to_chain(state, &election) {
+                                    tracing::warn!(
+                                        "resolve coordinator: published beacon does not match \
+                                         the anchor block; refusing the election"
+                                    );
+                                    (None, election.get("epoch").and_then(|e| e.as_u64()))
+                                } else {
+                                    crate::coordinator_resolve::resolve_from_election(
+                                        &election, &tier_id,
+                                    )
+                                }
+                            }
                             Err(e) => {
                                 tracing::debug!(error = %e, "resolve coordinator: election fetch failed");
                                 (None, None)
@@ -4056,12 +4224,10 @@ mod server {
                 coordinator_peers,
                 tier_id,
                 ghost_id,
-                bond_id_placeholder,
                 utxo_txid,
                 utxo_vout,
                 utxo_value_sats,
                 utxo_scriptpubkey_hex,
-                change_address,
                 mix_output_address,
                 bip86_index,
                 bip86_scan_max,
@@ -4099,45 +4265,47 @@ mod server {
                         );
                     }
                 };
-                // Build the ghost-pay client before `req` consumes
-                // `ghost_id`; escrow this participant's bond against it.
-                let bond_gid = ghost_id.clone();
+                // Same reason: `req` takes the scriptPubKey, and the
+                // ownership proof needs it to find the key that owns it.
+                let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
+                let network_for_proof = state.network;
+                let scan_max_for_proof = bip86_scan_max.unwrap_or(DEFAULT_SCAN_INDEX_MAX);
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo: ParticipantUtxo {
                         txid: utxo_txid,
                         vout: utxo_vout,
                         value_sats: utxo_value_sats,
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
-                    change_address,
                     mix_output_address,
                 };
-                let pay = match build_ghost_pay_client(state).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bond escrow client: {e}"),
-                            }),
-                        );
-                    }
-                };
-                let bond_setup = |session_id: &str, amount: u64| {
-                    let session_id = session_id.to_string();
-                    let pay = &pay;
-                    let gid = bond_gid.clone();
+                // Prove control of the input UTXO. The coordinator checks
+                // this against the scriptPubKey the chain reports for the
+                // outpoint, so it must come from the key that really owns
+                // the coin (#699). Async because the keystore sits behind
+                // the wallet lock.
+                let proof_spk = utxo_scriptpubkey_hex_for_proof.clone();
+                let prove_ownership = |challenge: &str| {
+                    let challenge = challenge.to_string();
+                    let spk = proof_spk.clone();
                     async move {
-                        pay.escrow_bond(&gid, &session_id, amount)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| WraithClientError::Bond(e.to_string()))
+                        with_active_wallet(state, move |_, ks| {
+                            wraith_wallet_core::wraith_signer::prove_ownership(
+                                ks,
+                                network_for_proof,
+                                &spk,
+                                &challenge,
+                                scan_max_for_proof,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(WraithClientError::OwnershipProof)
                     }
                 };
-                let prepared = match client.prepare_mix(req, bond_setup).await {
+                let prepared = match client.prepare_mix(req, prove_ownership).await {
                     Ok(p) => p,
                     Err(e) => {
                         return Envelope::new(
@@ -4346,6 +4514,27 @@ mod server {
             .await
             {
                 Ok(r) => Response::PsbtCreated(r),
+                Err(e) => Response::Error(ErrorResponse { message: e }),
+            },
+            Request::WraithPrepareCoin {
+                tier_id,
+                coordinator_url,
+                coordinator_peers,
+                receive_index,
+                fee_rate_sats_per_vb,
+                bip86_scan_max,
+            } => match wraith_prepare_coin_handler(
+                state,
+                &tier_id,
+                coordinator_url,
+                coordinator_peers,
+                receive_index,
+                fee_rate_sats_per_vb,
+                bip86_scan_max,
+            )
+            .await
+            {
+                Ok(r) => Response::WraithCoinPrepared(r),
                 Err(e) => Response::Error(ErrorResponse { message: e }),
             },
             Request::PsbtBroadcast { psbt_or_tx_hex } => {
@@ -4786,6 +4975,7 @@ mod server {
                 Request::WalletCreate {
                     name: "doomed".into(),
                     passphrase: "hunter2hunter2".into(),
+                    user_entropy_digest: None,
                 },
             ))
             .unwrap();

@@ -45,25 +45,20 @@ mod error;
 mod tier;
 
 pub use blind::{
-    BlindSignature, BlindSignatureResponse, BlindedAddress, BlindedChallenge, BlindingContext,
-    CoordinatorSigner, CoordinatorSignerConfig, PublicNonce, TokenVerifier, UnblindedToken,
+    ensure_os_rng_available, BlindSignature, BlindSignatureResponse, BlindedAddress,
+    BlindedChallenge, BlindingContext, CoordinatorSigner, CoordinatorSignerConfig, PublicNonce,
+    TokenVerifier, UnblindedToken,
 };
 pub use error::WraithError;
 pub use tier::{
-    LiteTier, LITE_BOND_BPS, LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS, VBYTES_PER_INPUT,
-    VBYTES_PER_OUTPUT,
+    LiteTier, LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
 };
 
 pub mod single_round;
 pub use single_round::{
-    LiteOutputKind, LiteOutputProvenance, LiteParticipantInput, LiteRound, LiteRoundBuilder,
-    CHANGE_DUST_THRESHOLD_SATS, DEFAULT_FEE_RATE_SATS_PER_VB,
-};
-
-pub mod bond;
-pub use bond::{
-    BondError, BondId, BondLedger, BondRecord, BondResolution, BondStatus, MockBondLedger,
-    RefundReason, SlashReason,
+    per_participant_mining_share, round_vbytes, LiteOutputKind, LiteOutputProvenance,
+    LiteParticipantInput, LiteRound, LiteRoundBuilder, CHANGE_DUST_THRESHOLD_SATS,
+    DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 pub mod lite_session;
@@ -74,13 +69,17 @@ pub use lite_session::{
     SessionGossipEvent, SessionIdGenerator, SystemClock,
 };
 
+pub mod ownership;
+pub use ownership::{ownership_challenge, OWNERSHIP_CHALLENGE_TAG};
+
 pub mod remix;
 
 pub mod epoch;
 pub mod service;
 pub mod sortition;
 pub use epoch::{
-    canonical_roster, epoch_for_height, snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
+    canonical_roster, derive_beacon, epoch_for_height, shard_key_for_tier_epoch,
+    snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
 };
 pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,

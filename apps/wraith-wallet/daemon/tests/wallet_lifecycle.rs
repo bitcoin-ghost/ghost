@@ -109,6 +109,7 @@ async fn wallet_lifecycle_round_trip() {
         Request::WalletCreate {
             name: "alpha".into(),
             passphrase: pass.clone(),
+            user_entropy_digest: None,
         },
     )
     .await
@@ -481,6 +482,7 @@ async fn idle_lock_locks_wallets_after_threshold() {
         Request::WalletCreate {
             name: "idle".into(),
             passphrase: pass.clone(),
+            user_entropy_digest: None,
         },
     )
     .await

@@ -66,230 +66,63 @@ const MAX_TOTAL_NONCES: usize = 1000;
 /// L-14: Now configurable via `CoordinatorSignerConfig::nonce_expiry_secs`.
 const DEFAULT_NONCE_EXPIRY_SECS: u64 = 3600;
 
-/// Calculate Shannon entropy of byte slice
+/// Fresh 32 bytes from the operating system's CSPRNG.
 ///
-/// Returns entropy in bits per byte (0.0 to 8.0).
-/// Cryptographically random data should have entropy close to 8.0.
-fn calculate_shannon_entropy(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
-        return 0.0;
-    }
-
-    // Calculate byte frequency
-    let mut counts = [0u32; 256];
-    for &b in bytes {
-        counts[b as usize] += 1;
-    }
-
-    // Calculate Shannon entropy
-    let len = bytes.len() as f64;
-    counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = c as f64 / len;
-            -p * p.log2()
-        })
-        .sum()
-}
-
-/// L-10 SEC-WRAITH-1: Minimum Shannon entropy for cryptographic randomness (bits per byte)
+/// No statistical checking of the output. Master spec §6A rule E-5: a
+/// boot-time health check asks whether the OS source is *available* and
+/// fails closed if it is not; it never runs statistical tests on samples,
+/// because those have a false-positive rate by construction, catch no real
+/// failure mode, and were themselves a v1 finding in this very file.
 ///
-/// Shannon entropy depends on the number of unique values observed. With 32
-/// samples from 256 possible values, valid randomness yields ~4.5-5.0 bits/byte
-/// due to expected collisions in small samples (birthday paradox).
+/// The randomness itself stays — rule E-3 requires it. These bytes become
+/// blind-signature nonces and per-round signing keys, which are multi-party
+/// and single-use; deterministic nonces there are a key-extraction vector.
+/// E-2's deterministic nonces are for *wallet-side single-signer* Schnorr,
+/// which is a different code path.
 ///
-/// Set to 4.0 bits/byte as a balance between:
-/// - Security (detecting weak RNG) - 4.0 is ~3 standard deviations below expected
-/// - Reliability (avoiding false positives on valid random data)
+/// # Errors
 ///
-/// This threshold is complemented by runs test and unique byte count checks
-/// to catch patterns that pass Shannon entropy but exhibit non-random structure.
-/// The combination of three independent tests provides strong RNG failure detection.
-///
-/// M-14 FALSE POSITIVE NOTE: Legitimate RNG can occasionally produce data that
-/// fails these statistical tests by pure chance. For a 3-sigma threshold, this
-/// occurs roughly 0.3% of the time per test. With three independent tests, the
-/// combined false positive rate is approximately 0.9% (3 x 0.3%). The
-/// `random_bytes_32_with_retry()` function handles this by retrying up to
-/// MAX_RNG_RETRIES times before failing, making false positive failures
-/// astronomically unlikely (0.009^100 ~ 10^-204) while still catching genuine
-/// RNG failures which would fail consistently.
-const MIN_ENTROPY_BITS_PER_BYTE: f64 = 4.0;
-
-/// L-10 SEC-WRAITH-1: Minimum number of runs (bit transitions) expected in random data.
-/// For 256 bits (32 bytes), random data should have ~128 runs (+/- ~11 std dev).
-/// L-10 FIX: Tightened from 85 to 95 runs (~3 std dev below mean instead of ~4).
-///
-/// M-14 NOTE: Legitimate random data falls outside this range ~0.3% of the time.
-/// The retry mechanism in random_bytes_32_with_retry() handles these rare cases.
-const MIN_RUNS_FOR_32_BYTES: usize = 95;
-
-/// L-10 SEC-WRAITH-1: Maximum runs test to catch oscillating patterns (0101010...).
-/// L-10 FIX: Tightened from 171 to 161 runs (~3 std dev above mean instead of ~4).
-///
-/// M-14 NOTE: Legitimate random data falls outside this range ~0.3% of the time.
-/// The retry mechanism in random_bytes_32_with_retry() handles these rare cases.
-const MAX_RUNS_FOR_32_BYTES: usize = 161;
-
-/// L-10 SEC-WRAITH-1: Minimum unique byte count for 32 bytes.
-/// With 32 samples from 256 values, birthday paradox gives ~30.4 expected unique values.
-/// L-10 FIX: Increased from 15 to 18 unique bytes for stronger pattern detection.
-///
-/// M-14 NOTE: Legitimate random data can occasionally have fewer unique bytes.
-/// The retry mechanism in random_bytes_32_with_retry() handles these rare cases.
-const MIN_UNIQUE_BYTES: usize = 18;
-
-/// SEC-WRAITH-1: Perform runs test on byte data
-///
-/// Counts the number of bit transitions (runs) in the data.
-/// Random data should have roughly n/2 runs where n is the number of bits.
-fn count_bit_runs(bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-
-    let mut runs = 1;
-    let mut prev_bit = bytes[0] >> 7;
-
-    for &byte in bytes {
-        for bit_pos in (0..8).rev() {
-            let current_bit = (byte >> bit_pos) & 1;
-            if current_bit != prev_bit {
-                runs += 1;
-                prev_bit = current_bit;
-            }
-        }
-    }
-
-    runs
-}
-
-/// SEC-WRAITH-1: Count unique bytes in the data
-fn count_unique_bytes(bytes: &[u8]) -> usize {
-    let mut seen = [false; 256];
-    for &b in bytes {
-        seen[b as usize] = true;
-    }
-    seen.iter().filter(|&&x| x).count()
-}
-
-/// Generate random 32 bytes for key material (WR4-L3, H-CRYPTO-1)
-///
-/// Validates entropy quality after generation to detect RNG failures.
-/// Uses multiple statistical tests to detect weak randomness:
-/// 1. Shannon entropy estimation (4.0 bits/byte minimum)
-/// 2. Runs test (bit transitions should be ~128 for 256 bits)
-/// 3. Unique byte count (birthday paradox expects ~30 unique)
-///
-/// Returns an error if any test indicates non-random data.
+/// Fails closed if the OS source cannot be read at all, which is the one
+/// failure that is real and detectable.
 fn random_bytes_32() -> Result<[u8; 32], WraithError> {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-
-    // WR4-L3: Validate entropy quality
-    // Check for pathological cases indicating RNG failure
-    if bytes.iter().all(|&b| b == 0) {
-        return Err(WraithError::MissingData(
-            "Entropy error: all zeros - RNG failure detected".to_string(),
-        ));
-    }
-    if bytes.iter().all(|&b| b == 0xff) {
-        return Err(WraithError::MissingData(
-            "Entropy error: all ones - RNG failure detected".to_string(),
-        ));
-    }
-
-    // H-CRYPTO-1: Shannon entropy validation
-    let entropy = calculate_shannon_entropy(&bytes);
-    if entropy < MIN_ENTROPY_BITS_PER_BYTE {
-        return Err(WraithError::MissingData(format!(
-            "Entropy error: insufficient Shannon entropy ({:.2} bits/byte, minimum {:.1}) - RNG failure detected",
-            entropy, MIN_ENTROPY_BITS_PER_BYTE
-        )));
-    }
-
-    // H-CRYPTO-1: Runs test - detect patterns like 00001111 or 01010101
-    let runs = count_bit_runs(&bytes);
-    if runs < MIN_RUNS_FOR_32_BYTES {
-        return Err(WraithError::MissingData(format!(
-            "Entropy error: insufficient bit runs ({} runs, minimum {}) - possible stuck bits or low-frequency pattern",
-            runs, MIN_RUNS_FOR_32_BYTES
-        )));
-    }
-    if runs > MAX_RUNS_FOR_32_BYTES {
-        return Err(WraithError::MissingData(format!(
-            "Entropy error: excessive bit runs ({} runs, maximum {}) - possible oscillating pattern",
-            runs, MAX_RUNS_FOR_32_BYTES
-        )));
-    }
-
-    // H-CRYPTO-1: Unique byte count - catch severe repetition
-    let unique = count_unique_bytes(&bytes);
-    if unique < MIN_UNIQUE_BYTES {
-        return Err(WraithError::MissingData(format!(
-            "Entropy error: insufficient unique bytes ({} unique, minimum {}) - possible repetition pattern",
-            unique, MIN_UNIQUE_BYTES
-        )));
-    }
-
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| WraithError::SecurityError(format!("OS random source unavailable: {e}")))?;
     Ok(bytes)
 }
 
-/// C-3 FIX: Maximum RNG retry attempts before returning error
-const MAX_RNG_RETRIES: usize = 100;
-
-/// Generate random 32 bytes for key material with retry logic
+/// Confirm the OS random source can be read, and fail closed if it cannot.
 ///
-/// C-3 FIX: Returns Result instead of panicking. The caller is responsible for
-/// handling RNG failures appropriately. This allows graceful degradation rather
-/// than crashing the entire system.
-///
-/// # Errors
-///
-/// Returns `WraithError::SecurityError` if RNG fails MAX_RNG_RETRIES consecutive
-/// times, indicating a potentially broken system RNG.
-fn random_bytes_32_with_retry() -> Result<[u8; 32], WraithError> {
-    for attempt in 0..MAX_RNG_RETRIES {
-        if let Ok(bytes) = random_bytes_32() {
-            return Ok(bytes);
-        }
-        // If we get here, RNG produced invalid entropy - log and retry
-        tracing::error!(
-            attempt = attempt + 1,
-            max = MAX_RNG_RETRIES,
-            "RNG produced invalid entropy, retrying..."
-        );
-    }
-
-    // C-3 FIX: Return error instead of panicking
-    Err(WraithError::SecurityError(format!(
-        "RNG failed {} consecutive attempts - system RNG may be compromised",
-        MAX_RNG_RETRIES
-    )))
+/// This is the whole of the health check permitted by E-5. Call it once at
+/// startup so a host with no usable entropy source refuses to serve rather
+/// than discovering the problem at the first signature.
+pub fn ensure_os_rng_available() -> Result<(), WraithError> {
+    random_bytes_32().map(|_| ())
 }
 
-/// Generate a random secret key
-///
-/// C-3 FIX: Now returns Result to propagate RNG failures to callers.
+/// A random secp256k1 secret key.
 ///
 /// # Errors
 ///
-/// Returns `WraithError::SecurityError` if the RNG is broken or if valid
-/// secret key bytes cannot be generated after retries.
+/// Fails closed if the OS random source is unreadable.
 fn random_secret_key() -> Result<SecretKey, WraithError> {
-    // Try up to MAX_RNG_RETRIES times to get valid secret key bytes
-    for _ in 0..MAX_RNG_RETRIES {
-        let bytes = random_bytes_32_with_retry()?;
+    // The retry is not an entropy check. `SecretKey::from_slice` rejects the
+    // handful of 32-byte values that are not a valid scalar (zero, or ≥ the
+    // curve order) — probability about 2^-128, so a few attempts is beyond
+    // generous, and it is a domain check on the value rather than a judgement
+    // about the randomness that produced it.
+    const SCALAR_RANGE_ATTEMPTS: usize = 4;
+    for _ in 0..SCALAR_RANGE_ATTEMPTS {
+        let bytes = random_bytes_32()?;
         if let Ok(sk) = SecretKey::from_slice(&bytes) {
             return Ok(sk);
         }
-        // Bytes passed entropy check but weren't valid for secp256k1
-        // This is extremely rare (probability ~2^-128) but possible
     }
-    Err(WraithError::SecurityError(
-        "Failed to generate valid secret key after maximum retries".to_string(),
-    ))
+    Err(WraithError::SecurityError(format!(
+        "{SCALAR_RANGE_ATTEMPTS} consecutive random values fell outside the secp256k1 \
+         scalar range; this is astronomically unlikely and indicates a broken RNG"
+    )))
 }
 
 // Custom serde for [u8; 33] using hex encoding
@@ -698,7 +531,7 @@ impl CoordinatorSigner {
         engine.input(&public_nonce.serialize());
         engine.input(&self.public_key.serialize()); // Bind to coordinator identity key
         engine.input(ghost_id.as_bytes()); // Also include participant ID
-        engine.input(&random_bytes_32_with_retry()?);
+        engine.input(&random_bytes_32()?);
         let session_id = sha256::Hash::from_engine(engine).to_byte_array();
 
         let nonce = SigningNonce {
@@ -1797,142 +1630,30 @@ mod tests {
         );
     }
 
-    /// H-CRYPTO-1: Test Shannon entropy validation
+    /// E-5: the only health check is that the OS source can be read.
+    ///
+    /// Deliberately not a statistical test. The Coldcard incident (July
+    /// 2026) is the case in point: seed generation had silently fallen back
+    /// to MicroPython's Yasmarang PRNG, cutting effective entropy to ~40-72
+    /// bits. Its *output* is perfectly well distributed — every statistical
+    /// test this file used to run would have passed it, right up to the
+    /// point where ~1,816 BTC was swept out of 5,200 addresses.
     #[test]
-    fn test_shannon_entropy_validation() {
-        // Test with high entropy data (random)
-        let high_entropy = calculate_shannon_entropy(&[
-            0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7,
-            0xf8, 0x09, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-            0xdd, 0xee, 0xff, 0x00,
-        ]);
-        // This data has 32 unique bytes, entropy should be exactly 5.0 bits/byte
-        // (each byte appears once in 32 bytes, so -32 * (1/32) * log2(1/32) = 5)
+    fn the_rng_health_check_is_availability_and_nothing_else() {
         assert!(
-            high_entropy >= 4.5,
-            "High diversity data should have good entropy: {:.2}",
-            high_entropy
-        );
-
-        // Test with all zeros (pathological case)
-        let zero_entropy = calculate_shannon_entropy(&[0u8; 32]);
-        assert!(
-            zero_entropy < 0.1,
-            "All zeros should have near-zero entropy: {:.2}",
-            zero_entropy
-        );
-
-        // Test with repeated pattern (low entropy)
-        let repeated = [
-            0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB,
-            0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB,
-            0xAA, 0xBB, 0xAA, 0xBB,
-        ];
-        let low_entropy = calculate_shannon_entropy(&repeated);
-        assert!(
-            low_entropy < MIN_ENTROPY_BITS_PER_BYTE,
-            "Repeated pattern should have low entropy: {:.2}",
-            low_entropy
-        );
-
-        // Verify random_bytes_32 produces valid entropy (statistical test)
-        // Should pass with overwhelming probability for a working RNG
-        for _ in 0..10 {
-            let result = random_bytes_32();
-            assert!(
-                result.is_ok(),
-                "random_bytes_32 should succeed with valid RNG"
-            );
-        }
-    }
-
-    /// H-CRYPTO-1: Test runs test for bit pattern detection
-    #[test]
-    fn test_bit_runs_validation() {
-        // Test with good random-like data - should have ~128 runs for 256 bits
-        let good_data = [
-            0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7,
-            0xf8, 0x09, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-            0xdd, 0xee, 0xff, 0x00,
-        ];
-        let good_runs = count_bit_runs(&good_data);
-        assert!(
-            (MIN_RUNS_FOR_32_BYTES..=MAX_RUNS_FOR_32_BYTES).contains(&good_runs),
-            "Good data should have acceptable run count: {} (expected {}-{})",
-            good_runs,
-            MIN_RUNS_FOR_32_BYTES,
-            MAX_RUNS_FOR_32_BYTES
-        );
-
-        // Test with all zeros - should have exactly 1 run (all 0s)
-        let zero_runs = count_bit_runs(&[0u8; 32]);
-        assert_eq!(zero_runs, 1, "All zeros should have 1 run");
-        assert!(
-            zero_runs < MIN_RUNS_FOR_32_BYTES,
-            "All zeros should fail runs test"
-        );
-
-        // Test with all ones - should have exactly 1 run (all 1s)
-        let ones_runs = count_bit_runs(&[0xff; 32]);
-        assert_eq!(ones_runs, 1, "All ones should have 1 run");
-        assert!(
-            ones_runs < MIN_RUNS_FOR_32_BYTES,
-            "All ones should fail runs test"
-        );
-
-        // Test with alternating bits (0101...) - should have 256 runs (maximum)
-        let alternating = [0x55u8; 32]; // 01010101 repeated
-        let alt_runs = count_bit_runs(&alternating);
-        assert!(
-            alt_runs > MAX_RUNS_FOR_32_BYTES,
-            "Alternating pattern should exceed max runs: {} > {}",
-            alt_runs,
-            MAX_RUNS_FOR_32_BYTES
-        );
-
-        // Test with 0xAA pattern (10101010) - also should have high runs
-        let aa_pattern = [0xAA; 32];
-        let aa_runs = count_bit_runs(&aa_pattern);
-        assert!(
-            aa_runs > MAX_RUNS_FOR_32_BYTES,
-            "0xAA pattern should exceed max runs: {} > {}",
-            aa_runs,
-            MAX_RUNS_FOR_32_BYTES
+            ensure_os_rng_available().is_ok(),
+            "the OS random source must be readable"
         );
     }
 
-    /// H-CRYPTO-1: Test unique byte count validation
+    /// Fresh calls must not repeat. A trivially broken RNG — one that
+    /// returns a constant — is caught by using the values, not by grading
+    /// them.
     #[test]
-    fn test_unique_bytes_validation() {
-        // Test with all unique bytes
-        let all_unique: [u8; 32] = [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31,
-        ];
-        let unique_count = count_unique_bytes(&all_unique);
-        assert_eq!(unique_count, 32, "All unique bytes should count 32");
-
-        // Test with all same bytes
-        let all_same = [0x42u8; 32];
-        let same_count = count_unique_bytes(&all_same);
-        assert_eq!(same_count, 1, "All same bytes should count 1");
-        assert!(
-            same_count < MIN_UNIQUE_BYTES,
-            "All same bytes should fail unique test"
-        );
-
-        // Test with two byte pattern
-        let two_bytes = [
-            0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB,
-            0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB,
-            0xAA, 0xBB, 0xAA, 0xBB,
-        ];
-        let two_count = count_unique_bytes(&two_bytes);
-        assert_eq!(two_count, 2, "Two byte pattern should count 2");
-        assert!(
-            two_count < MIN_UNIQUE_BYTES,
-            "Two byte pattern should fail unique test"
-        );
+    fn successive_random_values_differ() {
+        let a = random_bytes_32().expect("os rng");
+        let b = random_bytes_32().expect("os rng");
+        assert_ne!(a, b);
     }
 
     /// CRIT-7: Verify that malformed inputs return errors instead of panicking

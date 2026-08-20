@@ -69,9 +69,6 @@ enum Command {
     /// the unsigned transaction; the user signs out-of-band and
     /// invokes `submit` with the witness hex.
     ///
-    /// v1: bond escrow is the caller's responsibility — must be
-    /// arranged against the coordinator's BondLedger before
-    /// `prepare` is invoked. Phase C will move this into wraithd.
     Mix {
         #[command(subcommand)]
         sub: MixCommand,
@@ -89,6 +86,40 @@ enum Command {
 
 #[derive(Subcommand)]
 enum MixCommand {
+    /// Turn an ordinary coin into exactly one round seat.
+    ///
+    /// A round has no change output, because a change output would identify
+    /// you inside it — so your input has to be worth precisely what a seat
+    /// costs. This asks the coordinator that price, picks a fresh address for
+    /// the seat coin, and builds the split.
+    ///
+    /// It stops at an unsigned PSBT. Sign it with `wraith psbt sign` and send
+    /// it with `wraith psbt broadcast`, then mix using the resulting output
+    /// once it has confirmed.
+    ///
+    /// Note the split transaction is visible on-chain and marks you as
+    /// preparing to mix. That is the cost of not carrying the link into the
+    /// round itself, where it would reveal which output was yours.
+    PrepareCoin {
+        /// HTTP URL of the wraith-coordinator endpoint.
+        #[arg(long)]
+        coordinator: String,
+        /// Fallback coordinator URLs, repeatable.
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Tier to buy a seat in, e.g. `100k_sats`.
+        #[arg(long)]
+        tier: String,
+        /// BIP86 index for the address that receives the seat.
+        #[arg(long)]
+        index: Option<u32>,
+        /// Mining fee rate for the split, sats/vB.
+        #[arg(long, default_value_t = 5)]
+        fee_rate: u64,
+        /// Highest BIP86 index to scan for spendable UTXOs.
+        #[arg(long, default_value_t = 32)]
+        scan_max: u32,
+    },
     /// Step 1: enrol in a Wraith Lite mix session against
     /// `coordinator_url`, commit the supplied UTXO, run the blind-
     /// sig protocol over `mix_output_address`, and fetch the
@@ -116,13 +147,6 @@ enum MixCommand {
         /// only uses it to dedupe against double-enrolment.
         #[arg(long)]
         ghost_id: String,
-        /// Placeholder bond_id passed to /find_or_create. The real
-        /// bond is verified at /inputs time against the
-        /// (ghost_id, session_id, expected_sats) tuple in the
-        /// coordinator's BondLedger; the placeholder here is just
-        /// echoed back for diagnostic logs.
-        #[arg(long, default_value = "placeholder")]
-        bond_id_placeholder: String,
         /// UTXO outpoint as `txid:vout`.
         #[arg(long)]
         utxo: String,
@@ -132,18 +156,13 @@ enum MixCommand {
         /// UTXO scriptPubKey, hex-encoded.
         #[arg(long)]
         utxo_scriptpubkey: String,
-        /// Wallet-controlled change address. Required when the
-        /// input value exceeds (denom + per-participant fee shares)
-        /// by more than dust.
-        #[arg(long)]
-        change_address: Option<String>,
         /// Anonymous destination for the wallet's denom-sized
         /// mixed output. Should NOT be linkable to the input.
         #[arg(long)]
         mix_output_address: String,
     },
     /// Fetch the coordinator's `/api/v1/pool/discover` payload —
-    /// network, supported tiers, fee + bond rates. Useful for
+    /// network, supported tiers, fee rates. Useful for
     /// debugging "is this coordinator alive and serving the tiers
     /// I expect" before running a real mix.
     Discover {
@@ -184,16 +203,12 @@ enum MixCommand {
         tier: String,
         #[arg(long)]
         ghost_id: String,
-        #[arg(long, default_value = "placeholder")]
-        bond_id_placeholder: String,
         #[arg(long)]
         utxo: String,
         #[arg(long)]
         utxo_value: u64,
         #[arg(long)]
         utxo_scriptpubkey: String,
-        #[arg(long)]
-        change_address: Option<String>,
         #[arg(long)]
         mix_output_address: String,
         /// BIP86 derivation index of the wallet key that owns the
@@ -341,9 +356,6 @@ enum LocksCommand {
     ///   2. WraithMixOneShot(mix_output=funding_addr) → broadcast_txid
     ///   3. LocksConfirm(lock_id, broadcast_txid)     → block_height
     ///
-    /// Operator-side bond escrow is the caller's responsibility (v1).
-    /// The coordinator's BondLedger must be configured to accept the
-    /// wallet's bond before the mix's /inputs phase.
     PrepareViaWraith {
         /// Lock capacity in satoshis. Must match a Wraith Lite tier
         /// denomination (100k_sats / 1m_sats / 10m_sats / 100m_sats).
@@ -362,9 +374,6 @@ enum LocksCommand {
         /// (e.g. `socks5h://127.0.0.1:9050` for Tor).
         #[arg(long)]
         socks5_proxy: Option<String>,
-        /// Bond placeholder echoed at /find_or_create.
-        #[arg(long, default_value = "placeholder")]
-        bond_id_placeholder: String,
         /// UTXO outpoint feeding the mix as `txid:vout`.
         #[arg(long)]
         utxo: String,
@@ -374,10 +383,6 @@ enum LocksCommand {
         /// UTXO scriptPubKey, hex.
         #[arg(long)]
         utxo_scriptpubkey: String,
-        /// Change address — required when input value exceeds
-        /// (denom + per-participant fee shares) by ≥ dust.
-        #[arg(long)]
-        change_address: Option<String>,
         /// Optional BIP86 derivation index of the wallet key that
         /// owns the input UTXO. None → daemon scans 0..1024.
         #[arg(long)]
@@ -404,7 +409,19 @@ enum LocksCommand {
 #[derive(Subcommand)]
 enum WalletCommand {
     /// Create a fresh wallet under the given name (generates a new BIP39 mnemonic).
-    Create { name: String },
+    Create {
+        name: String,
+        /// Roll your own dice (or flip coins) and mix them into the seed.
+        ///
+        /// Your rolls are combined with this computer's randomness, never
+        /// used instead of it, so they can only help: if the operating
+        /// system's random source were ever weak, your rolls still stand
+        /// between an attacker and your coins. 99 die rolls or 256 coin
+        /// flips is a full-strength contribution; 50 rolls / 128 flips is
+        /// the minimum accepted.
+        #[arg(long)]
+        dice: bool,
+    },
     /// Import a wallet from an existing BIP-39 mnemonic. Prompts for the words
     /// and a new passphrase. Refuses to overwrite an existing wallet of the
     /// same name.
@@ -544,11 +561,9 @@ mod client {
                         tier,
                         ghost_id,
                         socks5_proxy,
-                        bond_id_placeholder,
                         utxo,
                         utxo_value,
                         utxo_scriptpubkey,
-                        change_address,
                         bip86_index,
                     },
             } = command
@@ -560,11 +575,9 @@ mod client {
                     tier,
                     ghost_id,
                     socks5_proxy,
-                    bond_id_placeholder,
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
-                    change_address,
                     bip86_index,
                 )
                 .await;
@@ -654,13 +667,24 @@ mod client {
                 UpdateCommand::Check { manifest_url } => Request::CheckForUpdate { manifest_url },
             },
             Command::Wallet { sub } => match sub {
-                WalletCommand::Create { name } => match prompt_new_passphrase() {
-                    Ok(pass) => Request::WalletCreate {
-                        name,
-                        passphrase: pass,
-                    },
-                    Err(e) => return io_err(e),
-                },
+                WalletCommand::Create { name, dice } => {
+                    let user_entropy_digest = if dice {
+                        match collect_user_entropy() {
+                            Ok(d) => Some(d),
+                            Err(e) => return io_err(e),
+                        }
+                    } else {
+                        None
+                    };
+                    match prompt_new_passphrase() {
+                        Ok(pass) => Request::WalletCreate {
+                            name,
+                            passphrase: pass,
+                            user_entropy_digest,
+                        },
+                        Err(e) => return io_err(e),
+                    }
+                }
                 WalletCommand::Import { name } => {
                     let mnemonic = match prompt_mnemonic() {
                         Ok(m) => m,
@@ -704,17 +728,30 @@ mod client {
                 },
             },
             Command::Mix { sub } => match sub {
+                MixCommand::PrepareCoin {
+                    coordinator,
+                    peers,
+                    tier,
+                    index,
+                    fee_rate,
+                    scan_max,
+                } => Request::WraithPrepareCoin {
+                    tier_id: tier,
+                    coordinator_url: coordinator,
+                    coordinator_peers: peers,
+                    receive_index: index,
+                    fee_rate_sats_per_vb: fee_rate,
+                    bip86_scan_max: scan_max,
+                },
                 MixCommand::Prepare {
                     coordinator,
                     coordinator_peers,
                     socks5_proxy,
                     tier,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
-                    change_address,
                     mix_output_address,
                 } => {
                     let (txid, vout) = match parse_outpoint(&utxo) {
@@ -732,12 +769,10 @@ mod client {
                         socks5_proxy,
                         tier_id: tier,
                         ghost_id,
-                        bond_id_placeholder,
                         utxo_txid: txid,
                         utxo_vout: vout,
                         utxo_value_sats: utxo_value,
                         utxo_scriptpubkey_hex: utxo_scriptpubkey,
-                        change_address,
                         mix_output_address,
                     }
                 }
@@ -761,11 +796,9 @@ mod client {
                     socks5_proxy,
                     tier,
                     ghost_id,
-                    bond_id_placeholder,
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
-                    change_address,
                     mix_output_address,
                     bip86_index,
                     bip86_scan_max,
@@ -785,12 +818,10 @@ mod client {
                         socks5_proxy,
                         tier_id: tier,
                         ghost_id,
-                        bond_id_placeholder,
                         utxo_txid: txid,
                         utxo_vout: vout,
                         utxo_value_sats: utxo_value,
                         utxo_scriptpubkey_hex: utxo_scriptpubkey,
-                        change_address,
                         mix_output_address,
                         bip86_index,
                         bip86_scan_max,
@@ -813,6 +844,38 @@ mod client {
         }
 
         match result {
+            Ok(Response::WraithCoinPrepared(p)) => {
+                println!(
+                    "seat price:   {} sats — exact, a round has no change output",
+                    p.seat_price_sats
+                );
+                println!(
+                    "destination:  {} (index {})",
+                    p.destination_address, p.destination_index
+                );
+                println!(
+                    "inputs:       {} totalling {} sats",
+                    p.input_count, p.total_input_sats
+                );
+                println!("change back:  {} sats", p.change_sats);
+                println!("mining fee:   {} sats", p.fee_sats);
+                println!();
+                println!("psbt:");
+                println!("{}", p.psbt);
+                println!();
+                println!("Next: `wraith psbt sign` then `wraith psbt broadcast`.");
+                println!(
+                    "Once it confirms, mix using the output at {} — that coin is exactly one seat.",
+                    p.destination_address
+                );
+                println!();
+                println!(
+                    "This split is visible on-chain and marks you as preparing to mix. It does\n\
+                     not reveal which output of the round is yours, which carrying the change\n\
+                     into the round would."
+                );
+                std::process::ExitCode::SUCCESS
+            }
             Ok(Response::Doctor(d)) => {
                 for c in &d.checks {
                     let mark = match c.status.as_str() {
@@ -1300,7 +1363,6 @@ mod client {
                 println!("network:          {}", d.network);
                 println!("pool_id:          {}", d.pool_id);
                 println!("service_fee_bps:  {}", d.service_fee_bps);
-                println!("bond_bps:         {}", d.bond_bps);
                 println!("fill_window_secs: {}", d.fill_window_secs);
                 if d.tiers.is_empty() {
                     println!("tiers:            (none)");
@@ -1308,12 +1370,8 @@ mod client {
                     println!("tiers:");
                     for t in &d.tiers {
                         println!(
-                            "  {:>10}  denom={:>12} sats  bond={:>9} sats  min={}  max={}",
-                            t.id,
-                            t.denomination_sats,
-                            t.bond_sats,
-                            t.min_participants,
-                            t.max_participants,
+                            "  {:>10}  denom={:>12} sats  min={}  max={}",
+                            t.id, t.denomination_sats, t.min_participants, t.max_participants,
                         );
                     }
                 }
@@ -1555,6 +1613,94 @@ mod client {
         }
     }
 
+    /// Collect dice rolls / coin flips and reduce them to a digest.
+    ///
+    /// The raw sequence never leaves this process: only the digest is sent
+    /// to the daemon. The minimum-contribution floor is enforced here, where
+    /// the rolls are, which is safe because mixing is one-directional — a
+    /// small contribution cannot weaken the seed, it just cannot honestly be
+    /// called protection.
+    fn collect_user_entropy() -> std::io::Result<String> {
+        use std::io::{BufRead, Write};
+        use wraith_wallet_core::user_entropy::{UserEntropy, MIN_USER_BITS, RECOMMENDED_USER_BITS};
+
+        println!("{}", wraith_wallet_core::user_entropy::guidance());
+        println!();
+        println!(
+            "Enter die rolls as digits 1-6, or coin flips as h/t. Spaces are fine, and you can\n\
+             paste a whole line at once. Type `done` when you have enough, or `cancel` to stop.\n"
+        );
+
+        let mut entropy = UserEntropy::new();
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        loop {
+            print!(
+                "  {:.0}/{:.0} bits ({} rolls, {} flips) > ",
+                entropy.bits(),
+                RECOMMENDED_USER_BITS,
+                entropy.die_rolls(),
+                entropy.coin_flips()
+            );
+            std::io::stdout().flush()?;
+
+            let line = match lines.next() {
+                Some(l) => l?,
+                None => break,
+            };
+            let trimmed = line.trim().to_ascii_lowercase();
+            if trimmed == "cancel" {
+                return Err(std::io::Error::other("cancelled"));
+            }
+            if trimmed == "done" {
+                break;
+            }
+
+            for ch in trimmed.chars().filter(|c| !c.is_whitespace()) {
+                match ch {
+                    '1'..='6' => {
+                        entropy
+                            .push_die(ch as u8 - b'0')
+                            .map_err(std::io::Error::other)?;
+                    }
+                    'h' => entropy.push_coin(true),
+                    't' => entropy.push_coin(false),
+                    other => {
+                        println!("  ignoring '{other}' — expected 1-6, h or t");
+                    }
+                }
+            }
+        }
+
+        // Report before refusing, so a user who stopped early can see how
+        // close they were rather than just being told no.
+        if entropy.bits() < MIN_USER_BITS {
+            let (rolls, flips) = entropy.remaining_for(MIN_USER_BITS);
+            return Err(std::io::Error::other(format!(
+                "only {:.0} bits supplied; {:.0} is the minimum ({rolls} more rolls or \
+                 {flips} more flips). Re-run without --dice to create the wallet from the \
+                 operating system's randomness alone, which is what happens by default.",
+                entropy.bits(),
+                MIN_USER_BITS
+            )));
+        }
+        if entropy.bits() < RECOMMENDED_USER_BITS {
+            println!(
+                "  note: {:.0} bits is accepted, but {:.0} matches the strength of the seed \
+                 it mixes into.",
+                entropy.bits(),
+                RECOMMENDED_USER_BITS
+            );
+        }
+
+        let digest = entropy.digest().map_err(std::io::Error::other)?;
+        println!(
+            "  mixing {:.0} bits of your own entropy into the seed.\n",
+            entropy.bits()
+        );
+        Ok(hex::encode(digest))
+    }
+
     fn prompt_new_passphrase() -> std::io::Result<String> {
         let pass = prompt_passphrase("new passphrase: ")?;
         if pass.is_empty() {
@@ -1632,11 +1778,9 @@ mod client {
         tier: String,
         ghost_id: String,
         socks5_proxy: Option<String>,
-        bond_id_placeholder: String,
         utxo: String,
         utxo_value: u64,
         utxo_scriptpubkey: String,
-        change_address: Option<String>,
         bip86_index: Option<u32>,
     ) -> std::process::ExitCode {
         let (txid, vout) = match parse_outpoint(&utxo) {
@@ -1678,12 +1822,10 @@ mod client {
             socks5_proxy,
             tier_id: tier,
             ghost_id,
-            bond_id_placeholder,
             utxo_txid: txid,
             utxo_vout: vout,
             utxo_value_sats: utxo_value,
             utxo_scriptpubkey_hex: utxo_scriptpubkey,
-            change_address,
             mix_output_address: prep.funding_address.clone(),
             bip86_index,
             bip86_scan_max: None,

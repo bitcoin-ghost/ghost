@@ -39,13 +39,10 @@ path = "src/main.rs"
 [dependencies]
 # Workspace crates
 wraith-protocol = { workspace = true }
-# Identity-pinning TLS: the bond ledger client pins ghost-pay's Ed25519
-# identity cert against the co-located node_id via
-# `ghost_common::tls::IdentityPinningVerifier`.
-ghost-common = { workspace = true }
 
 # Bitcoin (just needed for Network enum + re-exports)
 bitcoin = { workspace = true }
+bip322 = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }
@@ -58,11 +55,6 @@ tower = { workspace = true }
 # ureq is pure-sync (no tokio entanglement) and exactly fits the
 # "occasional sync HTTP call from inside an async handler" use case.
 ureq = { version = "2.10", features = ["json", "tls"] }
-# rustls ClientConfig wiring for the bond ledger's identity-pinned TLS. ureq
-# 2.12 links the same rustls 0.23 as `ghost-common`, so the
-# `Arc<rustls::ClientConfig>` we build with `IdentityPinningVerifier` is
-# accepted directly by `AgentBuilder::tls_config`.
-rustls = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 

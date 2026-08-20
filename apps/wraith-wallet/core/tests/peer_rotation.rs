@@ -35,7 +35,6 @@ async fn spawn_stub() -> (std::net::SocketAddr, Arc<AtomicU32>) {
                         "session_id": "stub-session",
                         "tier_id": "100k_sats",
                         "denom_sats": 100_000,
-                        "bond_amount_sats": 500,
                         "min_participants": 5,
                         "max_participants": 20,
                         "fill_window_secs": 300,
@@ -72,27 +71,22 @@ fn fixture_request() -> MixRequest {
     MixRequest {
         tier_id: "100k_sats".into(),
         ghost_id: "rotation-test".into(),
-        bond_id_placeholder: "placeholder".into(),
         utxo: ParticipantUtxo {
             txid: "11".repeat(32),
             vout: 0,
             value_sats: 200_000,
             scriptpubkey_hex: "deadbeef".into(),
         },
-        change_address: Some(signet_addr_for(50)),
         mix_output_address: signet_addr_for(1),
     }
 }
 
-/// `bond_setup` shouldn't run — `prepare_mix` returns a coordinator
-/// error before reaching it because our stub only handles
-/// `/find_or_create`. Returns Ok regardless to avoid masking the
-/// rotation behaviour we actually care about.
-fn bond_setup_noop(
+/// Unreached: `prepare_mix` returns a coordinator error before it asks
+/// for a proof, because our stub only handles `/find_or_create`.
+fn prove_ownership_noop(
     _: &str,
-    _: u64,
-) -> impl std::future::Future<Output = Result<(), WraithClientError>> {
-    async { Ok(()) }
+) -> impl std::future::Future<Output = Result<String, WraithClientError>> {
+    async { Ok(String::new()) }
 }
 
 #[tokio::test]
@@ -106,7 +100,9 @@ async fn rotates_to_peer_when_primary_unreachable() {
 
     // We expect this to FAIL — the stub only answers find_or_create —
     // but it must reach find_or_create on the peer at least once.
-    let _ = client.prepare_mix(fixture_request(), bond_setup_noop).await;
+    let _ = client
+        .prepare_mix(fixture_request(), prove_ownership_noop)
+        .await;
 
     assert!(
         counter.load(Ordering::SeqCst) >= 1,
@@ -136,7 +132,9 @@ async fn does_not_rotate_on_http_error() {
 
     let client = WraithSessionClient::with_peers(primary, vec![peer_url], Network::Signet);
 
-    let result = client.prepare_mix(fixture_request(), bond_setup_noop).await;
+    let result = client
+        .prepare_mix(fixture_request(), prove_ownership_noop)
+        .await;
 
     assert!(
         matches!(
@@ -186,7 +184,6 @@ fn canonical_discover_body() -> serde_json::Value {
         "network": "regtest",
         "pool_id": "wraith-pool-regtest",
         "service_fee_bps": 25,
-        "bond_bps": 50,
         "fill_window_secs": 300,
         "tiers": [
             {
@@ -194,8 +191,9 @@ fn canonical_discover_body() -> serde_json::Value {
                 "denomination_sats": 100000,
                 "min_participants": 5,
                 "max_participants": 20,
-                "bond_sats": 500,
-                "service_fee_sats": 250
+                "service_fee_sats": 250,
+                "mix_seat_price_sats": 101596,
+                "jump_seat_price_sats": 101010
             }
         ]
     })

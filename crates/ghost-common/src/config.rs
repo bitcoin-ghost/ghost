@@ -295,17 +295,11 @@ pub struct CoordinatorConfig {
     /// Actually RUN the coordinator when elected (vs. only advertising + being
     /// electable). Separate from `coordinator_enabled` so discovery can be on
     /// without auto-activating. SECURE-BY-DEFAULT: on mainnet, activation is
-    /// refused unless a real ghost-pay bond ledger is configured (an unbonded
-    /// coordinator lets participants grief rounds for free). Default false.
+    /// refused without a ghostd RPC endpoint — the coordinator verifies every
+    /// participant's input against the chain, and cannot take it on trust.
+    /// Default false.
     #[serde(default)]
     pub coordinator_role_enabled: bool,
-    /// ghost-pay L2 bond-ledger base URL the coordinator calls to verify/refund/
-    /// slash participant bonds. REQUIRED to activate on mainnet.
-    #[serde(default)]
-    pub bond_ledger_url: Option<String>,
-    /// Bearer token for the bond-ledger API.
-    #[serde(default)]
-    pub bond_ledger_token: Option<String>,
     /// Destination address for this coordinator's per-round service fee
     /// (`service_fee_bps`). Without it rounds run fee-less.
     #[serde(default)]
@@ -326,8 +320,6 @@ impl Default for CoordinatorConfig {
             advertised_endpoint: None,
             coordinator_port: default_coordinator_port(),
             coordinator_role_enabled: false,
-            bond_ledger_url: None,
-            bond_ledger_token: None,
             coordinator_fee_address: None,
         }
     }
@@ -1992,7 +1984,7 @@ impl ReaperSettings {
 /// alert is ever sent until an operator opts in and supplies a destination.
 ///
 /// Secrets (Telegram bot token) live in this struct exactly like the
-/// `[coordinator] bond_ledger_token` secret already does — persisted only to
+/// `[coordinator]` secrets already do — persisted only to
 /// the root-owned pool.toml and never logged.
 ///
 /// # TOML Example

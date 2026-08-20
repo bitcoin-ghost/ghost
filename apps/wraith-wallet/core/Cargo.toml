@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 bip32 = { workspace = true }
 bip39 = { workspace = true }
 bitcoin = { workspace = true }
+bip322 = { workspace = true }
 futures-util = { workspace = true }
 ghost-gsp-proto = { workspace = true }
 ghost-keys = { workspace = true }

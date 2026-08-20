@@ -40,7 +40,6 @@ ghost-locks = { workspace = true }
 ghost-storage = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-zkp = { workspace = true }
-wraith-protocol = { workspace = true, features = ["dev-mode"] }
 ghost-glyph = { workspace = true }
 ghost-mpc = { workspace = true }
 

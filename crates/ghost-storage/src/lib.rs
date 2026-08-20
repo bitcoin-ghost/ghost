@@ -50,7 +50,6 @@ pub use audit_log::*;
 pub use database::*;
 pub use encryption::*;
 pub use models::*;
-pub use queries::BondRow;
 pub use queries::GlyphRecord;
 pub use queries::L2StateInfo;
 pub use queries::MeshNodeListCheckpointRecord;

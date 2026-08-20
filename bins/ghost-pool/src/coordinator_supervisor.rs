@@ -8,15 +8,16 @@
 //! axum task rather than managing a subprocess.
 //!
 //! Lifecycle is reconciled against the election each epoch flip:
-//! - elected & not running → build state (production bond ledger + ghostd
-//!   broadcaster) and serve on the coordinator port;
+//! - elected & not running → build state (ghostd broadcaster + UTXO source)
+//!   and serve on the coordinator port;
 //! - not elected & running → graceful shutdown (a lost seat next epoch).
 //!
 //! ## Gating + secure-by-default
-//! Activation is OFF unless `coordinator_role_enabled`. On mainnet it is REFUSED
-//! at construction unless a real ghost-pay bond ledger is configured — a
-//! coordinator that can't verify participant bonds lets them grief rounds for
-//! free (DoS). This mirrors the `wraith-coordinator` binary's mainnet guards.
+//! Activation is OFF unless `coordinator_role_enabled`. Anti-DoS no longer
+//! needs a configured backend: registration proves control of the input UTXO
+//! and a coin that kills a round goes into cooldown (#699). What it does need
+//! is a UTXO source, and that comes from the same ghostd RPC the broadcaster
+//! uses — so a coordinator that can broadcast can always verify inputs too.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,10 +29,11 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use ghost_consensus::mesh::MeshNetwork;
-use wraith_coordinator::bond_ledger_http::GhostPayBondLedger;
 use wraith_coordinator::broadcaster::{Broadcaster, GhostdBroadcaster};
+use wraith_coordinator::rpc::RpcClient;
+use wraith_coordinator::utxo_source::{GhostdUtxoSource, UtxoSource};
 use wraith_coordinator::{build_router, CoordinatorState};
-use wraith_protocol::{BondLedger, RandomSessionIdGenerator, SystemClock};
+use wraith_protocol::{RandomSessionIdGenerator, SystemClock};
 
 /// Everything the supervisor needs to construct + run a coordinator. Built from
 /// `[coordinator]` + `[bitcoin]` config.
@@ -41,13 +43,6 @@ pub struct CoordinatorRoleConfig {
     pub network: Network,
     /// Address the embedded coordinator binds (`0.0.0.0:coordinator_port`).
     pub listen: SocketAddr,
-    pub bond_ledger_url: Option<String>,
-    pub bond_ledger_token: Option<String>,
-    /// This node's own `node_id` (Ed25519 pubkey). The co-located ghost-pay
-    /// derives its identity TLS cert from the SAME `node.key`, so the bond
-    /// ledger client pins the server cert's pubkey to exactly this value —
-    /// rejecting any other certificate on the loopback bond seam.
-    pub node_id: [u8; 32],
     pub fee_address: Option<String>,
     /// ghostd RPC the broadcaster pushes merged round txs to (reused from
     /// `[bitcoin]`).
@@ -57,16 +52,19 @@ pub struct CoordinatorRoleConfig {
 }
 
 /// The secure-by-default refusal reason for activating a coordinator, if any.
-/// Pure so it is unit-testable without a live mesh: a mainnet coordinator that
-/// can't verify participant bonds (no `bond_ledger_url`) is refused — an
-/// unbonded coordinator lets participants grief rounds for free. Only applies
-/// when activation is actually requested.
+/// Pure so it is unit-testable without a live mesh.
+///
+/// A mainnet coordinator must be able to check an input against the chain —
+/// without that, registration takes the participant's word for what its own
+/// input is, and the ownership proof underneath means nothing (#699). The
+/// check is the ghostd RPC the broadcaster already needs, so the refusal is
+/// about that being configured at all.
 fn mainnet_activation_refusal(cfg: &CoordinatorRoleConfig) -> Option<String> {
-    if cfg.enabled && cfg.network == Network::Bitcoin && cfg.bond_ledger_url.is_none() {
+    if cfg.enabled && cfg.network == Network::Bitcoin && cfg.ghostd_rpc_url.trim().is_empty() {
         return Some(
-            "MAINNET REFUSAL: [coordinator] coordinator_role_enabled requires bond_ledger_url \
-             (+ bond_ledger_token) so the coordinator can verify participant bonds; an unbonded \
-             coordinator allows free round-griefing"
+            "MAINNET REFUSAL: [coordinator] coordinator_role_enabled requires a ghostd RPC URL \
+             so the coordinator can verify participant inputs against the chain; without one \
+             every registration is taken on trust"
                 .to_string(),
         );
     }
@@ -131,49 +129,29 @@ impl CoordinatorSupervisor {
     }
 
     async fn start(&self) {
-        // Production bond ledger. On mainnet its presence was already enforced
-        // in `maybe_new`; off mainnet a node may run without one (test nets).
-        let bond_ledger: Option<Arc<dyn BondLedger>> = match (
-            &self.cfg.bond_ledger_url,
-            &self.cfg.bond_ledger_token,
-        ) {
-            (Some(url), Some(token)) => match GhostPayBondLedger::new(url, token, self.cfg.node_id)
-            {
-                Ok(l) => Some(Arc::new(l)),
-                Err(e) => {
-                    error!(error = %e, "coordinator: bond ledger init failed; not activating");
-                    return;
-                }
-            },
-            (Some(_), None) => {
-                error!(
-                    "coordinator: bond_ledger_url set without bond_ledger_token; not activating"
-                );
-                return;
-            }
-            _ => None,
-        };
-
-        let broadcaster: Option<Arc<dyn Broadcaster>> = match GhostdBroadcaster::new(
+        // One RPC client, two jobs: broadcasting merged rounds and reading
+        // the UTXO set so registration can verify an input rather than
+        // believe it (#699).
+        let rpc = RpcClient::new(
             self.cfg.ghostd_rpc_url.clone(),
             &self.cfg.ghostd_rpc_user,
             &self.cfg.ghostd_rpc_password,
-        ) {
-            Ok(b) => Some(Arc::new(b)),
-            Err(e) => {
-                error!(error = %e, "coordinator: broadcaster init failed; not activating");
-                return;
-            }
-        };
+        );
+        let utxo_source: Arc<dyn UtxoSource> = Arc::new(GhostdUtxoSource::new(rpc.clone()));
 
-        let state = Arc::new(CoordinatorState::with_components(
-            self.cfg.network,
-            Arc::new(SystemClock),
-            Arc::new(RandomSessionIdGenerator),
-            bond_ledger,
-            self.cfg.fee_address.clone(),
-            broadcaster,
-        ));
+        let broadcaster: Option<Arc<dyn Broadcaster>> =
+            Some(Arc::new(GhostdBroadcaster::from_rpc(rpc)));
+
+        let state = Arc::new(
+            CoordinatorState::with_components(
+                self.cfg.network,
+                Arc::new(SystemClock),
+                Arc::new(RandomSessionIdGenerator),
+                self.cfg.fee_address.clone(),
+                broadcaster,
+            )
+            .with_utxo_source(utxo_source),
+        );
 
         let listener = match tokio::net::TcpListener::bind(self.cfg.listen).await {
             Ok(l) => l,
@@ -220,37 +198,35 @@ impl CoordinatorSupervisor {
 mod tests {
     use super::*;
 
-    fn cfg(
-        enabled: bool,
-        network: Network,
-        bond_ledger_url: Option<&str>,
-    ) -> CoordinatorRoleConfig {
+    fn cfg(enabled: bool, network: Network, ghostd_rpc_url: &str) -> CoordinatorRoleConfig {
         CoordinatorRoleConfig {
             enabled,
             network,
             listen: "0.0.0.0:9100".parse().unwrap(),
-            bond_ledger_url: bond_ledger_url.map(String::from),
-            bond_ledger_token: bond_ledger_url.map(|_| "tok".to_string()),
-            node_id: [0u8; 32],
             fee_address: None,
-            ghostd_rpc_url: "http://127.0.0.1:8332".to_string(),
+            ghostd_rpc_url: ghostd_rpc_url.to_string(),
             ghostd_rpc_user: "u".to_string(),
             ghostd_rpc_password: "p".to_string(),
         }
     }
 
+    /// The mainnet gate moved with the bonds (#699). It used to demand a
+    /// ghost-pay bond ledger; a coordinator's non-optional dependency is now
+    /// a node it can check participants' inputs against, because without one
+    /// registration would take every input on trust.
     #[test]
-    fn mainnet_without_bond_ledger_is_refused_only_when_activating() {
-        // Refused: activating on mainnet with no bond ledger.
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Bitcoin, None)).is_some());
-        // Allowed: mainnet WITH a bond ledger.
+    fn mainnet_without_a_node_is_refused_only_when_activating() {
+        // Refused: activating on mainnet with no ghostd RPC.
+        assert!(mainnet_activation_refusal(&cfg(true, Network::Bitcoin, "")).is_some());
+        // Allowed: mainnet WITH one.
         assert!(
-            mainnet_activation_refusal(&cfg(true, Network::Bitcoin, Some("http://bond"))).is_none()
+            mainnet_activation_refusal(&cfg(true, Network::Bitcoin, "http://127.0.0.1:8332"))
+                .is_none()
         );
-        // Allowed: not activating (disabled) — gate doesn't apply.
-        assert!(mainnet_activation_refusal(&cfg(false, Network::Bitcoin, None)).is_none());
-        // Allowed: test nets may run without a real bond ledger.
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Signet, None)).is_none());
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Regtest, None)).is_none());
+        // Allowed: not activating (disabled) — the gate doesn't apply.
+        assert!(mainnet_activation_refusal(&cfg(false, Network::Bitcoin, "")).is_none());
+        // Allowed: test nets may run without one.
+        assert!(mainnet_activation_refusal(&cfg(true, Network::Signet, "")).is_none());
+        assert!(mainnet_activation_refusal(&cfg(true, Network::Regtest, "")).is_none());
     }
 }

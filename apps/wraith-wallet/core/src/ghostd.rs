@@ -115,6 +115,20 @@ impl GhostdRpc {
         self.rpc("getblockcount", vec![])
     }
 
+    /// The block hash at `height`, as the node reports it.
+    ///
+    /// Used to re-derive a coordinator epoch's beacon from the chain rather
+    /// than believing the one the operator published beside its election
+    /// (#697). Same reasoning as the recovery path this client was built for:
+    /// asking the operator to confirm the operator's own claim is not a check.
+    ///
+    /// The returned hex is fed to `wraith_protocol::derive_beacon` decoded
+    /// as-is, with no byte reversal — the node deriving the beacon does the
+    /// same, and the two must agree exactly.
+    pub fn get_block_hash(&self, height: u64) -> Result<String, GhostdError> {
+        self.rpc("getblockhash", vec![serde_json::Value::from(height)])
+    }
+
     /// Fetch a transaction in verbose mode. Returns enough to find
     /// the vout whose scriptPubKey matches the lock's funding
     /// address.

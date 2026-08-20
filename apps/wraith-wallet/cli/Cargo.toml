@@ -12,6 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 wraith-wallet-ipc = { workspace = true }
+# For the dice/coin entropy accumulator and its digest construction. Shared
+# rather than reimplemented: two versions of a seed derivation is exactly the
+# kind of drift that produces a Coldcard.
+wraith-wallet-core = { workspace = true }
+hex = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4.5"
 tokio = { workspace = true }

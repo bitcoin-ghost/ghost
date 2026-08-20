@@ -177,23 +177,21 @@ echo "fee-collection address: $FEE_ADDR"
 # so chain analysts can't link inputs→outputs by address reuse.
 declare -a INPUT_ADDRS
 declare -a MIX_OUT_ADDRS
-declare -a CHANGE_ADDRS
 for i in $(seq 0 $((N-1))); do
     addr=$(WRAITH --json light receive --index "$i" | jq -r '.LightReceive.address // .address')
     INPUT_ADDRS[$i]="$addr"
     mix=$(WRAITH --json light receive --index "$((100+i))" | jq -r '.LightReceive.address // .address')
     MIX_OUT_ADDRS[$i]="$mix"
-    chg=$(WRAITH --json light receive --index "$((200+i))" | jq -r '.LightReceive.address // .address')
-    CHANGE_ADDRS[$i]="$chg"
-    echo "participant $i: input=${INPUT_ADDRS[$i]} mix-out=${MIX_OUT_ADDRS[$i]} change=${CHANGE_ADDRS[$i]}"
+    echo "participant $i: input=${INPUT_ADDRS[$i]} mix-out=${MIX_OUT_ADDRS[$i]}"
 done
 
 # ---- wraith-coordinator -----------------------------------------------------
 # --ghostd-url so the assembled tx is broadcast to bitcoind for real
-# (no --mock-broadcaster). --mock-bond-ledger-auto-escrow so the
-# wallet doesn't need to pre-arrange L2 bonds (demo simplification —
+# (no --mock-broadcaster). Participation needs no escrow at all now:
+# registration proves control of the input and a coin that disrupts a
+# round goes into cooldown (#699). (demo note —
 # safe on regtest, refused on mainnet by the binary).
-step "starting wraith-coordinator (real broadcast, auto-escrow bonds)"
+step "starting wraith-coordinator (real broadcast, no bonds)"
 # --fill-window-secs 30 collapses the 5-minute Filling window so the
 # session locks ~30s after creation instead of waiting LITE_FILL_WINDOW_SECS
 # (300s). 30s is the smallest value that's still robustly larger than
@@ -204,8 +202,6 @@ step "starting wraith-coordinator (real broadcast, auto-escrow bonds)"
     --listen 127.0.0.1:9100 \
     --network regtest \
     --fee-address "$FEE_ADDR" \
-    --mock-bond-ledger \
-    --mock-bond-ledger-auto-escrow \
     --fill-window-secs 30 \
     --ghostd-url "$GHOSTD_RPC_URL" \
     --ghostd-user demo \
@@ -215,13 +211,20 @@ COORD_PID=$!
 sleep 2
 
 # ---- fund the 5 input UTXOs ------------------------------------------------
-# Each participant needs ≥ denom (100,000) + bond (500) + per-input
-# fee share + buffer. 200,000 sats covers everything with room to
-# spare — change goes back to the wallet.
-step "funding 5 input UTXOs at 200,000 sats each"
+# Each participant needs EXACTLY the seat price: denom (100,000) + their
+# mining-fee share + their service-fee share. Rounds have no change output
+# (#698), so an over-funded UTXO is refused — fund to the satoshi.
+# The coordinator publishes the figure as `mix_seat_price_sats` in
+# /api/v1/pool/discover; 101,596 is that value for the 100k tier.
+SEAT_PRICE=$(curl -s "http://127.0.0.1:9100/api/v1/pool/discover" \
+    | jq -r '[.tiers[] | select(.id == "100k_sats")][0].mix_seat_price_sats')
+[ -n "$SEAT_PRICE" ] && [ "$SEAT_PRICE" != "null" ] \
+    || { echo "coordinator did not publish mix_seat_price_sats"; exit 1; }
+SEAT_PRICE_BTC=$(awk -v s="$SEAT_PRICE" 'BEGIN { printf "%.8f", s / 100000000 }')
+step "funding 5 input UTXOs at exactly $SEAT_PRICE sats each"
 declare -a FUND_TXIDS
 for i in $(seq 0 $((N-1))); do
-    txid=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" 0.002)
+    txid=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" "$SEAT_PRICE_BTC")
     FUND_TXIDS[$i]="$txid"
     echo "  participant $i funded: $txid"
 done
@@ -266,11 +269,9 @@ for i in $(seq 0 $((N-1))); do
             --coordinator "$COORD_URL" \
             --tier 100k_sats \
             --ghost-id "participant_$i" \
-            --bond-id-placeholder "placeholder_$i" \
             --utxo "${FUND_TXIDS[$i]}:${UTXO_VOUTS[$i]}" \
-            --utxo-value 200000 \
+            --utxo-value "$SEAT_PRICE" \
             --utxo-scriptpubkey "${UTXO_SPKS[$i]}" \
-            --change-address "${CHANGE_ADDRS[$i]}" \
             --mix-output-address "${MIX_OUT_ADDRS[$i]}" \
             --bip86-index "$i" \
             > "$DATADIR/mix-$i.out" 2>&1

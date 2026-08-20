@@ -8,15 +8,35 @@
 //!
 //! ## What this commit (B/4a) covers
 //!
-//! - Pluggable `BondLedger` verification — the bond is checked against
-//!   `(ghost_id, session_id, expected_sats = tier.bond_sats)`. Without a
-//!   ledger configured, the endpoint returns 503 — see
-//!   `CoordinatorState::bond_ledger`.
 //! - Identity check: `ghost_id` must already be enrolled on the session.
-//! - Input arithmetic: `input.value_sats` ≥ denom + per-participant
-//!   service share + per-participant mining share. Surplus over that
-//!   total goes to the change output; if the surplus is ≥ dust, a
-//!   change address is required.
+//! - **Chain check** (#699): the outpoint must be an unspent, confirmed,
+//!   mature output whose value and scriptPubKey match what the
+//!   submission claims. Everything in `TxInputRef` is wallet-asserted,
+//!   so without this the round's arithmetic is computed from a number
+//!   the participant chose, and any later ownership proof is worthless —
+//!   a signature over a wallet-supplied script says nothing about the
+//!   real outpoint. Without a source configured, the endpoint returns
+//!   503 rather than falling back to trust.
+//! - **Ownership proof** (#699): a BIP-322 signature over
+//!   `ownership_challenge(session_id, txid, vout)`, checked against the
+//!   scriptPubKey the *chain* reports. Everything above establishes what
+//!   the coin is; only this establishes whose it is. The challenge binds
+//!   the session (so a proof cannot be replayed into another round) and
+//!   the outpoint (so proving you own one coin does not authorise
+//!   registering another).
+//! - **Disruption cooldown** (#699): an outpoint that killed a round by
+//!   never signing is refused for `DISRUPTION_BAN_SECS`. Honest
+//!   participants pay nothing; a disruptor must buy a fresh coin on-chain
+//!   for each attempt.
+//! - **One outpoint, one participant** (#701): two participants
+//!   registering the same coin builds a transaction with duplicate
+//!   inputs, which cannot broadcast — killing the round at broadcast,
+//!   where the no-sign deadline cannot catch the disruptor.
+//! - **Exact input** (#698): chain value == denom + per-participant service
+//!   share + per-participant mining share, to the satoshi. Rounds have no
+//!   change output — one would be linkable to the participant who produced
+//!   it — so a surplus has nowhere to go and is refused rather than
+//!   silently donated to miners.
 //! - Idempotent acceptance: submitting again with the same `ghost_id`
 //!   replaces the previous record (covers wallet retries).
 //! - Locked → Signing transition once all enrolled have submitted.
@@ -41,15 +61,18 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use bitcoin::constants::COINBASE_MATURITY;
+use bitcoin::Address;
+
 use wraith_protocol::{
-    BondError, LiteSession, LiteSessionState, LiteTier, SessionType, CHANGE_DUST_THRESHOLD_SATS,
-    DEFAULT_FEE_RATE_SATS_PER_VB, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
+    ownership_challenge, per_participant_mining_share, LiteSession, LiteSessionState, SessionType,
+    DEFAULT_FEE_RATE_SATS_PER_VB,
 };
 
 /// No-sign deadline for the Signing phase, in seconds. From the moment
 /// the round transitions Locked → Signing, every enrolled participant
 /// has this long to submit their /witness; past the deadline, the
-/// round fails and non-signers' bonds get slashed.
+/// round fails and the coins that never signed go into cooldown.
 ///
 /// Picked at 600s (10 min) to be generous: signing requires the wallet
 /// to derive a sighash, sign with a hardware wallet maybe, and post.
@@ -58,15 +81,18 @@ pub const WITNESS_DEADLINE_SECS: u64 = 600;
 
 use crate::inputs::{AcceptedInputs, TxInputRef};
 use crate::state::CoordinatorState;
+use crate::utxo_source::parse_outpoint;
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub ghost_id: String,
     pub input: TxInputRef,
-    /// Optional change address. Required when input value exceeds
-    /// (denom + fee shares) by ≥ dust threshold.
+    /// BIP-322 simple signature over `ownership_challenge(session_id,
+    /// txid, vout)`, base64-encoded exactly as the BIP specifies —
+    /// proof that the submitter controls the coin it is registering
+    /// (#699). Without it, anyone could register anyone's coin.
     #[serde(default)]
-    pub change_address: Option<String>,
+    pub ownership_proof: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,15 +114,16 @@ pub async fn post(
     Path(session_id): Path<String>,
     Json(req): Json<Request>,
 ) -> Response {
-    // 1. Bond ledger must be configured. Phase C wires the real one;
-    //    until then production binaries refuse commit-phase submissions.
-    let ledger = match state.bond_ledger.as_ref() {
-        Some(l) => l.clone(),
+    // 1. A UTXO source is not optional. Without one the coordinator
+    //    would have to take the participant's word for what its own
+    //    input is, which is what #699 exists to stop.
+    let utxo_source = match state.utxo_source.as_ref() {
+        Some(u) => u.clone(),
         None => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "ledger_not_configured",
-                "bond ledger backend is not yet wired (phase C)".into(),
+                "utxo_source_not_configured",
+                "no UTXO source is configured; registration cannot verify inputs".into(),
             );
         }
     };
@@ -150,108 +177,221 @@ pub async fn post(
         );
     }
 
-    // 5. Verify the bond against the ledger. Bond amount comes from
-    //    the tier — the wallet doesn't get to negotiate this.
-    let expected_bond = session.tier.bond_sats();
-    let verified_bond_id = match ledger.verify_bond(&req.ghost_id, &session_id, expected_bond) {
-        Ok(id) => id,
-        Err(BondError::NotBonded { .. }) => {
+    // 5. Check the input against the chain.
+    //
+    //    Everything in `req.input` is wallet-asserted. Until this
+    //    existed the coordinator believed all of it, so the round
+    //    arithmetic was computed from a number the participant chose and
+    //    the input might have been spent, or never have existed. One
+    //    `gettxout` settles existence, value, scriptPubKey and
+    //    unspent-ness together (#699).
+    let outpoint = match parse_outpoint(&req.input.txid, req.input.vout) {
+        Ok(o) => o,
+        Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_outpoint", detail),
+    };
+
+    //    A coin that killed a round is in cooldown. Checked before the
+    //    chain lookup so a banned outpoint costs the coordinator no RPC
+    //    round trip, and stated with its expiry so an honest wallet whose
+    //    last round died knows exactly when it can use the coin again.
+    if let Some(until) = state.bans.banned_until(&outpoint, now) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "outpoint_banned",
+            format!(
+                "{outpoint} disrupted a round and is in cooldown for another {} seconds",
+                until.saturating_sub(now)
+            ),
+        );
+    }
+
+    let chain_utxo = match utxo_source.get_utxo(&outpoint) {
+        Ok(Some(u)) => u,
+        // Absent or spent. Deliberately one error for both: saying
+        // which would answer a question about the chain that the
+        // submitter did not ask.
+        Ok(None) => {
             return error(
-                StatusCode::PAYMENT_REQUIRED,
-                "bond_not_found",
-                format!(
-                    "no escrowed bond for ghost_id '{}' in session '{}'",
-                    req.ghost_id, session_id
-                ),
+                StatusCode::BAD_REQUEST,
+                "utxo_not_found",
+                format!("{outpoint} is not an unspent output"),
             );
         }
-        Err(BondError::AmountMismatch {
-            expected_sats,
-            actual_sats,
-            ..
-        }) => {
-            return error(
-                StatusCode::PAYMENT_REQUIRED,
-                "bond_amount_mismatch",
-                format!("bond is {actual_sats} sats; expected {expected_sats}"),
-            );
-        }
-        Err(BondError::AlreadyResolved { .. }) => {
-            return error(
-                StatusCode::CONFLICT,
-                "bond_already_resolved",
-                "this bond has already been resolved against another round".into(),
-            );
-        }
-        Err(BondError::LedgerUnreachable(detail)) => {
-            warn!(?detail, "bond ledger unreachable during /inputs");
+        Err(e) => {
+            warn!(%outpoint, error = %e, "utxo lookup failed");
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "ledger_unreachable",
-                detail,
-            );
-        }
-        Err(other) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ledger_error",
-                other.to_string(),
+                "utxo_source_unreachable",
+                e.to_string(),
             );
         }
     };
 
-    // The ledger is authoritative for bond existence at /inputs time.
-    // The bond_id stored on `LiteSessionParticipant` at find_or_create
-    // time is an informational placeholder — wallets typically don't
-    // know the eventual session_id when first calling find_or_create,
-    // so they post the real bond against (ghost_id, session_id) AFTER
-    // the session exists, and `verify_bond` is what locks identity to
-    // the L2 escrow. No cross-check on the participant record's
-    // bond_id is meaningful here.
+    // An unconfirmed input can still be replaced out from under the
+    // round by its own parent, which would invalidate the whole
+    // transaction after everyone has signed.
+    if chain_utxo.confirmations == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "input_unconfirmed",
+            format!("{outpoint} is unconfirmed; a round input must be confirmed"),
+        );
+    }
+    if chain_utxo.coinbase && chain_utxo.confirmations < COINBASE_MATURITY {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "immature_coinbase",
+            format!(
+                "{outpoint} is a coinbase output with {} of {} confirmations",
+                chain_utxo.confirmations, COINBASE_MATURITY
+            ),
+        );
+    }
 
-    // 6. Validate input arithmetic. Compute per-participant fee shares
-    //    against the tier; reject inputs below the minimum or with
-    //    surplus-over-dust missing a change address.
-    let min_input = match minimum_participant_input(&session, &state) {
+    // The chain is authoritative. A mismatch is refused rather than
+    // silently corrected, so a wallet working from a stale view learns
+    // that it is stale instead of having its arithmetic quietly changed.
+    if chain_utxo.value_sats != req.input.value_sats {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "value_mismatch",
+            format!(
+                "{outpoint} is worth {} sats on-chain; submission claims {}",
+                chain_utxo.value_sats, req.input.value_sats
+            ),
+        );
+    }
+    let claimed_spk = req.input.scriptpubkey_hex.trim();
+    if !claimed_spk.eq_ignore_ascii_case(&chain_utxo.script_pubkey.to_hex_string()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "scriptpubkey_mismatch",
+            format!(
+                "{outpoint} has scriptPubKey {}; submission claims {claimed_spk}",
+                chain_utxo.script_pubkey.to_hex_string()
+            ),
+        );
+    }
+
+    // 6. Prove the submitter controls the coin.
+    //
+    //    Everything above establishes what the coin *is*; none of it
+    //    establishes whose it is. Without this, registering someone
+    //    else's outpoint is free — which kills their round, and once
+    //    outpoint banning lands would get their coin banned on their
+    //    behalf (#699).
+    //
+    //    Verified against the scriptPubKey the *chain* reports, never
+    //    the one the submission claims; that ordering is the whole
+    //    point, since a proof against a script the submitter chose
+    //    proves only that they can sign for a script they made up.
+    let proof = match req.ownership_proof.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_ownership_proof",
+                "ownership_proof is required: a BIP-322 signature over the \
+                 session's ownership challenge, made with the input's key"
+                    .into(),
+            );
+        }
+    };
+    let address = match Address::from_script(&chain_utxo.script_pubkey, state.network) {
+        Ok(a) => a,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_input_script",
+                format!("{outpoint} has a scriptPubKey with no address form: {e}"),
+            );
+        }
+    };
+    let witness = match decode_bip322_witness(proof) {
+        Ok(w) => w,
+        Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_ownership_proof", detail),
+    };
+    let challenge = ownership_challenge(&session_id, &req.input.txid, req.input.vout);
+    if let Err(e) = bip322::verify_simple(&address, challenge.as_bytes(), witness) {
+        // Deliberately terse to the caller. The failure detail is a
+        // description of someone else's key material as often as it is
+        // of a wallet bug, and the operator can read the log.
+        debug!(%outpoint, error = %e, "ownership proof rejected");
+        return error(
+            StatusCode::FORBIDDEN,
+            "ownership_proof_failed",
+            format!("ownership proof does not verify against {outpoint}'s scriptPubKey"),
+        );
+    }
+
+    // 7. The input must be worth exactly what a round seat costs.
+    //
+    //    Not "at least". A round has no change output, because a change
+    //    output is linkable: it pays back to an address the participant
+    //    controls, in an amount derived from their own input, in the same
+    //    transaction as their mixed output — handing an observer the
+    //    association the round exists to break (#698). So a surplus has
+    //    nowhere to go, and refusing is the only honest answer: silently
+    //    donating it to miners would take a participant's money without
+    //    telling them.
+    //
+    //    A wallet whose coin is not already exact makes a preparatory split
+    //    first. That transaction is visible and marks them as preparing to
+    //    mix, which is a stated cost — and a smaller one than carrying the
+    //    link into the round, because it does not reveal which output of
+    //    the round is theirs.
+    let required = match required_participant_input(&session, &state) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
 
-    if req.input.value_sats < min_input {
+    if chain_utxo.value_sats != required {
         return error(
             StatusCode::BAD_REQUEST,
-            "insufficient_input",
+            "input_not_exact",
             format!(
-                "input {} sats < required {} sats (denom + fee shares)",
-                req.input.value_sats, min_input
+                "input is {} sats; a round seat costs exactly {} sats \
+                 (denomination + fee shares). Split the coin first: rounds have no \
+                 change output, because a change output would identify you.",
+                chain_utxo.value_sats, required
             ),
         );
     }
 
-    let surplus = req.input.value_sats - min_input;
-    if surplus >= CHANGE_DUST_THRESHOLD_SATS && req.change_address.is_none() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "missing_change_address",
-            format!(
-                "input has {} sats surplus over minimum; change_address required",
-                surplus
-            ),
-        );
-    }
-
-    // 7. Stash the accepted submission. Idempotent: if this ghost_id
+    // 8. Stash the accepted submission. Idempotent: if this ghost_id
     //    already submitted, the entry is replaced (wallet retry path).
     let accepted = AcceptedInputs {
         ghost_id: req.ghost_id.clone(),
-        bond_id: verified_bond_id,
         input: req.input.clone(),
-        change_address: req.change_address.clone(),
         accepted_at: now,
     };
     let (submitted_count, enrolled_count) = {
         let mut store = state.inputs_store.lock().expect("inputs_store poisoned");
         let entry = store.entry(session_id.clone()).or_default();
+
+        // One outpoint, one participant (#701). Two participants
+        // registering the same coin builds a transaction with duplicate
+        // inputs, which cannot broadcast — the round dies for everyone
+        // at a cost of one enrolment, and it dies at *broadcast* rather
+        // than at signing, so the no-sign deadline never fires and
+        // there is nothing to hold the disruptor to.
+        //
+        // Checked under the same lock as the insert, or two concurrent
+        // submissions could each find the outpoint free.
+        if entry
+            .iter()
+            .any(|a| a.ghost_id != req.ghost_id && a.input.same_outpoint(&req.input))
+        {
+            return error(
+                StatusCode::CONFLICT,
+                "duplicate_outpoint",
+                format!(
+                    "{}:{} is already registered on session '{session_id}'",
+                    req.input.txid, req.input.vout
+                ),
+            );
+        }
+
         if let Some(existing) = entry.iter_mut().find(|a| a.ghost_id == req.ghost_id) {
             *existing = accepted;
         } else {
@@ -268,7 +408,7 @@ pub async fn post(
         "/inputs accepted submission",
     );
 
-    // 8. Advance Locked → Signing once every enrolled participant has
+    // 9. Advance Locked → Signing once every enrolled participant has
     //    submitted. The protocol crate's registry only exposes
     //    apply_event() and add_participant for state mutation — for
     //    Locked → Signing we use apply_event with StateChanged so
@@ -303,22 +443,16 @@ pub async fn post(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// Compute the minimum acceptable per-participant input for the round
-/// described by `session`. Mirrors `LiteRoundBuilder::min_participant_input`
-/// without instantiating a builder — keeps the validation path
-/// allocation-free and avoids needing the coordinator_fee_address for
-/// Mix rounds at /inputs time.
+/// The exact input a participant must bring: denomination + mining-fee
+/// share + service-fee share. Rounds have no change output (#698), so this
+/// is a single acceptable value rather than a floor.
 ///
-/// Returns either the minimum sat value or a pre-built error response
-/// for the conditions the caller can't recover from (Mix round with no
-/// fee address configured — the round can't be built later, so we fail
-/// the input now).
 // `Err = axum::http::Response` is the idiomatic axum early-return: the helper hands back the
 // exact response the caller should send. Boxing it to satisfy result_large_err would make
 // every call site unwrap a Box to return a Response, which is worse code for 128 bytes on a
 // path that is already building an HTTP response.
 #[allow(clippy::result_large_err)]
-fn minimum_participant_input(
+fn required_participant_input(
     session: &LiteSession,
     state: &CoordinatorState,
 ) -> Result<u64, Response> {
@@ -332,7 +466,8 @@ fn minimum_participant_input(
         ));
     }
     let tier = session.tier;
-    let mining_share = per_participant_mining_share(tier, session.session_type);
+    let mining_share =
+        per_participant_mining_share(tier, session.session_type, DEFAULT_FEE_RATE_SATS_PER_VB);
     let service_share = match session.session_type {
         SessionType::Mix => tier.service_fee_sats(),
         SessionType::Jump => 0,
@@ -340,22 +475,22 @@ fn minimum_participant_input(
     Ok(tier.denomination_sats() + mining_share + service_share)
 }
 
-/// Worst-case mining-fee share per participant. Mirrors
-/// `LiteRoundBuilder::per_participant_mining_share`: computed against
-/// `tier.min_participants()` (smallest N — fixed overhead amortised
-/// across fewest participants → highest per-share).
-fn per_participant_mining_share(tier: LiteTier, session_type: SessionType) -> u64 {
-    let n = tier.min_participants() as u64;
-    let outputs = (n as usize)
-        + (n as usize)
-        + match session_type {
-            SessionType::Mix => 1,
-            SessionType::Jump => 0,
-        }
-        + 1; // OP_RETURN
-    let vbytes = ((n as usize * VBYTES_PER_INPUT) + (outputs * VBYTES_PER_OUTPUT)) as u64;
-    let total = vbytes * DEFAULT_FEE_RATE_SATS_PER_VB;
-    total.div_ceil(n)
+/// Decode a base64 BIP-322 simple signature into the witness it encodes.
+///
+/// The BIP specifies base64 of the consensus-serialised witness, which is
+/// what `verify_simple_encoded` expects — we decode it ourselves because
+/// the address is derived from the chain's scriptPubKey rather than parsed
+/// from a string the submitter supplied.
+fn decode_bip322_witness(proof: &str) -> Result<bitcoin::Witness, String> {
+    use base64::Engine;
+    use bitcoin::consensus::Decodable;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(proof)
+        .map_err(|e| format!("ownership_proof is not valid base64: {e}"))?;
+    let mut cursor = bitcoin::io::Cursor::new(bytes);
+    bitcoin::Witness::consensus_decode_from_finite_reader(&mut cursor)
+        .map_err(|e| format!("ownership_proof is not a consensus-encoded witness: {e}"))
 }
 
 fn error(status: StatusCode, code: &'static str, detail: String) -> Response {

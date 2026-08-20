@@ -26,6 +26,8 @@
 //! model) and is excluded from the *next* epoch's snapshot. Membership therefore
 //! churns cleanly at epoch boundaries.
 
+use sha2::{Digest, Sha256};
+
 use crate::sortition::{elect_coordinators, shard_for, CoordinatorNodeId, ElectedCoordinator};
 
 /// Blocks per coordinator epoch. ~1 day at 10-minute blocks. Coordinators are
@@ -44,6 +46,52 @@ pub const fn snapshot_height_for_epoch(epoch: u64) -> u64 {
         Some(start) if start > 0 => start - 1,
         _ => 0,
     }
+}
+
+/// Domain separator for the coordinator shard key.
+const SHARD_KEY_DOMAIN: &[u8] = b"ghost/wraith/coordinator-shard/v1";
+
+/// The key a wallet and a node both shard on to agree which seat serves a
+/// tier this epoch: `SHA256(domain ‖ tier_id ‖ epoch_le)`.
+///
+/// Lives here because both sides must derive byte-identical bytes or they
+/// disagree about who is coordinating. It was previously defined only in the
+/// wallet daemon, where a node could not reach it.
+pub fn shard_key_for_tier_epoch(tier_id: &str, epoch: u64) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(SHARD_KEY_DOMAIN);
+    h.update(tier_id.as_bytes());
+    h.update(epoch.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Domain separator for the per-epoch beacon.
+const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
+
+/// Derive the 32-byte per-epoch beacon from the anchor block's hash:
+/// `SHA256(domain ‖ epoch_le ‖ anchor_hash)`.
+///
+/// Lives here, beside [`snapshot_height_for_epoch`], because a node and a
+/// wallet must derive the byte-identical beacon or every verification fails.
+/// It was previously defined in `ghost-pool`'s wiring layer, where a wallet
+/// could not reach it — and where it anchored on a different block than this
+/// module documents (see that function).
+///
+/// `anchor_hash` is the block hash **exactly as the node's JSON-RPC returns
+/// it**, hex-decoded with no byte reversal. Both sides must agree on that or
+/// the beacons differ silently.
+///
+/// SECURITY: the miner of the anchor block can choose among the candidate
+/// hashes it could publish, so this beacon's grinding-resistance is BOUNDED.
+/// The unbiasable construction is the threshold-VRF / DKG one, gated on an
+/// external crypto audit. Everything downstream takes the beacon as a value,
+/// so swapping it changes nothing else.
+pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(BEACON_DOMAIN);
+    h.update(epoch.to_le_bytes());
+    h.update(anchor_hash);
+    h.finalize().into()
 }
 
 /// Canonicalise a qualified-node membership set into a deterministic roster:
@@ -81,13 +129,29 @@ impl EpochCoordinators {
         self.coordinators.len()
     }
 
-    /// The coordinator that owns `session_id` this epoch — deterministic, so a
-    /// wallet and every node agree. `None` when no coordinators are seated.
-    pub fn coordinator_for_session(&self, session_id: &[u8; 32]) -> Option<&ElectedCoordinator> {
+    /// The coordinator that owns `tier_id`'s sessions this epoch — the same
+    /// answer for a wallet and for every node, because both derive it from
+    /// [`shard_key_for_tier_epoch`]. `None` when no coordinators are seated.
+    ///
+    /// Shards on `(tier, epoch)` rather than on a session id. A session id
+    /// does not exist until a coordinator creates one, so a wallet choosing
+    /// *whom to ask* cannot use it — and sharding by tier makes every wallet
+    /// wanting the same denomination in the same epoch converge on the same
+    /// seat, which is a larger anonymity set rather than load spreading.
+    ///
+    /// This replaced a `coordinator_for_session(session_id)` that documented
+    /// itself as the value "a wallet and every node agree" on, while the
+    /// wallet actually sharded by `(tier, epoch)` and nothing called the
+    /// library version. Two schemes selecting different seats, one of them
+    /// dead and inviting: whoever wired up its `owns_session` companion would
+    /// have had wallets dialling one seat while another believed it owned the
+    /// work.
+    pub fn coordinator_for_tier(&self, tier_id: &str, epoch: u64) -> Option<&ElectedCoordinator> {
         if self.coordinators.is_empty() {
             return None;
         }
-        let seat = shard_for(session_id, self.coordinators.len());
+        let key = shard_key_for_tier_epoch(tier_id, epoch);
+        let seat = shard_for(&key, self.coordinators.len());
         // seats are exactly 0..len in seat order, so index directly.
         self.coordinators.get(seat as usize)
     }
@@ -168,32 +232,50 @@ mod tests {
     }
 
     #[test]
-    fn every_session_maps_to_a_seated_coordinator() {
+    fn every_tier_maps_to_a_seated_coordinator() {
         let q = qualified(15);
         let ec = EpochCoordinators::elect(3, &beacon(2), &q, 5);
-        for i in 0u32..500 {
-            let mut sid = [0u8; 32];
-            sid[..4].copy_from_slice(&i.to_le_bytes());
+        for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
             let c = ec
-                .coordinator_for_session(&sid)
-                .expect("a coordinator owns every session");
+                .coordinator_for_tier(tier, 3)
+                .expect("a coordinator owns every tier");
             assert!(ec.is_coordinator(&c.node_id));
-            // mapping is stable
-            assert_eq!(ec.coordinator_for_session(&sid).unwrap().node_id, c.node_id);
+            // Stable: every wallet asking for this tier in this epoch lands
+            // on the same seat, which is the point — a larger anonymity set,
+            // not load spreading.
+            assert_eq!(ec.coordinator_for_tier(tier, 3).unwrap().node_id, c.node_id);
         }
     }
 
+    /// The assignment rotates with the epoch, so one seat does not own a
+    /// denomination for ever.
     #[test]
-    fn sessions_spread_across_all_seats() {
+    fn a_tier_moves_between_seats_across_epochs() {
         let q = qualified(15);
         let ec = EpochCoordinators::elect(3, &beacon(2), &q, 5);
         let mut hit = std::collections::HashSet::new();
-        for i in 0u32..1000 {
-            let mut sid = [0u8; 32];
-            sid[..4].copy_from_slice(&i.to_le_bytes());
-            hit.insert(ec.coordinator_for_session(&sid).unwrap().seat);
+        for epoch in 0u64..200 {
+            hit.insert(ec.coordinator_for_tier("100k_sats", epoch).unwrap().seat);
         }
-        assert_eq!(hit.len(), 5, "every seat coordinates some sessions");
+        assert_eq!(hit.len(), 5, "every seat serves the tier in some epoch");
+    }
+
+    /// A wallet and a node derive the identical shard key, or they disagree
+    /// about who is coordinating.
+    #[test]
+    fn the_shard_key_is_a_pure_function_of_tier_and_epoch() {
+        assert_eq!(
+            shard_key_for_tier_epoch("100k_sats", 7),
+            shard_key_for_tier_epoch("100k_sats", 7)
+        );
+        assert_ne!(
+            shard_key_for_tier_epoch("100k_sats", 7),
+            shard_key_for_tier_epoch("1m_sats", 7)
+        );
+        assert_ne!(
+            shard_key_for_tier_epoch("100k_sats", 7),
+            shard_key_for_tier_epoch("100k_sats", 8)
+        );
     }
 
     #[test]
@@ -229,6 +311,6 @@ mod tests {
     fn empty_roster_seats_nobody() {
         let ec = EpochCoordinators::elect(1, &beacon(1), &[], 4);
         assert_eq!(ec.seats(), 0);
-        assert!(ec.coordinator_for_session(&[7u8; 32]).is_none());
+        assert!(ec.coordinator_for_tier("100k_sats", 1).is_none());
     }
 }
