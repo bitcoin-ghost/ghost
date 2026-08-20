@@ -29,7 +29,6 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use sha2::{Digest, Sha256};
 
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
@@ -44,10 +43,13 @@ use wraith_protocol::sortition::CoordinatorNodeId;
 /// ~1 day at 10-minute blocks. The draw is reshuffled every epoch, so
 /// coordination rotates across the qualified set over time.
 ///
-/// Kept local (rather than reusing `wraith_protocol::epoch::EPOCH_BLOCKS`, also
-/// 144) so the live cadence is owned and tuneable at the wiring layer without
-/// changing the pure library's test fixtures.
-pub const COORDINATOR_EPOCH_BLOCKS: u64 = 144;
+/// This is `wraith_protocol::EPOCH_BLOCKS`, not a local copy. It used to be
+/// kept local "so the live cadence is owned and tuneable at the wiring layer"
+/// — which cannot be true of a value a *wallet* has to agree on. A wallet
+/// derives the anchor height from the epoch to check the beacon against the
+/// chain; tune this at the wiring layer and every wallet would compute a
+/// different anchor and reject every election.
+pub const COORDINATOR_EPOCH_BLOCKS: u64 = wraith_protocol::EPOCH_BLOCKS;
 
 /// Target number of concurrent coordinator seats per epoch. Sessions are
 /// sharded across these seats so no single coordinator owns every round.
@@ -86,42 +88,28 @@ pub fn seats_for_demand(demand: u64, eligible: usize) -> usize {
     by_demand.min(MAX_SEATS).min(eligible)
 }
 
-/// Domain separator for the beacon hash so it can never collide with any other
-/// hash in the system. Versioned for forward changes.
-const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
-
 /// The coordinator epoch a chain height falls in.
 pub const fn epoch_for_height(height: u64) -> u64 {
     height / COORDINATOR_EPOCH_BLOCKS
 }
 
-/// The chain height whose anchor freezes epoch `E` — the first block of epoch
-/// `E` (`E * K`). Using the epoch-start block (rather than a far-future one)
-/// keeps the anchor reachable the moment the epoch begins; its grinding
-/// resistance is addressed by the security note on `derive_beacon`.
+/// The chain height whose hash anchors epoch `E`'s beacon: the **last block of
+/// epoch `E-1`**, per `wraith_protocol::epoch::snapshot_height_for_epoch`.
+///
+/// This used to be the *first* block of epoch `E`, which is a different block.
+/// The library documents the anchor as freezing the epoch's inputs "before `E`
+/// begins … no mid-epoch surprises", and anchoring on `E`'s own first block
+/// defeats exactly that: the coordinators for an epoch were not knowable until
+/// the epoch had already started. Two definitions of one protocol quantity is
+/// also how the seat price came to disagree with itself (#698), so there is
+/// now one, in the library.
 pub const fn anchor_height_for_epoch(epoch: u64) -> u64 {
-    epoch.saturating_mul(COORDINATOR_EPOCH_BLOCKS)
+    wraith_protocol::snapshot_height_for_epoch(epoch)
 }
 
-/// Derive the 32-byte per-epoch beacon from an anchor hash the whole network
-/// agrees on: `SHA256(domain ‖ epoch_le ‖ anchor_hash)`.
-///
-/// SECURITY: the anchor used here is the block hash at the epoch-start height
-/// (see `CoordinatorElection::beacon_for_epoch`). A miner who finds that block
-/// can choose among the candidate hashes it could publish, so this interim
-/// anchor's grinding-resistance is BOUNDED — adequate for a read-only,
-/// role-inactive view, but NOT the endgame. The unbiasable beacon is the
-/// threshold-VRF / DKG construction (plan increment 5, gated on an EXTERNAL
-/// crypto audit). Because `epoch.rs`/`service.rs` are beacon-agnostic (they take
-/// the 32-byte beacon as a value), swapping this for the audited beacon changes
-/// nothing else in the wiring.
-pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(BEACON_DOMAIN);
-    h.update(epoch.to_le_bytes());
-    h.update(anchor_hash);
-    h.finalize().into()
-}
+/// Re-exported so the wiring layer and its tests use the same derivation a
+/// wallet does. Defined in `wraith_protocol::epoch`.
+pub use wraith_protocol::derive_beacon;
 
 /// Decode a Bitcoin block-hash hex string into the 32-byte anchor used by the
 /// beacon. Returns `None` for malformed input (the caller then skips the
@@ -408,9 +396,20 @@ mod tests {
         assert_eq!(epoch_for_height(COORDINATOR_EPOCH_BLOCKS), 1);
         assert_eq!(epoch_for_height(COORDINATOR_EPOCH_BLOCKS * 9 + 7), 9);
 
+        // The anchor is the LAST block of the previous epoch, so an epoch's
+        // inputs are frozen before it begins. This used to be the first block
+        // of the epoch itself — a different block, and one that could not be
+        // known until the epoch had already started.
         assert_eq!(anchor_height_for_epoch(0), 0);
-        assert_eq!(anchor_height_for_epoch(1), COORDINATOR_EPOCH_BLOCKS);
-        assert_eq!(anchor_height_for_epoch(5), 5 * COORDINATOR_EPOCH_BLOCKS);
+        assert_eq!(anchor_height_for_epoch(1), COORDINATOR_EPOCH_BLOCKS - 1);
+        assert_eq!(anchor_height_for_epoch(5), 5 * COORDINATOR_EPOCH_BLOCKS - 1);
+        // It is the library's definition, not a second copy of it.
+        for e in [0u64, 1, 5, 6689] {
+            assert_eq!(
+                anchor_height_for_epoch(e),
+                wraith_protocol::snapshot_height_for_epoch(e)
+            );
+        }
     }
 
     #[test]

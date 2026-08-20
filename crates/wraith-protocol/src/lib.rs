@@ -78,7 +78,8 @@ pub mod epoch;
 pub mod service;
 pub mod sortition;
 pub use epoch::{
-    canonical_roster, epoch_for_height, snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
+    canonical_roster, derive_beacon, epoch_for_height, snapshot_height_for_epoch,
+    EpochCoordinators, EPOCH_BLOCKS,
 };
 pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,

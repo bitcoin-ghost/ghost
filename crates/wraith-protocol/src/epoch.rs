@@ -26,6 +26,8 @@
 //! model) and is excluded from the *next* epoch's snapshot. Membership therefore
 //! churns cleanly at epoch boundaries.
 
+use sha2::{Digest, Sha256};
+
 use crate::sortition::{elect_coordinators, shard_for, CoordinatorNodeId, ElectedCoordinator};
 
 /// Blocks per coordinator epoch. ~1 day at 10-minute blocks. Coordinators are
@@ -44,6 +46,35 @@ pub const fn snapshot_height_for_epoch(epoch: u64) -> u64 {
         Some(start) if start > 0 => start - 1,
         _ => 0,
     }
+}
+
+/// Domain separator for the per-epoch beacon.
+const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
+
+/// Derive the 32-byte per-epoch beacon from the anchor block's hash:
+/// `SHA256(domain ‖ epoch_le ‖ anchor_hash)`.
+///
+/// Lives here, beside [`snapshot_height_for_epoch`], because a node and a
+/// wallet must derive the byte-identical beacon or every verification fails.
+/// It was previously defined in `ghost-pool`'s wiring layer, where a wallet
+/// could not reach it — and where it anchored on a different block than this
+/// module documents (see that function).
+///
+/// `anchor_hash` is the block hash **exactly as the node's JSON-RPC returns
+/// it**, hex-decoded with no byte reversal. Both sides must agree on that or
+/// the beacons differ silently.
+///
+/// SECURITY: the miner of the anchor block can choose among the candidate
+/// hashes it could publish, so this beacon's grinding-resistance is BOUNDED.
+/// The unbiasable construction is the threshold-VRF / DKG one, gated on an
+/// external crypto audit. Everything downstream takes the beacon as a value,
+/// so swapping it changes nothing else.
+pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(BEACON_DOMAIN);
+    h.update(epoch.to_le_bytes());
+    h.update(anchor_hash);
+    h.finalize().into()
 }
 
 /// Canonicalise a qualified-node membership set into a deterministic roster:
