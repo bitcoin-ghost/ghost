@@ -221,9 +221,7 @@ export function Mix({ activeWallet }: MixProps) {
     try {
       const baseIndex = 90 + Math.floor(Math.random() * 1000);
       const mix = await lightReceive(baseIndex);
-      const change = await lightReceive(baseIndex + 1);
       setMixOutAddr(mix.address);
-      setChangeAddr(change.address);
     } catch (e) {
       setErr((e as Error).message ?? String(e));
     } finally {

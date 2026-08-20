@@ -18,6 +18,11 @@ env:
   # System packages the Rust workspace needs: Cap'n Proto (bitcoin-core-sv2 build
   # script) and SQLite (ghost-storage / ghost-pay).
   LINUX_DEPS: libsqlite3-dev capnproto libcapnp-dev
+  # What the Tauri desktop crates need on top: webkit2gtk is the webview, and `patchelf` is
+  # used by the bundler. A superset of LINUX_DEPS so the one install script covers both.
+  TAURI_DEPS: >-
+    libsqlite3-dev capnproto libcapnp-dev libwebkit2gtk-4.1-dev libgtk-3-dev
+    libayatana-appindicator3-dev librsvg2-dev patchelf
 
 jobs:
   # Format check
@@ -335,6 +340,53 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps $WORKSPACE_EXCLUDES --all-features
+
+  # The Tauri desktop crates, which every other job excludes.
+  #
+  # They were excluded because `tauri::generate_context!` will not compile until the JS
+  # frontend has been built into `dist/`, which is a Node pipeline the Rust jobs do not run.
+  # That is a reason to give them their own job, not a reason to leave them untested: the
+  # exclusion let a GUI change ship that did not typecheck, because nothing anywhere checked.
+  #
+  # Ordered cheapest-first on purpose. `tsc --noEmit` needs no system packages and catches the
+  # class of mistake the exclusion was hiding, so it runs before anything downloads webkit.
+  tauri:
+    name: Desktop (Tauri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/wraith-wallet/gui/package-lock.json
+      - name: Install frontend deps
+        working-directory: apps/wraith-wallet/gui
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck the frontend
+        working-directory: apps/wraith-wallet/gui
+        run: npx tsc --noEmit
+      - name: Build the frontend
+        working-directory: apps/wraith-wallet/gui
+        run: npx vite build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apt-debs
+          # Keyed on the install script AND this job's package list, because the list is passed
+          # in through `LINUX_DEPS` rather than living in the script. Sharing the pure-Rust jobs'
+          # key would hand this job a cache holding none of the packages it needs.
+          key: apt-debs-tauri-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}-${{ env.TAURI_DEPS }}
+      - name: Install Linux deps
+        timeout-minutes: 10
+        env:
+          LINUX_DEPS: ${{ env.TAURI_DEPS }}
+        run: .github/scripts/install-linux-deps.sh
+      - name: Build the desktop crate
+        run: cargo build -p wraith-wallet-gui
 
   # Security audit
   audit:
