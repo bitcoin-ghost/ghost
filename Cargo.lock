@@ -3477,7 +3477,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wraith-coordinator",
- "wraith-protocol",
 ]
 
 [[package]]
@@ -10664,14 +10663,12 @@ dependencies = [
  "chrono",
  "clap",
  "getrandom 0.2.17",
- "ghost-common",
  "ghost-storage",
  "hex",
  "hmac",
  "http-body-util",
  "reqwest 0.12.28",
  "rusqlite",
- "rustls",
  "scrypt",
  "secp256k1 0.29.1",
  "serde",
