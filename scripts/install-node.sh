@@ -840,8 +840,11 @@ systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart gho
 #                                  node in the roster and it can be drawn
 #   coordinator_role_enabled     → actually RUNS the coordinator when drawn
 #
-# Both default false. A node also needs `advertised_endpoint` reachable, or it
-# is skipped: a seat nobody can dial is worse than one seat fewer.
+# Both default false. A node also needs:
+#   - `advertised_endpoint` reachable, or it is skipped when seats are drawn:
+#     a seat nobody can dial is worse than one seat fewer;
+#   - `coordinator_fee_address` set, or every Mix round refuses its inputs
+#     with 503 fee_address_not_configured — seated but unable to coordinate.
 #
 # Participation needs no bond — registration proves control of the input and a
 # disrupting coin goes into cooldown — so a coordinator needs only the node's
@@ -862,9 +865,16 @@ coordinator_role_enabled = ${COORD_ROLE}
 # Compute and publish the election view (safe to leave on: read-only).
 wraith_election_enabled = true
 # Where wallets dial this node's coordinator. Must be reachable or the node
-# is skipped when seats are drawn.
+# is skipped when seats are drawn. The 9100 firewall rule follows
+# coordinator_role_enabled automatically (ghost-mining-firewall).
 advertised_endpoint = "${PUBIP}:9100"
 coordinator_port = 9100
+# Destination for this coordinator's per-round service fee. NOT optional in
+# practice: a Mix round refuses every input with 503
+# fee_address_not_configured while this is unset, so a coordinator without
+# one is seated and cannot run a round. Defaults to this node's payout
+# address; change it if mixing revenue should land somewhere else.
+coordinator_fee_address = "${PAYOUT_ADDRESS}"
 EOF
 
 # H-11: configs with secrets must be 0600.
