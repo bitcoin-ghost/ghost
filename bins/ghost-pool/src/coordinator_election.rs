@@ -58,6 +58,13 @@ pub const COORDINATOR_EPOCH_BLOCKS: u64 = wraith_protocol::EPOCH_BLOCKS;
 /// looks like an election.
 pub const MIN_MEANINGFUL_ROSTER: usize = 3;
 
+/// Whether an election drawn from `roster_size` candidates should be reported
+/// as degraded. Two candidates still cannot resist a self-nominating
+/// operator — controlling one of two is controlling half the draw.
+pub const fn roster_is_degraded(roster_size: usize) -> bool {
+    roster_size < MIN_MEANINGFUL_ROSTER
+}
+
 /// Target number of concurrent coordinator seats per epoch. Sessions are
 /// sharded across these seats so no single coordinator owns every round.
 /// (Demand-driven sizing replaces this fixed target in a later increment.)
@@ -377,7 +384,7 @@ impl CoordinatorElection {
             // rotated, and so "no single party is the operator" is checkable
             // rather than assumed (#708).
             "roster_size": c.roster.len(),
-            "degraded": c.roster.len() < MIN_MEANINGFUL_ROSTER,
+            "degraded": roster_is_degraded(c.roster.len()),
         })
     }
 }
