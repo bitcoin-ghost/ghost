@@ -27,6 +27,7 @@ use ghost_zkp::{
     GhostConsolidateVerifier, GhostNoteSpendPublicInputs, GhostNoteVerifier, GhostUnshieldVerifier,
 };
 
+use crate::broadcast::BroadcastFn;
 use crate::epoch_manager::{EpochManager, PROPOSER_GRACE_SECS};
 use crate::mesh::MessageHandler;
 use crate::message::{
@@ -35,7 +36,6 @@ use crate::message::{
     L2TransferConfirmationMessage, L2TreeSyncRequest, L2TreeSyncResponse, MessageEnvelope,
     MessageType, ShieldCommitment, TreeSyncServeReport,
 };
-use crate::vote_handler::BroadcastFn;
 
 // =============================================================================
 // CONFIGURATION

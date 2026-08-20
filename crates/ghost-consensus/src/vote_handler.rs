@@ -525,7 +525,7 @@ const DEFAULT_STALE_PROPOSAL_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_MAX_PENDING_PROPOSALS: usize = 1000;
 
 /// Callback for broadcasting messages
-pub type BroadcastFn = Arc<dyn Fn(MessageType, Vec<u8>) -> GhostResult<()> + Send + Sync>;
+pub use crate::broadcast::BroadcastFn;
 
 /// Callback for executing approved proposals
 pub type ExecuteFn = Arc<dyn Fn(ConsensusResult) -> GhostResult<()> + Send + Sync>;
