@@ -385,6 +385,17 @@ jobs:
         env:
           LINUX_DEPS: ${{ env.TAURI_DEPS }}
         run: .github/scripts/install-linux-deps.sh
+      # The GUI bundles `wraithd` as a Tauri sidecar (`externalBin`), and
+      # `tauri-build` fails at build-script time if the binary is not already
+      # sitting at the target-triple path. So the daemon is built first and
+      # placed where the bundler expects it — which also means CI proves the
+      # desktop bundle can actually assemble, not just that its Rust compiles.
+      - name: Build the sidecar daemon
+        run: |
+          cargo build -p wraith-wallet-daemon --bin wraithd
+          triple=$(rustc -vV | awk '/^host:/ {print $2}')
+          mkdir -p apps/wraith-wallet/gui/src-tauri/binaries
+          cp target/debug/wraithd "apps/wraith-wallet/gui/src-tauri/binaries/wraithd-$triple"
       - name: Build the desktop crate
         run: cargo build -p wraith-wallet-gui
 

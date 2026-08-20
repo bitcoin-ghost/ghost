@@ -189,9 +189,22 @@ async fn wallet_delete(name: String) -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
+/// `user_entropy_digest` is the hex digest of dice or coin flips the user
+/// supplied, mixed into the seed alongside the OS source and never used
+/// instead of it. `None` is the ordinary case and costs the user nothing —
+/// see `wraith_wallet_core::user_entropy`.
 #[tauri::command]
-async fn wallet_create(name: String, passphrase: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletCreate { name, passphrase }).await?;
+async fn wallet_create(
+    name: String,
+    passphrase: String,
+    user_entropy_digest: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletCreate {
+        name,
+        passphrase,
+        user_entropy_digest,
+    })
+    .await?;
     to_value(&resp)
 }
 

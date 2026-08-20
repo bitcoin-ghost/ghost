@@ -296,11 +296,24 @@ export interface WalletCreateResult {
   path: string;
 }
 
+/**
+ * Create a wallet.
+ *
+ * `userEntropyDigest` is the hex digest of dice or coin flips the user rolled,
+ * mixed into the seed alongside the operating system's randomness and never
+ * used instead of it — so supplying none costs nothing, and supplying some can
+ * only raise the floor. Omitted until the dice screen lands (#705).
+ */
 export async function walletCreate(
   name: string,
   passphrase: string,
+  userEntropyDigest?: string,
 ): Promise<WalletCreateResult> {
-  const resp = await invoke("wallet_create", { name, passphrase });
+  const resp = await invoke("wallet_create", {
+    name,
+    passphrase,
+    userEntropyDigest,
+  });
   return unwrap<WalletCreateResult>(resp).payload;
 }
 
