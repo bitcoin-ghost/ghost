@@ -9346,8 +9346,9 @@ async fn main() -> Result<()> {
     });
     info!("Ban manager cleanup task started (60s interval)");
 
-    // Elder offline revocation checker — runs hourly, detects elders offline >7 days
-    // and proposes BFT revocation votes (burned slots are never reassigned)
+    // Elder offline revocation checker — detects elders offline >7 days and proposes BFT
+    // revocation votes. A revoked position is BURNED and never reassigned: that permanence is
+    // the point, and it is what makes an elder position scarce rather than a rotating seat.
     {
         let db_for_revoke = Arc::clone(&db);
         let vh_for_revoke = Arc::clone(&vote_handler);
@@ -9356,9 +9357,26 @@ async fn main() -> Result<()> {
         let alert_dispatcher_for_revoke = Arc::clone(&alert_dispatcher);
         let mut revoke_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            // Skip immediate first tick
-            interval.tick().await;
+            // Daily, with the first check shortly after start.
+            //
+            // DAILY rather than hourly: the threshold is 7 days, so hourly polling buys one hour
+            // of precision on a 604,800-second boundary — 0.6% — which nothing needs. For an
+            // action this irreversible, a day of extra grace before a slot is burned for good is
+            // a property worth having. The work is not the reason: the whole check is one 1 ms
+            // query over 8 rows plus an in-memory scan of the peer table.
+            //
+            // ⚠ The initial delay is a `sleep`, NOT the previous tick-and-discard. With a 24-hour
+            // period that older pattern would mean a node restarting more often than daily NEVER
+            // runs the check — and ghost-pool restarts well inside a day during a deploy or a
+            // config roll, so the feature would have gone silently dead. The delay lets the peer
+            // table populate: `detect_offline_elders` skips an elder absent from the peer table
+            // entirely ("no evidence of how long offline"), so a cold start cannot manufacture an
+            // accusation.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {}
+                _ = revoke_shutdown.recv() => return,
+            }
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(86_400));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -9382,7 +9400,7 @@ async fn main() -> Result<()> {
                         // NodeOffline alerts: this is the node's only periodic
                         // peer-liveness signal (self can't alert while it's the
                         // one that's down). Edge-trigger per elder so an elder
-                        // that stays offline doesn't re-alert every hour, and
+                        // that stays offline doesn't re-alert every day, and
                         // re-arm elders that are no longer offline so a later
                         // outage alerts again. Keyed by the offline peer's id.
                         {
@@ -9453,7 +9471,7 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        info!("Elder revocation checker started (hourly)");
+        info!("Elder revocation checker started (daily, first check in 10 min)");
     }
 
     // Stale glyph claim cleanup — runs hourly, deletes unfunded claims past their expires_at
