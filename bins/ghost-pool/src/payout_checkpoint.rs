@@ -375,10 +375,11 @@ fn payouts_agree(
     Ok(())
 }
 
-/// Optional diagnostic: `(cutoff_ts, height) -> human breakdown` of the root inputs
+/// Optional diagnostic: `(miners, nodes, cutoff_ts, height) -> human breakdown` of the root inputs
 /// (miner-set + node-set hashed separately, with counts + node list). Injected by
 /// `main.rs` to isolate live root divergence; `None` in tests and once diagnosed.
-pub type ComputeRootDiagFn = Arc<dyn Fn(i64, u64) -> String + Send + Sync>;
+pub type ComputeRootDiagFn =
+    Arc<dyn Fn(&[(String, u128)], &[(NodeId, i32)], i64, u64) -> String + Send + Sync>;
 
 /// Resolves the ACTIVE qualified voter set at a cutoff: `(cutoff_ts, height) -> sorted
 /// node ids`. Wired in `main.rs` to the SAME scoped qualified-node query
@@ -538,13 +539,31 @@ impl PayoutCheckpointManager {
     }
 
     /// Emit the root-input breakdown at INFO under a shared `tag`, if diag is wired.
-    fn log_diag(&self, tag: &str, height: u64, cutoff_ts: i64) {
+    ///
+    /// Takes the ALREADY-COMPUTED payout rather than a `(cutoff_ts, height)` to recompute from.
+    /// It used to take the latter, which made every call re-run `select_ledger_miner_work` — a
+    /// full scan of the unpaid ledger (1.46M rows on the live fleet) purely to print a hash of a
+    /// value the caller was already holding. Measured on ghost-vm7 2026-08-08, that doubled the
+    /// checkpoint scan load: ~37 propose/reject events in 30 min, each paying for two scans
+    /// instead of one.
+    ///
+    /// Recomputing was also a correctness wart: the ledger can change between the caller's
+    /// compute and the diagnostic's, so the breakdown could describe a DIFFERENT root than the
+    /// one being logged next to it — exactly the confusion the diagnostic exists to remove.
+    fn log_diag(
+        &self,
+        tag: &str,
+        height: u64,
+        cutoff_ts: i64,
+        miners: &[(String, u128)],
+        nodes: &[(NodeId, i32)],
+    ) {
         if let Some(d) = &self.diag {
             info!(
                 height,
                 tag,
                 "payout checkpoint DIAG: {}",
-                d(cutoff_ts, height)
+                d(miners, nodes, cutoff_ts, height)
             );
         }
     }
@@ -737,7 +756,13 @@ impl PayoutCheckpointManager {
             nodes = msg.node_shares.len(),
             "payout checkpoint: proposing"
         );
-        self.log_diag("propose", height, cutoff_ts);
+        self.log_diag(
+            "propose",
+            height,
+            cutoff_ts,
+            &msg.miner_payouts,
+            &msg.node_shares,
+        );
         self.broadcast(MessageType::PayoutLedgerCheckpoint, &msg);
         // The proposer reports too, and gets exactly one vote like everyone else.
         self.cast_vote(height, hash, true, Some(&proposer_own));
@@ -794,7 +819,6 @@ impl PayoutCheckpointManager {
                 height = msg.height,
                 "payout checkpoint: cannot recompute canonical payout — abstaining (needs convergence)"
             );
-            self.log_diag("abstain", msg.height, msg.cutoff_ts);
             let height = msg.height;
             let mut pending = self.pending.write();
             let slot = pending
@@ -828,7 +852,13 @@ impl PayoutCheckpointManager {
                 %reason,
                 "payout checkpoint: disagrees with proposal — voting reject"
             );
-            self.log_diag("reject", msg.height, msg.cutoff_ts);
+            self.log_diag(
+                "reject",
+                msg.height,
+                msg.cutoff_ts,
+                &local.miner_payouts,
+                &local.node_shares,
+            );
         }
         self.cast_vote(msg.height, hash, approve, Some(&local));
         if approve {

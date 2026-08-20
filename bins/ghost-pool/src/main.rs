@@ -3693,29 +3693,15 @@ async fn main() -> Result<()> {
     // DIAGNOSTIC (v1.10.34): breakdown of the root inputs (miner-set + node-set
     // hashed separately, with counts + node list), so a live root divergence can be
     // isolated to the miner half or the node half and compared across nodes.
-    let compute_ledger_root_diag_fn: ghost_pool::payout_checkpoint::ComputeRootDiagFn = {
-        let db_c = Arc::clone(&db);
-        let oracle_c = block_hash_oracle.clone();
-        Arc::new(move |cutoff_ts, height| {
-            let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
-            let miners = match ghost_pool::payout::select_ledger_miner_work(
-                &db_c, cutoff_ts, height, subsidy,
-            ) {
-                Ok(m) => m,
-                Err(e) => return format!("miner recompute failed: {e}"),
-            };
-            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
-            let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
-            let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
-            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(
-                cutoff_ts,
-                voter_set_scoped,
-                assignment_scoped,
-            );
-            ghost_pool::payout::ledger_root_diag(&miners, &nodes, cutoff_ts, height)
-        })
-    };
+    // Formats the breakdown from the lists the caller ALREADY computed — it does not touch the
+    // database. This closure previously re-ran `select_ledger_miner_work` and the qualified-node
+    // query, i.e. a second full scan of the unpaid ledger on every propose and every reject,
+    // solely to hash values the caller was holding. On the live fleet that is 1.46M rows per
+    // call and roughly half of all checkpoint scan load (measured ghost-vm7, 2026-08-08).
+    let compute_ledger_root_diag_fn: ghost_pool::payout_checkpoint::ComputeRootDiagFn =
+        Arc::new(|miners, nodes, cutoff_ts, height| {
+            ghost_pool::payout::ledger_root_diag(miners, nodes, cutoff_ts, height)
+        });
     // ACTIVE_VOTER_SET resolver: the qualified active node set at a cutoff, from the SAME
     // scoped query `compute_ledger_root_fn` uses for `node_shares` — so the voter set and
     // the ratified ledger's node set are identical by construction. Once ACTIVE_VOTER_SET
