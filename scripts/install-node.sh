@@ -448,7 +448,7 @@ if [[ -n "$POOL_NAME" ]]; then
   fi
 fi
 
-# Wraith mixing needs no bond ledger. Resolve the
+# Resolve the
 # "auto" default — track Ghost Pay — and pull Ghost Pay in when Wraith was asked
 # for explicitly without it. We auto-enable Ghost Pay (rather than erroring) so a
 # non-interactive `--wraith` install can't half-provision a coordinator that has
@@ -593,7 +593,7 @@ RPCPW="$(openssl rand -hex 32)"
 # internal_api_secret: the shared HMAC secret between ghost-pool and the node
 # dashboard. Generate ONCE and REUSE any existing value on re-runs, so an
 # upgrade/re-provision never rotates it out from under the dashboard (a rotated
-# secret 401s every internal dashboard request). Mirrors the BOND_LEDGER_TOKEN
+# secret 401s every internal dashboard request).
 # share-once pattern below. Change B (after pool.toml is written) mirrors this
 # same value into the dashboard's INTERNAL_AUTH_KEY so the two can never drift.
 if [[ -f /etc/ghost/pool.toml ]] && grep -qE '^internal_api_secret[[:space:]]*=' /etc/ghost/pool.toml; then
@@ -611,15 +611,11 @@ PRIVATE_MINING_PASSWORD=""
 if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
   PRIVATE_MINING_PASSWORD="$(openssl rand -hex 16)"
 fi
-# Ghost Pay secrets. On mainnet ghost-pay refuses to start without all three of
-# these (key-encryption password, API HMAC secret, coordinator bond-ledger
-# token). BOND_LEDGER_TOKEN is generated ONCE here and shared verbatim between
-# ghost-pay (GHOST_PAY_BOND_LEDGER_TOKEN) and the ghost-pool coordinator
-# ([coordinator] bond_ledger_token) so the two always match.
+# Ghost Pay secrets. On mainnet ghost-pay refuses to start without both of
+# these (key-encryption password, API HMAC secret).
 if [[ "$GHOST_PAY" == "true" ]]; then
   PAY_KEY_PASSWORD="$(openssl rand -hex 32)"
   PAY_API_SECRET="$(openssl rand -hex 32)"
-  BOND_LEDGER_TOKEN="$(openssl rand -hex 32)"
 fi
 
 # ───────────────────────── 5. ghostd config (sync) ───────────────────────────
@@ -1232,16 +1228,14 @@ cat > /etc/systemd/system/ghost-pool.service.d/journal-access.conf <<EOF
 SupplementaryGroups=systemd-journal
 EOF
 
-# ghost-pay L2 service (also serves the Wraith bond ledger on 8800). Only
-# installed when Ghost Pay is enabled. GHOST_PAY_BOND_LEDGER_TOKEN is the SAME
-# secret written into pool.toml's [coordinator] bond_ledger_token above, so the
-# coordinator authenticates to this bond ledger. MPC verification keys default
+# ghost-pay L2 service on 8800. Only
+# MPC verification keys default
 # to the sibling of --data-dir (/home/ghost/.ghost/mpc_params), where ghost-pool
 # fetches them. The unit carries secrets, so it is locked to 0600.
 if [[ "$GHOST_PAY" == "true" ]]; then
 cat > /etc/systemd/system/ghost-pay.service <<EOF
 [Unit]
-Description=Ghost Pay L2 service (Wraith bond ledger)
+Description=Ghost Pay L2 service
 After=network-online.target ghostd.service ghost-pool.service
 Wants=network-online.target
 [Service]
@@ -1255,7 +1249,6 @@ Environment=BITCOIN_RPC_USER=ghostrpc_mainnet
 Environment=BITCOIN_RPC_PASSWORD=${RPCPW}
 Environment=GHOST_PAY_PASSWORD=${PAY_KEY_PASSWORD}
 Environment=GHOST_PAY_API_SECRET=${PAY_API_SECRET}
-Environment=GHOST_PAY_BOND_LEDGER_TOKEN=${BOND_LEDGER_TOKEN}
 Restart=on-failure
 RestartSec=15
 LimitNOFILE=65536
@@ -1320,9 +1313,9 @@ ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
 ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications + MPC contribution/vote exchange)
 ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS (peers fetch MPC params + votes)
-# Ghost Pay L2 / Wraith bond ledger (peers issue Ghost Pay verification
-# challenges here, and wallets escrow Wraith bonds here) — only when enabled.
-[[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay / bond ledger
+# Ghost Pay L2 (peers issue Ghost Pay verification challenges here) — only
+# when enabled.
+[[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
@@ -1629,7 +1622,7 @@ health_ghost_pool() {
 }
 
 health_ghost_pay() {
-  # Only meaningful when ghost-pay is installed. Bond ledger serves TLS with an
+  # Only meaningful when ghost-pay is installed. It serves TLS with an
   # identity-derived cert, so -k (we are localhost, integrity is the binary swap
   # we just verified, not the transport).
   unit_present ghost-pay.service || { log "health: ghost-pay not installed — skipped"; return 0; }
