@@ -2403,14 +2403,11 @@ impl Database {
             if flat.len() % 32 != 0 {
                 return Ok(None);
             }
-            let path = flat
-                .chunks_exact(32)
-                .map(|c| {
-                    let mut n = [0u8; 32];
-                    n.copy_from_slice(c);
-                    n
-                })
-                .collect();
+            // `as_chunks` rather than `chunks_exact(32)`: the length is already known to be a
+            // multiple of 32 (checked above), so the remainder is provably empty and the
+            // per-chunk `copy_from_slice` was doing by hand what the type system can state.
+            // clippy 1.98 flags the old form (`chunks_exact_to_as_chunks`).
+            let path = flat.as_chunks::<32>().0.to_vec();
             Ok(Some((prefix, suffix, path)))
         })
     }
