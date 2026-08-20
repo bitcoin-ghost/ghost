@@ -465,6 +465,33 @@ pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 /// room for the build, canary soak and rolling deploy several times over.
 pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 
+/// The payout checkpoint takes its miner work from the SHARD, not the legacy unpaid ledger (#722).
+/// **ARMED at 964_500.**
+///
+/// Migration v56 handed `shares` to the shard and, at `main.rs`'s `shard_owns_evidence` latch,
+/// switched OFF the GHOST-03 ledger sweep that repaired it — while the checkpoint carried on
+/// recomputing per-address work from that same table. Repair was removed; the thing that fails
+/// without repair was left running. Holes became permanent and the fleet's totals for one address
+/// drifted 25% apart against a 2% tolerance, so every proposal was rejected by everyone and no
+/// checkpoint has finalised since 2026-08-18.
+///
+/// The build plan's own order for the cutover is BFT payout path first, sweep second. v56 did the
+/// sweep half early; this gate is the half that should have preceded it.
+///
+/// At and above this height [`crate::payout::select_shard_miner_work`] replaces
+/// `select_ledger_miner_work` in the checkpoint's root computation and its diagnostic twin. The
+/// shard converges where the legacy ledger cannot: its per-address totals are BYTE-IDENTICAL on
+/// vm1/vm2/vm3 today, and nodes already gossip and agree the table root (21/21 `agree=true`).
+///
+/// ⚠ Both the root fn and the diagnostic fn must move together. A diagnostic left reading the old
+/// source would describe a divergence that is not the one the vote actually turned on.
+///
+/// 964_500 is ~1,150 blocks beyond the tip at the time of arming (963_347), which at the observed
+/// ~8-10 min/block is roughly a week — room for the build, CI, canary soak and a rolling deploy to
+/// all eight nodes, with the margin this needs because a node still on the old source at the gate
+/// diverges from the fleet exactly the way v56 did. It does NOT ride the Stage 6 deletion release.
+pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 964_500;
+
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
 ///
@@ -585,6 +612,7 @@ mod gates {
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
+    pub(super) static CHECKPOINT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
     /// Not a height — the difficulty-tier floor the shard will ingest. Same reasoning as the
     /// gates: a regtest fleet cannot mine one, so without an override the rehearsal exercises an
     /// empty shard. See [`crate::network_tier_log2`].
@@ -668,6 +696,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         MESH_NODE_LIST_CHECKPOINT_HEIGHT,
     );
+    let checkpoint_from_shard = gates::from_env(
+        "GHOST_CHECKPOINT_FROM_SHARD_HEIGHT",
+        network,
+        CHECKPOINT_FROM_SHARD_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
@@ -681,6 +714,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
     let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
     let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
+    let _ = gates::CHECKPOINT_FROM_SHARD.set(checkpoint_from_shard);
 
     // Not a height, but resolved here for the same reason and under the same mainnet lock, so
     // there is one place to look for "what did this run actually enforce".
@@ -828,6 +862,12 @@ pub fn crosses_network_tier(tier_log2: Option<u32>) -> bool {
 /// Height at and above which every node settles won blocks by observing them on-chain.
 pub fn observed_settlement_height() -> u64 {
     *gates::OBSERVED_SETTLEMENT.get_or_init(|| OBSERVED_SETTLEMENT_HEIGHT)
+}
+
+/// Height at and above which the payout checkpoint computes its miner work from the shard
+/// instead of the legacy unpaid ledger (#722).
+pub fn checkpoint_from_shard_height() -> u64 {
+    *gates::CHECKPOINT_FROM_SHARD.get_or_init(|| CHECKPOINT_FROM_SHARD_HEIGHT)
 }
 
 /// Height at and above which the checkpoint adopts the per-address median of voters' own

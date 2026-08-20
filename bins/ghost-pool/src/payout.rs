@@ -345,6 +345,48 @@ pub fn read_adopted_payout(db: &ghost_storage::Database, tip_height: u64) -> Opt
     }
 }
 
+/// The checkpoint's miner work taken from the SHARD instead of the legacy unpaid ledger.
+///
+/// The counterpart to [`select_ledger_miner_work`], and the whole of the checkpoint half of the
+/// cutover. Same output shape — `(address, weight)` sorted work-desc then address-asc — so every
+/// downstream consumer (the root, `payouts_agree`, the adopted list the coinbase builds from) is
+/// unchanged code on both sides of the gate.
+///
+/// **Why this exists.** Migration v56 handed `shares` to the shard and disabled the GHOST-03
+/// ledger sweep that repaired it, while the checkpoint carried on recomputing from that same
+/// table. Holes in it became permanent, so no two nodes agreed a per-address total and every
+/// proposal was rejected — 25% apart on the live fleet, against a 2% tolerance, with no
+/// mechanism left to converge. The shard has one, and uses it: the per-address totals are
+/// BYTE-IDENTICAL across vm1/vm2/vm3 today.
+///
+/// The weight is `owed` micro-work rather than `WORK_SCALE`-quantised work. Only the ratios
+/// matter — the coinbase distributes `pool_sats * work / total` — and the tolerance terms that
+/// are not scale-invariant stay inert at these magnitudes (`ABS_TOL` sits ~165x below the
+/// 0.2%-of-pool floor). ⚠ That inertness is a property of the magnitudes, not of the code: if
+/// total owed ever fell below ~5e14 micro, `ABS_TOL` would silently become the governing bound.
+///
+/// Non-positive balances are dropped. `owed()` is `accrued − settled` and is documented to go
+/// negative transiently; the `i64 → u128` cast would otherwise wrap a small negative into a
+/// number larger than the entire pool. Mirrors `shard_miner_payouts`, which filters the same way
+/// on the paying side.
+///
+/// No dust filter here, unlike the legacy path: dust is applied when the coinbase is built
+/// (`shard_miner_payouts`, which knows the actual pool sats), and applying a subsidy-estimated
+/// one here as well would drop addresses the payer would have kept. The cap is
+/// `MAX_MINER_OUTPUTS` so the adopted list can never exceed what a coinbase is able to pay.
+pub fn select_shard_miner_work(
+    owed: &std::collections::BTreeMap<String, i64>,
+) -> Vec<(String, u128)> {
+    let mut rows: Vec<(String, u128)> = owed
+        .iter()
+        .filter(|(_, &micro)| micro > 0)
+        .map(|(addr, &micro)| (addr.clone(), micro as u128))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(ghost_common::constants::MAX_MINER_OUTPUTS);
+    rows
+}
+
 /// Option B cutoff-binding: a proposal's payout cutoff must be a fleet-ratified one.
 ///
 /// At and above `fee_gate_height` the coinbase is a pure function of a BFT-finalised
@@ -2636,6 +2678,73 @@ impl PayoutHandler {
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
+
+    /// `owed()` is `accrued − settled` and is documented to go negative transiently. The cast to
+    /// `u128` is where that becomes money: `-1i64 as u128` is 2^128−1, an address weighted above
+    /// the entire pool, and the coinbase splits proportionally. So the filter is not tidiness.
+    #[test]
+    fn shard_miner_work_drops_non_positive_balances_before_the_cast() {
+        let owed = std::collections::BTreeMap::from([
+            ("bc1qalice".to_string(), 500i64),
+            ("bc1qbob".to_string(), -1i64),
+            ("bc1qcarol".to_string(), 0i64),
+        ]);
+        let got = super::select_shard_miner_work(&owed);
+        assert_eq!(
+            got,
+            vec![("bc1qalice".to_string(), 500u128)],
+            "a negative or zero balance reached the output"
+        );
+        assert!(
+            got.iter().all(|(_, w)| *w < u128::MAX / 2),
+            "a negative balance wrapped through the u128 cast"
+        );
+    }
+
+    /// Canonical order: work descending, address ascending on a tie. `compute_ledger_root` sorts
+    /// internally so the root does not depend on this, but the adopted list is persisted and read
+    /// back by the coinbase builder, and a total order means two nodes cannot differ on a tie.
+    #[test]
+    fn shard_miner_work_is_ordered_work_desc_then_address_asc() {
+        let owed = std::collections::BTreeMap::from([
+            ("bc1qb".to_string(), 10i64),
+            ("bc1qa".to_string(), 10i64),
+            ("bc1qc".to_string(), 99i64),
+        ]);
+        assert_eq!(
+            super::select_shard_miner_work(&owed),
+            vec![
+                ("bc1qc".to_string(), 99u128),
+                ("bc1qa".to_string(), 10u128),
+                ("bc1qb".to_string(), 10u128),
+            ]
+        );
+    }
+
+    /// The adopted list must never be longer than a coinbase can pay, or the checkpoint ratifies
+    /// a split that cannot be built. Truncation keeps the LARGEST balances, which is why the sort
+    /// has to happen first — the reverse order would drop the addresses that matter.
+    #[test]
+    fn shard_miner_work_caps_at_max_miner_outputs_keeping_the_largest() {
+        let cap = ghost_common::constants::MAX_MINER_OUTPUTS;
+        let owed: std::collections::BTreeMap<String, i64> = (0..cap as i64 + 25)
+            .map(|i| (format!("bc1q{i:04}"), i + 1))
+            .collect();
+        let got = super::select_shard_miner_work(&owed);
+        assert_eq!(got.len(), cap, "cap not applied");
+        assert_eq!(
+            got[0].1,
+            (cap as u128) + 25,
+            "truncation kept the wrong end of the list"
+        );
+        let smallest_kept = got.last().expect("non-empty").1;
+        assert_eq!(smallest_kept, 26u128, "expected the largest `cap` balances");
+    }
+
+    #[test]
+    fn shard_miner_work_on_an_empty_shard_is_empty_not_a_panic() {
+        assert!(super::select_shard_miner_work(&std::collections::BTreeMap::new()).is_empty());
+    }
     use super::*;
 
     fn test_identity() -> Arc<NodeIdentity> {

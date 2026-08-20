@@ -3657,14 +3657,53 @@ async fn main() -> Result<()> {
     // compute_root: the canonical ledger root from THIS node's converged view at a
     // fixed cutoff — miner set (unpaid ledger) + qualified-node set. Deterministic
     // subsidy via calculate_block_subsidy(height, None) so every node matches.
+    // The shard, once it exists. It is constructed BELOW this point, while the checkpoint manager
+    // that owns the closure is built above it — so the handle is filled in rather than captured.
+    // Safe because the closure is only ever CALLED to propose or vote a checkpoint, long after
+    // startup has finished; it is never called during init.
+    let shard_for_checkpoint: Arc<OnceLock<Arc<ghost_pool::shard::ShardRuntime>>> =
+        Arc::new(OnceLock::new());
     let compute_ledger_root_fn: ghost_pool::payout_checkpoint::ComputeRootFn = {
         let db_c = Arc::clone(&db);
         let oracle_c = block_hash_oracle.clone();
+        let shard_c = Arc::clone(&shard_for_checkpoint);
         Arc::new(move |cutoff_ts, height| {
             let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
-            let miner_payouts =
+            // #722: at and above the gate the miner half comes from the SHARD, not the legacy
+            // unpaid ledger. v56 disabled the GHOST-03 sweep that repaired `shares` while this
+            // computation kept reading it, so its holes became permanent and no two nodes could
+            // agree a per-address total — 25% apart against a 2% tolerance, every proposal
+            // rejected by everyone since 2026-08-18. The shard converges where that table cannot.
+            //
+            // Refuse rather than fall back when the shard is absent or unarmed. A silent fall
+            // back to the legacy ledger is precisely the mixed-source divergence this gate exists
+            // to end: the node would compute a root nobody else can reproduce and reject every
+            // proposal, which is the failure we are already living with and the hardest kind to
+            // attribute. Returning `None` makes this node abstain, loudly.
+            let miner_payouts = if height >= ghost_pool::checkpoint_from_shard_height() {
+                let Some(rt) = shard_c.get() else {
+                    error!(
+                        height,
+                        "checkpoint: at/above CHECKPOINT_FROM_SHARD_HEIGHT but no shard is \
+                         running — abstaining. Set `pool.share_shard`; this node cannot take \
+                         part in payout checkpoints until it does"
+                    );
+                    return None;
+                };
+                if !rt.genesis_installed() {
+                    error!(
+                        height,
+                        "checkpoint: at/above CHECKPOINT_FROM_SHARD_HEIGHT but shard genesis is \
+                         NOT installed — abstaining. Its balances would omit everything the pool \
+                         owed before the shard was armed"
+                    );
+                    return None;
+                }
+                ghost_pool::payout::select_shard_miner_work(&rt.owed_snapshot())
+            } else {
                 ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
-                    .ok()?;
+                    .ok()?
+            };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()));
             // A-2/A-2b: the checkpoint root must scope challengers to the voter set +
@@ -3865,6 +3904,14 @@ async fn main() -> Result<()> {
         }
         _ => shard,
     };
+
+    // Hand the (possibly armed) shard to the checkpoint closure built above. Done here rather
+    // than at construction because the checkpoint manager is built before the shard exists, and
+    // done AFTER the arming match so the closure sees the armed runtime — an unarmed one has no
+    // genesis balances and its `owed()` would omit everything the pool owed before the cutover.
+    if let Some(rt) = shard.as_ref() {
+        let _ = shard_for_checkpoint.set(Arc::clone(rt));
+    }
 
     // The share checks in force right now: §6 sampling and the §12.4 evidence audits.
     //

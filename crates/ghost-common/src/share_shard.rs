@@ -1765,7 +1765,11 @@ mod tests {
             b.compute_table_root(),
             "same content must reach the same root"
         );
-        assert_eq!(a.owed(), b.owed(), "equal root but different owed — adoption is unsound");
+        assert_eq!(
+            a.owed(),
+            b.owed(),
+            "equal root but different owed — adoption is unsound"
+        );
 
         // And every way the payable state can differ must break the root, so a voter can
         // never adopt across it. Each case is a distinct axis: balance, settlement, and
