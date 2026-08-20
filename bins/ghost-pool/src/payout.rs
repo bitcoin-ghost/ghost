@@ -3048,6 +3048,97 @@ mod tests {
         );
     }
 
+    /// Block submission depends on these two agreeing, and today only a comment says they do.
+    ///
+    /// GHOST-02 compares for EXACT equality, not tolerance: `expected` is built by
+    /// `calculate_miner_payouts` from the adopted checkpoint list, `proposal.miner_payouts` by
+    /// `shard_miner_payouts` from the shard. Before #722's gate those are two different ledgers
+    /// and the check fails outright — measured on the live fleet as a 2-address frozen checkpoint
+    /// against a 5-address shard, which rejects a won block rather than mispaying it.
+    ///
+    /// After the gate both derive from the same `owed` balances, and the two functions are
+    /// documented to "differ only in WHICH balances they distribute, never in HOW". This pins
+    /// that claim, using the magnitudes actually on the fleet so the rounding is representative
+    /// rather than convenient.
+    #[test]
+    fn shard_derived_adopted_list_and_the_coinbase_split_agree_exactly() {
+        // Mainnet, not the shared regtest fixture: `calculate_miner_payouts` validates every
+        // resolved address against the configured network, so mainnet balances have to be judged
+        // by a mainnet creator or every payout is discarded as off-network.
+        let creator = {
+            let config = PayoutConfig {
+                treasury_address: Some(vec![1u8; 20]),
+                network: ghost_common::config::BitcoinNetwork::Mainnet,
+                ..Default::default()
+            };
+            let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+            PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
+        };
+        // Live vm1 balances, micro-work.
+        //
+        // Addresses must be REAL bech32: `get_miner_address` returns the key unchanged when it
+        // parses as an address and otherwise falls through to a database lookup. A placeholder
+        // like "bc1qalice" takes the second path, resolves to nothing, and the validator pays
+        // nobody — which is how this test first failed, and is worth knowing because it is also
+        // how a malformed address in the shard would behave in production: `shard_miner_payouts`
+        // does not validate addresses, so the coinbase would pay one the validator drops.
+        let owed = std::collections::BTreeMap::from([
+            (
+                "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+                76_039_051_664_125_167i64,
+            ),
+            (
+                "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
+                3_494_065_686_437_835i64,
+            ),
+            (
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                2_503_874_639_417_892i64,
+            ),
+            (
+                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3".to_string(),
+                532_541_467_700_909i64,
+            ),
+            (
+                "bc1pmfr3p9j00pfxjh0zmgp99y8zftmd3s5pmedqhyptwy6lm87hf5sspknck9".to_string(),
+                9_741_908_758_669i64,
+            ),
+        ]);
+        // 99% of a 3.125 BTC subsidy — the miner pool at the current halving era.
+        let miner_pool: u64 = 309_375_000;
+
+        // What a validator recomputes from the adopted checkpoint, post-gate.
+        let adopted = super::select_shard_miner_work(&owed);
+        let (expected, _dust) = creator
+            .calculate_miner_payouts(&adopted, miner_pool)
+            .expect("recompute");
+        let expected_map: std::collections::BTreeMap<String, u64> = expected
+            .iter()
+            .map(|e| {
+                (
+                    String::from_utf8(e.address.clone()).expect("utf8 address"),
+                    e.amount,
+                )
+            })
+            .collect();
+
+        // What the coinbase actually pays.
+        let paid = ghost_common::share_shard::shard_miner_payouts(
+            &owed,
+            miner_pool,
+            ghost_common::constants::MAX_MINER_OUTPUTS,
+            super::LEDGER_DUST_SATS,
+        );
+        let paid_map: std::collections::BTreeMap<String, u64> =
+            paid.payouts.iter().cloned().collect();
+
+        assert_eq!(
+            expected_map, paid_map,
+            "the adopted list and the coinbase disagree — GHOST-02 rejects the block"
+        );
+        assert!(!expected_map.is_empty(), "the fixture paid nobody");
+    }
+
     fn ghost02_creator() -> PayoutProposalCreator {
         let config = PayoutConfig {
             treasury_address: Some(vec![1u8; 20]),
