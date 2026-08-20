@@ -89,13 +89,7 @@ pub mod terminal_reject_cache;
 /// `ShadowChain::bootstrap_genesis` for why that is safe and why the genesis proposer is zero.
 pub const SBC_GENESIS_ANCHOR_HEIGHT: u64 = 961_642;
 
-pub mod sbc_checks;
-
-/// The share-batch chain running in shadow (WP-5) — computes, persists, pays nobody.
-pub mod sbc_shadow;
-
-/// Mesh handler routing batch traffic into the shadow chain (WP-5).
-pub mod sbc_handler;
+pub mod share_checks;
 
 /// The network shard's runtime: epoch folds, evidence retention, boundary detection
 /// (`SHARE_SHARD.md` §4.3/§4.4). Dark unless `pool.share_shard` is set.
@@ -274,7 +268,7 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// - `ShareProof.tier_log2`, GHOST-09-bound when present, absent → `signing_bytes`
 ///   byte-identical to today (`ghost-common/src/types.rs`);
 /// - every verification path selects the tier check at/above this gate and credits exactly
-///   `2^tier_log2`: gossip/backfill ingest (`round.rs`), the batch chain (`sbc_checks.rs`), the
+///   `2^tier_log2`: gossip/backfill ingest (`round.rs`), the shard (`share_checks.rs`), the
 ///   local webhook ingest (`ghost-verification` H-13, gate injected via
 ///   `with_share_tier_bind_height`), with the terminal-reject key tier-aware
 ///   (`terminal_reject_cache.rs`);

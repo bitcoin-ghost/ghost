@@ -2402,24 +2402,10 @@ pub struct PoolConfig {
     pub min_payout_sats: u64,
     /// Payout frequency (blocks)
     pub payout_interval_blocks: u64,
-    /// Run the share-batch chain in SHADOW alongside the existing payout path (WP-5).
-    ///
-    /// The chain computes, folds and persists its own state and emits `(seq, state_root)` for the
-    /// trust gate to compare fleet-wide. It pays nobody — the coinbase still reads the ratified
-    /// checkpoint until WP-6 — so enabling this cannot change what a block pays.
-    ///
-    /// Default FALSE, and deliberately a config flag rather than a height gate. A height gate is
-    /// for a change every node must make at the same block; this is safe to make one node at a
-    /// time, and being able to enable it per node is what makes a canary meaningful. It also means
-    /// deploying the binary does not by itself start batch traffic.
-    ///
-    /// See `docs/archive/SHARE_BATCH_CHAIN.md`.
-    #[serde(default)]
-    pub share_batch_shadow: bool,
     /// Run the network shard: fold this node's own network-tier shares into its counter column
     /// each epoch, and persist the result.
     ///
-    /// A config flag rather than a height gate, for the same reason as `share_batch_shadow` above
+    /// A config flag rather than a height gate: it selects a behaviour, not an era
     /// and for one more: gates exist so that shares already in the ledger stay valid across a rule
     /// change, and the shard is seeded from a snapshot with no history behind it, so there is
     /// nothing to activate around. A flag is also safe one node at a time, which is what makes a
@@ -2551,7 +2537,6 @@ impl Default for PoolConfig {
             min_payout_sats: 100_000, // 0.001 BTC minimum
             payout_interval_blocks: 100,
             // Dark by default: deploying the binary must not start batch traffic.
-            share_batch_shadow: false,
             // Same rule: deploying the binary must not by itself start folding.
             share_shard: false,
             shard_arm_genesis: false,
@@ -2568,31 +2553,6 @@ impl Default for PoolConfig {
 
 #[cfg(test)]
 mod tests {
-    /// A dark feature must be OFF unless asked for, and must stay off when the key is absent from
-    /// an existing config file.
-    ///
-    /// The failure this guards is deploying a binary that starts proposing batches on every node
-    /// because a default flipped — which would put real consensus traffic on the mesh before the
-    /// genesis ceremony had chosen a chain to build on.
-    #[test]
-    fn share_batch_shadow_is_off_by_default_and_when_absent() {
-        assert!(
-            !PoolConfig::default().share_batch_shadow,
-            "the shadow chain must not run unless explicitly enabled"
-        );
-
-        // An existing config predating the field must parse, and must not enable it.
-        let toml = r#"
-            min_payout_sats = 100000
-            payout_interval_blocks = 100
-        "#;
-        let parsed: PoolConfig =
-            toml::from_str(toml).expect("a config without the key must still parse");
-        assert!(
-            !parsed.share_batch_shadow,
-            "an absent key must read as off, not as a parse failure or a silent on"
-        );
-    }
 
     use super::*;
 

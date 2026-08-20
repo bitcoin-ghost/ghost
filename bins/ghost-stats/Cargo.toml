@@ -1,0 +1,59 @@
+#|======================================================================================================================|
+#|                                                                                                                      |
+#|  ▄▄▄▄    ██▓▄▄▄█████▓ ▄████▄   ▒█████   ██▓ ███▄    █      ▄████  ██░ ██  ▒█████    ██████ ▄▄▄█████▓   ▄████████▄    |
+#| ▓█████▄ ▓██▒▓  ██▒ ▓▒▒██▀ ▀█  ▒██▒  ██▒▓██▒ ██ ▀█   █     ██▒ ▀█▒▓██░ ██▒▒██▒  ██▒▒██    ▒ ▓  ██▒ ▓▒   ███▀██▀███    |
+#| ▒██▒ ▄██▒██▒▒ ▓██░ ▒░▒▓█    ▄ ▒██░  ██▒▒██▒▓██  ▀█ ██▒   ▒██░▄▄▄░▒██▀▀██░▒██░  ██▒░ ▓██▄   ▒ ▓██░ ▒░   ██████████░   |
+#| ▒██░█▀  ░██░░ ▓██▓ ░ ▒▓▓▄ ▄██▒▒██   ██░░██░▓██▒  ▐▌██▒   ░▓█  ██▓░▓█ ░██ ▒██   ██░  ▒   ██▒░ ▓██▓ ░    ██████████░░▒ |
+#| ░▓█  ▀█▓░██░  ▒██▒ ░ ▒ ▓███▀ ░░ ████▓▒░░██░▒██░   ▓██░   ░▒▓███▀▒░▓█▒░██▓░ ████▓▒░▒██████▒▒  ▒██▒ ░    ██▀▀██▀▀██░▒  |
+#| ░▒▓███▀▒░▓    ▒ ░░   ░ ░▒ ▒  ░░ ▒░▒░▒░ ░▓  ░ ▒░   ▒ ▒     ░▒   ▒  ▒ ░░▒░▒░ ▒░▒░▒░ ▒ ▒▓▒ ▒ ░  ▒ ░░      ▒ ░░▒░▒ ░░▒░  |
+#| ▒░▒   ░  ▒ ░    ░      ░  ▒     ░ ▒ ▒░  ▒ ░░ ░░   ░ ▒░     ░   ░  ▒ ░▒░ ░  ░ ▒ ▒░ ░ ░▒  ░ ░    ░         ▒ ░░▒░▒░ ░  |
+#|  ░    ░  ▒ ░  ░      ░        ░ ░ ░ ▒   ▒ ░   ░   ░ ░    ░ ░   ░  ░  ░░ ░░ ░ ░ ▒  ░  ░  ░    ░               ░  ░    |
+#|  ░       ░           ░ ░          ░ ░   ░           ░          ░  ░  ░  ░    ░ ░        ░                            |
+#|       ░              ░                                                                                               |
+#|----------------------------------------------------------------------------------------------------------------------|
+#|             < B I T C O I N  G H O S T > < D E F E N W Y C K E > < R E A D  T H E  W H I T E P A P E R >             |
+#|----------------------------------------------------------------------------------------------------------------------|
+#| PROJECT: Bitcoin Ghost                                                                                               |
+#| REPO: https://github.com/bitcoin-ghost                                                                               |
+#| WEB: https://bitcoinghost.org/                                                                                       |
+#| LICENSE: MIT                                                                                                         |
+#| FILE: bins/ghost-stats/Cargo.toml                                                                                    |
+
+[package]
+name = "ghost-stats"
+version = "0.1.0"
+edition = "2021"
+description = "Public pool-stats aggregator - one server-side snapshot instead of a per-viewer fan-out"
+license = "MIT"
+repository = "https://github.com/bitcoin-ghost"
+
+[[bin]]
+name = "ghost-stats"
+path = "src/main.rs"
+# Binary entry-points carry no useful rustdoc, and documenting them races
+# `cargo doc` on target/doc/ name collisions. Same rationale as ghost-gsp.
+doc = false
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP server (public read-only summary) and client (node fan-out)
+axum = { workspace = true }
+reqwest = { workspace = true }
+
+# CLI + configuration
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Concurrent node fan-out
+futures = { workspace = true }

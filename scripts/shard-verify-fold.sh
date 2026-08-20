@@ -32,7 +32,7 @@
 #
 # ## Why it compares SORTED VALUES rather than address-to-address
 #
-# `shard_counters.address_enc` is encrypted with a per-call nonce (the `sbc_balances` rule), so the
+# `shard_counters.address_enc` is encrypted with a per-call nonce (the `address_key` rule), so the
 # ciphertext cannot be matched back to a plaintext address from outside the node. Comparing the
 # sorted multiset of per-address values is nearly as strong: it catches a wrong total, a wrong
 # split, a missing address and a duplicated one. It would not catch two addresses having their
@@ -155,7 +155,7 @@ python3 - "$WORK/raw" "$WORK/persisted" <<'PY'
 import math, os, sys
 from collections import defaultdict
 
-# `creditable_difficulty` (share_batch.rs): the fold REFUSES a difficulty that is not finite, not
+# `creditable_difficulty` (work_fold.rs): the fold REFUSES a difficulty that is not finite, not
 # positive, or above the cap that would saturate the accumulator. Omitting this screen makes the
 # script count a share the pool deliberately excluded and report a MISMATCH with no bug in the fold.
 MAX_CREDIT_DIFFICULTY = 1e12

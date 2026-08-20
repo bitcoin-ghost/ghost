@@ -1,16 +1,17 @@
-//! The bridge from the batch chain to this node's share verification (WP-5).
+//! Does a share prove itself? The one definition, used by everything that judges a share it did
+//! not ingest.
 //!
-//! [`ghost_common::batch_consensus::BatchChecks`] is what `verify_batch` calls to decide whether a share in a peer's proposed
-//! batch is real. It must answer that question **exactly** as this node would for its own shares,
-//! or the shadow chain diverges for reasons that have nothing to do with consensus and the trust
-//! gate cannot tell the two apart.
+//! Extracted from the deleted share-batch chain, which is where this predicate was first written
+//! (`sbc_checks.rs`, WP-5). It survives the batch chain because the shard needs exactly the same
+//! question answered: §6 sampling and the §12.4 evidence audits both judge a PEER's share, and
+//! `shard_mesh.rs` calls straight in here. ONE definition, several consumers — a second spelling is
+//! how a signer and a verifier drift apart, and here one of them decides who gets publicly accused.
 //!
 //! ## What "valid" means here is deliberately NARROWER than `handle_share_proof`
 //!
-//! The batch chain asks one question: *does this share prove itself?* Per
-//! `docs/archive/SHARE_BATCH_CHAIN.md`, a `ShareProof` is self-proving — PoW preimage, GHOST-09 signature,
-//! receiver binding — so a validator checks **validity, not possession**. It needs no prior copy of
-//! the share and no agreement with anyone about what it holds.
+//! One question only: *does this share prove itself?* A `ShareProof` is self-proving — PoW preimage,
+//! GHOST-09 signature, receiver binding — so a validator checks **validity, not possession**. It
+//! needs no prior copy of the share and no agreement with anyone about what it holds.
 //!
 //! `RoundManager::handle_share_proof` asks more than that, because it is an *ingest* path with its
 //! own policy: C5 dedup, the M-6 `template_id` requirement, local template staleness, L-7
@@ -19,17 +20,19 @@
 //!
 //! The M-6 difference is the one that matters, and it is intentional. Requiring `template_id` on a
 //! remote share is a check on a field that path never reads (`round.rs` only consults it when
-//! `received_by == our_node_id`), and it currently strands historical shares that predate the
-//! field — measured at ~2,000-2,900 rejections/hour on every node, the same share set retried
-//! forever. Under the batch chain those shares prove themselves and are valid.
+//! `received_by == our_node_id`), and it strands historical shares that predate the field. A share
+//! that proves itself is valid here regardless.
 //!
-//! **So the shadow run is EXPECTED to credit slightly more work than the live ledger.** That drift
-//! is the defect being corrected, not a fault in the chain. What the trust gate must see is drift
-//! that is *bounded and non-growing*; a widening gap would mean something else is wrong.
+//! ⚠ Judge a share by ITS OWN era, never by the local node's activation rounds — that asymmetry is
+//! what made peers refuse each other's shares for ever. See `at_shared_height`.
 
-use ghost_common::batch_consensus::BatchChecks;
-use ghost_common::identity::verify_signature;
 use ghost_common::types::{RoundId, ShareProof};
+
+/// The share checks in force RIGHT NOW, rebuilt per call.
+///
+/// Rebuilt rather than captured once: the PoW predicate depends on the current height, and a
+/// handler holding a snapshot would keep applying the rules in force when the process started.
+pub type ChecksFn = std::sync::Arc<dyn Fn() -> NodeShareChecks + Send + Sync + 'static>;
 
 /// Verifies shares the way this node verifies its own.
 ///
@@ -37,7 +40,7 @@ use ghost_common::types::{RoundId, ShareProof};
 /// gets the same verdict regardless of when it is asked. `verify_batch` runs this over every share
 /// in a peer's batch, so a check that reached for shared state would also be a lock held across a
 /// whole batch.
-pub struct NodeBatchChecks {
+pub struct NodeShareChecks {
     /// The round at which GHOST-09 signatures began binding the payout address, if it has
     /// activated. Mirrors `RoundManager::requires_bound_signature` rather than re-deriving it: two
     /// spellings of the same predicate is how a signer and a verifier drift apart, and here that
@@ -97,7 +100,7 @@ struct EraByHeight {
     tier_bound: bool,
 }
 
-impl NodeBatchChecks {
+impl NodeShareChecks {
     pub fn new(
         addr_bind_activation_round: Option<RoundId>,
         pow_preimage_required: bool,
@@ -243,8 +246,13 @@ impl NodeBatchChecks {
     }
 }
 
-impl BatchChecks for NodeBatchChecks {
-    fn share_is_valid(&self, share: &ShareProof) -> bool {
+/// The share-validity predicate itself.
+///
+/// Inherent rather than a trait method: the trait (`batch_consensus::BatchChecks`) existed so the
+/// batch chain could inject this decision, and the batch chain is gone. The shard's §6 sampling and
+/// §12.4 evidence audits call this directly.
+impl NodeShareChecks {
+    pub fn share_is_valid(&self, share: &ShareProof) -> bool {
         // Signature first: it is cheap and it is what binds the share to a receiver, so a proof
         // that nobody vouched for is discarded before any hashing is done on its behalf.
         if !self.signature_ok(share) {
@@ -264,20 +272,6 @@ impl BatchChecks for NodeBatchChecks {
             return false;
         }
         true
-    }
-
-    fn proposer_signed(
-        &self,
-        proposer: &[u8; 32],
-        batch_hash: &[u8; 32],
-        signature: &[u8],
-    ) -> bool {
-        let Ok(sig) = <[u8; 64]>::try_from(signature) else {
-            return false;
-        };
-        // A verification error is not a valid signature — same fail-closed sense as
-        // `ShareProof::has_valid_bound_signature`.
-        verify_signature(proposer, batch_hash, &sig).unwrap_or(false)
     }
 }
 
@@ -318,8 +312,8 @@ mod tests {
         share
     }
 
-    fn checks() -> NodeBatchChecks {
-        NodeBatchChecks::new(None, true, None)
+    fn checks() -> NodeShareChecks {
+        NodeShareChecks::new(None, true, None)
     }
 
     /// The property §6 sampling depends on: two nodes with completely different round numbering
@@ -344,7 +338,7 @@ mod tests {
         let share_new_numbering = provable_share(&id, 3);
 
         // Height-decided era: below every gate, so both are judged by the pre-gate rules.
-        let early = NodeBatchChecks::at_shared_height(crate::SHARE_POW_VERIFY_HEIGHT - 1);
+        let early = NodeShareChecks::at_shared_height(crate::SHARE_POW_VERIFY_HEIGHT - 1);
         assert_eq!(
             early.share_is_valid(&share_veteran_numbering),
             early.share_is_valid(&share_new_numbering),
@@ -352,7 +346,7 @@ mod tests {
         );
 
         // And the era itself must still bite: at/above the PoW gate a header is demanded.
-        let late = NodeBatchChecks::at_shared_height(crate::SHARE_POW_VERIFY_HEIGHT);
+        let late = NodeShareChecks::at_shared_height(crate::SHARE_POW_VERIFY_HEIGHT);
         let mut headerless = provable_share(&id, 7);
         headerless.header = None;
         headerless.sign(&id);
@@ -430,7 +424,7 @@ mod tests {
     fn signature_format_is_judged_by_the_shares_round_not_the_current_height() {
         let id = NodeIdentity::generate();
         let activation: RoundId = 100;
-        let checks = NodeBatchChecks::new(Some(activation), true, None);
+        let checks = NodeShareChecks::new(Some(activation), true, None);
 
         // Pre-activation round, signed in the pre-activation format: valid.
         let old = provable_share(&id, activation - 1);
@@ -477,7 +471,7 @@ mod tests {
     /// window a node ingests its backfill burst.
     #[test]
     fn an_unestablished_height_takes_the_stronger_check() {
-        let strict = NodeBatchChecks::at_height(0, None, None, 1_000_000, None);
+        let strict = NodeShareChecks::at_height(0, None, None, 1_000_000, None);
         let id = NodeIdentity::generate();
         let mut fabricated = provable_share(&id, 1);
         fabricated.share_hash = [0xAB; 32];
@@ -497,7 +491,7 @@ mod tests {
         let id = NodeIdentity::generate();
         let boundary: RoundId = 100;
         // Tip far past the gate; boundary known.
-        let checks = NodeBatchChecks::at_height(2_000_000, None, Some(boundary), 1_000_000, None);
+        let checks = NodeShareChecks::at_height(2_000_000, None, Some(boundary), 1_000_000, None);
 
         let mut old = provable_share(&id, boundary - 1);
         old.header = None;
@@ -524,9 +518,9 @@ mod tests {
         let id = NodeIdentity::generate();
         let share = provable_share(&id, 1);
         assert!(share.tier_log2.is_none(), "fixture predates the tier era");
-        assert!(NodeBatchChecks::new(None, true, None).share_is_valid(&share));
+        assert!(NodeShareChecks::new(None, true, None).share_is_valid(&share));
         assert!(
-            NodeBatchChecks::at_height(1, None, None, 0, None).share_is_valid(&share),
+            NodeShareChecks::at_height(1, None, None, 0, None).share_is_valid(&share),
             "a dormant gate must leave the verdict untouched at any real height"
         );
     }
@@ -538,7 +532,7 @@ mod tests {
         let id = NodeIdentity::generate();
         let share = provable_share(&id, 1);
         assert!(
-            NodeBatchChecks::at_height(0, None, None, 1_000_000, None).share_is_valid(&share),
+            NodeShareChecks::at_height(0, None, None, 1_000_000, None).share_is_valid(&share),
             "height 0 must not turn the dormant tier requirement on"
         );
     }
@@ -576,7 +570,7 @@ mod tests {
     #[test]
     fn in_the_tier_era_a_share_is_judged_against_its_committed_tier() {
         let id = NodeIdentity::generate();
-        let tier_bound = NodeBatchChecks::new(None, true, Some(0));
+        let tier_bound = NodeShareChecks::new(None, true, Some(0));
 
         // Genesis committed to tier 11 and stating exactly 2^11: proves itself.
         assert!(
@@ -619,7 +613,7 @@ mod tests {
     fn a_pre_gate_share_stays_batchable_after_the_tier_gate_fires() {
         let id = NodeIdentity::generate();
         const ACTIVATION: RoundId = 121_703;
-        let checks = NodeBatchChecks::new(None, true, Some(ACTIVATION));
+        let checks = NodeShareChecks::new(None, true, Some(ACTIVATION));
 
         // Mined before the gate: carries no tier and can never acquire one retrospectively.
         assert!(
@@ -647,7 +641,7 @@ mod tests {
     /// Scanning for a qualifying preimage is what an honest miner does, and it keeps the share
     /// self-proving rather than lowering the difficulty until the check stops meaning anything.
     fn mined_share(identity: &NodeIdentity, round_id: RoundId, start_nonce: u32) -> ShareProof {
-        let era = NodeBatchChecks::at_shared_height(crate::share_addr_bind_height() - 1);
+        let era = NodeShareChecks::at_shared_height(crate::share_addr_bind_height() - 1);
         for nonce in start_nonce..start_nonce.saturating_add(100_000) {
             let mut header = vec![0u8; 80];
             header[76..80].copy_from_slice(&nonce.to_le_bytes());
@@ -687,7 +681,7 @@ mod tests {
     ///
     /// This composes the real pieces — real signed shares, the real summary, the real λ selection,
     /// the real Merkle verifier and the REAL era-aware predicate through
-    /// `NodeBatchChecks::at_shared_height` — and asserts the audit comes back clean.
+    /// `NodeShareChecks::at_shared_height` — and asserts the audit comes back clean.
     ///
     /// ⚠ It could not be shown on the regtest cluster, and that is not an oversight. The shard
     /// only ingests shares at or above `NETWORK_TIER_LOG2` (1024x diff1) and a CPU miner cannot
@@ -730,7 +724,7 @@ mod tests {
         // The canonical leaf order the responder serves from — the same sort the fold uses.
         let leaves: Vec<[u8; 32]> = {
             let mut sorted = shares.clone();
-            ghost_common::share_batch::canonical_sort(&mut sorted);
+            ghost_common::work_fold::canonical_sort(&mut sorted);
             sorted.iter().map(|s| s.share_hash).collect()
         };
 
@@ -758,7 +752,7 @@ mod tests {
 
         // Judged in the era these shares were actually signed for: below the addr-bind gate, so
         // the legacy received_by signature is the rule in force.
-        let era = NodeBatchChecks::at_shared_height(crate::share_addr_bind_height() - 1);
+        let era = NodeShareChecks::at_shared_height(crate::share_addr_bind_height() - 1);
         let outcome = verify_sample_response(
             &summary,
             &request,
@@ -791,29 +785,8 @@ mod tests {
     #[test]
     fn a_dormant_tier_gate_demands_no_tier_of_any_share() {
         let id = NodeIdentity::generate();
-        let checks = NodeBatchChecks::new(None, true, None);
+        let checks = NodeShareChecks::new(None, true, None);
         assert!(checks.share_is_valid(&provable_share(&id, 1)));
         assert!(checks.share_is_valid(&provable_share(&id, 999_999)));
-    }
-
-    #[test]
-    fn a_batch_signature_must_be_the_proposers_over_that_hash() {
-        let id = NodeIdentity::generate();
-        let batch_hash = [0x11u8; 32];
-        let sig = id.sign(&batch_hash);
-
-        assert!(checks().proposer_signed(&id.node_id(), &batch_hash, &sig));
-        assert!(
-            !checks().proposer_signed(&[0xFF; 32], &batch_hash, &sig),
-            "another node's id must not verify"
-        );
-        assert!(
-            !checks().proposer_signed(&id.node_id(), &[0x22u8; 32], &sig),
-            "the same signature must not replay onto another batch"
-        );
-        assert!(
-            !checks().proposer_signed(&id.node_id(), &batch_hash, &sig[..63]),
-            "a malformed signature is not valid"
-        );
     }
 }

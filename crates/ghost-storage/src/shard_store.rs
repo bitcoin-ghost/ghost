@@ -7,7 +7,7 @@
 //! from zero, so the round trip must be byte-identical under `compute_table_root` — a load that
 //! differs from the save is a node that diverges from the fleet while every local check passes.
 //!
-//! Keying follows `sbc_balances`: `H(plaintext address)`, never the ciphertext, because
+//! Keying follows `address_key`: `H(plaintext address)`, never the ciphertext, because
 //! `encrypt_sensitive` draws a fresh nonce per call and a ciphertext key can never be looked up.
 //! Never `GROUP BY` an encrypted column.
 //!
@@ -33,8 +33,8 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::share_shard::{AccruedColumns, EpochSummary, ShardTable, GENESIS_NODE_ID};
 use ghost_common::types::NodeId;
 
+use crate::address_key::{address_key, blob32};
 use crate::database::Database;
-use crate::sbc_store::{address_key, blob32};
 
 /// How many evidence rows one DELETE statement may name.
 ///

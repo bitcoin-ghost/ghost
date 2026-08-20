@@ -1,25 +1,15 @@
-//! Where the share-batch chain starts.
+//! Converting a ratified checkpoint into opening balances.
 //!
-//! Every batch after this one is checked against its parent, so the first one cannot be — something
-//! has to be adopted rather than verified. The only honest candidate is a **finalised
-//! `PayoutLedgerCheckpoint`**: the fleet has already agreed those numbers under the existing
-//! tolerance machinery, every node holds the identical adopted bytes, and its provenance is a vote
-//! that happened rather than a claim made now.
+//! Truncating, never rounding up: under-crediting by less than one micro-work is recoverable,
+//! over-crediting is not. The rounding loss is returned rather than swallowed so a caller can
+//! assert on it — a silent conversion loss is how an opening balance stops matching the ledger it
+//! came from.
 //!
-//! That is also the last use of tolerance. From `seq 1` onward, agreement is exact equality on a
-//! recomputed state root, which is only safe because the state everyone starts from is the same
-//! state — not merely a similar one.
-//!
-//! Genesis **converts** the checkpoint; it does not recompute it from local shares. Recomputing
-//! would reintroduce exactly the divergence the checkpoint exists to have settled: eight nodes with
-//! eight slightly different unpaid ledgers would derive eight slightly different genesis roots, and
-//! the chain would fail to start for the same reason the old one failed to agree.
-//!
-//! Dark code: nothing wires this into a runtime path yet.
+//! Written for the share-batch chain's genesis, which is deleted. The conversion outlived it:
+//! [`crate::shard_genesis`] reuses `genesis_balances` verbatim rather than re-spelling it, because
+//! two spellings of one conversion drift apart and this one decides opening money.
 
 use std::collections::BTreeMap;
-
-use ghost_common::share_batch::{compute_state_root, ShareBatch};
 
 use crate::shares::WORK_SCALE;
 
@@ -90,44 +80,6 @@ pub fn genesis_balances(
     (balances, rounding)
 }
 
-/// The genesis batch itself.
-///
-/// It carries no shares. The work is already in the opening balances, and re-listing the shares
-/// behind it would invite a validator to re-derive numbers that were agreed by vote rather than by
-/// arithmetic — the one thing genesis must not allow.
-///
-/// `prev_batch_hash` is the checkpoint hash, which makes the chain's first link point at the object
-/// that authorises it. A genesis with a zero parent would be a chain anyone could start; this one
-/// can only be started from a checkpoint the fleet finalised.
-pub fn genesis_batch(
-    checkpoint_hash: [u8; 32],
-    cutoff_ts: i64,
-    proposer: [u8; 32],
-    miner_payouts: &[(String, u128)],
-    node_shares: Vec<([u8; 32], i32)>,
-) -> (ShareBatch, BTreeMap<String, i64>, GenesisRounding) {
-    let (balances, rounding) = genesis_balances(miner_payouts);
-    let state_root = compute_state_root(&balances, 0, cutoff_ts);
-
-    let batch = ShareBatch {
-        seq: 0,
-        prev_batch_hash: checkpoint_hash,
-        close_ts: cutoff_ts,
-        proposer,
-        shares: Vec::new(),
-        settled_blocks: Vec::new(),
-        reversed_blocks: Vec::new(),
-        node_shares,
-        state_root,
-        truncated: false,
-        pending_count: 0,
-        // Signed by the caller, which holds the key. Left empty here so this function stays pure.
-        proposer_signature: Vec::new(),
-    };
-
-    (batch, balances, rounding)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,42 +142,20 @@ mod tests {
         assert_eq!(rounding.addresses_dropped, 1);
     }
 
-    /// Two nodes converting the same adopted checkpoint must reach the same root, whatever order
-    /// the list arrives in — this is the property the whole chain is built on top of.
+    /// Two nodes converting the same adopted checkpoint must reach the same balances, whatever
+    /// order the list arrives in. The shard's genesis table is built straight off this, so an
+    /// order-dependent conversion would give two nodes different opening money.
     #[test]
     fn genesis_is_identical_across_nodes() {
         let forwards = checkpoint();
         let mut backwards = checkpoint();
         backwards.reverse();
 
-        let (a, ba, _) = genesis_batch([0x77; 32], 1_700_000_000, [1u8; 32], &forwards, vec![]);
-        let (b, bb, _) = genesis_batch([0x77; 32], 1_700_000_000, [1u8; 32], &backwards, vec![]);
+        let (ba, ra) = genesis_balances(&forwards);
+        let (bb, rb) = genesis_balances(&backwards);
 
         assert_eq!(ba, bb);
-        assert_eq!(a.state_root, b.state_root);
-        assert_eq!(a.batch_hash(), b.batch_hash());
-    }
-
-    /// The first link points at the checkpoint that authorises it. A zero parent would be a chain
-    /// anyone could start.
-    #[test]
-    fn genesis_is_anchored_to_its_checkpoint() {
-        let (batch, _, _) =
-            genesis_batch([0x77; 32], 1_700_000_000, [1u8; 32], &checkpoint(), vec![]);
-        assert_eq!(batch.seq, 0);
-        assert_eq!(batch.prev_batch_hash, [0x77; 32]);
-        assert!(
-            batch.shares.is_empty(),
-            "the work is in the balances; re-listing shares invites re-derivation"
-        );
-    }
-
-    /// A different checkpoint must give a different genesis, or the anchor is decorative.
-    #[test]
-    fn a_different_checkpoint_gives_a_different_genesis() {
-        let (a, _, _) = genesis_batch([0x77; 32], 1_700_000_000, [1u8; 32], &checkpoint(), vec![]);
-        let (b, _, _) = genesis_batch([0x88; 32], 1_700_000_000, [1u8; 32], &checkpoint(), vec![]);
-        assert_ne!(a.batch_hash(), b.batch_hash());
+        assert_eq!(ra, rb);
     }
 
     /// A repeated address in the checkpoint must not lose work to an overwrite.
@@ -298,32 +228,6 @@ mod tests {
         assert_eq!(
             balances.get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
             Some(&56_331_582_763_867_633)
-        );
-    }
-
-    /// Golden vector for the production genesis candidate.
-    ///
-    /// Pins `(seq 0, cutoff_ts 1785580254)` against the adopted bytes at height 960,550. A change
-    /// here means either the conversion or the state-root encoding moved, and either one would
-    /// silently give eight nodes eight different opening balances.
-    #[test]
-    fn genesis_root_for_the_960550_candidate_is_pinned() {
-        const CUTOFF_TS: i64 = 1_785_580_254;
-        let (batch, _, _) = genesis_batch(
-            [0u8; 32], // the checkpoint hash is supplied at ceremony time
-            CUTOFF_TS,
-            [0u8; 32],
-            &ratified_960550(),
-            vec![],
-        );
-        let root: String = batch
-            .state_root
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(
-            root,
-            "e0c6ee483e18fa65d5a6b17b626515a38415863969441feba8d58e6a943fa9e4"
         );
     }
 
@@ -402,39 +306,11 @@ mod tests {
         );
     }
 
-    /// Golden vector for the CHOSEN genesis anchor.
-    ///
-    /// Pins `(seq 0, cutoff_ts 1786228093)` against the adopted bytes at 961,642. A change here
-    /// means the conversion or the state-root encoding moved, and either would silently give eight
-    /// nodes eight different opening balances — which cannot be detected after the fact, because
-    /// each node would be internally consistent.
-    #[test]
-    fn genesis_root_for_the_961642_anchor_is_pinned() {
-        const CUTOFF_TS: i64 = 1_786_228_093;
-        let (batch, _, _) = genesis_batch(
-            [0u8; 32], // the checkpoint hash is supplied at ceremony time
-            CUTOFF_TS,
-            [0u8; 32],
-            &ratified_961642(),
-            vec![],
-        );
-        let root: String = batch
-            .state_root
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(
-            root,
-            "cb5ac8470686192246bfc1330791e85023f2044b58f0b076b167ff89923ddc7f"
-        );
-    }
-
     /// An empty checkpoint is a cold start, not a panic.
     #[test]
     fn an_empty_checkpoint_yields_an_empty_genesis() {
-        let (batch, balances, rounding) = genesis_batch([0u8; 32], 0, [0u8; 32], &[], vec![]);
+        let (balances, rounding) = genesis_balances(&[]);
         assert!(balances.is_empty());
         assert_eq!(rounding, GenesisRounding::default());
-        assert_eq!(batch.state_root, compute_state_root(&balances, 0, 0));
     }
 }

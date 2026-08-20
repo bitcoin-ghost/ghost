@@ -19,6 +19,10 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # There was no timeout here at all, so the v1.11.23 apt hang was heading for the
+    # 6-hour default. Generous enough for a cold cross-target release build, bounded
+    # enough that a stall is visible the same day.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -54,22 +58,40 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Install system dependencies (Linux)
+      # Install system dependencies (Linux), with the mirrors off the critical path.
+      #
+      # #693 fixed this for `ci.yml` and did NOT reach here, which is how v1.11.23's
+      # release build sat 40+ minutes on `apt-get update` with every later step pending
+      # and no `timeout-minutes` to stop it. Same script, same reasoning — see
+      # `.github/scripts/install-linux-deps.sh` for why caching the .debs is the fix.
+      #
+      # ⚠ The cache key must NOT collide with ci.yml's. This job installs a strictly
+      # larger set (ghostd's C++ build deps as well as the Rust ones), and a shared key
+      # would let one workflow restore the other's .debs and install the wrong set. The
+      # `-release-` segment keeps them apart; hashing this file rotates the key whenever
+      # the package list below changes.
+      - name: Cache apt packages (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apt-debs
+          key: apt-debs-release-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh', '.github/workflows/release.yml') }}
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
+        timeout-minutes: 10
+        env:
           # ghost-pool/ghost-pay (Rust) need libsqlite3 + capnproto (the SV2
           # stratum-core dep). The Linux job ALSO builds ghostd (the C++ Bitcoin
           # Core daemon) below, which needs the standard Core build deps: a
           # compiler + CMake + pkgconf, libevent, boost, and libzmq. WITH_ZMQ is
           # ON (see the ghostd build step) because ghost-pool subscribes to
           # ghostd's ZMQ hashblock/sequence feed, so libzmq3-dev is required; the
-          # capnproto/libsqlite3 packages above double as ghostd's IPC
+          # capnproto/libsqlite3 packages double as ghostd's IPC
           # (ENABLE_IPC) and wallet (ENABLE_WALLET) dependencies.
-          sudo apt-get install -y \
-            libsqlite3-dev capnproto libcapnp-dev \
+          LINUX_DEPS: >-
+            libsqlite3-dev capnproto libcapnp-dev
             build-essential cmake pkgconf python3 libevent-dev libboost-dev libzmq3-dev
+        run: .github/scripts/install-linux-deps.sh
 
       # Cap'n Proto >= 1.0 from source (Linux only).
       #
@@ -196,12 +218,22 @@ jobs:
           fi
 
           # Create archive only if dist has files
+          #
+          # ⚠ `github.ref_name` is slash-free for a tag (`v1.11.23`) but NOT for a branch,
+          # and this workflow is also dispatchable as a dry run. On `fix/release-apt-hang`
+          # the name became `bitcoin-ghost-fix/release-apt-hang-<target>.tar.gz`, so tar
+          # tried to write into a directory that does not exist and every target failed at
+          # this step. The dry run was added (#540) precisely so the workflow could be
+          # exercised without cutting a tag — and it could not be, on any branch named the
+          # way every branch in this repo is named. Slashes are replaced, so a tag build is
+          # byte-identical to before and a dispatch produces a usable artefact.
           cd dist
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
           if [ -n "$(ls -A .)" ]; then
             if [ "${{ runner.os }}" = "Windows" ]; then
-              7z a ../bitcoin-ghost-${{ github.ref_name }}-${{ matrix.target }}.zip *
+              7z a "../bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.zip" *
             else
-              tar czvf ../bitcoin-ghost-${{ github.ref_name }}-${{ matrix.target }}.tar.gz *
+              tar czvf "../bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.tar.gz" *
             fi
           else
             echo "No binaries found to package"
@@ -302,7 +334,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bitcoin-ghost-${{ matrix.target }}
-          path: bitcoin-ghost-${{ github.ref_name }}-${{ matrix.target }}.*
+          # Same slash-replacement as the Package step above, or a dispatch uploads nothing.
+          path: bitcoin-ghost-*-${{ matrix.target }}.*
 
   release:
     name: Create Release
