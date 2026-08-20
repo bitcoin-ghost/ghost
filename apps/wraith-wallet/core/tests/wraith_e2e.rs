@@ -143,7 +143,6 @@ async fn five_wallets_complete_a_full_mix_round() {
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo,
-                change_address: Some(signet_addr(50 + i as u8)),
                 // Mixed outputs are P2TR and nothing else (#696).
                 mix_output_address: participant_address(i as u8 + 10).to_string(),
             };
@@ -325,7 +324,6 @@ async fn prepare_then_submit_works_via_split_api() {
                     value_sats: SEAT_PRICE,
                     scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
                 },
-                change_address: Some(signet_addr(50 + i as u8)),
                 mix_output_address: participant_address(i as u8 + 10).to_string(),
             };
 
@@ -464,8 +462,6 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
             let my_spk_hex_for_proof = my_spk_hex.clone();
             let mix_addr =
                 wraith_wallet_core::light::receive_address(&keystore, 1, Network::Signet).unwrap();
-            let change_addr =
-                wraith_wallet_core::light::receive_address(&keystore, 2, Network::Signet).unwrap();
 
             let client = WraithSessionClient::new(base_url, Network::Signet);
             let ghost = format!("wallet-{i}");
@@ -478,7 +474,6 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                     value_sats: SEAT_PRICE,
                     scriptpubkey_hex: my_spk_hex,
                 },
-                change_address: Some(change_addr.to_string()),
                 mix_output_address: mix_addr.to_string(),
             };
 

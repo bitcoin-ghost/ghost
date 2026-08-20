@@ -177,15 +177,12 @@ echo "fee-collection address: $FEE_ADDR"
 # so chain analysts can't link inputs→outputs by address reuse.
 declare -a INPUT_ADDRS
 declare -a MIX_OUT_ADDRS
-declare -a CHANGE_ADDRS
 for i in $(seq 0 $((N-1))); do
     addr=$(WRAITH --json light receive --index "$i" | jq -r '.LightReceive.address // .address')
     INPUT_ADDRS[$i]="$addr"
     mix=$(WRAITH --json light receive --index "$((100+i))" | jq -r '.LightReceive.address // .address')
     MIX_OUT_ADDRS[$i]="$mix"
-    chg=$(WRAITH --json light receive --index "$((200+i))" | jq -r '.LightReceive.address // .address')
-    CHANGE_ADDRS[$i]="$chg"
-    echo "participant $i: input=${INPUT_ADDRS[$i]} mix-out=${MIX_OUT_ADDRS[$i]} change=${CHANGE_ADDRS[$i]}"
+    echo "participant $i: input=${INPUT_ADDRS[$i]} mix-out=${MIX_OUT_ADDRS[$i]}"
 done
 
 # ---- wraith-coordinator -----------------------------------------------------
@@ -214,13 +211,20 @@ COORD_PID=$!
 sleep 2
 
 # ---- fund the 5 input UTXOs ------------------------------------------------
-# Each participant needs ≥ denom (100,000) + per-input
-# fee share + buffer. 200,000 sats covers everything with room to
-# spare — change goes back to the wallet.
-step "funding 5 input UTXOs at 200,000 sats each"
+# Each participant needs EXACTLY the seat price: denom (100,000) + their
+# mining-fee share + their service-fee share. Rounds have no change output
+# (#698), so an over-funded UTXO is refused — fund to the satoshi.
+# The coordinator publishes the figure as `mix_seat_price_sats` in
+# /api/v1/pool/discover; 101,596 is that value for the 100k tier.
+SEAT_PRICE=$(curl -s "http://127.0.0.1:9100/api/v1/pool/discover" \
+    | jq -r '[.tiers[] | select(.id == "100k_sats")][0].mix_seat_price_sats')
+[ -n "$SEAT_PRICE" ] && [ "$SEAT_PRICE" != "null" ] \
+    || { echo "coordinator did not publish mix_seat_price_sats"; exit 1; }
+SEAT_PRICE_BTC=$(awk -v s="$SEAT_PRICE" 'BEGIN { printf "%.8f", s / 100000000 }')
+step "funding 5 input UTXOs at exactly $SEAT_PRICE sats each"
 declare -a FUND_TXIDS
 for i in $(seq 0 $((N-1))); do
-    txid=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" 0.002)
+    txid=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" "$SEAT_PRICE_BTC")
     FUND_TXIDS[$i]="$txid"
     echo "  participant $i funded: $txid"
 done
@@ -266,9 +270,8 @@ for i in $(seq 0 $((N-1))); do
             --tier 100k_sats \
             --ghost-id "participant_$i" \
             --utxo "${FUND_TXIDS[$i]}:${UTXO_VOUTS[$i]}" \
-            --utxo-value 200000 \
+            --utxo-value "$SEAT_PRICE" \
             --utxo-scriptpubkey "${UTXO_SPKS[$i]}" \
-            --change-address "${CHANGE_ADDRS[$i]}" \
             --mix-output-address "${MIX_OUT_ADDRS[$i]}" \
             --bip86-index "$i" \
             > "$DATADIR/mix-$i.out" 2>&1

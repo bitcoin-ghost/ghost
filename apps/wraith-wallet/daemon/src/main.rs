@@ -3858,7 +3858,6 @@ mod server {
                 utxo_vout,
                 utxo_value_sats,
                 utxo_scriptpubkey_hex,
-                change_address,
                 mix_output_address,
             } => {
                 use wraith_wallet_core::wraith::{
@@ -3905,7 +3904,6 @@ mod server {
                         value_sats: utxo_value_sats,
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
-                    change_address,
                     mix_output_address,
                 };
                 // Prove control of the input UTXO. The coordinator checks
@@ -4046,6 +4044,8 @@ mod server {
                                     min_participants: t.min_participants,
                                     max_participants: t.max_participants,
                                     service_fee_sats: t.service_fee_sats,
+                                    mix_seat_price_sats: t.mix_seat_price_sats,
+                                    jump_seat_price_sats: t.jump_seat_price_sats,
                                 })
                                 .collect(),
                         })
@@ -4091,7 +4091,6 @@ mod server {
                 utxo_vout,
                 utxo_value_sats,
                 utxo_scriptpubkey_hex,
-                change_address,
                 mix_output_address,
                 bip86_index,
                 bip86_scan_max,
@@ -4143,7 +4142,6 @@ mod server {
                         value_sats: utxo_value_sats,
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
-                    change_address,
                     mix_output_address,
                 };
                 // Prove control of the input UTXO. The coordinator checks

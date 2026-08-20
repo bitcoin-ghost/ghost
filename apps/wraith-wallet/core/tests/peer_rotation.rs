@@ -77,7 +77,6 @@ fn fixture_request() -> MixRequest {
             value_sats: 200_000,
             scriptpubkey_hex: "deadbeef".into(),
         },
-        change_address: Some(signet_addr_for(50)),
         mix_output_address: signet_addr_for(1),
     }
 }
@@ -192,7 +191,9 @@ fn canonical_discover_body() -> serde_json::Value {
                 "denomination_sats": 100000,
                 "min_participants": 5,
                 "max_participants": 20,
-                "service_fee_sats": 250
+                "service_fee_sats": 250,
+                "mix_seat_price_sats": 101596,
+                "jump_seat_price_sats": 101010
             }
         ]
     })

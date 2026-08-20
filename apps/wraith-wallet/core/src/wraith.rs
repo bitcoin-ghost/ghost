@@ -82,9 +82,9 @@ pub struct ParticipantUtxo {
     pub txid: String,
     pub vout: u32,
     pub value_sats: u64,
-    /// Hex-encoded scriptPubKey of the spending output. Coordinator
-    /// trusts the wallet here; bitcoind/mempool acceptance enforces
-    /// correctness at broadcast time.
+    /// Hex-encoded scriptPubKey of the spending output. Checked against
+    /// the chain at registration (#699), so it must match what the UTXO
+    /// really pays to.
     pub scriptpubkey_hex: String,
 }
 
@@ -96,9 +96,6 @@ pub struct MixRequest {
     pub tier_id: String,
     pub ghost_id: String,
     pub utxo: ParticipantUtxo,
-    /// Optional change address. Required when input.value_sats
-    /// exceeds (denom + per-participant fee shares) by ≥ dust.
-    pub change_address: Option<String>,
     /// Wallet's destination address for its mixed (denom-sized)
     /// output. Must NOT be linkable to the wallet's input UTXO —
     /// fresh address recommended.
@@ -125,6 +122,12 @@ pub struct DiscoverTier {
     pub min_participants: u32,
     pub max_participants: u32,
     pub service_fee_sats: u64,
+    /// What a Mix seat costs, to the satoshi. A round has no change output
+    /// (#698), so registration demands exactly this — the wallet splits a
+    /// coin to match rather than deriving the figure itself.
+    pub mix_seat_price_sats: u64,
+    /// The same for a Jump round, which builds no fee output.
+    pub jump_seat_price_sats: u64,
 }
 
 /// The full `/api/v1/pool/discover` payload. Returned by
@@ -422,7 +425,6 @@ impl WraithSessionClient {
                         "value_sats": request.utxo.value_sats,
                         "scriptpubkey_hex": request.utxo.scriptpubkey_hex,
                     },
-                    "change_address": request.change_address,
                     "ownership_proof": ownership_proof,
                 }),
             )

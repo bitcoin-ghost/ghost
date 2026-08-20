@@ -432,8 +432,6 @@ pub enum Request {
         utxo_vout: u32,
         utxo_value_sats: u64,
         utxo_scriptpubkey_hex: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        change_address: Option<String>,
         mix_output_address: String,
     },
     /// Phase 5b companion to [`Request::WraithMixPrepare`]. Submits
@@ -489,8 +487,6 @@ pub enum Request {
         utxo_vout: u32,
         utxo_value_sats: u64,
         utxo_scriptpubkey_hex: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        change_address: Option<String>,
         mix_output_address: String,
         /// Optional BIP86 derivation index. When `None`, daemon
         /// scans 0..bip86_scan_max for an address whose
@@ -727,6 +723,11 @@ pub struct WraithDiscoverTier {
     pub min_participants: u32,
     pub max_participants: u32,
     pub service_fee_sats: u64,
+    /// Exact cost of a Mix seat. Rounds have no change output (#698), so
+    /// the wallet splits a coin to match this rather than approximating.
+    pub mix_seat_price_sats: u64,
+    /// Exact cost of a Jump seat (no fee output, so no service share).
+    pub jump_seat_price_sats: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

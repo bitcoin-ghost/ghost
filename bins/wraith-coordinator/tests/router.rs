@@ -281,6 +281,18 @@ async fn discover_endpoint_returns_full_tier_table() {
     assert_eq!(json["service_fee_bps"], 50);
     assert_eq!(json["fill_window_secs"], 300);
 
+    // The seat price the wallet must split its coin to match. Published so
+    // the wallet does not compute it independently — the coordinator and
+    // the round builder each doing that already disagreed once (#698).
+    let smallest_tier = json["tiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "100k_sats")
+        .expect("100k tier");
+    assert_eq!(smallest_tier["mix_seat_price_sats"], EXACT_INPUT_100K_MIX);
+    assert_eq!(smallest_tier["jump_seat_price_sats"], 101_010);
+
     let tiers = json["tiers"].as_array().expect("tiers must be an array");
     assert_eq!(tiers.len(), 4, "all four Lite tiers advertised");
 

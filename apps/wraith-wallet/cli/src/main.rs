@@ -122,11 +122,6 @@ enum MixCommand {
         /// UTXO scriptPubKey, hex-encoded.
         #[arg(long)]
         utxo_scriptpubkey: String,
-        /// Wallet-controlled change address. Required when the
-        /// input value exceeds (denom + per-participant fee shares)
-        /// by more than dust.
-        #[arg(long)]
-        change_address: Option<String>,
         /// Anonymous destination for the wallet's denom-sized
         /// mixed output. Should NOT be linkable to the input.
         #[arg(long)]
@@ -180,8 +175,6 @@ enum MixCommand {
         utxo_value: u64,
         #[arg(long)]
         utxo_scriptpubkey: String,
-        #[arg(long)]
-        change_address: Option<String>,
         #[arg(long)]
         mix_output_address: String,
         /// BIP86 derivation index of the wallet key that owns the
@@ -356,10 +349,6 @@ enum LocksCommand {
         /// UTXO scriptPubKey, hex.
         #[arg(long)]
         utxo_scriptpubkey: String,
-        /// Change address — required when input value exceeds
-        /// (denom + per-participant fee shares) by ≥ dust.
-        #[arg(long)]
-        change_address: Option<String>,
         /// Optional BIP86 derivation index of the wallet key that
         /// owns the input UTXO. None → daemon scans 0..1024.
         #[arg(long)]
@@ -541,7 +530,6 @@ mod client {
                         utxo,
                         utxo_value,
                         utxo_scriptpubkey,
-                        change_address,
                         bip86_index,
                     },
             } = command
@@ -556,7 +544,6 @@ mod client {
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
-                    change_address,
                     bip86_index,
                 )
                 .await;
@@ -716,7 +703,6 @@ mod client {
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
-                    change_address,
                     mix_output_address,
                 } => {
                     let (txid, vout) = match parse_outpoint(&utxo) {
@@ -738,7 +724,6 @@ mod client {
                         utxo_vout: vout,
                         utxo_value_sats: utxo_value,
                         utxo_scriptpubkey_hex: utxo_scriptpubkey,
-                        change_address,
                         mix_output_address,
                     }
                 }
@@ -765,7 +750,6 @@ mod client {
                     utxo,
                     utxo_value,
                     utxo_scriptpubkey,
-                    change_address,
                     mix_output_address,
                     bip86_index,
                     bip86_scan_max,
@@ -789,7 +773,6 @@ mod client {
                         utxo_vout: vout,
                         utxo_value_sats: utxo_value,
                         utxo_scriptpubkey_hex: utxo_scriptpubkey,
-                        change_address,
                         mix_output_address,
                         bip86_index,
                         bip86_scan_max,
@@ -1717,7 +1700,6 @@ mod client {
         utxo: String,
         utxo_value: u64,
         utxo_scriptpubkey: String,
-        change_address: Option<String>,
         bip86_index: Option<u32>,
     ) -> std::process::ExitCode {
         let (txid, vout) = match parse_outpoint(&utxo) {
@@ -1763,7 +1745,6 @@ mod client {
             utxo_vout: vout,
             utxo_value_sats: utxo_value,
             utxo_scriptpubkey_hex: utxo_scriptpubkey,
-            change_address,
             mix_output_address: prep.funding_address.clone(),
             bip86_index,
             bip86_scan_max: None,

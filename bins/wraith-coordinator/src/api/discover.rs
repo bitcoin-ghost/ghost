@@ -15,7 +15,10 @@ use std::sync::Arc;
 use axum::{extract::State, Json};
 use serde::Serialize;
 
-use wraith_protocol::{LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS};
+use wraith_protocol::{
+    per_participant_mining_share, LiteTier, SessionType, DEFAULT_FEE_RATE_SATS_PER_VB,
+    LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS,
+};
 
 use crate::state::CoordinatorState;
 
@@ -51,6 +54,30 @@ pub struct TierDescriptor {
     pub min_participants: u32,
     pub max_participants: u32,
     pub service_fee_sats: u64,
+    /// What a seat in a **Mix** round costs, to the satoshi: denomination
+    /// + mining-fee share + service-fee share.
+    ///
+    /// Published rather than left for the wallet to derive, because a
+    /// round has no change output (#698) and so registration demands this
+    /// exact value — and a wallet computing it independently is a fourth
+    /// copy of a calculation that has already disagreed with itself once.
+    /// The wallet splits its coin to match this number.
+    pub mix_seat_price_sats: u64,
+    /// The same for a **Jump** round, which builds no fee output and so
+    /// costs the service fee less.
+    pub jump_seat_price_sats: u64,
+}
+
+/// The exact input a seat costs. Derived from the same function the
+/// coordinator enforces with and the round builder builds with, so the
+/// three cannot drift apart.
+fn seat_price(tier: LiteTier, session_type: SessionType) -> u64 {
+    tier.denomination_sats()
+        + per_participant_mining_share(tier, session_type, DEFAULT_FEE_RATE_SATS_PER_VB)
+        + match session_type {
+            SessionType::Mix => tier.service_fee_sats(),
+            SessionType::Jump => 0,
+        }
 }
 
 pub async fn get(State(state): State<Arc<CoordinatorState>>) -> Json<DiscoverResponse> {
@@ -63,6 +90,8 @@ pub async fn get(State(state): State<Arc<CoordinatorState>>) -> Json<DiscoverRes
             min_participants: t.min_participants() as u32,
             max_participants: t.max_participants() as u32,
             service_fee_sats: t.service_fee_sats(),
+            mix_seat_price_sats: seat_price(t, SessionType::Mix),
+            jump_seat_price_sats: seat_price(t, SessionType::Jump),
         })
         .collect();
     Json(DiscoverResponse {

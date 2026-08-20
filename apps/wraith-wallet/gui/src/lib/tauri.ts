@@ -618,6 +618,8 @@ export interface WraithDiscoverTier {
   min_participants: number;
   max_participants: number;
   service_fee_sats: number;
+  mix_seat_price_sats: number;
+  jump_seat_price_sats: number;
 }
 
 export interface WraithDiscoverResult {
@@ -682,7 +684,6 @@ export interface WraithMixRunArgs {
   utxo_vout: number;
   utxo_value_sats: number;
   utxo_scriptpubkey_hex: string;
-  change_address?: string;
   mix_output_address: string;
   bip86_index?: number;
   bip86_scan_max?: number;
@@ -704,7 +705,6 @@ export async function wraithMixRun(
     utxoVout: args.utxo_vout,
     utxoValueSats: args.utxo_value_sats,
     utxoScriptpubkeyHex: args.utxo_scriptpubkey_hex,
-    changeAddress: args.change_address,
     mixOutputAddress: args.mix_output_address,
     bip86Index: args.bip86_index,
     bip86ScanMax: args.bip86_scan_max,

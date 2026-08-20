@@ -83,7 +83,6 @@ export function Mix({ activeWallet }: MixProps) {
   const [utxoScript, setUtxoScript] = useState("");
   const [bip86Index, setBip86Index] = useState("");
   const [mixOutAddr, setMixOutAddr] = useState("");
-  const [changeAddr, setChangeAddr] = useState("");
 
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -204,10 +203,8 @@ export function Mix({ activeWallet }: MixProps) {
         if (!alive) return;
         setGhostId(id.ghost_id);
         const mix = await lightReceive(90);
-        const change = await lightReceive(91);
         if (!alive) return;
         if (!mixOutAddr) setMixOutAddr(mix.address);
-        if (!changeAddr) setChangeAddr(change.address);
       } catch (e) {
         if (!alive) return;
         setErr((e as Error).message ?? String(e));
@@ -315,7 +312,6 @@ export function Mix({ activeWallet }: MixProps) {
         utxo_vout: vout,
         utxo_value_sats: value,
         utxo_scriptpubkey_hex: utxoScript.trim(),
-        change_address: changeAddr.trim() || undefined,
         mix_output_address: mixOutAddr.trim(),
         bip86_index: idx,
       });
@@ -650,10 +646,6 @@ export function Mix({ activeWallet }: MixProps) {
           <div className="v mono" style={{ fontSize: 12, wordBreak: "break-all" }}>
             {mixOutAddr || "—"}
           </div>
-          <div className="k">Change</div>
-          <div className="v mono" style={{ fontSize: 12, wordBreak: "break-all" }}>
-            {changeAddr || "—"}
-          </div>
         </div>
       </div>
 
@@ -751,15 +743,6 @@ export function Mix({ activeWallet }: MixProps) {
             className="mono"
             value={mixOutAddr}
             onChange={(e) => setMixOutAddr(e.target.value)}
-            disabled={busy}
-          />
-        </div>
-        <div className="col">
-          <label>Change address (override)</label>
-          <input
-            className="mono"
-            value={changeAddr}
-            onChange={(e) => setChangeAddr(e.target.value)}
             disabled={busy}
           />
         </div>
