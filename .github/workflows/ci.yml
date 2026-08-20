@@ -97,14 +97,22 @@ jobs:
       # warnings in its own code, so anything new is a regression introduced by the change
       # under review — which is the only moment it is cheap to fix.
       #
-      # The six `-A` entries are pre-existing style choices, not new exemptions.
+      # The `-A` entries are pre-existing style choices, not new exemptions.
+      #
+      # `result_large_err` was added by the rust 1.98 toolchain bump and fires 21 times in
+      # `bins/translator-sv2`, whose `TproxyError` is "at least 128 bytes" — exactly the default
+      # threshold. Nothing regressed: the error type is unchanged and the lint is new. It is
+      # allowed rather than fixed because that crate is SRI-derived, so boxing 21 signatures
+      # buys a divergence from upstream to satisfy a lint about a 128-byte error on paths that
+      # are not hot. ⚠ It is a real (if small) cost — every `TproxyResult` is that wide — so if
+      # translator-sv2 is ever brought fully in-house, box the error and drop this line.
       #
       # One warning remains and is deliberately NOT covered: cargo reports that
       # proc-macro-error2 v2.0.1 contains code a future rustc will reject. It arrives via
       # ghost-cli -> tabled 0.20 -> tabled_derive, 2.0.1 is the latest published version, and
       # it is a cargo future-incompat NOTE rather than a rustc lint — so it does not fail this
       # gate and cannot be fixed here. It needs tabled to drop the dependency upstream.
-      - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next
+      - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next -A clippy::result_large_err
       # A message type nothing dispatches is wiring that does not exist.
       - run: ./scripts/check-wiring.sh
 
