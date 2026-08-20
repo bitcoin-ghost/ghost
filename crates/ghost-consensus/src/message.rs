@@ -86,6 +86,12 @@ pub mod topics {
     pub const MESH_NODE_LIST_VOTE: &[u8] = b"mnlvote";
     /// Mesh node-list checkpoint sync (on-demand backfill of missed checkpoints)
     pub const MESH_NODE_LIST_SYNC: &[u8] = b"mnlsync";
+    /// A node's own signed endpoint advert, feeding the node-list checkpoint.
+    ///
+    /// `mnladv` shares no prefix relation with `mnlchk`/`mnlvote`/`mnlsync` — they diverge at
+    /// the fourth byte — which matters because ZMQ subscriptions match by PREFIX, so a topic
+    /// that extended an existing one would be silently delivered to its subscribers too.
+    pub const MESH_ENDPOINT_ADVERT: &[u8] = b"mnladv";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -317,6 +323,13 @@ pub enum MessageType {
     MeshNodeListCheckpointVote,
     /// Mesh node-list checkpoint sync request/response (node ↔ peer): on-demand backfill.
     MeshNodeListCheckpointSync,
+    /// A node's own signed endpoint advert (node → all): where miners reach it.
+    ///
+    /// Broadcast rather than requested, and self-signed rather than observed, because the
+    /// checkpoint's whole determinism rests on every node holding the SAME bytes for a peer's
+    /// endpoint. An address learned by observation differs per observer, which is what made
+    /// the node list unable to converge (#625).
+    MeshEndpointAdvertisement,
     /// Share shard: a node's signed epoch summary (node → all).
     ///
     /// Carries an `EpochSummary` — per-address `delta_micro` (evidenced by the epoch's Merkle
@@ -393,6 +406,7 @@ impl MessageType {
             Self::MeshNodeListCheckpoint => topics::MESH_NODE_LIST_CHECKPOINT,
             Self::MeshNodeListCheckpointVote => topics::MESH_NODE_LIST_VOTE,
             Self::MeshNodeListCheckpointSync => topics::MESH_NODE_LIST_SYNC,
+            Self::MeshEndpointAdvertisement => topics::MESH_ENDPOINT_ADVERT,
             Self::ShardEpochSummary => topics::SHARD_EPOCH_SUMMARY,
             Self::ShardTableSync => topics::SHARD_TABLE_SYNC,
             Self::ShardEvidence => topics::SHARD_EVIDENCE,
@@ -438,6 +452,7 @@ impl MessageType {
             Self::MeshNodeListCheckpoint => "mnlchk",
             Self::MeshNodeListCheckpointVote => "mnlvote",
             Self::MeshNodeListCheckpointSync => "mnlsync",
+            Self::MeshEndpointAdvertisement => "mnladv",
             Self::ShardEpochSummary => "shdsum",
             Self::ShardTableSync => "shdsync",
             Self::ShardEvidence => "shdevid",
@@ -1650,6 +1665,201 @@ pub struct MeshNodeEntry {
     pub sv2_port: u16,
 }
 
+/// A node's own signed statement of where miners reach it.
+///
+/// The endpoint is the one field in a node-list checkpoint that consensus does not already
+/// know. Membership comes from the ratified qualified set — objective, and backed by the
+/// stratum handshake challenge — but nothing on-chain records the host a miner should dial.
+/// Previously each node filled that in from its OWN peer table, which is why the list could
+/// never converge (#625: six distinct sets across seven reporters).
+///
+/// So the subject signs it. An advert is verifiable from its own bytes against `node_id`,
+/// which is the Ed25519 public key, so a voter needs no local view of the advertised node —
+/// exactly the self-proving property a `ShareProof` has. Nobody can advertise on another
+/// node's behalf, and nobody has to have met a node to agree where it lives.
+///
+/// `seq` is monotonic per node so a re-homed node supersedes its own earlier advert; ties
+/// (a node reusing a `seq`) are broken by taking the lexicographically smaller signature, so
+/// the choice is deterministic rather than arrival-ordered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshEndpointAdvert {
+    /// Subject and signer. Ed25519 public key.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub node_id: NodeId,
+    /// Public host WITHOUT a port, e.g. "203.0.113.7" or a hostname.
+    pub host: String,
+    /// Stratum V1 port (SV1 miners: Bitaxe/CGMiner).
+    pub sv1_port: u16,
+    /// Stratum V2 port.
+    pub sv2_port: u16,
+    /// Whether this node offers public mining at all. Carried rather than implied: the
+    /// proposal must cover EVERY qualified node, so a node that does not serve miners is
+    /// carried with `false` and filtered out deterministically. Selective omission by a
+    /// proposer is then detectable, because a short list fails the coverage check.
+    pub public_mining: bool,
+    /// Monotonic per node. A higher `seq` supersedes.
+    pub seq: u64,
+    /// The subject's signature over [`MeshEndpointAdvert::signing_bytes`].
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl MeshEndpointAdvert {
+    /// Domain-tagged, every variable-length field length-prefixed, so no two distinct adverts
+    /// can serialise to the same bytes by running fields together.
+    ///
+    /// The signature is NOT covered, for the obvious reason.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(64 + self.host.len());
+        v.extend_from_slice(b"MeshEndpointAdvert/v1");
+        v.extend_from_slice(&self.node_id);
+        let hb = self.host.as_bytes();
+        v.extend_from_slice(&(hb.len() as u32).to_le_bytes());
+        v.extend_from_slice(hb);
+        v.extend_from_slice(&self.sv1_port.to_le_bytes());
+        v.extend_from_slice(&self.sv2_port.to_le_bytes());
+        v.push(u8::from(self.public_mining));
+        v.extend_from_slice(&self.seq.to_le_bytes());
+        v
+    }
+
+    /// Does this advert prove itself? Signature by the subject over its own contents.
+    ///
+    /// Fail-closed on a verification error, the same sense as
+    /// `ShareProof::has_valid_bound_signature`: an error is not a valid signature.
+    pub fn is_self_signed(&self) -> bool {
+        ghost_common::identity::verify_signature(
+            &self.node_id,
+            &self.signing_bytes(),
+            &self.signature,
+        )
+        .unwrap_or(false)
+    }
+
+    /// The rendered directory entry, once membership and signature have been established.
+    pub fn to_entry(&self) -> MeshNodeEntry {
+        MeshNodeEntry {
+            node_id: self.node_id,
+            host: self.host.clone(),
+            sv1_port: self.sv1_port,
+            sv2_port: self.sv2_port,
+        }
+    }
+}
+
+/// Why a proposed node list is not the one this node would have derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshListRejection {
+    /// An advert's signature does not verify against its own `node_id`.
+    AdvertNotSelfSigned { node_id: NodeId },
+    /// Two adverts for one node with the same `seq` and the same signature.
+    DuplicateAdvert { node_id: NodeId },
+    /// The adverts do not cover a node that the ratified qualified set contains.
+    MissingAdvert { node_id: NodeId },
+    /// An advert for a node that is not in the ratified qualified set.
+    UnqualifiedAdvert { node_id: NodeId },
+    /// An advertised host is empty, so there is nothing for a miner to dial.
+    EmptyHost { node_id: NodeId },
+}
+
+/// Derive the canonical node list from the ratified qualified set and the carried adverts.
+///
+/// **One spelling, two callers.** The proposer builds a checkpoint with this and a voter
+/// re-derives with it; a second spelling is how a proposer and its verifier drift apart, and
+/// here the disagreement would be permanent rather than transient — an exact-set consensus
+/// that never converges produces no checkpoint at all, silently (#625).
+///
+/// The result is a pure function of `qualified` and `adverts`. It reads no clock, no peer
+/// table and no database, which is the whole point: the previous derivation consulted a
+/// 120-second liveness window and produced six distinct sets across seven nodes.
+///
+/// Liveness is not lost by removing that window. Membership comes from the qualified set,
+/// and qualification already requires an independent challenger to complete a stratum
+/// handshake against the node (`STRATUM_HANDSHAKE_PROOF`), ratified by consensus. That is a
+/// stronger liveness signal than "some peer had a socket open recently", and unlike the
+/// window it is the same for everyone.
+pub fn derive_mesh_node_list(
+    qualified: &[NodeId],
+    adverts: &[MeshEndpointAdvert],
+) -> Result<Vec<MeshNodeEntry>, MeshListRejection> {
+    use std::collections::BTreeMap;
+
+    let qualified_set: std::collections::BTreeSet<NodeId> = qualified.iter().copied().collect();
+
+    // Signature first: it is cheap, and an advert nobody signed should not reach the
+    // membership checks at all.
+    let mut best: BTreeMap<NodeId, &MeshEndpointAdvert> = BTreeMap::new();
+    for a in adverts {
+        if !a.is_self_signed() {
+            return Err(MeshListRejection::AdvertNotSelfSigned { node_id: a.node_id });
+        }
+        if a.host.is_empty() {
+            return Err(MeshListRejection::EmptyHost { node_id: a.node_id });
+        }
+        if !qualified_set.contains(&a.node_id) {
+            return Err(MeshListRejection::UnqualifiedAdvert { node_id: a.node_id });
+        }
+        match best.get(&a.node_id) {
+            None => {
+                best.insert(a.node_id, a);
+            }
+            Some(prev) => {
+                // Higher `seq` wins. On an equal `seq` the smaller signature wins, so a node
+                // that reuses a `seq` cannot make the outcome depend on arrival order — an
+                // identical duplicate is a genuine error rather than a tie.
+                if a.seq > prev.seq {
+                    best.insert(a.node_id, a);
+                } else if a.seq == prev.seq {
+                    match a.signature.cmp(&prev.signature) {
+                        std::cmp::Ordering::Less => {
+                            best.insert(a.node_id, a);
+                        }
+                        std::cmp::Ordering::Equal => {
+                            return Err(MeshListRejection::DuplicateAdvert { node_id: a.node_id })
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Coverage must be TOTAL. Without this a proposer could omit a node it dislikes and the
+    // shorter list would still be internally consistent.
+    for id in &qualified_set {
+        if !best.contains_key(id) {
+            return Err(MeshListRejection::MissingAdvert { node_id: *id });
+        }
+    }
+
+    // `best` is a BTreeMap, so this is already ordered by node_id.
+    Ok(best
+        .values()
+        .filter(|a| a.public_mining)
+        .map(|a| a.to_entry())
+        .collect())
+}
+
+/// Canonical root over the ADVERTS a checkpoint adopts.
+///
+/// Distinct from [`mesh_node_list_root`], which roots the rendered entries a shim consumes.
+/// Both are committed: the entry root is what a miner acts on, the advert root is what makes
+/// the entries attributable, and binding only the former would let a proposer swap in an
+/// unsigned host.
+pub fn mesh_advert_set_root(adverts: &[MeshEndpointAdvert]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&MeshEndpointAdvert> = adverts.iter().collect();
+    sorted.sort_by_key(|a| a.node_id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"MeshAdvertSet/v1");
+    hasher.update((sorted.len() as u32).to_le_bytes());
+    for a in sorted {
+        hasher.update(a.signing_bytes());
+        hasher.update(a.signature);
+    }
+    hasher.finalize().into()
+}
+
 /// Canonical Merkle-free root over a node list: sort by `node_id`, then hash each
 /// entry length-prefixed. Every node derives the byte-identical root from the same
 /// set, so `list_root` binds the list inside `checkpoint_hash`.
@@ -1709,11 +1919,23 @@ pub struct MeshNodeListCheckpointMessage {
     pub height: u64,
     /// Cutoff = the anchor block's timestamp (deterministic, chain-committed).
     pub cutoff_ts: i64,
-    /// The canonical public-mining node set as of `cutoff_ts`. Voters recompute
-    /// their own connected public-mining set and approve iff it matches; adopted
-    /// verbatim on finalise.
+    /// The canonical public-mining node set as of `cutoff_ts` — the RENDERED entries a
+    /// shim acts on, derived from `adverts` by keeping those with `public_mining`.
     #[serde(default)]
     pub nodes: Vec<MeshNodeEntry>,
+    /// One self-signed advert for EVERY node in the qualified set at `cutoff_ts`, including
+    /// those not offering public mining (carried with `public_mining = false`).
+    ///
+    /// Coverage is total on purpose. It makes `nodes` a pure function of the ratified
+    /// qualified set plus these bytes, so a voter re-derives it without consulting any local
+    /// view — and a proposer that drops a node it dislikes produces a list that fails the
+    /// coverage check rather than one that merely looks smaller.
+    #[serde(default)]
+    pub adverts: Vec<MeshEndpointAdvert>,
+    /// `mesh_advert_set_root(adverts)` — binds the signed endpoints inside `checkpoint_hash`,
+    /// so the rendered `nodes` cannot be swapped for hosts nobody signed.
+    #[serde(with = "ghost_common::serde_hex::bytes32", default)]
+    pub advert_root: [u8; 32],
     /// `mesh_node_list_root(nodes)` — binds the list inside `checkpoint_hash`.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub list_root: [u8; 32],
@@ -1743,10 +1965,15 @@ impl MeshNodeListCheckpointMessage {
     pub fn checkpoint_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"MeshNodeListCheckpoint/v1");
+        // v2: `advert_root` joined the commitment when the node set moved from each node's
+        // local liveness view to the ratified qualified set plus signed endpoints (#625).
+        // Bumped freely: the gate is `u64::MAX` and no checkpoint has ever finalised, so
+        // there is no chain of prior hashes to stay compatible with.
+        hasher.update(b"MeshNodeListCheckpoint/v2");
         hasher.update(self.height.to_le_bytes());
         hasher.update(self.cutoff_ts.to_le_bytes());
         hasher.update(self.list_root);
+        hasher.update(self.advert_root);
         hasher.update(self.signer_set_root);
         hasher.update(self.active_node_count.to_le_bytes());
         hasher.update(self.proposer);
@@ -1801,6 +2028,15 @@ pub struct MeshNodeListCheckpointSyncEntry {
     /// Canonical public-mining node set as of `cutoff_ts`.
     #[serde(default)]
     pub nodes: Vec<MeshNodeEntry>,
+    /// The self-signed adverts the checkpoint adopted. Carried through sync so a lagging peer
+    /// — or a shim — re-derives and re-verifies rather than trusting the serving node's
+    /// rendering of `nodes`.
+    #[serde(default)]
+    pub adverts: Vec<MeshEndpointAdvert>,
+    /// `mesh_advert_set_root(adverts)`. Part of `checkpoint_hash`, so it must survive sync or
+    /// the proposer signature cannot be reconstructed.
+    #[serde(with = "ghost_common::serde_hex::bytes32", default)]
+    pub advert_root: [u8; 32],
     /// `mesh_node_list_root(nodes)`.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub list_root: [u8; 32],
@@ -2355,6 +2591,177 @@ impl ShardSampleResponseMessage {
 
 #[cfg(test)]
 mod tests {
+    // ── Deterministic node-list derivation (#625) ────────────────────────────────────────
+
+    fn advert_for(
+        id: &ghost_common::identity::NodeIdentity,
+        host: &str,
+        public_mining: bool,
+        seq: u64,
+    ) -> MeshEndpointAdvert {
+        let mut a = MeshEndpointAdvert {
+            node_id: id.node_id(),
+            host: host.to_string(),
+            sv1_port: 3333,
+            sv2_port: 34255,
+            public_mining,
+            seq,
+            signature: [0u8; 64],
+        };
+        a.signature = id.sign(&a.signing_bytes());
+        a
+    }
+
+    /// THE property #625 is about. Three nodes deriving from the same ratified set and the
+    /// same adverts must reach the same list — whatever order those adverts arrived in.
+    ///
+    /// The old derivation could not satisfy this: it read a 120-second liveness window, so
+    /// the answer depended on who each node happened to be talking to.
+    #[test]
+    fn the_list_is_identical_whatever_order_the_adverts_arrive_in() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let c = ghost_common::identity::NodeIdentity::generate();
+        let qualified = {
+            let mut q = vec![a.node_id(), b.node_id(), c.node_id()];
+            q.sort_unstable();
+            q
+        };
+        let forwards = vec![
+            advert_for(&a, "203.0.113.1", true, 1),
+            advert_for(&b, "203.0.113.2", true, 1),
+            advert_for(&c, "203.0.113.3", true, 1),
+        ];
+        let mut backwards = forwards.clone();
+        backwards.reverse();
+
+        let l1 = derive_mesh_node_list(&qualified, &forwards).expect("forwards");
+        let l2 = derive_mesh_node_list(&qualified, &backwards).expect("backwards");
+        assert_eq!(l1, l2);
+        assert_eq!(mesh_node_list_root(&l1), mesh_node_list_root(&l2));
+        assert_eq!(l1.len(), 3);
+    }
+
+    /// A node that does not serve miners is carried, not omitted, and filtered out here.
+    /// Carrying it is what makes the coverage check meaningful.
+    #[test]
+    fn a_node_that_does_not_offer_mining_is_carried_but_not_listed() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let mut qualified = vec![a.node_id(), b.node_id()];
+        qualified.sort_unstable();
+        let adverts = vec![
+            advert_for(&a, "203.0.113.1", true, 1),
+            advert_for(&b, "203.0.113.2", false, 1),
+        ];
+        let list = derive_mesh_node_list(&qualified, &adverts).expect("derives");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].node_id, a.node_id());
+    }
+
+    /// Selective omission must be a REJECTION, not a shorter list. Otherwise a proposer can
+    /// quietly drop a competitor and still produce something internally consistent.
+    #[test]
+    fn omitting_a_qualified_node_is_rejected_rather_than_shortening_the_list() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let mut qualified = vec![a.node_id(), b.node_id()];
+        qualified.sort_unstable();
+        let only_a = vec![advert_for(&a, "203.0.113.1", true, 1)];
+        assert_eq!(
+            derive_mesh_node_list(&qualified, &only_a),
+            Err(MeshListRejection::MissingAdvert {
+                node_id: b.node_id()
+            })
+        );
+    }
+
+    /// Nobody may advertise on another node's behalf. This is the property that lets a voter
+    /// accept an endpoint for a node it has never met.
+    #[test]
+    fn an_advert_signed_by_the_wrong_node_is_refused() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let impostor = ghost_common::identity::NodeIdentity::generate();
+        let qualified = vec![a.node_id()];
+
+        // Same claimed subject, signed by somebody else.
+        let mut forged = advert_for(&a, "evil.example", true, 1);
+        forged.signature = impostor.sign(&forged.signing_bytes());
+        assert_eq!(
+            derive_mesh_node_list(&qualified, &[forged]),
+            Err(MeshListRejection::AdvertNotSelfSigned {
+                node_id: a.node_id()
+            })
+        );
+    }
+
+    /// Rewriting the host after signing must invalidate the advert, or the signature is
+    /// decorative and a proposer can redirect miners anywhere.
+    #[test]
+    fn editing_the_host_after_signing_invalidates_the_advert() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let mut tampered = advert_for(&a, "203.0.113.1", true, 1);
+        tampered.host = "attacker.example".to_string();
+        assert!(!tampered.is_self_signed());
+        assert_eq!(
+            derive_mesh_node_list(&[a.node_id()], &[tampered]),
+            Err(MeshListRejection::AdvertNotSelfSigned {
+                node_id: a.node_id()
+            })
+        );
+    }
+
+    /// A re-homed node supersedes its own earlier advert by `seq`, and the outcome must not
+    /// depend on which one arrived first.
+    #[test]
+    fn a_higher_seq_supersedes_regardless_of_order() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let old = advert_for(&a, "203.0.113.1", true, 1);
+        let new = advert_for(&a, "203.0.113.9", true, 2);
+        let q = vec![a.node_id()];
+        let f = derive_mesh_node_list(&q, &[old.clone(), new.clone()]).expect("f");
+        let b = derive_mesh_node_list(&q, &[new, old]).expect("b");
+        assert_eq!(f, b);
+        assert_eq!(f[0].host, "203.0.113.9");
+    }
+
+    /// An advert for a node outside the ratified set is refused, or the qualified set stops
+    /// being what decides membership.
+    #[test]
+    fn an_advert_from_an_unqualified_node_is_refused() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let outsider = ghost_common::identity::NodeIdentity::generate();
+        let adverts = vec![
+            advert_for(&a, "203.0.113.1", true, 1),
+            advert_for(&outsider, "203.0.113.99", true, 1),
+        ];
+        assert_eq!(
+            derive_mesh_node_list(&[a.node_id()], &adverts),
+            Err(MeshListRejection::UnqualifiedAdvert {
+                node_id: outsider.node_id()
+            })
+        );
+    }
+
+    /// The advert root must cover the signatures, or two different signed endpoint sets could
+    /// share a root and the commitment would not bind what was adopted.
+    #[test]
+    fn the_advert_root_changes_when_an_endpoint_does() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let one = vec![advert_for(&a, "203.0.113.1", true, 1)];
+        let two = vec![advert_for(&a, "203.0.113.2", true, 1)];
+        assert_ne!(mesh_advert_set_root(&one), mesh_advert_set_root(&two));
+        // ...and is order-independent, like the list itself.
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let mut pair = vec![
+            advert_for(&a, "203.0.113.1", true, 1),
+            advert_for(&b, "203.0.113.2", true, 1),
+        ];
+        let root_fwd = mesh_advert_set_root(&pair);
+        pair.reverse();
+        assert_eq!(root_fwd, mesh_advert_set_root(&pair));
+    }
+
     /// `MessageType` goes on the wire as its NAME, not a positional discriminant.
     ///
     /// This is what makes removing a dead variant safe. The enum has no explicit discriminants, so
@@ -2888,6 +3295,10 @@ mod tests {
             cutoff_ts: 1_760_000_000,
             list_root: mesh_node_list_root(&nodes),
             nodes,
+            // This fixture predates signed adverts and exercises the hash/serde shape, not
+            // the derivation; the derivation has its own tests above.
+            adverts: vec![],
+            advert_root: mesh_advert_set_root(&[]),
             signer_set_delta: SignerSetDelta {
                 added: vec![[2u8; 32]],
                 removed: vec![],
@@ -2974,6 +3385,144 @@ mod tests {
         assert_eq!(back.checkpoint_hash(), cp.checkpoint_hash());
         assert_eq!(back.nodes, cp.nodes);
         assert_eq!(back.signer_set_delta, cp.signer_set_delta);
+    }
+
+    /// ZMQ subscriptions match by PREFIX, so a topic that extends another is silently
+    /// delivered to that other topic's subscribers as well — a cross-wiring with no error and
+    /// no log line.
+    ///
+    /// The `topics` module has always documented this invariant and claimed it was "pinned by
+    /// a test". It was not. `test_message_topics` asserts two topics and
+    /// `test_topic_str_matches_topic_bytes` walks six hardcoded types; neither compares topics
+    /// against each other. The rule was enforced by whoever remembered to check by hand.
+    ///
+    /// ⚠ If a new topic makes this fail, RENAME IT. Do not relax the assertion: the failure is
+    /// telling you two message streams would land in one subscriber.
+    #[test]
+    fn no_topic_is_a_prefix_of_another() {
+        let all: &[(&str, &[u8])] = &[
+            ("SHARE", topics::SHARE),
+            ("BLOCK", topics::BLOCK),
+            ("PAYOUT_PROPOSAL", topics::PAYOUT_PROPOSAL),
+            ("VOTE", topics::VOTE),
+            ("HEALTH", topics::HEALTH),
+            ("DISCOVERY", topics::DISCOVERY),
+            ("ELDER", topics::ELDER),
+            ("ZK_PROPOSAL", topics::ZK_PROPOSAL),
+            ("ZK_VOTE", topics::ZK_VOTE),
+            ("VERIFICATION", topics::VERIFICATION),
+            ("EQUIVOCATION", topics::EQUIVOCATION),
+            ("MPC", topics::MPC),
+            ("L2_TRANSFER", topics::L2_TRANSFER),
+            ("L2_CHECKPOINT", topics::L2_CHECKPOINT),
+            ("L2_VOTE", topics::L2_VOTE),
+            ("L2_SYNC", topics::L2_SYNC),
+            ("PAYOUT_LEDGER_CHECKPOINT", topics::PAYOUT_LEDGER_CHECKPOINT),
+            ("PAYOUT_LEDGER_VOTE", topics::PAYOUT_LEDGER_VOTE),
+            ("PAYOUT_LEDGER_SYNC", topics::PAYOUT_LEDGER_SYNC),
+            ("PAYOUT_PROPOSAL_SYNC", topics::PAYOUT_PROPOSAL_SYNC),
+            ("SHARE_BATCH", topics::SHARE_BATCH),
+            ("SHARE_BATCH_VOTE", topics::SHARE_BATCH_VOTE),
+            ("SHARE_BATCH_SYNC", topics::SHARE_BATCH_SYNC),
+            ("SHARE_BATCH_PREVOTE", topics::SHARE_BATCH_PREVOTE),
+            ("SHARE_BATCH_PRECOMMIT", topics::SHARE_BATCH_PRECOMMIT),
+            (
+                "MESH_NODE_LIST_CHECKPOINT",
+                topics::MESH_NODE_LIST_CHECKPOINT,
+            ),
+            ("MESH_NODE_LIST_VOTE", topics::MESH_NODE_LIST_VOTE),
+            ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
+            ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
+            ("L2_SHIELD", topics::L2_SHIELD),
+            ("GLYPH", topics::GLYPH),
+            ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
+            ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
+            ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),
+            ("SHARD_SAMPLE_REQUEST", topics::SHARD_SAMPLE_REQUEST),
+            ("SHARD_SAMPLE_RESPONSE", topics::SHARD_SAMPLE_RESPONSE),
+        ];
+
+        // The count is pinned so a new topic cannot be added without visiting this test and
+        // being confronted with the invariant.
+        assert_eq!(
+            all.len(),
+            36,
+            "a topic was added or removed — extend `all` above, then check the invariant still holds"
+        );
+
+        for (name_a, a) in all {
+            for (name_b, b) in all {
+                if name_a == name_b {
+                    continue;
+                }
+                assert!(
+                    !b.starts_with(a),
+                    "topic {} ({}) is a prefix of {} ({}) — ZMQ would deliver {} to {} subscribers",
+                    name_a,
+                    String::from_utf8_lossy(a),
+                    name_b,
+                    String::from_utf8_lossy(b),
+                    name_b,
+                    name_a
+                );
+            }
+        }
+    }
+
+    /// Two message types sharing one topic is legitimate (the glyph pair does it), but two
+    /// DIFFERENT topics with identical bytes would make `validate_topic` ambiguous.
+    #[test]
+    fn no_two_distinct_topics_share_bytes() {
+        let all: &[(&str, &[u8])] = &[
+            ("SHARE", topics::SHARE),
+            ("BLOCK", topics::BLOCK),
+            ("PAYOUT_PROPOSAL", topics::PAYOUT_PROPOSAL),
+            ("VOTE", topics::VOTE),
+            ("HEALTH", topics::HEALTH),
+            ("DISCOVERY", topics::DISCOVERY),
+            ("ELDER", topics::ELDER),
+            ("ZK_PROPOSAL", topics::ZK_PROPOSAL),
+            ("ZK_VOTE", topics::ZK_VOTE),
+            ("VERIFICATION", topics::VERIFICATION),
+            ("EQUIVOCATION", topics::EQUIVOCATION),
+            ("MPC", topics::MPC),
+            ("L2_TRANSFER", topics::L2_TRANSFER),
+            ("L2_CHECKPOINT", topics::L2_CHECKPOINT),
+            ("L2_VOTE", topics::L2_VOTE),
+            ("L2_SYNC", topics::L2_SYNC),
+            ("PAYOUT_LEDGER_CHECKPOINT", topics::PAYOUT_LEDGER_CHECKPOINT),
+            ("PAYOUT_LEDGER_VOTE", topics::PAYOUT_LEDGER_VOTE),
+            ("PAYOUT_LEDGER_SYNC", topics::PAYOUT_LEDGER_SYNC),
+            ("PAYOUT_PROPOSAL_SYNC", topics::PAYOUT_PROPOSAL_SYNC),
+            ("SHARE_BATCH", topics::SHARE_BATCH),
+            ("SHARE_BATCH_VOTE", topics::SHARE_BATCH_VOTE),
+            ("SHARE_BATCH_SYNC", topics::SHARE_BATCH_SYNC),
+            ("SHARE_BATCH_PREVOTE", topics::SHARE_BATCH_PREVOTE),
+            ("SHARE_BATCH_PRECOMMIT", topics::SHARE_BATCH_PRECOMMIT),
+            (
+                "MESH_NODE_LIST_CHECKPOINT",
+                topics::MESH_NODE_LIST_CHECKPOINT,
+            ),
+            ("MESH_NODE_LIST_VOTE", topics::MESH_NODE_LIST_VOTE),
+            ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
+            ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
+            ("L2_SHIELD", topics::L2_SHIELD),
+            ("GLYPH", topics::GLYPH),
+            ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
+            ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
+            ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),
+            ("SHARD_SAMPLE_REQUEST", topics::SHARD_SAMPLE_REQUEST),
+            ("SHARD_SAMPLE_RESPONSE", topics::SHARD_SAMPLE_RESPONSE),
+        ];
+        for (i, (name_a, a)) in all.iter().enumerate() {
+            for (name_b, b) in all.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "topics {} and {} have identical bytes",
+                    name_a, name_b
+                );
+            }
+        }
     }
 
     #[test]

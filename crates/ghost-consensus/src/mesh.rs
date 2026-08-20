@@ -1831,6 +1831,11 @@ impl MeshNetwork {
             | MessageType::MeshNodeListCheckpoint
             | MessageType::MeshNodeListCheckpointVote
             | MessageType::MeshNodeListCheckpointSync
+            // The endpoint advert feeds that checkpoint's node list, so it rides the same
+            // consensus/voting port. ⚠ This arm exists TWICE — `endpoint_for_message` and
+            // `is_valid_msg_type_for_port` — and they must mirror, or a message is sent to a
+            // port that then rejects it as cross-channel injection.
+            | MessageType::MeshEndpointAdvertisement
             // The shard IS the payout ledger — who is owed what, per address. Financial data
             // defaults to Noise here for the same reason the batch chain does: a new financial
             // message that falls to plaintext is the kind of omission that never announces
@@ -2214,6 +2219,11 @@ impl MeshNetwork {
             | MessageType::MeshNodeListCheckpoint
             | MessageType::MeshNodeListCheckpointVote
             | MessageType::MeshNodeListCheckpointSync
+            // The endpoint advert feeds that checkpoint's node list, so it rides the same
+            // consensus/voting port. ⚠ This arm exists TWICE — `endpoint_for_message` and
+            // `is_valid_msg_type_for_port` — and they must mirror, or a message is sent to a
+            // port that then rejects it as cross-channel injection.
+            | MessageType::MeshEndpointAdvertisement
             // Share shard: the consensus/voting port, like the payout-ledger machinery it
             // replaces — the summaries and table decide who gets paid, and reusing the port
             // means no fleet-wide firewall change before a single summary can flow.
@@ -3305,6 +3315,11 @@ impl MeshNetwork {
             | MessageType::MeshNodeListCheckpoint
             | MessageType::MeshNodeListCheckpointVote
             | MessageType::MeshNodeListCheckpointSync
+            // The endpoint advert feeds that checkpoint's node list, so it rides the same
+            // consensus/voting port. ⚠ This arm exists TWICE — `endpoint_for_message` and
+            // `is_valid_msg_type_for_port` — and they must mirror, or a message is sent to a
+            // port that then rejects it as cross-channel injection.
+            | MessageType::MeshEndpointAdvertisement
             // Share shard rides the consensus/voting port — must mirror the endpoint match
             // above, or Noise-delivered shard messages get rejected as cross-channel injection.
             | MessageType::ShardEpochSummary
@@ -4245,6 +4260,7 @@ mod tests {
                 | MessageType::MeshNodeListCheckpoint
                 | MessageType::MeshNodeListCheckpointVote
                 | MessageType::MeshNodeListCheckpointSync
+                | MessageType::MeshEndpointAdvertisement
                 | MessageType::ShardEpochSummary
                 | MessageType::ShardTableSync
                 | MessageType::ShardEvidence

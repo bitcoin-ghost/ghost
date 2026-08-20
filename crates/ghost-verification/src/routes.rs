@@ -6141,6 +6141,14 @@ async fn api_qualification_scoped_set_handler(
         .fee_split_fn
         .as_ref()
         .and_then(|f| f(cutoff, cp.height));
+    // MESH_NODE_LIST convergence: the node-list checkpoint this node would propose, with the
+    // gate ignored. Identical `list_root` AND `advert_root` on all nodes = #402's acceptance
+    // criterion met — the check to run BEFORE arming MESH_NODE_LIST_CHECKPOINT_HEIGHT, which
+    // could not be run at all until now (#625: nothing is proposed below the gate).
+    let mesh_node_list = state
+        .mesh_node_list_fn
+        .as_ref()
+        .and_then(|f| f(cutoff, cp.height));
     Json(serde_json::json!({
         "cutoff_ts": cutoff,
         "checkpoint_height": cp.height,
@@ -6164,6 +6172,15 @@ async fn api_qualification_scoped_set_handler(
         "fee_split": {
             "hash": fee_split,
             "has_fn": state.fee_split_fn.is_some(),
+        },
+        "mesh_node_list": {
+            "listed": mesh_node_list.as_ref().map(|(c, _, _, _)| *c),
+            "list_root": mesh_node_list.as_ref().map(|(_, r, _, _)| r.clone()),
+            "advert_root": mesh_node_list.as_ref().map(|(_, _, a, _)| a.clone()),
+            // Empty = full coverage. Non-empty names who has not advertised, which is the
+            // only reason a fleet that agrees on everything else still cannot checkpoint.
+            "missing_adverts": mesh_node_list.as_ref().map(|(_, _, _, m)| m.clone()),
+            "has_fn": state.mesh_node_list_fn.is_some(),
         },
     }))
 }

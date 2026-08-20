@@ -15,8 +15,9 @@ use anyhow::{bail, Context, Result};
 use ghost_common::identity::verify_signature;
 use ghost_common::types::NodeId;
 use ghost_consensus::{
-    mesh_node_list_root, mesh_signer_set_root, MeshNodeEntry, MeshNodeListCheckpointMessage,
-    MeshNodeListCheckpointVoteMessage, SignerSetDelta,
+    mesh_advert_set_root, mesh_node_list_root, mesh_signer_set_root, MeshEndpointAdvert,
+    MeshNodeEntry, MeshNodeListCheckpointMessage, MeshNodeListCheckpointVoteMessage,
+    SignerSetDelta,
 };
 
 const BFT_THRESHOLD_PERCENT: u64 = 67;
@@ -32,6 +33,13 @@ pub(crate) struct CheckpointBlob {
     pub height: u64,
     pub cutoff_ts: i64,
     pub nodes: Vec<BlobNode>,
+    /// One self-signed advert per node in the qualified set at `cutoff_ts`.
+    #[serde(default)]
+    pub adverts: Vec<BlobAdvert>,
+    /// `mesh_advert_set_root(adverts)`. Inside `checkpoint_hash`, so the hash — and therefore
+    /// every signature over it — cannot be reconstructed without it.
+    #[serde(default)]
+    pub advert_root: String,
     pub list_root: String,
     pub signer_set_root: String,
     #[serde(default)]
@@ -41,6 +49,17 @@ pub(crate) struct CheckpointBlob {
     pub proposer_signature: String,
     #[serde(default)]
     pub approvals: Vec<BlobApproval>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct BlobAdvert {
+    pub node_id: String,
+    pub host: String,
+    pub sv1_port: u16,
+    pub sv2_port: u16,
+    pub public_mining: bool,
+    pub seq: u64,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -151,10 +170,60 @@ pub(crate) fn verify_and_advance(
         .collect::<Result<_>>()?;
     let proposer = hex32(&blob.proposer)?;
     let proposer_signature = hex64(&blob.proposer_signature)?;
+
+    // (1b) Every endpoint must be signed BY THE NODE IT POINTS AT.
+    //
+    // This is what a quorum signature alone does not give you. Without it the checkpoint says
+    // "67% of the trusted set agreed on this list" — but not that any listed node ever claimed
+    // that address, so a proposer able to reach quorum could point miners anywhere. With it,
+    // redirecting a node's traffic requires that node's own key.
+    let adverts: Vec<MeshEndpointAdvert> = blob
+        .adverts
+        .iter()
+        .map(|a| {
+            Ok(MeshEndpointAdvert {
+                node_id: hex32(&a.node_id)?,
+                host: a.host.clone(),
+                sv1_port: a.sv1_port,
+                sv2_port: a.sv2_port,
+                public_mining: a.public_mining,
+                seq: a.seq,
+                signature: hex64(&a.signature)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    for (a, raw) in adverts.iter().zip(blob.adverts.iter()) {
+        if !a.is_self_signed() {
+            bail!("advert for {} is not signed by that node", raw.node_id);
+        }
+    }
+    let advert_root = hex32(&blob.advert_root)?;
+    if mesh_advert_set_root(&adverts) != advert_root {
+        bail!("advert_root does not match the adverts");
+    }
+
+    // (1c) The rendered list must be exactly what those adverts produce. A served blob that
+    // carries valid adverts AND a different `nodes` array beside them is the obvious way to
+    // slip an unattested host past a signature check that only covers the roots.
+    let rendered: Vec<MeshNodeEntry> = {
+        let mut v: Vec<MeshNodeEntry> = adverts
+            .iter()
+            .filter(|a| a.public_mining)
+            .map(|a| a.to_entry())
+            .collect();
+        v.sort_by_key(|n| n.node_id);
+        v
+    };
+    if mesh_node_list_root(&rendered) != list_root {
+        bail!("the node list is not what its adverts derive to");
+    }
+
     let msg = MeshNodeListCheckpointMessage {
         height: blob.height,
         cutoff_ts: blob.cutoff_ts,
         nodes: entries.clone(),
+        adverts: adverts.clone(),
+        advert_root,
         list_root,
         signer_set_delta: SignerSetDelta {
             added: added.clone(),
@@ -237,13 +306,46 @@ mod tests {
     use super::*;
     use ghost_common::identity::NodeIdentity;
 
-    fn entry(id: u8, host: &str) -> MeshNodeEntry {
-        MeshNodeEntry {
-            node_id: [id; 32],
+    /// A node's own signed advert, as production builds it.
+    ///
+    /// Fixtures must sign with the SUBJECT's key now: a checkpoint whose hosts nobody attested
+    /// is exactly what `verify_and_advance` refuses, so a fixture that fabricated `node_id`
+    /// bytes would be testing a shape the shim no longer accepts.
+    fn advert(id: &NodeIdentity, host: &str, public_mining: bool) -> MeshEndpointAdvert {
+        let mut a = MeshEndpointAdvert {
+            node_id: id.node_id(),
             host: host.into(),
             sv1_port: 3333,
             sv2_port: 34255,
+            public_mining,
+            seq: 1,
+            signature: [0u8; 64],
+        };
+        a.signature = id.sign(&a.signing_bytes());
+        a
+    }
+
+    fn blob_advert(a: &MeshEndpointAdvert) -> BlobAdvert {
+        BlobAdvert {
+            node_id: hex::encode(a.node_id),
+            host: a.host.clone(),
+            sv1_port: a.sv1_port,
+            sv2_port: a.sv2_port,
+            public_mining: a.public_mining,
+            seq: a.seq,
+            signature: hex::encode(a.signature),
         }
+    }
+
+    /// The rendered list, derived the one way production derives it.
+    fn entries_from(adverts: &[MeshEndpointAdvert]) -> Vec<MeshNodeEntry> {
+        let mut v: Vec<MeshNodeEntry> = adverts
+            .iter()
+            .filter(|a| a.public_mining)
+            .map(|a| a.to_entry())
+            .collect();
+        v.sort_by_key(|n| n.node_id);
+        v
     }
 
     /// Build a valid signed blob. `signers` = identities of the PRIOR trusted set (the voters);
@@ -251,10 +353,12 @@ mod tests {
     /// `prior[height % n]`; every signer casts an approve vote.
     fn build_blob(
         signers: &[NodeIdentity],
-        nodes: &[MeshNodeEntry],
+        adverts: &[MeshEndpointAdvert],
         new_signer_set: &[NodeId],
         height: u64,
     ) -> CheckpointBlob {
+        let nodes = &entries_from(adverts);
+        let advert_root = mesh_advert_set_root(adverts);
         let mut prior: Vec<NodeId> = signers.iter().map(|i| i.node_id()).collect();
         prior.sort_unstable();
         let prior_set: HashSet<NodeId> = prior.iter().copied().collect();
@@ -271,6 +375,8 @@ mod tests {
             height,
             cutoff_ts: 1_784_000_000,
             nodes: nodes.to_vec(),
+            adverts: adverts.to_vec(),
+            advert_root,
             list_root,
             signer_set_delta: SignerSetDelta {
                 added: added.clone(),
@@ -314,6 +420,8 @@ mod tests {
                     sv2_port: e.sv2_port,
                 })
                 .collect(),
+            adverts: adverts.iter().map(blob_advert).collect(),
+            advert_root: hex::encode(advert_root),
             list_root: hex::encode(list_root),
             signer_set_root: hex::encode(signer_set_root),
             signer_set_delta: BlobDelta {
@@ -327,6 +435,39 @@ mod tests {
         }
     }
 
+    /// Two advertising nodes, each signing its own endpoint. Returned sorted by node_id so a
+    /// test can index into the derived list deterministically.
+    fn two_mining_nodes() -> (Vec<NodeIdentity>, Vec<MeshEndpointAdvert>) {
+        let mut ids: Vec<NodeIdentity> = (0..2).map(|_| NodeIdentity::generate()).collect();
+        ids.sort_by_key(|i| i.node_id());
+        let adverts = vec![
+            advert(&ids[0], "203.0.113.1", true),
+            advert(&ids[1], "203.0.113.2", true),
+        ];
+        (ids, adverts)
+    }
+
+    /// Assert the checkpoint is refused FOR THE STATED REASON.
+    ///
+    /// A bare `is_err()` is nearly worthless on this function: it has nine distinct refusal
+    /// paths, and a fixture that trips an earlier one passes a test named after a later one
+    /// while proving nothing about it. That is how a suite stays green through a regression in
+    /// exactly the check it claims to cover.
+    fn refused_because(blob: &CheckpointBlob, trusted: &[NodeId], expected: &str) {
+        let mut t = trusted.to_vec();
+        let err = verify_and_advance(blob, &mut t)
+            .expect_err("expected refusal, got acceptance")
+            .to_string();
+        assert!(
+            err.contains(expected),
+            "refused for the wrong reason:\n  expected to contain: {expected}\n  actual: {err}"
+        );
+        assert_eq!(
+            t, trusted,
+            "a refused checkpoint must not advance the trusted set"
+        );
+    }
+
     fn signer_ids(signers: &[NodeIdentity]) -> Vec<NodeId> {
         let mut v: Vec<NodeId> = signers.iter().map(|i| i.node_id()).collect();
         v.sort_unstable();
@@ -335,10 +476,13 @@ mod tests {
 
     #[test]
     fn valid_checkpoint_verifies_and_returns_nodes() {
-        let signers: Vec<NodeIdentity> = (0..4).map(|_| NodeIdentity::generate()).collect();
+        let (node_ids, adverts) = two_mining_nodes();
+        // The advertising nodes are also the signers: an advert only reaches a checkpoint if
+        // its subject is in the qualified set, which is the property that stops an outsider
+        // inserting itself into the directory.
+        let signers = node_ids;
         let trusted = signer_ids(&signers);
-        let nodes = vec![entry(200, "203.0.113.1"), entry(201, "203.0.113.2")];
-        let blob = build_blob(&signers, &nodes, &trusted, 100);
+        let blob = build_blob(&signers, &adverts, &trusted, 100);
         let mut t = trusted.clone();
         let out = verify_and_advance(&blob, &mut t).expect("valid");
         assert_eq!(out.len(), 2);
@@ -355,8 +499,9 @@ mod tests {
         let mut new_set = prior.clone();
         new_set.push(newcomer);
         new_set.sort_unstable();
-        let nodes = vec![entry(200, "h")];
-        let blob = build_blob(&signers, &nodes, &new_set, 100);
+        let node = NodeIdentity::generate();
+        let adverts = vec![advert(&node, "h", true)];
+        let blob = build_blob(&signers, &adverts, &new_set, 100);
         let mut trusted = prior.clone();
         verify_and_advance(&blob, &mut trusted).expect("valid membership change");
         assert!(
@@ -370,34 +515,36 @@ mod tests {
     fn tampered_proposer_signature_rejected() {
         let signers: Vec<NodeIdentity> = (0..4).map(|_| NodeIdentity::generate()).collect();
         let trusted = signer_ids(&signers);
-        let nodes = vec![entry(200, "h")];
-        let mut blob = build_blob(&signers, &nodes, &trusted, 100);
+        let node = NodeIdentity::generate();
+        let adverts = vec![advert(&node, "h", true)];
+        let mut blob = build_blob(&signers, &adverts, &trusted, 100);
         let mut sig = hex::decode(&blob.proposer_signature).unwrap();
         sig[0] ^= 0xff;
         blob.proposer_signature = hex::encode(sig);
-        let mut t = trusted.clone();
-        assert!(verify_and_advance(&blob, &mut t).is_err());
-        assert_eq!(t, trusted, "trusted untouched on failure");
+        // `refused_because` also asserts the trusted set is untouched.
+        refused_because(&blob, &trusted, "proposer signature invalid");
     }
 
     #[test]
     fn sub_quorum_rejected() {
         let signers: Vec<NodeIdentity> = (0..4).map(|_| NodeIdentity::generate()).collect();
         let trusted = signer_ids(&signers);
-        let nodes = vec![entry(200, "h")];
-        let mut blob = build_blob(&signers, &nodes, &trusted, 100);
+        let node = NodeIdentity::generate();
+        let adverts = vec![advert(&node, "h", true)];
+        let mut blob = build_blob(&signers, &adverts, &trusted, 100);
         blob.approvals.truncate(2); // 2 < quorum(4) = 3
-        assert!(verify_and_advance(&blob, &mut trusted.clone()).is_err());
+        refused_because(&blob, &trusted, "insufficient quorum");
     }
 
     #[test]
     fn wrong_list_root_rejected() {
         let signers: Vec<NodeIdentity> = (0..4).map(|_| NodeIdentity::generate()).collect();
         let trusted = signer_ids(&signers);
-        let nodes = vec![entry(200, "h")];
-        let mut blob = build_blob(&signers, &nodes, &trusted, 100);
+        let node = NodeIdentity::generate();
+        let adverts = vec![advert(&node, "h", true)];
+        let mut blob = build_blob(&signers, &adverts, &trusted, 100);
         blob.list_root = hex::encode([9u8; 32]);
-        assert!(verify_and_advance(&blob, &mut trusted.clone()).is_err());
+        refused_because(&blob, &trusted, "list_root does not match the node list");
     }
 
     #[test]
@@ -408,8 +555,49 @@ mod tests {
         let trusted = signer_ids(&real);
         let attackers: Vec<NodeIdentity> = (0..4).map(|_| NodeIdentity::generate()).collect();
         let atk_set = signer_ids(&attackers);
-        let nodes = vec![entry(200, "evil.example")];
-        let blob = build_blob(&attackers, &nodes, &atk_set, 100);
-        assert!(verify_and_advance(&blob, &mut trusted.clone()).is_err());
+        let node = NodeIdentity::generate();
+        let adverts = vec![advert(&node, "evil.example", true)];
+        let blob = build_blob(&attackers, &adverts, &atk_set, 100);
+        refused_because(&blob, &trusted, "proposer is not in the trusted signer set");
+    }
+    /// The refusal that did not exist before: a quorum-signed checkpoint whose hosts nobody
+    /// attested. Previously the shim verified only that ≥67% signed A list — never that any
+    /// listed node had claimed that address — so a proposer able to reach quorum could point
+    /// miners anywhere. Here the adverts are valid but `nodes` says something else.
+    #[test]
+    fn a_host_the_node_never_attested_is_rejected() {
+        let (node_ids, adverts) = two_mining_nodes();
+        let signers = node_ids;
+        let trusted = signer_ids(&signers);
+        let mut blob = build_blob(&signers, &adverts, &trusted, 100);
+        // Swap one rendered host for somewhere its node never signed for, and re-root so the
+        // list_root check passes — the derivation check is the one that must catch this.
+        blob.nodes[0].host = "attacker.example".into();
+        let tampered: Vec<MeshNodeEntry> = blob
+            .nodes
+            .iter()
+            .map(|n| MeshNodeEntry {
+                node_id: hex32(&n.node_id).unwrap(),
+                host: n.host.clone(),
+                sv1_port: n.sv1_port,
+                sv2_port: n.sv2_port,
+            })
+            .collect();
+        blob.list_root = hex::encode(mesh_node_list_root(&tampered));
+        refused_because(&blob, &trusted, "not what its adverts derive to");
+    }
+
+    /// An advert signed by anyone other than its subject must not be usable, or the endpoint
+    /// attestation is decorative.
+    #[test]
+    fn an_advert_signed_by_an_impostor_is_rejected() {
+        let (node_ids, mut adverts) = two_mining_nodes();
+        let signers = node_ids;
+        let trusted = signer_ids(&signers);
+        let impostor = NodeIdentity::generate();
+        adverts[0].host = "attacker.example".into();
+        adverts[0].signature = impostor.sign(&adverts[0].signing_bytes());
+        let blob = build_blob(&signers, &adverts, &trusted, 100);
+        refused_because(&blob, &trusted, "is not signed by that node");
     }
 }

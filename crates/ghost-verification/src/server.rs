@@ -1383,6 +1383,21 @@ pub struct VerificationState {
     #[allow(clippy::type_complexity)]
     pub checkpoint_voter_set_fn:
         Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>>,
+    /// MESH_NODE_LIST convergence proof: given `(cutoff_ts, height)`, the node-list checkpoint
+    /// this node WOULD propose — `(listed, list_root, advert_root, missing_adverts)` — computed
+    /// with the activation gate IGNORED.
+    ///
+    /// ⚠ Ignoring the gate is the entire point. #625: nothing is proposed below
+    /// `MESH_NODE_LIST_CHECKPOINT_HEIGHT`, so "prove the blob is byte-identical fleet-wide,
+    /// then arm" is circular — convergence only becomes observable once it is already live,
+    /// which is how a gate ships that fires on schedule and then quietly never produces
+    /// anything. This makes #402's acceptance criterion measurable BEFORE arming.
+    ///
+    /// `missing_adverts` names the qualified nodes whose signed endpoint this node has not
+    /// seen. A stalled checkpoint should say who is holding it up, not just fail.
+    #[allow(clippy::type_complexity)]
+    pub mesh_node_list_fn:
+        Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, String, Vec<String>)> + Send + Sync>>,
     /// FEE coinbase reward-split convergence proof: given `(cutoff_ts, height)`, returns a hash of
     /// the GO-LIVE reward split (`miner_pool`, `treasury_amount`, `node_reward_pool`) — the
     /// `COINBASE_FEE_SPLIT` regime forced ON — computed from THIS node's `treasury_state` at the
@@ -1764,6 +1779,7 @@ impl VerificationState {
             block_hash_oracle: None,
             fee_node_split_fn: None,
             checkpoint_voter_set_fn: None,
+            mesh_node_list_fn: None,
             fee_split_fn: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
             node_config: parking_lot::RwLock::new(NodeConfig::default()),
@@ -2301,6 +2317,16 @@ impl VerificationState {
         f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>,
     ) -> Self {
         self.checkpoint_voter_set_fn = Some(f);
+        self
+    }
+
+    /// See [`VerificationState::mesh_node_list_fn`].
+    #[allow(clippy::type_complexity)]
+    pub fn with_mesh_node_list_fn(
+        mut self,
+        f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, String, Vec<String>)> + Send + Sync>,
+    ) -> Self {
+        self.mesh_node_list_fn = Some(f);
         self
     }
 

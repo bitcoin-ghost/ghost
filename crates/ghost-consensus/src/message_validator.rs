@@ -122,6 +122,10 @@ pub const MAX_SHARE_BATCH_SYNC_SIZE: usize = MAX_SHARE_BATCH_SIZE;
 ///
 /// Deliberately conservative: under-filling a batch costs one extra batch, while over-filling it
 /// produces a message every peer rejects, at a sequence the chain cannot skip past.
+/// One signed endpoint advert. Generous against a long hostname while still far below any
+/// bound that would let a peer spend our bandwidth: 2 KiB.
+pub const MAX_MESH_ENDPOINT_ADVERT_SIZE: usize = 2 * 1024;
+
 pub const fn share_batch_pack_budget() -> usize {
     const JSON_EXPANSION_NUMERATOR: usize = 10;
     const JSON_EXPANSION_DENOMINATOR: usize = 31; // ~3.1x
@@ -553,6 +557,11 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::MeshNodeListCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::MeshNodeListCheckpointVote => MAX_VOTE_SIZE,
         MessageType::MeshNodeListCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
+        // One advert: a 32-byte id, a host string, two ports, a flag, a seq and a 64-byte
+        // signature — a few hundred bytes hex-encoded. Its OWN bound rather than borrowing a
+        // neighbour's: a type that falls into someone else's limit is how an oversized payload
+        // gets through the one check meant to stop it.
+        MessageType::MeshEndpointAdvertisement => MAX_MESH_ENDPOINT_ADVERT_SIZE,
         // Share shard: each type has its own derived bound — see the constants for the
         // arithmetic. A type that silently falls into someone else's bound is how a payload
         // ends up rejected for a reason nobody wrote down.

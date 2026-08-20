@@ -555,6 +555,18 @@ pub const ACTIVE_VOTER_SET_HEIGHT: u64 = 959_200;
 /// untrusted miner-side shim can verify offline (see tasks/design_mesh_node_list_checkpoint.md).
 /// DORMANT (`u64::MAX`): below it nothing is proposed, so the binary is behaviour-neutral. Built
 /// dormant — a concrete height is set only after fleet-wide convergence is proven, like the rest.
+/// Stratum ports carried in a node's endpoint advert. Fleet-wide well-known values; a node
+/// that moves them would need to say so in its advert, which is exactly what the advert is for.
+pub const MESH_ADVERT_SV1_PORT: u16 = 3333;
+/// See [`MESH_ADVERT_SV1_PORT`].
+pub const MESH_ADVERT_SV2_PORT: u16 = 34255;
+/// How often a node re-publishes its (unchanged) endpoint advert.
+///
+/// Re-publishing matters because the store is in memory: a peer that restarts has an empty
+/// store and refills from this cadence. Ten minutes bounds how long a restarted node leaves
+/// the fleet unable to reach full coverage, while costing a few hundred bytes per node.
+pub const MESH_ADVERT_REPUBLISH_SECS: u64 = 600;
+
 pub const MESH_NODE_LIST_CHECKPOINT_HEIGHT: u64 = u64::MAX;
 
 /// Activation heights, resolved once at startup.

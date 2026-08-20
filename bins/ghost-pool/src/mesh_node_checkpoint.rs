@@ -5,8 +5,19 @@
 //! DNS or a website. Mirrors [`crate::payout_checkpoint`]'s BFT lifecycle, with three
 //! differences specific to this checkpoint:
 //!
-//! - **Agreement is exact-set, not tolerance.** A voter approves iff its own connected
-//!   public-mining set hashes to the same `list_root` as the proposer's.
+//! - **Agreement is exact-set, not tolerance.** A voter approves iff the list it re-derives
+//!   hashes to the same `list_root` as the proposer's.
+//!
+//!   ⚠ What it re-derives FROM is the point (#625). Membership comes from the ratified
+//!   qualified set at the chain-anchored cutoff — identical fleet-wide by construction — and
+//!   the endpoints come from the adverts carried in the proposal, each signed by its own
+//!   subject. Nothing node-local enters the derivation.
+//!
+//!   It used to recompute a local view: `get_connected_peers(120)` filtered by health-ping
+//!   capabilities and locally-observed addresses. Exact agreement over three subjective
+//!   inputs is not achievable, and it was not achieved — measured across the fleet, seven
+//!   reporters produced six distinct sets, one node appearing in none of them. Divergence
+//!   fails safe, so the symptom was not a bad checkpoint but no checkpoint, indefinitely.
 //! - **The signer set rides a forward chain.** Each checkpoint carries `signer_set_root`
 //!   (the root of the deterministic voter set, committed in `checkpoint_hash`) and a
 //!   `signer_set_delta` vs the previous checkpoint. A shim baked with the genesis signer set
@@ -32,7 +43,8 @@ use ghost_common::error::GhostResult;
 use ghost_common::identity::{verify_signature, NodeIdentity};
 use ghost_common::types::NodeId;
 use ghost_consensus::{
-    mesh_node_list_root, mesh_signer_set_root, MeshNodeEntry, MeshNodeListCheckpointMessage,
+    derive_mesh_node_list, mesh_advert_set_root, mesh_node_list_root, mesh_signer_set_root,
+    MeshEndpointAdvert, MeshNodeEntry, MeshNodeListCheckpointMessage,
     MeshNodeListCheckpointSyncEntry, MeshNodeListCheckpointSyncRequest,
     MeshNodeListCheckpointSyncResponse, MeshNodeListCheckpointVoteMessage, MessageEnvelope,
     MessageHandler, MessageType, SignerSetDelta,
@@ -53,7 +65,12 @@ const MAX_SYNC_CHECKPOINTS: u64 = 8;
 /// Computes THIS node's canonical public-mining node set at a cutoff:
 /// `(cutoff_ts, height) -> sorted node entries`. `None` = cannot compute yet (mesh view not
 /// ready) → the C-7 abstain rule. `main.rs` wires this to the live mesh peer state.
-pub type ComputeNodeListFn = Arc<dyn Fn(i64, u64) -> Option<Vec<MeshNodeEntry>> + Send + Sync>;
+/// Supplies the signed adverts this node holds, for the qualified set at `(cutoff_ts, height)`.
+///
+/// Adverts, not rendered entries: an entry is only as trustworthy as the node that wrote it
+/// down, and the whole point of #625's fix is that a voter should not have to trust the
+/// proposer's transcription of where a peer lives. The subject signs; everyone else carries.
+pub type ComputeAdvertsFn = Arc<dyn Fn(&[NodeId]) -> Option<Vec<MeshEndpointAdvert>> + Send + Sync>;
 
 /// Resolves the ACTIVE qualified voter set at a cutoff (see the payout manager's analog).
 /// `None` in tests → the elder floor is always used.
@@ -93,7 +110,9 @@ pub struct MeshNodeListCheckpointManager {
     identity: Arc<NodeIdentity>,
     db: Arc<Database>,
     send: BroadcastFn,
-    compute_nodes: ComputeNodeListFn,
+    compute_adverts: ComputeAdvertsFn,
+    /// Endpoint adverts held by this node, keyed by subject. See [`AdvertStore`].
+    adverts: Arc<AdvertStore>,
     active_voter_set: Option<ActiveVoterSetFn>,
     /// Activation-height override for tests. `None` (production) = read the live gate
     /// `crate::mesh_node_list_checkpoint_height()` (u64::MAX = dormant on mainnet).
@@ -137,6 +156,120 @@ fn vec_to_sig(v: &[u8]) -> Option<[u8; 64]> {
     Some(a)
 }
 
+/// The adverts this node currently holds, one per subject, newest by `seq`.
+///
+/// Deliberately IN MEMORY. A node that restarts simply refills from the next broadcast round,
+/// and nothing is lost that matters: the live path re-derives from adverts carried in the
+/// proposal, sync carries them in-message, and a finalised checkpoint persists its own copy.
+/// Persisting a second copy would add a schema migration and a staleness question, to hold
+/// data that is re-announced on a cadence anyway.
+///
+/// Entry is gated on the signature, so this cannot be poisoned by a peer relaying someone
+/// else's endpoint: only the subject can produce a valid advert for itself.
+#[derive(Default)]
+pub struct AdvertStore {
+    by_node: parking_lot::RwLock<HashMap<NodeId, MeshEndpointAdvert>>,
+}
+
+impl AdvertStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept an advert if it proves itself and is not older than what we hold.
+    ///
+    /// Returns whether the store changed, so a caller can log a genuine update without
+    /// narrating every re-broadcast of something already known.
+    pub fn accept(&self, advert: MeshEndpointAdvert) -> bool {
+        if !advert.is_self_signed() {
+            return false;
+        }
+        let mut m = self.by_node.write();
+        match m.get(&advert.node_id) {
+            Some(existing) if existing.seq > advert.seq => false,
+            // Equal `seq` with identical bytes is just a re-broadcast, not news.
+            Some(existing) if existing.seq == advert.seq && *existing == advert => false,
+            _ => {
+                m.insert(advert.node_id, advert);
+                true
+            }
+        }
+    }
+
+    /// The adverts covering `wanted`, or `None` if ANY of them is missing.
+    ///
+    /// All-or-nothing on purpose: `derive_mesh_node_list` requires total coverage, so a
+    /// partial answer here would only produce a proposal that every peer rejects. Returning
+    /// `None` lets the caller say "not yet" once, rather than proposing into a wall.
+    pub fn covering(&self, wanted: &[NodeId]) -> Option<Vec<MeshEndpointAdvert>> {
+        let m = self.by_node.read();
+        let mut out = Vec::with_capacity(wanted.len());
+        for id in wanted {
+            out.push(m.get(id)?.clone());
+        }
+        Some(out)
+    }
+
+    /// Which of `wanted` we are missing — for the operator-facing convergence proof, so a
+    /// stalled checkpoint names the node holding it up instead of just failing quietly.
+    pub fn missing(&self, wanted: &[NodeId]) -> Vec<NodeId> {
+        let m = self.by_node.read();
+        wanted
+            .iter()
+            .filter(|id| !m.contains_key(*id))
+            .copied()
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_node.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Build this node's own advert and sign it.
+///
+/// `seq` is the current unix time in seconds rather than a counter: it is monotonic across
+/// restarts without persisting anything, which matters because the store is in memory. A node
+/// that re-homes and restarts still supersedes its own earlier advert.
+pub fn build_self_advert(
+    identity: &NodeIdentity,
+    host: &str,
+    sv1_port: u16,
+    sv2_port: u16,
+    public_mining: bool,
+    seq: u64,
+) -> MeshEndpointAdvert {
+    let mut a = MeshEndpointAdvert {
+        node_id: identity.node_id(),
+        host: host.to_string(),
+        sv1_port,
+        sv2_port,
+        public_mining,
+        seq,
+        signature: [0u8; 64],
+    };
+    a.signature = identity.sign(&a.signing_bytes());
+    a
+}
+
+/// Adverts as stored. Canonical JSON so the round trip is lossless: the `advert_root` is
+/// inside `checkpoint_hash`, so a checkpoint whose adverts cannot be recovered byte-for-byte
+/// is one whose proposer signature can never be re-verified.
+fn adverts_to_json(adverts: &[MeshEndpointAdvert]) -> String {
+    serde_json::to_string(adverts).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The inverse. An unparseable blob yields an EMPTY set rather than a panic, which the
+/// callers treat as "cannot re-derive" — they fall back to the signature checks rather than
+/// silently accepting a list nobody can reproduce.
+fn adverts_from_json(json: &str) -> Vec<MeshEndpointAdvert> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
 fn entries_to_storage(nodes: &[MeshNodeEntry]) -> Vec<([u8; 32], String, u16, u16)> {
     nodes
         .iter()
@@ -161,13 +294,14 @@ impl MeshNodeListCheckpointManager {
         identity: Arc<NodeIdentity>,
         db: Arc<Database>,
         send: BroadcastFn,
-        compute_nodes: ComputeNodeListFn,
+        compute_adverts: ComputeAdvertsFn,
     ) -> Self {
         Self {
             identity,
             db,
             send,
-            compute_nodes,
+            compute_adverts,
+            adverts: Arc::new(AdvertStore::new()),
             active_voter_set: None,
             gate_height: None,
             pending: RwLock::new(HashMap::new()),
@@ -179,6 +313,18 @@ impl MeshNodeListCheckpointManager {
     /// Attach the active-voter-set resolver (see the payout manager's analog). Once the
     /// `ACTIVE_VOTER_SET` gate is active, the signer/voter set widens from the MPC elders to
     /// the converged active qualified set.
+    /// Share the advert store with the caller.
+    ///
+    /// ⚠ The inbound handler WRITES to this store and the propose path READS from it. If the
+    /// manager kept a private one while `main.rs` held another, adverts would arrive into a
+    /// store nothing ever proposed from — the checkpoint would sit silently at "adverts not
+    /// available yet" for ever, which is the same shape of quiet failure this change exists to
+    /// remove.
+    pub fn with_advert_store(mut self, store: Arc<AdvertStore>) -> Self {
+        self.adverts = store;
+        self
+    }
+
     pub fn with_active_voter_set_fn(mut self, f: ActiveVoterSetFn) -> Self {
         self.active_voter_set = Some(f);
         self
@@ -232,6 +378,31 @@ impl MeshNodeListCheckpointManager {
             }
         }
         elders
+    }
+
+    /// The advert store, so the node can seed its OWN advert and an operator endpoint can
+    /// report coverage without reaching through the mesh.
+    pub fn adverts(&self) -> Arc<AdvertStore> {
+        Arc::clone(&self.adverts)
+    }
+
+    /// WHO IS LISTED, as opposed to who votes.
+    ///
+    /// The ratified qualified set at the chain-anchored cutoff — the same set
+    /// `get_all_qualified_nodes_at_cutoff_from_db` gives the payout path, so it is identical
+    /// fleet-wide by construction rather than by hope. Deliberately NOT `voter_set_for`: that
+    /// widens to the elder floor, and an elder has not necessarily proven it serves miners.
+    /// Qualification has — it requires a challenger to complete a real stratum handshake.
+    ///
+    /// `None` when no resolver is wired or the set is empty: with nothing ratified to derive
+    /// from, the honest answer is to abstain rather than to fall back on a local view, which
+    /// is precisely the mistake that made this checkpoint unable to converge.
+    fn qualified_set_for(&self, height: u64, cutoff_ts: i64) -> Option<Vec<NodeId>> {
+        let resolve = self.active_voter_set.as_ref()?;
+        let mut v = resolve(cutoff_ts, height);
+        v.sort_unstable();
+        v.dedup();
+        (!v.is_empty()).then_some(v)
     }
 
     /// Deterministic proposer for `height` (round-robin over the voter set at `cutoff_ts`).
@@ -295,15 +466,37 @@ impl MeshNodeListCheckpointManager {
         if proposer != Some(me) || self.already_finalized(height) {
             return;
         }
-        let Some(mut nodes) = (self.compute_nodes)(cutoff_ts, height) else {
+        let Some(qualified) = self.qualified_set_for(height, cutoff_ts) else {
             warn!(
                 height,
-                "mesh node checkpoint: node set not computable yet — not proposing"
+                "mesh node checkpoint: no ratified qualified set at this cutoff — not proposing"
             );
             return;
         };
-        nodes.sort_by_key(|n| n.node_id);
+        let Some(adverts) = (self.compute_adverts)(&qualified) else {
+            warn!(
+                height,
+                "mesh node checkpoint: adverts not available yet — not proposing"
+            );
+            return;
+        };
+        // Derive with the SAME function every voter will re-derive with. A proposal this node
+        // cannot derive is one nobody could approve, so failing here is strictly better than
+        // proposing something that will be rejected: the reason is logged once, by the only
+        // node in a position to know it.
+        let nodes = match derive_mesh_node_list(&qualified, &adverts) {
+            Ok(n) => n,
+            Err(reason) => {
+                warn!(
+                    height,
+                    ?reason,
+                    "mesh node checkpoint: cannot derive the node list — not proposing"
+                );
+                return;
+            }
+        };
         let list_root = mesh_node_list_root(&nodes);
+        let advert_root = mesh_advert_set_root(&adverts);
 
         // Cadence: only checkpoint when the set changed. If the latest finalised checkpoint
         // already commits this exact list, re-affirm silently rather than mint a duplicate.
@@ -322,6 +515,8 @@ impl MeshNodeListCheckpointManager {
             height,
             cutoff_ts,
             nodes,
+            adverts,
+            advert_root,
             list_root,
             signer_set_delta,
             signer_set_root,
@@ -372,6 +567,7 @@ impl MeshNodeListCheckpointManager {
         // else the signed hash wouldn't bind them.
         let voters = self.voter_set_for(msg.height, msg.cutoff_ts);
         if mesh_node_list_root(&msg.nodes) != msg.list_root
+            || mesh_advert_set_root(&msg.adverts) != msg.advert_root
             || mesh_signer_set_root(&voters) != msg.signer_set_root
         {
             warn!(
@@ -382,12 +578,21 @@ impl MeshNodeListCheckpointManager {
             return Ok(());
         }
 
-        // EXACT-SET AGREEMENT: recompute our own connected public-mining set; approve iff it
-        // hashes to the same list_root. Cannot compute yet → abstain (C-7).
-        let Some(local) = (self.compute_nodes)(msg.cutoff_ts, msg.height) else {
+        // EXACT-SET AGREEMENT, re-derived from the PROPOSAL'S adverts and OUR ratified
+        // qualified set.
+        //
+        // The adverts come from the message on purpose. This node does not substitute its own
+        // copy of them, and does not need to hold one at all: every advert is signed by its
+        // subject, so their authenticity is decidable from the bytes. The only thing supplied
+        // locally is the qualified set, which is ratified and therefore identical fleet-wide.
+        //
+        // That is the whole of the #625 fix. The previous spelling recomputed a LOCAL view
+        // (`compute_nodes` over a 120-second liveness window) and approved iff it happened to
+        // match — which, measured across seven nodes, produced six different answers.
+        let Some(qualified) = self.qualified_set_for(msg.height, msg.cutoff_ts) else {
             warn!(
                 height = msg.height,
-                "mesh node checkpoint: cannot recompute node set — abstaining"
+                "mesh node checkpoint: no ratified qualified set — abstaining"
             );
             let height = msg.height;
             let mut pending = self.pending.write();
@@ -398,7 +603,19 @@ impl MeshNodeListCheckpointManager {
                 .proposal = Some(msg);
             return Ok(());
         };
-        let approve = mesh_node_list_root(&local) == msg.list_root;
+        // A derivation failure is a REJECT, not an abstain: unlike a missing local view, it is
+        // a property of the proposal's own bytes, so every honest node reaches it identically.
+        let approve = match derive_mesh_node_list(&qualified, &msg.adverts) {
+            Ok(local) => mesh_node_list_root(&local) == msg.list_root,
+            Err(reason) => {
+                warn!(
+                    height = msg.height,
+                    ?reason,
+                    "mesh node checkpoint: proposal does not derive — voting reject"
+                );
+                false
+            }
+        };
         info!(height = msg.height, approve, "mesh node checkpoint: vote");
         {
             let mut pending = self.pending.write();
@@ -509,6 +726,7 @@ impl MeshNodeListCheckpointManager {
                 msg.signer_set_delta.removed.clone(),
             ),
             approvals: approved.iter().map(|(v, s)| (*v, s.to_vec())).collect(),
+            adverts_json: adverts_to_json(&msg.adverts),
         };
         match self.db.upsert_mesh_node_list_checkpoint(&record) {
             Ok(()) => {
@@ -608,6 +826,8 @@ impl MeshNodeListCheckpointManager {
                 height: r.height,
                 cutoff_ts: r.cutoff_ts,
                 nodes: storage_to_entries(&r.nodes),
+                adverts: adverts_from_json(&r.adverts_json),
+                advert_root: mesh_advert_set_root(&adverts_from_json(&r.adverts_json)),
                 list_root: r.list_root,
                 signer_set_delta: SignerSetDelta {
                     added: r.signer_set_delta.0,
@@ -672,15 +892,30 @@ impl MeshNodeListCheckpointManager {
         }
         let voters = self.voter_set_for(entry.height, entry.cutoff_ts);
         if mesh_node_list_root(&entry.nodes) != entry.list_root
+            || mesh_advert_set_root(&entry.adverts) != entry.advert_root
             || mesh_signer_set_root(&voters) != entry.signer_set_root
         {
             return false;
+        }
+        // A synced checkpoint is re-DERIVED, never taken on the serving node's word: the
+        // rendered `nodes` must be what the adopted adverts actually produce against the
+        // ratified qualified set. Without this a peer could serve a valid signature over one
+        // list and a different list beside it. Abstain-shaped inputs (no ratified set at this
+        // cutoff) fall through to the signature checks below rather than rejecting a
+        // checkpoint we are simply not in a position to re-derive.
+        if let Some(qualified) = self.qualified_set_for(entry.height, entry.cutoff_ts) {
+            match derive_mesh_node_list(&qualified, &entry.adverts) {
+                Ok(local) if mesh_node_list_root(&local) == entry.list_root => {}
+                _ => return false,
+            }
         }
         // Reconstruct the checkpoint hash and verify the proposer's signature over it.
         let msg = MeshNodeListCheckpointMessage {
             height: entry.height,
             cutoff_ts: entry.cutoff_ts,
             nodes: entry.nodes.clone(),
+            adverts: entry.adverts.clone(),
+            advert_root: entry.advert_root,
             list_root: entry.list_root,
             signer_set_delta: entry.signer_set_delta.clone(),
             signer_set_root: entry.signer_set_root,
@@ -739,6 +974,7 @@ impl MeshNodeListCheckpointManager {
                 entry.signer_set_delta.removed.clone(),
             ),
             approvals: entry.approvals.clone(),
+            adverts_json: adverts_to_json(&entry.adverts),
         };
         match self.db.upsert_mesh_node_list_checkpoint(&record) {
             Ok(()) => {
@@ -762,6 +998,21 @@ impl MessageHandler for MeshNodeListCheckpointManager {
     async fn handle_message(&self, envelope: Arc<MessageEnvelope>) -> GhostResult<()> {
         match envelope.msg_type {
             MessageType::MeshNodeListCheckpoint => self.on_proposal(&envelope).await,
+            MessageType::MeshEndpointAdvertisement => {
+                // Accepted or dropped purely on the signature — this handler holds no opinion
+                // about who a peer is or whether we have seen it lately. That is the point:
+                // an endpoint learned by observation differs per observer.
+                match serde_json::from_slice::<MeshEndpointAdvert>(&envelope.payload) {
+                    Ok(advert) => {
+                        let node = hex::encode(&advert.node_id[..4]);
+                        if self.adverts.accept(advert) {
+                            debug!(node = %node, "mesh endpoint advert: accepted");
+                        }
+                    }
+                    Err(e) => debug!(error = %e, "mesh endpoint advert: undecodable — dropped"),
+                }
+                Ok(())
+            }
             MessageType::MeshNodeListCheckpointVote => self.on_vote(&envelope).await,
             MessageType::MeshNodeListCheckpointSync => {
                 // Multiplex request/response by trial-deserialise (only the request carries
@@ -812,29 +1063,65 @@ mod tests {
         }
     }
 
-    fn entry(id: u8, host: &str) -> MeshNodeEntry {
-        MeshNodeEntry {
-            node_id: [id; 32],
-            host: host.to_string(),
-            sv1_port: 3333,
-            sv2_port: 34255,
-        }
+    /// The shared "converged" public-mining set every node computes.
+    /// A fixed advert set for tests that only care about "some coherent list", built from
+    /// throwaway identities so every advert is genuinely self-signed.
+    fn std_adverts() -> Vec<MeshEndpointAdvert> {
+        let ids: Vec<Arc<NodeIdentity>> =
+            (0..2).map(|_| Arc::new(NodeIdentity::generate())).collect();
+        adverts_for(&ids)
     }
 
-    /// The shared "converged" public-mining set every node computes.
-    fn std_nodes() -> Vec<MeshNodeEntry> {
-        vec![entry(200, "203.0.113.1"), entry(201, "203.0.113.2")]
+    /// A node's own signed advert, as production builds it.
+    fn signed_advert(id: &NodeIdentity, host: &str, public_mining: bool) -> MeshEndpointAdvert {
+        build_self_advert(id, host, 3333, 34255, public_mining, 1)
+    }
+
+    /// Every elder advertises itself. This is the ordinary case: the qualified set and the
+    /// advert set coincide, so coverage is total and the list derives.
+    fn adverts_for(ids: &[Arc<NodeIdentity>]) -> Vec<MeshEndpointAdvert> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| signed_advert(id, &format!("203.0.113.{}", i + 1), true))
+            .collect()
     }
 
     /// Build `n` nodes; node at SORTED elder position `i` computes `lists[i]` as its own view
     /// (`None` = C-7 abstain). Sorted order means `nodes[i].id == elders_sorted[i]`, so the
     /// proposer for height `H` is `nodes[H % n]`.
-    fn build(n: usize, lists: &[Option<Vec<MeshNodeEntry>>]) -> (Vec<Node>, Vec<NodeId>) {
-        assert_eq!(n, lists.len());
+    /// Build an n-node cluster. `held[i]` is the advert set node `i` holds — `None` means it
+    /// cannot supply any, which is how a node that has heard from nobody behaves.
+    ///
+    /// Every node is given the SAME ratified qualified set, because that is what ratified
+    /// means. The interesting variable is now advert coverage, not each node's private view of
+    /// who is reachable — that view no longer enters the derivation at all (#625).
+    /// What advert coverage a node has. Expressed as a rule rather than a literal list because
+    /// the adverts must be signed by THIS cluster's identities — an advert from some other
+    /// cluster is not in the qualified set, so the derivation refuses it and nothing proposes.
+    /// (That is a real property, and it cost me four failing tests to notice.)
+    #[derive(Clone, Copy)]
+    enum Hold {
+        /// Every advert: full coverage.
+        All,
+        /// The first `k` only — a partial view.
+        First(usize),
+        /// Holds an empty set: has heard from nobody.
+        Empty,
+        /// Cannot supply adverts at all.
+        Nothing,
+    }
+
+    fn build(n: usize, holds: &[Hold]) -> (Vec<Node>, Vec<NodeId>, Vec<MeshEndpointAdvert>) {
+        assert_eq!(n, holds.len());
         let ids: Vec<Arc<NodeIdentity>> =
             (0..n).map(|_| Arc::new(NodeIdentity::generate())).collect();
         let mut elders: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
         elders.sort_unstable();
+        // Adverts are signed by the cluster's OWN identities, sorted to match the elder order
+        // so `Hold::First(k)` is deterministic.
+        let mut by_id: Vec<Arc<NodeIdentity>> = ids.clone();
+        by_id.sort_by_key(|i| i.node_id());
+        let all_adverts = adverts_for(&by_id);
 
         let mut nodes = Vec::new();
         for (pos, &want) in elders.iter().enumerate() {
@@ -847,14 +1134,22 @@ mod tests {
                 ob.lock().unwrap().push((ty, bytes));
                 Ok(())
             });
-            let list = lists[pos].clone();
-            let compute: ComputeNodeListFn = Arc::new(move |_c, _h| list.clone());
+            let mine = match holds[pos] {
+                Hold::All => Some(all_adverts.clone()),
+                Hold::First(k) => Some(all_adverts[..k].to_vec()),
+                Hold::Empty => Some(Vec::new()),
+                Hold::Nothing => None,
+            };
+            let compute: ComputeAdvertsFn = Arc::new(move |_qualified| mine.clone());
+            let ratified = elders.clone();
             let mgr = MeshNodeListCheckpointManager::new(
                 identity.clone(),
                 Arc::clone(&db),
                 send,
                 compute,
             )
+            // The ratified qualified set — identical on every node, which is the whole point.
+            .with_active_voter_set_fn(Arc::new(move |_ts, _h| ratified.clone()))
             .with_gate_height(0); // armed for the cluster tests
             nodes.push(Node {
                 id: identity.node_id(),
@@ -863,7 +1158,7 @@ mod tests {
                 outbox,
             });
         }
-        (nodes, elders)
+        (nodes, elders, all_adverts)
     }
 
     fn drain(n: &Node) -> Vec<(MessageType, Vec<u8>)> {
@@ -917,7 +1212,7 @@ mod tests {
             ob.lock().unwrap().push((ty, bytes));
             Ok(())
         });
-        let compute: ComputeNodeListFn = Arc::new(|_, _| Some(std_nodes()));
+        let compute: ComputeAdvertsFn = Arc::new(|_| Some(std_adverts()));
         // No .with_gate_height → uses the live gate (dormant u64::MAX).
         let mgr = MeshNodeListCheckpointManager::new(ident, Arc::clone(&db), send, compute);
         mgr.maybe_propose(100, CUTOFF).await;
@@ -934,14 +1229,19 @@ mod tests {
 
     #[tokio::test]
     async fn convergent_fleet_finalises_signed_list() {
-        let (nodes, _) = build(4, &vec![Some(std_nodes()); 4]);
+        // Every node holds every advert: coverage is total, so the list derives everywhere.
+        let (nodes, _, adverts) = build(4, &[Hold::All; 4]);
         assert_eq!(nodes[0].mgr.proposer_for(H, CUTOFF), Some(nodes[0].id));
         assert_eq!(quorum_for(4), 3, "67% of 4 = 3");
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
-        let want_root = mesh_node_list_root(&std_nodes());
+        let want_root = {
+            let mut q: Vec<NodeId> = adverts.iter().map(|a| a.node_id).collect();
+            q.sort_unstable();
+            mesh_node_list_root(&derive_mesh_node_list(&q, &adverts).expect("derives"))
+        };
         for n in &nodes {
             let rec =
                 n.db.get_latest_mesh_node_list_checkpoint()
@@ -949,7 +1249,7 @@ mod tests {
                     .expect("every node finalises");
             assert_eq!(rec.height, H);
             assert_eq!(rec.list_root, want_root);
-            assert_eq!(rec.nodes.len(), 2, "adopted node list");
+            assert_eq!(rec.nodes.len(), 4, "adopted node list");
             assert_eq!(
                 rec.proposer_signature.len(),
                 64,
@@ -963,36 +1263,74 @@ mod tests {
         }
     }
 
+    /// THE #625 REGRESSION TEST.
+    ///
+    /// Nodes hold DIFFERENT advert stores — the proposer has everything, one peer has a
+    /// subset, one has nothing at all — and the fleet still finalises one identical list.
+    ///
+    /// Under the old design this was the failing case, and it was the ordinary case: a voter
+    /// recomputed its own `get_connected_peers(120)` view and approved only if it matched, so
+    /// seven nodes produced six different sets and nothing ever finalised. A voter no longer
+    /// consults what it holds. It re-derives from the adverts carried IN THE PROPOSAL against
+    /// the ratified qualified set, and every advert proves itself, so a node that has never
+    /// heard of a peer can still vote on that peer's endpoint.
     #[tokio::test]
-    async fn divergent_node_set_does_not_finalise() {
-        // Proposer + one peer see std; two peers see a DIFFERENT set → they reject → only 2
-        // approvals < 3 → nothing finalises (safe).
-        let other = vec![entry(210, "198.51.100.9")];
-        let (nodes, _) = build(
+    async fn peers_with_differing_advert_stores_still_converge() {
+        let (nodes, _, all) = build(
             4,
             &[
-                Some(std_nodes()),
-                Some(std_nodes()),
-                Some(other.clone()),
-                Some(other),
+                Hold::All,      // proposer: full coverage
+                Hold::First(2), // a partial view
+                Hold::Empty,    // has heard from nobody
+                Hold::Nothing,  // cannot supply any at all
             ],
         );
+        assert_eq!(nodes[0].mgr.proposer_for(H, CUTOFF), Some(nodes[0].id));
+        for n in &nodes {
+            n.mgr.maybe_propose(H, CUTOFF).await;
+        }
+        gossip_until_quiet(&nodes).await;
+
+        let want_root = {
+            let mut q: Vec<NodeId> = all.iter().map(|a| a.node_id).collect();
+            q.sort_unstable();
+            mesh_node_list_root(&derive_mesh_node_list(&q, &all).expect("derives"))
+        };
+        for n in &nodes {
+            let rec =
+                n.db.get_latest_mesh_node_list_checkpoint()
+                    .unwrap()
+                    .expect("a node that holds no adverts still finalises the proposed list");
+            assert_eq!(rec.list_root, want_root);
+        }
+    }
+
+    /// Coverage is total or nothing. A proposer that cannot cover the whole qualified set does
+    /// not propose a shorter list — it stays quiet, because a partial list would be a
+    /// different list and every peer would reject it.
+    ///
+    /// Fail-safe, like the divergence case it replaces: no checkpoint rather than a wrong one.
+    #[tokio::test]
+    async fn a_proposer_missing_an_advert_proposes_nothing() {
+        // The proposer is missing exactly one qualified node's advert.
+        let (nodes, _, _) = build(4, &[Hold::First(3), Hold::All, Hold::All, Hold::All]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
         for n in &nodes {
-            assert!(n
-                .db
-                .get_latest_mesh_node_list_checkpoint()
-                .unwrap()
-                .is_none());
+            assert!(
+                n.db.get_latest_mesh_node_list_checkpoint()
+                    .unwrap()
+                    .is_none(),
+                "incomplete coverage must produce no checkpoint at all"
+            );
         }
     }
 
     #[tokio::test]
     async fn unchanged_node_set_is_not_re_proposed() {
-        let (nodes, _) = build(4, &vec![Some(std_nodes()); 4]);
+        let (nodes, _, _) = build(4, &[Hold::All; 4]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
@@ -1013,11 +1351,12 @@ mod tests {
     async fn changed_node_set_is_re_proposed() {
         // Pre-seed a stale finalised checkpoint whose list_root differs from the current set, so
         // the proposer sees a change and DOES propose (the other direction of the cadence gate).
-        let (nodes, _) = build(4, &vec![Some(std_nodes()); 4]);
+        let (nodes, _, _) = build(4, &[Hold::All; 4]);
         let stale = MeshNodeListCheckpointRecord {
             height: 96,
             cutoff_ts: CUTOFF,
-            list_root: [1u8; 32], // != mesh_node_list_root(std_nodes())
+            list_root: [1u8; 32], // != the root the current adverts derive to
+            adverts_json: "[]".to_string(),
             signer_set_root: [2u8; 32],
             proposer_id: hex::encode(nodes[0].id),
             active_node_count: 4,
@@ -1043,7 +1382,7 @@ mod tests {
     async fn missed_checkpoint_backfills_via_signed_sync() {
         // Build a fleet, finalise H with real signatures, then hand the finalised checkpoint to a
         // BYSTANDER that missed it. It adopts only after verifying the full signed blob.
-        let (nodes, elders) = build(4, &vec![Some(std_nodes()); 4]);
+        let (nodes, elders, _) = build(4, &[Hold::All; 4]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
@@ -1059,6 +1398,11 @@ mod tests {
             height: rec.height,
             cutoff_ts: rec.cutoff_ts,
             nodes: storage_to_entries(&rec.nodes),
+            // Carried through sync exactly as the serving node stored them: `advert_root` is
+            // inside `checkpoint_hash`, so dropping them here would make the proposer
+            // signature unverifiable rather than merely lose detail.
+            adverts: adverts_from_json(&rec.adverts_json),
+            advert_root: mesh_advert_set_root(&adverts_from_json(&rec.adverts_json)),
             list_root: rec.list_root,
             signer_set_delta: SignerSetDelta {
                 added: rec.signer_set_delta.0.clone(),
@@ -1075,7 +1419,7 @@ mod tests {
         let db = Arc::new(Database::in_memory().expect("db"));
         register_elders(&db, &elders);
         let send: BroadcastFn = Arc::new(|_, _| Ok(()));
-        let compute: ComputeNodeListFn = Arc::new(|_, _| None); // apply verifies sigs, not view
+        let compute: ComputeAdvertsFn = Arc::new(|_| None); // apply verifies signatures, not a local view
         let bystander = MeshNodeListCheckpointManager::new(
             Arc::new(NodeIdentity::generate()),
             Arc::clone(&db),
@@ -1100,7 +1444,7 @@ mod tests {
         let db2 = Arc::new(Database::in_memory().expect("db2"));
         register_elders(&db2, &elders);
         let send2: BroadcastFn = Arc::new(|_, _| Ok(()));
-        let compute2: ComputeNodeListFn = Arc::new(|_, _| None);
+        let compute2: ComputeAdvertsFn = Arc::new(|_| None);
         let bystander2 = MeshNodeListCheckpointManager::new(
             Arc::new(NodeIdentity::generate()),
             Arc::clone(&db2),

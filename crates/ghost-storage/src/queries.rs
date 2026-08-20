@@ -8762,6 +8762,12 @@ pub struct MeshNodeListCheckpointRecord {
     pub signer_set_delta: (Vec<[u8; 32]>, Vec<[u8; 32]>),
     /// Approver signatures over the vote signing message: `(voter_id, signature)` (64-byte sigs).
     pub approvals: Vec<([u8; 32], Vec<u8>)>,
+    /// The self-signed endpoint adverts this checkpoint adopted, as canonical JSON.
+    ///
+    /// Kept so a served or re-synced checkpoint can be RE-DERIVED rather than trusted: the
+    /// `advert_root` is inside `checkpoint_hash`, so without these the proposer signature
+    /// cannot even be reconstructed.
+    pub adverts_json: String,
 }
 
 /// Decode a `mesh_node_list_checkpoints` row tuple into a record; returns `None` on a malformed
@@ -8778,11 +8784,26 @@ fn mesh_row_to_record(
     list_root.copy_from_slice(&list_root_b);
     let mut signer_set_root = [0u8; 32];
     signer_set_root.copy_from_slice(&signer_root_b);
-    let (nodes, signer_set_delta, approvals): (
+    type Legacy = (
         Vec<([u8; 32], String, u16, u16)>,
         (Vec<[u8; 32]>, Vec<[u8; 32]>),
         Vec<([u8; 32], Vec<u8>)>,
-    ) = serde_json::from_slice(&detail).ok()?;
+    );
+    // Adverts joined `detail` after the fact. Try the current shape, then fall back to the
+    // pre-advert one rather than returning None: `.ok()?` here would drop a checkpoint row
+    // ENTIRELY and silently, which reads at the call site as "no checkpoint exists" — the
+    // wrong answer, arrived at without a word in the logs.
+    //
+    // In practice no such row exists on any node (the gate is `u64::MAX` and nothing has ever
+    // finalised), so the fallback is belt-and-braces, not a migration path being relied on.
+    let (nodes, signer_set_delta, approvals, adverts_json) =
+        match serde_json::from_slice::<(Legacy, String)>(&detail) {
+            Ok(((n, d, a), adv)) => (n, d, a, adv),
+            Err(_) => {
+                let (n, d, a): Legacy = serde_json::from_slice(&detail).ok()?;
+                (n, d, a, "[]".to_string())
+            }
+        };
     Some(MeshNodeListCheckpointRecord {
         height: height as u64,
         cutoff_ts,
@@ -8794,6 +8815,7 @@ fn mesh_row_to_record(
         nodes,
         signer_set_delta,
         approvals,
+        adverts_json,
     })
 }
 
@@ -9539,8 +9561,11 @@ impl Database {
         &self,
         r: &MeshNodeListCheckpointRecord,
     ) -> GhostResult<()> {
-        let detail = serde_json::to_vec(&(&r.nodes, &r.signer_set_delta, &r.approvals))
-            .map_err(|e| GhostError::Database(e.to_string()))?;
+        let detail = serde_json::to_vec(&(
+            (&r.nodes, &r.signer_set_delta, &r.approvals),
+            &r.adverts_json,
+        ))
+        .map_err(|e| GhostError::Database(e.to_string()))?;
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO mesh_node_list_checkpoints
@@ -10886,6 +10911,9 @@ mod tests {
             ],
             signer_set_delta: (vec![[2u8; 32]], vec![]),
             approvals: vec![([1u8; 32], vec![5u8; 64]), ([2u8; 32], vec![6u8; 64])],
+            // Round-tripped verbatim: `advert_root` is inside `checkpoint_hash`, so adverts
+            // that do not survive storage make the proposer signature unverifiable.
+            adverts_json: r#"[{"node_id":"aa","host":"h"}]"#.to_string(),
         };
         db.upsert_mesh_node_list_checkpoint(&rec).unwrap();
 
@@ -10899,6 +10927,10 @@ mod tests {
         assert_eq!(got.signer_set_delta.0, vec![[2u8; 32]]);
         assert_eq!(got.approvals.len(), 2);
         assert_eq!(got.approvals[1].1, vec![6u8; 64]);
+        // Verbatim, not merely present: the adverts are hashed into `advert_root`, which is
+        // inside `checkpoint_hash`, so a byte lost here makes the proposer signature
+        // unverifiable for ever after.
+        assert_eq!(got.adverts_json, r#"[{"node_id":"aa","host":"h"}]"#);
 
         // Idempotent by height (INSERT OR REPLACE), and range reads behave.
         db.upsert_mesh_node_list_checkpoint(&rec).unwrap();
