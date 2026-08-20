@@ -466,7 +466,7 @@ pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 
 /// The payout checkpoint takes its miner work from the SHARD, not the legacy unpaid ledger (#722).
-/// **ARMED at 964_500.**
+/// **ARMED at 963_388.**
 ///
 /// Migration v56 handed `shares` to the shard and, at `main.rs`'s `shard_owns_evidence` latch,
 /// switched OFF the GHOST-03 ledger sweep that repaired it — while the checkpoint carried on
@@ -486,11 +486,25 @@ pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 /// ⚠ Both the root fn and the diagnostic fn must move together. A diagnostic left reading the old
 /// source would describe a divergence that is not the one the vote actually turned on.
 ///
-/// 964_500 is ~1,150 blocks beyond the tip at the time of arming (963_347), which at the observed
-/// ~8-10 min/block is roughly a week — room for the build, CI, canary soak and a rolling deploy to
-/// all eight nodes, with the margin this needs because a node still on the old source at the gate
-/// diverges from the fleet exactly the way v56 did. It does NOT ride the Stage 6 deletion release.
-pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 964_500;
+/// 963_388 is 30 blocks beyond the tip at arming (963_358 at 2026-08-20 23:14 UTC). The last 12
+/// blocks ran at 13.5 min each, which puts the gate ~6.7 hours out; if the rate returns to ~8
+/// min it is ~4.0 hours. Sized against the FAST case deliberately — the deploy must finish
+/// before the gate, never the other way round.
+///
+/// ⚠ A node still on the old source when this fires computes its root from the legacy ledger and
+/// diverges from the fleet exactly the way v56 did. That is the failure this gate exists to end,
+/// so the ordering is the whole point: merge, canary, soak, roll all eight, THEN let the gate
+/// arrive. `scripts/soak-test-l2.sh` flags `checkpoint-divergence` as critical and is the
+/// detector if the roll runs late.
+///
+/// The cost of arriving late is bounded and self-clearing: nodes on either source reject each
+/// other's proposals, which extends the existing outage rather than creating a new state, and it
+/// resolves as soon as the last node is upgraded. That is what makes a short fuse defensible
+/// here; it would not be if the divergence were permanent, which is precisely the legacy
+/// ledger's problem.
+///
+/// It does NOT ride the Stage 6 deletion release.
+pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 963_388;
 
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
