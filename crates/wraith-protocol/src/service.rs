@@ -33,6 +33,10 @@ pub struct SeatedCoordinator {
     pub node_id: CoordinatorNodeId,
     /// Seat index `0..seats`; sessions shard onto seats via `shard_for`.
     pub seat: u32,
+    /// The sortition hash that won the seat. Published so a consumer can
+    /// recompute the draw and see *why* this node holds it, rather than
+    /// taking the seat list on trust (#697).
+    pub rank: [u8; 32],
     /// The endpoint a wallet dials for this seat, or `None` if the owner hasn't
     /// advertised one yet (the wallet then waits or picks another epoch).
     pub endpoint: Option<String>,
@@ -91,6 +95,7 @@ impl CoordinatorView {
             .map(|c| SeatedCoordinator {
                 node_id: c.node_id,
                 seat: c.seat,
+                rank: c.rank,
                 endpoint: self.endpoints.get(&c.node_id).cloned(),
             })
             .collect();

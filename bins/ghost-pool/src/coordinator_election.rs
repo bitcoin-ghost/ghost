@@ -142,6 +142,17 @@ fn anchor_from_block_hash_hex(hex_str: &str) -> Option<[u8; 32]> {
 struct Cached {
     epoch: u64,
     view: CoordinatorView,
+    /// The beacon the draw was made with, and the roster it drew from.
+    ///
+    /// Published alongside the result so a wallet can recompute the election
+    /// and check it (`sortition::verify_election`) rather than believing the
+    /// seat list it is handed. Without these two the draw is unfalsifiable:
+    /// anyone relaying the view could seat whoever they liked (#697).
+    beacon: [u8; 32],
+    roster: Vec<CoordinatorNodeId>,
+    /// Height of the block whose hash the beacon is derived from, so the
+    /// beacon itself can be re-derived straight from the chain.
+    anchor_height: u64,
 }
 
 /// Live coordinator-election service for ghost-pool.
@@ -291,7 +302,13 @@ impl CoordinatorElection {
         let (roster, endpoints, demand) = self.roster_with_endpoints();
         let seats = seats_for_demand(demand, roster.len());
         let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, seats);
-        *self.cached.write() = Some(Cached { epoch, view });
+        *self.cached.write() = Some(Cached {
+            epoch,
+            view,
+            beacon,
+            roster,
+            anchor_height: anchor_height_for_epoch(epoch),
+        });
         epoch
     }
 
@@ -324,6 +341,9 @@ impl CoordinatorElection {
                 "my_seat": serde_json::Value::Null,
                 "elected": [],
                 "coordinators": [],
+                "beacon": serde_json::Value::Null,
+                "anchor_height": serde_json::Value::Null,
+                "roster": [],
             });
         };
 
@@ -335,6 +355,7 @@ impl CoordinatorElection {
                 serde_json::json!({
                     "node_id": hex::encode(s.node_id),
                     "seat": s.seat,
+                    "rank": hex::encode(s.rank),
                     "endpoint": s.endpoint,
                 })
             })
@@ -346,6 +367,14 @@ impl CoordinatorElection {
             "my_seat": c.view.my_seat(&self.self_id),
             "elected": elected,
             "coordinators": coordinators,
+            // The draw's inputs, so a consumer can recompute it rather than
+            // trust it (#697). `beacon` is SHA256(domain ‖ epoch ‖ anchor
+            // hash), and `anchor_height` names the block that anchor comes
+            // from — so the beacon is re-derivable straight from the chain
+            // and a publisher cannot invent one.
+            "beacon": hex::encode(c.beacon),
+            "anchor_height": c.anchor_height,
+            "roster": c.roster.iter().map(hex::encode).collect::<Vec<_>>(),
         })
     }
 }

@@ -198,37 +198,35 @@ impl CoordinatorSupervisor {
 mod tests {
     use super::*;
 
-    fn cfg(
-        enabled: bool,
-        network: Network,
-        bond_ledger_url: Option<&str>,
-    ) -> CoordinatorRoleConfig {
+    fn cfg(enabled: bool, network: Network, ghostd_rpc_url: &str) -> CoordinatorRoleConfig {
         CoordinatorRoleConfig {
             enabled,
             network,
             listen: "0.0.0.0:9100".parse().unwrap(),
-            bond_ledger_url: bond_ledger_url.map(String::from),
-            bond_ledger_token: bond_ledger_url.map(|_| "tok".to_string()),
-            node_id: [0u8; 32],
             fee_address: None,
-            ghostd_rpc_url: "http://127.0.0.1:8332".to_string(),
+            ghostd_rpc_url: ghostd_rpc_url.to_string(),
             ghostd_rpc_user: "u".to_string(),
             ghostd_rpc_password: "p".to_string(),
         }
     }
 
+    /// The mainnet gate moved with the bonds (#699). It used to demand a
+    /// ghost-pay bond ledger; a coordinator's non-optional dependency is now
+    /// a node it can check participants' inputs against, because without one
+    /// registration would take every input on trust.
     #[test]
-    fn mainnet_without_bond_ledger_is_refused_only_when_activating() {
-        // Refused: activating on mainnet with no bond ledger.
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Bitcoin, None)).is_some());
-        // Allowed: mainnet WITH a bond ledger.
+    fn mainnet_without_a_node_is_refused_only_when_activating() {
+        // Refused: activating on mainnet with no ghostd RPC.
+        assert!(mainnet_activation_refusal(&cfg(true, Network::Bitcoin, "")).is_some());
+        // Allowed: mainnet WITH one.
         assert!(
-            mainnet_activation_refusal(&cfg(true, Network::Bitcoin, Some("http://bond"))).is_none()
+            mainnet_activation_refusal(&cfg(true, Network::Bitcoin, "http://127.0.0.1:8332"))
+                .is_none()
         );
-        // Allowed: not activating (disabled) — gate doesn't apply.
-        assert!(mainnet_activation_refusal(&cfg(false, Network::Bitcoin, None)).is_none());
-        // Allowed: test nets may run without a real bond ledger.
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Signet, None)).is_none());
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Regtest, None)).is_none());
+        // Allowed: not activating (disabled) — the gate doesn't apply.
+        assert!(mainnet_activation_refusal(&cfg(false, Network::Bitcoin, "")).is_none());
+        // Allowed: test nets may run without one.
+        assert!(mainnet_activation_refusal(&cfg(true, Network::Signet, "")).is_none());
+        assert!(mainnet_activation_refusal(&cfg(true, Network::Regtest, "")).is_none());
     }
 }
