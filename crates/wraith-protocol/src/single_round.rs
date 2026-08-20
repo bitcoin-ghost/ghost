@@ -962,13 +962,13 @@ mod seat_price {
                 }
         };
 
-        assert_eq!(price(LiteTier::Denom100kSats, SessionType::Mix), 101_596);
+        assert_eq!(price(LiteTier::Denom100kSats, SessionType::Mix), 102_096);
         assert_eq!(price(LiteTier::Denom100kSats, SessionType::Jump), 101_010);
-        assert_eq!(price(LiteTier::Denom1mSats, SessionType::Mix), 1_006_096);
-        assert_eq!(price(LiteTier::Denom10mSats, SessionType::Mix), 10_051_096);
+        assert_eq!(price(LiteTier::Denom1mSats, SessionType::Mix), 1_003_596);
+        assert_eq!(price(LiteTier::Denom10mSats, SessionType::Mix), 10_026_096);
         assert_eq!(
             price(LiteTier::Denom100mSats, SessionType::Mix),
-            100_501_096
+            100_251_096
         );
 
         // A Jump seat is cheaper than a Mix seat by the service fee itself

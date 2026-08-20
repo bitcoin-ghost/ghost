@@ -26,7 +26,7 @@ const TIER_ID: &str = "100k_sats";
 const TIER_DENOM: u64 = 100_000;
 /// The exact input a 100k-tier Mix seat costs. Rounds have no change output
 /// (#698), so a participant brings this to the satoshi or is refused.
-const SEAT_PRICE: u64 = 101_596;
+const SEAT_PRICE: u64 = 102_096;
 const N: usize = 5;
 
 /// Generate the i-th deterministic signet P2WPKH address. Same scheme

@@ -278,7 +278,7 @@ async fn discover_endpoint_returns_full_tier_table() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["network"], "signet");
     assert_eq!(json["pool_id"], "wraith-pool-signet");
-    assert_eq!(json["service_fee_bps"], 50);
+    assert_eq!(json["service_fee_bps"], 25);
     assert_eq!(json["fill_window_secs"], 300);
 
     // The seat price the wallet must split its coin to match. Published so
@@ -305,7 +305,8 @@ async fn discover_endpoint_returns_full_tier_table() {
     assert_eq!(smallest["denomination_sats"], 100_000);
     assert_eq!(smallest["min_participants"], 5);
     assert_eq!(smallest["max_participants"], 20);
-    assert_eq!(smallest["service_fee_sats"], 500);
+    // 25 bps of 100k is 250, so the 1,000-sat floor binds here (spec §9.1).
+    assert_eq!(smallest["service_fee_sats"], 1_000);
 }
 
 #[tokio::test]
@@ -663,7 +664,7 @@ const MIN_5: usize = 5;
 /// The exact input a 100k-tier Mix seat costs: denomination + mining-fee
 /// share + service-fee share. Rounds have no change output (#698), so this
 /// is the only acceptable value, not a floor.
-const EXACT_INPUT_100K_MIX: u64 = 101_596;
+const EXACT_INPUT_100K_MIX: u64 = 102_096;
 
 /// A scriptPubKey with no address form at all. Registration has to
 /// refuse it rather than panic deriving an address to check a proof
