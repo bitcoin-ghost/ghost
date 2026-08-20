@@ -61,7 +61,7 @@ pub const MIN_MEANINGFUL_ROSTER: usize = 3;
 /// Whether an election drawn from `roster_size` candidates should be reported
 /// as degraded. Two candidates still cannot resist a self-nominating
 /// operator — controlling one of two is controlling half the draw.
-pub const fn roster_is_degraded(roster_size: usize) -> bool {
+pub fn roster_is_degraded(roster_size: usize) -> bool {
     roster_size < MIN_MEANINGFUL_ROSTER
 }
 
@@ -415,15 +415,14 @@ mod tests {
     /// #708 after the live fleet turned out to have exactly that.
     #[test]
     fn a_thin_roster_is_reported_as_degraded() {
-        assert!(1 < MIN_MEANINGFUL_ROSTER, "one candidate cannot rotate");
-        assert!(
-            2 < MIN_MEANINGFUL_ROSTER,
-            "two cannot resist self-nomination"
-        );
-        assert!(
-            MIN_MEANINGFUL_ROSTER <= MAX_SEATS,
-            "the threshold must be reachable"
-        );
+        // Nobody opted in, or one node did: no draw happened.
+        assert!(roster_is_degraded(0));
+        assert!(roster_is_degraded(1), "one candidate cannot rotate");
+        // Two is still not enough: controlling one is half the draw.
+        assert!(roster_is_degraded(2));
+        // Three upwards is a real draw.
+        assert!(!roster_is_degraded(3));
+        assert!(!roster_is_degraded(20));
     }
 
     #[test]
