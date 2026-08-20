@@ -9,14 +9,10 @@
 //! The `WraithResolveCoordinator` IPC request exposes it; the GUI "use the
 //! network-elected coordinator" toggle that calls it is the deferred next task.
 
-use sha2::{Digest, Sha256};
 use wraith_protocol::sortition::{
     shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,
 };
 use wraith_protocol::{derive_beacon, snapshot_height_for_epoch};
-
-/// Domain separator for the coordinator shard key.
-const SHARD_KEY_DOMAIN: &[u8] = b"ghost/wraith/coordinator-shard/v1";
 
 /// Why a published election is recomputed before it is used.
 ///
@@ -168,19 +164,14 @@ pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> O
         .map(String::from)
 }
 
-/// Derive the shard key a wallet uses to pick its coordinator seat, from the mix
-/// `(tier_id, epoch)`. Sharding on (tier, epoch) — rather than a per-mix session
-/// id, which doesn't exist until the coordinator creates it — makes every wallet
-/// wanting the same denomination in the same epoch converge on the SAME seat, for
-/// a larger anonymity set. `tier_id` is the protocol's string tier id.
-/// `SHA256(domain || tier_id_bytes || epoch_le)`.
-pub fn shard_key_for_tier_epoch(tier_id: &str, epoch: u64) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(SHARD_KEY_DOMAIN);
-    h.update(tier_id.as_bytes());
-    h.update(epoch.to_le_bytes());
-    h.finalize().into()
-}
+/// The shard key comes from `wraith_protocol`, not from here.
+///
+/// It used to be defined in this file, which meant the value a wallet shards
+/// on lived somewhere a node could not reach — and the library carried a
+/// *different* scheme (by session id) documented as the one "a wallet and
+/// every node agree" on, with no callers. Two schemes, different answers, and
+/// the dead one inviting whoever wired it up next.
+pub use wraith_protocol::shard_key_for_tier_epoch;
 
 /// Resolve the coordinator endpoint for a mix of `tier_id` from a node's election
 /// JSON (as relayed by ghost-pay). Returns `(endpoint, epoch)`: `endpoint` is
