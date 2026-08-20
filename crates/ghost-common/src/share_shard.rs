@@ -1728,6 +1728,84 @@ mod tests {
         );
     }
 
+    /// The contract the payout checkpoint hangs money on: **equal root ⇒ equal `owed()`**.
+    ///
+    /// The checkpoint adopts a proposer's miner list on root equality alone rather than
+    /// recomputing it, so this implication is not a nicety — it is the whole reason the
+    /// adoption is safe. `owed()` derives from `accrued` and `settled`, and
+    /// [`ShardTable::compute_table_root`] must therefore commit to BOTH; the sibling test
+    /// above pins that each of them moves the root.
+    ///
+    /// This one pins the direction that test cannot: that two tables agreeing on the root
+    /// agree on every payable balance, whatever order they were built in. If someone later
+    /// narrows the root — drops `settled`, drops per-node attribution, stops length-prefixing
+    /// — the checkpoint would start adopting a split the fleet does not actually agree on,
+    /// silently. That failure pays real satoshis to the wrong addresses, so it gets its own
+    /// named test rather than riding on the encoding test's coattails.
+    #[test]
+    fn equal_table_root_implies_equal_owed() {
+        let n1 = [0x01; 32];
+        let n2 = [0x02; 32];
+
+        // Same content, deliberately different construction order and column interleaving.
+        let mut a = ShardTable::new();
+        a.accrue(n1, "bc1qalice", 7);
+        a.accrue(n2, "bc1qalice", 3);
+        a.accrue(n1, "bc1qbob", 11);
+        a.record_settled("bc1qalice", 5);
+
+        let mut b = ShardTable::new();
+        b.record_settled("bc1qalice", 5);
+        b.accrue(n1, "bc1qbob", 11);
+        b.accrue(n2, "bc1qalice", 3);
+        b.accrue(n1, "bc1qalice", 7);
+
+        assert_eq!(
+            a.compute_table_root(),
+            b.compute_table_root(),
+            "same content must reach the same root"
+        );
+        assert_eq!(a.owed(), b.owed(), "equal root but different owed — adoption is unsound");
+
+        // And every way the payable state can differ must break the root, so a voter can
+        // never adopt across it. Each case is a distinct axis: balance, settlement, and
+        // which column holds the value.
+        let mut extra_accrual = a.clone();
+        extra_accrual.accrue(n1, "bc1qalice", 1);
+
+        let mut extra_settlement = a.clone();
+        extra_settlement.record_settled("bc1qbob", 1);
+
+        let mut reattributed = ShardTable::new();
+        reattributed.accrue(n2, "bc1qalice", 7);
+        reattributed.accrue(n1, "bc1qalice", 3);
+        reattributed.accrue(n1, "bc1qbob", 11);
+        reattributed.record_settled("bc1qalice", 5);
+
+        for (label, other) in [
+            ("an extra accrual", &extra_accrual),
+            ("an extra settlement", &extra_settlement),
+            ("re-attributed columns", &reattributed),
+        ] {
+            assert_ne!(
+                a.compute_table_root(),
+                other.compute_table_root(),
+                "{label} left the root unchanged — a voter would adopt across it"
+            );
+        }
+
+        // Re-attribution is the subtle one: the per-address totals are IDENTICAL, so `owed()`
+        // matches while the root differs. That asymmetry is correct and deliberate — the root
+        // is strictly stronger than `owed()`, which is what makes it safe to adopt on. Pinned
+        // so nobody "fixes" the root to ignore attribution on the grounds that it cannot
+        // change what anyone is paid.
+        assert_eq!(
+            a.owed(),
+            reattributed.owed(),
+            "this case is meant to hold owed() constant while moving the root"
+        );
+    }
+
     /// Golden vector, pinning `ShardTableRoot/v1` at the moment the encoding was defined.
     ///
     /// If this ever fails, the encoding changed. The fix is a domain-tag version bump plus a
