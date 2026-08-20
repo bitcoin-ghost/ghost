@@ -345,6 +345,48 @@ pub fn read_adopted_payout(db: &ghost_storage::Database, tip_height: u64) -> Opt
     }
 }
 
+/// The checkpoint's miner work taken from the SHARD instead of the legacy unpaid ledger.
+///
+/// The counterpart to [`select_ledger_miner_work`], and the whole of the checkpoint half of the
+/// cutover. Same output shape — `(address, weight)` sorted work-desc then address-asc — so every
+/// downstream consumer (the root, `payouts_agree`, the adopted list the coinbase builds from) is
+/// unchanged code on both sides of the gate.
+///
+/// **Why this exists.** Migration v56 handed `shares` to the shard and disabled the GHOST-03
+/// ledger sweep that repaired it, while the checkpoint carried on recomputing from that same
+/// table. Holes in it became permanent, so no two nodes agreed a per-address total and every
+/// proposal was rejected — 25% apart on the live fleet, against a 2% tolerance, with no
+/// mechanism left to converge. The shard has one, and uses it: the per-address totals are
+/// BYTE-IDENTICAL across vm1/vm2/vm3 today.
+///
+/// The weight is `owed` micro-work rather than `WORK_SCALE`-quantised work. Only the ratios
+/// matter — the coinbase distributes `pool_sats * work / total` — and the tolerance terms that
+/// are not scale-invariant stay inert at these magnitudes (`ABS_TOL` sits ~165x below the
+/// 0.2%-of-pool floor). ⚠ That inertness is a property of the magnitudes, not of the code: if
+/// total owed ever fell below ~5e14 micro, `ABS_TOL` would silently become the governing bound.
+///
+/// Non-positive balances are dropped. `owed()` is `accrued − settled` and is documented to go
+/// negative transiently; the `i64 → u128` cast would otherwise wrap a small negative into a
+/// number larger than the entire pool. Mirrors `shard_miner_payouts`, which filters the same way
+/// on the paying side.
+///
+/// No dust filter here, unlike the legacy path: dust is applied when the coinbase is built
+/// (`shard_miner_payouts`, which knows the actual pool sats), and applying a subsidy-estimated
+/// one here as well would drop addresses the payer would have kept. The cap is
+/// `MAX_MINER_OUTPUTS` so the adopted list can never exceed what a coinbase is able to pay.
+pub fn select_shard_miner_work(
+    owed: &std::collections::BTreeMap<String, i64>,
+) -> Vec<(String, u128)> {
+    let mut rows: Vec<(String, u128)> = owed
+        .iter()
+        .filter(|(_, &micro)| micro > 0)
+        .map(|(addr, &micro)| (addr.clone(), micro as u128))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(ghost_common::constants::MAX_MINER_OUTPUTS);
+    rows
+}
+
 /// Option B cutoff-binding: a proposal's payout cutoff must be a fleet-ratified one.
 ///
 /// At and above `fee_gate_height` the coinbase is a pure function of a BFT-finalised
@@ -2636,6 +2678,73 @@ impl PayoutHandler {
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
+
+    /// `owed()` is `accrued − settled` and is documented to go negative transiently. The cast to
+    /// `u128` is where that becomes money: `-1i64 as u128` is 2^128−1, an address weighted above
+    /// the entire pool, and the coinbase splits proportionally. So the filter is not tidiness.
+    #[test]
+    fn shard_miner_work_drops_non_positive_balances_before_the_cast() {
+        let owed = std::collections::BTreeMap::from([
+            ("bc1qalice".to_string(), 500i64),
+            ("bc1qbob".to_string(), -1i64),
+            ("bc1qcarol".to_string(), 0i64),
+        ]);
+        let got = super::select_shard_miner_work(&owed);
+        assert_eq!(
+            got,
+            vec![("bc1qalice".to_string(), 500u128)],
+            "a negative or zero balance reached the output"
+        );
+        assert!(
+            got.iter().all(|(_, w)| *w < u128::MAX / 2),
+            "a negative balance wrapped through the u128 cast"
+        );
+    }
+
+    /// Canonical order: work descending, address ascending on a tie. `compute_ledger_root` sorts
+    /// internally so the root does not depend on this, but the adopted list is persisted and read
+    /// back by the coinbase builder, and a total order means two nodes cannot differ on a tie.
+    #[test]
+    fn shard_miner_work_is_ordered_work_desc_then_address_asc() {
+        let owed = std::collections::BTreeMap::from([
+            ("bc1qb".to_string(), 10i64),
+            ("bc1qa".to_string(), 10i64),
+            ("bc1qc".to_string(), 99i64),
+        ]);
+        assert_eq!(
+            super::select_shard_miner_work(&owed),
+            vec![
+                ("bc1qc".to_string(), 99u128),
+                ("bc1qa".to_string(), 10u128),
+                ("bc1qb".to_string(), 10u128),
+            ]
+        );
+    }
+
+    /// The adopted list must never be longer than a coinbase can pay, or the checkpoint ratifies
+    /// a split that cannot be built. Truncation keeps the LARGEST balances, which is why the sort
+    /// has to happen first — the reverse order would drop the addresses that matter.
+    #[test]
+    fn shard_miner_work_caps_at_max_miner_outputs_keeping_the_largest() {
+        let cap = ghost_common::constants::MAX_MINER_OUTPUTS;
+        let owed: std::collections::BTreeMap<String, i64> = (0..cap as i64 + 25)
+            .map(|i| (format!("bc1q{i:04}"), i + 1))
+            .collect();
+        let got = super::select_shard_miner_work(&owed);
+        assert_eq!(got.len(), cap, "cap not applied");
+        assert_eq!(
+            got[0].1,
+            (cap as u128) + 25,
+            "truncation kept the wrong end of the list"
+        );
+        let smallest_kept = got.last().expect("non-empty").1;
+        assert_eq!(smallest_kept, 26u128, "expected the largest `cap` balances");
+    }
+
+    #[test]
+    fn shard_miner_work_on_an_empty_shard_is_empty_not_a_panic() {
+        assert!(super::select_shard_miner_work(&std::collections::BTreeMap::new()).is_empty());
+    }
     use super::*;
 
     fn test_identity() -> Arc<NodeIdentity> {
@@ -2937,6 +3046,97 @@ mod tests {
             dust > 0,
             "the unresolvable miner's share must go to the node pool as dust, got dust={dust}"
         );
+    }
+
+    /// Block submission depends on these two agreeing, and today only a comment says they do.
+    ///
+    /// GHOST-02 compares for EXACT equality, not tolerance: `expected` is built by
+    /// `calculate_miner_payouts` from the adopted checkpoint list, `proposal.miner_payouts` by
+    /// `shard_miner_payouts` from the shard. Before #722's gate those are two different ledgers
+    /// and the check fails outright — measured on the live fleet as a 2-address frozen checkpoint
+    /// against a 5-address shard, which rejects a won block rather than mispaying it.
+    ///
+    /// After the gate both derive from the same `owed` balances, and the two functions are
+    /// documented to "differ only in WHICH balances they distribute, never in HOW". This pins
+    /// that claim, using the magnitudes actually on the fleet so the rounding is representative
+    /// rather than convenient.
+    #[test]
+    fn shard_derived_adopted_list_and_the_coinbase_split_agree_exactly() {
+        // Mainnet, not the shared regtest fixture: `calculate_miner_payouts` validates every
+        // resolved address against the configured network, so mainnet balances have to be judged
+        // by a mainnet creator or every payout is discarded as off-network.
+        let creator = {
+            let config = PayoutConfig {
+                treasury_address: Some(vec![1u8; 20]),
+                network: ghost_common::config::BitcoinNetwork::Mainnet,
+                ..Default::default()
+            };
+            let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+            PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
+        };
+        // Live vm1 balances, micro-work.
+        //
+        // Addresses must be REAL bech32: `get_miner_address` returns the key unchanged when it
+        // parses as an address and otherwise falls through to a database lookup. A placeholder
+        // like "bc1qalice" takes the second path, resolves to nothing, and the validator pays
+        // nobody — which is how this test first failed, and is worth knowing because it is also
+        // how a malformed address in the shard would behave in production: `shard_miner_payouts`
+        // does not validate addresses, so the coinbase would pay one the validator drops.
+        let owed = std::collections::BTreeMap::from([
+            (
+                "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+                76_039_051_664_125_167i64,
+            ),
+            (
+                "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
+                3_494_065_686_437_835i64,
+            ),
+            (
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                2_503_874_639_417_892i64,
+            ),
+            (
+                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3".to_string(),
+                532_541_467_700_909i64,
+            ),
+            (
+                "bc1pmfr3p9j00pfxjh0zmgp99y8zftmd3s5pmedqhyptwy6lm87hf5sspknck9".to_string(),
+                9_741_908_758_669i64,
+            ),
+        ]);
+        // 99% of a 3.125 BTC subsidy — the miner pool at the current halving era.
+        let miner_pool: u64 = 309_375_000;
+
+        // What a validator recomputes from the adopted checkpoint, post-gate.
+        let adopted = super::select_shard_miner_work(&owed);
+        let (expected, _dust) = creator
+            .calculate_miner_payouts(&adopted, miner_pool)
+            .expect("recompute");
+        let expected_map: std::collections::BTreeMap<String, u64> = expected
+            .iter()
+            .map(|e| {
+                (
+                    String::from_utf8(e.address.clone()).expect("utf8 address"),
+                    e.amount,
+                )
+            })
+            .collect();
+
+        // What the coinbase actually pays.
+        let paid = ghost_common::share_shard::shard_miner_payouts(
+            &owed,
+            miner_pool,
+            ghost_common::constants::MAX_MINER_OUTPUTS,
+            super::LEDGER_DUST_SATS,
+        );
+        let paid_map: std::collections::BTreeMap<String, u64> =
+            paid.payouts.iter().cloned().collect();
+
+        assert_eq!(
+            expected_map, paid_map,
+            "the adopted list and the coinbase disagree — GHOST-02 rejects the block"
+        );
+        assert!(!expected_map.is_empty(), "the fixture paid nobody");
     }
 
     fn ghost02_creator() -> PayoutProposalCreator {
