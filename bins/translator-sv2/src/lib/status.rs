@@ -93,7 +93,7 @@ async fn send_status<O>(sender: &StatusSender, error: TproxyError<O>) -> bool {
         Disconnect(downstream_id) => {
             let state = State::DownstreamShutdown {
                 downstream_id,
-                reason: error.kind,
+                reason: *error.kind,
             };
 
             if let Err(e) = sender.send(Status { state }).await {
@@ -108,7 +108,7 @@ async fn send_status<O>(sender: &StatusSender, error: TproxyError<O>) -> bool {
         }
 
         Fallback => {
-            let state = State::UpstreamShutdown(error.kind);
+            let state = State::UpstreamShutdown(*error.kind);
 
             if let Err(e) = sender.send(Status { state }).await {
                 tracing::error!("Failed to send fallback status from {:?}: {:?}", sender, e);
@@ -124,16 +124,16 @@ async fn send_status<O>(sender: &StatusSender, error: TproxyError<O>) -> bool {
                         "Channel Manager shutdown requested due to error: {:?}",
                         error.kind
                     );
-                    State::ChannelManagerShutdown(error.kind)
+                    State::ChannelManagerShutdown(*error.kind)
                 }
                 StatusSender::Sv1Server(_) => {
                     warn!(
                         "Sv1Server shutdown requested due to error: {:?}",
                         error.kind
                     );
-                    State::Sv1ServerShutdown(error.kind)
+                    State::Sv1ServerShutdown(*error.kind)
                 }
-                _ => State::ChannelManagerShutdown(error.kind),
+                _ => State::ChannelManagerShutdown(*error.kind),
             };
 
             if let Err(e) = sender.send(Status { state }).await {
