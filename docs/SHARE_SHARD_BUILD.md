@@ -473,9 +473,11 @@ scaffolding ~1.4k · gate collapse ~600.
 
 ⚠ **That total is stale as of 2026-08-19 and reads high, but by less than first thought.** Of the
 three open decisions, one resolved towards *keeping* code: the voting layer (4,578 lines) survives
-with elder revocation, so the BFT payout path's ~11–12k shrinks by up to that much. The mesh
-node-list checkpoint stays in the deletion budget — an earlier "keep it" correction was itself wrong
-and is retracted below. Re-count the payout path before quoting a Stage 6 size to anyone.
+with elder revocation, so the BFT payout path's ~11–12k shrinks by up to that much. ⚠ The mesh
+node-list checkpoint has since LEFT the deletion budget again (#715): the reason it was deletable —
+that it could not converge and so could never be armed — was fixed rather than accepted. That takes
+~1.4k of "dormant scaffolding" off the total. Re-count the payout path before quoting a Stage 6 size
+to anyone.
 
 **DONE 2026-08-19 — SBC layer deleted, net −8,600 lines.** ~9.6k of candidate files were counted;
 the delivered figure is lower because **the layer was not separable**. The shard was built ON TOP of
@@ -618,30 +620,20 @@ Consequences for Stage 6:
   ⚠ That initial delay is a `sleep`, not the old tick-and-discard: at a 24-hour period the old
   pattern would have meant a node restarting more often than daily never runs the check at all.
 
-**~~Mesh node-list checkpoint~~ BLOCKED 2026-08-19 — it is neither deletable nor armable. Decide.**
-It is not scaffolding: it is the producing half of #402. The pool finalises the signed blob and serves
-it at `/api/v1/pool/mesh-node-list-checkpoint` (`routes.rs:244`, `main.rs:8069`); `ghost-miner-proxy`
-fetches that URL every refresh and verifies it offline against a baked-in genesis signer set
-(`checkpoint.rs:1-9`, "the security core of the shim"). Delete the producer and the shim has nothing
-to verify — #402's implementation dies with it.
+**~~Mesh node-list checkpoint~~ RESOLVED 2026-08-20 — KEPT, and it works now (#715).**
+It was neither deletable nor armable: deleting the producer would kill #402's shim, and arming was
+blocked by #625 — the node set came from each node's own 120-second liveness view, so eight nodes
+produced up to six different answers and nothing could ever finalise.
 
-It cannot simply be armed either. #625: the node set comes from a per-node 120 s liveness view, so the
-blob cannot be byte-identical fleet-wide — which is exactly #402's acceptance criterion — and nothing
-is proposed below the gate, so convergence is unobservable until it is already live.
+Fixed rather than accepted. Membership now comes from the ratified qualified set (identical
+fleet-wide by construction, and already carrying liveness via the stratum handshake challenge), and
+endpoints come from adverts each node signs for itself, carried in the proposal. A voter re-derives
+from the proposal's bytes plus ratified state, consulting nothing local.
 
-So the options are (a) delete both halves and rebuild discovery later, (b) keep it dormant and let
-Stage 6 step around it, or (c) fix #625 first and arm it. That is an operator decision, not a
-mechanical cleanup, and Stage 6's "dormant scaffolding ~1.4k" line cannot be actioned until it is made.
-
-⚠ **Two retracted claims, recorded because both mistakes are repeatable.**
-1. "Keep it — 6 consumers in `ghost-miner-proxy`." A grep over that directory does return 6 hits, and
-   every one is a message *type* name resolved from `ghost_consensus::message`. The count was
-   verified; the referent was not. Count what the matches point AT.
-2. "Delete it — the proxy is independent, it has its own BFT." Also wrong, and wrong in the more
-   dangerous direction: the proxy's threshold is the *verification* side of the same protocol, and its
-   dependency on the pool module is a RUNTIME one over HTTP. **No code reference exists to grep for.**
-   A clean `grep -r` across the workspace is not evidence that nothing depends on a module — it is
-   evidence that nothing *links* against it. Check what serves the endpoints too.
+⚠ Still dormant: `MESH_NODE_LIST_CHECKPOINT_HEIGHT` remains `u64::MAX`. Arming needs the fleet-wide
+measurement the new convergence endpoint makes possible — curl it on all eight and diff `list_root`
+and `advert_root` — plus #402's independently-operated seeds, which no code can supply while one
+operator runs every node.
 
 Consequence: `widen_voter_set` and `active_is_superset_of_elders` (`payout_checkpoint.rs:490`, `:499`)
 have **no consumer that survives Stage 6** — the payout checkpoint (deleted), the mesh checkpoint
