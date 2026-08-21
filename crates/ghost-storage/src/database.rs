@@ -1612,21 +1612,35 @@ mod tests {
     /// 2.1GB file it needed ~2.8GB resident and the kernel OOM-killed the process on the
     /// hour. Heap profiling attributed 96.9% of all allocation to that one call.
     ///
-    /// A fresh database has an empty freelist, so this asserts the cheap path is taken and
-    /// the database is still usable afterwards.
+    /// A fresh database's freelist holds only the handful of pages that migration v57
+    /// released when it dropped `wraith_bonds` — far below the threshold — so this asserts
+    /// the cheap path is taken and the database is still usable afterwards.
+    ///
+    /// It used to assert an empty freelist. That stopped being true when v57 landed: a
+    /// migration chain that creates a table and later drops it leaves free pages behind in
+    /// every database that runs the whole chain. The property worth guarding was never
+    /// "zero" — it is "not enough to be worth a rebuild".
     #[test]
     fn optimize_skips_vacuum_when_nothing_to_reclaim() {
         let db = Database::in_memory().expect("create in-memory database");
 
-        let freelist_before: i64 = db
+        let (freelist_before, page_size): (i64, i64) = db
             .with_connection(|conn| {
-                conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))
-                    .map_err(|e| GhostError::Database(e.to_string()))
+                let f = conn
+                    .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                let p = conn
+                    .query_row("PRAGMA page_size", [], |row| row.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                Ok((f, p))
             })
             .expect("read freelist");
-        assert_eq!(
-            freelist_before, 0,
-            "a fresh database should have no free pages"
+        let reclaimable = freelist_before * page_size;
+        assert!(
+            (reclaimable as u64) < Database::VACUUM_MIN_RECLAIMABLE_BYTES,
+            "a fresh database holds {reclaimable} reclaimable bytes, at or above the \
+             {}-byte threshold — optimize would rebuild it",
+            Database::VACUUM_MIN_RECLAIMABLE_BYTES
         );
 
         db.optimize().expect("optimize must succeed");

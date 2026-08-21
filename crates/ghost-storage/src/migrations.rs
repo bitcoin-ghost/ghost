@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 56;
+const SCHEMA_VERSION: u32 = 57;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -133,6 +133,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (54, migrate_v54),
         (55, migrate_v55),
         (56, migrate_v56),
+        (57, migrate_v57),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2729,6 +2730,56 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 /// database backup plus the `.bak` binary, exactly as Stage 0 specified. The point of no return
 /// is `DROP TABLE shares_archive`, which this migration does not do and nothing should until v1
 /// has shipped.
+/// v57: drop `wraith_bonds`, the Wraith bond escrow ledger.
+///
+/// v38 created it. The bond subsystem it served is gone — bonds punished
+/// register-then-refuse-to-sign, which an ownership proof plus an outpoint
+/// cooldown now does without holding anyone's money — and no code reads or
+/// writes the table any more.
+///
+/// **It verifies the table is empty rather than trusting that it is.** The
+/// coordinator only ever ran against a mock ledger, and eleven days of
+/// ghost-pay logs showed no escrow activity, but a migration that destroys
+/// rows should establish that for itself rather than inherit someone's
+/// recollection. A non-empty table aborts the migration with the row count,
+/// leaving the database untouched at v56 — those sats were withheld from
+/// someone's spendable balance and they need resolving, not deleting.
+fn migrate_v57(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v57: drop wraith_bonds");
+
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wraith_bonds'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        debug!("v57: no `wraith_bonds` table — nothing to drop");
+        return Ok(());
+    }
+
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM wraith_bonds", [], |r| r.get(0))
+        .map_err(|e| GhostError::Migration(format!("v57: cannot count `wraith_bonds`: {e}")))?;
+    if rows != 0 {
+        return Err(GhostError::Migration(format!(
+            "v57: refusing to drop `wraith_bonds` — it holds {rows} row(s). Every escrowed bond \
+             subtracted from its owner's spendable L2 balance, so dropping the table would \
+             silently release or strand those sats. Resolve them first, then re-run."
+        )));
+    }
+
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_wraith_bonds_live;
+         DROP TABLE IF EXISTS wraith_bonds;",
+    )
+    .map_err(|e| GhostError::Migration(format!("v57: cannot drop `wraith_bonds`: {e}")))?;
+
+    debug!("v57: dropped `wraith_bonds` and its index");
+    Ok(())
+}
+
 fn migrate_v56(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v56: shares -> shares_archive, fresh `shares`, `shares_all` view");
 
@@ -3788,86 +3839,76 @@ mod tests {
         assert_eq!(pragma_version, SCHEMA_VERSION);
     }
 
+    /// v38 created `wraith_bonds`; v57 drops it. A database that runs the
+    /// whole chain ends with no such table.
+    ///
+    /// This replaced a test asserting the table exists after `run_migrations`,
+    /// which was correct until the bond subsystem was deleted. The v38
+    /// migration is still exercised — it runs as part of the chain — but what
+    /// is worth asserting now is the end state.
     #[test]
-    fn test_v38_wraith_bonds_table_and_partial_unique_index() {
+    fn test_v57_drops_the_wraith_bonds_table() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        // Table exists.
         let tables = get_table_names(&conn);
         assert!(
-            tables.contains(&"wraith_bonds".to_string()),
-            "v38 wraith_bonds table missing. Found: {:?}",
+            !tables.contains(&"wraith_bonds".to_string()),
+            "v57 should have dropped wraith_bonds. Found: {:?}",
             tables
         );
 
-        // The partial unique index exists.
-        let index_names: Vec<String> = conn
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wraith_bonds'",
-            )
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index'")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         assert!(
-            index_names.contains(&"idx_wraith_bonds_live".to_string()),
-            "v38 partial unique index missing. Found: {:?}",
-            index_names
+            !indexes.contains(&"idx_wraith_bonds_live".to_string()),
+            "v57 should have dropped the bond index too. Found: {:?}",
+            indexes
         );
+    }
 
-        // First escrowed bond for (alice, sess-1) inserts fine.
-        conn.execute(
-            "INSERT INTO wraith_bonds
-                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
-             VALUES ('b1', 'alice', 'sess-1', 500, 'escrowed', NULL, 100, NULL)",
-            [],
+    /// The drop refuses a table that still holds rows, and leaves the database
+    /// alone when it does.
+    ///
+    /// Every escrowed bond subtracted from its owner's spendable L2 balance,
+    /// so dropping the table with rows in it would silently release or strand
+    /// those sats. The migration establishes emptiness itself rather than
+    /// inheriting anyone's recollection that nothing was ever escrowed.
+    #[test]
+    fn v57_refuses_to_drop_a_wraith_bonds_table_that_still_holds_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Recreate v38's shape, then put a bond in it.
+        conn.execute_batch(
+            "CREATE TABLE wraith_bonds (
+                 bond_id TEXT PRIMARY KEY,
+                 ghost_id TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 amount_sats INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 resolution TEXT,
+                 created_at INTEGER NOT NULL,
+                 resolved_at INTEGER
+             );
+             INSERT INTO wraith_bonds
+                 (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
+             VALUES ('b1', 'alice', 'sess-1', 500, 'escrowed', NULL, 100, NULL);",
         )
         .unwrap();
 
-        // A SECOND escrowed bond for the same (ghost_id, session_id) is
-        // rejected by the partial unique index.
-        let dup = conn.execute(
-            "INSERT INTO wraith_bonds
-                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
-             VALUES ('b2', 'alice', 'sess-1', 500, 'escrowed', NULL, 101, NULL)",
-            [],
-        );
-        assert!(
-            dup.is_err(),
-            "second escrowed bond for the same (ghost_id, session_id) must be rejected"
-        );
+        let err = migrate_v57(&conn).expect_err("a non-empty table must not be dropped");
+        let msg = err.to_string();
+        assert!(msg.contains("1 row"), "the error must say how many: {msg}");
 
-        // Resolve the first bond (refund) — frees the partial-unique slot.
-        conn.execute(
-            "UPDATE wraith_bonds SET status='refunded', resolved_at=200 WHERE bond_id='b1'",
-            [],
-        )
-        .unwrap();
-
-        // Now a fresh escrowed bond for the same pair is allowed.
-        conn.execute(
-            "INSERT INTO wraith_bonds
-                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
-             VALUES ('b3', 'alice', 'sess-1', 500, 'escrowed', NULL, 201, NULL)",
-            [],
-        )
-        .expect("a new escrowed bond must be allowed once the prior one is refunded");
-
-        // A slashed prior bond likewise frees the slot for one more escrow.
-        conn.execute(
-            "UPDATE wraith_bonds SET status='slashed', resolution='x', resolved_at=300 WHERE bond_id='b3'",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO wraith_bonds
-                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
-             VALUES ('b4', 'alice', 'sess-1', 500, 'escrowed', NULL, 301, NULL)",
-            [],
-        )
-        .expect("a new escrowed bond must be allowed once the prior one is slashed");
+        // And the rows are still there.
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wraith_bonds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "a refused migration must not delete anything");
     }
 
     #[test]

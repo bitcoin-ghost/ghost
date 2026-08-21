@@ -59,9 +59,24 @@ pub(crate) const MAX_TX_VBYTES: usize = 90_000;
 //   * Carries the service-fee rate directly on the tier so callers
 //     don't have to thread them separately.
 
-/// Service-fee rate as basis points (50 bps = 0.5%). Applied to total round
-/// notional value. Fee output goes to the coordinator pool's fee address.
-pub const LITE_SERVICE_FEE_BPS: u32 = 50;
+/// Service-fee rate as basis points (25 bps = 0.25%), per master spec §9.1.
+/// The fee output goes to the coordinator's fee address.
+///
+/// Was 50 bps with no floor, which `DESIGN_LITE.md` §11 pinned. The spec is
+/// the document in force and sets a different figure with a reason: fees are
+/// "uniform per participant within a round (amount-proportional fees leak;
+/// uniform fees don't)". Uniformity already held here by construction, since
+/// every participant in a round pays the same denomination — what changed is
+/// the rate and the floor, which the spec calls governance-tunable.
+pub const LITE_SERVICE_FEE_BPS: u32 = 25;
+
+/// Least a participant pays in service fee, per master spec §9.1 ("floor
+/// 1,000 sats").
+///
+/// Without it the smallest tier charges 250 sats, which does not cover the
+/// cost of coordinating a round for someone. The floor binds only on the
+/// 100k tier; every larger tier clears it on rate alone.
+pub const LITE_SERVICE_FEE_FLOOR_SATS: u64 = 1_000;
 
 /// How long a `Filling` session stays open after `min_participants` is
 /// reached, waiting for more arrivals up to `max_participants`. Default
@@ -151,7 +166,12 @@ impl LiteTier {
     /// Per-participant service fee included in the round transaction.
     /// Funds the coordinator pool operator.
     pub const fn service_fee_sats(&self) -> u64 {
-        (self.denomination_sats() * LITE_SERVICE_FEE_BPS as u64) / 10_000
+        let by_rate = (self.denomination_sats() * LITE_SERVICE_FEE_BPS as u64) / 10_000;
+        if by_rate < LITE_SERVICE_FEE_FLOOR_SATS {
+            LITE_SERVICE_FEE_FLOOR_SATS
+        } else {
+            by_rate
+        }
     }
 
     /// Round transaction size in vbytes — used to sanity-check every tier
@@ -242,16 +262,18 @@ mod tests {
 
     #[test]
     fn lite_tier_fees_match_spec() {
-        // 0.5% service fee, applied per-tier.
+        // Master spec §9.1: 25 bps, floor 1,000 sats.
         for tier in LiteTier::all() {
             let denom = tier.denomination_sats();
-            assert_eq!(tier.service_fee_sats(), denom / 200, "tier {tier} fee");
+            let expected = (denom / 400).max(LITE_SERVICE_FEE_FLOOR_SATS);
+            assert_eq!(tier.service_fee_sats(), expected, "tier {tier} fee");
         }
-        // Concrete:
-        assert_eq!(LiteTier::Denom100kSats.service_fee_sats(), 500);
-        assert_eq!(LiteTier::Denom1mSats.service_fee_sats(), 5_000);
-        assert_eq!(LiteTier::Denom10mSats.service_fee_sats(), 50_000);
-        assert_eq!(LiteTier::Denom100mSats.service_fee_sats(), 500_000);
+        // Concrete. The floor binds on the smallest tier only — 25 bps of
+        // 100k is 250, which does not cover coordinating a round.
+        assert_eq!(LiteTier::Denom100kSats.service_fee_sats(), 1_000);
+        assert_eq!(LiteTier::Denom1mSats.service_fee_sats(), 2_500);
+        assert_eq!(LiteTier::Denom10mSats.service_fee_sats(), 25_000);
+        assert_eq!(LiteTier::Denom100mSats.service_fee_sats(), 250_000);
     }
 
     #[test]
@@ -330,7 +352,8 @@ mod tests {
         // 50 bps = 0.5%, 5 minute fill window — these are wallet-visible,
         // pin them so a future "let's tune the rate" change has to
         // explicitly update the test.
-        assert_eq!(LITE_SERVICE_FEE_BPS, 50);
+        assert_eq!(LITE_SERVICE_FEE_BPS, 25);
+        assert_eq!(LITE_SERVICE_FEE_FLOOR_SATS, 1_000);
         assert_eq!(LITE_FILL_WINDOW_SECS, 300);
     }
 }
