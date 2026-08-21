@@ -542,6 +542,23 @@ pub const STRATUM_HANDSHAKE_PROOF_HEIGHT: u64 = 962_000;
 /// set and the node-reward split would diverge.
 pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = u64::MAX;
 
+/// H-7: height at and above which a challenger BROADCASTS the address proof it already
+/// performs, so the `/24` a node claims becomes a converged, majority-attested fact rather
+/// than a self-report nothing checks.
+///
+/// The probe itself has run in the verification rotation since #633 and is report-only. This
+/// gate governs EMISSION, not probing, and it exists for a wire reason rather than a
+/// consensus one: `CapabilityType` is a plain serde enum with no unknown-variant fallback,
+/// so a node on an older binary cannot deserialise a verdict carrying `"address"` and drops
+/// the whole message. Emitting before the fleet is uniform would therefore have every old
+/// peer discard every new verdict — and, worse, discard it silently.
+///
+/// `u64::MAX` = never. Arm only once every node runs a binary that KNOWS the variant, and
+/// then only once a live pass rate has been observed — measured over 24h on 2026-08-21 at
+/// **9,681 pass / 181 fail across all 8 nodes (98.2%)**, with all 181 failures `Unreachable`
+/// and not one `WrongSigner`, `BadSignature`, or `NonceMismatch`.
+pub const ADDRESS_PROOF_HEIGHT: u64 = u64::MAX;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -634,6 +651,7 @@ mod gates {
     pub(super) static PAYOUT_MEDIAN_ADOPTION: OnceLock<u64> = OnceLock::new();
     pub(super) static STRATUM_HANDSHAKE_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ARCHIVE_TX_PROOF: OnceLock<u64> = OnceLock::new();
+    pub(super) static ADDRESS_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
@@ -717,6 +735,8 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         ARCHIVE_TX_PROOF_HEIGHT,
     );
+    let address_proof =
+        gates::from_env("GHOST_ADDRESS_PROOF_HEIGHT", network, ADDRESS_PROOF_HEIGHT);
     let mesh_node_list_checkpoint = gates::from_env(
         "GHOST_MESH_NODE_LIST_CHECKPOINT_HEIGHT",
         network,
@@ -739,6 +759,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
     let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
     let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
+    let _ = gates::ADDRESS_PROOF.set(address_proof);
     let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
     let _ = gates::CHECKPOINT_FROM_SHARD.set(checkpoint_from_shard);
 
@@ -905,6 +926,11 @@ pub fn payout_median_adoption_height() -> u64 {
 /// Height at and above which Archive is proved by serving transaction-level detail (#605).
 pub fn archive_tx_proof_height() -> u64 {
     *gates::ARCHIVE_TX_PROOF.get_or_init(|| ARCHIVE_TX_PROOF_HEIGHT)
+}
+
+/// Height at and above which a challenger broadcasts its H-7 address proof (#605).
+pub fn address_proof_height() -> u64 {
+    *gates::ADDRESS_PROOF.get_or_init(|| ADDRESS_PROOF_HEIGHT)
 }
 
 /// Height at and above which Public Mining is proved by a challenger-performed stratum handshake

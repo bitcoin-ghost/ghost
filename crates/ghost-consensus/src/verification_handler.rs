@@ -912,6 +912,24 @@ impl VerificationResultHandler {
                     warn!(error = %e, "Failed to store ghostpay challenge result");
                 }
             }
+            CapabilityType::Address => {
+                // H-7. Deliberately no legacy table and no re-derivation.
+                //
+                // The convergence ledger insert above is the whole of the storage: an
+                // address proof has no `*_challenges` analogue because nothing consumes it
+                // as a per-node capability. It qualifies a CHALLENGER's `/24` for the
+                // diversity count, which reads the ledger directly.
+                //
+                // Re-derivation is not merely unwired here, it is impossible. The other
+                // four re-derive by checking the TARGET's signed response against this
+                // node's own ground truth. An address proof's signed response binds the
+                // target's key to the CHALLENGER's nonce and carries no address, so a third
+                // party can confirm the target answered something without learning where it
+                // answered. Handing it to a re-deriver would return `Unverifiable` for every
+                // row and record nothing — which is how a silently inert defence gets
+                // shipped. Anti-grief is the distinct-challenger majority applied at
+                // qualification, as described above the ledger insert.
+            }
         }
 
         debug!(

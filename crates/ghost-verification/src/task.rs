@@ -70,6 +70,8 @@ pub struct VerificationTaskConfig {
     /// block header. `u64::MAX` (default) keeps the header-only challenge, so a node that never sets
     /// this behaves exactly as before.
     pub archive_tx_gate_height: u64,
+    /// H-7: height at and above which an address proof is BROADCAST rather than only logged.
+    pub address_proof_gate_height: u64,
 }
 
 impl Default for VerificationTaskConfig {
@@ -88,6 +90,7 @@ impl Default for VerificationTaskConfig {
             stratum_proof_gate_height: u64::MAX,
             stratum_proof_port: 3333,
             archive_tx_gate_height: u64::MAX,
+            address_proof_gate_height: u64::MAX,
         }
     }
 }
@@ -882,6 +885,17 @@ impl VerificationTask {
         self
     }
 
+    /// H-7: broadcast the address proof this task already performs, at and above `height`.
+    ///
+    /// Gated for a WIRE reason, not a consensus one. `CapabilityType` is a plain serde enum
+    /// with no unknown-variant fallback, so a peer on an older binary fails to deserialise a
+    /// verdict carrying `"address"` and drops the entire message — silently. Emitting before
+    /// the fleet is uniform would spend every probe on peers that discard it.
+    pub fn with_address_proof_gate(mut self, height: u64) -> Self {
+        self.config.address_proof_gate_height = height;
+        self
+    }
+
     /// H-1 FIX: Check if identity has been verified before allowing DB writes
     ///
     /// Returns Ok(()) if identity is verified, Err if not.
@@ -1306,6 +1320,9 @@ impl VerificationTask {
         peer_id_hex: &str,
         short_id: &str,
     ) {
+        use crate::address_proof::address_verdict;
+        use sha2::{Digest, Sha256};
+
         let claimed = match self.db.get_node(peer_id_hex) {
             Ok(Some(node)) => node.public_address,
             Ok(None) => None,
@@ -1322,11 +1339,27 @@ impl VerificationTask {
             return;
         };
 
-        match self
+        let outcome = self
             .client
             .probe_claimed_address(&address, peer_id_hex)
-            .await
-        {
+            .await;
+
+        // What the outcome is ALLOWED to assert. Only a cryptographic failure is evidence the
+        // claimant lied; everything else is evidence about the network or about the peer's
+        // build, and must not cost it its subnet.
+        //
+        //   `Unreachable`  - could not connect. Measured over 24h on 2026-08-21 this was 181
+        //                    of 181 failures across all 8 nodes, spread over 7 distinct peers
+        //                    with no peer above ~8% - i.e. transient blips, not liars. Voting
+        //                    FAIL on these would strip an honest node's subnet every time its
+        //                    link hiccupped.
+        //   `NotSigned`    - ambiguous by construction: a peer running a build with no signing
+        //                    identity answers `signed: false` to everything, so this is also
+        //                    exactly what "peer predates address proofs" looks like.
+        //
+        // Both record NOTHING - never a false FAIL - matching the PASS-or-Unverifiable rule the
+        // other capabilities apply to challenger-authored data.
+        match outcome {
             Ok(()) => info!(
                 peer = %short_id,
                 address = %address,
@@ -1340,6 +1373,52 @@ impl VerificationTask {
                 "H-7 address proof did not pass"
             ),
         }
+        let verdict = address_verdict(outcome);
+
+        let Some(passed) = verdict else { return };
+
+        // Below the gate the probe stays exactly what #633 shipped: report-only.
+        let tip_at_or_above_gate = match self.rpc.as_ref() {
+            Some(rpc) => match rpc.get_block_count().await {
+                Ok(tip) => tip >= self.config.address_proof_gate_height,
+                // Cannot read the tip - do not guess the gate is active, for the same reason
+                // the stratum handshake does not.
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !tip_at_or_above_gate {
+            return;
+        }
+
+        // S-7: the mesh carries no cleartext IPs, and a verdict gossiped to every peer is the
+        // last place to reintroduce them. The address is bound by HASH instead - any node
+        // already holding the claim in its own `nodes` row can recompute it and match, and a
+        // node that does not hold the claim learns nothing it could dial.
+        let challenge_data = serde_json::json!({
+            "address_hash": hex::encode(Sha256::digest(address.as_bytes())),
+        })
+        .to_string();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // No `target_signed_response`. The reply IS signed, but it binds the target's key to
+        // OUR nonce and carries no address, so passing it on would let a receiver confirm the
+        // peer answered something without learning where - which is not the claim being made
+        // and would read as re-derivable when it is not.
+        self.broadcast_result(
+            peer.node_id,
+            "address",
+            passed,
+            challenge_data,
+            None,
+            timestamp,
+            None,
+        )
+        .await;
     }
 
     /// Verify archive capability
