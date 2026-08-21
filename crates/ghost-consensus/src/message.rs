@@ -2610,7 +2610,10 @@ mod tests {
     fn address_capability_round_trips_on_the_wire() {
         use super::CapabilityType;
         assert_eq!(CapabilityType::Address.as_str(), "address");
-        assert_eq!(CapabilityType::parse("address"), Some(CapabilityType::Address));
+        assert_eq!(
+            CapabilityType::parse("address"),
+            Some(CapabilityType::Address)
+        );
         assert_eq!(
             serde_json::to_string(&CapabilityType::Address).unwrap(),
             "\"address\""

@@ -735,11 +735,8 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         ARCHIVE_TX_PROOF_HEIGHT,
     );
-    let address_proof = gates::from_env(
-        "GHOST_ADDRESS_PROOF_HEIGHT",
-        network,
-        ADDRESS_PROOF_HEIGHT,
-    );
+    let address_proof =
+        gates::from_env("GHOST_ADDRESS_PROOF_HEIGHT", network, ADDRESS_PROOF_HEIGHT);
     let mesh_node_list_checkpoint = gates::from_env(
         "GHOST_MESH_NODE_LIST_CHECKPOINT_HEIGHT",
         network,
