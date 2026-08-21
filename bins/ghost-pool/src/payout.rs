@@ -2537,6 +2537,36 @@ impl PayoutHandler {
         // and we need to build coinbase outputs
         self.template_processor.store_proposal(proposal.clone());
 
+        // Stage 6 step 3: at and above the gate there is no vote at all.
+        //
+        // `SHARE_SHARD.md` §8 — "No consensus on the ledger. Each node pays from its own view."
+        // §7 lists voting, quorum and two-phase commit as deleted. The proposal above was already
+        // built from this node's own shard view (`BlockFoundData::shard_owed`), so a vote adds no
+        // information about the shares; `validate_proposal_split` only ever recomputed the split
+        // from the voter's OWN table and demanded an exact match (GHOST-02).
+        //
+        // ⛔ That exact match is a liveness hazard, not a safety property: nothing finalised
+        // between 18 and 21 August because tables that had diverged could not agree, and one
+        // address 6.71% apart rejected every checkpoint symmetrically. Above this gate divergence
+        // is benign — `owed` is signed and never clamped, so a small over- or under-payment leaves
+        // a residual the next block corrects.
+        //
+        // Share validity is unaffected and lives where it always did: per-share at receive time
+        // (GHOST-09 signature with receiver and address binding, PoW preimage, difficulty-tier
+        // commitment), plus §6 sampling. Delete the gate, keep the rule.
+        if proposal.block_height >= crate::payout_from_shard_height() {
+            info!(
+                round_id = proposal.round_id,
+                height = proposal.block_height,
+                miners = proposal.miner_payouts.len(),
+                nodes = proposal.node_payouts.len(),
+                hash = %hex::encode(&proposal_hash[..8]),
+                "Paying from this node's own shard view (no vote — Stage 6 step 3)"
+            );
+            self.template_processor.set_local_payout(proposal);
+            return Ok(proposal_hash);
+        }
+
         // Submit to vote handler for BFT consensus
         // A single-operator pool has nobody to vote with, so it approves its own proposal.
         //
