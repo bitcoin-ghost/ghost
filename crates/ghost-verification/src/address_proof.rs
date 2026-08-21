@@ -52,6 +52,36 @@ pub enum AddressProofFailure {
     Unreachable,
 }
 
+/// What a probe outcome is allowed to ASSERT to the rest of the fleet.
+///
+/// `Some(true)` = broadcast a PASS, `Some(false)` = broadcast a FAIL, `None` = say nothing.
+///
+/// Only a cryptographic failure is evidence that the claimant lied about where it lives.
+/// Everything else is a fact about the network or about the peer's build, and a verdict that
+/// confused the two would cost honest nodes their subnet:
+///
+/// - [`AddressProofFailure::Unreachable`] is overwhelmingly transient. Measured across all
+///   eight production nodes over 24h on 2026-08-21: **181 of 181 probe failures** were
+///   `Unreachable`, spread over seven distinct peers with none above ~8% of its own probes,
+///   against 9,681 passes. Not one `WrongSigner`, `NonceMismatch`, or `BadSignature` occurred.
+/// - [`AddressProofFailure::NotSigned`] is ambiguous by construction: a peer running a build
+///   with no signing identity answers `signed: false` to every request, so this is also
+///   precisely what "peer predates address proofs" looks like.
+///
+/// Staying silent on both is the same PASS-or-Unverifiable rule the other capabilities apply
+/// to challenger-authored data — never a false FAIL, never an unverified PASS.
+pub fn address_verdict(outcome: Result<(), AddressProofFailure>) -> Option<bool> {
+    match outcome {
+        Ok(()) => Some(true),
+        Err(AddressProofFailure::Unreachable | AddressProofFailure::NotSigned) => None,
+        Err(
+            AddressProofFailure::WrongSigner
+            | AddressProofFailure::NonceMismatch
+            | AddressProofFailure::BadSignature,
+        ) => Some(false),
+    }
+}
+
 /// The `/health` endpoint to probe for an address a node advertises.
 ///
 /// A node's stored `public_address` carries whichever port it advertised — on this fleet
@@ -164,6 +194,50 @@ pub fn verify_address_proof(
             verify_signature(&pk, message_hash, &sig).unwrap_or(false)
         })
         .map_err(|_| AddressProofFailure::BadSignature)
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::{address_verdict, AddressProofFailure};
+
+    /// The whole point of H-7: something answered at the claimed address and it was NOT the
+    /// claimant. This is the only class a bare TCP probe cannot distinguish, and it must vote.
+    #[test]
+    fn a_cryptographic_failure_votes_fail() {
+        for failure in [
+            AddressProofFailure::WrongSigner,
+            AddressProofFailure::NonceMismatch,
+            AddressProofFailure::BadSignature,
+        ] {
+            assert_eq!(
+                address_verdict(Err(failure)),
+                Some(false),
+                "{failure:?} is evidence the claimant lied and must be broadcast as a FAIL"
+            );
+        }
+    }
+
+    /// Guards the property the live measurement bought: 181 of 181 observed failures were
+    /// `Unreachable`. Were this to return `Some(false)`, every honest node would lose its
+    /// subnet on a transient, and the diversity floor it feeds would collapse toward the
+    /// single-subnet state #629 fixed.
+    #[test]
+    fn an_unreachable_peer_says_nothing() {
+        assert_eq!(address_verdict(Err(AddressProofFailure::Unreachable)), None);
+    }
+
+    /// A peer on a build with no signing identity answers `signed: false` to everything, so
+    /// `NotSigned` cannot distinguish a liar from an old binary. During any rollout that is
+    /// most of the fleet.
+    #[test]
+    fn an_unsigned_reply_says_nothing() {
+        assert_eq!(address_verdict(Err(AddressProofFailure::NotSigned)), None);
+    }
+
+    #[test]
+    fn a_proved_address_votes_pass() {
+        assert_eq!(address_verdict(Ok(())), Some(true));
+    }
 }
 
 #[cfg(test)]

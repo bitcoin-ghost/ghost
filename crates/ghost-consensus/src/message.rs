@@ -578,6 +578,15 @@ pub enum CapabilityType {
     Stratum,
     /// Ghost Pay capability
     GhostPay,
+    /// H-7: the node proved it holds its identity key at the address it CLAIMS.
+    ///
+    /// Unlike the other four this is not a service the target offers — it is an
+    /// observation the challenger made about WHERE the target answered. It cannot be
+    /// re-derived by a third party: the signed reply binds the target's key to the
+    /// challenger's nonce, but carries no address, so only the challenger knows which
+    /// address it dialled. Convergence therefore rests entirely on the
+    /// distinct-challenger majority, exactly as it does for a backfilled verdict.
+    Address,
 }
 
 impl CapabilityType {
@@ -588,6 +597,7 @@ impl CapabilityType {
             Self::Policy => "policy",
             Self::Stratum => "stratum",
             Self::GhostPay => "ghostpay",
+            Self::Address => "address",
         }
     }
 
@@ -598,6 +608,7 @@ impl CapabilityType {
             "policy" => Some(Self::Policy),
             "stratum" => Some(Self::Stratum),
             "ghostpay" => Some(Self::GhostPay),
+            "address" => Some(Self::Address),
             _ => None,
         }
     }
@@ -2591,6 +2602,38 @@ impl ShardSampleResponseMessage {
 
 #[cfg(test)]
 mod tests {
+    // ── H-7 address capability (#605) ────────────────────────────────────────────────────
+
+    /// The wire string is the ledger's `capability` column and the key
+    /// `ChallengeConvergence` reconciles on, so it is a stored format, not a label.
+    #[test]
+    fn address_capability_round_trips_on_the_wire() {
+        use super::CapabilityType;
+        assert_eq!(CapabilityType::Address.as_str(), "address");
+        assert_eq!(CapabilityType::parse("address"), Some(CapabilityType::Address));
+        assert_eq!(
+            serde_json::to_string(&CapabilityType::Address).unwrap(),
+            "\"address\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilityType>("\"address\"").unwrap(),
+            CapabilityType::Address
+        );
+    }
+
+    /// Documents the constraint that forces the H-7 emission gate to exist. There is no
+    /// `#[serde(other)]` fallback, so a peer on a binary predating `Address` does not
+    /// merely ignore the new variant — it fails to deserialise the message carrying it and
+    /// drops the verdict whole. Adding such a fallback here would NOT fix a rollout, since
+    /// the nodes that need it are the ones running the old binary; the gate is what fixes
+    /// it. If this test ever starts failing because a fallback was added, the gate still
+    /// has to stay for every already-deployed node.
+    #[test]
+    fn an_unknown_capability_fails_to_deserialise_rather_than_degrading() {
+        use super::CapabilityType;
+        assert!(serde_json::from_str::<CapabilityType>("\"not_a_capability\"").is_err());
+    }
+
     // ── Deterministic node-list derivation (#625) ────────────────────────────────────────
 
     fn advert_for(

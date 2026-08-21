@@ -10354,6 +10354,9 @@ async fn main() -> Result<()> {
                 )
                 // #605: demand transaction-level detail for Archive at/above the gate.
                 .with_archive_tx_gate(ghost_pool::archive_tx_proof_height())
+                // #605 H-7: broadcast the address proof at/above the gate, so a claimed
+                // `/24` becomes a majority-attested fact instead of a self-report.
+                .with_address_proof_gate(ghost_pool::address_proof_height())
                 .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
@@ -10401,6 +10404,9 @@ async fn main() -> Result<()> {
                 "policy" => CapabilityType::Policy,
                 "stratum" => CapabilityType::Stratum,
                 "ghostpay" => CapabilityType::GhostPay,
+                // H-7. Emitted only at/above `address_proof_height()`; the task will not
+                // hand one over below the gate, so reaching here means the gate is live.
+                "address" => CapabilityType::Address,
                 other => {
                     warn!(capability = %other, "Unknown capability type, skipping broadcast");
                     continue;
