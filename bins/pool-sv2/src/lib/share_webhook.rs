@@ -11,7 +11,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use ghost_common::internal_auth::{now_secs, InternalAuthKey};
+
 use crate::config::ShareWebhookConfig;
+use crate::error::PoolErrorKind;
 
 /// Channel capacity for share notifications (bounded to prevent unbounded memory growth)
 const CHANNEL_CAPACITY: usize = 10_000;
@@ -195,6 +198,18 @@ impl ShareWebhookSender {
 pub struct ShareWebhookWorker {
     receiver: mpsc::Receiver<WebhookItem>,
     config: ShareWebhookConfig,
+    /// The validated share-webhook secret (H-13).
+    ///
+    /// Not an `Option`: a secret that will not parse is refused by [`ShareWebhookWorker::new`],
+    /// which propagates to `PoolSv2::start` and stops the process. An earlier version of this
+    /// only logged and carried on with `None`, which produced the worst outcome available — the
+    /// pool started, miners connected, SV2 acknowledged every share, and `send_batch` discarded
+    /// 100% of the work before it ever reached the HTTP call, leaving one line at boot as the
+    /// only evidence. A config fault must not be survivable by the process that has the config.
+    secret: InternalAuthKey,
+    /// Consecutive batches rejected for a bad signature, so the log says whether the loss is
+    /// ongoing rather than something that happened once at boot.
+    auth_failures: AtomicU64,
     pool_id: u16,
     batch_seq: AtomicU64,
     client: reqwest::Client,
@@ -207,8 +222,30 @@ pub struct ShareWebhookWorker {
 }
 
 impl ShareWebhookWorker {
-    /// Create a new webhook worker and sender pair
-    pub fn new(config: ShareWebhookConfig, pool_id: u16) -> (ShareWebhookSender, Self) {
+    /// Create a new webhook worker and sender pair.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `share_webhook.secret` is not a usable internal-API secret. This is deliberately
+    /// fatal to startup: an unsigned or wrongly-signed batch is rejected by ghost-pool, so a pool
+    /// that starts without a valid secret cannot report a single share. Failing here costs a
+    /// restart; failing later costs every share mined until somebody notices.
+    ///
+    /// The rule applied is `InternalAuthKey`'s, which is the same code ghost-pool verifies with —
+    /// so "this secret is acceptable" cannot mean two different things on the two ends of the
+    /// socket.
+    pub fn new(
+        config: ShareWebhookConfig,
+        pool_id: u16,
+    ) -> Result<(ShareWebhookSender, Self), PoolErrorKind> {
+        let secret = InternalAuthKey::from_hex(&config.secret).map_err(|e| {
+            PoolErrorKind::ShareWebhookConfig(format!(
+                "share_webhook.secret is unusable ({e}). It must be the co-located ghost-pool's \
+                 [network] internal_api_secret — at least 32 bytes of hex, generated with \
+                 `openssl rand -hex 32`. Without it every share batch is rejected."
+            ))
+        })?;
+
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
 
         let client = reqwest::Client::builder()
@@ -221,8 +258,10 @@ impl ShareWebhookWorker {
         let worker = ShareWebhookWorker {
             receiver,
             config,
+            secret,
             pool_id,
             batch_seq: AtomicU64::new(0),
+            auth_failures: AtomicU64::new(0),
             client,
             recent_skeletons: Arc::clone(&recent_skeletons),
         };
@@ -232,7 +271,7 @@ impl ShareWebhookWorker {
             recent_skeletons,
         };
 
-        (sender, worker)
+        Ok((sender, worker))
     }
 
     /// Run the webhook worker loop
@@ -347,31 +386,86 @@ impl ShareWebhookWorker {
             skeletons: std::mem::take(skeletons),
         };
 
+        // Serialise ONCE and send those exact bytes. The HMAC covers the body, so re-serialising
+        // per attempt (or letting `reqwest::json` serialise separately from what we signed) would
+        // risk signing bytes other than the ones sent — serde_json is stable here, but "the two
+        // will surely agree" is precisely the assumption that produces an unreproducible signature
+        // failure at 3am.
+        let body = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(batch_seq, error = %e, "Share batch could not be serialised; dropped");
+                self.forget_skeletons(&payload.skeletons);
+                return;
+            }
+        };
+
         let mut attempts = 0;
         let max_retries = self.config.max_retries;
 
         loop {
             attempts += 1;
 
+            // Signed per attempt, not once: the timestamp is inside the MAC and ghost-pool only
+            // accepts a 30-second window, so a batch that backs off past that window would fail
+            // authentication for ever if it carried the original stamp.
+            let timestamp = now_secs();
+            let signature = self.secret.sign(timestamp, &body);
+
             match self
                 .client
                 .post(&self.config.url)
-                .json(&payload)
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", timestamp.to_string())
+                .header("X-Ghost-Signature", signature)
+                .body(body.clone())
                 .send()
                 .await
             {
                 Ok(response) => {
-                    if response.status().is_success() {
+                    let status = response.status();
+                    if status.is_success() {
+                        // Reset so the counter reads "consecutive", not "ever" — an operator
+                        // needs to know whether the loss is still happening.
+                        self.auth_failures.store(0, Ordering::Relaxed);
                         debug!(batch_seq, share_count, "Share batch sent successfully");
                         return;
-                    } else {
-                        warn!(
-                            batch_seq,
-                            status = %response.status(),
-                            attempt = attempts,
-                            "Share batch request failed with status"
-                        );
                     }
+
+                    // An authentication failure is PERMANENT, and must not be drained through a
+                    // retry budget sized for a refused connection. Retrying cannot help — the
+                    // secret, the clock or the deploy order is wrong — so three attempts and
+                    // ~700 ms later the batch would simply be destroyed, and the operator would
+                    // see a "failed after max retries" line indistinguishable from ghost-pool
+                    // being briefly down. Before H-13 this endpoint could not fail auth at all,
+                    // so this is a loss channel the signing requirement introduced; it deserves
+                    // its own unmistakable message rather than the generic one.
+                    //
+                    // Whole-fleet triggers: pool_sv2 restarted with a secret ghost-pool does not
+                    // share, a rotation applied to one side only, or clock drift past the 30 s
+                    // window. Every one of them discards 100% of shares until it is fixed.
+                    if is_auth_failure(status) {
+                        error!(
+                            batch_seq,
+                            share_count,
+                            status = %status,
+                            consecutive = self.auth_failures.fetch_add(1, Ordering::Relaxed) + 1,
+                            "SHARE LOSS: ghost-pool REJECTED this batch's signature. Every share \
+                             is being discarded. Check that share_webhook.secret matches \
+                             ghost-pool's [network] internal_api_secret and that both clocks are \
+                             NTP-synchronised, then restart. Not retried — retrying cannot fix a \
+                             credential."
+                        );
+                        self.forget_skeletons(&payload.skeletons);
+                        return;
+                    }
+
+                    warn!(
+                        batch_seq,
+                        status = %status,
+                        attempt = attempts,
+                        "Share batch request failed with status"
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -406,6 +500,15 @@ impl ShareWebhookWorker {
     }
 }
 
+/// Is this status a refusal of our credentials rather than a transport or server problem?
+///
+/// Only 401 and 403 — the two ghost-pool's share-ingest middleware returns for a bad signature
+/// and for an off-box peer. A 5xx is the server having a bad day and IS worth retrying; treating
+/// it as permanent would throw away shares over a restart.
+fn is_auth_failure(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
+}
+
 /// Get current timestamp in milliseconds
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -418,11 +521,22 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn a_secret() -> String {
+        hex::encode((0u8..32).map(|i| i.wrapping_add(0x42)).collect::<Vec<u8>>())
+    }
+
     fn a_pair() -> (ShareWebhookSender, ShareWebhookWorker) {
+        a_worker_with_secret(&a_secret()).expect("a valid secret must build a worker")
+    }
+
+    fn a_worker_with_secret(
+        secret: &str,
+    ) -> Result<(ShareWebhookSender, ShareWebhookWorker), PoolErrorKind> {
         ShareWebhookWorker::new(
             crate::config::ShareWebhookConfig {
                 // Port 0 never accepts, so every send fails — which is the case under test.
                 url: "http://127.0.0.1:1/never".to_string(),
+                secret: secret.to_string(),
                 batch_size: 1,
                 batch_timeout_ms: 1000,
                 max_retries: 0,
@@ -456,6 +570,264 @@ mod tests {
             }
         }
         assert_eq!(ids, vec!["aa".to_string(), "bb".to_string()]);
+    }
+
+    /// H-13, the two halves of the share-webhook signature meeting.
+    ///
+    /// The emitter here and the verifier in ghost-pool have to agree on bytes that appear
+    /// nowhere on the wire: the timestamp is hashed as LITTLE-ENDIAN u64, and hashed BEFORE the
+    /// body. Nothing in either function signature says so, and getting it wrong produces a pool
+    /// that mines happily while every batch is rejected `401` — silent, and paid for in miners'
+    /// work. That is the exact shape of the outage this endpoint already caused once.
+    ///
+    /// Both ends now call `InternalAuthKey`, so this drives the REAL verifier. A test that
+    /// recomputed the MAC would agree with a wrong implementation just as readily.
+    #[test]
+    fn a_signed_batch_verifies_against_the_pool_side_verifier() {
+        let key = InternalAuthKey::from_hex(&a_secret()).unwrap();
+        let body = br#"{"pool_id":1,"batch_seq":1,"shares":[]}"#;
+        let ts = now_secs();
+
+        let signature = key.sign(ts, body);
+        assert!(
+            key.verify(&signature, ts, body).is_ok(),
+            "ghost-pool must accept the signature this emitter produces"
+        );
+
+        // Negative controls, so the assertion above cannot be passing for a trivial reason.
+        assert!(
+            key.verify(&signature, ts, b"tampered body").is_err(),
+            "the signature must cover the body"
+        );
+        let mut other = (0u8..32).map(|i| i.wrapping_add(0x42)).collect::<Vec<u8>>();
+        other[0] ^= 0xff;
+        let other = InternalAuthKey::new(&other).unwrap();
+        assert!(
+            key.verify(&other.sign(ts, body), ts, body).is_err(),
+            "a different secret must not verify"
+        );
+    }
+
+    /// An unusable secret must STOP THE PROCESS, not log and carry on.
+    ///
+    /// Carrying on is the worst outcome available: the pool starts, miners connect, SV2
+    /// acknowledges every share, and `send_batch` discards 100% of the work before the HTTP call
+    /// — with one line at boot as the only evidence. The failure has to reach `PoolSv2::start`.
+    #[test]
+    fn an_unusable_secret_refuses_to_build_the_worker() {
+        // Positive control first: a good secret must still build, or every case below is
+        // passing for the wrong reason.
+        assert!(a_worker_with_secret(&a_secret()).is_ok());
+
+        for (secret, why) in [
+            ("", "empty"),
+            ("0011", "too short"),
+            (&"zz".repeat(32), "not hex"),
+            (&hex::encode([7u8; 32]), "no entropy — one repeated byte"),
+        ] {
+            assert!(
+                matches!(
+                    a_worker_with_secret(secret),
+                    Err(PoolErrorKind::ShareWebhookConfig(_))
+                ),
+                "a {why} secret must refuse to build the worker"
+            );
+        }
+    }
+
+    /// The emitter must accept exactly what the verifier accepts.
+    ///
+    /// `InternalAuthKey` takes a secret of 32 bytes OR LONGER and uses the first 32. An emitter
+    /// that demanded exactly 32 would leave an operator with a 96-hex secret running a ghost-pool
+    /// that authenticates and a pool_sv2 that refuses to start — a disagreement about the same
+    /// config value, on two ends of a loopback socket.
+    #[test]
+    fn a_longer_secret_is_accepted_because_the_verifier_accepts_it() {
+        let long = hex::encode((0u8..96).map(|i| i.wrapping_add(0x42)).collect::<Vec<u8>>());
+        assert!(
+            a_worker_with_secret(&long).is_ok(),
+            "a 96-byte secret must build here, because ghost-pool accepts it"
+        );
+    }
+
+    /// Every `[share_webhook]` section shipped in this repo must still load.
+    ///
+    /// `secret` is mandatory with no `serde` default, so adding it to the code silently invalidated
+    /// every config that did not have it — and one of them, `pool-sv2.toml.example`, is the file
+    /// the regtest README tells people to copy. The README was updated to explain the new key and
+    /// the file it points at was not, which no amount of care at review time reliably catches.
+    ///
+    /// Discovered by walking rather than by a hardcoded list, so a config added later is covered
+    /// without anyone remembering to add it here. Deserialised with the REAL loader the binary
+    /// uses, so this fails for any future mandatory field too, not just this one.
+    #[test]
+    fn every_shipped_share_webhook_config_still_loads() {
+        use ext_config::{Config, File, FileFormat};
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                // `target` is build output and `.git` is enormous; neither ships configs.
+                if name == "target" || name == ".git" || name == "node_modules" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if std::fs::read_to_string(&path)
+                    .is_ok_and(|c| c.contains("[share_webhook]"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("bins/pool-sv2 must sit two levels below the repo root")
+            .to_path_buf();
+
+        let mut configs = Vec::new();
+        walk(&repo_root, &mut configs);
+        configs.retain(|p| {
+            p.extension().is_some_and(|e| e == "toml" || e == "example")
+                || p.to_string_lossy().ends_with(".toml.example")
+        });
+
+        // Positive control: if the walk finds nothing, every assertion below is vacuous and this
+        // test would keep passing while the configs rotted.
+        assert!(
+            configs.len() >= 3,
+            "expected to find the shipped share_webhook configs, found {:?}",
+            configs
+        );
+
+        for path in configs {
+            let loaded: ShareWebhookConfig = Config::builder()
+                .add_source(File::new(
+                    path.to_str().expect("config path must be UTF-8"),
+                    FileFormat::Toml,
+                ))
+                .build()
+                .and_then(|settings| settings.get::<ShareWebhookConfig>("share_webhook"))
+                .unwrap_or_else(|e| panic!("{} does not load: {e}", path.display()));
+
+            // A file carrying a literal secret must carry a USABLE one. Deployment templates
+            // (`${INTERNAL_API_SECRET}`) are filled in by the installer, so only their presence
+            // can be checked here.
+            if !loaded.secret.contains("${") {
+                assert!(
+                    InternalAuthKey::from_hex(&loaded.secret).is_ok(),
+                    "{} carries a literal secret that pool_sv2 would refuse at startup",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// A `401` is a permanent credential failure, not a transient one, and must not be drained
+    /// through the retry budget.
+    ///
+    /// Retrying cannot fix a wrong secret, a one-sided rotation, or a clock past the 30 s window
+    /// — it just spends ~700 ms and then destroys the batch with a message indistinguishable
+    /// from "ghost-pool was briefly down". Before H-13 this endpoint could not fail auth at all,
+    /// so this is a loss channel the signing requirement introduced.
+    ///
+    /// Asserts the OUTCOME — how many times the batch is actually put on the wire — rather than
+    /// the predicate, because a correct `is_auth_failure` wired into nothing would still pass.
+    #[tokio::test]
+    async fn an_auth_failure_is_not_retried_but_a_server_error_is() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Accept connections, reply with `status`, and count how many arrived.
+        async fn serve(status: &'static str) -> (String, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/shares", listener.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}
+Content-Length: 0
+Connection: close
+
+"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            (url, hits)
+        }
+
+        async fn deliveries_attempted(status: &'static str, max_retries: u32) -> usize {
+            let (url, hits) = serve(status).await;
+            let (_sender, worker) = ShareWebhookWorker::new(
+                crate::config::ShareWebhookConfig {
+                    url,
+                    secret: a_secret(),
+                    batch_size: 1,
+                    batch_timeout_ms: 1000,
+                    max_retries,
+                },
+                1,
+            )
+            .unwrap();
+            let mut batch = vec![ShareData {
+                timestamp_ms: 0,
+                share_hash: "aa".to_string(),
+                share_work: 1.0,
+                channel_id: 1,
+                sequence_number: 1,
+                job_id: 1,
+                downstream_id: 1,
+                is_block: false,
+                user_identity: "bc1q.w".to_string(),
+                header: None,
+                extranonce: None,
+                skeleton_id: None,
+                tier_log2: None,
+            }];
+            worker.send_batch(&mut batch, &mut Vec::new()).await;
+            hits.load(Ordering::SeqCst)
+        }
+
+        // Positive control: a 500 IS transient, so the retry budget must still be spent — 1
+        // attempt plus 2 retries. Without this, a `send_batch` that gave up on everything would
+        // pass the assertion below.
+        assert_eq!(
+            deliveries_attempted("500 Internal Server Error", 2).await,
+            3,
+            "a server error must still consume the retry budget"
+        );
+
+        // The fix: one attempt, then stop. Same budget, permanent failure.
+        assert_eq!(
+            deliveries_attempted("401 Unauthorized", 2).await,
+            1,
+            "an auth failure must not be retried"
+        );
+        assert_eq!(
+            deliveries_attempted("403 Forbidden", 2).await,
+            1,
+            "an off-box rejection must not be retried either"
+        );
     }
 
     /// **The self-healing property.**

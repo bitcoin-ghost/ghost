@@ -1099,8 +1099,14 @@ required_extensions = []
 monitoring_address = "127.0.0.1:9090"
 
 # Native share accounting into ghost-pool.
+#
+# `secret` is mandatory (H-13) and must match ghost-pool's [network] internal_api_secret —
+# the same ${APISECRET} written into pool.toml above. ghost-pool now requires an HMAC on every
+# share batch: loopback alone authorised any process on the box to write the payout ledger, and
+# would authorise the internet if :8080 were ever put behind a reverse proxy.
 [share_webhook]
 url = "http://127.0.0.1:8080/api/internal/shares"
+secret = "${APISECRET}"
 batch_size = 1
 batch_timeout_ms = 2000
 max_retries = 3

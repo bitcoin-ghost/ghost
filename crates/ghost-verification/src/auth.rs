@@ -47,20 +47,10 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use ghost_common::internal_auth::{InternalAuthError, InternalAuthKey};
 use std::sync::Arc;
 use tracing::warn;
 use zeroize::{Zeroize, ZeroizeOnDrop};
-
-/// HMAC-SHA256 type alias
-type HmacSha256 = Hmac<Sha256>;
-
-/// API-4 FIX: Maximum timestamp drift allowed (30 seconds)
-/// Reduced from 60 seconds to further minimize replay attack window.
-/// 30 seconds is still generous for properly synchronized nodes while
-/// reducing the attack surface by 50%. Nodes MUST use NTP for accurate time.
-const MAX_TIMESTAMP_DRIFT_SECS: u64 = 30;
 
 /// Internal API authentication using HMAC-SHA256
 ///
@@ -73,7 +63,14 @@ const MAX_TIMESTAMP_DRIFT_SECS: u64 = 30;
 /// - Fake consensus triggers
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct InternalAuth {
-    secret: [u8; 32],
+    /// The one implementation of the construction and of the secret rule.
+    ///
+    /// This type used to carry its own copy of both. That is how the verifier came to accept a
+    /// secret of 32 bytes *or longer* while `pool_sv2`'s emitter demanded exactly 32 — a split
+    /// that turns a perfectly valid 96-hex secret into total, silent share loss on one side of a
+    /// loopback socket. Delegating means the two halves cannot disagree, because there is only
+    /// one of them.
+    key: InternalAuthKey,
 }
 
 impl InternalAuth {
@@ -81,32 +78,19 @@ impl InternalAuth {
     ///
     /// # Errors
     ///
-    /// Returns error if secret is too short or has insufficient entropy
+    /// Returns error if secret is too short or has insufficient entropy. A secret LONGER than 32
+    /// bytes is accepted and truncated to its first 32 — see [`InternalAuthKey::new`].
     pub fn new(secret: &[u8]) -> Result<Self, AuthError> {
-        // H10: Require minimum 32 bytes for security
-        if secret.len() < 32 {
-            return Err(AuthError::WeakSecret(
-                "Internal API secret must be at least 32 bytes".to_string(),
-            ));
-        }
-
-        // Check for trivially weak secrets (all same byte)
-        if secret.iter().all(|&b| b == secret[0]) {
-            return Err(AuthError::WeakSecret(
-                "Internal API secret has insufficient entropy".to_string(),
-            ));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&secret[..32]);
-        Ok(Self { secret: key })
+        Ok(Self {
+            key: InternalAuthKey::new(secret)?,
+        })
     }
 
     /// Create from a hex-encoded secret string
     pub fn from_hex(hex_secret: &str) -> Result<Self, AuthError> {
-        let bytes = hex::decode(hex_secret)
-            .map_err(|_| AuthError::InvalidSecret("Invalid hex encoding".to_string()))?;
-        Self::new(&bytes)
+        Ok(Self {
+            key: InternalAuthKey::from_hex(hex_secret)?,
+        })
     }
 
     /// Verify a request signature
@@ -121,80 +105,30 @@ impl InternalAuth {
     ///
     /// Ok(()) if signature is valid and timestamp is within acceptable range
     pub fn verify(&self, signature: &str, timestamp: u64, body: &[u8]) -> Result<(), AuthError> {
-        // Check timestamp is within acceptable range (replay prevention)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let drift = timestamp.abs_diff(now);
-
-        if drift > MAX_TIMESTAMP_DRIFT_SECS {
-            return Err(AuthError::TimestampOutOfRange {
-                received: timestamp,
-                server_time: now,
-            });
-        }
-
-        // Compute expected signature: HMAC-SHA256(secret, timestamp_bytes || body)
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).expect("HMAC can accept any key size");
-        mac.update(&timestamp.to_le_bytes());
-        mac.update(body);
-        let expected = mac.finalize().into_bytes();
-
-        // Decode provided signature
-        let provided = hex::decode(signature)
-            .map_err(|_| AuthError::InvalidSignature("Invalid hex encoding".to_string()))?;
-
-        // Constant-time comparison
-        if !constant_time_eq(&expected, &provided) {
-            return Err(AuthError::InvalidSignature(
-                "Signature verification failed".to_string(),
-            ));
-        }
-
-        Ok(())
+        Ok(self.key.verify(signature, timestamp, body)?)
     }
 
     /// Generate a signature for a request (for testing/client use)
     pub fn sign(&self, timestamp: u64, body: &[u8]) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).expect("HMAC can accept any key size");
-        mac.update(&timestamp.to_le_bytes());
-        mac.update(body);
-        hex::encode(mac.finalize().into_bytes())
+        self.key.sign(timestamp, body)
     }
 }
 
-/// Constant-time byte comparison to prevent timing attacks
-///
-/// L-18 SECURITY NOTE: The length comparison on line 186 does leak timing information
-/// about whether the lengths match. However, this is acceptable here because:
-///
-/// 1. HMAC-SHA256 always produces exactly 32 bytes of output
-/// 2. Attackers already know the expected signature length is 32 bytes (it's public knowledge)
-/// 3. The length check only reveals "signature is/isn't 32 bytes" which provides no
-///    useful information about the actual signature value
-/// 4. The actual byte comparison in the loop below is constant-time and does not
-///    leak information about which bytes differ or how many match
-///
-/// To fully eliminate timing information, we could pad shorter inputs and always
-/// compare 32 bytes, but this would add complexity for zero security benefit since
-/// the HMAC output size is already public.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // L-18: This length check leaks timing info about length mismatch, but HMAC-SHA256
-    // is always 32 bytes so attackers already know the expected length. No information
-    // about the actual signature value is revealed.
-    if a.len() != b.len() {
-        return false;
+impl From<InternalAuthError> for AuthError {
+    fn from(e: InternalAuthError) -> Self {
+        match e {
+            InternalAuthError::WeakSecret(r) => AuthError::WeakSecret(r),
+            InternalAuthError::InvalidSecret(r) => AuthError::InvalidSecret(r),
+            InternalAuthError::InvalidSignature(r) => AuthError::InvalidSignature(r),
+            InternalAuthError::TimestampOutOfRange {
+                received,
+                server_time,
+            } => AuthError::TimestampOutOfRange {
+                received,
+                server_time,
+            },
+        }
     }
-
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Authentication error types
@@ -438,16 +372,48 @@ mod tests {
         assert!(matches!(result, Err(AuthError::InvalidSignature(_))));
     }
 
+    /// This type must stay a thin forward to `ghost_common::internal_auth`, not a second
+    /// implementation that merely happens to agree today.
+    ///
+    /// The construction is `timestamp.to_le_bytes() ‖ body`, and none of that is visible in a
+    /// signature or recoverable from the output. When `pool_sv2` had its own copy, its secret
+    /// rule drifted from this one within a single change. Asserting the two produce and accept
+    /// each other's signatures is what makes a future fork fail here rather than in production.
     #[test]
-    fn test_constant_time_eq() {
-        let a = [1u8, 2, 3, 4];
-        let b = [1u8, 2, 3, 4];
-        let c = [1u8, 2, 3, 5];
-        let d = [1u8, 2, 3];
+    fn this_type_is_a_forward_to_the_shared_key_not_a_second_implementation() {
+        let secret = test_secret();
+        let wrapper = InternalAuth::new(&secret).unwrap();
+        let shared = InternalAuthKey::new(&secret).unwrap();
 
-        assert!(constant_time_eq(&a, &b));
-        assert!(!constant_time_eq(&a, &c));
-        assert!(!constant_time_eq(&a, &d));
+        let ts = ghost_common::internal_auth::now_secs();
+        let body = b"a share batch";
+
+        assert_eq!(
+            wrapper.sign(ts, body),
+            shared.sign(ts, body),
+            "the wrapper must produce the shared construction, byte for byte"
+        );
+        assert!(
+            wrapper.verify(&shared.sign(ts, body), ts, body).is_ok(),
+            "the wrapper must accept what the shared key signs"
+        );
+        assert!(
+            shared.verify(&wrapper.sign(ts, body), ts, body).is_ok(),
+            "the shared key must accept what the wrapper signs"
+        );
+    }
+
+    /// A secret LONGER than 32 bytes must be accepted here, because `pool_sv2` accepts it too.
+    /// If this side ever tightened to "exactly 32" the two would disagree and every share from a
+    /// node with a longer secret would be discarded with a 401 nobody is watching for.
+    #[test]
+    fn a_longer_secret_is_accepted_and_matches_its_first_32_bytes() {
+        let long: Vec<u8> = (0u8..96).map(|i| i.wrapping_add(0x42)).collect();
+        let from_long = InternalAuth::new(&long).expect("a 96-byte secret must be accepted");
+        let from_short = InternalAuth::new(&long[..32]).unwrap();
+
+        let ts = ghost_common::internal_auth::now_secs();
+        assert_eq!(from_long.sign(ts, b"body"), from_short.sign(ts, b"body"));
     }
 
     #[test]
@@ -481,11 +447,19 @@ mod tests {
         let sig = auth.sign(ts, body);
         assert!(auth.verify(&sig, ts, body).is_ok());
 
-        // Zeroize and verify the secret is zeroed
+        // Zeroize, then assert on the OUTCOME rather than on a private field: a key that has
+        // been wiped can no longer produce the signature it produced a moment ago, and can no
+        // longer accept it.
+        let before = auth.sign(ts, body);
         auth.zeroize();
-        assert_eq!(
-            auth.secret, [0u8; 32],
+        assert_ne!(
+            auth.sign(ts, body),
+            before,
             "Secret must be zeroed after zeroize()"
+        );
+        assert!(
+            auth.verify(&before, ts, body).is_err(),
+            "a zeroized key must not still accept signatures made under the real secret"
         );
     }
 
@@ -584,7 +558,8 @@ mod tests {
     fn test_timestamp_tolerance_constant() {
         // API-4 FIX: Verify the constant is 30 seconds (reduced from 60)
         assert_eq!(
-            MAX_TIMESTAMP_DRIFT_SECS, 30,
+            ghost_common::internal_auth::MAX_TIMESTAMP_DRIFT_SECS,
+            30,
             "API-4: Timestamp tolerance should be 30 seconds"
         );
     }

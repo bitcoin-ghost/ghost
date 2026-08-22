@@ -13,6 +13,11 @@ monitoring_address = "127.0.0.1:9090"
 
 [share_webhook]
 url = "http://127.0.0.1:8080/api/internal/shares"
+# Mandatory field (H-13). On regtest the pool runs without an internal_api_secret, so its
+# dev-mode insecure path still admits an unsigned loopback POST and this value is ignored —
+# but the key must be present, because pool_sv2 refuses to start without a usable one. On
+# mainnet it must equal ghost-pool's [network] internal_api_secret.
+secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 batch_size = 1
 batch_timeout_ms = 500
 max_retries = 3

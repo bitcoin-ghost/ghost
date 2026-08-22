@@ -42,6 +42,7 @@ use crate::auth::{verify_internal_auth, InternalAuth};
 use crate::challenge::*;
 use crate::server::{MeshNodeInfo, ShareBatch, ShareNotification, VerificationState};
 use crate::websocket::{ws_handler, WsAuthQuery};
+use ghost_common::error::GhostError;
 
 /// M-STOR-3: Check if a path is in the allowed list
 fn is_safe_proc_path(path: &str, allowed: &[String]) -> bool {
@@ -475,8 +476,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
                 },
             ),
         )
-        .route("/api/internal/share", post(share_notification_handler))
-        .route("/api/internal/shares", post(share_batch_handler))
         .route("/api/internal/pool-nodes", get(pool_nodes_handler))
         // L2 mutation endpoints — localhost only (ghost-pay is colocated)
         .route("/api/v1/l2/submit", post(api_l2_submit_handler))
@@ -494,6 +493,19 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_glyph_relay_registered_handler),
         )
         .layer(middleware::from_fn(localhost_only_middleware));
+
+    // H-13: the share ingest lane. Separated from `localhost_router` because loopback is not an
+    // authorisation decision for a route that writes the payout ledger — see
+    // `share_ingest_auth_middleware` for why.
+    let share_ingest_auth = state.internal_auth.clone();
+    let share_ingest_required = state.require_internal_auth;
+    let share_ingest_router = Router::new()
+        .route("/api/internal/share", post(share_notification_handler))
+        .route("/api/internal/shares", post(share_batch_handler))
+        .layer(middleware::from_fn(move |request, next| {
+            let auth = share_ingest_auth.clone();
+            share_ingest_auth_middleware(auth, share_ingest_required, request, next)
+        }));
 
     // Internal/admin endpoints with HMAC authentication (AUTH4-1 fix)
     // CRIT-6: All config POST endpoints moved here to require authentication
@@ -776,6 +788,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
     // Merge routers
     public_router
         .merge(localhost_router)
+        .merge(share_ingest_router)
         .merge(internal_router)
         .with_state(state)
 }
@@ -818,6 +831,119 @@ async fn internal_auth_middleware(
     let request = axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
     Ok(next.run(request).await)
+}
+
+/// Authentication for the share ingest lane, `POST /api/internal/share{,s}` (H-13).
+///
+/// # What was wrong
+///
+/// These two routes were on `localhost_only_middleware` — the caller was authorised by
+/// `ConnectInfo.ip().is_loopback()` and nothing else. That is not authentication, for two
+/// reasons:
+///
+/// * **Loopback is not an identity.** Every process on the box is loopback. Anything running as
+///   any user — a compromised dashboard, a stray script, a container sharing the network
+///   namespace — could POST work into the payout ledger, and the ledger pays real money.
+/// * **A reverse proxy erases the distinction.** If an operator ever fronts `:8080` with an
+///   on-box nginx (which the fleet does for the public API), the proxy is the TCP peer, so
+///   `ConnectInfo` reads `127.0.0.1` for a request that arrived from the internet. The check
+///   then admits the whole world while still reporting "localhost only". `X-Forwarded-For`
+///   cannot rescue it either: a header a remote client controls can never authorise anything.
+///
+/// # What it does now
+///
+/// Loopback is still required — a share submitted from off-box is refused before the HMAC is
+/// even computed — but it is now the outer of two gates rather than the only one. The inner gate
+/// is the same `InternalAuth` HMAC-SHA256 over `timestamp || body` that `/api/internal/*` and
+/// `/admin/*` already use, which pins the caller to a holder of `internal_api_secret`.
+///
+/// Keeping the loopback check as well as the HMAC is deliberate: it costs nothing, and it means
+/// a leaked secret still does not open a remote lane into the ledger.
+///
+/// # What the HMAC does NOT do
+///
+/// It is not replay protection, and an earlier version of this comment claimed it was. The
+/// 30-second timestamp window bounds how long a CAPTURED request stays acceptable; it does
+/// nothing about the holder of the secret re-sending a body, because re-signing an identical body
+/// under a fresh timestamp is trivial for anyone with the key. That matters here specifically:
+/// `scripts/install-node.sh` gives the same `internal_api_secret` to ghost-dashboard as
+/// `INTERNAL_AUTH_KEY`, so a compromised dashboard — one of the two threats named above — holds a
+/// valid signing key.
+///
+/// Replay is refused one layer down, at the ledger, by the share-hash dedup in
+/// `VerificationState::record_share`. That is the right place for it: it is keyed on the share
+/// rather than the request, so it also catches the same share arriving in a re-crafted batch, and
+/// it catches `pool_sv2` legitimately re-sending a batch whose `200` was lost — which needed no
+/// attacker and was being credited twice.
+///
+/// # Fail-closed
+///
+/// `require_internal_auth` is on by default and `internal_api_secret` is MANDATORY on mainnet
+/// (`GhostConfig::validate_mainnet_security`), so a production node always has a secret and
+/// unsigned requests are rejected. The one path that keeps loopback-only is an operator who has
+/// explicitly asked for it with `allow_insecure_internal_api(true)` — the dev/regtest mode that
+/// already governs every other internal route. Even there the share is not taken on trust: the
+/// PoW gate in `VerificationState::record_share` still has to accept it.
+///
+/// # Rate limiting
+///
+/// Loopback stays exempt from `rate_limit_middleware`, and that is now a defensible position
+/// rather than an oversight: a flood on this lane is rejected by an HMAC check before it can
+/// touch the ledger, so the exemption no longer amplifies anything. A limiter in front of the
+/// money path would be the more dangerous of the two options — a mis-sized bucket silently
+/// discards shares that miners were paid for, which is the failure this whole area keeps having.
+async fn share_ingest_auth_middleware(
+    auth: Option<Arc<InternalAuth>>,
+    require_auth: bool,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let is_localhost = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+
+    if !is_localhost {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Share webhook only accessible from localhost".to_string(),
+        ));
+    }
+
+    match auth {
+        Some(auth) => {
+            // Body has to be buffered to compute the HMAC over it, exactly as
+            // `internal_auth_middleware` does; the same bytes are then handed on to the handler.
+            let (parts, body) = request.into_parts();
+            let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read request body: {}", e),
+                    )
+                })?;
+            verify_internal_auth(&auth, &parts.headers, &body_bytes)?;
+            let request =
+                axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
+            Ok(next.run(request).await)
+        }
+        None if require_auth => {
+            tracing::warn!(
+                path = %request.uri().path(),
+                "H-13: rejecting share submission — no internal_api_secret is configured, so the \
+                 caller cannot be authenticated"
+            );
+            Err((
+                StatusCode::UNAUTHORIZED,
+                "Share webhook authentication not configured".to_string(),
+            ))
+        }
+        // Explicit dev/regtest mode (`allow_insecure_internal_api(true)`). Loopback-only, as
+        // before, and still subject to the PoW gate at ingest.
+        None => Ok(next.run(request).await),
+    }
 }
 
 /// Middleware that restricts access to localhost (127.0.0.1/::1) connections only.
@@ -9917,6 +10043,28 @@ async fn share_notification_handler(
 
     match state.record_share(share) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
+        // A share this node REFUSED is the caller's fault, and must not be reported as this
+        // node's fault. Returning 500 for a forged or replayed share made it indistinguishable
+        // from "recorder not configured", and any client with the usual retry-on-5xx rule would
+        // resubmit it — turning a rejection into a loop. The batch lane already answers 200 with
+        // a `recorded` count for the same situation; this lane now agrees with it.
+        Err(e @ GhostError::InvalidShare(_)) => {
+            warn!(error = %e, "Rejected share");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "rejected", "message": e.to_string()})),
+            )
+        }
+        // 409, not 400: the share is well-formed and was genuinely mined — this node has simply
+        // already credited it. A caller re-sending after a lost response gets a definite "already
+        // counted" rather than a reason to try again.
+        Err(e @ GhostError::DuplicateShare(_)) => {
+            debug!(error = %e, "Duplicate share");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"status": "duplicate", "message": e.to_string()})),
+            )
+        }
         Err(e) => {
             warn!(error = %e, "Failed to record share");
             (
@@ -14160,6 +14308,342 @@ mod tests {
                 endpoint
             );
         }
+    }
+
+    // ===========================================================================
+    // H-13: share webhook authentication
+    // ===========================================================================
+
+    /// Build a state whose share ingest is fully wired: an HMAC secret, a recorder that counts
+    /// what reaches the ledger, and a tip below every gate so the PoW check is not what decides
+    /// these tests. The counter is returned so a test can assert on the LEDGER, not on a status
+    /// code that might be produced for some unrelated reason.
+    fn share_ingest_state() -> (
+        Arc<crate::server::VerificationState>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&recorded);
+        let state = crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+        .with_share_recorder(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        (Arc::new(state), recorded)
+    }
+
+    /// One share batch, in the shape `pool_sv2` puts on the wire.
+    fn a_share_batch() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "pool_id": 1,
+            "batch_seq": 1,
+            "shares": [{
+                "timestamp_ms": 0u64,
+                "share_hash": "00".repeat(32),
+                "share_work": 1024.0,
+                "channel_id": 1,
+                "sequence_number": 1,
+                "job_id": 1,
+                "downstream_id": 1,
+                "is_block": false,
+                "user_identity": "bc1qtest.worker",
+            }],
+        }))
+        .unwrap()
+    }
+
+    fn loopback() -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+        axum::extract::ConnectInfo("127.0.0.1:54321".parse().unwrap())
+    }
+
+    fn off_box() -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+        axum::extract::ConnectInfo("77.22.112.180:54321".parse().unwrap())
+    }
+
+    /// Sign `body` exactly as `InternalAuth` verifies it, and return the two headers.
+    fn signed_headers(body: &[u8]) -> (String, String) {
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        (ts.to_string(), auth.sign(ts, body))
+    }
+
+    /// H-13. `POST /api/internal/share{,s}` was authorised by `ConnectInfo.ip().is_loopback()`
+    /// and nothing else, so every process on the box could write the payout ledger — and so
+    /// could the internet, the moment an operator put a reverse proxy in front of `:8080`, since
+    /// the proxy then IS the loopback peer.
+    ///
+    /// Both routes are asserted, because only the batch one ever got the PoW fix and the
+    /// singular one is the lane that is easy to forget.
+    #[tokio::test]
+    async fn share_ingest_needs_an_hmac_not_merely_a_loopback_socket() {
+        use std::sync::atomic::Ordering;
+
+        for uri in ["/api/internal/shares", "/api/internal/share"] {
+            let (state, recorded) = share_ingest_state();
+            let body = if uri.ends_with("shares") {
+                a_share_batch()
+            } else {
+                serde_json::to_vec(&serde_json::json!({
+                    "miner_id": "bc1qtest.worker",
+                    "work": 1024.0,
+                    "share_hash": "00".repeat(32),
+                    "job_id": 1,
+                    "timestamp": 0u64,
+                    "is_block": false,
+                }))
+                .unwrap()
+            };
+
+            // Positive control first: a correctly signed loopback POST must still be accepted,
+            // and must actually reach the recorder. Without this, a middleware that rejected
+            // everything would pass every other assertion in this test.
+            let (ts, sig) = signed_headers(&body);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", &ts)
+                .header("X-Ghost-Signature", &sig)
+                .body(Body::from(body.clone()))
+                .unwrap();
+            request.extensions_mut().insert(loopback());
+            let response = super::create_router(Arc::clone(&state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{uri}: a signed loopback submission must be accepted"
+            );
+            assert_eq!(
+                recorded.load(Ordering::SeqCst),
+                1,
+                "{uri}: the signed share must actually reach the ledger"
+            );
+
+            // Unsigned, from loopback — the exact request any local process could send before.
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            request.extensions_mut().insert(loopback());
+            let response = super::create_router(Arc::clone(&state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri}: loopback alone must no longer authorise a ledger write"
+            );
+
+            // Signed over DIFFERENT bytes: the signature is valid, the body is not the one it
+            // covers. This is the tamper case — a proxied batch with the work figures rewritten.
+            let (ts, sig) = signed_headers(b"a completely different body");
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", &ts)
+                .header("X-Ghost-Signature", &sig)
+                .body(Body::from(body.clone()))
+                .unwrap();
+            request.extensions_mut().insert(loopback());
+            let response = super::create_router(Arc::clone(&state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri}: a signature over other bytes must not authorise this body"
+            );
+
+            // Correctly signed but from off-box: loopback is kept as the OUTER gate, so a leaked
+            // secret still does not open a remote lane into the ledger.
+            let (ts, sig) = signed_headers(&body);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", &ts)
+                .header("X-Ghost-Signature", &sig)
+                .body(Body::from(body.clone()))
+                .unwrap();
+            request.extensions_mut().insert(off_box());
+            let response = super::create_router(Arc::clone(&state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{uri}: off-box must be refused even with a valid signature"
+            );
+
+            assert_eq!(
+                recorded.load(Ordering::SeqCst),
+                1,
+                "{uri}: only the one properly authorised share may have been recorded"
+            );
+        }
+    }
+
+    /// A share this node refuses must answer 4xx, not 500.
+    ///
+    /// `record_share` signals a rejection with an error, and the singular handler mapped EVERY
+    /// error to `INTERNAL_SERVER_ERROR` — so a forged share was indistinguishable from "recorder
+    /// not configured", and any client following the usual retry-on-5xx rule would resubmit it
+    /// for ever. The batch lane already answers 200 with a `recorded` count; this lane now
+    /// distinguishes the caller's fault from the node's.
+    #[tokio::test]
+    async fn the_singular_lane_answers_4xx_for_a_share_it_refuses() {
+        use bitcoin::hashes::{sha256d, Hash};
+        use ghost_accounting::DifficultyCalculator;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+            .with_share_recorder(|_| Ok(()))
+            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_share_pow_verify_height(959_030),
+        );
+
+        let header = [0u8; 80];
+        let wire_hex = sha256d::Hash::hash(&header).to_string();
+        let achieved = DifficultyCalculator::difficulty_from_hash(
+            &sha256d::Hash::hash(&header).to_byte_array(),
+        );
+
+        async fn post(
+            state: &Arc<crate::server::VerificationState>,
+            work: f64,
+            share_hash: &str,
+            header_hex: Option<String>,
+        ) -> StatusCode {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "miner_id": "bc1qtest.worker",
+                "work": work,
+                "share_hash": share_hash,
+                "job_id": 1,
+                "timestamp": 0u64,
+                "is_block": false,
+                "header": header_hex,
+            }))
+            .unwrap();
+            let (ts, sig) = signed_headers(&body);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/internal/share")
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", &ts)
+                .header("X-Ghost-Signature", &sig)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(loopback());
+            super::create_router(Arc::clone(state))
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status()
+        }
+
+        let header_hex = hex::encode(header);
+
+        // Positive control first: a genuine share still answers 200.
+        assert_eq!(
+            post(&state, achieved * 0.5, &wire_hex, Some(header_hex.clone())).await,
+            StatusCode::OK
+        );
+
+        // Replay of that share: 409, so a caller re-sending after a lost response learns it is
+        // already counted rather than being invited to try again.
+        assert_eq!(
+            post(&state, achieved * 0.5, &wire_hex, Some(header_hex.clone())).await,
+            StatusCode::CONFLICT,
+            "a duplicate must be 409, not 500"
+        );
+
+        // Forged work: 400. Never 5xx — a client retrying on 5xx would loop on a forgery.
+        assert_eq!(
+            post(&state, 1e12, &"cd".repeat(32), Some(header_hex)).await,
+            StatusCode::BAD_REQUEST,
+            "work the header does not justify must be 400, not 500"
+        );
+
+        // A genuine node fault is still 5xx: no recorder wired at all.
+        let broken = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+        );
+        assert_eq!(
+            post(&broken, 1024.0, &"ef".repeat(32), None).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a real node fault must stay 5xx, or the distinction is meaningless"
+        );
+    }
+
+    /// Fail-closed. A node with `require_internal_auth` on but no secret configured cannot
+    /// authenticate anyone, so it must refuse share submissions rather than fall back to the
+    /// loopback-only rule the secret was introduced to replace.
+    ///
+    /// (`validate_security_config` refuses to start such a node, and mainnet config validation
+    /// makes `internal_api_secret` mandatory — this pins the middleware's own behaviour so the
+    /// fallback cannot be reintroduced by a refactor that never touches startup.)
+    #[tokio::test]
+    async fn share_ingest_fails_closed_when_no_secret_is_configured() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let state = Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        ));
+        assert!(
+            state.require_internal_auth,
+            "the default must be to require auth, or this test proves nothing"
+        );
+
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/internal/shares")
+            .header("Content-Type", "application/json")
+            .body(Body::from(a_share_batch()))
+            .unwrap();
+        request.extensions_mut().insert(loopback());
+
+        let response = super::create_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// The live event socket must not be reachable from off-box.

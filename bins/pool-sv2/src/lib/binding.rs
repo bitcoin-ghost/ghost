@@ -64,12 +64,14 @@ mod tests {
         ShareWebhookWorker::new(
             ShareWebhookConfig {
                 url: "http://127.0.0.1:0/unused".to_string(),
+                secret: hex::encode((0u8..32).map(|i| i.wrapping_add(0x42)).collect::<Vec<u8>>()),
                 batch_size: 1,
                 batch_timeout_ms: 1000,
                 max_retries: 0,
             },
             1,
         )
+        .expect("a valid secret must build a worker")
     }
 
     /// The id a share carries must be the id the skeleton hashes to — that is the whole basis of

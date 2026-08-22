@@ -12,9 +12,12 @@ The full mining stack works end-to-end against the local cluster. Topology:
    SV2 on `34256`, and POSTs shares to `/api/internal/shares`.
    **Run it inside the pool's network namespace** (`docker run
    --network container:rc-pool1 …`) so the webhook + TDP calls are loopback —
-   the internal API is **localhost-only** (cross-container POSTs get `403`; on
-   regtest no `internal_api_secret` is needed, the dev-mode insecure path admits
-   loopback). pool_sv2's listener is then reachable at the pool's own IP:34256.
+   the share webhook requires loopback **and** an HMAC (H-13), so cross-container
+   POSTs get `403`. On regtest no `internal_api_secret` is set, so the dev-mode
+   insecure path admits an unsigned loopback POST and `[share_webhook] secret`
+   is ignored — it still has to be present, because the field is mandatory and a
+   config without it will not parse. On mainnet the two must be equal.
+   pool_sv2's listener is then reachable at the pool's own IP:34256.
 3. **translator_sv2** (`translator.toml.example`): upstream = the pool's IP:34256,
    serves SV1 on `:3333`. Use `aggregate_channels = false` so the SV1 authorize
    username (a `bcrt1…addr.worker`) flows through as the payout identity.

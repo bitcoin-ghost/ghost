@@ -35,6 +35,8 @@ toml = { workspace = true }
 bitcoin = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+# Internal-API request signing, shared by every process that speaks the internal HTTP protocol.
+hmac = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
