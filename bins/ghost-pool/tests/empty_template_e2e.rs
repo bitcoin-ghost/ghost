@@ -18,8 +18,11 @@ use ghost_common::types::TreasuryAddress;
 use ghost_pool::template::{TemplateConfig, TemplateProcessor};
 use serde_json::json;
 
+mod common;
+
 fn rpc() -> Option<Arc<BitcoinRpc>> {
-    let mut r = BitcoinRpc::new("127.0.0.1", 18443, "ghosttest", "ghosttest").ok()?;
+    // Credentials from the environment with the shipped compose defaults (see `common`).
+    let mut r = common::regtest_rpc_raw()?;
     // The checked get_block_template validates the target against the rpc's network
     // (mainnet by default), and regtest's trivial target reads as "too easy" under
     // the mainnet limit. Point the rpc at Regtest so it uses the permissive limit.

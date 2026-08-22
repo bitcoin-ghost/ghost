@@ -48,6 +48,8 @@ use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
 use ghost_storage::{Database, MinerRecord, ShareRecord};
 use ghost_verification::qualification::QualifiedCapabilityProvider;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Scenario: the mainnet shape
 // ---------------------------------------------------------------------------
@@ -129,9 +131,10 @@ fn block_found_at() -> i64 {
 }
 
 fn regtest_rpc() -> Option<Arc<BitcoinRpc>> {
-    BitcoinRpc::new("127.0.0.1", 18443, "ghosttest", "ghosttest")
-        .ok()
-        .map(Arc::new)
+    // Credentials come from the environment with the shipped compose defaults.
+    // Hardcoding `ghosttest` here matched no config in the repo, so every test in
+    // this file skipped even against a healthy node. See `common/mod.rs`.
+    common::regtest_rpc()
 }
 
 /// A checksum-valid regtest P2WPKH address, derived deterministically.

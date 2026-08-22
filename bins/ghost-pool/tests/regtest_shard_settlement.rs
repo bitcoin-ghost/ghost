@@ -44,12 +44,12 @@ use ghost_common::rpc::BitcoinRpc;
 use ghost_pool::shard::ShardRuntime;
 use ghost_storage::Database;
 
+mod common;
+
 fn rpc() -> Option<Arc<BitcoinRpc>> {
-    let hostport = std::env::var("GHOST_REGTEST_RPC").ok()?;
-    let (host, port) = hostport.split_once(':')?;
-    Some(Arc::new(
-        BitcoinRpc::new(host, port.parse().ok()?, "rt", "rt").expect("rpc"),
-    ))
+    // Explicit `GHOST_REGTEST_RPC=host:port` opt-in kept; credentials now shared (see `common`).
+    // The previous hardcoded `rt`/`rt` matched no shipped config.
+    common::regtest_rpc_explicit()
 }
 
 /// A shard runtime over a fresh in-memory database.

@@ -24,17 +24,17 @@ use ghost_pool::settlement::{SettleOutcome, SettlementObserver};
 use ghost_storage::models::{MinerRecord, ShareRecord};
 use ghost_storage::Database;
 
+mod common;
+
 const MINER: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080.worker";
 const ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 /// Matches the payout id the rehearsal block was mined with.
 const PROPOSAL_HASH: [u8; 32] = [0x5A; 32];
 
 fn rpc() -> Option<Arc<BitcoinRpc>> {
-    let hostport = std::env::var("GHOST_REGTEST_RPC").ok()?;
-    let (host, port) = hostport.split_once(':')?;
-    Some(Arc::new(
-        BitcoinRpc::new(host, port.parse().ok()?, "rt", "rt").expect("rpc"),
-    ))
+    // Explicit `GHOST_REGTEST_RPC=host:port` opt-in kept; credentials now shared (see `common`).
+    // The previous hardcoded `rt`/`rt` matched no shipped config.
+    common::regtest_rpc_explicit()
 }
 
 /// Drive Core directly for the operator-side actions.
