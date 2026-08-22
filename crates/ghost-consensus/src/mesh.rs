@@ -4958,9 +4958,11 @@ mod high_water_tests {
     #[test]
     fn the_real_signing_path_produces_a_verifiable_envelope() {
         let identity = Arc::new(NodeIdentity::generate());
-        let mut config = MeshConfig::default();
-        config.noise_enabled = false;
-        config.noise_required = false;
+        let config = MeshConfig {
+            noise_enabled: false,
+            noise_required: false,
+            ..Default::default()
+        };
         let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
 
         let env = mesh
@@ -4983,9 +4985,11 @@ mod high_water_tests {
     #[test]
     fn a_height_past_the_gate_switches_the_real_signing_path_to_v2() {
         let identity = Arc::new(NodeIdentity::generate());
-        let mut config = MeshConfig::default();
-        config.noise_enabled = false;
-        config.noise_required = false;
+        let config = MeshConfig {
+            noise_enabled: false,
+            noise_required: false,
+            ..Default::default()
+        };
         let mut mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
 
         let gate = mesh_envelope_v2_height();
