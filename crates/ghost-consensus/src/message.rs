@@ -4066,22 +4066,127 @@ mod envelope_signing_tests {
         );
     }
 
-    /// Length prefixes, not just concatenation: `payload="ab", seq=1` and `payload="a", seq=…`
-    /// style ambiguities are what unprefixed formats admit. Two envelopes that differ only in
-    /// where the boundary between payload and the fields after it falls must not share a preimage.
+    /// Decode the v2 preimage field by field and check it against the documented layout.
+    ///
+    /// This replaces a test that asserted two envelopes with DIFFERENT-LENGTH payloads produce
+    /// different preimages. That could not fail: the payloads already differed, so it held with
+    /// either length prefix deleted. It read as a demonstration that the encoding is unambiguous
+    /// and demonstrated nothing.
+    ///
+    /// A collision test cannot do the job here either. `type_tag` is drawn from a fixed set of
+    /// `MessageType` JSON names, not chosen by an attacker, and no two of them line up to produce
+    /// a colliding preimage even with the prefix removed. And `payload` is the LAST field, so
+    /// `payload_len` is not what makes the encoding decodable at all — it is redundancy, and no
+    /// collision can exist to catch its removal.
+    ///
+    /// So the honest check is the layout itself: parse it back, assert every field lands where the
+    /// doc comment says, and assert the cursor ends exactly at the end. Delete either length
+    /// prefix and the parse desynchronises immediately.
     #[test]
-    fn v2_preimage_is_unambiguous_across_field_boundaries() {
-        let mut a = envelope(ENVELOPE_VERSION_V2, MessageType::Vote, 1_700_000_000_000, 8);
-        let mut b = a.clone();
-        a.payload = b"abc".to_vec();
-        b.payload = b"ab".to_vec();
-        b.sequence = a.sequence;
-
-        assert_ne!(
-            a.signing_bytes().unwrap(),
-            b.signing_bytes().unwrap(),
-            "a shorter payload must not be absorbable into a neighbouring field"
+    fn v2_preimage_matches_its_documented_layout() {
+        let env = envelope(
+            ENVELOPE_VERSION_V2,
+            MessageType::ShareProof,
+            1_700_000_000_123,
+            8,
         );
+        let bytes = env.signing_bytes().expect("v2 preimage");
+        let expected_tag = serde_json::to_vec(&env.msg_type).expect("tag");
+
+        let mut cur = 0usize;
+        let mut take = |n: usize| -> &[u8] {
+            assert!(
+                cur + n <= bytes.len(),
+                "preimage ran out at offset {cur} wanting {n} of {}",
+                bytes.len()
+            );
+            let out = &bytes[cur..cur + n];
+            cur += n;
+            out
+        };
+
+        assert_eq!(take(23), b"ghost/mesh/envelope/v2\0", "domain separator");
+        assert_eq!(take(32), &env.sender[..], "sender");
+        assert_eq!(
+            u64::from_le_bytes(take(8).try_into().unwrap()),
+            env.timestamp,
+            "timestamp"
+        );
+        assert_eq!(
+            u64::from_le_bytes(take(8).try_into().unwrap()),
+            env.sequence,
+            "sequence"
+        );
+
+        let tag_len = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+        assert_eq!(tag_len, expected_tag.len(), "type_tag length prefix");
+        assert_eq!(take(tag_len), &expected_tag[..], "type_tag");
+
+        let payload_len = u64::from_le_bytes(take(8).try_into().unwrap()) as usize;
+        assert_eq!(payload_len, env.payload.len(), "payload length prefix");
+        assert_eq!(take(payload_len), &env.payload[..], "payload");
+
+        assert_eq!(cur, bytes.len(), "trailing bytes after the payload");
+    }
+
+    /// The property the layout is FOR: distinct field tuples must not share a preimage.
+    ///
+    /// Varying one field at a time from a common base is what makes this meaningful — it catches a
+    /// field dropped from the preimage entirely, which is the realistic way this encoding breaks.
+    /// `ttl` is varied too, and is the one field required to COLLIDE, since it changes on every
+    /// hop.
+    #[test]
+    fn v2_preimages_are_distinct_for_distinct_field_tuples() {
+        let base = envelope(
+            ENVELOPE_VERSION_V2,
+            MessageType::ShareProof,
+            1_700_000_000_000,
+            8,
+        );
+
+        let mut other_sender = base.clone();
+        other_sender.sender = [8u8; 32];
+        let mut other_ts = base.clone();
+        other_ts.timestamp += 1;
+        let mut other_seq = base.clone();
+        other_seq.sequence += 1;
+        let mut other_type = base.clone();
+        other_type.msg_type = MessageType::ShareConvergence;
+        let mut other_payload = base.clone();
+        other_payload.payload = b"payloae".to_vec(); // same length, one byte different
+
+        let variants = [
+            ("sender", other_sender),
+            ("timestamp", other_ts),
+            ("sequence", other_seq),
+            ("msg_type", other_type),
+            ("payload", other_payload),
+        ];
+
+        let base_bytes = base.signing_bytes().unwrap();
+        for (field, variant) in &variants {
+            assert_ne!(
+                base_bytes,
+                variant.signing_bytes().unwrap(),
+                "changing {field} left the preimage unchanged — it is not bound"
+            );
+        }
+
+        // And distinct from each other, not merely from the base.
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(
+                    variants[i].1.signing_bytes().unwrap(),
+                    variants[j].1.signing_bytes().unwrap(),
+                    "{} and {} collided",
+                    variants[i].0,
+                    variants[j].0
+                );
+            }
+        }
+
+        // Same tuple, same bytes — a preimage that varied run to run would be unverifiable.
+        assert_eq!(base_bytes, base.signing_bytes().unwrap());
     }
 
     /// A version this binary cannot reconstruct is a version it cannot authenticate. It must be an

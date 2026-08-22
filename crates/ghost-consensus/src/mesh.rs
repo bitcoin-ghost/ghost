@@ -461,34 +461,69 @@ const SEQUENCE_LEASE_THRESHOLD: u64 = 10_000;
 
 /// How long a per-sender inbound high-water mark outlives the last message from that sender.
 ///
-/// This is the replay window that remains once the mark is doing its job, and it is a trade, not
-/// a free parameter. Longer is stronger — but a peer whose OUTBOUND counter rewound (its
-/// `sequence_persist_path` file lost with a rebuilt data directory) is refused for exactly this
-/// long, and that is a liveness outage, not a degradation. 24 hours is chosen so a rewound peer
-/// self-heals within one operator day without needing anyone to know this mechanism exists, while
-/// still being ~288x the 300-second window it replaces.
+/// This is the replay window that remains once the mark is doing its job, and it is a trade.
+/// Longer is stronger — but a peer whose OUTBOUND counter rewound (its `sequence_persist_path`
+/// lost with a rebuilt data directory) is refused for exactly this long by every peer that
+/// remembers it, and because the marks are persisted, restarting the REJECTING node no longer
+/// clears it. That is a fleet-wide partition of one node, not a degradation.
+///
+/// One hour, not a day. A day was chosen on the reasoning that a rewound peer "self-heals within
+/// one operator day"; an hour of an eight-node mesh running seven-eighths strength is a bounded
+/// incident, and a day is not. It is still 12x the ~300 s window it replaces, and an honest peer
+/// cannot reach it in normal operation: health pings run every 10 s, so a peer silent for an hour
+/// is a peer that is down.
+///
+/// ⚠ The TTL is the BACKSTOP for a rewind, not the remedy. The remedy is
+/// `GHOST_MESH_SEQUENCE_RESUME_AT` on the rewound node itself — see
+/// [`MeshNetwork::load_and_reserve_sequence`] — which fixes it for the whole fleet by touching the
+/// one node that is actually broken, rather than deleting a file on the other seven.
 ///
 /// ⚠ Once [`crate::message::ENVELOPE_VERSION_V2`] is armed this stops being the primary defence:
 /// a v2 envelope binds its own timestamp, so a replay cannot be re-stamped and dies on the ±30 s
-/// drift check regardless of what the marks remember. The marks then only cover replays inside
-/// that 30-second window. Until then they are the whole of it.
-const PEER_HIGH_WATER_TTL_SECS: u64 = 86_400;
+/// drift check regardless of what the marks remember. Until then they are the whole of it.
+const PEER_HIGH_WATER_TTL_SECS: u64 = 3_600;
 
-/// Cap on tracked senders, so an attacker forging sender ids cannot grow the map without bound.
-/// The fleet is eight nodes; this is three orders of magnitude of headroom.
+/// Total tracked senders. The fleet is eight nodes; this is three orders of magnitude of headroom.
 const MAX_HIGH_WATER_SENDERS: usize = 1_000;
+
+/// Of that budget, the most a sender we do NOT mesh with may ever occupy.
+///
+/// ⛔ This split is the whole reason the marks are worth anything. Node ids are ed25519 public
+/// keys behind ~24 bits of PoW — roughly 30 seconds of CPU each — so "number of distinct senders"
+/// is a quantity an attacker chooses, not a fact about the network. An eviction policy driven by
+/// that quantity is an eviction policy the attacker drives.
+///
+/// The first version of this evicted the least-recently-heard-from entry once the map was full,
+/// which meant ~1001 throwaway keypairs flushed the replay floor of precisely the quiet honest
+/// peer the mark exists to protect — turning H-11 from "reachable after a quiet period" into
+/// "reachable on demand", which is strictly worse than having no marks at all, because the code
+/// reads as though it is defended.
+///
+/// So: strangers share a small fixed pool and can never displace anyone. 1000 − 128 = 872 slots
+/// are reserved for peers we actually mesh with, against a fleet of eight.
+const MAX_UNKNOWN_HIGH_WATER_SENDERS: usize = 128;
 
 /// Per-sender inbound high-water marks: the highest sequence ever accepted from each sender.
 ///
 /// Deliberately NOT part of [`SeenMessageCache`]. That cache exists to bound memory and evicts
 /// aggressively — by TTL, by per-sender count, by global capacity and by memory pressure — and
 /// every one of those paths dropped the sequence state with it, which is precisely how the replay
-/// defence became reachable-around. These marks are 16 bytes per peer and age out on one rule
-/// only: [`PEER_HIGH_WATER_TTL_SECS`] since that peer was last heard from.
+/// defence became reachable-around.
+///
+/// The eviction rule here is deliberately NOT recency. Two rules only, in this order:
+///  1. **age** — a mark older than [`PEER_HIGH_WATER_TTL_SECS`] is dropped. An attacker cannot
+///     make an honest peer's mark older than it is, so this is not a lever;
+///  2. **stranger pressure** — a known peer may take a slot from a stranger, never the reverse.
+///
+/// An existing mark for a known peer is never removed to make room for anything.
 #[derive(Debug, Default)]
 struct PeerHighWaterMarks {
     /// sender -> (highest sequence ever accepted, unix seconds when it was accepted)
     marks: HashMap<NodeId, (u64, u64)>,
+    /// Senders we actually mesh with, refreshed from `PeerManager` on the cleanup tick. Marks for
+    /// these are protected from stranger pressure. Empty until the first tick, which is safe: at
+    /// startup every sender competes for the stranger pool, and the fleet is eight.
+    known: std::collections::HashSet<NodeId>,
     /// Set when `marks` has changed since the last successful write, so the periodic save is a
     /// no-op on an idle node rather than a disk write per minute.
     dirty: bool,
@@ -506,25 +541,89 @@ impl PeerHighWaterMarks {
         })
     }
 
+    /// Replace the protected set. Called on the cleanup tick from the peer table.
+    fn set_known(&mut self, known: std::collections::HashSet<NodeId>) {
+        self.known = known;
+    }
+
+    /// How many slots strangers currently hold.
+    fn unknown_len(&self) -> usize {
+        self.marks
+            .keys()
+            .filter(|id| !self.known.contains(*id))
+            .count()
+    }
+
     /// Record an accepted sequence. Monotonic: an out-of-order acceptance inside the tolerance
     /// window must not lower the mark, or the next quiet period would reopen the gap it closed.
+    ///
+    /// An UPDATE to an existing mark is always honoured — capacity never applies to a sender we
+    /// are already tracking, so no amount of stranger traffic can stop an honest peer's mark from
+    /// advancing.
     fn record(&mut self, sender: NodeId, sequence: u64, now_secs: u64) {
-        match self.marks.entry(sender) {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                let (seq, seen) = e.get_mut();
-                if sequence > *seq {
-                    *seq = sequence;
-                    self.dirty = true;
-                }
-                *seen = now_secs;
-            }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((sequence, now_secs));
+        if let Some((seq, seen)) = self.marks.get_mut(&sender) {
+            if sequence > *seq {
+                *seq = sequence;
                 self.dirty = true;
             }
+            *seen = now_secs;
+            return;
         }
-        if self.marks.len() > MAX_HIGH_WATER_SENDERS {
-            self.prune(now_secs);
+        if !self.admit_new(&sender, now_secs) {
+            return;
+        }
+        self.marks.insert(sender, (sequence, now_secs));
+        self.dirty = true;
+    }
+
+    /// May a sender we have never recorded take a slot?
+    ///
+    /// Refusing costs that sender its replay floor — the pre-change behaviour — while evicting an
+    /// incumbent costs someone ELSE theirs. Under pressure this always chooses the first, because
+    /// the pressure is attacker-supplied and the incumbent may not be.
+    fn admit_new(&mut self, sender: &NodeId, now_secs: u64) -> bool {
+        let is_known = self.known.contains(sender);
+        if self.has_room_for(is_known) {
+            return true;
+        }
+        // Reclaim by AGE before considering anything else.
+        self.drop_expired(now_secs);
+        if self.has_room_for(is_known) {
+            return true;
+        }
+        // Still full. A known peer may take a stranger's slot; a stranger takes nobody's.
+        if !is_known {
+            return false;
+        }
+        let Some(victim) = self
+            .marks
+            .iter()
+            .filter(|(id, _)| !self.known.contains(*id))
+            .min_by_key(|(_, (_, seen))| *seen)
+            .map(|(id, _)| *id)
+        else {
+            return false;
+        };
+        self.marks.remove(&victim);
+        self.dirty = true;
+        true
+    }
+
+    fn has_room_for(&self, is_known: bool) -> bool {
+        if self.marks.len() >= MAX_HIGH_WATER_SENDERS {
+            return false;
+        }
+        is_known || self.unknown_len() < MAX_UNKNOWN_HIGH_WATER_SENDERS
+    }
+
+    /// Drop marks past the TTL. The only unconditional removal rule, and the only one an attacker
+    /// cannot influence.
+    fn drop_expired(&mut self, now_secs: u64) {
+        let before = self.marks.len();
+        self.marks
+            .retain(|_, (_, seen)| now_secs.saturating_sub(*seen) <= PEER_HIGH_WATER_TTL_SECS);
+        if self.marks.len() != before {
+            self.dirty = true;
         }
     }
 
@@ -577,27 +676,54 @@ impl PeerHighWaterMarks {
         }
         Self {
             marks,
+            known: std::collections::HashSet::new(),
             dirty: false,
         }
     }
 
-    /// Write the marks out, write-temp-then-rename so a crash mid-write cannot leave a truncated
-    /// file that would be discarded on load and silently drop the floor.
-    fn save(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        let snapshot: HashMap<String, (u64, u64)> = self
-            .marks
+    /// The marks as they should appear on disk. Taken under the cache lock; written outside it.
+    fn snapshot(&self) -> HashMap<String, (u64, u64)> {
+        self.marks
             .iter()
             .map(|(id, v)| (hex::encode(id), *v))
-            .collect();
-        let encoded = serde_json::to_vec(&snapshot)
+            .collect()
+    }
+
+    /// Write a snapshot out: temp file, fsync, rename, fsync the directory.
+    ///
+    /// Every step is load-bearing. `write` + `rename` alone leaves the data in the page cache, so
+    /// a machine that loses power after the rename can come back with the name pointing at a file
+    /// whose contents were never written — and this file failing to parse degrades SILENTLY to
+    /// "no replay floor", which is the security property, not a cache miss. The directory fsync is
+    /// what makes the rename itself durable.
+    ///
+    /// Free-standing rather than a method: it runs OUTSIDE the `seen_messages` lock, so it must
+    /// not be able to touch the live map.
+    fn write_snapshot(
+        path: &std::path::Path,
+        snapshot: &HashMap<String, (u64, u64)>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let encoded = serde_json::to_vec(snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &encoded)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&encoded)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
-        self.dirty = false;
+        if let Some(parent) = path.parent() {
+            // Best effort: a filesystem that refuses to open a directory still gave us a durable
+            // temp file and an atomic rename, which is the bulk of the guarantee.
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -606,27 +732,6 @@ impl PeerHighWaterMarks {
     fn reset(&mut self, sender: NodeId, sequence: u64, now_secs: u64) {
         self.marks.insert(sender, (sequence, now_secs));
         self.dirty = true;
-    }
-
-    /// Drop expired marks, then — only if still over capacity — the least recently heard from.
-    fn prune(&mut self, now_secs: u64) {
-        let before = self.marks.len();
-        self.marks
-            .retain(|_, (_, seen)| now_secs.saturating_sub(*seen) <= PEER_HIGH_WATER_TTL_SECS);
-        while self.marks.len() > MAX_HIGH_WATER_SENDERS {
-            let Some(oldest) = self
-                .marks
-                .iter()
-                .min_by_key(|(_, (_, seen))| *seen)
-                .map(|(id, _)| *id)
-            else {
-                break;
-            };
-            self.marks.remove(&oldest);
-        }
-        if self.marks.len() != before {
-            self.dirty = true;
-        }
     }
 }
 
@@ -977,7 +1082,12 @@ impl SeenMessageCache {
                             sender = %hex::encode(&sender[..8]),
                             sequence = sequence,
                             high_water = floor,
-                            "H-11: Rejecting first-message replay below the persisted high-water mark"
+                            ttl_secs = PEER_HIGH_WATER_TTL_SECS,
+                            "H-11: Rejecting first-message replay below the persisted high-water \
+                             mark. If this repeats for one peer and that peer is healthy, its \
+                             outbound sequence has REWOUND (lost lease file) — fix it there with \
+                             GHOST_MESH_SEQUENCE_RESUME_AT above the high_water shown here, not \
+                             by deleting mesh_peer_sequences.json on this node"
                         );
                         return SequenceVerdict::Reject;
                     }
@@ -1765,6 +1875,36 @@ impl MeshNetwork {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
+
+        // H-11 REWIND REMEDY. If this node lost its lease file — a rebuilt data directory, a
+        // restore from a backup taken before the counter advanced — it resumes BELOW the sequence
+        // its peers last accepted from it, and every one of them refuses its messages as replays
+        // until their high-water mark for us ages out (`PEER_HIGH_WATER_TTL_SECS`).
+        //
+        // The remedy belongs HERE, on the node that is actually broken, rather than as "delete
+        // `mesh_peer_sequences.json` on the other seven": one node to touch instead of seven, no
+        // window in which those seven run with no replay floor at all, and it takes effect on our
+        // next message rather than on their next cleanup tick.
+        //
+        // Only ever raises the counter. A value at or below what we already persisted is ignored,
+        // so it cannot be used to walk the sequence backwards.
+        let resume_at = std::env::var("GHOST_MESH_SEQUENCE_RESUME_AT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let persisted = if resume_at > persisted {
+            warn!(
+                path = %path.display(),
+                persisted,
+                resume_at,
+                "Mesh outbound sequence: RESUMING FROM GHOST_MESH_SEQUENCE_RESUME_AT — set this \
+                 only to recover a node whose lease file was lost, and unset it afterwards"
+            );
+            resume_at
+        } else {
+            persisted
+        };
+
         let ceiling = persisted.saturating_add(SEQUENCE_LEASE_BLOCK);
         match Self::write_sequence_ceiling(path, ceiling) {
             Ok(()) => {
@@ -3517,37 +3657,67 @@ impl MeshNetwork {
             .as_secs();
         let cutoff = now.saturating_sub(max_age_secs);
 
-        let mut seen = self.seen_messages.write();
-        let before_len = seen.len();
-        seen.cleanup_older_than(cutoff);
-        let after_len = seen.len();
+        // H-11: refresh the protected set BEFORE taking the cache lock. `get_all_peers` takes
+        // `PeerManager`'s own lock, and taking two locks in one order here and the other order
+        // anywhere else is how a deadlock gets built.
+        let known: std::collections::HashSet<NodeId> = self
+            .peers
+            .get_all_peers()
+            .into_iter()
+            .map(|p| p.node_id)
+            .collect();
 
-        // H-11: the marks ride the same tick rather than a timer of their own, so there is one
-        // cadence to reason about — and they are pruned and written here, NOT in
-        // `cleanup_older_than`, because that function's entire job is to evict and this is the one
-        // structure that must survive it.
-        seen.high_water.prune(now);
-        if let Some(path) = self.config.peer_sequence_persist_path.as_deref() {
-            if seen.high_water.dirty {
-                if let Err(e) = seen.high_water.save(path) {
-                    // Logged, not fatal: losing a write costs replay protection across the NEXT
-                    // restart only, and the in-memory marks are unaffected. Failing the mesh over
-                    // it would trade a hardening layer for an outage.
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "H-11: could not persist per-sender high-water marks"
-                    );
-                }
+        // Everything under this lock is in-memory only. The disk write happens after it is
+        // dropped: `save` used to run here, which put a synchronous file write on the path of
+        // every inbound message twice a minute — on nodes already measured at 23-35% iowait
+        // (#690), that is a real stall, not a theoretical one.
+        let snapshot = {
+            let mut seen = self.seen_messages.write();
+            let before_len = seen.len();
+            seen.cleanup_older_than(cutoff);
+            let after_len = seen.len();
+
+            // The marks ride the same tick rather than a timer of their own, so there is one
+            // cadence to reason about — and they are aged and snapshotted here, NOT in
+            // `cleanup_older_than`, because that function's entire job is to evict and this is
+            // the one structure that must survive it.
+            seen.high_water.set_known(known);
+            seen.high_water.drop_expired(now);
+
+            let snapshot =
+                if self.config.peer_sequence_persist_path.is_some() && seen.high_water.dirty {
+                    // Clearing `dirty` under the lock, before the write, is deliberate. If the
+                    // write then fails we lose one tick's persistence, which costs replay
+                    // protection across the NEXT restart only; leaving it set would instead retry
+                    // a failing synchronous write every 60 s for as long as the disk stays unhappy.
+                    seen.high_water.dirty = false;
+                    Some(seen.high_water.snapshot())
+                } else {
+                    None
+                };
+
+            if before_len != after_len {
+                debug!(
+                    remaining = after_len,
+                    removed = before_len - after_len,
+                    "Cleaned up seen messages"
+                );
             }
-        }
+            snapshot
+        };
 
-        if before_len != after_len {
-            debug!(
-                remaining = after_len,
-                removed = before_len - after_len,
-                "Cleaned up seen messages"
-            );
+        if let (Some(path), Some(snapshot)) =
+            (self.config.peer_sequence_persist_path.as_deref(), snapshot)
+        {
+            if let Err(e) = PeerHighWaterMarks::write_snapshot(path, &snapshot) {
+                // Logged, not fatal: the in-memory marks are unaffected. Failing the mesh over a
+                // cache file would trade a hardening layer for an outage.
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "H-11: could not persist per-sender high-water marks"
+                );
+            }
         }
     }
 
@@ -4851,8 +5021,9 @@ mod high_water_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mesh_peer_sequences.json");
 
-        let mut before = cache_at(900);
-        before.high_water.save(&path).expect("save marks");
+        let before = cache_at(900);
+        PeerHighWaterMarks::write_snapshot(&path, &before.high_water.snapshot())
+            .expect("save marks");
 
         let mut after =
             SeenMessageCache::with_high_water(100, PeerHighWaterMarks::load(&path, now_secs()));
@@ -4915,23 +5086,182 @@ mod high_water_tests {
         assert_eq!(marks.floor(&SENDER, now_secs()), None);
     }
 
-    /// An attacker forging sender ids must not be able to grow the map without bound. The fleet is
-    /// eight nodes; the cap is 1000.
+    fn stranger(i: usize) -> NodeId {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        id[31] = 0xEE;
+        id
+    }
+
+    /// ⛔ **The finding-1 property, and the reason the marks are worth anything.**
+    ///
+    /// The first version evicted the least-recently-heard-from entry once the map filled, so
+    /// ~1001 throwaway keypairs flushed the replay floor of exactly the quiet honest peer the mark
+    /// exists to protect. Node ids are ed25519 keys behind ~24 bits of PoW — about 30 seconds of
+    /// CPU each — so that made H-11 reachable ON DEMAND rather than after a quiet period: strictly
+    /// worse than no marks at all, because the code reads as defended.
+    ///
+    /// A known peer's mark must survive any amount of stranger traffic.
     #[test]
-    fn the_mark_map_is_bounded() {
+    fn a_flood_of_strangers_cannot_evict_a_known_peers_mark() {
         let now = now_secs();
         let mut marks = PeerHighWaterMarks::default();
+        marks.set_known(std::iter::once(SENDER).collect());
+        marks.record(SENDER, 500, now);
 
-        for i in 0..(MAX_HIGH_WATER_SENDERS + 500) {
-            let mut id = [0u8; 32];
-            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            marks.record(id, 1, now);
+        // Ten times the whole budget, all distinct, all recent — the flood the old policy served.
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 10) {
+            marks.record(stranger(i), 1, now);
         }
 
+        assert_eq!(
+            marks.floor(&SENDER, now),
+            Some(500),
+            "a stranger flood flushed the honest peer's replay floor — H-11 is reachable on demand"
+        );
         assert!(
             marks.marks.len() <= MAX_HIGH_WATER_SENDERS,
             "mark map grew to {} — an unbounded map is a memory DoS",
             marks.marks.len()
+        );
+    }
+
+    /// The same property one level down: strangers share a fixed pool well below the total budget,
+    /// so the slots reserved for peers we actually mesh with cannot be consumed at all.
+    #[test]
+    fn strangers_are_capped_below_the_total_budget() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known(std::iter::once(SENDER).collect());
+
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 2) {
+            marks.record(stranger(i), 1, now);
+        }
+
+        assert_eq!(
+            marks.unknown_len(),
+            MAX_UNKNOWN_HIGH_WATER_SENDERS,
+            "strangers must be held to their own pool, not the whole budget"
+        );
+        const {
+            assert!(
+                MAX_UNKNOWN_HIGH_WATER_SENDERS < MAX_HIGH_WATER_SENDERS,
+                "the stranger pool must leave slots reserved for known peers"
+            )
+        };
+    }
+
+    /// A known peer arriving for the FIRST time while strangers hold their pool must still get a
+    /// slot — otherwise the flood denies the floor to a peer that has not been recorded yet, which
+    /// is the same attack by a different route.
+    #[test]
+    fn a_known_peer_can_still_take_a_slot_while_strangers_hold_theirs() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known(std::iter::once(SENDER).collect());
+
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 2) {
+            marks.record(stranger(i), 1, now);
+        }
+        marks.record(SENDER, 500, now);
+
+        assert_eq!(
+            marks.floor(&SENDER, now),
+            Some(500),
+            "a known peer was denied a slot by stranger pressure"
+        );
+    }
+
+    /// Capacity must never apply to a sender already tracked. If a full map could stop an
+    /// incumbent's mark from ADVANCING, an attacker could freeze the floor in place and replay
+    /// everything above it.
+    #[test]
+    fn an_existing_mark_advances_even_when_the_map_is_full() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.record(SENDER, 500, now);
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 2) {
+            marks.record(stranger(i), 1, now);
+        }
+
+        marks.record(SENDER, 900, now);
+
+        assert_eq!(marks.floor(&SENDER, now), Some(900));
+    }
+
+    /// Eviction is by AGE, never by recency. An attacker can make a mark NEW (send a message) but
+    /// cannot make an honest peer's mark old, which is what stops the policy from being a lever.
+    #[test]
+    fn expiry_is_the_only_unconditional_removal_rule() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.record(SENDER, 500, now - PEER_HIGH_WATER_TTL_SECS - 1);
+        marks.record([0xABu8; 32], 700, now);
+
+        marks.drop_expired(now);
+
+        assert_eq!(
+            marks.floor(&SENDER, now),
+            None,
+            "expired mark should be gone"
+        );
+        assert_eq!(
+            marks.floor(&[0xABu8; 32], now),
+            Some(700),
+            "a fresh mark must survive expiry"
+        );
+    }
+
+    /// The rewind outage is bounded by this constant, so its value is the finding, not a detail.
+    /// A day of an eight-node mesh running seven-eighths strength is not "self-healing".
+    #[test]
+    fn the_rewind_lockout_is_bounded_to_an_hour() {
+        assert_eq!(
+            PEER_HIGH_WATER_TTL_SECS, 3_600,
+            "the rewind lockout is this long — changing it changes an outage budget"
+        );
+    }
+
+    /// The wiring check for the protected set.
+    ///
+    /// Every finding-1 test above calls `set_known` by hand. If the LIVE path never called it, the
+    /// protected set would be permanently empty in production — every real peer would compete in
+    /// the 128-slot stranger pool — and every one of those tests would still be green. That is the
+    /// same "unit-tested and wired to nothing" shape `check-wiring.sh` exists for.
+    #[tokio::test]
+    async fn the_cleanup_tick_populates_the_protected_set_from_the_peer_table() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let config = MeshConfig {
+            noise_enabled: false,
+            noise_required: false,
+            ..Default::default()
+        };
+        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let peer_id = [0x5Au8; 32];
+        mesh.peers
+            .upsert_peer(Peer::new(peer_id, "203.0.113.9:8559".to_string()));
+
+        assert!(
+            !mesh
+                .seen_messages
+                .read()
+                .high_water
+                .known
+                .contains(&peer_id),
+            "protected set should start empty"
+        );
+
+        mesh.cleanup_seen_messages(300);
+
+        assert!(
+            mesh.seen_messages
+                .read()
+                .high_water
+                .known
+                .contains(&peer_id),
+            "the cleanup tick did not carry the peer table into the protected set — every real \
+             peer would be treated as a stranger"
         );
     }
 
@@ -5018,7 +5348,7 @@ mod high_water_tests {
         let mut written = PeerHighWaterMarks::default();
         written.record(SENDER, 4242, now);
         written.record([0xABu8; 32], 7, now);
-        written.save(&path).expect("save");
+        PeerHighWaterMarks::write_snapshot(&path, &written.snapshot()).expect("save");
 
         let read = PeerHighWaterMarks::load(&path, now);
 
