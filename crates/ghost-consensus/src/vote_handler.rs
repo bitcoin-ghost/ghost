@@ -929,12 +929,17 @@ impl VoteHandler {
 
     /// P2P4-M1: Verify the signature on a message envelope
     ///
-    /// The message signed is: payload + sequence (as per mesh.rs create_envelope)
+    /// The signed bytes are whatever [`MessageEnvelope::signing_bytes`] says they are for the
+    /// format the envelope declares — one definition shared with every other verifier.
     fn verify_envelope_signature(&self, envelope: &MessageEnvelope) -> bool {
-        // Reconstruct the message that was signed (matches mesh.rs create_envelope)
-        // Signed data is: payload_bytes + sequence.to_le_bytes()
-        let mut signed_data = envelope.payload.clone();
-        signed_data.extend_from_slice(&envelope.sequence.to_le_bytes());
+        let Ok(signed_data) = envelope.signing_bytes() else {
+            warn!(
+                sender = %hex::encode(&envelope.sender[..8]),
+                envelope_version = envelope.version,
+                "Rejecting vote envelope with an unreconstructable signing version"
+            );
+            return false;
+        };
 
         // Verify using the sender's public key (which is their NodeId)
         match ghost_common::identity::verify_signature(

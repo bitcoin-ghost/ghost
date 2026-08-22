@@ -119,9 +119,142 @@ pub const DEFAULT_MESSAGE_TTL: u8 = 8;
 /// Minimum TTL for messages to be forwarded (messages with TTL 0 are not forwarded)
 pub const MIN_FORWARD_TTL: u8 = 1;
 
+/// Mesh envelope signing format 1: the preimage is `payload || sequence_le`, and nothing else.
+///
+/// `msg_type`, `timestamp` and `ttl` are outside it. A relay can therefore re-type a captured
+/// envelope (`topic()` is not injective — `ShareProof` and `ShareConvergence` share `topics::SHARE`)
+/// and can re-stamp its `timestamp` to defeat the ±30 s drift check in
+/// [`crate::message_validator::validate_timestamp`]. That is audit finding H-11.
+pub const ENVELOPE_VERSION_V1: u8 = 1;
+
+/// Mesh envelope signing format 2: a domain-separated, length-prefixed preimage that binds
+/// `sender`, `msg_type`, `timestamp`, `sequence` and `payload`.
+///
+/// `ttl` is deliberately still excluded — it is decremented on every forward by design
+/// ([`MessageEnvelope::decrement_ttl`]), so binding it would invalidate the signature at the first
+/// hop. Nothing trusts `ttl` beyond deciding whether to relay.
+///
+/// Binding `timestamp` is what turns the drift window into a real replay bound: an attacker
+/// replaying a captured envelope can no longer move it forward, so it dies on
+/// `validate_timestamp` once it is `DEFAULT_TIMESTAMP_DRIFT_MS` old — with no dependence on
+/// per-sender sequence state surviving in memory.
+pub const ENVELOPE_VERSION_V2: u8 = 2;
+
+/// Domain separator for [`ENVELOPE_VERSION_V2`] preimages.
+///
+/// Its purpose is cross-protocol separation: every other signature this node produces over a
+/// mesh-adjacent structure (`VerificationResultMessage::signing_data`, `EquivocationProof`,
+/// GHOST-09 share binding) is a bare concatenation under the SAME ed25519 key. Without a prefix
+/// that is unique to this structure, a preimage from one of them could in principle be presented
+/// as a valid envelope for the other. The trailing NUL keeps the tag unambiguous against any
+/// future `…/v2x` sibling.
+const ENVELOPE_V2_DOMAIN: &[u8] = b"ghost/mesh/envelope/v2\0";
+
+/// Serde default for [`MessageEnvelope::version`]: an envelope from a node that predates the
+/// field carries no `v` key, and such a node signs the v1 preimage.
+fn default_envelope_version() -> u8 {
+    ENVELOPE_VERSION_V1
+}
+
+/// Keeps the pre-gate wire bytes byte-for-byte identical to what a pre-`v` binary emits.
+///
+/// This is load-bearing for the mixed-fleet roll, not cosmetics: while the gate is closed a new
+/// node's envelope is indistinguishable from an old node's, so there is no window in which the
+/// new binary is emitting something an old peer has never seen.
+fn is_envelope_v1(version: &u8) -> bool {
+    *version == ENVELOPE_VERSION_V1
+}
+
+/// Height at and above which this node SIGNS mesh envelopes with [`ENVELOPE_VERSION_V2`].
+///
+/// `u64::MAX` = never. **DORMANT.** Arming is a separate, observed change and must not ride the
+/// release that introduces the tolerance.
+///
+/// This is an emit-side gate only. There is deliberately no matching verify-side gate: a receiver
+/// picks the preimage from the envelope's own `v` field, so a v2 node accepts v1 and v2
+/// simultaneously and forever, and needs no notion of height to do it.
+/// [`crate::message_validator::validate_and_verify`] is a free function over `&[u8]` with no
+/// access to a chain tip, and threading one into it would have bought nothing.
+///
+/// ⛔ Why a height and not a config flag: a node that signs v2 while a peer still verifies v1
+/// has every one of its messages rejected as `InvalidSignature` by that peer — silently, from the
+/// sender's point of view, because rejection happens at the far end. `CapabilityType` already
+/// taught this fleet the cost of emitting before every receiver tolerates (see
+/// `ghost-pool`'s `ADDRESS_PROOF_HEIGHT`). A height makes the flip simultaneous across eight nodes
+/// that do not coordinate restarts.
+///
+/// The order is fixed and cannot be shortened:
+/// 1. ship this release — every node VERIFIES both formats, every node EMITS v1;
+/// 2. roll all eight and confirm each is on the new binary;
+/// 3. only then set this constant to a height at least a few hundred blocks out, ship that, roll
+///    again, and let the gate fire.
+///
+/// If the gate is armed while any node is on an older binary, that node rejects every mesh
+/// message from every upgraded peer — total mesh partition, not degradation. There is no
+/// self-healing path back other than upgrading it.
+///
+/// What to watch after it fires: `bad_signature` in [`crate::message_validator::ValidationStats`]
+/// must stay flat, and `"Mesh envelope signing format"` is logged once per node at the flip.
+pub const MESH_ENVELOPE_V2_HEIGHT: u64 = u64::MAX;
+
+/// Resolved gate, so off-mainnet runs can rehearse the flip. Set once at startup by
+/// `ghost_pool::init_activation_heights`; falls back to the shipped constant when unset.
+static MESH_ENVELOPE_V2_GATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Install the resolved [`MESH_ENVELOPE_V2_HEIGHT`] for this run. Call once, before the mesh
+/// starts. Later calls are ignored, as are calls after the first read.
+pub fn set_mesh_envelope_v2_height(height: u64) {
+    let _ = MESH_ENVELOPE_V2_GATE.set(height);
+}
+
+/// The height at and above which this node signs [`ENVELOPE_VERSION_V2`].
+pub fn mesh_envelope_v2_height() -> u64 {
+    *MESH_ENVELOPE_V2_GATE.get_or_init(|| MESH_ENVELOPE_V2_HEIGHT)
+}
+
+/// Which signing format this node emits at `height`.
+///
+/// One predicate for the three places that build a signed envelope, so they cannot disagree about
+/// which format is in force at a given block. An unknown height (0, the fallback when no L1
+/// height provider is wired) resolves to v1 — the direction that cannot partition a mesh.
+pub fn envelope_version_for_height(height: u64) -> u8 {
+    if height >= mesh_envelope_v2_height() {
+        ENVELOPE_VERSION_V2
+    } else {
+        ENVELOPE_VERSION_V1
+    }
+}
+
+/// Failure to build a signing preimage.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum EnvelopeSigningError {
+    /// The envelope claims a signing format this binary does not implement. Treated as an invalid
+    /// signature on receive: a version we cannot reconstruct is a version we cannot authenticate.
+    #[error("unsupported mesh envelope signing version {0}")]
+    UnsupportedVersion(u8),
+    /// The message type could not be encoded for the preimage.
+    #[error("could not encode message type for signing: {0}")]
+    TypeTag(String),
+}
+
 /// Consensus message envelope
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEnvelope {
+    /// Signing format of [`MessageEnvelope::signature`] — [`ENVELOPE_VERSION_V1`] or
+    /// [`ENVELOPE_VERSION_V2`].
+    ///
+    /// Absent on the wire when it is v1, and absent entirely from envelopes built by binaries
+    /// that predate the field, which is why the serde default is v1 rather than "latest".
+    ///
+    /// The field needs no integrity protection of its own: it SELECTS the preimage, so flipping
+    /// it makes the receiver reconstruct a different byte string and the signature simply fails.
+    /// A downgrade attacker gains nothing — it cannot produce a v1 signature it does not hold.
+    #[serde(
+        default = "default_envelope_version",
+        skip_serializing_if = "is_envelope_v1",
+        rename = "v"
+    )]
+    pub version: u8,
     /// Message type
     pub msg_type: MessageType,
     /// Sender node ID
@@ -149,7 +282,13 @@ fn default_ttl() -> u8 {
 }
 
 impl MessageEnvelope {
-    /// Create a new message envelope with default TTL
+    /// Create a message envelope carrying a signature produced elsewhere, with default TTL.
+    ///
+    /// ⚠ The timestamp is stamped HERE, so this cannot be used to carry an
+    /// [`ENVELOPE_VERSION_V2`] signature: v2 binds `timestamp`, and the caller cannot have signed
+    /// a timestamp this call had not yet chosen. Anything destined for the wire must go through
+    /// [`MessageEnvelope::signed`], which owns both. What is left for this constructor is local
+    /// and test delivery, where the signature is a placeholder and is never verified.
     pub fn new(
         msg_type: MessageType,
         sender: NodeId,
@@ -157,18 +296,19 @@ impl MessageEnvelope {
         sequence: u64,
         signature: [u8; 64],
     ) -> Self {
-        Self {
+        Self::with_ttl(
             msg_type,
             sender,
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            payload,
             sequence,
             signature,
-            payload,
-            ttl: DEFAULT_MESSAGE_TTL,
-        }
+            DEFAULT_MESSAGE_TTL,
+        )
     }
 
-    /// Create a new message envelope with custom TTL
+    /// Create a message envelope carrying a signature produced elsewhere, with custom TTL.
+    ///
+    /// Carries the same caveat as [`MessageEnvelope::new`].
     pub fn with_ttl(
         msg_type: MessageType,
         sender: NodeId,
@@ -178,6 +318,7 @@ impl MessageEnvelope {
         ttl: u8,
     ) -> Self {
         Self {
+            version: ENVELOPE_VERSION_V1,
             msg_type,
             sender,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
@@ -185,6 +326,119 @@ impl MessageEnvelope {
             signature,
             payload,
             ttl,
+        }
+    }
+
+    /// Build a signed envelope: the only constructor that can produce a valid signature.
+    ///
+    /// It exists because v2 binds `timestamp`, and a caller that computed a preimage and then
+    /// handed it to [`MessageEnvelope::new`] would be signing a timestamp different from the one
+    /// the envelope ends up carrying — a signature that fails verification everywhere while
+    /// looking correct at the call site. Stamping and signing in one place makes that
+    /// unrepresentable, and collapses the three copies of the preimage that used to exist in
+    /// `mesh.rs` into one.
+    pub fn signed(
+        version: u8,
+        msg_type: MessageType,
+        sender: NodeId,
+        payload: Vec<u8>,
+        sequence: u64,
+        ttl: u8,
+        sign: impl FnOnce(&[u8]) -> [u8; 64],
+    ) -> Result<Self, EnvelopeSigningError> {
+        let mut envelope = Self {
+            version,
+            msg_type,
+            sender,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            sequence,
+            signature: [0u8; 64],
+            payload,
+            ttl,
+        };
+        let preimage = envelope.signing_bytes()?;
+        envelope.signature = sign(&preimage);
+        Ok(envelope)
+    }
+
+    /// The exact bytes [`MessageEnvelope::signature`] covers, per this envelope's `version`.
+    ///
+    /// The single definition of the mesh signing preimage: every signer and every verifier calls
+    /// this. Before it existed the formula was written out by hand in six places (three signers in
+    /// `mesh.rs`, three verifiers in `message_validator.rs`, `vote_handler.rs` and
+    /// `discovery_handler.rs`), each with a comment asking the reader to keep it in step with the
+    /// others.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, EnvelopeSigningError> {
+        Self::signing_preimage(
+            self.version,
+            self.msg_type,
+            &self.sender,
+            self.timestamp,
+            self.sequence,
+            &self.payload,
+        )
+    }
+
+    /// Build the signing preimage for `version` from the fields it covers.
+    ///
+    /// v1 is `payload || sequence_le` — reproduced verbatim, including its lack of any separator,
+    /// because every envelope on the fleet today is signed that way.
+    ///
+    /// v2 is domain-separated and length-prefixed:
+    ///
+    /// ```text
+    /// "ghost/mesh/envelope/v2\0"  (23)
+    /// sender                      (32)
+    /// timestamp                   (8, LE)
+    /// sequence                    (8, LE)
+    /// type_tag_len                (4, LE)
+    /// type_tag                    (type_tag_len)
+    /// payload_len                 (8, LE)
+    /// payload                     (payload_len)
+    /// ```
+    ///
+    /// Every variable-length field is length-prefixed so no two distinct field tuples can share a
+    /// preimage. Unprefixed concatenation is what makes v1's `payload || sequence` ambiguous in
+    /// principle as well as incomplete in practice.
+    ///
+    /// `type_tag` is the message type's own JSON encoding — the bytes actually on the wire — so
+    /// the tag cannot drift from the transmitted discriminant when a variant is added or renamed.
+    /// A hand-kept table of numeric tags could; this cannot. Binding the type matters because
+    /// [`MessageType::topic`] is not injective: `ShareProof` and `ShareConvergence` both ride
+    /// `topics::SHARE`, so under v1 a captured envelope can be re-typed between them and still
+    /// verify.
+    pub fn signing_preimage(
+        version: u8,
+        msg_type: MessageType,
+        sender: &NodeId,
+        timestamp: u64,
+        sequence: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeSigningError> {
+        match version {
+            ENVELOPE_VERSION_V1 => {
+                let mut out = Vec::with_capacity(payload.len() + 8);
+                out.extend_from_slice(payload);
+                out.extend_from_slice(&sequence.to_le_bytes());
+                Ok(out)
+            }
+            ENVELOPE_VERSION_V2 => {
+                let type_tag = serde_json::to_vec(&msg_type)
+                    .map_err(|e| EnvelopeSigningError::TypeTag(e.to_string()))?;
+                let mut out = Vec::with_capacity(
+                    ENVELOPE_V2_DOMAIN.len() + 32 + 8 + 8 + 4 + type_tag.len() + 8 + payload.len(),
+                );
+                out.extend_from_slice(ENVELOPE_V2_DOMAIN);
+                out.extend_from_slice(sender);
+                out.extend_from_slice(&timestamp.to_le_bytes());
+                out.extend_from_slice(&sequence.to_le_bytes());
+                out.extend_from_slice(&(type_tag.len() as u32).to_le_bytes());
+                out.extend_from_slice(&type_tag);
+                out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                out.extend_from_slice(payload);
+                Ok(out)
+            }
+            other => Err(EnvelopeSigningError::UnsupportedVersion(other)),
         }
     }
 
@@ -3656,5 +3910,247 @@ mod tests {
             mesh_node_list_root(&[a, b, reported]),
             "changing a port kept the root"
         );
+    }
+}
+
+#[cfg(test)]
+mod envelope_signing_tests {
+    use super::*;
+
+    fn envelope(version: u8, msg_type: MessageType, timestamp: u64, ttl: u8) -> MessageEnvelope {
+        MessageEnvelope {
+            version,
+            msg_type,
+            sender: [7u8; 32],
+            timestamp,
+            sequence: 42,
+            signature: [9u8; 64],
+            payload: b"payload".to_vec(),
+            ttl,
+        }
+    }
+
+    /// v1 must stay EXACTLY `payload || sequence_le`. Every envelope on the eight-node fleet is
+    /// signed that way right now, so this is the compatibility contract, not an implementation
+    /// detail: if the refactor that centralised the preimage changed one byte, every node on the
+    /// new binary would reject every node on the old one.
+    #[test]
+    fn v1_preimage_is_byte_identical_to_the_shipped_formula() {
+        let env = envelope(
+            ENVELOPE_VERSION_V1,
+            MessageType::ShareProof,
+            1_700_000_000_000,
+            8,
+        );
+
+        let mut expected = env.payload.clone();
+        expected.extend_from_slice(&env.sequence.to_le_bytes());
+
+        assert_eq!(
+            env.signing_bytes().expect("v1 preimage"),
+            expected,
+            "the v1 signing preimage moved — this breaks every peer on the current binary"
+        );
+    }
+
+    /// The other half of the same contract: the pre-gate WIRE bytes must not gain a `v` key, so a
+    /// node on the new binary emits JSON an old node has already been parsing for months.
+    #[test]
+    fn v1_wire_bytes_carry_no_version_key() {
+        let json = serde_json::to_string(&envelope(
+            ENVELOPE_VERSION_V1,
+            MessageType::HealthPing,
+            1_700_000_000_000,
+            8,
+        ))
+        .expect("serialise");
+
+        assert!(
+            !json.contains("\"v\""),
+            "a v1 envelope must serialise without the version key: {json}"
+        );
+    }
+
+    /// And the reverse direction: an envelope from a binary that predates the field has no `v`,
+    /// and must be read as v1 rather than failing to deserialise. `CapabilityType` is the standing
+    /// reminder of what a hard-failing decode costs — the whole message is dropped, silently.
+    #[test]
+    fn envelope_without_version_key_deserialises_as_v1() {
+        let json = r#"{"msg_type":"HealthPing","sender":"0707070707070707070707070707070707070707070707070707070707070707","timestamp":1700000000000,"sequence":42,"signature":"09090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909","payload":[1,2,3],"ttl":8}"#;
+
+        let env = MessageEnvelope::deserialize(json.as_bytes()).expect("deserialise legacy");
+
+        assert_eq!(env.version, ENVELOPE_VERSION_V1);
+    }
+
+    /// H-11 itself. Under v1 the timestamp is outside the signature, so a relay can re-stamp a
+    /// captured envelope and walk it past the ±30 s drift check for ever. Under v2 it cannot.
+    #[test]
+    fn v2_binds_the_timestamp_and_v1_does_not() {
+        let early = 1_700_000_000_000;
+        let late = early + 60_000;
+
+        let v1_early = envelope(ENVELOPE_VERSION_V1, MessageType::ShareProof, early, 8);
+        let v1_late = envelope(ENVELOPE_VERSION_V1, MessageType::ShareProof, late, 8);
+        assert_eq!(
+            v1_early.signing_bytes().unwrap(),
+            v1_late.signing_bytes().unwrap(),
+            "v1 leaves the timestamp malleable — that is the finding being fixed"
+        );
+
+        let v2_early = envelope(ENVELOPE_VERSION_V2, MessageType::ShareProof, early, 8);
+        let v2_late = envelope(ENVELOPE_VERSION_V2, MessageType::ShareProof, late, 8);
+        assert_ne!(
+            v2_early.signing_bytes().unwrap(),
+            v2_late.signing_bytes().unwrap(),
+            "v2 must bind the timestamp, or replay is bounded by nothing but in-memory state"
+        );
+    }
+
+    /// The second half of H-11. `MessageType::topic` is not injective — `ShareProof` and
+    /// `ShareConvergence` both ride `topics::SHARE` — so under v1 a captured envelope can be
+    /// re-typed between them and still verify, arriving at a different handler than its signer
+    /// intended.
+    #[test]
+    fn v2_binds_the_message_type_and_v1_does_not() {
+        assert_eq!(
+            MessageType::ShareProof.topic(),
+            MessageType::ShareConvergence.topic(),
+            "this test is only meaningful while these two types share a topic"
+        );
+
+        let ts = 1_700_000_000_000;
+        let v1_proof = envelope(ENVELOPE_VERSION_V1, MessageType::ShareProof, ts, 8);
+        let v1_conv = envelope(ENVELOPE_VERSION_V1, MessageType::ShareConvergence, ts, 8);
+        assert_eq!(
+            v1_proof.signing_bytes().unwrap(),
+            v1_conv.signing_bytes().unwrap(),
+            "v1 leaves the message type malleable"
+        );
+
+        let v2_proof = envelope(ENVELOPE_VERSION_V2, MessageType::ShareProof, ts, 8);
+        let v2_conv = envelope(ENVELOPE_VERSION_V2, MessageType::ShareConvergence, ts, 8);
+        assert_ne!(
+            v2_proof.signing_bytes().unwrap(),
+            v2_conv.signing_bytes().unwrap(),
+            "v2 must bind the message type"
+        );
+    }
+
+    /// `ttl` is decremented on every hop by design, so binding it would invalidate the signature
+    /// at the first relay — a mesh that only works between direct neighbours. This pins the
+    /// exclusion as deliberate rather than an oversight someone later "fixes".
+    #[test]
+    fn v2_does_not_bind_the_ttl() {
+        let ts = 1_700_000_000_000;
+        let fresh = envelope(ENVELOPE_VERSION_V2, MessageType::ShareProof, ts, 8);
+        let forwarded = envelope(ENVELOPE_VERSION_V2, MessageType::ShareProof, ts, 3);
+
+        assert_eq!(
+            fresh.signing_bytes().unwrap(),
+            forwarded.signing_bytes().unwrap(),
+            "binding ttl would break every forwarded message"
+        );
+    }
+
+    /// The domain separator exists for cross-protocol separation under a shared ed25519 key.
+    #[test]
+    fn v2_preimage_is_domain_separated() {
+        let bytes = envelope(ENVELOPE_VERSION_V2, MessageType::Vote, 1_700_000_000_000, 8)
+            .signing_bytes()
+            .unwrap();
+
+        assert!(
+            bytes.starts_with(b"ghost/mesh/envelope/v2\0"),
+            "v2 preimage lost its domain tag"
+        );
+    }
+
+    /// Length prefixes, not just concatenation: `payload="ab", seq=1` and `payload="a", seq=…`
+    /// style ambiguities are what unprefixed formats admit. Two envelopes that differ only in
+    /// where the boundary between payload and the fields after it falls must not share a preimage.
+    #[test]
+    fn v2_preimage_is_unambiguous_across_field_boundaries() {
+        let mut a = envelope(ENVELOPE_VERSION_V2, MessageType::Vote, 1_700_000_000_000, 8);
+        let mut b = a.clone();
+        a.payload = b"abc".to_vec();
+        b.payload = b"ab".to_vec();
+        b.sequence = a.sequence;
+
+        assert_ne!(
+            a.signing_bytes().unwrap(),
+            b.signing_bytes().unwrap(),
+            "a shorter payload must not be absorbable into a neighbouring field"
+        );
+    }
+
+    /// A version this binary cannot reconstruct is a version it cannot authenticate. It must be an
+    /// error the verifier turns into a rejection, never a silently-empty preimage.
+    #[test]
+    fn unknown_envelope_version_cannot_produce_a_preimage() {
+        let err = envelope(99, MessageType::Vote, 1_700_000_000_000, 8)
+            .signing_bytes()
+            .expect_err("version 99 must not yield bytes");
+
+        assert!(matches!(err, EnvelopeSigningError::UnsupportedVersion(99)));
+    }
+
+    /// [`MessageEnvelope::signed`] is the only constructor that can produce a valid v2 signature,
+    /// because v2 binds the timestamp and this is the only place that chooses it. Pinning the
+    /// round-trip here is what stops a future refactor from splitting the two apart again.
+    #[test]
+    fn signed_constructor_round_trips_both_formats() {
+        use ghost_common::identity::NodeIdentity;
+
+        let identity = NodeIdentity::generate();
+        for version in [ENVELOPE_VERSION_V1, ENVELOPE_VERSION_V2] {
+            let env = MessageEnvelope::signed(
+                version,
+                MessageType::ShareProof,
+                identity.node_id(),
+                b"a payload".to_vec(),
+                17,
+                DEFAULT_MESSAGE_TTL,
+                |bytes| identity.sign(bytes),
+            )
+            .expect("sign");
+
+            assert_eq!(env.version, version);
+            assert!(
+                ghost_common::identity::verify_signature(
+                    &env.sender,
+                    &env.signing_bytes().unwrap(),
+                    &env.signature,
+                )
+                .unwrap(),
+                "v{version} envelope did not verify against its own preimage"
+            );
+        }
+    }
+
+    /// The gate ships DORMANT. Arming it while any node is on an older binary partitions the mesh
+    /// completely, so the value it ships with is the whole safety argument for this release.
+    #[test]
+    fn v2_emission_gate_ships_dormant() {
+        assert_eq!(
+            MESH_ENVELOPE_V2_HEIGHT,
+            u64::MAX,
+            "the envelope v2 gate must ship dormant — arming is a separate, observed change"
+        );
+    }
+
+    /// The boundary is inclusive at the gate height, matching every other gate in the codebase,
+    /// and an unknown height (0, the health-ping provider's fallback) resolves to v1 — the only
+    /// direction that cannot partition a mesh.
+    #[test]
+    fn emission_gate_boundary_is_inclusive_and_fails_closed() {
+        let gate = mesh_envelope_v2_height();
+
+        assert_eq!(envelope_version_for_height(0), ENVELOPE_VERSION_V1);
+        assert_eq!(
+            envelope_version_for_height(gate.saturating_sub(1)),
+            ENVELOPE_VERSION_V1
+        );
+        assert_eq!(envelope_version_for_height(gate), ENVELOPE_VERSION_V2);
     }
 }

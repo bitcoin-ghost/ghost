@@ -246,10 +246,11 @@ impl MessageHandler for ShareProofHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_consensus::message::MessageEnvelope;
+    use ghost_consensus::message::{MessageEnvelope, ENVELOPE_VERSION_V1};
 
     fn make_envelope(msg_type: MessageType, payload: Vec<u8>) -> MessageEnvelope {
         MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             msg_type,
             sender: [0u8; 32],
             timestamp: Utc::now().timestamp() as u64,

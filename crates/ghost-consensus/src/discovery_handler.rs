@@ -656,10 +656,15 @@ impl DiscoveryHandler {
             return false;
         }
 
-        // Reconstruct the message that was signed (matches mesh.rs create_envelope)
-        // Signed data is: payload_bytes + sequence.to_le_bytes()
-        let mut signed_data = envelope.payload.clone();
-        signed_data.extend_from_slice(&envelope.sequence.to_le_bytes());
+        // One definition of the signed bytes, shared with every other verifier.
+        let Ok(signed_data) = envelope.signing_bytes() else {
+            warn!(
+                sender = %hex::encode(&envelope.sender[..8]),
+                envelope_version = envelope.version,
+                "M-3: Rejecting discovery message with an unreconstructable signing version"
+            );
+            return false;
+        };
 
         // Verify using the sender's public key (which is their NodeId)
         match ghost_common::identity::verify_signature(
@@ -1034,6 +1039,7 @@ impl MessageHandler for DiscoveryHandler {
 mod tests {
     use super::*;
     use crate::ban_manager::BanReason;
+    use crate::message::ENVELOPE_VERSION_V1;
 
     #[test]
     fn test_discovery_handler_creation() {
@@ -1202,6 +1208,7 @@ mod tests {
     #[test]
     fn test_discovery_rejects_mismatched_node_id() {
         use crate::message::{DiscoveryMessage, MessageEnvelope, MessageType};
+
         use ghost_common::identity::NodeIdentity;
         use ghost_common::types::NodeCapabilities;
 
@@ -1229,6 +1236,7 @@ mod tests {
 
         // Envelope says it's from identity's node_id - MISMATCH with discovery_msg.node_id!
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             sender: identity.node_id(),
             msg_type: MessageType::Discovery,
             payload,
@@ -1266,6 +1274,7 @@ mod tests {
     #[test]
     fn test_discovery_accepts_matching_node_id() {
         use crate::message::{DiscoveryMessage, MessageEnvelope, MessageType};
+
         use ghost_common::identity::NodeIdentity;
         use ghost_common::types::NodeCapabilities;
 
@@ -1293,6 +1302,7 @@ mod tests {
 
         // Envelope sender matches the message node_id
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             sender: identity.node_id(),
             msg_type: MessageType::Discovery,
             payload,
@@ -1609,6 +1619,7 @@ mod tests {
         let handler = DiscoveryHandler::new([1u8; 32], "8.8.8.8:8559".to_string(), peers);
 
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             sender: [2u8; 32],
             msg_type: MessageType::Discovery,
             payload: vec![1, 2, 3],
@@ -1631,6 +1642,7 @@ mod tests {
         let handler = DiscoveryHandler::new([1u8; 32], "8.8.8.8:8559".to_string(), peers);
 
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             sender: [2u8; 32],
             msg_type: MessageType::Discovery,
             payload: vec![1, 2, 3],
@@ -1665,6 +1677,7 @@ mod tests {
         let signature = identity.sign(&signed_data);
 
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             sender: identity.node_id(),
             msg_type: MessageType::Discovery,
             payload,

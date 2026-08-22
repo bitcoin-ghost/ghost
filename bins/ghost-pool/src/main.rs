@@ -3095,6 +3095,9 @@ async fn main() -> Result<()> {
         // Persist the outbound mesh sequence so a restart resumes above its
         // prior value instead of resetting to 0 (which peers reject as replays).
         sequence_persist_path: Some(data_dir.join("mesh_sequence")),
+        // Persist the INBOUND per-sender high-water marks so a restart does not reopen the
+        // replay window that the dedup cache's 300-second eviction leaves behind (H-11).
+        peer_sequence_persist_path: Some(data_dir.join("mesh_peer_sequences.json")),
         ..Default::default()
     };
     // M-2: Use try_new() to properly handle Noise initialization failures

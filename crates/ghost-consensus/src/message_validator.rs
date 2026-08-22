@@ -681,9 +681,23 @@ pub fn validate_timestamp_with_drift(
 ///
 /// MUST be called before trusting any message content.
 pub fn verify_envelope_signature(envelope: &MessageEnvelope) -> Result<(), MessageValidationError> {
-    // Reconstruct signed data (payload + sequence)
-    let mut signed_data = envelope.payload.clone();
-    signed_data.extend_from_slice(&envelope.sequence.to_le_bytes());
+    // Reconstruct the signed bytes for the format this envelope declares. A version we cannot
+    // reconstruct is a version we cannot authenticate, so it is an invalid signature and not a
+    // deserialisation error — the message must be dropped, never trusted.
+    let signed_data = match envelope.signing_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let sender_hex = hex::encode(&envelope.sender[..8]);
+            warn!(
+                sender = %sender_hex,
+                msg_type = ?envelope.msg_type,
+                envelope_version = envelope.version,
+                error = %e,
+                "Cannot reconstruct envelope signing bytes — rejecting"
+            );
+            return Err(MessageValidationError::InvalidSignature(sender_hex));
+        }
+    };
 
     // SEC-MSG-1: Log verification errors instead of silently treating as invalid
     let is_valid = match verify_signature(&envelope.sender, &signed_data, &envelope.signature) {
@@ -1458,6 +1472,7 @@ mod tests {
         assert_eq!(extract_timestamp_fast(data.as_bytes()), Some(envelope_ts));
     }
     use super::*;
+    use crate::message::ENVELOPE_VERSION_V1;
 
     #[test]
     fn test_validate_header_too_small() {
@@ -1631,6 +1646,7 @@ mod tests {
     fn test_zero_signature_rejected() {
         // H-P2P-2: Test that zero signatures are rejected by validate_envelope
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             msg_type: MessageType::Vote,
             sender: [1u8; 32],
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
@@ -1648,6 +1664,7 @@ mod tests {
     fn test_non_zero_signature_passes_validation() {
         // Non-zero signature should pass the zero check (actual sig verification is separate)
         let envelope = MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             msg_type: MessageType::Vote,
             sender: [1u8; 32],
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
@@ -1864,5 +1881,176 @@ mod tests {
 
         stats.memory_limit_exceeded += 1;
         assert_eq!(stats.memory_limit_exceeded, 1);
+    }
+}
+
+/// H-11: what [`verify_envelope_signature`] accepts and refuses across the two signing formats.
+///
+/// These sit at the verifier rather than in `message.rs` because the claim that matters for the
+/// deploy is not "the preimages differ" — it is "this binary accepts both, and refuses a replay of
+/// either". A preimage test cannot show the second half.
+#[cfg(test)]
+mod envelope_version_tolerance_tests {
+    use super::*;
+    use crate::message::{ENVELOPE_VERSION_V1, ENVELOPE_VERSION_V2};
+    use ghost_common::identity::NodeIdentity;
+
+    fn signed(identity: &NodeIdentity, version: u8, msg_type: MessageType) -> MessageEnvelope {
+        MessageEnvelope::signed(
+            version,
+            msg_type,
+            identity.node_id(),
+            b"a share proof would go here".to_vec(),
+            77,
+            8,
+            |bytes| identity.sign(bytes),
+        )
+        .expect("sign envelope")
+    }
+
+    /// **The mixed-version fleet claim, as an assertion.** One binary, both formats, both
+    /// accepted. This is what makes it safe to roll this release across eight nodes that restart
+    /// at different times: an upgraded node keeps accepting its un-upgraded peers, and once the
+    /// gate eventually arms it keeps accepting anything still emitting v1.
+    #[test]
+    fn both_signing_formats_verify_on_the_same_binary() {
+        let identity = NodeIdentity::generate();
+
+        for version in [ENVELOPE_VERSION_V1, ENVELOPE_VERSION_V2] {
+            let env = signed(&identity, version, MessageType::ShareProof);
+            assert!(
+                verify_envelope_signature(&env).is_ok(),
+                "v{version} envelope must verify — a receiver that refuses one of the two \
+                 partitions the mesh"
+            );
+        }
+    }
+
+    /// H-11, at the verifier. A captured envelope re-stamped with a fresh timestamp is what walks
+    /// a replay past the ±30 s drift window indefinitely. v1 cannot tell; v2 must.
+    ///
+    /// The v1 half is asserted deliberately: it documents the live hole this release does not yet
+    /// close, and it fails the moment someone believes it is closed before the gate is armed.
+    #[test]
+    fn restamping_a_captured_envelope_defeats_v1_and_is_caught_by_v2() {
+        let identity = NodeIdentity::generate();
+
+        let mut v1 = signed(&identity, ENVELOPE_VERSION_V1, MessageType::ShareProof);
+        v1.timestamp += 3_600_000;
+        assert!(
+            verify_envelope_signature(&v1).is_ok(),
+            "v1 is expected to accept a re-stamped envelope — that IS finding H-11"
+        );
+
+        let mut v2 = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        v2.timestamp += 3_600_000;
+        assert!(
+            matches!(
+                verify_envelope_signature(&v2),
+                Err(MessageValidationError::InvalidSignature(_))
+            ),
+            "v2 must refuse a re-stamped envelope"
+        );
+    }
+
+    /// Re-typing between two message types that share a ZMQ topic delivers a signed payload to a
+    /// handler its signer never addressed. `topic()` cannot distinguish them, so only the
+    /// signature can.
+    #[test]
+    fn retyping_across_a_shared_topic_is_caught_by_v2() {
+        let identity = NodeIdentity::generate();
+
+        let mut v1 = signed(&identity, ENVELOPE_VERSION_V1, MessageType::ShareProof);
+        v1.msg_type = MessageType::ShareConvergence;
+        assert!(
+            verify_envelope_signature(&v1).is_ok(),
+            "v1 is expected to accept a re-typed envelope — that IS finding H-11"
+        );
+
+        let mut v2 = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        v2.msg_type = MessageType::ShareConvergence;
+        assert!(
+            matches!(
+                verify_envelope_signature(&v2),
+                Err(MessageValidationError::InvalidSignature(_))
+            ),
+            "v2 must refuse a re-typed envelope"
+        );
+    }
+
+    /// Forwarding decrements `ttl`, and every message on the mesh is forwarded up to eight times.
+    /// If v2 bound `ttl` the format would look correct in every unit test and fail on the wire at
+    /// the second hop.
+    #[test]
+    fn a_forwarded_v2_envelope_still_verifies() {
+        let identity = NodeIdentity::generate();
+        let mut env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::HealthPing);
+
+        for _ in 0..8 {
+            assert!(env.decrement_ttl());
+        }
+
+        assert!(
+            verify_envelope_signature(&env).is_ok(),
+            "a relayed v2 envelope must still verify"
+        );
+    }
+
+    /// Claiming a version the binary cannot reconstruct must be a REJECTION, not a panic and not
+    /// a pass. A future v3 emitted early would otherwise be the same silent-drop trap
+    /// `CapabilityType` set.
+    #[test]
+    fn an_unknown_claimed_version_is_rejected_not_trusted() {
+        let identity = NodeIdentity::generate();
+        let mut env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        env.version = 3;
+
+        assert!(matches!(
+            verify_envelope_signature(&env),
+            Err(MessageValidationError::InvalidSignature(_))
+        ));
+    }
+
+    /// Flipping the version field is not a downgrade attack: the field SELECTS the preimage, so a
+    /// flip makes the receiver reconstruct different bytes and the signature fails. Pinning this
+    /// is why the field itself needs no integrity protection.
+    #[test]
+    fn flipping_the_version_field_invalidates_the_signature_in_both_directions() {
+        let identity = NodeIdentity::generate();
+
+        let mut down = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        down.version = ENVELOPE_VERSION_V1;
+        assert!(matches!(
+            verify_envelope_signature(&down),
+            Err(MessageValidationError::InvalidSignature(_))
+        ));
+
+        let mut up = signed(&identity, ENVELOPE_VERSION_V1, MessageType::ShareProof);
+        up.version = ENVELOPE_VERSION_V2;
+        assert!(matches!(
+            verify_envelope_signature(&up),
+            Err(MessageValidationError::InvalidSignature(_))
+        ));
+    }
+
+    /// End to end through the real inbound pipeline, not just the signature step: header checks,
+    /// staleness prefilter, depth scan, deserialisation, field validation, signature. A v2
+    /// envelope has to survive all of it, including `extract_timestamp_fast`, which scans for the
+    /// FIRST `"timestamp":` in the JSON and would misread it if the new field shifted the layout.
+    #[test]
+    fn a_v2_envelope_survives_the_whole_inbound_pipeline() {
+        let identity = NodeIdentity::generate();
+        let env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        let bytes = env.serialize().expect("serialise");
+
+        assert_eq!(
+            extract_timestamp_fast(&bytes),
+            Some(env.timestamp),
+            "the version field must not displace the timestamp the fast path scans for"
+        );
+
+        let parsed =
+            validate_and_verify(&bytes).expect("v2 envelope must pass validate_and_verify");
+        assert_eq!(parsed.version, ENVELOPE_VERSION_V2);
     }
 }
