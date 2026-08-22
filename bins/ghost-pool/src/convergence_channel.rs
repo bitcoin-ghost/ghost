@@ -574,13 +574,12 @@ impl ConvergenceTransport for MeshConvergenceTransport {
     /// cannot happen, such a node reports every reply as `unaddressable`, which is the honest
     /// reading: addressing is not landing and the drain is paying full fan-out cost.
     fn knows_peer(&self, peer: &NodeId) -> bool {
-        if !self.mesh.noise_available() {
-            return false;
-        }
-        self.mesh
-            .peers()
-            .get_peer(peer)
-            .is_some_and(|p| is_addressable(&p))
+        let found = self.mesh.peers().get_peer(peer);
+        addressing_available(
+            self.mesh.noise_available(),
+            found.as_ref().map(peer_liveness),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        )
     }
 
     async fn unicast(&self, peer: &NodeId, bytes: Vec<u8>) -> GhostResult<Delivered> {
@@ -604,10 +603,40 @@ impl ConvergenceTransport for MeshConvergenceTransport {
     }
 }
 
-fn is_addressable(peer: &ghost_consensus::peer::Peer) -> bool {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    peer.state == ghost_consensus::peer::PeerState::Connected
-        && peer.last_seen >= now.saturating_sub(PEER_FRESHNESS_SECS)
+/// The two facts about a peer that decide whether it can be addressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerLiveness {
+    pub connected: bool,
+    pub last_seen: u64,
+}
+
+fn peer_liveness(peer: &ghost_consensus::peer::Peer) -> PeerLiveness {
+    PeerLiveness {
+        connected: peer.state == ghost_consensus::peer::PeerState::Connected,
+        last_seen: peer.last_seen,
+    }
+}
+
+/// Can a reply be addressed to this peer? Pure, so the rule is testable without standing up a
+/// `MeshNetwork` — and the Noise half in particular, which no integration test would exercise
+/// because production always has a pool.
+///
+/// `noise_available` is not a detail. `MeshNetwork::should_use_noise` returns `false` for *every*
+/// message type when the pool is absent, and `send_to_peer` then takes the ZMQ path, whose
+/// publisher loop discards the endpoint and publishes to all subscribers. Without this half, a
+/// node with no Noise pool would report `unicast` for frames that were physically broadcast.
+pub fn addressing_available(
+    noise_available: bool,
+    peer: Option<PeerLiveness>,
+    now_secs: u64,
+) -> bool {
+    if !noise_available {
+        return false;
+    }
+    match peer {
+        Some(p) => p.connected && p.last_seen >= now_secs.saturating_sub(PEER_FRESHNESS_SECS),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +966,102 @@ mod tests {
         );
         // And a genuine later reading still logs, so the limiter is not wedged either way.
         assert!(limiter.allow(160_000, SHED_LOG_INTERVAL_MS));
+    }
+
+    /// ⚠ A node with no Noise pool cannot address anything, and must not claim it can.
+    ///
+    /// `MeshNetwork::should_use_noise` returns `false` for EVERY message type when `noise_pool`
+    /// is `None`, so `send_to_peer` takes the ZMQ path and the publisher loop discards the
+    /// endpoint and publishes to all subscribers. On regtest, a dev cluster, or a node whose pool
+    /// failed to initialise, a `Route::Unicast` is physically a fan-out — and reporting it as a
+    /// unicast would make `/health` show the fix working on exactly the nodes where it does not.
+    #[test]
+    fn nothing_is_addressable_without_a_noise_plane() {
+        let live = PeerLiveness {
+            connected: true,
+            last_seen: 1_000,
+        };
+        assert!(
+            addressing_available(true, Some(live), 1_000),
+            "positive control — a fresh connected peer on a Noise-capable node IS addressable"
+        );
+        assert!(
+            !addressing_available(false, Some(live), 1_000),
+            "with no Noise pool a `unicast` is physically a broadcast, so nothing is addressable"
+        );
+    }
+
+    /// The peer half of the same rule. The freshness window mirrors the one `Mesh::broadcast`
+    /// uses to pick its fan-out targets, so an addressed frame reaches exactly the peer a fan-out
+    /// would have reached — never one the mesh already considers stale.
+    #[test]
+    fn a_stale_or_disconnected_peer_is_not_addressable() {
+        let now = 10_000u64;
+        let fresh = PeerLiveness {
+            connected: true,
+            last_seen: now - PEER_FRESHNESS_SECS,
+        };
+        assert!(
+            addressing_available(true, Some(fresh), now),
+            "a peer exactly at the freshness bound is still addressable"
+        );
+        assert!(
+            !addressing_available(
+                true,
+                Some(PeerLiveness {
+                    last_seen: now - PEER_FRESHNESS_SECS - 1,
+                    ..fresh
+                }),
+                now
+            ),
+            "a peer past the freshness bound must fall back to fan-out"
+        );
+        assert!(
+            !addressing_available(
+                true,
+                Some(PeerLiveness {
+                    connected: false,
+                    ..fresh
+                }),
+                now
+            ),
+            "a disconnected peer must fall back to fan-out"
+        );
+        assert!(
+            !addressing_available(true, None, now),
+            "an unknown peer must fall back to fan-out"
+        );
+    }
+
+    /// The counters are only worth having if they survive the trip to `/health`. The wire struct
+    /// is built field by field, so a dropped or transposed field is a silent zero on the endpoint
+    /// — the counter reads correct in-process and reports nothing to the operator.
+    #[test]
+    fn every_counter_survives_the_conversion_to_the_health_response() {
+        let snap = ConvergenceLaneSnapshot {
+            capacity: 64,
+            queued: 7,
+            enqueued: 11,
+            shed: 13,
+            unicast: 17,
+            fanout: 19,
+            unaddressable: 23,
+            send_failed: 29,
+            expired: 31,
+        };
+        let wire: ghost_verification::challenge::ConvergenceLaneStats = snap.clone().into();
+        assert_eq!(wire.capacity, snap.capacity);
+        assert_eq!(wire.queued, snap.queued);
+        assert_eq!(wire.enqueued, snap.enqueued);
+        assert_eq!(wire.shed, snap.shed, "the #647 number must survive");
+        assert_eq!(wire.unicast, snap.unicast);
+        assert_eq!(wire.fanout, snap.fanout);
+        assert_eq!(wire.unaddressable, snap.unaddressable);
+        assert_eq!(
+            wire.send_failed, snap.send_failed,
+            "a frame that never reached the wire must be readable on /health"
+        );
+        assert_eq!(wire.expired, snap.expired);
     }
 
     /// The two rate limiters must be independent: a shed burst must not silence the send-failure
