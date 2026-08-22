@@ -392,6 +392,23 @@ pub struct ShardRuntime {
     /// [`ShardRuntime::evidence_is_too_old`], a liar has to keep lying inside the retention window
     /// to stay excluded, and an honest node wrongly accused is freed by the next restart.
     quarantined: Mutex<std::collections::BTreeSet<ghost_common::types::NodeId>>,
+    /// How many sampling audits each peer has left unanswered (#734). **Report-only.**
+    ///
+    /// §6 deliberately declines to say what refusal-to-serve means: the response cap makes an
+    /// honest partial answer legal, and an expired audit is not a verdict. So this is a COUNTER,
+    /// not a state — nothing reads it to make a decision, and no code path may start doing so
+    /// without the policy question in #734 being answered first.
+    ///
+    /// It exists because the threshold that question eventually needs must be chosen against real
+    /// data. The H-7 address proof measured 9,681 passes against 181 failures, and 181 of 181 were
+    /// `Unreachable` — transient, across seven peers, none above ~8% of its own probes. Treating
+    /// non-response as guilt there would have stripped every honest node's subnet on a link
+    /// hiccup. Sample silence has the same shape and we have no equivalent measurement, so the
+    /// probe runs report-only first, exactly as H-7's did.
+    ///
+    /// Bounded by peer count, and in memory only: a restart clears it, which is correct for a
+    /// diagnostic that must never accumulate into an accusation.
+    unanswered_samples: Mutex<std::collections::BTreeMap<ghost_common::types::NodeId, u64>>,
 }
 
 /// An audit in flight: what we asked, and the commitment we asked it against.
@@ -487,6 +504,7 @@ impl ShardRuntime {
             last_epoch_seen: AtomicU64::new(0),
             pending_samples: Mutex::new(BTreeMap::new()),
             quarantined: Mutex::new(std::collections::BTreeSet::new()),
+            unanswered_samples: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -1010,9 +1028,52 @@ impl ShardRuntime {
     /// caller's policy rather than turned into an accusation here.
     pub fn expire_pending_samples(&self, older_than: std::time::Duration) -> usize {
         let mut pending = self.pending_samples.lock();
-        let before = pending.len();
-        pending.retain(|_, p| p.sent_at.elapsed() < older_than);
-        before - pending.len()
+
+        // Which peer went quiet, not just how many audits lapsed (#734). The old code returned a
+        // bare count and discarded the identity, so "who never answers" was unanswerable from the
+        // logs — and that is precisely the question the eventual policy has to be set against.
+        //
+        // ⚠ ONE pass, deliberately. Selecting the expired keys and then re-testing the predicate
+        // in a `retain` evaluates `elapsed()` twice at different instants, so an audit sitting on
+        // the boundary can be counted in one pass and kept by the other — the returned count then
+        // disagrees with what was actually removed. Collect the keys, then remove exactly those.
+        let expired_keys: Vec<(ghost_common::types::NodeId, u64)> = pending
+            .iter()
+            .filter(|(_, p)| p.sent_at.elapsed() >= older_than)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &expired_keys {
+            pending.remove(key);
+        }
+        drop(pending);
+
+        let expired: Vec<ghost_common::types::NodeId> =
+            expired_keys.iter().map(|(target, _)| *target).collect();
+
+        if !expired.is_empty() {
+            let mut counts = self.unanswered_samples.lock();
+            for target in &expired {
+                let n = counts.entry(*target).or_insert(0);
+                *n += 1;
+                // Report-only. NOT a verdict, and nothing downstream reads this.
+                info!(
+                    peer = %hex::encode(&target[..4]),
+                    unanswered_total = *n,
+                    "shard: sampling audit went unanswered (report-only, not a verdict — #734)"
+                );
+            }
+        }
+
+        expired.len()
+    }
+
+    /// Per-peer count of unanswered sampling audits since this process started (#734).
+    ///
+    /// ⚠ Diagnostic only. Read it to CHOOSE a policy, never to enforce one — see the field's doc.
+    pub fn unanswered_sample_counts(
+        &self,
+    ) -> std::collections::BTreeMap<ghost_common::types::NodeId, u64> {
+        self.unanswered_samples.lock().clone()
     }
 
     /// Is this node in the ratified set?
@@ -2195,6 +2256,107 @@ mod tests {
             rt.evidence_is_too_old(0),
             "ancient evidence is refused however recent its (unsigned) timestamp claims to be"
         );
+    }
+
+    // ── #734: report-only counter for unanswered sampling audits ────────────────────────────
+
+    fn pending_sample_for(target: ghost_common::types::NodeId, epoch: u64) -> PendingSample {
+        PendingSample {
+            request: ghost_consensus::message::ShardSampleRequestMessage {
+                epoch,
+                target_node: target,
+                share_root: [0u8; 32],
+                leaf_indices: vec![0, 1, 2],
+                requesting_node: [9u8; 32],
+            },
+            summary: EpochSummary {
+                epoch,
+                node_id: target,
+                deltas: Default::default(),
+                share_count: 3,
+                share_root: [0u8; 32],
+                genesis_marker: None,
+                signature: Vec::new(),
+            },
+            sent_at: std::time::Instant::now(),
+        }
+    }
+
+    /// The counter must record WHO went quiet, not merely how many audits lapsed. The old code
+    /// returned a bare count and discarded the identity, which is exactly the fact the eventual
+    /// policy in #734 has to be chosen against.
+    #[test]
+    fn an_unanswered_audit_is_counted_against_the_peer_that_ignored_it() {
+        let (_id, _db, rt) = runtime();
+        let quiet = [0xAAu8; 32];
+        let other = [0xBBu8; 32];
+
+        rt.pending_samples
+            .lock()
+            .insert((quiet, 1), pending_sample_for(quiet, 1));
+        rt.pending_samples
+            .lock()
+            .insert((quiet, 2), pending_sample_for(quiet, 2));
+        rt.pending_samples
+            .lock()
+            .insert((other, 1), pending_sample_for(other, 1));
+
+        // Zero window: everything already sent is older than it.
+        let removed = rt.expire_pending_samples(std::time::Duration::from_secs(0));
+
+        assert_eq!(removed, 3, "every pending audit was past the window");
+        let counts = rt.unanswered_sample_counts();
+        assert_eq!(
+            counts.get(&quiet),
+            Some(&2),
+            "two audits ignored by this peer"
+        );
+        assert_eq!(counts.get(&other), Some(&1));
+    }
+
+    /// An audit still inside its window is not silence — counting it would manufacture the very
+    /// false signal that makes the #734 policy hard to set.
+    #[test]
+    fn an_audit_still_within_its_window_is_not_counted() {
+        let (_id, _db, rt) = runtime();
+        let peer = [0xCCu8; 32];
+        rt.pending_samples
+            .lock()
+            .insert((peer, 1), pending_sample_for(peer, 1));
+
+        let removed = rt.expire_pending_samples(std::time::Duration::from_secs(3600));
+
+        assert_eq!(removed, 0);
+        assert!(
+            rt.unanswered_sample_counts().is_empty(),
+            "a live audit must not be recorded as silence"
+        );
+        assert_eq!(
+            rt.pending_samples.lock().len(),
+            1,
+            "and must still be pending"
+        );
+    }
+
+    /// The returned count must equal what was actually removed. Selecting expired keys and then
+    /// re-testing the predicate in a `retain` evaluates `elapsed()` twice at different instants,
+    /// so a boundary audit could be counted by one pass and kept by the other.
+    #[test]
+    fn the_returned_count_equals_the_number_actually_removed() {
+        let (_id, _db, rt) = runtime();
+        for i in 0..5u64 {
+            let peer = [i as u8; 32];
+            rt.pending_samples
+                .lock()
+                .insert((peer, i), pending_sample_for(peer, i));
+        }
+
+        let before = rt.pending_samples.lock().len();
+        let removed = rt.expire_pending_samples(std::time::Duration::from_secs(0));
+        let after = rt.pending_samples.lock().len();
+
+        assert_eq!(removed, before - after);
+        assert_eq!(after, 0);
     }
 
     fn runtime() -> (Arc<NodeIdentity>, Arc<Database>, ShardRuntime) {
