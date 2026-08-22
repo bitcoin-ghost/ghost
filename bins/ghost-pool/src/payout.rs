@@ -1648,11 +1648,9 @@ impl PayoutProposalCreator {
         let expected_map = Self::address_amount_map(&expected);
         let proposal_map = Self::address_amount_map(&proposal.miner_payouts);
         if expected_map != proposal_map {
-            return Err(format!(
-                "GHOST-02: miner split does not match local recompute \
-                 ({} expected payout addresses vs {} in proposal)",
-                expected_map.len(),
-                proposal_map.len()
+            return Err(Self::describe_split_disagreement(
+                &expected_map,
+                &proposal_map,
             ));
         }
 
@@ -1776,6 +1774,141 @@ impl PayoutProposalCreator {
 
     /// Address-grouped (address -> total amount) view of a payout set, for the
     /// GHOST-02 comparison. Ordered so the comparison is independent of entry order.
+    /// Short, cross-node-comparable handle for a payout address (#727).
+    ///
+    /// Payout addresses are stored encrypted per-node, so the ciphertext differs everywhere and
+    /// cannot be grepped across logs; this hash is derived from the address bytes and is
+    /// therefore identical on every node. It also keeps the address-to-miner linkage out of the
+    /// log. Same construction as `payout_checkpoint::addr_handle`, deliberately — a handle that
+    /// differed between the two rejection paths would be worse than none.
+    fn addr_handle(addr: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(&Sha256::digest(addr)[..6])
+    }
+
+    /// Say what actually disagreed, not how many addresses each side had (#727).
+    ///
+    /// The old message printed both map LENGTHS. Whenever the disagreement is in the amounts
+    /// rather than the address set — the common case — it named two numbers that are equal:
+    ///
+    /// ```text
+    /// GHOST-02: miner split does not match local recompute (5 ... vs 5 in proposal)
+    /// ```
+    ///
+    /// That reads as an address-set mismatch that does not exist, and the disagreeing amounts —
+    /// the only thing identifying the fault — were discarded while still in scope. It cost real
+    /// time during the #724 investigation.
+    ///
+    /// Bounded on purpose: a split can hold hundreds of addresses and this string ends up in a
+    /// log line and an error return, so it reports every class with a count and shows at most
+    /// `MAX_SHOWN` examples of each. Truncation is stated rather than silent — a message that
+    /// quietly dropped the entry you needed would repeat the original fault.
+    fn describe_split_disagreement(
+        expected: &std::collections::BTreeMap<Vec<u8>, u64>,
+        proposed: &std::collections::BTreeMap<Vec<u8>, u64>,
+    ) -> String {
+        const MAX_SHOWN: usize = 3;
+
+        let mut differing: Vec<(String, u64, u64)> = Vec::new();
+        let mut missing: Vec<(String, u64)> = Vec::new();
+        let mut unexpected: Vec<(String, u64)> = Vec::new();
+
+        for (addr, exp) in expected {
+            match proposed.get(addr) {
+                Some(got) if got != exp => differing.push((Self::addr_handle(addr), *exp, *got)),
+                Some(_) => {}
+                None => missing.push((Self::addr_handle(addr), *exp)),
+            }
+        }
+        for (addr, got) in proposed {
+            if !expected.contains_key(addr) {
+                unexpected.push((Self::addr_handle(addr), *got));
+            }
+        }
+
+        // Largest disagreement first: with a bounded list, the biggest discrepancy is the one
+        // worth showing, and it is also the one most likely to breach the checkpoint tolerance.
+        differing.sort_by_key(|(_, exp, got)| std::cmp::Reverse(exp.abs_diff(*got)));
+        missing.sort_by_key(|(_, amt)| std::cmp::Reverse(*amt));
+        unexpected.sort_by_key(|(_, amt)| std::cmp::Reverse(*amt));
+
+        let mut parts: Vec<String> = Vec::new();
+
+        if !differing.is_empty() {
+            let shown: Vec<String> = differing
+                .iter()
+                .take(MAX_SHOWN)
+                .map(|(h, exp, got)| {
+                    let delta = got.abs_diff(*exp);
+                    let sign = if got > exp { "+" } else { "-" };
+                    format!("{h} expected {exp} got {got} ({sign}{delta})")
+                })
+                .collect();
+            parts.push(format!(
+                "{} address(es) differ in amount [{}{}]",
+                differing.len(),
+                shown.join("; "),
+                if differing.len() > MAX_SHOWN {
+                    format!("; +{} more not shown", differing.len() - MAX_SHOWN)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if !missing.is_empty() {
+            let shown: Vec<String> = missing
+                .iter()
+                .take(MAX_SHOWN)
+                .map(|(h, amt)| format!("{h} ({amt})"))
+                .collect();
+            parts.push(format!(
+                "{} address(es) we expect are absent from the proposal [{}{}]",
+                missing.len(),
+                shown.join("; "),
+                if missing.len() > MAX_SHOWN {
+                    format!("; +{} more", missing.len() - MAX_SHOWN)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if !unexpected.is_empty() {
+            let shown: Vec<String> = unexpected
+                .iter()
+                .take(MAX_SHOWN)
+                .map(|(h, amt)| format!("{h} ({amt})"))
+                .collect();
+            parts.push(format!(
+                "{} address(es) in the proposal we do not expect [{}{}]",
+                unexpected.len(),
+                shown.join("; "),
+                if unexpected.len() > MAX_SHOWN {
+                    format!("; +{} more", unexpected.len() - MAX_SHOWN)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+
+        // Defensive: the caller only reaches here when the maps differ, so an empty `parts`
+        // would mean the comparison and this description disagree about what "differ" means.
+        // Say so rather than returning a message that names nothing.
+        if parts.is_empty() {
+            return format!(
+                "GHOST-02: miner split does not match local recompute, but the two maps compare \
+                 equal entry-by-entry ({} expected, {} proposed) — this is a bug in the \
+                 comparison, not a split disagreement",
+                expected.len(),
+                proposed.len()
+            );
+        }
+
+        format!(
+            "GHOST-02: miner split does not match local recompute: {}",
+            parts.join("; ")
+        )
+    }
+
     fn address_amount_map(entries: &[PayoutEntry]) -> std::collections::BTreeMap<Vec<u8>, u64> {
         let mut m = std::collections::BTreeMap::new();
         for e in entries {
@@ -2708,6 +2841,118 @@ impl PayoutHandler {
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
+
+    // ── #727: the split rejection must name what disagreed ──────────────────────────────────
+
+    use super::PayoutProposalCreator;
+
+    fn map_of(pairs: &[(&[u8], u64)]) -> std::collections::BTreeMap<Vec<u8>, u64> {
+        pairs.iter().map(|(a, v)| (a.to_vec(), *v)).collect()
+    }
+
+    /// **The regression this closes.** Same address set, different amounts — the case that
+    /// actually fires on the fleet. The old message printed both map lengths and so read
+    /// "5 expected payout addresses vs 5 in proposal", pointing at a mismatch that did not
+    /// exist and discarding the only fact that identified the fault.
+    #[test]
+    fn a_split_rejection_names_the_amounts_not_the_counts() {
+        let expected = map_of(&[(b"addr_a", 100), (b"addr_b", 200)]);
+        let proposed = map_of(&[(b"addr_a", 100), (b"addr_b", 250)]);
+
+        let msg = PayoutProposalCreator::describe_split_disagreement(&expected, &proposed);
+
+        assert!(
+            msg.contains("200") && msg.contains("250"),
+            "the disagreeing amounts must appear: {msg}"
+        );
+        assert!(msg.contains("+50"), "the delta must appear: {msg}");
+        assert!(
+            msg.contains("1 address(es) differ in amount"),
+            "the class of disagreement must be named: {msg}"
+        );
+        assert!(
+            !msg.contains("2 expected payout addresses vs 2"),
+            "must not report equal counts as though they were the disagreement: {msg}"
+        );
+    }
+
+    /// A genuinely differing address SET must still be reported as such, in both directions —
+    /// otherwise fixing the amounts case would blind the one it used to describe.
+    #[test]
+    fn a_split_rejection_names_missing_and_unexpected_addresses() {
+        let expected = map_of(&[(b"addr_a", 100), (b"only_ours", 7)]);
+        let proposed = map_of(&[(b"addr_a", 100), (b"only_theirs", 9)]);
+
+        let msg = PayoutProposalCreator::describe_split_disagreement(&expected, &proposed);
+
+        assert!(
+            msg.contains("absent from the proposal"),
+            "an address we expect but they omit must be named: {msg}"
+        );
+        assert!(
+            msg.contains("we do not expect"),
+            "an address they pay but we do not must be named: {msg}"
+        );
+    }
+
+    /// The message lands in a log line and an error return, and a split can hold hundreds of
+    /// addresses. It must bound itself AND say that it did — silent truncation would repeat the
+    /// original fault in a new place.
+    #[test]
+    fn a_large_disagreement_is_bounded_and_says_so() {
+        let mut expected = std::collections::BTreeMap::new();
+        let mut proposed = std::collections::BTreeMap::new();
+        for i in 0u64..50 {
+            let addr = format!("addr_{i:03}").into_bytes();
+            expected.insert(addr.clone(), 1_000);
+            proposed.insert(addr, 1_000 + i + 1);
+        }
+
+        let msg = PayoutProposalCreator::describe_split_disagreement(&expected, &proposed);
+
+        assert!(
+            msg.contains("50 address(es) differ in amount"),
+            "the full count must be reported even though the list is capped: {msg}"
+        );
+        assert!(
+            msg.contains("+47 more not shown"),
+            "truncation must be explicit: {msg}"
+        );
+        assert!(
+            msg.len() < 600,
+            "message must stay log-sized, got {} bytes",
+            msg.len()
+        );
+    }
+
+    /// Largest discrepancy first: with a capped list, showing the biggest one is what makes the
+    /// cap survivable, and it is also the one most likely to breach the checkpoint tolerance.
+    #[test]
+    fn the_largest_discrepancy_is_shown_first() {
+        let expected = map_of(&[(b"small", 100), (b"huge", 1_000), (b"mid", 500)]);
+        let proposed = map_of(&[(b"small", 101), (b"huge", 9_000), (b"mid", 600)]);
+
+        let msg = PayoutProposalCreator::describe_split_disagreement(&expected, &proposed);
+        let huge = PayoutProposalCreator::addr_handle(b"huge");
+        let small = PayoutProposalCreator::addr_handle(b"small");
+
+        assert!(
+            msg.find(&huge).unwrap() < msg.find(&small).unwrap(),
+            "the 8,000 discrepancy must precede the 1: {msg}"
+        );
+    }
+
+    /// The handle must match `payout_checkpoint::addr_handle` — the two rejection paths describe
+    /// the same addresses, and a handle that differed between them would be worse than none.
+    #[test]
+    fn the_address_handle_matches_the_checkpoint_convention() {
+        use sha2::{Digest, Sha256};
+        let addr = b"bc1qexample";
+        assert_eq!(
+            PayoutProposalCreator::addr_handle(addr),
+            hex::encode(&Sha256::digest(addr)[..6])
+        );
+    }
 
     /// `owed()` is `accrued − settled` and is documented to go negative transiently. The cast to
     /// `u128` is where that becomes money: `-1i64 as u128` is 2^128−1, an address weighted above
