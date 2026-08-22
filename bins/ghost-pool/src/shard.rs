@@ -1852,7 +1852,7 @@ impl ShardRuntime {
         let mut skipped_unreadable = Vec::new();
         for height in from..=to {
             let read = match rpc.get_block_hash(height).await {
-                Ok(hash) => crate::settlement::fetch_coinbase_parts(rpc, &hash)
+                Ok(hash) => crate::coinbase_verifier::fetch_coinbase_parts(rpc, &hash)
                     .await
                     .map(|(scriptsig, outputs)| FetchedCoinbase {
                         block_hash: hash,

@@ -3702,8 +3702,19 @@ async fn main() -> Result<()> {
                 }
                 ghost_pool::payout::select_shard_miner_work(&rt.owed_snapshot())
             } else {
-                ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
-                    .ok()?
+                // Stage 6: the legacy ledger source is gone. Below the gate there is nothing to
+                // fall back TO, so abstain loudly rather than compute a root from a source that
+                // no longer exists.
+                //
+                // ⚠ Unreachable in practice — `CHECKPOINT_FROM_SHARD_HEIGHT` (963,388) passed on
+                // 2026-08-21, so no live height takes this arm. The branch survives only until
+                // the tip-keyed gate collapse removes the gate itself, which is a later release.
+                error!(
+                    height,
+                    "checkpoint: below CHECKPOINT_FROM_SHARD_HEIGHT, whose legacy source was \
+                     removed in the Stage 6 deletion — abstaining"
+                );
+                return None;
             };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()));
