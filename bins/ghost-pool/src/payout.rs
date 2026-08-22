@@ -1104,8 +1104,11 @@ impl PayoutProposalCreator {
                 // whole point of address grouping. It is an identifier carried alongside the
                 // payout, not an input to the coinbase: `from_proposal` hashes only address and
                 // amount, so this cannot change what a block pays.
-                let entries: Vec<PayoutEntry> = mp
-                    .payouts
+                // #726: the shard pays whatever address key it holds; the legacy path
+                // validates and dusts what fails. See `drop_invalid_shard_payouts`.
+                let (valid_payouts, invalid_sats) = self.drop_invalid_shard_payouts(&mp.payouts);
+
+                let entries: Vec<PayoutEntry> = valid_payouts
                     .iter()
                     .map(|(addr, sats)| {
                         let mut recipient_id = [0u8; 32];
@@ -1123,7 +1126,12 @@ impl PayoutProposalCreator {
                 // The remainder is floor-division leftover. It joins dust in the node pool for
                 // the same reason dust does: a satoshi that is tracked and re-homed is not lost,
                 // and silently dropping it is how a pool leaks money slowly.
-                (entries, mp.dust_sats.saturating_add(mp.remainder_sats))
+                (
+                    entries,
+                    mp.dust_sats
+                        .saturating_add(mp.remainder_sats)
+                        .saturating_add(invalid_sats),
+                )
             }
             None => self.calculate_miner_payouts(&data.miner_work, fee_dist.miner_pool)?,
         };
@@ -2316,6 +2324,72 @@ impl PayoutProposalCreator {
     /// - Matches the configured network (mainnet/testnet/signet/regtest)
     ///
     /// Returns Ok(()) if valid, or an error describing the issue.
+    /// Drop shard payouts whose address the coinbase validator would reject, folding their sats
+    /// into dust (#726).
+    ///
+    /// Returns `(kept, invalid_sats)`.
+    ///
+    /// `shard_miner_payouts` pays whatever address key the shard holds; `calculate_miner_payouts`
+    /// resolves each address and drops what `validate_payout_address` rejects. GHOST-02 compares
+    /// the two for EXACT equality, so one malformed address made the coinbase pay an output the
+    /// validator drops, the maps differed, and the whole BLOCK was rejected — one bad address
+    /// costing every miner in it, the same class of failure as #722 from the other direction.
+    ///
+    /// ⚠ **This must not redistribute.** The amounts in `payouts` were already computed from the
+    /// FULL owed set, so removing an entry here leaves every other entry untouched and the
+    /// removed sats become dust, which joins the node pool. That is exactly what the legacy path
+    /// does when validation fails, and it is what keeps the documented property true: the two
+    /// constructors "differ only in WHICH balances they distribute, never in HOW". Filtering the
+    /// owed map BEFORE distribution would instead re-weight every surviving miner — a silent
+    /// change to what a block pays.
+    ///
+    /// `validate_payout_address` also checks the configured network, so a testnet-shaped address
+    /// in a mainnet shard is caught here too (C-02).
+    fn drop_invalid_shard_payouts(&self, payouts: &[(String, u64)]) -> (Vec<(String, u64)>, u64) {
+        // Local rather than a shared helper: #727 adds an `addr_handle` associated fn to this
+        // same impl on its own branch, and two independent definitions would collide at merge.
+        // Same construction (sha256 of the address, first 6 bytes), so the handle is comparable
+        // across nodes and across both rejection paths.
+        let handle = |addr: &str| -> String {
+            use sha2::{Digest, Sha256};
+            hex::encode(&Sha256::digest(addr.as_bytes())[..6])
+        };
+
+        let mut invalid_sats: u64 = 0;
+        let mut invalid_count: usize = 0;
+        let kept: Vec<(String, u64)> = payouts
+            .iter()
+            .filter(|(addr, sats)| {
+                match self.validate_payout_address(addr.as_bytes(), "shard miner") {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            addr_handle = %handle(addr),
+                            sats = *sats,
+                            error = %e,
+                            "#726: shard payout address is invalid — treating as dust rather \
+                             than paying an output the validator drops"
+                        );
+                        invalid_sats = invalid_sats.saturating_add(*sats);
+                        invalid_count += 1;
+                        false
+                    }
+                }
+            })
+            .cloned()
+            .collect();
+
+        if invalid_count > 0 {
+            warn!(
+                invalid_count,
+                invalid_sats,
+                remaining_payees = kept.len(),
+                "#726: dropped invalid shard payout addresses into dust"
+            );
+        }
+        (kept, invalid_sats)
+    }
+
     fn validate_payout_address(&self, address: &[u8], context: &str) -> GhostResult<()> {
         if address.is_empty() {
             return Err(ghost_common::error::GhostError::InvalidAddress(format!(
@@ -3412,6 +3486,99 @@ mod tests {
             "the adopted list and the coinbase disagree — GHOST-02 rejects the block"
         );
         assert!(!expected_map.is_empty(), "the fixture paid nobody");
+    }
+
+    // ── #726: shard payouts must pass the same address validation the validator applies ─────
+
+    /// A regtest-valid address, so `ghost02_creator` (Regtest) accepts it.
+    const RT_ADDR_A: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    const RT_ADDR_B: &str = "bcrt1qee0086cgnlvdvge8e4swx3zyyhq6j8de45ct35exdd6xmzmed8pqg6t2hc";
+
+    /// **The bug.** A malformed address in the shard used to reach the coinbase, where the
+    /// validator drops it — so the recompute and the proposal disagreed and GHOST-02 rejected
+    /// the whole block. One bad address cost every miner in it.
+    #[test]
+    fn an_invalid_shard_address_becomes_dust_instead_of_a_dropped_output() {
+        let creator = ghost02_creator();
+        let payouts = vec![
+            (RT_ADDR_A.to_string(), 1_000u64),
+            ("not a bitcoin address".to_string(), 250u64),
+        ];
+
+        let (kept, invalid_sats) = creator.drop_invalid_shard_payouts(&payouts);
+
+        assert_eq!(kept.len(), 1, "the malformed address must not be paid");
+        assert_eq!(kept[0].0, RT_ADDR_A);
+        assert_eq!(
+            invalid_sats, 250,
+            "its sats must be accounted as dust, not lost"
+        );
+    }
+
+    /// **The property that keeps GHOST-02 agreeing.** Removing an invalid entry must leave every
+    /// other amount byte-identical. The amounts were computed from the FULL owed set, so dropping
+    /// one here folds its sats into dust; filtering the owed map *before* distribution would
+    /// instead re-weight every surviving miner — silently changing what the block pays.
+    #[test]
+    fn dropping_an_invalid_address_does_not_redistribute_to_the_others() {
+        let creator = ghost02_creator();
+        let with_bad = vec![
+            (RT_ADDR_A.to_string(), 1_000u64),
+            ("!!not-an-address!!".to_string(), 999u64),
+            (RT_ADDR_B.to_string(), 2_000u64),
+        ];
+        let without_bad = vec![
+            (RT_ADDR_A.to_string(), 1_000u64),
+            (RT_ADDR_B.to_string(), 2_000u64),
+        ];
+
+        let (kept_a, invalid) = creator.drop_invalid_shard_payouts(&with_bad);
+        let (kept_b, none) = creator.drop_invalid_shard_payouts(&without_bad);
+
+        assert_eq!(kept_a, kept_b, "surviving amounts must be untouched");
+        assert_eq!(invalid, 999);
+        assert_eq!(none, 0);
+    }
+
+    /// C-02: `validate_payout_address` also pins the network, so a mainnet-shaped address in a
+    /// regtest-configured pool is caught by the same filter. Cross-network payouts are
+    /// unspendable, and the issue calls this out explicitly.
+    #[test]
+    fn a_wrong_network_shard_address_is_also_dusted() {
+        let creator = ghost02_creator();
+        // Valid bech32, valid mainnet — wrong network for this Regtest creator.
+        let payouts = vec![
+            (RT_ADDR_A.to_string(), 500u64),
+            (
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                700u64,
+            ),
+        ];
+
+        let (kept, invalid_sats) = creator.drop_invalid_shard_payouts(&payouts);
+
+        assert_eq!(
+            kept.len(),
+            1,
+            "a mainnet address must not be paid on regtest"
+        );
+        assert_eq!(kept[0].0, RT_ADDR_A);
+        assert_eq!(invalid_sats, 700);
+    }
+
+    /// The common case must cost nothing and change nothing.
+    #[test]
+    fn an_all_valid_shard_split_is_passed_through_untouched() {
+        let creator = ghost02_creator();
+        let payouts = vec![
+            (RT_ADDR_A.to_string(), 1_000u64),
+            (RT_ADDR_B.to_string(), 2_000u64),
+        ];
+
+        let (kept, invalid_sats) = creator.drop_invalid_shard_payouts(&payouts);
+
+        assert_eq!(kept, payouts);
+        assert_eq!(invalid_sats, 0);
     }
 
     fn ghost02_creator() -> PayoutProposalCreator {
