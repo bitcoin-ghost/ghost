@@ -5172,21 +5172,103 @@ mod high_water_tests {
         );
     }
 
+    fn known_id(i: usize) -> NodeId {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        id[31] = 0x11;
+        id
+    }
+
+    /// Fill the map to exactly `MAX_HIGH_WATER_SENDERS` with peers in the protected set.
+    ///
+    /// Filling it with STRANGERS cannot work and that was the bug in the first versions of the two
+    /// tests below: strangers are held to their own 128-slot pool, so a stranger flood leaves the
+    /// map at 129 entries, "when the map is full" never happens, and the branches these tests
+    /// claim to cover are never reached.
+    fn full_map(now: u64) -> PeerHighWaterMarks {
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known((0..MAX_HIGH_WATER_SENDERS).map(known_id).collect());
+        for i in 0..MAX_HIGH_WATER_SENDERS {
+            marks.record(known_id(i), 100, now);
+        }
+        assert_eq!(
+            marks.marks.len(),
+            MAX_HIGH_WATER_SENDERS,
+            "the map is not actually full — this test would prove nothing"
+        );
+        marks
+    }
+
     /// Capacity must never apply to a sender already tracked. If a full map could stop an
     /// incumbent's mark from ADVANCING, an attacker could freeze the floor in place and replay
     /// everything above it.
     #[test]
     fn an_existing_mark_advances_even_when_the_map_is_full() {
         let now = now_secs();
+        let mut marks = full_map(now);
+
+        marks.record(known_id(0), 900, now);
+
+        assert_eq!(
+            marks.floor(&known_id(0), now),
+            Some(900),
+            "a full map blocked an incumbent's mark from advancing"
+        );
+        assert_eq!(
+            marks.marks.len(),
+            MAX_HIGH_WATER_SENDERS,
+            "size must not grow"
+        );
+    }
+
+    /// The safety valve: with the map genuinely full, a known peer arriving for the first time
+    /// takes a STRANGER's slot, never another known peer's.
+    ///
+    /// Only reachable once the protected set is larger than the reserved region, so it is dead
+    /// weight for a fleet of eight — but it is the branch that decides who loses a slot when it
+    /// does run, which is the whole subject of finding 1.
+    #[test]
+    fn a_known_newcomer_displaces_a_stranger_and_never_a_known_peer() {
+        let now = now_secs();
+        let reserved = MAX_HIGH_WATER_SENDERS - MAX_UNKNOWN_HIGH_WATER_SENDERS;
+        let newcomer = known_id(usize::MAX / 2);
+
         let mut marks = PeerHighWaterMarks::default();
-        marks.record(SENDER, 500, now);
-        for i in 0..(MAX_HIGH_WATER_SENDERS * 2) {
+        let mut known: std::collections::HashSet<NodeId> = (0..reserved).map(known_id).collect();
+        known.insert(newcomer);
+        marks.set_known(known);
+
+        for i in 0..reserved {
+            marks.record(known_id(i), 100, now);
+        }
+        for i in 0..MAX_UNKNOWN_HIGH_WATER_SENDERS {
             marks.record(stranger(i), 1, now);
         }
+        assert_eq!(
+            marks.marks.len(),
+            MAX_HIGH_WATER_SENDERS,
+            "map must be full"
+        );
+        assert_eq!(marks.unknown_len(), MAX_UNKNOWN_HIGH_WATER_SENDERS);
 
-        marks.record(SENDER, 900, now);
+        marks.record(newcomer, 500, now);
 
-        assert_eq!(marks.floor(&SENDER, now), Some(900));
+        assert_eq!(
+            marks.floor(&newcomer, now),
+            Some(500),
+            "a known peer was refused a slot on a full map"
+        );
+        assert_eq!(
+            marks.unknown_len(),
+            MAX_UNKNOWN_HIGH_WATER_SENDERS - 1,
+            "the displaced entry must have been a stranger"
+        );
+        for i in 0..reserved {
+            assert!(
+                marks.marks.contains_key(&known_id(i)),
+                "a known peer's mark was displaced"
+            );
+        }
     }
 
     /// Eviction is by AGE, never by recency. An attacker can make a mark NEW (send a message) but
@@ -5200,13 +5282,16 @@ mod high_water_tests {
 
         marks.drop_expired(now);
 
-        assert_eq!(
-            marks.floor(&SENDER, now),
-            None,
-            "expired mark should be gone"
+        // Asserted on the MAP, not through `floor()`. `floor()` applies the TTL itself, so it
+        // answers `None` for an expired mark whether or not `drop_expired` removed anything —
+        // the first version of this test asserted through it and passed with the whole body of
+        // `drop_expired` deleted.
+        assert!(
+            !marks.marks.contains_key(&SENDER),
+            "the expired mark is still occupying a slot — expiry did not actually remove it"
         );
         assert_eq!(
-            marks.floor(&[0xABu8; 32], now),
+            marks.marks.get(&[0xABu8; 32]).map(|&(seq, _)| seq),
             Some(700),
             "a fresh mark must survive expiry"
         );
