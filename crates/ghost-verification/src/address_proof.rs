@@ -249,6 +249,7 @@ mod tests {
     fn health_body(identity: &NodeIdentity, nonce: Option<&str>, signed_flag: bool) -> String {
         let payload = HealthResponse {
             mesh_validation: None,
+            convergence_channels: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),

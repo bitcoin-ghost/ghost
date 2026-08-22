@@ -116,6 +116,11 @@ pub mod share_handler;
 /// GHOST-03: ledger convergence (share-set reconciliation) between mesh nodes.
 pub mod convergence;
 
+/// #647: the bounded outbound queue that carries convergence frames from the sync handler
+/// callbacks to the async mesh, its shed counters, and the addressing that keeps a reply from
+/// costing one Noise send per peer.
+pub mod convergence_channel;
+
 /// Chain height at which the security-audit cluster's ENFORCEMENT activates
 /// fleet-wide. Mirrors `PAYOUT_ADDRESS_GROUPING_HEIGHT`: baking the activation as
 /// a deterministic block-height gate (not a flag) means every node — running the

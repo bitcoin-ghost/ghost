@@ -118,7 +118,15 @@ const MAX_PROOF_BYTES_PER_RESPONSE: usize = 64 * 1024;
 /// Broadcasts a serialized [`ConvergencePayload`] to the mesh under
 /// `MessageType::ShareConvergence`. Supplied by production wiring; `None` in
 /// tests that drive the exchange directly.
-pub type ConvergenceSendFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Sync>;
+/// Hands a serialised convergence frame to the outbound queue.
+///
+/// The second argument is the peer the frame is **addressed to**, or `None` to fan out. A reply
+/// is always addressed: its payload is the complement of one specific peer's advertisement, so
+/// fanning it out spends a Noise send per peer to serve one, and hands six uninterested nodes a
+/// `LedgerResponse` whose `more_available` flag then makes each of them emit a follow-up request
+/// of its own. That amplification is what fills the queue (#647).
+pub type ConvergenceSendFn =
+    Arc<dyn Fn(Vec<u8>, Option<ghost_common::types::NodeId>) -> GhostResult<()> + Send + Sync>;
 
 /// Drives ledger convergence for one node against its [`RoundManager`].
 pub struct ConvergenceHandler {
@@ -374,8 +382,17 @@ impl ConvergenceHandler {
 
     /// Credit a verified proof to both the in-memory round view and the `shares` TABLE.
     ///
-    /// The table is the only thing the payout ledger reads, so a backfill that lands only in
-    /// memory repairs nothing that matters. Idempotent — UNIQUE(share_hash) is the dedup.
+    /// A backfill that lands only in memory repairs nothing durable. Idempotent —
+    /// UNIQUE(share_hash) is the dedup.
+    ///
+    /// ⚠ This used to say the table is "the only thing the payout ledger reads". That has been
+    /// FALSE since migration v56 and the `checkpoint_from_shard_height` gate: the coinbase split
+    /// comes from `shard_owed` (`payout.rs`, `shard_miner_payouts`) and the checkpoint root from
+    /// `select_shard_miner_work`, both reading the in-memory `ShardTable` and never a `shares`
+    /// row. The shard's fold is additionally scoped to `received_by = own_node_id[..8]` while
+    /// this path writes the ORIGIN node's id — so a backfilled row is invisible to the fold by
+    /// construction. What still reads these rows is retention, GHOST-03 re-serving, paid-marking
+    /// and per-miner stats. Read that before judging a dropped convergence frame's severity.
     fn accept_proof(&self, proof: &ghost_common::types::ShareProof) -> AcceptOutcome {
         let miner_hex = hex::encode(&proof.miner_id[..8]);
         let from_node = hex::encode(&proof.received_by[..4]);
@@ -575,13 +592,20 @@ impl ConvergenceHandler {
                     // is fire-and-forget (dropped on channel overflow); this protocol exists to
                     // repair those drops. Feeding the RoundManager alone repaired only the
                     // in-memory round view — node-share credit and dedup — while the `shares`
-                    // table stayed short. And the `shares` table is the ONLY thing the payout
-                    // ledger reads (`select_ledger_miner_work` -> `get_top_unpaid_*`).
+                    // table stayed short.
                     //
-                    // The consequence was permanent, compounding ledger divergence: every node
-                    // summed a different share set, so every node computed a different miner
-                    // split, so the GHOST-02 exact-equality check rejected every proposal — and
-                    // nothing in the system ever repaired it. Safety held; liveness did not.
+                    // At the time the consequence was permanent, compounding ledger divergence:
+                    // every node summed a different share set, so every node computed a different
+                    // miner split, so the GHOST-02 exact-equality check rejected every proposal —
+                    // and nothing in the system ever repaired it. Safety held; liveness did not.
+                    //
+                    // ⚠ That is HISTORY, not the present. Since v56 the shard owns the payout —
+                    // `shard_owed` for the coinbase, `select_shard_miner_work` for the checkpoint
+                    // root — and the shard folds only rows whose `received_by` is this node's own
+                    // id, which a backfilled row (carrying the ORIGIN's id) never is. These rows
+                    // now feed retention, GHOST-03 re-serving, paid-marking and stats. The claim
+                    // that this table is "the ONLY thing the payout ledger reads" stood here
+                    // after it stopped being true, which is how #647 read as a money-losing bug.
                     //
                     // Mirrors the live-gossip insert in `share_handler.rs` exactly, so a share
                     // backfilled here is byte-identical to one that arrived first time. The
@@ -660,7 +684,9 @@ impl MessageHandler for ConvergenceHandler {
                 if let Some(send) = &self.send {
                     let bytes = serde_json::to_vec(&ConvergencePayload::Response(resp))
                         .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))?;
-                    send(bytes)?;
+                    // Addressed to the requester: `missing_shares` is the complement of THIS
+                    // peer's advertisement and means nothing to any other node (#647).
+                    send(bytes, Some(envelope.sender))?;
                 }
             }
             ConvergencePayload::LedgerRequest(req) => {
@@ -684,7 +710,10 @@ impl MessageHandler for ConvergenceHandler {
                 if let Some(send) = &self.send {
                     let bytes = serde_json::to_vec(&ConvergencePayload::LedgerResponse(resp))
                         .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))?;
-                    send(bytes)?;
+                    // Addressed to the requester. Fanning this out was the amplification behind
+                    // the measured 0/h -> 691/h storm: six nodes that never asked receive the
+                    // response, apply it, and each re-request on `more_available` (#647).
+                    send(bytes, Some(envelope.sender))?;
                 }
             }
             ConvergencePayload::LedgerResponse(resp) => {
@@ -715,7 +744,9 @@ impl MessageHandler for ConvergenceHandler {
                                     until = resp.until_ts,
                                     "GHOST-03: window has more — re-requesting immediately"
                                 );
-                                send(bytes)?;
+                                // Only this peer told us it had more, so only this peer is
+                                // worth asking again (#647).
+                                send(bytes, Some(envelope.sender))?;
                             }
                             Err(e) => {
                                 debug!(error = %e, "GHOST-03: could not build follow-up request");
@@ -807,6 +838,109 @@ mod tests {
             received_by: hex::encode(&p.received_by[..4]),
             valid: true,
         }
+    }
+
+    /// One outbound frame as a test sees it: the bytes, and the peer it is addressed to.
+    type CapturedFrame = (Vec<u8>, Option<ghost_common::types::NodeId>);
+
+    /// Capture the outbound frames a handler emits, WITH the peer each is addressed to.
+    fn capturing_send(buf: Arc<std::sync::Mutex<Vec<CapturedFrame>>>) -> ConvergenceSendFn {
+        Arc::new(move |bytes, to| {
+            buf.lock().unwrap().push((bytes, to));
+            Ok(())
+        })
+    }
+
+    fn convergence_envelope(
+        sender: ghost_common::types::NodeId,
+        payload: Vec<u8>,
+    ) -> Arc<ghost_consensus::message::MessageEnvelope> {
+        Arc::new(ghost_consensus::message::MessageEnvelope::new(
+            MessageType::ShareConvergence,
+            sender,
+            payload,
+            1,
+            [0u8; 64],
+        ))
+    }
+
+    /// #647: a convergence RESPONSE must be addressed to the peer that asked.
+    ///
+    /// `missing_shares` is computed as the complement of *that requester's* advertised hash set,
+    /// so it is meaningless to every other node. Handing it to `Mesh::broadcast` spent a Noise
+    /// send per peer to serve one, and the drain task processes frames one at a time — so the
+    /// fan-out, not the queue depth, is what set the drain rate and filled the 64-slot channel.
+    ///
+    /// Worse, the six nodes that never asked apply the response anyway and, on `more_available`,
+    /// each emit a follow-up request of their own. That is the amplification measured when the
+    /// v56 cutover left the sweep running: inbound `ShareConvergence` 0/h -> 691/h on ghost-vm7.
+    #[tokio::test]
+    async fn a_round_convergence_response_is_addressed_to_the_requester() {
+        let producer = NodeIdentity::generate();
+        let rm_server = round_manager();
+        let rm_client = round_manager();
+
+        // The server holds three shares; the client advertises only the first.
+        let shares: Vec<ShareProof> = (1..=3).map(|n| signed_share(&producer, n)).collect();
+        for sh in &shares {
+            rm_server.handle_share_proof(sh.clone()).expect("server");
+        }
+        rm_client
+            .handle_share_proof(shares[0].clone())
+            .expect("client");
+
+        let outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = ConvergenceHandler::new(Arc::clone(&rm_server))
+            .with_send(capturing_send(Arc::clone(&outbox)));
+        let client = ConvergenceHandler::new(Arc::clone(&rm_client));
+
+        let round_id = rm_client.current_round_id();
+        let request = client.request_bytes(round_id).expect("request");
+
+        let requester: ghost_common::types::NodeId = [0xd7; 32];
+        server
+            .handle_message(convergence_envelope(requester, request))
+            .await
+            .expect("server answers");
+
+        let frames = outbox.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1, "the server must answer exactly once");
+        assert_eq!(
+            frames[0].1,
+            Some(requester),
+            "the reply must be addressed to the requester — fanning it out is the per-frame cost \
+             that filled the outbound queue (#647)"
+        );
+
+        // And it must still be a usable reply, not merely a correctly addressed empty one.
+        let payload: ConvergencePayload =
+            serde_json::from_slice(&frames[0].0).expect("reply parses");
+        let ConvergencePayload::Response(resp) = payload else {
+            panic!("the server must answer a Request with a Response");
+        };
+        assert_eq!(
+            resp.missing_shares.len(),
+            2,
+            "the reply must carry the two shares the requester did not advertise"
+        );
+    }
+
+    /// The periodic ADVERTISEMENT is genuinely for every peer, so it must NOT be addressed —
+    /// otherwise the routing fix would quietly turn a mesh-wide advertisement into a unicast and
+    /// convergence would stop reaching anyone but one node.
+    #[test]
+    fn a_round_convergence_request_carries_no_address() {
+        let rm = round_manager();
+        let handler = ConvergenceHandler::new(Arc::clone(&rm));
+        let bytes = handler
+            .request_bytes(rm.current_round_id())
+            .expect("request");
+        let payload: ConvergencePayload = serde_json::from_slice(&bytes).expect("parses");
+        assert!(
+            matches!(payload, ConvergencePayload::Request(_)),
+            "the periodic frame is an advertisement, and main.rs enqueues it with `None` so it \
+             fans out to every peer"
+        );
     }
 
     /// GHOST-03 must repair the `shares` TABLE, not merely the in-memory round view.

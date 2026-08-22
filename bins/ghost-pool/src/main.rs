@@ -3574,33 +3574,31 @@ async fn main() -> Result<()> {
     // GHOST-03 share ledger sweep below. The handler's send is sync, so outbound
     // frames go through an mpsc channel drained by a task that wraps each in a
     // ChallengeConvergence envelope and broadcasts it.
-    let (verify_conv_tx, mut verify_conv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    //
+    // A response is addressed to its requester rather than fanned out: it serves exactly one
+    // peer's advertised key set, so a fan-out spends a Noise send per peer to serve one (#647).
+    let (verify_conv_tx, verify_conv_rx) = ghost_pool::convergence_channel::convergence_channel(
+        ghost_pool::convergence_channel::CONVERGENCE_CHANNEL_CAPACITY,
+        "challenge",
+    );
     {
-        let mesh_for_vconv = Arc::clone(&mesh);
-        tokio::spawn(async move {
-            while let Some(bytes) = verify_conv_rx.recv().await {
-                match mesh_for_vconv
-                    .create_envelope_raw(ghost_consensus::MessageType::ChallengeConvergence, bytes)
-                {
-                    Ok(envelope) => {
-                        if let Err(e) = mesh_for_vconv.broadcast(envelope).await {
-                            tracing::debug!(error = %e, "challenge-convergence broadcast failed");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "challenge-convergence envelope failed"),
-                }
-            }
-        });
+        let counters = Arc::clone(verify_conv_tx.counters());
+        let transport = Arc::new(
+            ghost_pool::convergence_channel::MeshConvergenceTransport::new(
+                Arc::clone(&mesh),
+                ghost_consensus::MessageType::ChallengeConvergence,
+            ),
+        );
+        tokio::spawn(ghost_pool::convergence_channel::drain(
+            verify_conv_rx,
+            transport,
+            counters,
+            "challenge",
+        ));
     }
     let verify_conv_send: ghost_consensus::verification_handler::ChallengeSendFn = {
         let verify_conv_tx = verify_conv_tx.clone();
-        Arc::new(move |bytes| {
-            verify_conv_tx.try_send(bytes).map_err(|e| {
-                ghost_common::error::GhostError::P2PMessage(format!(
-                    "challenge-convergence channel: {e}"
-                ))
-            })
-        })
+        Arc::new(move |bytes, to| verify_conv_tx.try_enqueue(bytes, to))
     };
 
     // Create and register verification result handler for P2P verification results
@@ -4778,31 +4776,31 @@ async fn main() -> Result<()> {
     // (drop/partition) and we apply them (re-verifying the GHOST-09 signature).
     // `broadcast()` is async but the handler's send is sync, so outbound
     // convergence frames go through an mpsc channel drained by a spawned task.
-    let (conv_tx, mut conv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    //
+    // Each frame carries the peer it is addressed to. A REPLY is addressed to its requester —
+    // its contents are the complement of that peer's advertisement — so the drain pays one Noise
+    // send instead of one per peer, and six uninterested nodes no longer receive a response they
+    // then re-request on `more_available`. That amplification is what filled this queue (#647).
+    // An advertisement carries no address and still fans out.
+    let (conv_tx, conv_rx) = ghost_pool::convergence_channel::convergence_channel(
+        ghost_pool::convergence_channel::CONVERGENCE_CHANNEL_CAPACITY,
+        "share",
+    );
     {
-        let mesh_for_conv = Arc::clone(&mesh);
-        tokio::spawn(async move {
-            while let Some(bytes) = conv_rx.recv().await {
-                match mesh_for_conv
-                    .create_envelope_raw(ghost_consensus::MessageType::ShareConvergence, bytes)
-                {
-                    Ok(envelope) => {
-                        if let Err(e) = mesh_for_conv.broadcast(envelope).await {
-                            tracing::debug!(error = %e, "GHOST-03: convergence broadcast failed");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "GHOST-03: convergence envelope failed"),
-                }
-            }
-        });
+        let counters = Arc::clone(conv_tx.counters());
+        let transport = Arc::new(
+            ghost_pool::convergence_channel::MeshConvergenceTransport::new(
+                Arc::clone(&mesh),
+                ghost_consensus::MessageType::ShareConvergence,
+            ),
+        );
+        tokio::spawn(ghost_pool::convergence_channel::drain(
+            conv_rx, transport, counters, "share",
+        ));
     }
     let conv_send: ghost_pool::convergence::ConvergenceSendFn = {
         let conv_tx = conv_tx.clone();
-        Arc::new(move |bytes| {
-            conv_tx.try_send(bytes).map_err(|e| {
-                ghost_common::error::GhostError::P2PMessage(format!("convergence channel: {e}"))
-            })
-        })
+        Arc::new(move |bytes, to| conv_tx.try_enqueue(bytes, to))
     };
     // The shared era axis for GHOST-03 backfill (#677).
     //
@@ -4968,7 +4966,8 @@ async fn main() -> Result<()> {
                 // Repair the round in flight (fast path for a share dropped seconds ago).
                 let round_id = rm_for_conv.current_round_id();
                 if let Ok(bytes) = conv_handler.request_bytes(round_id) {
-                    let _ = conv_tx.send(bytes).await;
+                    // An advertisement: every peer is a legitimate recipient, so it fans out.
+                    conv_tx.enqueue(bytes, None).await;
                 }
 
                 // The ledger sweep repairs the LEGACY unpaid ledger, and since migration v56
@@ -5085,7 +5084,7 @@ async fn main() -> Result<()> {
                                 bytes = bytes.len(),
                                 "GHOST-03: window convergence request sent"
                             );
-                            let _ = conv_tx.send(bytes).await;
+                            conv_tx.enqueue(bytes, None).await;
                             sent += 1;
                         }
                         Err(e) => {
@@ -9150,6 +9149,22 @@ async fn main() -> Result<()> {
                 bad_timestamp: s.bad_timestamp,
                 other_errors: s.other_errors,
                 memory_limit_exceeded: s.memory_limit_exceeded,
+            }
+        });
+    }
+
+    // #647: surface the outbound convergence-queue counters on `/health`. The queues shed frames
+    // when full and the only evidence was an ERROR line per shed frame, so establishing that the
+    // fleet was losing 3,770 frames a day on one node took a hand-run journald grep across eight
+    // hosts. `shed` is now a number an operator (or a monitor) can read, and `unaddressable`
+    // says whether the reply-addressing that removes the fan-out cost is actually landing.
+    {
+        let share = conv_tx.clone();
+        let challenge = verify_conv_tx.clone();
+        verification_state = verification_state.with_convergence_channels(move || {
+            ghost_verification::challenge::ConvergenceChannelStats {
+                share: share.snapshot().into(),
+                challenge: challenge.snapshot().into(),
             }
         });
     }
