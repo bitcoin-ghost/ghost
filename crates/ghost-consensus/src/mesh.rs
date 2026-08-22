@@ -162,12 +162,12 @@ pub struct MeshConfig {
     /// Path to persist the per-sender INBOUND high-water marks (audit H-11).
     ///
     /// The dedup cache's per-sender sequence state is evicted after `MESSAGE_TTL_SECONDS` of
-    /// silence and lost entirely on restart, and re-entry goes through the vacant-entry arm of
-    /// [`SeenMessageCache::validate_and_update_sequence`], which accepts ANY sequence. So the
-    /// replay window was never 300 seconds — it was "until the next quiet period", after which an
-    /// old validly-signed envelope could be re-admitted as a first message. Keeping the marks
-    /// outside the dedup cache closes the quiet-period half; persisting them here closes the
-    /// restart half. `None` (the default, e.g. tests) keeps the marks in memory only.
+    /// silence and lost entirely on restart, and re-entry goes through the vacant-entry arm of the
+    /// sequence check, which accepts ANY sequence. So the replay window was never 300 seconds — it
+    /// was "until the next quiet period", after which an old validly-signed envelope could be
+    /// re-admitted as a first message. Keeping the marks outside the dedup cache closes the
+    /// quiet-period half; persisting them here closes the restart half. `None` (the default, e.g.
+    /// tests) keeps the marks in memory only.
     pub peer_sequence_persist_path: Option<std::path::PathBuf>,
 }
 
@@ -963,6 +963,14 @@ impl SeenMessageCache {
                 // every captured envelope is a first message again. `floor` is the highest
                 // sequence we ever accepted from this sender; anything at or below it is a replay
                 // of something already processed, whatever the dedup cache still remembers.
+                //
+                // ⚠ Residual, and deliberate: once re-baselined here, the Occupied arm's
+                // `SEQUENCE_TOLERANCE_WINDOW` still admits the ten sequences below the new
+                // baseline, because mixed Noise/ZMQ transports genuinely reorder by about that
+                // much. So this bounds the window to ten messages rather than closing it. Closing
+                // it needs the signed timestamp — a v2 envelope cannot be re-stamped, so a replay
+                // inside the window dies on the ±30 s drift check instead. Ten bounded sequences
+                // is a different order of problem from "any sequence, for ever".
                 if let Some(floor) = floor {
                     if sequence <= floor {
                         warn!(
@@ -1891,7 +1899,7 @@ impl MeshNetwork {
     /// Reads the L1 tip through the same provider the health ping uses. That provider is optional
     /// and falls back to 0, and 0 is below every real gate — so a node with no height source
     /// keeps emitting v1. That is the only safe direction: emitting v2 at a peer that verifies v1
-    /// is a silent, total rejection at the far end (see [`MESH_ENVELOPE_V2_HEIGHT`]).
+    /// is a silent, total rejection at the far end (see [`crate::message::MESH_ENVELOPE_V2_HEIGHT`]).
     fn envelope_version(&self) -> u8 {
         let height = self.l1_height_fn.as_ref().map(|f| f()).unwrap_or(0);
         let version = envelope_version_for_height(height);
@@ -4939,6 +4947,59 @@ mod high_water_tests {
         marks.reset(SENDER, 7, now);
 
         assert_eq!(marks.floor(&SENDER, now), Some(7));
+    }
+
+    /// The wiring check: the REAL signing path, not just the constructor.
+    ///
+    /// `create_envelope_raw` is what every mesh broadcast goes through, and it picks the format
+    /// from `envelope_version()`, which reads a height provider that may not be wired at all. A
+    /// preimage that is correct in isolation and a signer that never reaches it is the failure
+    /// this repo already has a `check-wiring.sh` for.
+    #[test]
+    fn the_real_signing_path_produces_a_verifiable_envelope() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let mut config = MeshConfig::default();
+        config.noise_enabled = false;
+        config.noise_required = false;
+        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let env = mesh
+            .create_envelope_raw(MessageType::HealthPing, b"ping".to_vec())
+            .expect("create envelope");
+
+        assert_eq!(
+            env.version, ENVELOPE_VERSION_V1,
+            "with the gate dormant and no height provider wired, this node must emit v1"
+        );
+        assert!(
+            crate::message_validator::verify_envelope_signature(&env).is_ok(),
+            "the envelope this node actually broadcasts must verify against the shared preimage"
+        );
+    }
+
+    /// Wired the other way: with a height provider past the gate, the same path emits v2 and it
+    /// still verifies. Without this the emit-side gate could be dead code and every test above
+    /// would still pass.
+    #[test]
+    fn a_height_past_the_gate_switches_the_real_signing_path_to_v2() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let mut config = MeshConfig::default();
+        config.noise_enabled = false;
+        config.noise_required = false;
+        let mut mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let gate = mesh_envelope_v2_height();
+        mesh.set_l1_height_provider(Arc::new(move || gate));
+
+        let env = mesh
+            .create_envelope_raw(MessageType::HealthPing, b"ping".to_vec())
+            .expect("create envelope");
+
+        assert_eq!(env.version, crate::message::ENVELOPE_VERSION_V2);
+        assert!(
+            crate::message_validator::verify_envelope_signature(&env).is_ok(),
+            "a v2 envelope from the real signing path must verify"
+        );
     }
 
     /// The persisted round trip must preserve the sender ids exactly. A hex encoding that lost or

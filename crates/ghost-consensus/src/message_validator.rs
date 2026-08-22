@@ -1997,18 +1997,29 @@ mod envelope_version_tolerance_tests {
     }
 
     /// Claiming a version the binary cannot reconstruct must be a REJECTION, not a panic and not
-    /// a pass. A future v3 emitted early would otherwise be the same silent-drop trap
-    /// `CapabilityType` set.
+    /// a pass.
+    ///
+    /// The envelope here carries a signature that is genuinely VALID over the degenerate preimage
+    /// an unknown version would produce if `signing_preimage` answered `Ok(vec![])` instead of an
+    /// error. That is the shape of the real bug: a signature over the empty message, obtained once,
+    /// would then authenticate any future-versioned envelope with arbitrary content. Asserting
+    /// only that a v2-signed envelope re-labelled v3 is rejected does not catch it — those bytes
+    /// fail to match whatever the preimage is, so the test passes for the wrong reason.
     #[test]
     fn an_unknown_claimed_version_is_rejected_not_trusted() {
         let identity = NodeIdentity::generate();
         let mut env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
         env.version = 3;
+        env.signature = identity.sign(&[]);
 
-        assert!(matches!(
-            verify_envelope_signature(&env),
-            Err(MessageValidationError::InvalidSignature(_))
-        ));
+        assert!(
+            matches!(
+                verify_envelope_signature(&env),
+                Err(MessageValidationError::InvalidSignature(_))
+            ),
+            "an unreconstructable version must be refused outright, never verified against a \
+             degenerate preimage"
+        );
     }
 
     /// Flipping the version field is not a downgrade attack: the field SELECTS the preimage, so a
