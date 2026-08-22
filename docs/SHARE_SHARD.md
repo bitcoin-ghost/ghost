@@ -429,6 +429,23 @@ and validity checks survive.
 - **Payout ledger stays; PPLNS-style windowing is rejected.**
 - **No GPU or ZK requirement to participate.**
 - **Signed balances**, not clamped at zero.
+- **A proven liar loses the future, not the past** *(settled 2026-08-22)*. When §6 sampling proves
+  a node committed work it cannot back, it is quarantined — no further summary, no table sync —
+  and its existing column **stands**. Nothing un-credits it.
+
+  The merge stays **grow-only**, and that is the whole reason: idempotence, commutativity and
+  associativity are what make out-of-order, duplicate and missing delivery harmless, and they are
+  what makes "a missing message makes you behind, never wrong" true (§4.4). A revocation that
+  reduced a column would make the merge subtractive and take all three properties with it — the
+  same mistake the first draft made by having the rebase subtract from a grow-only counter, which
+  produced double payment.
+
+  The cost is bounded and was measured rather than assumed: at ~35 audits per node per day with
+  λ=20, a node faking half its work is caught with probability ~1−2⁻²⁰ on the first audit that
+  targets it. A liar therefore profits once, briefly, and never again.
+
+  ⛔ **Nothing may make the merge subtractive.** Recovering a liar's past work is not a feature to
+  be added later; it is the property being traded away, deliberately.
 
 ## 9. Open decisions
 
