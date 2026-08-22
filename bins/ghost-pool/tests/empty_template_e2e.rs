@@ -18,8 +18,11 @@ use ghost_common::types::TreasuryAddress;
 use ghost_pool::template::{TemplateConfig, TemplateProcessor};
 use serde_json::json;
 
+mod common;
+
 fn rpc() -> Option<Arc<BitcoinRpc>> {
-    let mut r = BitcoinRpc::new("127.0.0.1", 18443, "ghosttest", "ghosttest").ok()?;
+    // Credentials from the environment with the shipped compose defaults (see `common`).
+    let mut r = common::regtest_rpc_raw()?;
     // The checked get_block_template validates the target against the rpc's network
     // (mainnet by default), and regtest's trivial target reads as "too easy" under
     // the mainnet limit. Point the rpc at Regtest so it uses the permissive limit.
@@ -61,6 +64,20 @@ async fn empty_template_is_coinbase_only_while_forced_full_includes_mempool() {
     rpc.call_raw("generatetoaddress", vec![json!(101), json!(mining_addr)])
         .await
         .expect("generate");
+
+    // ⛔ Refresh the client's cached tip after generating, or `validate_template` rejects every
+    // template that follows.
+    //
+    // `BitcoinRpc` remembers the height it last saw and checks a template against it within
+    // `MAX_HEIGHT_DEVIATION` (10). Mining 101 blocks moves the chain 101 past that cache, so the
+    // first template is ~101 out and fails with `Height out of range: template=N, expected near
+    // N-101`.
+    //
+    // ⚠ This test could never have passed — the deviation is unconditional, not environmental.
+    // It went unnoticed because the file skipped: its hardcoded `ghosttest` credentials matched
+    // no shipped config, so a credential mismatch read as "no regtest node" and the test reported
+    // success without executing. See `common/mod.rs`.
+    rpc.get_block_count().await.expect("refresh cached tip");
     let dest = rpc.call_raw("getnewaddress", vec![]).await.expect("addr2");
     rpc.call_raw("sendtoaddress", vec![dest, json!(1.0)])
         .await

@@ -40,6 +40,8 @@ use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
 use ghost_storage::{Database, MinerRecord, ShareRecord};
 use ghost_verification::qualification::QualifiedCapabilityProvider;
 
+mod common;
+
 const FLEET: usize = 8;
 const MINERS: usize = 6;
 const ROUNDS: u64 = 20;
@@ -57,9 +59,10 @@ struct Node {
 }
 
 fn rpc() -> Option<Arc<BitcoinRpc>> {
-    BitcoinRpc::new("127.0.0.1", 18443, "ghosttest", "ghosttest")
-        .ok()
-        .map(Arc::new)
+    // Credentials come from the environment with the shipped compose defaults. The previous
+    // hardcoded `ghosttest` matched no config in the repo, so this skipped even against a
+    // healthy node. See `common/mod.rs`.
+    common::regtest_rpc()
 }
 
 fn addr(seed: u8) -> String {
