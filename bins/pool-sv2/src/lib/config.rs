@@ -47,10 +47,18 @@ pub struct ShareWebhookConfig {
     /// **Mandatory when this section is present, and deliberately has no default.** ghost-pool
     /// authorised this webhook by `is_loopback()` alone, so every process on the box could write
     /// to the payout ledger; it now requires an HMAC-SHA256 over `timestamp || body` under this
-    /// secret. A `#[serde(default)]` here would let a stale config start a pool that mines
-    /// happily while every batch is rejected `401` and the shares are lost — silent, and paid for
-    /// in miners' work. A missing key instead fails config parse at startup, loudly, before a
-    /// single miner connects.
+    /// secret.
+    ///
+    /// Two ways to get this wrong, both closed. A `#[serde(default)]` would let a stale config
+    /// start a pool that mines happily while every batch is rejected `401` and the shares are
+    /// lost — silent, and paid for in miners' work; without one, the file fails to parse. And a
+    /// key that is PRESENT but unusable is refused by `ShareWebhookWorker::new`, which propagates
+    /// to `PoolSv2::start` and stops the process. Neither is survivable at runtime, because the
+    /// runtime symptom is total share loss behind an SV2 acknowledgement the miner already has.
+    ///
+    /// The acceptance rule is `InternalAuthKey`'s — at least 32 bytes of hex, first 32 used —
+    /// which is the same code ghost-pool verifies with, so "acceptable" cannot mean two different
+    /// things on the two ends of the socket.
     pub secret: String,
     /// Number of shares to accumulate before sending a batch.
     #[serde(default = "default_share_webhook_batch_size")]

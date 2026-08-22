@@ -34,6 +34,7 @@ use ghost_common::rpc::BitcoinRpc;
 use ghost_common::types::{NodeCapabilities, WindowBestRecord};
 use ghost_policy::{PolicyEngine, PolicyProfile};
 use ghost_storage::Database;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -1327,6 +1328,26 @@ pub struct VerificationState {
     /// will ever ratify. Defaults to the dormant `u64::MAX` so an unwired embedder (regtest,
     /// tests) keeps the pre-gate behaviour rather than silently refusing every share.
     share_pow_verify_height: u64,
+    /// Share hashes already admitted through ingest, newest-last, bounded (H-13 / replay).
+    ///
+    /// The HMAC proves the CALLER, and its 30-second window bounds how long a captured request
+    /// stays replayable — but neither stops a key holder from sending the same batch again, and
+    /// on this fleet `internal_api_secret` is also handed to ghost-dashboard as
+    /// `INTERNAL_AUTH_KEY` (`scripts/install-node.sh`), so "a compromised dashboard" — one of the
+    /// threats this endpoint is being hardened against — holds a valid signing key. Re-POSTing a
+    /// captured batch would then credit every share in it again, because nothing downstream
+    /// deduplicates: `RoundManager::record_share` credits in-memory work before the database is
+    /// touched, and the database's UNIQUE constraint only stops the ROW, not the credit.
+    ///
+    /// This also closes a self-inflicted case that needed no attacker at all: when a `200` is
+    /// lost in transit, `pool_sv2` re-sends the identical batch under a fresh timestamp, and both
+    /// copies were credited.
+    ///
+    /// Sizing: 50,000 hashes ≈ 6 MB at 64 hex characters each. At this fleet's rate — single
+    /// figures of shares a second per node — that is hours of window, and the nodes are RAM-tight
+    /// (a 5 GB database on 4 GB boxes), so a larger ring would cost more than it protects. A
+    /// share older than the ring is a share whose batch has long since been acknowledged.
+    recent_share_hashes: parking_lot::Mutex<(HashSet<String>, VecDeque<String>)>,
     /// Round ID getter (callback)
     get_round_id: Box<dyn Fn() -> u64 + Send + Sync>,
     /// Miner count getter (callback)
@@ -1685,6 +1706,11 @@ pub struct GhostPayInfo {
     pub wraith_enabled: bool,
 }
 
+/// How many recently-admitted share hashes ingest remembers, for replay rejection (H-13).
+///
+/// See `VerificationState::recent_share_hashes` for the sizing argument.
+const RECENT_SHARE_HASHES: usize = 50_000;
+
 /// Does this locally-submitted share's header justify the work it claims? (H-13)
 ///
 /// **`header_required` decides what "no evidence" means.** With it false the check is advisory —
@@ -1789,6 +1815,10 @@ impl VerificationState {
             get_block_height: Box::new(|| 0),
             share_tier_bind_height: u64::MAX,
             share_pow_verify_height: u64::MAX,
+            recent_share_hashes: parking_lot::Mutex::new((
+                HashSet::with_capacity(RECENT_SHARE_HASHES),
+                VecDeque::with_capacity(RECENT_SHARE_HASHES),
+            )),
             get_round_id: Box::new(|| 0),
             get_miner_count: Box::new(|| 0),
             get_peer_count: Box::new(|| 0),
@@ -2048,35 +2078,75 @@ impl VerificationState {
         )
     }
 
+    /// Claim this share hash for the first time, or report that it has already been seen.
+    ///
+    /// **Claim-once by construction**, which is why it is called exactly once per share rather
+    /// than "checked" in one place and "recorded" in another: a check followed by a later record
+    /// is a race, and calling it twice for the same share would make the second call report the
+    /// first as a duplicate.
+    ///
+    /// Hashes are lower-cased before comparison. Hex is case-insensitive, so without that a
+    /// replayer could re-send a captured batch with the hashes upper-cased and every share would
+    /// look new — the dedup would be defeated by the shift key.
+    fn claim_share_hash(&self, share_hash: &str) -> bool {
+        let key = share_hash.to_ascii_lowercase();
+        let mut seen = self.recent_share_hashes.lock();
+        if !seen.0.insert(key.clone()) {
+            return false;
+        }
+        seen.1.push_back(key);
+        while seen.1.len() > RECENT_SHARE_HASHES {
+            if let Some(evicted) = seen.1.pop_front() {
+                seen.0.remove(&evicted);
+            }
+        }
+        true
+    }
+
     /// Record a share (called from HTTP endpoint)
     ///
-    /// H-13: the PoW gate lives HERE, not only in `record_share_batch`, because
-    /// `POST /api/internal/share` (singular) reaches the ledger through this method and had no
-    /// verification of any kind — it took `work` on trust and wrote it straight into the payout
-    /// ledger. The batch lane checks first as well, and deliberately so: it must decide whether
-    /// to fire the block-found callback, which happens outside this call. A duplicated sha256d
-    /// per share is a rounding error next to a lane that credits unearned work.
+    /// H-13: every ingest check lives HERE, and is reached by both lanes.
+    /// `POST /api/internal/share` (singular) arrives through this method and had no verification
+    /// of any kind — it took `work` on trust and wrote it straight into the payout ledger.
+    ///
+    /// The order matters. The PoW verdict is pure and cheap, so it runs first and a forged share
+    /// never consumes a slot in the dedup ring — otherwise anyone able to reach this endpoint
+    /// could evict the ring's real contents with rubbish and re-open the replay window.
+    ///
+    /// Rejections are `InvalidShare`/`DuplicateShare`, never `Internal`: the caller is wrong, not
+    /// this node, and the HTTP layer turns that distinction into a 4xx that a client will not
+    /// retry.
     pub fn record_share(&self, share: ShareNotification) -> GhostResult<()> {
-        if let Some(ref recorder) = self.record_share_fn {
-            if !self.share_pow_verdict(&share) {
-                tracing::warn!(
-                    miner_id = %share.miner_id,
-                    share_hash = %share.share_hash,
-                    claimed_work = share.work,
-                    has_header = share.header.is_some(),
-                    "H-13: rejecting locally-submitted share whose header does not justify its \
-                     claimed work"
-                );
-                return Err(GhostError::Internal(
-                    "share proof-of-work does not justify its claimed work".to_string(),
-                ));
-            }
-            recorder(share)
-        } else {
-            Err(GhostError::Internal(
+        let Some(ref recorder) = self.record_share_fn else {
+            return Err(GhostError::Internal(
                 "Share recorder not configured".to_string(),
-            ))
+            ));
+        };
+
+        if !self.share_pow_verdict(&share) {
+            tracing::warn!(
+                miner_id = %share.miner_id,
+                share_hash = %share.share_hash,
+                claimed_work = share.work,
+                has_header = share.header.is_some(),
+                "H-13: rejecting locally-submitted share whose header does not justify its \
+                 claimed work"
+            );
+            return Err(GhostError::InvalidShare(
+                "share proof-of-work does not justify its claimed work".to_string(),
+            ));
         }
+
+        if !self.claim_share_hash(&share.share_hash) {
+            tracing::warn!(
+                miner_id = %share.miner_id,
+                share_hash = %share.share_hash,
+                "H-13: rejecting a share already credited — a replayed or re-sent submission"
+            );
+            return Err(GhostError::DuplicateShare(share.share_hash.clone()));
+        }
+
+        recorder(share)
     }
 
     /// Record a batch of shares (called from HTTP endpoint for native SRI webhook)
@@ -2157,26 +2227,32 @@ impl VerificationState {
             // Uses the SAME `verify_pow_preimage` the gossip path uses, rather than a second copy
             // of the difficulty maths: two implementations would drift, and this one decides
             // money.
-            if !self.share_pow_verdict(&notification) {
-                tracing::warn!(
-                    miner_id = %miner_id,
-                    share_hash = %share.share_hash,
-                    claimed_work = share.share_work,
-                    has_header = share.header.is_some(),
-                    "H-13: rejecting locally-submitted share whose header does not justify its \
-                     claimed work"
-                );
-                continue;
-            }
-
-            if let Err(e) = self.record_share(notification) {
-                tracing::warn!(error = %e, "Failed to record share from batch");
-            } else {
-                recorded += 1;
-            }
+            // ONE decision, and everything this share can cause hangs off it.
+            //
+            // The pre-filter that used to sit here duplicated the PoW check so the block-found
+            // callback below could be suppressed for a rejected share. That worked for a pure
+            // check and stops working the moment ingest also claims the share hash: a claim
+            // evaluated twice reports its own first call as a duplicate. Taking the verdict from
+            // `record_share` itself is both simpler and stricter — a replayed `is_block` share
+            // can no longer re-trigger a payout proposal for a block that was already found.
+            let admitted = match self.record_share(notification) {
+                Ok(()) => {
+                    recorded += 1;
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        miner_id = %miner_id,
+                        share_hash = %share.share_hash,
+                        error = %e,
+                        "Share from batch not recorded"
+                    );
+                    false
+                }
+            };
 
             // Handle block found event (triggers payout proposal creation)
-            if share.is_block {
+            if admitted && share.is_block {
                 blocks_found += 1;
                 tracing::info!(
                     share_hash = %share.share_hash,
@@ -3824,6 +3900,196 @@ mod tests {
             recorded.load(Ordering::SeqCst),
             1,
             "exactly one share — the genuine one — may have reached the ledger"
+        );
+    }
+
+    /// H-13 / replay. The same share must be credited ONCE, however many times it arrives.
+    ///
+    /// The HMAC proves the caller and bounds the replay window, but it does not stop a key holder
+    /// re-sending a captured batch — and `install-node.sh` hands the same `internal_api_secret` to
+    /// ghost-dashboard as `INTERNAL_AUTH_KEY`, so "a compromised dashboard" holds a valid signing
+    /// key. Nothing downstream deduplicates: `RoundManager::record_share` credits in-memory work
+    /// before the database is reached, and the database's UNIQUE constraint stops the row, not the
+    /// credit. It also fixes a case needing no attacker at all — `pool_sv2` re-sending a batch
+    /// whose `200` was lost, which used to be counted twice.
+    #[test]
+    fn a_replayed_share_is_not_credited_twice() {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::{sha256d, Hash};
+        use ghost_accounting::DifficultyCalculator;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&recorded);
+        let state = VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_share_recorder(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .with_callbacks(|| 960_000, || 1, || 1, || 1)
+        .with_share_pow_verify_height(959_030);
+
+        let header = [0u8; 80];
+        let header_hex = hex::encode(header);
+        let wire_hex = sha256d::Hash::hash(&header).to_string();
+        let achieved = DifficultyCalculator::difficulty_from_hash(
+            &sha256d::Hash::hash(&header).to_byte_array(),
+        );
+
+        let share = |hash: &str, hdr: &str, work: f64| ShareNotification {
+            miner_id: "bc1qtest.worker".to_string(),
+            work,
+            share_hash: hash.to_string(),
+            job_id: 1,
+            timestamp: 0,
+            is_block: false,
+            payout_address: Some("bc1qtest".to_string()),
+            header: Some(hdr.to_string()),
+            extranonce: None,
+            skeleton_id: None,
+            tier_log2: None,
+        };
+
+        // A forged copy arrives FIRST. It must be refused, and — the ordering property — it must
+        // not consume the ring slot for its own hash. If the claim ran before the PoW check, the
+        // genuine share below would be rejected as a duplicate of the forgery, and anyone able to
+        // reach this endpoint could unpay a miner by guessing their share hash.
+        assert!(matches!(
+            state.record_share(share(&wire_hex, &header_hex, 1e12)),
+            Err(GhostError::InvalidShare(_))
+        ));
+
+        assert!(
+            state
+                .record_share(share(&wire_hex, &header_hex, achieved * 0.5))
+                .is_ok(),
+            "the genuine share must be admitted — a refused forgery must not claim its hash"
+        );
+
+        // The replay.
+        assert!(
+            matches!(
+                state.record_share(share(&wire_hex, &header_hex, achieved * 0.5)),
+                Err(GhostError::DuplicateShare(_))
+            ),
+            "the same share submitted again must not be credited again"
+        );
+
+        // Hex is case-insensitive, so without normalisation the dedup is defeated by the shift
+        // key: re-send the captured batch upper-cased and every share looks new.
+        assert!(
+            matches!(
+                state.record_share(share(
+                    &wire_hex.to_ascii_uppercase(),
+                    &header_hex,
+                    achieved * 0.5
+                )),
+                Err(GhostError::DuplicateShare(_))
+            ),
+            "an upper-cased hash is the SAME share and must not be credited again"
+        );
+
+        // Positive control: a genuinely different share is still admitted, so the assertions
+        // above are not passing because the ring refuses everything after the first.
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut genesis_header = Vec::new();
+        genesis
+            .header
+            .consensus_encode(&mut genesis_header)
+            .unwrap();
+        assert!(
+            state
+                .record_share(share(
+                    &genesis.header.block_hash().to_string(),
+                    &hex::encode(&genesis_header),
+                    2048.0
+                ))
+                .is_ok(),
+            "a different share must still be admitted"
+        );
+
+        assert_eq!(
+            recorded.load(Ordering::SeqCst),
+            2,
+            "exactly the two distinct genuine shares may have reached the ledger"
+        );
+    }
+
+    /// A replayed block share must not re-trigger the payout proposal.
+    ///
+    /// The callback lives in `record_share_batch`'s loop, outside `record_share`. It is now gated
+    /// on that call's verdict, so a duplicate cannot drive the pool into proposing a payout for a
+    /// block it already found.
+    #[test]
+    fn a_replayed_block_share_cannot_re_trigger_the_payout_proposal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let block_counter = Arc::clone(&blocks);
+        let share_counter = Arc::clone(&recorded);
+
+        let state = VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_share_recorder(move |_| {
+            share_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .with_block_found_callback(move |_| {
+            block_counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .with_callbacks(|| 100, || 1, || 1, || 1);
+        // Below every gate, so the PoW check is not what decides this test.
+
+        let batch = || ShareBatch {
+            pool_id: 1,
+            batch_seq: 1,
+            shares: vec![ShareData {
+                timestamp_ms: 0,
+                share_hash: "ab".repeat(32),
+                share_work: 1024.0,
+                channel_id: 1,
+                sequence_number: 1,
+                job_id: 1,
+                downstream_id: 1,
+                is_block: true,
+                user_identity: "bc1qtest.worker".to_string(),
+                header: None,
+                extranonce: None,
+                skeleton_id: None,
+                tier_log2: None,
+            }],
+            skeletons: vec![],
+        };
+
+        // Positive control: the first delivery must work end to end.
+        assert_eq!(state.record_share_batch(batch()).unwrap(), 1);
+        assert_eq!(blocks.load(Ordering::SeqCst), 1);
+
+        // The re-send — `pool_sv2` retrying a batch whose 200 was lost, or a replay.
+        assert_eq!(
+            state.record_share_batch(batch()).unwrap(),
+            0,
+            "a re-sent batch must record nothing"
+        );
+        assert_eq!(
+            recorded.load(Ordering::SeqCst),
+            1,
+            "the work must be credited once"
+        );
+        assert_eq!(
+            blocks.load(Ordering::SeqCst),
+            1,
+            "a replayed block share must not start a second payout proposal"
         );
     }
 

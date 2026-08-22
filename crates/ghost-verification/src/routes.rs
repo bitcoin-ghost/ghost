@@ -42,6 +42,7 @@ use crate::auth::{verify_internal_auth, InternalAuth};
 use crate::challenge::*;
 use crate::server::{MeshNodeInfo, ShareBatch, ShareNotification, VerificationState};
 use crate::websocket::{ws_handler, WsAuthQuery};
+use ghost_common::error::GhostError;
 
 /// M-STOR-3: Check if a path is in the allowed list
 fn is_safe_proc_path(path: &str, allowed: &[String]) -> bool {
@@ -854,11 +855,26 @@ async fn internal_auth_middleware(
 /// Loopback is still required — a share submitted from off-box is refused before the HMAC is
 /// even computed — but it is now the outer of two gates rather than the only one. The inner gate
 /// is the same `InternalAuth` HMAC-SHA256 over `timestamp || body` that `/api/internal/*` and
-/// `/admin/*` already use, which pins the caller to a holder of `internal_api_secret` and, via
-/// the 30-second timestamp window, blocks replay of a captured batch.
+/// `/admin/*` already use, which pins the caller to a holder of `internal_api_secret`.
 ///
 /// Keeping the loopback check as well as the HMAC is deliberate: it costs nothing, and it means
 /// a leaked secret still does not open a remote lane into the ledger.
+///
+/// # What the HMAC does NOT do
+///
+/// It is not replay protection, and an earlier version of this comment claimed it was. The
+/// 30-second timestamp window bounds how long a CAPTURED request stays acceptable; it does
+/// nothing about the holder of the secret re-sending a body, because re-signing an identical body
+/// under a fresh timestamp is trivial for anyone with the key. That matters here specifically:
+/// `scripts/install-node.sh` gives the same `internal_api_secret` to ghost-dashboard as
+/// `INTERNAL_AUTH_KEY`, so a compromised dashboard — one of the two threats named above — holds a
+/// valid signing key.
+///
+/// Replay is refused one layer down, at the ledger, by the share-hash dedup in
+/// `VerificationState::record_share`. That is the right place for it: it is keyed on the share
+/// rather than the request, so it also catches the same share arriving in a re-crafted batch, and
+/// it catches `pool_sv2` legitimately re-sending a batch whose `200` was lost — which needed no
+/// attacker and was being credited twice.
 ///
 /// # Fail-closed
 ///
@@ -10027,6 +10043,28 @@ async fn share_notification_handler(
 
     match state.record_share(share) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
+        // A share this node REFUSED is the caller's fault, and must not be reported as this
+        // node's fault. Returning 500 for a forged or replayed share made it indistinguishable
+        // from "recorder not configured", and any client with the usual retry-on-5xx rule would
+        // resubmit it — turning a rejection into a loop. The batch lane already answers 200 with
+        // a `recorded` count for the same situation; this lane now agrees with it.
+        Err(e @ GhostError::InvalidShare(_)) => {
+            warn!(error = %e, "Rejected share");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "rejected", "message": e.to_string()})),
+            )
+        }
+        // 409, not 400: the share is well-formed and was genuinely mined — this node has simply
+        // already credited it. A caller re-sending after a lost response gets a definite "already
+        // counted" rather than a reason to try again.
+        Err(e @ GhostError::DuplicateShare(_)) => {
+            debug!(error = %e, "Duplicate share");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"status": "duplicate", "message": e.to_string()})),
+            )
+        }
         Err(e) => {
             warn!(error = %e, "Failed to record share");
             (
@@ -14465,6 +14503,112 @@ mod tests {
                 "{uri}: only the one properly authorised share may have been recorded"
             );
         }
+    }
+
+    /// A share this node refuses must answer 4xx, not 500.
+    ///
+    /// `record_share` signals a rejection with an error, and the singular handler mapped EVERY
+    /// error to `INTERNAL_SERVER_ERROR` — so a forged share was indistinguishable from "recorder
+    /// not configured", and any client following the usual retry-on-5xx rule would resubmit it
+    /// for ever. The batch lane already answers 200 with a `recorded` count; this lane now
+    /// distinguishes the caller's fault from the node's.
+    #[tokio::test]
+    async fn the_singular_lane_answers_4xx_for_a_share_it_refuses() {
+        use bitcoin::hashes::{sha256d, Hash};
+        use ghost_accounting::DifficultyCalculator;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+            .with_share_recorder(|_| Ok(()))
+            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_share_pow_verify_height(959_030),
+        );
+
+        let header = [0u8; 80];
+        let wire_hex = sha256d::Hash::hash(&header).to_string();
+        let achieved = DifficultyCalculator::difficulty_from_hash(
+            &sha256d::Hash::hash(&header).to_byte_array(),
+        );
+
+        async fn post(
+            state: &Arc<crate::server::VerificationState>,
+            work: f64,
+            share_hash: &str,
+            header_hex: Option<String>,
+        ) -> StatusCode {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "miner_id": "bc1qtest.worker",
+                "work": work,
+                "share_hash": share_hash,
+                "job_id": 1,
+                "timestamp": 0u64,
+                "is_block": false,
+                "header": header_hex,
+            }))
+            .unwrap();
+            let (ts, sig) = signed_headers(&body);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/internal/share")
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", &ts)
+                .header("X-Ghost-Signature", &sig)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(loopback());
+            super::create_router(Arc::clone(state))
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status()
+        }
+
+        let header_hex = hex::encode(header);
+
+        // Positive control first: a genuine share still answers 200.
+        assert_eq!(
+            post(&state, achieved * 0.5, &wire_hex, Some(header_hex.clone())).await,
+            StatusCode::OK
+        );
+
+        // Replay of that share: 409, so a caller re-sending after a lost response learns it is
+        // already counted rather than being invited to try again.
+        assert_eq!(
+            post(&state, achieved * 0.5, &wire_hex, Some(header_hex.clone())).await,
+            StatusCode::CONFLICT,
+            "a duplicate must be 409, not 500"
+        );
+
+        // Forged work: 400. Never 5xx — a client retrying on 5xx would loop on a forgery.
+        assert_eq!(
+            post(&state, 1e12, &"cd".repeat(32), Some(header_hex)).await,
+            StatusCode::BAD_REQUEST,
+            "work the header does not justify must be 400, not 500"
+        );
+
+        // A genuine node fault is still 5xx: no recorder wired at all.
+        let broken = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+        );
+        assert_eq!(
+            post(&broken, 1024.0, &"ef".repeat(32), None).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a real node fault must stay 5xx, or the distinction is meaningless"
+        );
     }
 
     /// Fail-closed. A node with `require_internal_auth` on but no secret configured cannot

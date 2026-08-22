@@ -164,8 +164,11 @@ impl PoolSv2 {
                 webhook_cfg.url, webhook_cfg.batch_size, webhook_cfg.batch_timeout_ms
             );
             let pool_id = self.config.server_id();
+            // `?`, not a log-and-continue: a share webhook that cannot sign discards every share
+            // it is handed, and does so after SV2 has already acknowledged the submission to the
+            // miner. Refusing to start is the only outcome that is visible.
             let (sender, worker) =
-                crate::share_webhook::ShareWebhookWorker::new(webhook_cfg.clone(), pool_id);
+                crate::share_webhook::ShareWebhookWorker::new(webhook_cfg.clone(), pool_id)?;
             let ct = cancellation_token.clone();
             tokio::spawn(async move {
                 worker.run(ct).await;

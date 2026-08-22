@@ -42,6 +42,7 @@ pub mod error;
 pub mod identity;
 pub mod identity_rotation;
 pub mod instant;
+pub mod internal_auth;
 pub mod key_rotation;
 pub mod metrics;
 pub mod mpc;

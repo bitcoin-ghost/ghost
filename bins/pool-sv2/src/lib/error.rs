@@ -195,6 +195,13 @@ pub enum PoolErrorKind {
     PayoutModeError(String),
     /// JDS error (from embedded Job Declaration Server)
     Jds(jd_server_sv2::error::JDSErrorKind),
+    /// `[share_webhook]` is present but unusable — today, a `secret` that is not a valid
+    /// internal-API secret (H-13).
+    ///
+    /// Fatal at startup by design. A pool that cannot sign its share batches cannot report a
+    /// single share, so continuing means mining that is acknowledged to the miner and discarded
+    /// on the way to the ledger.
+    ShareWebhookConfig(String),
 }
 
 impl std::fmt::Display for PoolErrorKind {
@@ -218,6 +225,7 @@ impl std::fmt::Display for PoolErrorKind {
             PoolErrorKind::Vardiff(e) => {
                 write!(f, "Received Vardiff Error : {e:?}")
             }
+            ShareWebhookConfig(e) => write!(f, "Share webhook configuration error: {e}"),
             Parser(e) => write!(f, "Parser error: `{e:?}`"),
             UnexpectedMessage(extension_type, message_type) => write!(f, "Unexpected message: extension type: {extension_type:?}, message type: {message_type:?}"),
             ChannelErrorSender => write!(f, "Channel sender error"),
