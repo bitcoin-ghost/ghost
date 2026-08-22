@@ -3814,6 +3814,7 @@ mod tests {
     /// actually reached the ledger.
     #[test]
     fn record_share_refuses_work_the_header_does_not_justify() {
+        use bitcoin::consensus::Encodable;
         use bitcoin::hashes::{sha256d, Hash};
         use ghost_accounting::DifficultyCalculator;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3841,10 +3842,17 @@ mod tests {
             &sha256d::Hash::hash(&header).to_byte_array(),
         );
 
-        let share = |work: f64, header: Option<String>| ShareNotification {
+        // EVERY case below gets its OWN share hash.
+        //
+        // An earlier version reused one hash for all of them, and the ingest dedup added later
+        // quietly took the gate's job: with the PoW check deleted, the second submission was
+        // refused as a DUPLICATE and this test still passed. It survived a mutation that removed
+        // the very thing it exists to pin, and only the mutation run exposed it. Distinct hashes
+        // mean only the PoW gate can produce these rejections.
+        let share = |hash: &str, work: f64, header: Option<String>| ShareNotification {
             miner_id: "bc1qtest.worker".to_string(),
             work,
-            share_hash: wire_hex.clone(),
+            share_hash: hash.to_string(),
             job_id: 1,
             timestamp: 0,
             is_block: false,
@@ -3855,12 +3863,22 @@ mod tests {
             tier_log2: None,
         };
 
-        // Positive control FIRST: without it a broken gate that refuses everything would read as
-        // a pass on every assertion below. This is the shape that took the fleet down for 30
-        // minutes once already.
+        // Positive control FIRST, on a hash used by nothing else: without it a broken gate that
+        // refuses everything would read as a pass on every assertion below. That is the shape
+        // that took the fleet down for 30 minutes once already.
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut genesis_header = Vec::new();
+        genesis
+            .header
+            .consensus_encode(&mut genesis_header)
+            .unwrap();
         assert!(
             state
-                .record_share(share(achieved * 0.5, Some(header_hex.clone())))
+                .record_share(share(
+                    &genesis.header.block_hash().to_string(),
+                    2048.0,
+                    Some(hex::encode(&genesis_header))
+                ))
                 .is_ok(),
             "a genuine share must still reach the ledger"
         );
@@ -3868,31 +3886,37 @@ mod tests {
 
         // The attack: claim 1e12 work off a header that proves a fraction of it.
         assert!(
-            state
-                .record_share(share(1e12, Some(header_hex.clone())))
-                .is_err(),
+            matches!(
+                state.record_share(share(&wire_hex, 1e12, Some(header_hex.clone()))),
+                Err(GhostError::InvalidShare(_))
+            ),
             "work the header does not justify must not reach the ledger"
         );
 
         // The bypass by OMISSION. Above SHARE_POW_VERIFY_HEIGHT a missing header is not
         // "no evidence, so admit" — it is the cheapest possible forgery, and was admitted.
         assert!(
-            state.record_share(share(1e12, None)).is_err(),
+            matches!(
+                state.record_share(share(&"01".repeat(32), 1e12, None)),
+                Err(GhostError::InvalidShare(_))
+            ),
             "a header-less share must not mint work above the gate"
         );
 
         // The bypass by MALFORMED header — same idea, one step subtler: garbage hex used to
         // return `true` on the grounds that parsing was not this check's job.
         assert!(
-            state
-                .record_share(share(1e12, Some("zz".to_string())))
-                .is_err(),
+            matches!(
+                state.record_share(share(&"02".repeat(32), 1e12, Some("zz".to_string()))),
+                Err(GhostError::InvalidShare(_))
+            ),
             "an unparseable header must not mint work above the gate"
         );
         assert!(
-            state
-                .record_share(share(1e12, Some(hex::encode([0u8; 79]))))
-                .is_err(),
+            matches!(
+                state.record_share(share(&"03".repeat(32), 1e12, Some(hex::encode([0u8; 79])))),
+                Err(GhostError::InvalidShare(_))
+            ),
             "a 79-byte header proves nothing and must not mint work above the gate"
         );
 
@@ -3901,6 +3925,16 @@ mod tests {
             1,
             "exactly one share — the genuine one — may have reached the ledger"
         );
+
+        // The over-claim's hash must still be FREE: a share the PoW gate refused must not have
+        // claimed a dedup slot, or an attacker could unpay a miner by guessing their share hash.
+        assert!(
+            state
+                .record_share(share(&wire_hex, achieved * 0.5, Some(header_hex)))
+                .is_ok(),
+            "a refused share must not claim the hash of the genuine share behind it"
+        );
+        assert_eq!(recorded.load(Ordering::SeqCst), 2);
     }
 
     /// H-13 / replay. The same share must be credited ONCE, however many times it arrives.
