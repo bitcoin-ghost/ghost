@@ -531,7 +531,28 @@ pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 963_388;
 /// well-formedness and summary-chain consistency checked before ANY merge, plus unpredictable
 /// λ-sampling of merkle leaves for PoW + GHOST-09 + binding. λ-sampling must be ENFORCING before
 /// any node we do not own is admitted; this gate does not arm it.
-pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = u64::MAX;
+///
+/// **ARMED at 964_100** (2026-08-22). Tip was 963,575 when this was cut — 525 blocks, roughly
+/// 3 days, sized against the precedent [`CHECKPOINT_FROM_SHARD_HEIGHT`] set (541 blocks). The
+/// deploy must finish well before the gate, never the other way round.
+///
+/// ⚠ Every node must be on a binary that HAS the local path before this height arrives. All
+/// eight ran `v1.11.25` from 2026-08-22, which is what makes arming safe: a node still on an
+/// older binary would keep voting while its peers stopped proposing, and the two would disagree
+/// about how the coinbase was committed.
+///
+/// **This is observable within minutes, not a 161-year wait.** The live proposal path is the
+/// tip-driven one (`main.rs`, `payout_for_tips.handle_block_found`), which fires on every new
+/// block — measured at 155 payout-consensus approvals per week on vm1. Above the gate those
+/// become the no-vote path instead, so the change shows up ~22 times a day. That is what makes
+/// "arm, observe, then delete" a sequence that can actually complete, rather than the kind of
+/// precondition that quietly keeps the legacy path alive for ever.
+///
+/// What to watch after it fires: `"Paying from this node's own shard view (no vote"` should
+/// appear ~22x/day and `"Payout consensus approved"` should stop. The payout ledger CHECKPOINT
+/// is a separate path and must keep finalising — if it stops, this gate is not the cause but the
+/// standoff it produces looks identical, so check both.
+pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = 964_100;
 
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
@@ -1137,20 +1158,14 @@ mod in_dns_tests {
 mod payout_from_shard_gate_tests {
     use super::PAYOUT_FROM_SHARD_HEIGHT;
 
-    /// **The dark-landing proof for Stage 6 step 3.** The gate ships as `u64::MAX`, so no live
-    /// height takes the no-vote path and every payout on the deployed fleet still goes through
-    /// BFT exactly as it does today. Arming is a separate, observed change.
-    ///
-    /// ⚠ Asserted as `== u64::MAX` rather than "large", because the whole safety argument for
-    /// shipping this in one release with nothing deleted is that it is UNREACHABLE. A height that
-    /// merely looked far away would still fire, and it would fire on one node before the others.
+    /// The gate is a fleet-wide agreement: every node must flip on the SAME block or they
+    /// disagree about how the coinbase was committed. Pinned to the exact value so a typo is
+    /// distinguishable from an intended change.
     #[test]
-    fn the_no_vote_path_ships_unreachable() {
+    fn the_no_vote_gate_is_armed_at_the_intended_height() {
         assert_eq!(
-            PAYOUT_FROM_SHARD_HEIGHT,
-            u64::MAX,
-            "Stage 6 step 3 must land dark — arming it is a separate change, made once the whole \
-             fleet runs a binary that has the local path"
+            PAYOUT_FROM_SHARD_HEIGHT, 964_100,
+            "the no-vote gate height is a fleet-wide agreement — changing it is a deliberate act"
         );
     }
 }
