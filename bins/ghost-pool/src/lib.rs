@@ -801,6 +801,17 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         CHECKPOINT_FROM_SHARD_HEIGHT,
     );
+    // The mesh envelope gate lives with the format it governs, in `ghost-consensus` — this crate
+    // cannot own it, because `ghost-consensus` does not depend on `ghost-pool`. Resolving it here
+    // and pushing it down keeps ONE value: the env override, the mainnet lock and the "what did
+    // this run actually enforce" report all stay in the same place as every other gate, and the
+    // predicate stays next to the preimage it selects.
+    let mesh_envelope_v2 = gates::from_env(
+        "GHOST_MESH_ENVELOPE_V2_HEIGHT",
+        network,
+        ghost_consensus::message::MESH_ENVELOPE_V2_HEIGHT,
+    );
+    ghost_consensus::message::set_mesh_envelope_v2_height(mesh_envelope_v2);
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);

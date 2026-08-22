@@ -54,7 +54,7 @@ use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tmq::{publish, subscribe, Context, Multipart};
 use tokio::sync::mpsc;
@@ -68,7 +68,10 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::NodeId;
 
-use crate::message::{MessageEnvelope, MessageType};
+use crate::message::{
+    envelope_version_for_height, mesh_envelope_v2_height, MessageEnvelope, MessageType,
+    DEFAULT_MESSAGE_TTL, ENVELOPE_VERSION_V1,
+};
 use crate::message_validator::{validate_and_verify, ValidationStats};
 use crate::noise_pool::{NoiseConnectionPool, NoisePoolConfig};
 use crate::peer::{Peer, PeerManager};
@@ -156,6 +159,16 @@ pub struct MeshConfig {
     /// counter at 0 with no persistence — only safe when peers also reset (a
     /// coordinated full-fleet restart). Set this on every long-running node.
     pub sequence_persist_path: Option<std::path::PathBuf>,
+    /// Path to persist the per-sender INBOUND high-water marks (audit H-11).
+    ///
+    /// The dedup cache's per-sender sequence state is evicted after `MESSAGE_TTL_SECONDS` of
+    /// silence and lost entirely on restart, and re-entry goes through the vacant-entry arm of the
+    /// sequence check, which accepts ANY sequence. So the replay window was never 300 seconds — it
+    /// was "until the next quiet period", after which an old validly-signed envelope could be
+    /// re-admitted as a first message. Keeping the marks outside the dedup cache closes the
+    /// quiet-period half; persisting them here closes the restart half. `None` (the default, e.g.
+    /// tests) keeps the marks in memory only.
+    pub peer_sequence_persist_path: Option<std::path::PathBuf>,
 }
 
 /// Default Noise port for encrypted TCP connections
@@ -187,6 +200,7 @@ impl Default for MeshConfig {
             // Fallback mode should ONLY be used during development/testing.
             noise_required: true,
             sequence_persist_path: None,
+            peer_sequence_persist_path: None,
         }
     }
 }
@@ -242,6 +256,9 @@ pub struct MeshNetwork {
     /// Serialises lease extensions (the rare on-disk ceiling write) so only one
     /// thread persists at a time.
     sequence_lease_lock: std::sync::Mutex<()>,
+    /// Last envelope signing version this node logged, so the gate crossing is announced once
+    /// rather than on every message.
+    last_logged_envelope_version: AtomicU8,
     /// Seen message cache for deduplication (P2P-L1: O(1) eviction)
     seen_messages: RwLock<SeenMessageCache>,
     /// Message handlers
@@ -442,6 +459,305 @@ const SEQUENCE_LEASE_BLOCK: u64 = 100_000;
 /// out. At ~1000 msgs/sec this persists roughly once every ~90 seconds.
 const SEQUENCE_LEASE_THRESHOLD: u64 = 10_000;
 
+/// How long a per-sender inbound high-water mark outlives the last message from that sender.
+///
+/// This is the replay window that remains once the mark is doing its job, and it is a trade.
+/// Longer is stronger — but a peer whose OUTBOUND counter rewound (its `sequence_persist_path`
+/// lost with a rebuilt data directory) is refused for exactly this long by every peer that
+/// remembers it, and because the marks are persisted, restarting the REJECTING node no longer
+/// clears it. That is a fleet-wide partition of one node, not a degradation.
+///
+/// One hour, not a day. A day was chosen on the reasoning that a rewound peer "self-heals within
+/// one operator day"; an hour of an eight-node mesh running seven-eighths strength is a bounded
+/// incident, and a day is not. It is still 12x the ~300 s window it replaces, and an honest peer
+/// cannot reach it in normal operation: health pings run every 10 s, so a peer silent for an hour
+/// is a peer that is down.
+///
+/// ⚠ The TTL is the BACKSTOP for a rewind, not the remedy. The remedy is
+/// `GHOST_MESH_SEQUENCE_RESUME_AT` on the rewound node itself — see
+/// [`MeshNetwork::load_and_reserve_sequence`] — which fixes it for the whole fleet by touching the
+/// one node that is actually broken, rather than deleting a file on the other seven.
+///
+/// ⚠ Once [`crate::message::ENVELOPE_VERSION_V2`] is armed this stops being the primary defence:
+/// a v2 envelope binds its own timestamp, so a replay cannot be re-stamped and dies on the ±30 s
+/// drift check regardless of what the marks remember. Until then they are the whole of it.
+const PEER_HIGH_WATER_TTL_SECS: u64 = 3_600;
+
+/// Total tracked senders. The fleet is eight nodes; this is three orders of magnitude of headroom.
+const MAX_HIGH_WATER_SENDERS: usize = 1_000;
+
+/// Of that budget, the most a sender we do NOT mesh with may ever occupy.
+///
+/// ⛔ This split is the whole reason the marks are worth anything. Node ids are ed25519 public
+/// keys behind ~24 bits of PoW — roughly 30 seconds of CPU each — so "number of distinct senders"
+/// is a quantity an attacker chooses, not a fact about the network. An eviction policy driven by
+/// that quantity is an eviction policy the attacker drives.
+///
+/// The first version of this evicted the least-recently-heard-from entry once the map was full,
+/// which meant ~1001 throwaway keypairs flushed the replay floor of precisely the quiet honest
+/// peer the mark exists to protect — turning H-11 from "reachable after a quiet period" into
+/// "reachable on demand", which is strictly worse than having no marks at all, because the code
+/// reads as though it is defended.
+///
+/// So: strangers share a small fixed pool and can never displace anyone. 1000 − 128 = 872 slots
+/// are reserved for peers we actually mesh with, against a fleet of eight.
+const MAX_UNKNOWN_HIGH_WATER_SENDERS: usize = 128;
+
+/// Per-sender inbound high-water marks: the highest sequence ever accepted from each sender.
+///
+/// Deliberately NOT part of [`SeenMessageCache`]. That cache exists to bound memory and evicts
+/// aggressively — by TTL, by per-sender count, by global capacity and by memory pressure — and
+/// every one of those paths dropped the sequence state with it, which is precisely how the replay
+/// defence became reachable-around.
+///
+/// The eviction rule here is deliberately NOT recency. Two rules only, in this order:
+///  1. **age** — a mark older than [`PEER_HIGH_WATER_TTL_SECS`] is dropped. An attacker cannot
+///     make an honest peer's mark older than it is, so this is not a lever;
+///  2. **stranger pressure** — a known peer may take a slot from a stranger, never the reverse.
+///
+/// An existing mark for a known peer is never removed to make room for anything.
+#[derive(Debug, Default)]
+struct PeerHighWaterMarks {
+    /// sender -> (highest sequence ever accepted, unix seconds when it was accepted)
+    marks: HashMap<NodeId, (u64, u64)>,
+    /// Senders we actually mesh with, refreshed from `PeerManager` on the cleanup tick. Marks for
+    /// these are protected from stranger pressure. Empty until the first tick, which is safe: at
+    /// startup every sender competes for the stranger pool, and the fleet is eight.
+    known: std::collections::HashSet<NodeId>,
+    /// Set when `marks` has changed since the last successful write, so the periodic save is a
+    /// no-op on an idle node rather than a disk write per minute.
+    dirty: bool,
+}
+
+impl PeerHighWaterMarks {
+    /// The floor a first-message-since-eviction must clear, if we remember one for this sender.
+    fn floor(&self, sender: &NodeId, now_secs: u64) -> Option<u64> {
+        self.marks.get(sender).and_then(|&(seq, seen)| {
+            if now_secs.saturating_sub(seen) > PEER_HIGH_WATER_TTL_SECS {
+                None
+            } else {
+                Some(seq)
+            }
+        })
+    }
+
+    /// Replace the protected set. Called on the cleanup tick from the peer table.
+    fn set_known(&mut self, known: std::collections::HashSet<NodeId>) {
+        self.known = known;
+    }
+
+    /// How many slots strangers currently hold.
+    fn unknown_len(&self) -> usize {
+        self.marks
+            .keys()
+            .filter(|id| !self.known.contains(*id))
+            .count()
+    }
+
+    /// Record an accepted sequence. Monotonic: an out-of-order acceptance inside the tolerance
+    /// window must not lower the mark, or the next quiet period would reopen the gap it closed.
+    ///
+    /// An UPDATE to an existing mark is always honoured — capacity never applies to a sender we
+    /// are already tracking, so no amount of stranger traffic can stop an honest peer's mark from
+    /// advancing.
+    fn record(&mut self, sender: NodeId, sequence: u64, now_secs: u64) {
+        if let Some((seq, seen)) = self.marks.get_mut(&sender) {
+            if sequence > *seq {
+                *seq = sequence;
+                self.dirty = true;
+            }
+            *seen = now_secs;
+            return;
+        }
+        if !self.admit_new(&sender, now_secs) {
+            return;
+        }
+        self.marks.insert(sender, (sequence, now_secs));
+        self.dirty = true;
+    }
+
+    /// May a sender we have never recorded take a slot?
+    ///
+    /// Refusing costs that sender its replay floor — the pre-change behaviour — while evicting an
+    /// incumbent costs someone ELSE theirs. Under pressure this always chooses the first, because
+    /// the pressure is attacker-supplied and the incumbent may not be.
+    fn admit_new(&mut self, sender: &NodeId, now_secs: u64) -> bool {
+        let is_known = self.known.contains(sender);
+        if self.has_room_for(is_known) {
+            return true;
+        }
+        // Reclaim by AGE before considering anything else.
+        self.drop_expired(now_secs);
+        if self.has_room_for(is_known) {
+            return true;
+        }
+        // Still full. A known peer may take a stranger's slot; a stranger takes nobody's.
+        if !is_known {
+            return false;
+        }
+        let Some(victim) = self
+            .marks
+            .iter()
+            .filter(|(id, _)| !self.known.contains(*id))
+            .min_by_key(|(_, (_, seen))| *seen)
+            .map(|(id, _)| *id)
+        else {
+            return false;
+        };
+        self.marks.remove(&victim);
+        self.dirty = true;
+        true
+    }
+
+    fn has_room_for(&self, is_known: bool) -> bool {
+        if self.marks.len() >= MAX_HIGH_WATER_SENDERS {
+            return false;
+        }
+        is_known || self.unknown_len() < MAX_UNKNOWN_HIGH_WATER_SENDERS
+    }
+
+    /// Drop marks past the TTL. The only unconditional removal rule, and the only one an attacker
+    /// cannot influence.
+    fn drop_expired(&mut self, now_secs: u64) {
+        let before = self.marks.len();
+        self.marks
+            .retain(|_, (_, seen)| now_secs.saturating_sub(*seen) <= PEER_HIGH_WATER_TTL_SECS);
+        if self.marks.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// Read marks written by a previous process.
+    ///
+    /// A missing, unreadable or malformed file yields an EMPTY set rather than an error: the marks
+    /// are a hardening layer, and refusing to start because a cache file is corrupt would convert
+    /// a tightening into an outage. It is logged, because silently starting with no floor is
+    /// exactly the state this change exists to end.
+    fn load(path: &std::path::Path, now_secs: u64) -> Self {
+        let mut marks = HashMap::new();
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<HashMap<String, (u64, u64)>>(&raw) {
+                Ok(parsed) => {
+                    for (id_hex, (seq, seen)) in parsed {
+                        if now_secs.saturating_sub(seen) > PEER_HIGH_WATER_TTL_SECS {
+                            continue;
+                        }
+                        let Ok(bytes) = hex::decode(&id_hex) else {
+                            continue;
+                        };
+                        let Ok(id) = <NodeId>::try_from(bytes.as_slice()) else {
+                            continue;
+                        };
+                        marks.insert(id, (seq, seen));
+                    }
+                    info!(
+                        path = %path.display(),
+                        peers = marks.len(),
+                        "H-11: restored per-sender inbound high-water marks"
+                    );
+                }
+                Err(e) => warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "H-11: high-water mark file is unreadable — starting with no replay floor"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    path = %path.display(),
+                    "H-11: no high-water mark file yet — this restart has no replay floor"
+                );
+            }
+            Err(e) => warn!(
+                path = %path.display(),
+                error = %e,
+                "H-11: could not read high-water marks — starting with no replay floor"
+            ),
+        }
+        Self {
+            marks,
+            known: std::collections::HashSet::new(),
+            dirty: false,
+        }
+    }
+
+    /// The marks as they should appear on disk. Taken under the cache lock; written outside it.
+    fn snapshot(&self) -> HashMap<String, (u64, u64)> {
+        self.marks
+            .iter()
+            .map(|(id, v)| (hex::encode(id), *v))
+            .collect()
+    }
+
+    /// Write a snapshot out: temp file, fsync, rename, fsync the directory.
+    ///
+    /// Every step is load-bearing. `write` + `rename` alone leaves the data in the page cache, so
+    /// a machine that loses power after the rename can come back with the name pointing at a file
+    /// whose contents were never written — and this file failing to parse degrades SILENTLY to
+    /// "no replay floor", which is the security property, not a cache miss. The directory fsync is
+    /// what makes the rename itself durable.
+    ///
+    /// Free-standing rather than a method: it runs OUTSIDE the `seen_messages` lock, so it must
+    /// not be able to touch the live map.
+    fn write_snapshot(
+        path: &std::path::Path,
+        snapshot: &HashMap<String, (u64, u64)>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let encoded = serde_json::to_vec(snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&encoded)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            // Best effort: a filesystem that refuses to open a directory still gave us a durable
+            // temp file and an atomic rename, which is the bulk of the guarantee.
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Move the mark to `sequence` unconditionally, including downwards. Only for a verified
+    /// wrap-around; see [`SequenceVerdict::AcceptWrapped`].
+    fn reset(&mut self, sender: NodeId, sequence: u64, now_secs: u64) {
+        self.marks.insert(sender, (sequence, now_secs));
+        self.dirty = true;
+    }
+}
+
+/// Wall-clock seconds since the epoch, 0 if the clock is before it.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Outcome of the per-sender sequence rules.
+///
+/// A bool cannot express this: a wrap-around and a normal advance are both "accept", but they
+/// move the high-water mark in opposite directions, and collapsing them is how a legitimate wrap
+/// would lock a peer out for [`PEER_HIGH_WATER_TTL_SECS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceVerdict {
+    /// Replay, forgery, or a jump the sender cannot justify. Drop the message.
+    Reject,
+    /// Accept and raise the high-water mark if this advances it.
+    Accept,
+    /// Accept a verified u64 wrap-around and move the mark DOWN to the post-wrap sequence.
+    AcceptWrapped,
+}
+
 /// M-2/H-P2P-5/H-7: Sequence state tracking with wrap-around protection
 /// Handles the case where sequence numbers wrap from MAX back to 1,
 /// while preventing attackers from trivially triggering wrap-around.
@@ -488,6 +804,8 @@ struct SeenMessageCache {
     /// M-2: Sequence state per sender with wrap-around epoch tracking
     /// Used to reject replayed messages while handling sequence wrap-around
     sequence_state: HashMap<NodeId, SequenceState>,
+    /// H-11: high-water marks that OUTLIVE `sequence_state`'s eviction and this process.
+    high_water: PeerHighWaterMarks,
     /// Maximum global capacity
     capacity: usize,
     /// Maximum messages per sender (H3 security fix)
@@ -499,13 +817,19 @@ struct SeenMessageCache {
 }
 
 impl SeenMessageCache {
+    #[cfg(test)]
     fn new(capacity: usize) -> Self {
+        Self::with_high_water(capacity, PeerHighWaterMarks::default())
+    }
+
+    fn with_high_water(capacity: usize, high_water: PeerHighWaterMarks) -> Self {
         Self {
             map: HashMap::with_capacity(capacity),
             queue: VecDeque::with_capacity(capacity),
             sender_counts: HashMap::new(),
             sender_queues: HashMap::new(),
             sequence_state: HashMap::new(),
+            high_water,
             capacity,
             max_per_sender: MAX_MESSAGES_PER_SENDER,
             max_memory_bytes: MAX_CACHE_MEMORY_BYTES,
@@ -537,11 +861,43 @@ impl SeenMessageCache {
     /// 4. **Cumulative Distance**: Total distance checked against message count (H-7)
     /// 5. **Strict Ordering**: Sequence must be > highest_seq (no replay)
     /// 6. **Initial Sequence**: First message limited to prevent setup attacks
+    /// 7. **High-Water Floor**: a first message after eviction or restart must clear the highest
+    ///    sequence we ever accepted from this sender (H-11)
     fn validate_and_update_sequence(&mut self, sender: &NodeId, sequence: u64) -> bool {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
+        // The high-water mark is updated in exactly one place — here, keyed off the verdict —
+        // rather than at each of the four accept sites inside the check. Four copies of "and also
+        // remember this" is how the mark and the thing it is supposed to mirror drift apart.
+        match self.check_sequence(sender, sequence, now_secs) {
+            SequenceVerdict::Reject => false,
+            SequenceVerdict::Accept => {
+                self.high_water.record(*sender, sequence, now_secs);
+                true
+            }
+            // A genuine u64 wrap is the one case where the sender's counter legitimately goes
+            // backwards, so the mark must follow it down or every post-wrap message would be
+            // below the floor for ever. The wrap branch's own gates (>= 1M messages from this
+            // sender, recent activity, post-wrap sequence <= 1000) are what make that safe; a
+            // freshly baselined sender has `message_count == 1` and cannot reach it.
+            SequenceVerdict::AcceptWrapped => {
+                self.high_water.reset(*sender, sequence, now_secs);
+                true
+            }
+        }
+    }
+
+    /// The sequence rules themselves. Returns a verdict rather than a bool so the caller can tell
+    /// a normal acceptance from a wrap-around, which move the high-water mark in opposite
+    /// directions.
+    fn check_sequence(&mut self, sender: &NodeId, sequence: u64, now_secs: u64) -> SequenceVerdict {
+        // Disjoint field borrow: `high_water` is read below while `sequence_state` is held by the
+        // entry API. Keeping the marks in a sibling field rather than inside `SequenceState` is
+        // what makes them survive every eviction path that clears `sequence_state`.
+        let floor = self.high_water.floor(sender, now_secs);
 
         // H-5: Use entry() API for atomic check-and-update
         match self.sequence_state.entry(*sender) {
@@ -563,7 +919,7 @@ impl SeenMessageCache {
                             min_required = MIN_MESSAGES_BEFORE_WRAP,
                             "H-P2P-5: Rejecting suspicious wrap-around - not enough messages"
                         );
-                        return false;
+                        return SequenceVerdict::Reject;
                     }
 
                     // M-3 SECURITY: Timing-based validation during wrap-around
@@ -577,7 +933,7 @@ impl SeenMessageCache {
                             max_gap_secs = MAX_WRAP_AROUND_GAP_SECS,
                             "M-3: Rejecting wrap-around - last message too old (possible replay attack)"
                         );
-                        return false;
+                        return SequenceVerdict::Reject;
                     }
 
                     // HIGH-CONS-1: Legitimate wrap-around must start in range 1-1000
@@ -589,7 +945,7 @@ impl SeenMessageCache {
                             max_allowed = MAX_POST_WRAP_SEQUENCE,
                             "HIGH-CONS-1: Rejecting wrap-around with invalid post-wrap sequence"
                         );
-                        return false;
+                        return SequenceVerdict::Reject;
                     }
 
                     // Valid wrap-around - update state atomically
@@ -605,7 +961,7 @@ impl SeenMessageCache {
                         message_count = state.message_count,
                         "H-P2P-5/M-3: Legitimate sequence wrap-around detected"
                     );
-                    return true;
+                    return SequenceVerdict::AcceptWrapped;
                 }
 
                 // Normal case: Allow sequences within tolerance window of highest_seq.
@@ -624,7 +980,7 @@ impl SeenMessageCache {
                         tolerance_floor = tolerance_floor,
                         "Rejecting sequence outside tolerance window"
                     );
-                    return false;
+                    return SequenceVerdict::Reject;
                 }
 
                 // If sequence is within tolerance but <= highest, it's out-of-order
@@ -640,7 +996,7 @@ impl SeenMessageCache {
                         highest_seq = state.highest_seq,
                         "Accepting out-of-order sequence within tolerance"
                     );
-                    return true;
+                    return SequenceVerdict::Accept;
                 }
 
                 // H-P2P-5: Reject large sequence jumps
@@ -654,7 +1010,7 @@ impl SeenMessageCache {
                         max_jump = MAX_SEQUENCE_JUMP,
                         "H-P2P-5: Rejecting message with excessive sequence jump"
                     );
-                    return false;
+                    return SequenceVerdict::Reject;
                 }
 
                 // H-7 SECURITY: Check cumulative distance
@@ -672,7 +1028,7 @@ impl SeenMessageCache {
                         min_messages = MIN_MESSAGES_BEFORE_WRAP,
                         "H-7: Rejecting message - cumulative sequence distance too high for message count"
                     );
-                    return false;
+                    return SequenceVerdict::Reject;
                 }
 
                 // Valid sequence - update state atomically
@@ -680,7 +1036,7 @@ impl SeenMessageCache {
                 state.last_message_time = now_secs;
                 state.cumulative_distance = projected_cumulative;
                 state.highest_seq = sequence;
-                true
+                SequenceVerdict::Accept
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 // First message from this sender — establish the sequence baseline.
@@ -706,6 +1062,37 @@ impl SeenMessageCache {
                 //    path requires message_count >= MIN_MESSAGES_BEFORE_WRAP, and a
                 //    fresh baseline has message_count == 1.
                 //
+                // H-11: what makes accepting any first sequence safe is now a WRITTEN-DOWN floor
+                // rather than an assumption. Without one, "a first message cannot be a replay (no
+                // prior state)" is only true the very first time — after an eviction or a restart
+                // every captured envelope is a first message again. `floor` is the highest
+                // sequence we ever accepted from this sender; anything at or below it is a replay
+                // of something already processed, whatever the dedup cache still remembers.
+                //
+                // ⚠ Residual, and deliberate: once re-baselined here, the Occupied arm's
+                // `SEQUENCE_TOLERANCE_WINDOW` still admits the ten sequences below the new
+                // baseline, because mixed Noise/ZMQ transports genuinely reorder by about that
+                // much. So this bounds the window to ten messages rather than closing it. Closing
+                // it needs the signed timestamp — a v2 envelope cannot be re-stamped, so a replay
+                // inside the window dies on the ±30 s drift check instead. Ten bounded sequences
+                // is a different order of problem from "any sequence, for ever".
+                if let Some(floor) = floor {
+                    if sequence <= floor {
+                        warn!(
+                            sender = %hex::encode(&sender[..8]),
+                            sequence = sequence,
+                            high_water = floor,
+                            ttl_secs = PEER_HIGH_WATER_TTL_SECS,
+                            "H-11: Rejecting first-message replay below the persisted high-water \
+                             mark. If this repeats for one peer and that peer is healthy, its \
+                             outbound sequence has REWOUND (lost lease file) — fix it there with \
+                             GHOST_MESH_SEQUENCE_RESUME_AT above the high_water shown here, not \
+                             by deleting mesh_peer_sequences.json on this node"
+                        );
+                        return SequenceVerdict::Reject;
+                    }
+                }
+
                 // cumulative_distance starts at 0: no distance has been travelled
                 // since we began observing this peer.
                 debug!(
@@ -720,7 +1107,7 @@ impl SeenMessageCache {
                     last_message_time: now_secs,
                     cumulative_distance: 0,
                 });
-                true
+                SequenceVerdict::Accept
             }
         }
     }
@@ -1082,8 +1469,15 @@ impl MeshNetwork {
             peers,
             sequence: AtomicU64::new(init_sequence),
             sequence_ceiling: AtomicU64::new(init_ceiling),
+            last_logged_envelope_version: AtomicU8::new(ENVELOPE_VERSION_V1),
             sequence_lease_lock: std::sync::Mutex::new(()),
-            seen_messages: RwLock::new(SeenMessageCache::new(config.max_seen_messages)),
+            seen_messages: RwLock::new(SeenMessageCache::with_high_water(
+                config.max_seen_messages,
+                match config.peer_sequence_persist_path.as_deref() {
+                    Some(path) => PeerHighWaterMarks::load(path, now_secs()),
+                    None => PeerHighWaterMarks::default(),
+                },
+            )),
             handlers: RwLock::new(Vec::new()),
             running: AtomicBool::new(false),
             outbound_tx,
@@ -1481,6 +1875,36 @@ impl MeshNetwork {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
+
+        // H-11 REWIND REMEDY. If this node lost its lease file — a rebuilt data directory, a
+        // restore from a backup taken before the counter advanced — it resumes BELOW the sequence
+        // its peers last accepted from it, and every one of them refuses its messages as replays
+        // until their high-water mark for us ages out (`PEER_HIGH_WATER_TTL_SECS`).
+        //
+        // The remedy belongs HERE, on the node that is actually broken, rather than as "delete
+        // `mesh_peer_sequences.json` on the other seven": one node to touch instead of seven, no
+        // window in which those seven run with no replay floor at all, and it takes effect on our
+        // next message rather than on their next cleanup tick.
+        //
+        // Only ever raises the counter. A value at or below what we already persisted is ignored,
+        // so it cannot be used to walk the sequence backwards.
+        let resume_at = std::env::var("GHOST_MESH_SEQUENCE_RESUME_AT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let persisted = if resume_at > persisted {
+            warn!(
+                path = %path.display(),
+                persisted,
+                resume_at,
+                "Mesh outbound sequence: RESUMING FROM GHOST_MESH_SEQUENCE_RESUME_AT — set this \
+                 only to recover a node whose lease file was lost, and unset it afterwards"
+            );
+            resume_at
+        } else {
+            persisted
+        };
+
         let ceiling = persisted.saturating_add(SEQUENCE_LEASE_BLOCK);
         match Self::write_sequence_ceiling(path, ceiling) {
             Ok(()) => {
@@ -1610,6 +2034,30 @@ impl MeshNetwork {
         seen.validate_and_update_sequence(&msg_id.sender, msg_id.sequence);
     }
 
+    /// Which mesh envelope signing format this node emits right now.
+    ///
+    /// Reads the L1 tip through the same provider the health ping uses. That provider is optional
+    /// and falls back to 0, and 0 is below every real gate — so a node with no height source
+    /// keeps emitting v1. That is the only safe direction: emitting v2 at a peer that verifies v1
+    /// is a silent, total rejection at the far end (see [`crate::message::MESH_ENVELOPE_V2_HEIGHT`]).
+    fn envelope_version(&self) -> u8 {
+        let height = self.l1_height_fn.as_ref().map(|f| f()).unwrap_or(0);
+        let version = envelope_version_for_height(height);
+        if version
+            != self
+                .last_logged_envelope_version
+                .swap(version, Ordering::Relaxed)
+        {
+            info!(
+                envelope_version = version,
+                l1_height = height,
+                gate = mesh_envelope_v2_height(),
+                "Mesh envelope signing format"
+            );
+        }
+        version
+    }
+
     /// Create a message envelope
     pub fn create_envelope<T: serde::Serialize>(
         &self,
@@ -1618,22 +2066,7 @@ impl MeshNetwork {
     ) -> GhostResult<MessageEnvelope> {
         let payload_bytes =
             serde_json::to_vec(payload).map_err(|e| GhostError::Serialization(e.to_string()))?;
-
-        let sequence = self.next_sequence();
-
-        // Sign the payload + sequence (verifier expects both)
-        let mut signed_data = Vec::with_capacity(payload_bytes.len() + 8);
-        signed_data.extend_from_slice(&payload_bytes);
-        signed_data.extend_from_slice(&sequence.to_le_bytes());
-        let signature = self.identity.sign(&signed_data);
-
-        Ok(MessageEnvelope::new(
-            msg_type,
-            self.identity.node_id(),
-            payload_bytes,
-            sequence,
-            signature,
-        ))
+        self.create_envelope_raw(msg_type, payload_bytes)
     }
 
     /// Create a message envelope from pre-serialized payload bytes
@@ -1643,20 +2076,16 @@ impl MeshNetwork {
         payload: Vec<u8>,
     ) -> GhostResult<MessageEnvelope> {
         let sequence = self.next_sequence();
-
-        // Sign the payload + sequence (must match create_envelope for P2P4-M1 verification)
-        let mut signed_data = Vec::with_capacity(payload.len() + 8);
-        signed_data.extend_from_slice(&payload);
-        signed_data.extend_from_slice(&sequence.to_le_bytes());
-        let signature = self.identity.sign(&signed_data);
-
-        Ok(MessageEnvelope::new(
+        MessageEnvelope::signed(
+            self.envelope_version(),
             msg_type,
             self.identity.node_id(),
             payload,
             sequence,
-            signature,
-        ))
+            DEFAULT_MESSAGE_TTL,
+            |bytes| self.identity.sign(bytes),
+        )
+        .map_err(|e| GhostError::Serialization(e.to_string()))
     }
 
     /// Broadcast a message to all peers
@@ -3228,17 +3657,67 @@ impl MeshNetwork {
             .as_secs();
         let cutoff = now.saturating_sub(max_age_secs);
 
-        let mut seen = self.seen_messages.write();
-        let before_len = seen.len();
-        seen.cleanup_older_than(cutoff);
-        let after_len = seen.len();
+        // H-11: refresh the protected set BEFORE taking the cache lock. `get_all_peers` takes
+        // `PeerManager`'s own lock, and taking two locks in one order here and the other order
+        // anywhere else is how a deadlock gets built.
+        let known: std::collections::HashSet<NodeId> = self
+            .peers
+            .get_all_peers()
+            .into_iter()
+            .map(|p| p.node_id)
+            .collect();
 
-        if before_len != after_len {
-            debug!(
-                remaining = after_len,
-                removed = before_len - after_len,
-                "Cleaned up seen messages"
-            );
+        // Everything under this lock is in-memory only. The disk write happens after it is
+        // dropped: `save` used to run here, which put a synchronous file write on the path of
+        // every inbound message twice a minute — on nodes already measured at 23-35% iowait
+        // (#690), that is a real stall, not a theoretical one.
+        let snapshot = {
+            let mut seen = self.seen_messages.write();
+            let before_len = seen.len();
+            seen.cleanup_older_than(cutoff);
+            let after_len = seen.len();
+
+            // The marks ride the same tick rather than a timer of their own, so there is one
+            // cadence to reason about — and they are aged and snapshotted here, NOT in
+            // `cleanup_older_than`, because that function's entire job is to evict and this is
+            // the one structure that must survive it.
+            seen.high_water.set_known(known);
+            seen.high_water.drop_expired(now);
+
+            let snapshot =
+                if self.config.peer_sequence_persist_path.is_some() && seen.high_water.dirty {
+                    // Clearing `dirty` under the lock, before the write, is deliberate. If the
+                    // write then fails we lose one tick's persistence, which costs replay
+                    // protection across the NEXT restart only; leaving it set would instead retry
+                    // a failing synchronous write every 60 s for as long as the disk stays unhappy.
+                    seen.high_water.dirty = false;
+                    Some(seen.high_water.snapshot())
+                } else {
+                    None
+                };
+
+            if before_len != after_len {
+                debug!(
+                    remaining = after_len,
+                    removed = before_len - after_len,
+                    "Cleaned up seen messages"
+                );
+            }
+            snapshot
+        };
+
+        if let (Some(path), Some(snapshot)) =
+            (self.config.peer_sequence_persist_path.as_deref(), snapshot)
+        {
+            if let Err(e) = PeerHighWaterMarks::write_snapshot(path, &snapshot) {
+                // Logged, not fatal: the in-memory marks are unaffected. Failing the mesh over a
+                // cache file would trade a hardening layer for an outage.
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "H-11: could not persist per-sender high-water marks"
+                );
+            }
         }
     }
 
@@ -3369,22 +3848,8 @@ impl MeshNetwork {
             ));
         }
 
-        let sequence = self.next_sequence();
-
-        // Sign the payload + sequence (must match create_envelope for P2P4-M1 verification)
-        let mut signed_data = Vec::with_capacity(payload.len() + 8);
-        signed_data.extend_from_slice(&payload);
-        signed_data.extend_from_slice(&sequence.to_le_bytes());
-        let signature = self.identity.sign(&signed_data);
-
-        // Create envelope
-        let envelope = MessageEnvelope::new(
-            msg_type,
-            self.identity.node_id(),
-            payload,
-            sequence,
-            signature,
-        );
+        // Same signed bytes as create_envelope — one definition, so the two paths cannot drift.
+        let envelope = self.create_envelope_raw(msg_type, payload)?;
 
         // Serialize envelope
         let data = envelope
@@ -4477,5 +4942,503 @@ mod tests {
         // A stray -0.0 / garbage term can't drag the total below the real sum.
         let total = MeshNetwork::compute_mesh_total_hashrate(-0.0, [5.0, -2.0].into_iter());
         assert!((total - 5.0).abs() < 1e-9, "expected 5.0, got {total}");
+    }
+}
+
+/// H-11: the per-sender inbound high-water marks.
+///
+/// The replay defence these replace was never a 300-second window. `sequence_state` is dropped by
+/// four separate eviction paths and by every restart, and re-entry goes through the vacant arm of
+/// [`SeenMessageCache::validate_and_update_sequence`], which accepted ANY sequence. So the real
+/// window was "until the next quiet period" — unbounded in practice.
+#[cfg(test)]
+mod high_water_tests {
+    use super::*;
+
+    const SENDER: NodeId = [3u8; 32];
+
+    /// Advance a cache through a run of accepted sequences and return it.
+    fn cache_at(sequence: u64) -> SeenMessageCache {
+        let mut cache = SeenMessageCache::new(100);
+        assert!(
+            cache.validate_and_update_sequence(&SENDER, sequence),
+            "baseline sequence {sequence} should be accepted"
+        );
+        cache
+    }
+
+    /// The core of the finding. Evict everything the dedup cache holds — exactly what happens
+    /// after `MESSAGE_TTL_SECONDS` of silence from a peer — and the sender's next message is a
+    /// "first message" again. Before this change that re-baselined at whatever sequence turned up,
+    /// so a captured envelope walked straight back in.
+    #[test]
+    fn a_replay_after_dedup_eviction_is_refused() {
+        let mut cache = cache_at(500);
+
+        // Evict everything: cutoff in the far future leaves no entry alive.
+        cache.cleanup_older_than(u64::MAX);
+        assert!(
+            cache.sequence_state.is_empty(),
+            "the eviction this test depends on did not happen"
+        );
+
+        assert!(
+            !cache.validate_and_update_sequence(&SENDER, 400),
+            "a sequence below the high-water mark is a replay of a message already processed"
+        );
+        assert!(
+            !cache.validate_and_update_sequence(&SENDER, 500),
+            "re-presenting the high-water mark itself is still a replay"
+        );
+        assert!(
+            cache.validate_and_update_sequence(&SENDER, 501),
+            "an honest peer's next message must still be accepted, or eviction becomes an outage"
+        );
+    }
+
+    /// An out-of-order message inside `SEQUENCE_TOLERANCE_WINDOW` is accepted but must NOT pull
+    /// the mark down with it — otherwise every quiet period reopens the gap by the width of the
+    /// tolerance window.
+    #[test]
+    fn an_in_tolerance_out_of_order_message_does_not_lower_the_mark() {
+        let mut cache = cache_at(500);
+        assert!(
+            cache.validate_and_update_sequence(&SENDER, 495),
+            "in-tolerance out-of-order delivery must still be accepted"
+        );
+
+        assert_eq!(
+            cache.high_water.floor(&SENDER, now_secs()),
+            Some(500),
+            "the mark must be monotonic across out-of-order acceptance"
+        );
+    }
+
+    /// The restart half. Marks written by one process must bound the next one; without this the
+    /// floor is only as durable as the process, which is how a restart reopened the window.
+    #[test]
+    fn marks_survive_a_restart_through_the_persist_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mesh_peer_sequences.json");
+
+        let before = cache_at(900);
+        PeerHighWaterMarks::write_snapshot(&path, &before.high_water.snapshot())
+            .expect("save marks");
+
+        let mut after =
+            SeenMessageCache::with_high_water(100, PeerHighWaterMarks::load(&path, now_secs()));
+        assert!(
+            after.sequence_state.is_empty(),
+            "a restarted node starts with no sequence state — that is the point"
+        );
+
+        assert!(
+            !after.validate_and_update_sequence(&SENDER, 800),
+            "a restart must not reopen the replay window"
+        );
+        assert!(
+            after.validate_and_update_sequence(&SENDER, 901),
+            "an honest peer must still get through after our restart"
+        );
+    }
+
+    /// The liveness escape hatch. A peer whose own outbound counter rewound — its
+    /// `sequence_persist_path` lost with a rebuilt data directory — would otherwise be refused for
+    /// ever. `PEER_HIGH_WATER_TTL_SECS` bounds that to one operator day.
+    #[test]
+    fn an_expired_mark_does_not_lock_out_a_rewound_peer() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.record(SENDER, 900, now - PEER_HIGH_WATER_TTL_SECS - 1);
+
+        assert_eq!(
+            marks.floor(&SENDER, now),
+            None,
+            "a mark older than the TTL must not bound anything"
+        );
+
+        let mut cache = SeenMessageCache::with_high_water(100, marks);
+        assert!(
+            cache.validate_and_update_sequence(&SENDER, 1),
+            "a peer that has been silent past the TTL must be able to re-baseline"
+        );
+    }
+
+    /// A corrupt or truncated file must degrade to "no floor", loudly, rather than refusing to
+    /// start. A hardening layer that can wedge the node is worse than the hole it closes.
+    #[test]
+    fn an_unreadable_mark_file_degrades_to_no_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marks.json");
+        std::fs::write(&path, b"{not json at all").expect("write junk");
+
+        let marks = PeerHighWaterMarks::load(&path, now_secs());
+
+        assert_eq!(marks.floor(&SENDER, now_secs()), None);
+    }
+
+    /// A missing file is the ordinary first-boot case and must be silent-but-logged, not an error.
+    #[test]
+    fn a_missing_mark_file_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marks = PeerHighWaterMarks::load(&dir.path().join("absent.json"), now_secs());
+
+        assert_eq!(marks.floor(&SENDER, now_secs()), None);
+    }
+
+    fn stranger(i: usize) -> NodeId {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        id[31] = 0xEE;
+        id
+    }
+
+    /// ⛔ **The finding-1 property, and the reason the marks are worth anything.**
+    ///
+    /// The first version evicted the least-recently-heard-from entry once the map filled, so
+    /// ~1001 throwaway keypairs flushed the replay floor of exactly the quiet honest peer the mark
+    /// exists to protect. Node ids are ed25519 keys behind ~24 bits of PoW — about 30 seconds of
+    /// CPU each — so that made H-11 reachable ON DEMAND rather than after a quiet period: strictly
+    /// worse than no marks at all, because the code reads as defended.
+    ///
+    /// A known peer's mark must survive any amount of stranger traffic.
+    #[test]
+    fn a_flood_of_strangers_cannot_evict_a_known_peers_mark() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known(std::iter::once(SENDER).collect());
+        marks.record(SENDER, 500, now);
+
+        // Ten times the whole budget, all distinct, all recent — the flood the old policy served.
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 10) {
+            marks.record(stranger(i), 1, now);
+        }
+
+        assert_eq!(
+            marks.floor(&SENDER, now),
+            Some(500),
+            "a stranger flood flushed the honest peer's replay floor — H-11 is reachable on demand"
+        );
+        assert!(
+            marks.marks.len() <= MAX_HIGH_WATER_SENDERS,
+            "mark map grew to {} — an unbounded map is a memory DoS",
+            marks.marks.len()
+        );
+    }
+
+    /// The same property one level down: strangers share a fixed pool well below the total budget,
+    /// so the slots reserved for peers we actually mesh with cannot be consumed at all.
+    #[test]
+    fn strangers_are_capped_below_the_total_budget() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known(std::iter::once(SENDER).collect());
+
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 2) {
+            marks.record(stranger(i), 1, now);
+        }
+
+        assert_eq!(
+            marks.unknown_len(),
+            MAX_UNKNOWN_HIGH_WATER_SENDERS,
+            "strangers must be held to their own pool, not the whole budget"
+        );
+        const {
+            assert!(
+                MAX_UNKNOWN_HIGH_WATER_SENDERS < MAX_HIGH_WATER_SENDERS,
+                "the stranger pool must leave slots reserved for known peers"
+            )
+        };
+    }
+
+    /// A known peer arriving for the FIRST time while strangers hold their pool must still get a
+    /// slot — otherwise the flood denies the floor to a peer that has not been recorded yet, which
+    /// is the same attack by a different route.
+    #[test]
+    fn a_known_peer_can_still_take_a_slot_while_strangers_hold_theirs() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known(std::iter::once(SENDER).collect());
+
+        for i in 0..(MAX_HIGH_WATER_SENDERS * 2) {
+            marks.record(stranger(i), 1, now);
+        }
+        marks.record(SENDER, 500, now);
+
+        assert_eq!(
+            marks.floor(&SENDER, now),
+            Some(500),
+            "a known peer was denied a slot by stranger pressure"
+        );
+    }
+
+    fn known_id(i: usize) -> NodeId {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        id[31] = 0x11;
+        id
+    }
+
+    /// Fill the map to exactly `MAX_HIGH_WATER_SENDERS` with peers in the protected set.
+    ///
+    /// Filling it with STRANGERS cannot work and that was the bug in the first versions of the two
+    /// tests below: strangers are held to their own 128-slot pool, so a stranger flood leaves the
+    /// map at 129 entries, "when the map is full" never happens, and the branches these tests
+    /// claim to cover are never reached.
+    fn full_map(now: u64) -> PeerHighWaterMarks {
+        let mut marks = PeerHighWaterMarks::default();
+        marks.set_known((0..MAX_HIGH_WATER_SENDERS).map(known_id).collect());
+        for i in 0..MAX_HIGH_WATER_SENDERS {
+            marks.record(known_id(i), 100, now);
+        }
+        assert_eq!(
+            marks.marks.len(),
+            MAX_HIGH_WATER_SENDERS,
+            "the map is not actually full — this test would prove nothing"
+        );
+        marks
+    }
+
+    /// Capacity must never apply to a sender already tracked. If a full map could stop an
+    /// incumbent's mark from ADVANCING, an attacker could freeze the floor in place and replay
+    /// everything above it.
+    #[test]
+    fn an_existing_mark_advances_even_when_the_map_is_full() {
+        let now = now_secs();
+        let mut marks = full_map(now);
+
+        marks.record(known_id(0), 900, now);
+
+        assert_eq!(
+            marks.floor(&known_id(0), now),
+            Some(900),
+            "a full map blocked an incumbent's mark from advancing"
+        );
+        assert_eq!(
+            marks.marks.len(),
+            MAX_HIGH_WATER_SENDERS,
+            "size must not grow"
+        );
+    }
+
+    /// The safety valve: with the map genuinely full, a known peer arriving for the first time
+    /// takes a STRANGER's slot, never another known peer's.
+    ///
+    /// Only reachable once the protected set is larger than the reserved region, so it is dead
+    /// weight for a fleet of eight — but it is the branch that decides who loses a slot when it
+    /// does run, which is the whole subject of finding 1.
+    #[test]
+    fn a_known_newcomer_displaces_a_stranger_and_never_a_known_peer() {
+        let now = now_secs();
+        let reserved = MAX_HIGH_WATER_SENDERS - MAX_UNKNOWN_HIGH_WATER_SENDERS;
+        let newcomer = known_id(usize::MAX / 2);
+
+        let mut marks = PeerHighWaterMarks::default();
+        let mut known: std::collections::HashSet<NodeId> = (0..reserved).map(known_id).collect();
+        known.insert(newcomer);
+        marks.set_known(known);
+
+        for i in 0..reserved {
+            marks.record(known_id(i), 100, now);
+        }
+        for i in 0..MAX_UNKNOWN_HIGH_WATER_SENDERS {
+            marks.record(stranger(i), 1, now);
+        }
+        assert_eq!(
+            marks.marks.len(),
+            MAX_HIGH_WATER_SENDERS,
+            "map must be full"
+        );
+        assert_eq!(marks.unknown_len(), MAX_UNKNOWN_HIGH_WATER_SENDERS);
+
+        marks.record(newcomer, 500, now);
+
+        assert_eq!(
+            marks.floor(&newcomer, now),
+            Some(500),
+            "a known peer was refused a slot on a full map"
+        );
+        assert_eq!(
+            marks.unknown_len(),
+            MAX_UNKNOWN_HIGH_WATER_SENDERS - 1,
+            "the displaced entry must have been a stranger"
+        );
+        for i in 0..reserved {
+            assert!(
+                marks.marks.contains_key(&known_id(i)),
+                "a known peer's mark was displaced"
+            );
+        }
+    }
+
+    /// Eviction is by AGE, never by recency. An attacker can make a mark NEW (send a message) but
+    /// cannot make an honest peer's mark old, which is what stops the policy from being a lever.
+    #[test]
+    fn expiry_is_the_only_unconditional_removal_rule() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.record(SENDER, 500, now - PEER_HIGH_WATER_TTL_SECS - 1);
+        marks.record([0xABu8; 32], 700, now);
+
+        marks.drop_expired(now);
+
+        // Asserted on the MAP, not through `floor()`. `floor()` applies the TTL itself, so it
+        // answers `None` for an expired mark whether or not `drop_expired` removed anything —
+        // the first version of this test asserted through it and passed with the whole body of
+        // `drop_expired` deleted.
+        assert!(
+            !marks.marks.contains_key(&SENDER),
+            "the expired mark is still occupying a slot — expiry did not actually remove it"
+        );
+        assert_eq!(
+            marks.marks.get(&[0xABu8; 32]).map(|&(seq, _)| seq),
+            Some(700),
+            "a fresh mark must survive expiry"
+        );
+    }
+
+    /// The rewind outage is bounded by this constant, so its value is the finding, not a detail.
+    /// A day of an eight-node mesh running seven-eighths strength is not "self-healing".
+    #[test]
+    fn the_rewind_lockout_is_bounded_to_an_hour() {
+        assert_eq!(
+            PEER_HIGH_WATER_TTL_SECS, 3_600,
+            "the rewind lockout is this long — changing it changes an outage budget"
+        );
+    }
+
+    /// The wiring check for the protected set.
+    ///
+    /// Every finding-1 test above calls `set_known` by hand. If the LIVE path never called it, the
+    /// protected set would be permanently empty in production — every real peer would compete in
+    /// the 128-slot stranger pool — and every one of those tests would still be green. That is the
+    /// same "unit-tested and wired to nothing" shape `check-wiring.sh` exists for.
+    #[tokio::test]
+    async fn the_cleanup_tick_populates_the_protected_set_from_the_peer_table() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let config = MeshConfig {
+            noise_enabled: false,
+            noise_required: false,
+            ..Default::default()
+        };
+        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let peer_id = [0x5Au8; 32];
+        mesh.peers
+            .upsert_peer(Peer::new(peer_id, "203.0.113.9:8559".to_string()));
+
+        assert!(
+            !mesh
+                .seen_messages
+                .read()
+                .high_water
+                .known
+                .contains(&peer_id),
+            "protected set should start empty"
+        );
+
+        mesh.cleanup_seen_messages(300);
+
+        assert!(
+            mesh.seen_messages
+                .read()
+                .high_water
+                .known
+                .contains(&peer_id),
+            "the cleanup tick did not carry the peer table into the protected set — every real \
+             peer would be treated as a stranger"
+        );
+    }
+
+    /// A genuine u64 wrap is the one case where a sender's counter legitimately goes backwards.
+    /// The mark has to follow it down, or every post-wrap message sits below the floor until the
+    /// TTL expires.
+    #[test]
+    fn a_verified_wrap_moves_the_mark_down() {
+        let now = now_secs();
+        let mut marks = PeerHighWaterMarks::default();
+        marks.record(SENDER, u64::MAX - 10, now);
+
+        marks.reset(SENDER, 7, now);
+
+        assert_eq!(marks.floor(&SENDER, now), Some(7));
+    }
+
+    /// The wiring check: the REAL signing path, not just the constructor.
+    ///
+    /// `create_envelope_raw` is what every mesh broadcast goes through, and it picks the format
+    /// from `envelope_version()`, which reads a height provider that may not be wired at all. A
+    /// preimage that is correct in isolation and a signer that never reaches it is the failure
+    /// this repo already has a `check-wiring.sh` for.
+    #[test]
+    fn the_real_signing_path_produces_a_verifiable_envelope() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let config = MeshConfig {
+            noise_enabled: false,
+            noise_required: false,
+            ..Default::default()
+        };
+        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let env = mesh
+            .create_envelope_raw(MessageType::HealthPing, b"ping".to_vec())
+            .expect("create envelope");
+
+        assert_eq!(
+            env.version, ENVELOPE_VERSION_V1,
+            "with the gate dormant and no height provider wired, this node must emit v1"
+        );
+        assert!(
+            crate::message_validator::verify_envelope_signature(&env).is_ok(),
+            "the envelope this node actually broadcasts must verify against the shared preimage"
+        );
+    }
+
+    /// Wired the other way: with a height provider past the gate, the same path emits v2 and it
+    /// still verifies. Without this the emit-side gate could be dead code and every test above
+    /// would still pass.
+    #[test]
+    fn a_height_past_the_gate_switches_the_real_signing_path_to_v2() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let config = MeshConfig {
+            noise_enabled: false,
+            noise_required: false,
+            ..Default::default()
+        };
+        let mut mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let gate = mesh_envelope_v2_height();
+        mesh.set_l1_height_provider(Arc::new(move || gate));
+
+        let env = mesh
+            .create_envelope_raw(MessageType::HealthPing, b"ping".to_vec())
+            .expect("create envelope");
+
+        assert_eq!(env.version, crate::message::ENVELOPE_VERSION_V2);
+        assert!(
+            crate::message_validator::verify_envelope_signature(&env).is_ok(),
+            "a v2 envelope from the real signing path must verify"
+        );
+    }
+
+    /// The persisted round trip must preserve the sender ids exactly. A hex encoding that lost or
+    /// mangled a byte would silently produce a floor for a node that does not exist, and none for
+    /// the node that does — a defence that reads as present and protects nothing.
+    #[test]
+    fn the_persist_file_round_trips_sender_ids_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marks.json");
+        let now = now_secs();
+
+        let mut written = PeerHighWaterMarks::default();
+        written.record(SENDER, 4242, now);
+        written.record([0xABu8; 32], 7, now);
+        PeerHighWaterMarks::write_snapshot(&path, &written.snapshot()).expect("save");
+
+        let read = PeerHighWaterMarks::load(&path, now);
+
+        assert_eq!(read.floor(&SENDER, now), Some(4242));
+        assert_eq!(read.floor(&[0xABu8; 32], now), Some(7));
+        assert_eq!(read.marks.len(), 2);
     }
 }

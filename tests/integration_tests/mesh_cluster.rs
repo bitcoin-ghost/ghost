@@ -21,7 +21,7 @@ use ghost_common::identity::NodeIdentity;
 use ghost_common::types::{NodeId, ShareProof};
 use ghost_consensus::mesh::MessageHandler;
 use ghost_consensus::message::{
-    MessageEnvelope, MessageType, ShareConvergenceResponse, ShareProofMessage,
+    MessageEnvelope, MessageType, ShareConvergenceResponse, ShareProofMessage, ENVELOPE_VERSION_V1,
 };
 use ghost_pool::convergence::ConvergenceHandler;
 use ghost_pool::round::{RoundConfig, RoundManager};
@@ -159,6 +159,7 @@ impl TestMeshCluster {
     async fn deliver(&self, from: usize, proof: ShareProof) {
         let payload = serde_json::to_vec(&ShareProofMessage { proof }).expect("serialize proof");
         let envelope = Arc::new(MessageEnvelope {
+            version: ENVELOPE_VERSION_V1,
             msg_type: MessageType::ShareProof,
             sender: self.nodes[from].node_id,
             timestamp: Utc::now().timestamp() as u64,
