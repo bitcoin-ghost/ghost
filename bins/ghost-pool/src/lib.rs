@@ -116,6 +116,13 @@ pub mod share_handler;
 /// GHOST-03: ledger convergence (share-set reconciliation) between mesh nodes.
 pub mod convergence;
 
+// ⚠ No outer `///` doc here on purpose. An outer doc on the `mod` item is merged with the
+// module's own `//!` docs, and rustdoc then resolves the merged block's intra-doc links in the
+// PARENT scope — so `[`FRAME_MAX_AGE`]`, a public item of the module itself, failed to resolve
+// and the doc job (which runs `-D warnings`) refused to document the crate. The module documents
+// itself; see the `//!` block at the top of `convergence_channel.rs`.
+pub mod convergence_channel;
+
 /// Chain height at which the security-audit cluster's ENFORCEMENT activates
 /// fleet-wide. Mirrors `PAYOUT_ADDRESS_GROUPING_HEIGHT`: baking the activation as
 /// a deterministic block-height gate (not a flag) means every node — running the

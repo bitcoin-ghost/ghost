@@ -542,6 +542,50 @@ pub struct HealthResponse {
     /// for weeks. A counter with no reader is not instrumentation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mesh_validation: Option<MeshValidationStats>,
+    /// Outbound convergence-queue counters, or `null` if not wired.
+    ///
+    /// #647: the queues shed frames when full, and the only trace was an ERROR line — 3,770 of
+    /// them a day on ghost-vm4, discovered by accident during an unrelated soak. `shed` is that
+    /// number, readable without an SSH session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub convergence_channels: Option<ConvergenceChannelStats>,
+}
+
+/// Outbound convergence-queue counters surfaced on `/health` (#647).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ConvergenceChannelStats {
+    /// GHOST-03 share convergence (`MessageType::ShareConvergence`).
+    pub share: ConvergenceLaneStats,
+    /// Node-reward challenge convergence (`MessageType::ChallengeConvergence`).
+    pub challenge: ConvergenceLaneStats,
+}
+
+/// One outbound convergence queue.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ConvergenceLaneStats {
+    /// Queue bound, in frames.
+    pub capacity: usize,
+    /// Frames waiting at the moment of the read.
+    pub queued: usize,
+    /// Frames accepted onto the queue since start.
+    pub enqueued: u64,
+    /// Frames dropped because the queue was full. The #647 number.
+    pub shed: u64,
+    /// Dequeued frames delivered to one addressed peer.
+    pub unicast: u64,
+    /// Dequeued frames fanned out to every connected peer.
+    pub fanout: u64,
+    /// Addressed frames that fell back to fan-out because the peer was not in the peer set, or
+    /// because the node has no Noise pool to address anything over. A rising value means
+    /// addressing is not landing and the drain still pays full fan-out cost.
+    pub unaddressable: u64,
+    /// Frames the transport failed to send AFTER they were dequeued. Same effect as `shed` — the
+    /// frame never reached the wire — but a different cause, and a unicast has none of the
+    /// accidental redundancy a fan-out had, so this is the counter that catches a broken link.
+    pub send_failed: u64,
+    /// Frames discarded at the head of the queue for being stale. `shed` means production outran
+    /// the drain; `expired` means the drain outran the frame's usefulness.
+    pub expired: u64,
 }
 
 /// Mesh message-validation counters surfaced on `/health`.
@@ -1163,6 +1207,7 @@ mod tests {
     fn test_signed_response_creation() {
         let health = HealthResponse {
             mesh_validation: None,
+            convergence_channels: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),
@@ -1197,6 +1242,7 @@ mod tests {
     fn test_signed_response_timestamp_validation() {
         let health = HealthResponse {
             mesh_validation: None,
+            convergence_channels: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),

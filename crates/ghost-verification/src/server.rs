@@ -1364,6 +1364,10 @@ pub struct VerificationState {
     /// rather than a confident row of zeros that looks like a clean mesh.
     get_mesh_validation:
         Option<Box<dyn Fn() -> crate::challenge::MeshValidationStats + Send + Sync>>,
+    /// #647: outbound convergence-queue counters. Optional for the same reason as above — an
+    /// unwired caller reports `null`, not a row of zeros that reads like a queue shedding nothing.
+    get_convergence_channels:
+        Option<Box<dyn Fn() -> crate::challenge::ConvergenceChannelStats + Send + Sync>>,
     /// Archive mode handler
     archive_handler: Option<Box<dyn ArchiveHandler + Send + Sync>>,
     /// GhostPay handler
@@ -1824,6 +1828,7 @@ impl VerificationState {
             get_peer_count: Box::new(|| 0),
             get_core_health: None,
             get_mesh_validation: None,
+            get_convergence_channels: None,
             archive_handler: None,
             ghostpay_handler: None,
             gsp_handler: None,
@@ -2604,6 +2609,17 @@ impl VerificationState {
         self
     }
 
+    /// Wire the outbound convergence-queue counters into `/health` (#647). Without this, a queue
+    /// shedding frames is observable only by grepping journald on every node — which is how #647
+    /// went unnoticed until an unrelated soak tripped over it.
+    pub fn with_convergence_channels(
+        mut self,
+        probe: impl Fn() -> crate::challenge::ConvergenceChannelStats + Send + Sync + 'static,
+    ) -> Self {
+        self.get_convergence_channels = Some(Box::new(probe));
+        self
+    }
+
     pub fn with_core_health(
         mut self,
         probe: impl Fn() -> (bool, u64) + Send + Sync + 'static,
@@ -2972,6 +2988,7 @@ impl VerificationState {
         let core = self.get_core_health.as_ref().map(|probe| probe());
         HealthResponse {
             mesh_validation: self.get_mesh_validation.as_ref().map(|p| p()),
+            convergence_channels: self.get_convergence_channels.as_ref().map(|p| p()),
             // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it
             // can reach Ghost Core, and saying "healthy" on that basis is what hid vm7's outage.
             healthy: core.map(|(reachable, _)| reachable).unwrap_or(false),
@@ -4269,6 +4286,69 @@ mod tests {
             .expect("wired probe must report");
         assert_eq!(stats.total, 1_000);
         assert_eq!(stats.too_large, 60, "the drop count must be readable");
+    }
+
+    /// #647. The outbound convergence queues shed frames when full, and the only trace was one
+    /// ERROR line per shed frame — 3,770 a day on ghost-vm4, found by accident during an
+    /// unrelated soak. A number nobody can read without an SSH session is not instrumentation.
+    #[tokio::test]
+    async fn health_surfaces_convergence_channels_when_wired_and_omits_them_when_not() {
+        use crate::challenge::{ConvergenceChannelStats, ConvergenceLaneStats};
+
+        fn state() -> VerificationState {
+            VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+        }
+
+        // Unwired: absent, NOT a row of zeros that reads like a queue shedding nothing.
+        assert!(
+            state().get_health().await.convergence_channels.is_none(),
+            "an unwired probe must report unknown, not a clean-looking zero"
+        );
+
+        let wired = state().with_convergence_channels(|| ConvergenceChannelStats {
+            share: ConvergenceLaneStats {
+                capacity: 64,
+                queued: 3,
+                enqueued: 9_000,
+                shed: 3_770,
+                unicast: 8_800,
+                fanout: 200,
+                unaddressable: 0,
+                send_failed: 12,
+                expired: 47,
+            },
+            challenge: ConvergenceLaneStats::default(),
+        });
+        let stats = wired
+            .get_health()
+            .await
+            .convergence_channels
+            .expect("wired probe must report");
+        assert_eq!(
+            stats.share.shed, 3_770,
+            "the shed count is the whole point — it must reach the response"
+        );
+        assert_eq!(stats.share.capacity, 64, "headroom needs the bound too");
+        assert_eq!(
+            stats.share.unicast, 8_800,
+            "whether replies are addressed must be readable, or a silently unaddressed fleet \
+             looks identical to a fixed one"
+        );
+        // The three ways a frame fails to reach the wire must be separable, or an operator cannot
+        // tell a broken link from an overloaded producer from a drain that fell behind.
+        assert_eq!(
+            stats.share.send_failed, 12,
+            "a frame the transport could not send is lost as completely as a shed one"
+        );
+        assert_eq!(
+            stats.share.expired, 47,
+            "frames discarded for staleness must be distinguishable from frames shed on enqueue"
+        );
     }
 
     use super::*;

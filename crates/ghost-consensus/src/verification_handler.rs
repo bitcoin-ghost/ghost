@@ -146,7 +146,12 @@ pub trait ResultReVerifier: Send + Sync {
 
 /// Callback used to transmit a serialized [`ChallengeConvergencePayload`] to a
 /// peer over the `verify` topic. Supplied by `main.rs`, which owns the mesh.
-pub type ChallengeSendFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Sync>;
+///
+/// The second argument is the peer the frame is **addressed to**, or `None` to fan out. A
+/// convergence *response* serves exactly one requester — its proofs are the complement of that
+/// peer's advertised key set — so fanning it out spends a send per peer to serve one, and it is
+/// the shape that filled the outbound queue in #647.
+pub type ChallengeSendFn = Arc<dyn Fn(Vec<u8>, Option<NodeId>) -> GhostResult<()> + Send + Sync>;
 
 /// Upper bound on proofs served in one convergence response. Sized so a full
 /// batch of worst-case proofs (`MAX_VERIFICATION_SIZE` each) stays under the 1MB
@@ -331,7 +336,8 @@ impl VerificationResultHandler {
             return Ok(());
         };
         let bytes = self.build_challenge_request(since_ts, until_ts)?;
-        send(bytes)
+        // An advertisement is genuinely for every peer, so it fans out.
+        send(bytes, None)
     }
 
     /// Handle an inbound [`ChallengeConvergencePayload`] (request or response).
@@ -354,7 +360,8 @@ impl VerificationResultHandler {
                 };
                 let bytes = serde_json::to_vec(&ChallengeConvergencePayload::Response(resp))
                     .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))?;
-                send(bytes)?;
+                // Addressed to the requester — nobody else advertised this key set (#647).
+                send(bytes, Some(envelope.sender))?;
             }
             ChallengeConvergencePayload::Response(resp) => {
                 let applied = self.apply_challenge_response(&resp).await;
@@ -1295,11 +1302,13 @@ mod tests {
     // CHALLENGE CONVERGENCE: two divergent ledgers reconcile
     // =================================================================
 
-    /// Capture outbound convergence bytes into a shared buffer so a test can
-    /// hand-deliver them to the other node.
-    fn capturing_send(buf: Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> ChallengeSendFn {
-        Arc::new(move |bytes: Vec<u8>| {
-            buf.lock().unwrap().push(bytes);
+    /// Capture outbound convergence frames — bytes AND the peer they are addressed to — into a
+    /// shared buffer so a test can hand-deliver them to the other node and assert on the routing.
+    type CapturedFrame = (Vec<u8>, Option<NodeId>);
+
+    fn capturing_send(buf: Arc<std::sync::Mutex<Vec<CapturedFrame>>>) -> ChallengeSendFn {
+        Arc::new(move |bytes: Vec<u8>, to: Option<NodeId>| {
+            buf.lock().unwrap().push((bytes, to));
             Ok(())
         })
     }
@@ -1356,22 +1365,34 @@ mod tests {
             1
         );
 
+        // Distinct wire identities so the reply's ADDRESS is meaningful (#647).
+        let node_a: NodeId = [0xaa; 32];
+        let node_b: NodeId = [0xbb; 32];
+
         // --- Direction 1: A pulls from B ---
         // A advertises what it holds (P1); B serves back what A lacks (P2).
         let a_req = handler_a
             .build_challenge_request(window.0, window.1)
             .unwrap();
         handler_b
-            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_req))
+            .handle_challenge_convergence(&convergence_envelope(node_a, a_req))
             .await
             .unwrap();
-        let b_reply = outbox_b
+        let (b_reply, b_reply_to) = outbox_b
             .lock()
             .unwrap()
             .pop()
             .expect("B serves A's missing proof");
+        // #647: the reply serves exactly one peer's advertised key set, so it must be addressed
+        // to that peer. Fanning it out spends a send per peer to serve one, which is what filled
+        // the outbound queue.
+        assert_eq!(
+            b_reply_to,
+            Some(node_a),
+            "a convergence reply must be addressed to its requester, not fanned out"
+        );
         handler_a
-            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), b_reply))
+            .handle_challenge_convergence(&convergence_envelope(node_b, b_reply))
             .await
             .unwrap();
 
@@ -1380,19 +1401,21 @@ mod tests {
             .build_challenge_request(window.0, window.1)
             .unwrap();
         handler_a
-            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), b_req))
+            .handle_challenge_convergence(&convergence_envelope(node_b, b_req))
             .await
             .unwrap();
-        let a_reply = outbox_a
+        let (a_reply, a_reply_to) = outbox_a
             .lock()
             .unwrap()
             .pop()
             .expect("A serves B's missing proof");
+        assert_eq!(
+            a_reply_to,
+            Some(node_b),
+            "a convergence reply must be addressed to its requester, not fanned out"
+        );
         handler_b
-            .handle_challenge_convergence(&convergence_envelope(
-                challenger.node_id(),
-                a_reply.clone(),
-            ))
+            .handle_challenge_convergence(&convergence_envelope(node_a, a_reply.clone()))
             .await
             .unwrap();
 
@@ -1410,7 +1433,7 @@ mod tests {
 
         // Re-applying an already-held proof is idempotent (INSERT OR IGNORE).
         handler_b
-            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_reply))
+            .handle_challenge_convergence(&convergence_envelope(node_a, a_reply))
             .await
             .unwrap();
         assert_eq!(
