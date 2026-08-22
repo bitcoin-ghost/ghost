@@ -506,6 +506,33 @@ pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 /// It does NOT ride the Stage 6 deletion release.
 pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 963_388;
 
+/// Stage 6 step 3: height at and above which the coinbase payout commitment is constructed from
+/// this node's OWN shard view, with no BFT vote in the path.
+///
+/// `u64::MAX` = never. Arming is a separate, observed change.
+///
+/// The vote being removed never inspected a share. `PayoutHandler::validate_proposal_split`
+/// recomputes the miner split from the voter's own `local_miner_work` and demands an EXACT match
+/// (GHOST-02), so its entire guarantee is "your arithmetic matches mine" — which is only ever as
+/// strong as the two tables already agreeing. Share validity is established per-share at receive
+/// time (GHOST-09 signature with receiver and address binding, the PoW preimage check, the
+/// difficulty-tier commitment) and is untouched by this gate. Delete the gate, keep the rule.
+///
+/// ⛔ That exactness is a LIVENESS hazard, and it fired: nothing finalised between 18 and 21
+/// August, and one address 6.71% apart rejected every checkpoint symmetrically. An exact-match
+/// vote over tables that can diverge converts divergence into a total payment HALT. Above this
+/// gate divergence is benign instead — `owed` is signed and never clamped, so an over- or
+/// under-payment leaves a residual the next block corrects (SHARE_SHARD.md §4.4, §4.6).
+///
+/// This is what `SHARE_SHARD.md` §8 settles: "No consensus on the ledger. Each node pays from its
+/// own view." §7 lists voting, quorum and two-phase commit as deleted.
+///
+/// ⚠ Removing the vote does NOT remove verification, it relocates it to §6: signature,
+/// well-formedness and summary-chain consistency checked before ANY merge, plus unpredictable
+/// λ-sampling of merkle leaves for PoW + GHOST-09 + binding. λ-sampling must be ENFORCING before
+/// any node we do not own is admitted; this gate does not arm it.
+pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = u64::MAX;
+
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
 ///
@@ -657,6 +684,7 @@ mod gates {
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
     pub(super) static CHECKPOINT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
+    pub(super) static PAYOUT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
     /// Not a height — the difficulty-tier floor the shard will ingest. Same reasoning as the
     /// gates: a regtest fleet cannot mine one, so without an override the rehearsal exercises an
     /// empty shard. See [`crate::network_tier_log2`].
@@ -742,6 +770,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         MESH_NODE_LIST_CHECKPOINT_HEIGHT,
     );
+    let payout_from_shard = gates::from_env(
+        "GHOST_PAYOUT_FROM_SHARD_HEIGHT",
+        network,
+        PAYOUT_FROM_SHARD_HEIGHT,
+    );
     let checkpoint_from_shard = gates::from_env(
         "GHOST_CHECKPOINT_FROM_SHARD_HEIGHT",
         network,
@@ -762,6 +795,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::ADDRESS_PROOF.set(address_proof);
     let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
     let _ = gates::CHECKPOINT_FROM_SHARD.set(checkpoint_from_shard);
+    let _ = gates::PAYOUT_FROM_SHARD.set(payout_from_shard);
 
     // Not a height, but resolved here for the same reason and under the same mainnet lock, so
     // there is one place to look for "what did this run actually enforce".
@@ -915,6 +949,12 @@ pub fn observed_settlement_height() -> u64 {
 /// instead of the legacy unpaid ledger (#722).
 pub fn checkpoint_from_shard_height() -> u64 {
     *gates::CHECKPOINT_FROM_SHARD.get_or_init(|| CHECKPOINT_FROM_SHARD_HEIGHT)
+}
+
+/// Height at and above which the coinbase payout commitment is built from this node's own shard
+/// view, with no BFT vote in the path (Stage 6 step 3).
+pub fn payout_from_shard_height() -> u64 {
+    *gates::PAYOUT_FROM_SHARD.get_or_init(|| PAYOUT_FROM_SHARD_HEIGHT)
 }
 
 /// Height at and above which the checkpoint adopts the per-address median of voters' own
@@ -1090,6 +1130,28 @@ mod in_dns_tests {
         let resolved = vec![ip("83.136.251.162"), ip("2001:db8::1")];
         let local = vec![ip("10.0.0.5"), ip("2001:db8::1")];
         assert_eq!(is_in_mining_dns(&resolved, &local), InDns::Yes);
+    }
+}
+
+#[cfg(test)]
+mod payout_from_shard_gate_tests {
+    use super::PAYOUT_FROM_SHARD_HEIGHT;
+
+    /// **The dark-landing proof for Stage 6 step 3.** The gate ships as `u64::MAX`, so no live
+    /// height takes the no-vote path and every payout on the deployed fleet still goes through
+    /// BFT exactly as it does today. Arming is a separate, observed change.
+    ///
+    /// ⚠ Asserted as `== u64::MAX` rather than "large", because the whole safety argument for
+    /// shipping this in one release with nothing deleted is that it is UNREACHABLE. A height that
+    /// merely looked far away would still fire, and it would fire on one node before the others.
+    #[test]
+    fn the_no_vote_path_ships_unreachable() {
+        assert_eq!(
+            PAYOUT_FROM_SHARD_HEIGHT,
+            u64::MAX,
+            "Stage 6 step 3 must land dark — arming it is a separate change, made once the whole \
+             fleet runs a binary that has the local path"
+        );
     }
 }
 

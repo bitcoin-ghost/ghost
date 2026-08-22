@@ -1019,6 +1019,52 @@ impl TemplateProcessor {
         );
     }
 
+    /// Stage 6 step 3: commit to a payout this node constructed itself, with no vote in the path.
+    ///
+    /// Used at and above `payout_from_shard_height()`. The proposal is already built from this
+    /// node's own shard view (`BlockFoundData::shard_owed`), so there is nothing to ratify — per
+    /// `SHARE_SHARD.md` §8, "no consensus on the ledger; each node pays from its own view".
+    ///
+    /// Deliberately identical to [`Self::set_approved_payout`] in EVERY step that touches money:
+    /// the same `CoinbaseCommitment::from_proposal` over the same `effective_treasury_address`,
+    /// the same persistence, the same `approved_payout` handle the coinbase builder reads. This
+    /// is a change of ROUTE, not of AMOUNT, and `local_commitment_matches_the_voted_one` pins
+    /// that byte-for-byte.
+    ///
+    /// The one difference is the MED-POOL-6 cache lookup, which is absent because it cannot apply.
+    /// That guard exists because a stale VOTE can arrive after a restart for a proposal whose
+    /// in-memory data is gone; a proposal this node just built is in hand by construction, so
+    /// looking it up to check it exists would be a check that cannot fail.
+    pub fn set_local_payout(&self, proposal: PayoutProposal) {
+        let proposal_hash = proposal.proposal_hash;
+
+        // Cache it first: the coinbase builder resolves `approved_payout` back through
+        // `get_proposal`, so publishing the handle before the data would race a template refresh.
+        self.store_proposal(proposal.clone());
+
+        // M-28: same commitment constructor the voted path uses.
+        let treasury_addr = self.effective_treasury_address(&proposal);
+        let commitment = CoinbaseCommitment::from_proposal(&proposal, &treasury_addr);
+        self.coinbase_verifier.set_commitment(commitment);
+
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.mark_payout_approved(&proposal_hash) {
+                warn!(
+                    hash = %hex::encode(&proposal_hash[..8]),
+                    error = %e,
+                    "Failed to persist local payout to database"
+                );
+            }
+            self.record_payout_entries(db, &proposal);
+        }
+
+        *self.approved_payout.write() = Some(proposal_hash);
+        info!(
+            hash = %hex::encode(&proposal_hash[..8]),
+            "Set locally-constructed payout for coinbase (no vote)"
+        );
+    }
+
     /// Record individual payout entries to the database for history tracking.
     ///
     /// Converts each `PayoutEntry` from the proposal into a `PayoutRecord`
@@ -3700,6 +3746,127 @@ struct FilterStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Stage 6 step 3: paying from this node's own shard view ──────────────────────────────
+
+    fn stage6_processor() -> TemplateProcessor {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        TemplateProcessor::new(
+            TemplateConfig::default(),
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::default(),
+        )
+    }
+
+    fn stage6_proposal() -> PayoutProposal {
+        use ghost_common::types::PayoutEntry;
+        PayoutProposal {
+            proposal_hash: [7u8; 32],
+            round_id: 4242,
+            block_hash: [2u8; 32],
+            block_height: 963_500,
+            proposer: [3u8; 32],
+            miner_payouts: vec![
+                PayoutEntry {
+                    address: b"bc1qminer1".to_vec(),
+                    amount: 100_000_000,
+                    recipient_id: [10u8; 32],
+                    payout_type: PayoutType::Mining,
+                },
+                PayoutEntry {
+                    address: b"bc1qminer2".to_vec(),
+                    amount: 50_000_000,
+                    recipient_id: [11u8; 32],
+                    payout_type: PayoutType::Mining,
+                },
+            ],
+            node_payouts: vec![PayoutEntry {
+                address: b"bc1qnode1".to_vec(),
+                amount: 25_000_000,
+                recipient_id: [20u8; 32],
+                payout_type: PayoutType::NodeReward,
+            }],
+            treasury_amount: 12_500_000,
+            treasury_address: b"bc1qtreasury".to_vec(),
+            tx_fees: 1_000_000,
+            subsidy: 312_500_000,
+            timestamp: 1_700_000_000,
+            tx_fees_unallocated: 0,
+        }
+    }
+
+    /// **The test this change rests on.** Removing the vote must change the ROUTE a payout takes,
+    /// never the AMOUNT it pays. Both paths are driven with the same proposal and the resulting
+    /// M-28 commitments are compared field by field — a divergence here would mean the fleet
+    /// commits to different coinbase outputs either side of the gate, which is the one outcome
+    /// that cannot be allowed to reach a block.
+    #[test]
+    fn local_commitment_is_byte_identical_to_the_voted_one() {
+        let proposal = stage6_proposal();
+
+        let voted = stage6_processor();
+        voted.store_proposal(proposal.clone());
+        voted.set_approved_payout(proposal.proposal_hash);
+        let voted_commitment = voted
+            .coinbase_verifier
+            .get_commitment()
+            .expect("voted path must set a commitment");
+
+        let local = stage6_processor();
+        local.set_local_payout(proposal.clone());
+        let local_commitment = local
+            .coinbase_verifier
+            .get_commitment()
+            .expect("local path must set a commitment");
+
+        assert_eq!(
+            local_commitment.output_hash, voted_commitment.output_hash,
+            "output hash differs — the two paths would commit to different coinbase outputs"
+        );
+        assert_eq!(local_commitment.total_value, voted_commitment.total_value);
+        assert_eq!(local_commitment.output_count, voted_commitment.output_count);
+        assert_eq!(local_commitment.round_id, voted_commitment.round_id);
+        assert_eq!(local_commitment.block_height, voted_commitment.block_height);
+        assert_eq!(
+            local_commitment.proposal_hash, voted_commitment.proposal_hash,
+            "commitment must be bound to the same proposal"
+        );
+    }
+
+    /// The coinbase builder resolves `approved_payout` back through `get_proposal`, so publishing
+    /// the handle before the data would let a template refresh land on a hash whose proposal is
+    /// not in the cache — the MED-POOL-6 failure, reached by a different route.
+    #[test]
+    fn set_local_payout_caches_the_proposal_it_publishes() {
+        let proposal = stage6_proposal();
+        let processor = stage6_processor();
+
+        processor.set_local_payout(proposal.clone());
+
+        let approved = *processor.approved_payout.read();
+        assert_eq!(approved, Some(proposal.proposal_hash));
+        assert!(
+            processor.get_proposal(&proposal.proposal_hash).is_some(),
+            "the proposal the approved handle names must be retrievable"
+        );
+    }
+
+    /// `set_approved_payout` refuses a hash it has no data for. `set_local_payout` takes the
+    /// proposal by value and therefore cannot be in that position — this pins the distinction so
+    /// nobody "tidies" the two into one signature and reintroduces the lookup.
+    #[test]
+    fn the_voted_path_still_refuses_a_hash_it_has_no_data_for() {
+        let processor = stage6_processor();
+
+        processor.set_approved_payout([99u8; 32]);
+
+        assert!(
+            processor.approved_payout.read().is_none(),
+            "a hash with no cached proposal must not become the approved payout"
+        );
+        assert!(processor.coinbase_verifier.get_commitment().is_none());
+    }
 
     #[test]
     fn test_height_encoding() {
