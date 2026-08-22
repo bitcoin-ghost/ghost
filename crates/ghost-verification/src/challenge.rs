@@ -575,9 +575,17 @@ pub struct ConvergenceLaneStats {
     pub unicast: u64,
     /// Dequeued frames fanned out to every connected peer.
     pub fanout: u64,
-    /// Addressed frames that fell back to fan-out because the peer was not in the peer set. A
-    /// rising value means addressing is not landing and the drain still pays full fan-out cost.
+    /// Addressed frames that fell back to fan-out because the peer was not in the peer set, or
+    /// because the node has no Noise pool to address anything over. A rising value means
+    /// addressing is not landing and the drain still pays full fan-out cost.
     pub unaddressable: u64,
+    /// Frames the transport failed to send AFTER they were dequeued. Same effect as `shed` — the
+    /// frame never reached the wire — but a different cause, and a unicast has none of the
+    /// accidental redundancy a fan-out had, so this is the counter that catches a broken link.
+    pub send_failed: u64,
+    /// Frames discarded at the head of the queue for being stale. `shed` means production outran
+    /// the drain; `expired` means the drain outran the frame's usefulness.
+    pub expired: u64,
 }
 
 /// Mesh message-validation counters surfaced on `/health`.

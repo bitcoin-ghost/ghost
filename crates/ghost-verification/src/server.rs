@@ -3728,6 +3728,8 @@ mod tests {
                 unicast: 8_800,
                 fanout: 200,
                 unaddressable: 0,
+                send_failed: 12,
+                expired: 47,
             },
             challenge: ConvergenceLaneStats::default(),
         });
@@ -3745,6 +3747,16 @@ mod tests {
             stats.share.unicast, 8_800,
             "whether replies are addressed must be readable, or a silently unaddressed fleet \
              looks identical to a fixed one"
+        );
+        // The three ways a frame fails to reach the wire must be separable, or an operator cannot
+        // tell a broken link from an overloaded producer from a drain that fell behind.
+        assert_eq!(
+            stats.share.send_failed, 12,
+            "a frame the transport could not send is lost as completely as a shed one"
+        );
+        assert_eq!(
+            stats.share.expired, 47,
+            "frames discarded for staleness must be distinguishable from frames shed on enqueue"
         );
     }
 
