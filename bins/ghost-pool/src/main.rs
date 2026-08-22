@@ -7678,6 +7678,14 @@ async fn main() -> Result<()> {
     // (its default is the dormant u64::MAX, so an unwired embedder cannot arm early).
     verification_state =
         verification_state.with_share_tier_bind_height(ghost_pool::share_tier_bind_height());
+    // H-13: the same hand-off for SHARE_POW_VERIFY. At and above this height ingest REQUIRES the
+    // 80-byte header, rather than treating its absence as "no evidence, so admit". Without that,
+    // the PoW check the webhook gained was bypassable by simply omitting the header — which is
+    // exactly what an attacker minting work would do. Requiring it here matches the rule already
+    // in force below: since this gate armed, `with_share_recorder` attaches the header to every
+    // `ShareProof`, so a header-less share is already unverifiable at every peer.
+    verification_state =
+        verification_state.with_share_pow_verify_height(ghost_pool::share_pow_verify_height());
     // A-2b: hand the verification server the same warm block-hash oracle the payout
     // checkpoint uses, so /api/v1/qualification/scoped-set can compute the
     // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
@@ -8463,7 +8471,12 @@ async fn main() -> Result<()> {
             share_hash: canonical_share_hash,
             timestamp: share.timestamp as i64,
             received_by: hex::encode(&identity_for_shares.node_id()[..8]),
-            valid: true, // Already validated by SRI Pool
+            // H-13: this used to read "Already validated by SRI Pool", which was a claim about a
+            // process on the other side of an HTTP endpoint that anything on the box could call.
+            // It is now true of this share specifically: the ingest gate in
+            // `VerificationState::record_share` has recomputed sha256d(header) and confirmed it
+            // justifies `share.work` before this recorder ever ran.
+            valid: true,
         };
 
         // Establish which node this share was really mined for, from the share itself.

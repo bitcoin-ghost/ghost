@@ -64,6 +64,7 @@ mod tests {
         ShareWebhookWorker::new(
             ShareWebhookConfig {
                 url: "http://127.0.0.1:0/unused".to_string(),
+                secret: hex::encode([7u8; 32]),
                 batch_size: 1,
                 batch_timeout_ms: 1000,
                 max_retries: 0,

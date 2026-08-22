@@ -61,6 +61,13 @@ monitoring_address = "127.0.0.1:9090"
 # Native integration with ghost-pool for share accounting
 [share_webhook]
 url = "http://127.0.0.1:8080/api/internal/shares"
+# MANDATORY (H-13). Must be byte-for-byte the co-located ghost-pool's
+# [network] internal_api_secret from pool.toml. ghost-pool authorised this webhook by
+# "the TCP peer is 127.0.0.1" alone, which every process on the box satisfies — and which a
+# reverse proxy in front of :8080 hands to the whole internet. Each batch is now signed
+# HMAC-SHA256 over `timestamp || body` under this secret.
+# There is no default: pool_sv2 refuses to start without it, rather than mining into 401s.
+secret = "${INTERNAL_API_SECRET}"
 batch_size = 50
 batch_timeout_ms = 2000
 max_retries = 3

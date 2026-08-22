@@ -30,7 +30,20 @@ clap = { version = "4.5.39", features = ["derive"] }
 bitcoin_core_sv2 = { path = "../../crates/bitcoin-core-sv2" }
 jd_server_sv2 = { path = "../jd-server-sv2" }
 hex = "0.4.3"
+# Share-webhook request signing (H-13): the emitter's half of the InternalAuth HMAC that
+# ghost-pool now requires on `/api/internal/share{,s}`.
+hmac = { workspace = true }
+sha2 = { workspace = true }
 hotpath = "0.14.0"
+
+[dev-dependencies]
+# H-13. The share webhook is signed here and verified in ghost-verification, and the two halves
+# have to agree on bytes nobody can see on the wire: `timestamp.to_le_bytes() || body`. A signer
+# test that reimplements the MAC would only prove the test agrees with itself — the same mistake
+# that let a byte-order bug reject every share in production for 30 minutes — so the round trip
+# is asserted against the REAL verifier. No cycle: ghost-verification does not depend on this
+# crate, and this is a dev-dependency only.
+ghost-verification = { workspace = true }
 
 [features]
 default = ["monitoring"]

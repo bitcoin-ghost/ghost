@@ -41,6 +41,17 @@ fn default_share_webhook_max_retries() -> u32 {
 pub struct ShareWebhookConfig {
     /// URL to POST share batches to.
     pub url: String,
+    /// Shared secret for signing each batch, hex (64 chars = 32 bytes). Must equal the
+    /// co-located ghost-pool's `[network] internal_api_secret` (H-13).
+    ///
+    /// **Mandatory when this section is present, and deliberately has no default.** ghost-pool
+    /// authorised this webhook by `is_loopback()` alone, so every process on the box could write
+    /// to the payout ledger; it now requires an HMAC-SHA256 over `timestamp || body` under this
+    /// secret. A `#[serde(default)]` here would let a stale config start a pool that mines
+    /// happily while every batch is rejected `401` and the shares are lost — silent, and paid for
+    /// in miners' work. A missing key instead fails config parse at startup, loudly, before a
+    /// single miner connects.
+    pub secret: String,
     /// Number of shares to accumulate before sending a batch.
     #[serde(default = "default_share_webhook_batch_size")]
     pub batch_size: usize,

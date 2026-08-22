@@ -195,6 +195,13 @@ impl ShareWebhookSender {
 pub struct ShareWebhookWorker {
     receiver: mpsc::Receiver<WebhookItem>,
     config: ShareWebhookConfig,
+    /// The 32-byte share-webhook secret, decoded once at construction (H-13).
+    ///
+    /// Decoded here rather than per request so a mistyped secret is a startup failure instead of
+    /// a per-batch `401` nobody reads. `None` means the configured hex would not decode to 32
+    /// bytes; `send_batch` then refuses to send at all, because an unsigned batch would be
+    /// rejected by ghost-pool anyway and retrying it only hides the misconfiguration.
+    secret: Option<[u8; 32]>,
     pool_id: u16,
     batch_seq: AtomicU64,
     client: reqwest::Client,
@@ -218,9 +225,19 @@ impl ShareWebhookWorker {
 
         let recent_skeletons = Arc::new(Mutex::new((HashSet::new(), VecDeque::new())));
 
+        let secret = decode_secret(&config.secret);
+        if secret.is_none() {
+            error!(
+                "share_webhook.secret is not 64 hex characters (32 bytes); ghost-pool will reject \
+                 every share batch. It must match the co-located ghost-pool's \
+                 [network] internal_api_secret."
+            );
+        }
+
         let worker = ShareWebhookWorker {
             receiver,
             config,
+            secret,
             pool_id,
             batch_seq: AtomicU64::new(0),
             client,
@@ -347,16 +364,50 @@ impl ShareWebhookWorker {
             skeletons: std::mem::take(skeletons),
         };
 
+        // Serialise ONCE and send those exact bytes. The HMAC covers the body, so re-serialising
+        // per attempt (or letting `reqwest::json` serialise separately from what we signed) would
+        // risk signing bytes other than the ones sent — serde_json is stable here, but "the two
+        // will surely agree" is precisely the assumption that produces an unreproducible signature
+        // failure at 3am.
+        let body = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(batch_seq, error = %e, "Share batch could not be serialised; dropped");
+                self.forget_skeletons(&payload.skeletons);
+                return;
+            }
+        };
+
+        let Some(secret) = self.secret else {
+            error!(
+                batch_seq,
+                share_count,
+                "Share batch dropped: no usable share_webhook.secret, so it cannot be signed and \
+                 ghost-pool would reject it"
+            );
+            self.forget_skeletons(&payload.skeletons);
+            return;
+        };
+
         let mut attempts = 0;
         let max_retries = self.config.max_retries;
 
         loop {
             attempts += 1;
 
+            // Signed per attempt, not once: the timestamp is inside the MAC and ghost-pool only
+            // accepts a 30-second window, so a batch that backs off past that window would fail
+            // authentication for ever if it carried the original stamp.
+            let timestamp = now_secs();
+            let signature = sign_body(&secret, timestamp, &body);
+
             match self
                 .client
                 .post(&self.config.url)
-                .json(&payload)
+                .header("Content-Type", "application/json")
+                .header("X-Ghost-Timestamp", timestamp.to_string())
+                .header("X-Ghost-Signature", signature)
+                .body(body.clone())
                 .send()
                 .await
             {
@@ -406,6 +457,35 @@ impl ShareWebhookWorker {
     }
 }
 
+/// Decode the configured share-webhook secret, or `None` if it is not 32 bytes of hex.
+fn decode_secret(hex_secret: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(hex_secret.trim()).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
+/// Sign a request body the way `ghost_verification::auth::InternalAuth` verifies it (H-13).
+///
+/// `HMAC-SHA256(secret, timestamp.to_le_bytes() || body)`, hex-encoded. The byte order of the
+/// timestamp and the fact that it is hashed BEFORE the body are both part of the contract — the
+/// verifier does `mac.update(&timestamp.to_le_bytes()); mac.update(body)` — so this must not be
+/// "tidied" into a string concatenation.
+fn sign_body(secret: &[u8; 32], timestamp: u64, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(&timestamp.to_le_bytes());
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Get current timestamp in whole seconds (the unit `X-Ghost-Timestamp` carries).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Get current timestamp in milliseconds
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -423,6 +503,7 @@ mod tests {
             crate::config::ShareWebhookConfig {
                 // Port 0 never accepts, so every send fails — which is the case under test.
                 url: "http://127.0.0.1:1/never".to_string(),
+                secret: hex::encode([7u8; 32]),
                 batch_size: 1,
                 batch_timeout_ms: 1000,
                 max_retries: 0,
@@ -456,6 +537,55 @@ mod tests {
             }
         }
         assert_eq!(ids, vec!["aa".to_string(), "bb".to_string()]);
+    }
+
+    /// H-13, the two halves of the share-webhook signature meeting.
+    ///
+    /// `sign_body` here and `InternalAuth::verify` in ghost-pool have to agree on bytes that
+    /// appear nowhere on the wire: the timestamp is hashed as LITTLE-ENDIAN u64 and hashed
+    /// BEFORE the body. Nothing in either signature says so, and getting it wrong produces a
+    /// pool that mines happily while every batch is rejected `401` — silent, and paid for in
+    /// miners' work. That is the exact shape of the outage this endpoint already caused once.
+    ///
+    /// So this drives the REAL verifier rather than restating the construction: a test that
+    /// recomputed the MAC would agree with a wrong implementation just as readily.
+    #[test]
+    fn a_signed_batch_verifies_against_the_pool_side_verifier() {
+        // Varied bytes: `InternalAuth::new` refuses an all-one-byte secret as low entropy.
+        let mut secret = [0u8; 32];
+        for (i, b) in secret.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x42);
+        }
+        let auth = ghost_verification::auth::InternalAuth::new(&secret).unwrap();
+        let body = br#"{"pool_id":1,"batch_seq":1,"shares":[]}"#;
+        let ts = now_secs();
+
+        let signature = sign_body(&secret, ts, body);
+        assert!(
+            auth.verify(&signature, ts, body).is_ok(),
+            "ghost-pool must accept the signature this emitter produces"
+        );
+
+        // Negative controls, so the assertion above cannot be passing for a trivial reason.
+        assert!(
+            auth.verify(&signature, ts, b"tampered body").is_err(),
+            "the signature must cover the body"
+        );
+        assert!(
+            auth.verify(&sign_body(&[9u8; 32], ts, body), ts, body)
+                .is_err(),
+            "a different secret must not verify"
+        );
+    }
+
+    /// A secret that is not 32 bytes of hex is a misconfiguration, not something to paper over:
+    /// an unsigned batch is rejected by ghost-pool, so retrying it only hides the cause.
+    #[test]
+    fn a_malformed_secret_is_refused_rather_than_half_accepted() {
+        assert_eq!(decode_secret(&hex::encode([7u8; 32])), Some([7u8; 32]));
+        assert_eq!(decode_secret("  0011"), None, "too short");
+        assert_eq!(decode_secret(&"aa".repeat(33)), None, "too long");
+        assert_eq!(decode_secret("zz".repeat(32).as_str()), None, "not hex");
     }
 
     /// **The self-healing property.**
