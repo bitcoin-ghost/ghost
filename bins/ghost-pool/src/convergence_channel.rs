@@ -127,7 +127,7 @@ const SHED_LOG_INTERVAL_SECS: u64 = 60;
 
 impl ConvergenceCounters {
     /// Record a shed frame. Returns `true` if the caller should emit a log line — at most once
-    /// per [`SHED_LOG_INTERVAL_SECS`], whatever the burst rate.
+    /// per `SHED_LOG_INTERVAL_SECS` (60s), whatever the burst rate.
     pub fn record_shed(&self, now_secs: u64) -> bool {
         self.shed.fetch_add(1, Ordering::Relaxed);
         let last = self.last_shed_log.load(Ordering::Relaxed);
