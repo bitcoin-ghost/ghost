@@ -415,6 +415,17 @@ verdict_case "unreadable baseline -> not measurable, proceed"                   
 verdict_case "unreadable post with a real baseline -> proceed"                  52 "" 400 30 no
 verdict_case "unreadable submit count with silence -> proceed"                  52 0 400 "" no
 
+# ⛔ MINIMUM SAMPLE (ghost-vm7, 2026-08-23). A verdict of "nothing was credited" only carries
+# information when enough work arrived that zero is surprising. vm7 was rolled back on submits=2,
+# and a local share for that window DID exist — the read happened before the insert landed. The
+# node it convicted was the busiest on the fleet; the restart's own miner shed is what shrank the
+# sample that then condemned it. Insert lag and an ordinary share rejection each explain one
+# uncredited share, and neither is an outage.
+verdict_case "work arrived but only 2 submissions -> too small to convict"      52 0 400 2 no
+verdict_case "just below the floor -> too small to convict"                     52 0 400 7 no
+verdict_case "at the floor with nothing credited -> ROLL BACK"                  52 0 400 8 yes
+verdict_case "well above the floor with nothing credited -> ROLL BACK"          52 0 400 90 yes
+
 # ⛔ THE PROBE ITSELF FAILING. `loglines` is the positive control: zero means journalctl returned
 # nothing — no sudo, rotated journal, ssh trouble — which is NOT the same as "no work arrived".
 # Without this the gate reads a broken probe as a clean shed and proceeds on evidence it never

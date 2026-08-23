@@ -303,7 +303,26 @@ throughput_regressed() {
     [ "$loglines" -gt 0 ] 2>/dev/null || return 1   # probe did not work -> conclude nothing
     [ -n "$submits" ] || return 1
     [ "$submits" -gt 0 ] 2>/dev/null || return 1    # nothing arrived -> a shed, not a discard
-    # Work arrived and NOTHING was credited. That is the H-13 signature.
+
+    # MINIMUM SAMPLE. "Nothing was credited" only means something when enough work arrived that
+    # zero is surprising. It is not surprising at n=2.
+    #
+    # ghost-vm7, 2026-08-23: rolled back on `submits=2, batches=1, credited=0`. A local share for
+    # that window DID exist — the read simply happened before the insert landed. One late row on a
+    # sample of two produced a confident verdict about a healthy binary, and the node it convicted
+    # was the busiest on the fleet (103 local shares/5m before the swap), so the restart's own
+    # miner shed is exactly what shrank the sample that then condemned it.
+    #
+    # Two independent things can each explain a single uncredited share and neither is an outage:
+    # insert lag against a fixed-width window, and an ordinary share rejection (stale, duplicate,
+    # below target). Requiring several means both would have to happen repeatedly.
+    #
+    # This BOUNDS a correct signal; it does not replace one. Below the floor the answer is
+    # "not measurable", which the caller reports as UNVERIFIED and proceeds — never as healthy.
+    H13_MIN_SUBMITS="${H13_MIN_SUBMITS:-8}"
+    [ "$submits" -ge "$H13_MIN_SUBMITS" ] 2>/dev/null || return 1
+
+    # Work arrived in quantity and NOTHING was credited. That is the H-13 signature.
     return 0
 }
 
@@ -736,6 +755,11 @@ if [ -z "${ROLLBACK:-}" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
         info "no local shares since the swap, and pool_sv2 received NO submissions either: the"
         info "  restart shed this node's miners and they have rehomed via the mining DNS (all eight"
         info "  nodes are in it). Not H-13 — throughput here is UNVERIFIED, not regressed. Proceeding."
+    elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null && [ -n "${WH_SUBMITS:-}" ] && [ "${WH_SUBMITS:-0}" -gt 0 ] 2>/dev/null && [ "${WH_SUBMITS:-0}" -lt "${H13_MIN_SUBMITS:-8}" ] 2>/dev/null; then
+        info "WARNING: no shares credited since the swap, but only ${WH_SUBMITS} submission(s) arrived —"
+        info "  below the ${H13_MIN_SUBMITS:-8} needed for 'nothing credited' to mean anything. A single"
+        info "  uncredited share is explained by insert lag or an ordinary rejection. Throughput here is"
+        info "  UNVERIFIED, not regressed. Proceeding — re-check this node by hand."
     elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null; then
         info "WARNING: no shares since the swap and pool_sv2's activity is UNREADABLE"
         info "  (loglines='${WH_LINES:-}' submits='${WH_SUBMITS:-}') — cannot distinguish H-13 from a"
