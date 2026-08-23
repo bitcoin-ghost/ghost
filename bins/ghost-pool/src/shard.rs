@@ -289,32 +289,6 @@ pub struct SettleReport {
     pub deferred: usize,
 }
 
-/// How far the shard's balances have drifted from the legacy ledger's.
-///
-/// This is the soak signal the cutover is judged on: if the two agree, a coinbase built from the
-/// shard pays what the coinbase built from the ledger would have paid, and the switch is safe. If
-/// they disagree, the disagreement is visible here BEFORE any money moves rather than afterwards.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DriftReport {
-    /// Addresses both sides know, whose micro-work totals differ, with `shard − ledger`.
-    pub differing: Vec<(String, i64)>,
-    /// Addresses the shard credits that the legacy ledger does not.
-    pub only_shard: Vec<String>,
-    /// Addresses the legacy ledger credits that the shard does not.
-    pub only_ledger: Vec<String>,
-    /// Addresses agreeing exactly. The number that should be ~everything.
-    pub agreeing: usize,
-    /// Net `shard − ledger` across every address, in micro-work.
-    pub net_micro: i64,
-}
-
-impl DriftReport {
-    /// Whether the two ledgers agree completely.
-    pub fn is_clean(&self) -> bool {
-        self.differing.is_empty() && self.only_shard.is_empty() && self.only_ledger.is_empty()
-    }
-}
-
 /// The shard's view on this node: the merged table, plus the fold watermark.
 pub struct ShardRuntime {
     identity: Arc<NodeIdentity>,
@@ -845,18 +819,6 @@ impl ShardRuntime {
         self.table.lock().owed()
     }
 
-    /// Compare the shard's balances against the legacy unpaid ledger.
-    ///
-    /// ⚠ **Call this once per EPOCH, never per tick.** It runs `get_top_unpaid_addresses`, which is
-    /// the 2.76M-row, ~1.6 s scan already running at roughly 40% duty on the propose and vote
-    /// paths — the very load this design exists to delete. Hourly it is lost in the noise; every
-    /// thirty seconds it would be a meaningful share of the node, and we would have rebuilt the
-    /// problem while measuring the cure for it.
-    ///
-    /// Compares in integer micro-work, converted the same way [`micro_work`] converts, so a
-    /// difference here is a real difference and not a rounding artefact of the comparison.
-    ///
-    /// [`micro_work`]: ghost_common::work_fold::micro_work
     /// Build this node's §12.6 whole-table sync REQUEST.
     ///
     /// Carries our own root so the responder can see the drift too — either side can log it.
@@ -1510,39 +1472,6 @@ impl ShardRuntime {
                 Ok(TableSyncMerge::Rejected(format!("{:?}", e)))
             }
         }
-    }
-
-    pub fn drift_against_legacy_ledger(&self, cutoff_ts: i64) -> GhostResult<DriftReport> {
-        let ledger = self.db.get_top_unpaid_addresses(cutoff_ts, u32::MAX)?;
-        let ledger: BTreeMap<String, i64> = ledger
-            .into_iter()
-            .map(|(addr, work, _)| (addr, ghost_common::work_fold::micro_work(work)))
-            .collect();
-
-        let owed = self.table.lock().owed();
-        let mut report = DriftReport::default();
-
-        for (addr, &shard_micro) in &owed {
-            match ledger.get(addr) {
-                Some(&ledger_micro) if ledger_micro == shard_micro => report.agreeing += 1,
-                Some(&ledger_micro) => {
-                    let delta = shard_micro.saturating_sub(ledger_micro);
-                    report.net_micro = report.net_micro.saturating_add(delta);
-                    report.differing.push((addr.clone(), delta));
-                }
-                None => {
-                    report.net_micro = report.net_micro.saturating_add(shard_micro);
-                    report.only_shard.push(addr.clone());
-                }
-            }
-        }
-        for (addr, &ledger_micro) in &ledger {
-            if !owed.contains_key(addr) {
-                report.net_micro = report.net_micro.saturating_sub(ledger_micro);
-                report.only_ledger.push(addr.clone());
-            }
-        }
-        Ok(report)
     }
 
     /// Record the height seen on a template refresh. Returns true iff this height crossed into
