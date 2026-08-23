@@ -748,7 +748,6 @@ prune_height = 0
 [pool]
 ${POOL_IDENTITY_BLOCK}
 treasury_address = "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k"
-treasury_fee_percent = 1.0
 min_payout_sats = 10000
 payout_interval_blocks = 100
 
@@ -756,20 +755,26 @@ payout_interval_blocks = 100
 enabled = ${GHOST_PAY}
 virtual_block_secs = 10
 epoch_blocks = 100
-transfer_fee_bps = 10
-min_transfer_fee_sats = 100
 wraith_enabled = ${GHOST_PAY}
-wraith_fee_percent = 0.5
-http_port = 8081
 
-[tdp]
-enabled = true
-port = 8442
-max_connections = 10
+# NOTE (#760): the keys removed from the blocks above and below were read by NOTHING. There is no
+# `#[serde(deny_unknown_fields)]` on NodeConfig, so they parsed, were discarded, and produced no
+# warning — while reading, to anyone opening the file, exactly like settings that were in force:
+#
+#   pool.treasury_fee_percent      no such field on PoolConfig; the split is a constant
+#   ghost_pay.transfer_fee_bps     no such field on GhostPayConfig
+#   ghost_pay.min_transfer_fee_sats  ditto
+#   ghost_pay.wraith_fee_percent   ditto
+#   ghost_pay.http_port            ditto (network.http_port is real; this one was not)
+#   reaper.mode                    no such field on ReaperSettings; the controls are reject_*
+#
+# The whole [tdp] section went with them. TDP is configured on the COMMAND LINE, not in this file:
+# the unit runs `--tdp-enabled --tdp-port 8442`, and `main.rs` sets `tdp_config.port =
+# args.tdp_port`. Putting `port = 8442` here looked like configuration and did nothing, so editing
+# it and restarting changed nothing, silently.
 
 [reaper]
 enabled = ${REAPER}
-mode = "strict"
 EOF
 
 # Change B: mirror internal_api_secret into the dashboard's INTERNAL_AUTH_KEY so
