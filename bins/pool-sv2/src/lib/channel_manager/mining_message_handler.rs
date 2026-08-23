@@ -11,6 +11,7 @@ use stratum_apps::stratum_core::{
             share_accounting::{ShareValidationError, ShareValidationResult},
             standard::StandardChannel,
         },
+        target::hash_rate_to_target,
         Vardiff, VardiffState,
     },
     extensions_sv2::{
@@ -21,6 +22,7 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
+use stratum_apps::utils::types::SharesPerMinute;
 use tracing::{error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
@@ -54,6 +56,63 @@ fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) ->
         }
         None => channel_uid,
     }
+}
+
+/// Error code returned when the extended extranonce allocator has no prefixes left.
+///
+/// The SV2 mining spec only enumerates `unknown-user` and `max-target-out-of-range` for
+/// `OpenMiningChannel.Error`, and the field itself is a free-form human-readable `Str0255`,
+/// so roles are expected to extend the set — this pool already sends
+/// `invalid-user-identity`, `invalid-nominal-hashrate` and `min-extranonce-size-too-large`.
+/// Exhaustion gets its own code because it is an upstream fault with an upstream remedy:
+/// reporting it as `min-extranonce-size-too-large` blames the client's requested size and
+/// sends whoever investigates in exactly the wrong direction.
+pub(crate) const EXTRANONCE_SPACE_EXHAUSTED: &str = "extranonce-space-exhausted";
+
+/// Validates an `OpenExtendedMiningChannel` request and, only if it is acceptable, mints the
+/// extranonce prefix for the channel it will open.
+///
+/// The order here is the whole point. The extended allocator is `server_id || counter` over
+/// `POOL_ALLOCATION_BYTES`, of which the two-byte server id is fixed, leaving a 16-bit
+/// counter — 65,535 prefixes for the lifetime of the process, measured by
+/// `extended_prefix_space_is_only_sixteen_bits` — and a prefix is never handed back. Any
+/// check performed *after* `next_prefix_extended` therefore turns a rejected open into a
+/// permanently burnt prefix, so an unauthenticated client looping deliberately invalid opens
+/// can exhaust the space and stop every honest miner from opening a channel until `pool_sv2`
+/// restarts. Validate first, allocate last: a rejection then costs the attacker nothing and
+/// the pool nothing.
+///
+/// The nominal-hashrate and max-target checks duplicate the first two checks inside
+/// `ExtendedChannel::new_for_pool` on purpose — those are the remaining client-controlled
+/// fields that can reject a channel, and the constructor cannot run before the prefix exists
+/// because it takes the prefix. The constructor's own branches stay in place as a backstop.
+///
+/// On rejection the returned `&'static str` is the `error_code` to put in the
+/// `OpenMiningChannelError` sent back to the client.
+fn validate_and_allocate_extended(
+    extranonce_prefix_factory: &mut ExtendedExtranonce,
+    user_identity: &str,
+    nominal_hash_rate: f32,
+    requested_max_target: &Target,
+    shares_per_minute: SharesPerMinute,
+    requested_min_rollable_extranonce_size: usize,
+) -> Result<(PayoutMode, Vec<u8>), &'static str> {
+    let payout_mode = PayoutMode::try_from(user_identity).map_err(|_| "invalid-user-identity")?;
+
+    let target = hash_rate_to_target(nominal_hash_rate.into(), shares_per_minute.into())
+        .map_err(|_| "invalid-nominal-hashrate")?;
+    if &target > requested_max_target {
+        return Err("max-target-out-of-range");
+    }
+
+    let extranonce_prefix = extranonce_prefix_factory
+        .next_prefix_extended(requested_min_rollable_extranonce_size)
+        .map_err(|e| match e {
+            ExtendedExtranonceError::MaxValueReached => EXTRANONCE_SPACE_EXHAUSTED,
+            _ => "min-extranonce-size-too-large",
+        })?;
+
+    Ok((payout_mode, extranonce_prefix.to_vec()))
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -351,50 +410,42 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     .super_safe_lock(|downstream_data| {
                         let mut messages: Vec<RouteMessageTo> = Vec::new();
 
-                        let extranonce_prefix = match channel_manager_data
-                            .extranonce_prefix_factory_extended
-                            .next_prefix_extended(requested_min_rollable_extranonce_size.into())
-                        {
-                            Ok(extranonce_prefix) => extranonce_prefix.to_vec(),
-                            Err(_) => {
-                                error!("OpenMiningChannelError: min-extranonce-size-too-large");
-                                let open_extended_mining_channel_error = OpenMiningChannelError {
-                                    request_id,
-                                    error_code: "min-extranonce-size-too-large"
-                                        .to_string()
-                                        .try_into()
-                                        .expect("error code must be valid string"),
-                                };
-                                return Ok(vec![(
-                                    downstream_id,
-                                    Mining::OpenMiningChannelError(
-                                        open_extended_mining_channel_error,
-                                    ),
-                                )
-                                    .into()]);
-                            }
-                        };
-
-                        let payout_mode = match PayoutMode::try_from(user_identity.as_str()) {
-                            Ok(mode) => mode,
-                            Err(_) => {
-                                error!("Invalid user_identity '{}': does not match any supported identity format", user_identity);
-                                let open_extended_mining_channel_error = OpenMiningChannelError {
-                                    request_id,
-                                    error_code: "invalid-user-identity"
-                                        .to_string()
-                                        .try_into()
-                                        .expect("error code must be valid string"),
-                                };
-                                return Ok(vec![(
-                                    downstream_id,
-                                    Mining::OpenMiningChannelError(
-                                        open_extended_mining_channel_error,
-                                    ),
-                                )
-                                    .into()]);
-                            }
-                        };
+                        // Validate the request in full BEFORE any extranonce prefix is minted.
+                        // See `validate_and_allocate_extended`: the extended allocator's
+                        // counter is tiny and nothing ever hands a prefix back, so a rejected
+                        // open must never consume one.
+                        let (payout_mode, extranonce_prefix) =
+                            match validate_and_allocate_extended(
+                                &mut channel_manager_data.extranonce_prefix_factory_extended,
+                                user_identity.as_str(),
+                                nominal_hash_rate,
+                                &requested_max_target,
+                                self.shares_per_minute,
+                                requested_min_rollable_extranonce_size.into(),
+                            ) {
+                                Ok(accepted) => accepted,
+                                Err(error_code) => {
+                                    error!(
+                                        "OpenMiningChannelError: {} (user_identity: '{}')",
+                                        error_code, user_identity
+                                    );
+                                    let open_extended_mining_channel_error =
+                                        OpenMiningChannelError {
+                                            request_id,
+                                            error_code: error_code
+                                                .to_string()
+                                                .try_into()
+                                                .expect("error code must be valid string"),
+                                        };
+                                    return Ok(vec![(
+                                        downstream_id,
+                                        Mining::OpenMiningChannelError(
+                                            open_extended_mining_channel_error,
+                                        ),
+                                    )
+                                        .into()]);
+                                }
+                            };
 
                         downstream_data.payout_mode = Some(payout_mode.clone());
 
@@ -1559,5 +1610,190 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             .map_err(|e| PoolError::disconnect(e, downstream_id))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod extranonce_allocation_tests {
+    use super::*;
+    use crate::channel_manager::POOL_ALLOCATION_BYTES;
+
+    /// A `user_identity` this pool rejects: `sri/<mode>` with an unrecognised mode.
+    const INVALID_IDENTITY: &str = "sri/nonsense";
+    /// A `user_identity` this pool accepts (empty means full donation to the pool).
+    const VALID_IDENTITY: &str = "";
+    const SHARES_PER_MINUTE: SharesPerMinute = 6.0;
+    const NOMINAL_HASH_RATE: f32 = 1e12;
+
+    /// Builds the extranonce factory with exactly the geometry `ChannelManager::new` uses, so
+    /// these tests exercise the real allocation space rather than a convenient toy one.
+    fn pool_factory() -> ExtendedExtranonce {
+        let server_id: u16 = 0;
+        ExtendedExtranonce::new(
+            0..0,
+            0..POOL_ALLOCATION_BYTES,
+            POOL_ALLOCATION_BYTES..POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES,
+            Some(server_id.to_be_bytes().to_vec()),
+        )
+        .expect("valid ranges")
+    }
+
+    fn open(
+        factory: &mut ExtendedExtranonce,
+        user_identity: &str,
+    ) -> Result<(PayoutMode, Vec<u8>), &'static str> {
+        validate_and_allocate_extended(
+            factory,
+            user_identity,
+            NOMINAL_HASH_RATE,
+            &Target::MAX,
+            SHARES_PER_MINUTE,
+            CLIENT_SEARCH_SPACE_BYTES,
+        )
+    }
+
+    /// Positive control plus the number the DoS turns on: how many extended channels the pool
+    /// can ever open. Two of the four allocation bytes are the fixed server id, leaving a
+    /// 16-bit counter. If this ever grows, the tests below should still hold — but the loop
+    /// counts need revisiting.
+    #[test]
+    fn extended_prefix_space_is_only_sixteen_bits() {
+        let mut factory = pool_factory();
+        let mut minted = 0usize;
+        loop {
+            match open(&mut factory, VALID_IDENTITY) {
+                Ok(_) => minted += 1,
+                Err(code) => {
+                    assert_eq!(code, EXTRANONCE_SPACE_EXHAUSTED);
+                    break;
+                }
+            }
+            assert!(minted <= 1 << 16, "allocator did not run out");
+        }
+        assert_eq!(minted, (1 << 16) - 1);
+    }
+
+    /// The regression test for #744.
+    ///
+    /// A client that loops `OpenExtendedMiningChannel` with an identity the pool rejects must
+    /// not consume anything, so an honest miner arriving afterwards still gets a channel. The
+    /// loop deliberately runs past the size of the whole allocation space: with the identity
+    /// check performed after allocation, this test fails long before it finishes.
+    #[test]
+    fn rejected_identities_never_consume_a_prefix() {
+        let mut factory = pool_factory();
+
+        let attempts = (1 << 16) + 1_000;
+        for attempt in 0..attempts {
+            match open(&mut factory, INVALID_IDENTITY) {
+                Err("invalid-user-identity") => {}
+                other => panic!(
+                    "attempt {attempt} of {attempts} did not fail cleanly on identity: \
+                     {:?}",
+                    other.map(|(_, prefix)| prefix)
+                ),
+            }
+        }
+
+        let (_, prefix) = open(&mut factory, VALID_IDENTITY)
+            .expect("an honest miner must still be able to open a channel");
+        assert_eq!(prefix.len(), POOL_ALLOCATION_BYTES);
+    }
+
+    /// Same property for the other two client-controlled fields that can reject an open.
+    #[test]
+    fn rejected_hashrate_and_target_never_consume_a_prefix() {
+        let mut factory = pool_factory();
+
+        let attempts = ((1 << 16) + 1_000) / 2;
+        for attempt in 0..attempts {
+            assert_eq!(
+                validate_and_allocate_extended(
+                    &mut factory,
+                    VALID_IDENTITY,
+                    -1.0,
+                    &Target::MAX,
+                    SHARES_PER_MINUTE,
+                    CLIENT_SEARCH_SPACE_BYTES,
+                )
+                .err(),
+                Some("invalid-nominal-hashrate"),
+                "attempt {attempt}"
+            );
+            assert_eq!(
+                validate_and_allocate_extended(
+                    &mut factory,
+                    VALID_IDENTITY,
+                    NOMINAL_HASH_RATE,
+                    &Target::from_le_bytes([0u8; 32]),
+                    SHARES_PER_MINUTE,
+                    CLIENT_SEARCH_SPACE_BYTES,
+                )
+                .err(),
+                Some("max-target-out-of-range"),
+                "attempt {attempt}"
+            );
+        }
+
+        open(&mut factory, VALID_IDENTITY)
+            .expect("an honest miner must still be able to open a channel");
+    }
+
+    /// The runtime tests above prove the helper allocates last. They cannot see whether the
+    /// handler still goes through the helper, and re-inlining an allocation ahead of the
+    /// validation is exactly how #744 was written in the first place — so assert the call
+    /// site against the source: the extended allocator must be unreachable except from
+    /// inside `validate_and_allocate_extended`.
+    ///
+    /// The needles are assembled at run time so this test's own text cannot match them.
+    #[test]
+    fn the_extended_allocator_has_exactly_one_call_site() {
+        let src = include_str!("mining_message_handler.rs");
+        let allocator = format!("next_prefix{}", "_extended(");
+        let helper = format!("fn validate_and_allocate{}(", "_extended");
+
+        let call_sites: Vec<_> = src.match_indices(&allocator).map(|(i, _)| i).collect();
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "the extended extranonce allocator is called from {} places",
+            call_sites.len()
+        );
+
+        let helper_start = src.find(&helper).expect("the helper must still exist");
+        let helper_end = helper_start
+            + src[helper_start..]
+                .find("\n}\n")
+                .expect("the helper must be a top-level fn");
+        assert!(
+            (helper_start..helper_end).contains(&call_sites[0]),
+            "an extranonce prefix is minted outside the validating helper"
+        );
+    }
+
+    /// Exhaustion and "you asked for too many rollable bytes" are different faults with
+    /// different remedies, so they must not share an error code.
+    #[test]
+    fn exhaustion_and_oversized_request_report_different_codes() {
+        let mut oversized = pool_factory();
+        assert_eq!(
+            validate_and_allocate_extended(
+                &mut oversized,
+                VALID_IDENTITY,
+                NOMINAL_HASH_RATE,
+                &Target::MAX,
+                SHARES_PER_MINUTE,
+                CLIENT_SEARCH_SPACE_BYTES + 1,
+            )
+            .err(),
+            Some("min-extranonce-size-too-large")
+        );
+
+        let mut drained = pool_factory();
+        while open(&mut drained, VALID_IDENTITY).is_ok() {}
+        assert_eq!(
+            open(&mut drained, VALID_IDENTITY).err(),
+            Some(EXTRANONCE_SPACE_EXHAUSTED)
+        );
     }
 }
