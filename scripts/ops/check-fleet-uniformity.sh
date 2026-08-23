@@ -99,6 +99,13 @@ COLLECT='
   printf "farm_listen=%s\n"      "$($SUDO ss -ltn 2>/dev/null | grep -c ":4444")"
   printf "farm_ufw=%s\n"         "$($SUDO ufw status 2>/dev/null | grep -c "4444")"
   printf "mining_mode=%s\n"      "$(grep -oP "^\s*mining_mode\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)"
+  # #759: config is never reconciled against what the repo ships, so dead keys survive for months
+  # and required ones are absent while the compiled default silently covers for them. Both are
+  # "correct by accident" — a value nobody chose. List the names, not just a count, so the report
+  # says WHICH.
+  printf "dead_keys=%s\n"        "$(grep -ohE "^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=" /etc/ghost/pool.toml /etc/ghost/translator-config.toml 2>/dev/null | tr -d " =" | sort -u | paste -sd, -)"
+  printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
+  printf "cfg_parses=%s\n"       "$(/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
 '
 
 declare -A VALUES   # VALUES[node|field] = value
@@ -246,6 +253,17 @@ for n in "${REACHED[@]}"; do
     # mining_mode decides whether payouts go through BFT. Relying on MiningMode::default() means a
     # change to that default silently reconfigures the node.
     [ -n "$mm" ] || { echo "  FAIL $n mining_mode is not set in pool.toml — running on MiningMode::default() (#758)"; rc=1; }
+
+    # #759: keys for features that no longer exist, and required keys covered for by a default.
+    dk="${VALUES[$n|dead_keys]:-}"
+    [ -z "$dk" ] || { echo "  FAIL $n config carries dead key(s) for removed features: $dk (#759)"; rc=1; }
+    [ "${VALUES[$n|tdp_cfg]:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n no [tdp] block — template distribution is running on compiled defaults (#759)"; rc=1; }
+    # The strongest single check available: does the shipped binary actually accept this file?
+    case "${VALUES[$n|cfg_parses]:-}" in
+        ok) ;;
+        "") echo "  WARN $n could not run the config parse check" ;;
+        *)  echo "  FAIL $n pool.toml does NOT parse with the deployed ghost-pool — this node will not restart"; rc=1 ;;
+    esac
 
     eb="${VALUES[$n|en_bitcoind]:-}"
     case "$eb" in
