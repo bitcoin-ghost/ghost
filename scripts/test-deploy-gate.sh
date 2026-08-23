@@ -43,6 +43,33 @@ import os, sys
 sys.exit(int(os.environ.get("GATE_SMOKE_EXIT", "0")))
 SMOKE_STUB
 chmod +x "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py"
+
+# Stand-in for ssh, for the ONE precondition that has to ask a node a question: gate 3c, the
+# share-webhook secret. Without it that gate is the only one in the file nobody can drive, which
+# is the position #459 was found in.
+#
+# deploy-node.sh reaches for it through GHOST_DEPLOY_SSH, and ONLY for gate 3c — the transfer and
+# verify paths call `ssh`/`scp` directly, so this cannot silently stand in for a real deploy.
+# Committed rather than written mid-test, for the same reason as the smoke stub: creating a file
+# later dirties the tree and trips gate 1 before the case under test is reached.
+cat > "$REPO_ROOT/scripts/ssh-stub.sh" <<'SSH_STUB'
+#!/usr/bin/env bash
+# The remote command is the last argument; everything before it is ssh options and the host.
+cmd="${@: -1}"
+case "$cmd" in
+    *"cat /etc/ghost/pool-config.toml"*)
+        # An ssh or `cat` that fails yields NO output and a non-zero status, which is what a
+        # root-owned 0600 config on a node we cannot sudo on looks like.
+        [ "${STUB_CONF_UNREADABLE:-0}" = 1 ] && exit 1
+        printf '%s\n' "$STUB_CONF" ;;
+    *"stat -c %Y"*)
+        # Two lines: config mtime, then sri-pool's ActiveEnterTimestamp as an epoch. Either may
+        # be empty, which is how an unreadable stamp reaches the caller.
+        printf '%s\n%s\n' "${STUB_MTIME:-}" "${STUB_START:-}" ;;
+    *)  exit 1 ;;
+esac
+SSH_STUB
+chmod +x "$REPO_ROOT/scripts/ssh-stub.sh"
 git -C "$REPO_ROOT" init -q
 git -C "$REPO_ROOT" add -A
 git -C "$REPO_ROOT" -c user.email=t@t -c user.name=t commit -qm "gate under test"
@@ -59,6 +86,10 @@ run_gate() {
     ( cd "$REPO_ROOT" \
         && GHOST_DEPLOY_REPO_ROOT="$REPO_ROOT" STATE_DIR="$TMP/state" SOAK_MINUTES=60 \
         GATE_SMOKE_EXIT="${GATE_SMOKE_EXIT:-0}" \
+        GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK="${GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK:-}" \
+        STUB_CONF="${STUB_CONF:-}" STUB_CONF_UNREADABLE="${STUB_CONF_UNREADABLE:-0}" \
+        STUB_MTIME="${STUB_MTIME:-}" STUB_START="${STUB_START:-}" \
+        GHOST_DEPLOY_SSH="${GHOST_DEPLOY_SSH:-ssh}" \
         timeout 60 bash "$DEPLOY" "$node" "$binary" 2>&1 )
 }
 
@@ -72,6 +103,22 @@ check() {
         printf "        expected to match: %s\n" "$expect"
         printf "        got: %s\n" "$(head -3 <<<"$out" | tr '\n' ' ')"
         fail=$((fail+1))
+    fi
+}
+
+# The mirror of check(): assert something is NOT in the output. Needed because half of what a
+# gate has to prove is that it PERMITS — a guard that refuses everything passes every refusal
+# assertion in this file and is still useless.
+check_absent() {
+    local name="$1" forbid="$2" out="$3"
+    if grep -qiE "$forbid" <<<"$out"; then
+        printf "  [BAD] %s\n" "$name"
+        printf "        must NOT have matched: %s\n" "$forbid"
+        printf "        got: %s\n" "$(head -3 <<<"$out" | tr '\n' ' ')"
+        fail=$((fail+1))
+    else
+        printf "  [ok ] %s\n" "$name"
+        pass=$((pass+1))
     fi
 }
 
@@ -176,7 +223,144 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. The post-deploy throughput verdict.
+# 8. The share-webhook secret gate (3c), end to end.
+#
+#    Since #742 ghost-pool authenticates every share batch with an HMAC under the co-located
+#    pool_sv2's `[share_webhook] secret`, so the two must be brought up in one order: pool_sv2
+#    configured and restarted FIRST. Backwards, pool_sv2 gets a 401 — which it treats as
+#    PERMANENT, on purpose, because retrying cannot fix a credential — and drops the batch.
+#    Every share submitted into a mis-ordered window is destroyed, not delayed, and nothing
+#    downstream objects: the unit is active, the port listens, /health answers.
+#
+#    Driven through a stub ssh (GHOST_DEPLOY_SSH), because this is the one precondition that has
+#    to ask a node a question, and an unexerciseable guard is the position #459 was found in.
+# ---------------------------------------------------------------------------
+SSH_STUB_BIN="$REPO_ROOT/scripts/ssh-stub.sh"
+GOOD_CONF=$'[share_webhook]\nurl = "http://127.0.0.1:8080/api/internal/shares"\nsecret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"\nbatch_size = 1\n[template_provider_type.Sv2Tp]\naddress = "127.0.0.1:8442"\n'
+
+# The fleet's ACTUAL state on 2026-08-23, measured on all eight nodes: a [share_webhook] section
+# with url/batch_size/timeout/retries and no `secret` at all. This is the case that matters.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" \
+      STUB_CONF=$'[share_webhook]\nurl = "http://127.0.0.1:8080/api/internal/shares"\nbatch_size = 1\nmax_retries = 3\n[template_provider_type.Sv2Tp]\naddress = "127.0.0.1:8442"\n' \
+      run_gate ghost-vm5 ghost-pool)"
+check "refuses ghost-pool when [share_webhook] has no secret" "cannot sign share batches" "$out"
+
+# `grep -q secret` over the whole file would match `internal_api_secret` in [network], a
+# commented-out line, and `secret = \"\"`. All three are the shape this gate exists to refuse.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" \
+      STUB_CONF=$'[network]\ninternal_api_secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"\n[share_webhook]\nurl = "u"\n# secret = "deadbeef"\n' \
+      run_gate ghost-vm5 ghost-pool)"
+check "a secret in ANOTHER section, and a commented-out one, do not satisfy it" \
+    "cannot sign share batches" "$out"
+
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF=$'[share_webhook]\nsecret = ""\n' \
+      run_gate ghost-vm5 ghost-pool)"
+check "an empty secret is refused" "is empty" "$out"
+
+# config/sri/pool-config.toml and install-node.sh both ship this key as a shell placeholder.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF=$'[share_webhook]\nsecret = "${APISECRET}"\n' \
+      run_gate ghost-vm5 ghost-pool)"
+check "an unexpanded install placeholder is refused" "unexpanded install placeholder" "$out"
+
+# FAIL CLOSED. A config that could not be read is not evidence that the secret is there, and the
+# cost of assuming it is is total, silent share loss.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-pool)"
+check "an unreadable config refuses rather than assuming the best" "could not be read" "$out"
+
+# The gate must PERMIT. Reaching "not built" means it cleared 3c and went on to the deploy stage.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
+      STUB_MTIME=1787036059 STUB_START=1787036059 run_gate ghost-vm5 ghost-pool)"
+check_absent "a node with a usable secret is NOT refused" "cannot sign share batches|was edited AFTER" "$out"
+check "a node with a usable secret proceeds to the deploy stage" "not built" "$out"
+
+# Written but not LOADED is the same outage: sri-pool's ExecStartPre rewrites this file on every
+# start, so in the healthy case its mtime always lands just before ActiveEnterTimestamp (measured
+# equal to the second on ghost-vm1 and ghost-vm5). An mtime AFTER it means nobody restarted.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
+      STUB_MTIME=1787036999 STUB_START=1787036059 run_gate ghost-vm5 ghost-pool)"
+check "a secret written but not loaded is refused, naming the restart" "was edited AFTER sri-pool last started" "$out"
+
+# Unreadable stamps are not evidence of staleness, and must not block a deploy on a measurement
+# that was never taken — but the gap must be STATED, not assumed away.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" run_gate ghost-vm5 ghost-pool)"
+check_absent "unreadable stamps do not block" "was edited AFTER" "$out"
+check "unreadable stamps are reported as unverified, not as satisfied" "is unverified" "$out"
+
+# SCOPE. pool_sv2 is how the secret REACHES the node, so gating it would deadlock the remedy the
+# refusal above prints; translator_sv2 never touches this path. Both are driven against the most
+# hostile node state there is — a config that cannot even be read.
+for b in pool_sv2 translator_sv2; do
+    out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 "$b")"
+    check_absent "$b is NOT gated on the webhook secret" "cannot sign share batches" "$out"
+    check "$b still reaches the deploy stage" "not built" "$out"
+done
+
+# The escape hatch, which exists for exactly one thing: rolling back to a ghost-pool that
+# predates #742. It must work, and it must be impossible to miss in a transcript.
+out="$(GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 GHOST_DEPLOY_SSH="$SSH_STUB_BIN" \
+      STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-pool)"
+check_absent "the override skips the gate" "cannot sign share batches" "$out"
+check "the override announces itself loudly" "GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1" "$out"
+check "the override says what it is for" "predates #742" "$out"
+
+# ---------------------------------------------------------------------------
+# 9. The webhook-config parsing predicates, directly.
+#
+#    Sourced out of the real script rather than re-implemented, for the reason section 10 gives:
+#    the H-13 fix shipped with two tests that passed against broken production because both
+#    re-implemented the transformation under test.
+# ---------------------------------------------------------------------------
+eval "$(sed -n '/^webhook_secret_verdict()/,/^}/p' "$DEPLOY")"
+eval "$(sed -n '/^webhook_config_is_stale()/,/^}/p' "$DEPLOY")"
+
+secret_case() {  # label config want("usable"|"refused")
+    local label="$1" conf="$2" want="$3" got=usable
+    webhook_secret_verdict "$conf" >/dev/null || got=refused
+    if [ "$got" = "$want" ]; then
+        printf "  [ok ] %s\n" "$label"
+        pass=$((pass+1))
+    else
+        printf "  [BAD] %s (wanted %s, got %s)\n" "$label" "$want" "$got"
+        fail=$((fail+1))
+    fi
+}
+
+# Section scoping is not decorative: on ghost-vm5 the line after the [share_webhook] block is
+# [template_provider_type.Sv2Tp] with NO blank line between them, so an extractor that does not
+# stop at the next `[` header runs straight on into the next section and reads its keys.
+secret_case "a secret in the FOLLOWING section is not this section's" \
+    $'[share_webhook]\nurl = "u"\n[template_provider_type.Sv2Tp]\nsecret = "deadbeef"\n' refused
+secret_case "no [share_webhook] section at all"        $'[network]\nsecret = "aa"\n'   refused
+secret_case "a commented-out section header is not a section" $'#[share_webhook]\nsecret = "aa"\n' refused
+secret_case "whitespace-only secret is empty"          $'[share_webhook]\nsecret = "   "\n' refused
+secret_case "a real 64-hex secret is usable"           $'[share_webhook]\nsecret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"\n' usable
+secret_case "an unquoted value is usable"              $'[share_webhook]\nsecret=abc123\n' usable
+secret_case "indentation and trailing spaces survive"  $'[share_webhook]\n  secret =  "abc"  \n' usable
+
+stale_case() {  # label mtime started want(yes|no)
+    local label="$1" got=no
+    webhook_config_is_stale "$2" "$3" && got=yes
+    if [ "$got" = "$4" ]; then
+        printf "  [ok ] %s\n" "$label"
+        pass=$((pass+1))
+    else
+        printf "  [BAD] %s (wanted stale=%s, got %s)\n" "$label" "$4" "$got"
+        fail=$((fail+1))
+    fi
+}
+
+stale_case "edited after the unit went active -> stale"           200 100 yes
+# The real reading on ghost-vm1 and ghost-vm5: ExecStartPre rewrites the file, so mtime and
+# ActiveEnterTimestamp land in the SAME second. Equal must not read as stale, or the gate
+# refuses every healthy node on the fleet.
+stale_case "mtime equal to the start second -> current"           1787036059 1787036059 no
+stale_case "restarted after the edit -> current"                  100 200 no
+stale_case "unreadable mtime -> not measurable, do not block"     "" 100 no
+stale_case "unreadable start -> not measurable, do not block"     100 "" no
+stale_case "a non-numeric stamp -> not measurable, do not block"  "x" 100 no
+
+# ---------------------------------------------------------------------------
+# 10. The post-deploy throughput verdict.
 #
 #    This is the check the H-13 outage went straight through: a PoW check with its operands in
 #    the wrong byte order rejected every locally-submitted share on all eight nodes for ~30
@@ -223,7 +407,7 @@ verdict_case "unreadable post with a real baseline -> proceed"                  
 verdict_case "unreadable connection count with silence -> proceed"               52 0 "" no
 
 # ---------------------------------------------------------------------------
-# 9. The remote-read validator. Its predecessor was `tr -cd '0-9'`, which cannot fail: any
+# 11. The remote-read validator. Its predecessor was `tr -cd '0-9'`, which cannot fail: any
 #    stray stdout line has its digits CONCATENATED into the count, so a read that half-worked
 #    came back as a confident wrong number instead of as "unreadable".
 # ---------------------------------------------------------------------------
@@ -253,4 +437,4 @@ if [ "$fail" -ne 0 ]; then
     echo "*** $fail of $((pass+fail)) deploy-gate checks FAILED — the gate is not refusing what it must ***"
     exit 1
 fi
-echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks, and rolls back a deploy that stops crediting work."
+echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks; refuses ghost-pool on a node whose pool_sv2 cannot sign share batches, while leaving pool_sv2 and translator_sv2 free to fix it; and rolls back a deploy that stops crediting work."

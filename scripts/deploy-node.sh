@@ -10,6 +10,8 @@
 #     share attribution.                                         -> requires canary soak
 #   * "It compiled" was treated as "it works".                   -> requires tests + smoke
 #   * Recovery was manual and improvised each time.              -> backup + auto-rollback
+#   * ghost-pool was deployed to a node whose pool_sv2 could not yet SIGN share batches,
+#     so every batch 401'd and was destroyed rather than retried.  -> requires a webhook secret
 #
 # Usage:
 #   scripts/deploy-node.sh <node> <binary> [--canary]
@@ -20,6 +22,14 @@
 #             but NOT the clean-tree or test requirements.
 #
 # Exit codes: 0 ok, 1 precondition failed, 2 deploy failed, 3 smoke failed (rolled back).
+#
+# Environment escape hatch:
+#
+#   GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1
+#       Skips the share-webhook secret precondition (gate 3c) for `ghost-pool` ONLY. It exists
+#       for exactly one situation: ROLLING BACK to a ghost-pool build that predates #742 and
+#       therefore does not require a signature. Anything newer will 401 and destroy shares, so
+#       do not reach for this to "get the deploy through". It prints a banner every time.
 #
 # A CALLER LOOPING OVER BINARIES MUST STOP ON ANY NON-ZERO EXIT. These three binaries talk
 # to each other and are not independently deployable. Rolling v1.11.18 to vm8, pool_sv2
@@ -60,6 +70,11 @@ SOAK_MINUTES="${SOAK_MINUTES:-60}"
 # the moment a soak record carried a recorded hash. Canary deploys skip the block, so it
 # only ever failed on the production path — the one that matters.
 SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes)
+# Overridable so scripts/test-deploy-gate.sh can drive the ONE precondition that has to talk to a
+# node (gate 3c) against a stub, rather than being the one guard in this file that nobody can
+# exercise. Deliberately scoped to that gate: the deploy and verify paths below still call `ssh`
+# and `scp` directly, so nothing here can redirect a real transfer.
+SSH_BIN="${GHOST_DEPLOY_SSH:-ssh}"
 XFER_TIMEOUT="${XFER_TIMEOUT:-300}"
 REMOTE_TIMEOUT="${REMOTE_TIMEOUT:-120}"
 # Overridable alongside STATE_DIR so scripts/test-deploy-gate.sh can drive the gate against a
@@ -258,6 +273,169 @@ throughput_regressed() {
     [ "$conns" -gt 0 ] 2>/dev/null || return 1
     return 0
 }
+
+# Read the `secret` under `[share_webhook]` out of a pool_sv2 config, and say why it is not
+# usable when it is not.
+#
+# Pure, and takes the config TEXT rather than a path, so scripts/test-deploy-gate.sh can drive
+# every branch without a node. The parsing is the part that goes wrong, and it goes wrong
+# silently: `grep -q secret` over the whole file matches `internal_api_secret` in a different
+# section, matches a commented-out line, and matches `secret = ""`. All three are the shape this
+# gate exists to refuse, and all three would have read as satisfied.
+#
+# Section scoping is not decorative either. On ghost-vm5 the very next line after the
+# `[share_webhook]` block is `[template_provider_type.Sv2Tp]` with no blank line between them,
+# so an extractor that does not stop at the next `[` header runs straight on into the next
+# section.
+#
+# Prints a REASON and returns 1 when unusable; prints nothing and returns 0 when usable. The
+# secret's value is never printed, on either path.
+webhook_secret_verdict() {
+    local conf="${1:-}" line value
+    [ -n "$conf" ] || { echo "the config could not be read (empty)"; return 1; }
+    line=$(printf '%s\n' "$conf" | awk '
+        # A section header is a line whose first non-blank character is `[`. A commented-out
+        # header (`#[share_webhook]`) is therefore correctly NOT a header.
+        /^[[:space:]]*\[/ { in_s = ($0 ~ /^[[:space:]]*\[share_webhook\]/); next }
+        # `secret` must start the line (after indentation), so `# secret = ...` and
+        # `internal_api_secret = ...` are both skipped.
+        in_s && /^[[:space:]]*secret[[:space:]]*=/ { print; exit }
+    ')
+    if [ -z "$line" ]; then
+        if printf '%s\n' "$conf" | grep -q '^[[:space:]]*\[share_webhook\]'; then
+            echo "[share_webhook] is present but has no 'secret' key"
+        else
+            echo "there is no [share_webhook] section at all"
+        fi
+        return 1
+    fi
+    value=${line#*=}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    # Strip one matching pair of TOML quotes, then re-trim: `secret = "   "` is empty.
+    case "$value" in
+        '"'*'"') value=${value#\"}; value=${value%\"} ;;
+        "'"*"'") value=${value#\'}; value=${value%\'} ;;
+    esac
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$value" in
+        '')    echo "'secret' under [share_webhook] is empty"; return 1 ;;
+        # config/sri/pool-config.toml and scripts/install-node.sh both ship this key as a shell
+        # placeholder (`${INTERNAL_API_SECRET}`, `${APISECRET}`) to be substituted at install
+        # time. A config where the substitution never happened has a non-empty `secret` that
+        # cannot possibly match ghost-pool's, which is the 401 case wearing a passing shape.
+        *'$'*) echo "'secret' under [share_webhook] is an unexpanded install placeholder"; return 1 ;;
+    esac
+    return 0
+}
+
+# Has the config been edited since the pool_sv2 that is RUNNING read it?
+#
+# The precondition is not "the secret is in the file", it is "the running pool_sv2 is signing
+# with it" — a secret written but not yet loaded produces exactly the outage this gate exists to
+# stop. sri-pool's ExecStartPre (`update-pool-signature.sh`) rewrites this file on every start,
+# so in the healthy case the mtime always lands just BEFORE ActiveEnterTimestamp; measured on
+# ghost-vm1 and ghost-vm5, both read equal to the second. An mtime AFTER the unit went active
+# therefore means a human edited it and did not restart.
+#
+# 0 = stale (refuse), 1 = current, or not measurable. Unreadable stamps are not evidence of
+# staleness and must not block a deploy on a measurement that was never taken.
+webhook_config_is_stale() {
+    local mtime="${1:-}" started="${2:-}"
+    [ -n "$mtime" ] && [ -n "$started" ] || return 1
+    [ "$mtime" -gt 0 ] 2>/dev/null || return 1
+    [ "$started" -gt 0 ] 2>/dev/null || return 1
+    [ "$mtime" -gt "$started" ] 2>/dev/null || return 1
+    return 0
+}
+
+# 3c. ghost-pool may not be deployed to a node whose pool_sv2 cannot SIGN share batches.
+#
+#     Since #742 ghost-pool authenticates POST /api/internal/shares with an HMAC-SHA256 over
+#     `timestamp || body` under the co-located pool_sv2's `[share_webhook] secret`. So the two
+#     sides must be brought up in one order and one order only: pool_sv2 configured and
+#     RESTARTED first, ghost-pool second.
+#
+#     Backwards, the node does not merely lag. pool_sv2 treats a 401 as PERMANENT — deliberately,
+#     because retrying cannot fix a credential — so it drops the batch and forgets its skeletons
+#     rather than spending a retry budget on it. Every share submitted during a mis-ordered
+#     window is DESTROYED, not delayed, and the only signal is a log line on the pool_sv2 side.
+#     Nothing downstream objects: the unit is active, :8442 listens, /health answers, and the
+#     post-deploy throughput check below reads the node as simply having no traffic.
+#
+#     Only `ghost-pool` is gated. `pool_sv2` is how the secret reaches the node in the first
+#     place, and `translator_sv2` never touches this path — gating either would deadlock the
+#     remedy this message prints.
+#
+#     Fails CLOSED. A config that cannot be read is not evidence that the secret is there, and
+#     the cost of assuming it is is total, silent share loss.
+if [ "$BINARY" = "ghost-pool" ]; then
+  if [ "${GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK:-}" = "1" ]; then
+    echo "  ###############################################################################" >&2
+    echo "  #  GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 — the share-webhook secret gate is" >&2
+    echo "  #  SKIPPED for $NODE." >&2
+    echo "  #" >&2
+    echo "  #  This is correct for ONE thing: rolling back to a build that predates #742." >&2
+    echo "  #  Anything newer will 401 every share batch, and a 401 is not retried — the" >&2
+    echo "  #  shares are DESTROYED, not delayed." >&2
+    echo "  ###############################################################################" >&2
+  else
+    POOL_SV2_CONF="/etc/ghost/pool-config.toml"
+    # The file is root-owned 0600 on vm5-8 and ghost-owned on vm1-4, so it needs the same
+    # sudo-if-present dance the deploy uses. Read into a variable and parsed HERE; the value
+    # never reaches a log line, a message, or the terminal.
+    WEBHOOK_CONF=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" \
+        "S=\$(command -v sudo >/dev/null && echo sudo || echo); \$S cat $POOL_SV2_CONF 2>/dev/null" \
+        2>/dev/null) || WEBHOOK_CONF=""
+
+    if ! WEBHOOK_WHY=$(webhook_secret_verdict "$WEBHOOK_CONF"); then
+        die "pool_sv2 on $NODE cannot sign share batches — $WEBHOOK_WHY
+       ($POOL_SV2_CONF)
+
+       ghost-pool has required an HMAC on every share batch since #742, and pool_sv2
+       treats a 401 as PERMANENT rather than retrying it. Deploying ghost-pool to this
+       node now would make every batch it produces 401 and be DISCARDED. The mis-ordered
+       window does not delay shares, it destroys them.
+
+       Do this, in this order:
+         1. set 'secret' under [share_webhook] in $POOL_SV2_CONF on $NODE to
+            ghost-pool's [network] internal_api_secret from /etc/ghost/pool.toml,
+            byte-for-byte (64 hex characters)
+         2. scripts/deploy-node.sh $NODE pool_sv2      <- deliberately NOT gated on this
+         3. re-run this command
+
+       Rolling BACK to a ghost-pool that predates #742 is the one case where this gate is
+       wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
+    fi
+
+    # The secret is in the file. Is the pool_sv2 that is RUNNING actually using it?
+    WEBHOOK_STAMPS=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
+S=\$(command -v sudo >/dev/null && echo sudo || echo)
+\$S stat -c %Y $POOL_SV2_CONF 2>/dev/null || echo
+date -d \"\$(\$S systemctl show sri-pool -p ActiveEnterTimestamp --value 2>/dev/null)\" +%s 2>/dev/null || echo
+" 2>/dev/null) || WEBHOOK_STAMPS=""
+    CONF_MTIME=$(one_clean_integer "$(printf '%s\n' "$WEBHOOK_STAMPS" | sed -n 1p)" || true)
+    SRI_POOL_STARTED=$(one_clean_integer "$(printf '%s\n' "$WEBHOOK_STAMPS" | sed -n 2p)" || true)
+    if webhook_config_is_stale "$CONF_MTIME" "$SRI_POOL_STARTED"; then
+        die "$POOL_SV2_CONF on $NODE was edited AFTER sri-pool last started
+       (config mtime $CONF_MTIME, sri-pool active since $SRI_POOL_STARTED)
+
+       The secret is in the file but the running pool_sv2 has not loaded it, which signs
+       every batch with the OLD credential — the same 401, the same destroyed shares.
+
+       Do this, in this order:
+         1. ssh $NODE 'systemctl restart sri-pool'   (it does not bind :34255 for ~60s)
+         2. re-run this command"
+    fi
+    if [ -z "$CONF_MTIME" ] || [ -z "$SRI_POOL_STARTED" ]; then
+        info "note: could not read $POOL_SV2_CONF's mtime and sri-pool's start time on $NODE —"
+        info "      the secret is present, but that it has been LOADED is unverified"
+    else
+        info "share-webhook secret present on $NODE and loaded by sri-pool (config $CONF_MTIME <= start $SRI_POOL_STARTED)"
+    fi
+  fi
+fi
 
 # 4. Canary soak before production. The bugs that hurt were behavioural and only showed
 #    under real traffic over time — an hourly livelock, and attribution that looked fine
