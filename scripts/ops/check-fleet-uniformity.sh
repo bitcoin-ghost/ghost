@@ -46,12 +46,12 @@ COLLECT='
   printf "gp_sha=%s\n"        "$(sha256sum /opt/ghost/bin/ghost-pool 2>/dev/null | cut -c1-12)"
   printf "poolsv2_sha=%s\n"   "$(sha256sum /opt/ghost/bin/pool_sv2 2>/dev/null | cut -c1-12)"
   printf "trans_sha=%s\n"     "$(sha256sum /opt/ghost/bin/translator_sv2 2>/dev/null | cut -c1-12)"
-  printf "vardiff=%s\n"       "$(grep -hE "^min_individual_miner_hashrate" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | xargs)"
-  printf "en2_size=%s\n"      "$(grep -hE "^downstream_extranonce2_size" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | xargs)"
-  printf "aggregate=%s\n"     "$(grep -hE "^aggregate_channels" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | xargs)"
-  printf "spm=%s\n"           "$(grep -hE "^shares_per_minute" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | xargs)"
-  printf "vardiff_on=%s\n"    "$(grep -hE "^enable_vardiff" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | xargs)"
-  printf "port=%s\n"          "$(grep -hE "^downstream_port" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | xargs)"
+  printf "vardiff=%s\n"       "$(grep -hE "^min_individual_miner_hashrate" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
+  printf "en2_size=%s\n"      "$(grep -hE "^downstream_extranonce2_size" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
+  printf "aggregate=%s\n"     "$(grep -hE "^aggregate_channels" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
+  printf "spm=%s\n"           "$(grep -hE "^shares_per_minute" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
+  printf "vardiff_on=%s\n"    "$(grep -hE "^enable_vardiff" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
+  printf "port=%s\n"          "$(grep -hE "^downstream_port" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
   printf "journal=%s\n"       "$([ -d /var/log/journal ] && echo persistent || echo volatile)"
   printf "watchdog=%s\n"      "$(systemctl is-active ghost-restart-watch.timer 2>/dev/null)"
   printf "pool_svc=%s\n"      "$(systemctl is-active ghost-pool 2>/dev/null)"
@@ -64,9 +64,13 @@ COLLECT='
   # miners fed a superseded binary that could not open a session with pool_sv2. Every check
   # this script had read green throughout, because each one asked "is the right unit enabled"
   # and none asked "is anything ELSE also running, and who actually holds the port".
-  printf "procs_translator=%s\n" "$(pgrep -c -x translator_sv2 2>/dev/null || echo 0),$(pgrep -c -x translator 2>/dev/null || echo 0)"
-  printf "procs_poolsv2=%s\n"    "$(pgrep -c -x pool_sv2 2>/dev/null || echo 0),$(pgrep -c -x pool 2>/dev/null || echo 0)"
-  printf "procs_ghostpool=%s\n"  "$(pgrep -c -x ghost-pool 2>/dev/null || echo 0)"
+  # ⚠ `pgrep -c` PRINTS 0 and also EXITS NON-ZERO when nothing matches, so `|| echo 0` emits a
+  # SECOND zero on its own line — which this collector then reads as a field named "0". Take the
+  # output and default it, rather than falling back on the exit status.
+  nproc() { local c; c="$(pgrep -c -x "$1" 2>/dev/null)"; printf "%s" "${c:-0}"; }
+  printf "procs_translator=%s,%s\n" "$(nproc translator_sv2)" "$(nproc translator)"
+  printf "procs_poolsv2=%s,%s\n"    "$(nproc pool_sv2)" "$(nproc pool)"
+  printf "procs_ghostpool=%s\n"     "$(nproc ghost-pool)"
   # Who actually holds each load-bearing port. The binary NAME, not the unit that claims it.
   printf "owner_3333=%s\n"       "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":3333\s.*users:\(\(\"\K[^\"]+" | head -1)"
   printf "owner_34255=%s\n"      "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":34255\s.*users:\(\(\"\K[^\"]+" | head -1)"
@@ -87,6 +91,14 @@ COLLECT='
   printf "en_sritrans=%s\n"      "$(systemctl is-enabled sri-translator 2>/dev/null | head -1)"
   printf "en_bitcoind=%s\n"      "$(systemctl is-enabled bitcoind 2>/dev/null | head -1)"
   printf "en_poolgate=%s\n"      "$(systemctl is-enabled ghost-pool-gate 2>/dev/null | head -1)"
+  # #758: the farm tier was decided ON for every public mining node (#410, 2026-07-27) and reached
+  # exactly ONE of eight. It was visible here only as `vardiff` drift, because vm8 returned two
+  # min_individual_miner_hashrate values where others returned one — which reads as a config
+  # preference, not as "a shipped feature is missing on seven nodes". Assert the thing itself.
+  printf "farm_cfg=%s\n"         "$(grep -cE "^\[farm_tier\]" /etc/ghost/translator-config.toml 2>/dev/null)"
+  printf "farm_listen=%s\n"      "$($SUDO ss -ltn 2>/dev/null | grep -c ":4444")"
+  printf "farm_ufw=%s\n"         "$($SUDO ufw status 2>/dev/null | grep -c "4444")"
+  printf "mining_mode=%s\n"      "$(grep -oP "^\s*mining_mode\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)"
 '
 
 declare -A VALUES   # VALUES[node|field] = value
@@ -219,6 +231,22 @@ for n in "${REACHED[@]}"; do
     done
     # The superseded chain unit must not be enabled anywhere; on vm1 it was enabled AND
     # crash-looping while the real ghostd ran disabled beside it.
+    # The farm tier: config, listener and firewall must agree. An open ufw rule with no listener
+    # is the worst of the three states — anything auditing reachability by firewall says yes and
+    # is wrong. Seven nodes sat exactly there.
+    fc="${VALUES[$n|farm_cfg]:-0}"; fl="${VALUES[$n|farm_listen]:-0}"; fw="${VALUES[$n|farm_ufw]:-0}"
+    mm="${VALUES[$n|mining_mode]:-}"
+    if [ "$mm" = "public_pool" ]; then
+        [ "${fc:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n public_pool but no [farm_tier] in translator-config.toml (#758)"; rc=1; }
+        [ "${fl:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n public_pool but nothing is LISTENING on :4444 (#758)"; rc=1; }
+    fi
+    if [ "${fw:-0}" -gt 0 ] 2>/dev/null && [ "${fl:-0}" -eq 0 ] 2>/dev/null; then
+        echo "  FAIL $n ufw allows 4444 but NOTHING listens there — an audit by firewall reads this as reachable"; rc=1
+    fi
+    # mining_mode decides whether payouts go through BFT. Relying on MiningMode::default() means a
+    # change to that default silently reconfigures the node.
+    [ -n "$mm" ] || { echo "  FAIL $n mining_mode is not set in pool.toml — running on MiningMode::default() (#758)"; rc=1; }
+
     eb="${VALUES[$n|en_bitcoind]:-}"
     case "$eb" in
         not-found|"") ;;
