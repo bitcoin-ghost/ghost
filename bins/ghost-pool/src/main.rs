@@ -84,22 +84,6 @@ use ghost_pool::treasury::TreasuryState;
 /// Used when config is updated via API and requires restart to apply
 const EXIT_CODE_RESTART: i32 = 100;
 
-/// Block height at which the payout proposal switches from per-`miner_id` grouping to
-/// per-`payout_address` grouping.
-///
-/// Below this height: a user running N workers under one address takes N coinbase output
-/// slots. At/above this height: their unpaid work is summed across workers and they take
-/// ONE slot — freeing the rest for other miners.
-///
-/// This is a BFT-voted payout calculation. If any node uses a different algorithm than its
-/// peers, its proposal diverges and never reaches the 67 % supermajority. Baking the
-/// activation as a block-height gate (not a feature flag) means every node makes the same
-/// decision at the same block. See `tasks/plan_payout_address_grouping.md` for the rollout.
-///
-/// Defined in the library so that the proposer and the GHOST-02 validator — which must
-/// group the ledger identically — cannot drift apart. Re-exported here for the binary.
-use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
-
 /// Trailing window for the per-node realized hashrate gossiped in health pings
 /// and summed into the mesh-wide pool total. 10 minutes smooths small-miner
 /// share variance while still tracking real changes within a few minutes.
@@ -8690,69 +8674,16 @@ async fn main() -> Result<()> {
                     "Block submitted to Ghost Core, creating payout proposal..."
                 );
 
-                // SETTLE THE LEDGER — the coins now exist.
+                // Settlement is the SHARD's, and it happens at COINBASE_MATURITY — not here, and
+                // not at tip. Stage 6 removed the tip-time settler entirely.
                 //
-                // This block's coinbase carries the payout named by the snapshot its template
-                // was built against, so THIS is the moment the miners in that payout are
-                // genuinely paid, and the only safe moment to mark their shares paid.
+                // Marking shares paid the moment a block is submitted means settling a payment a
+                // reorg can still undo, which is why the deleted path needed `reverse_settlement`
+                // and a deferred-settlement table to go with it. Settling 100 blocks deep needs
+                // none of that, and `ShareShard::settle_matured` reaches the same conclusion from
+                // the same evidence — the coinbase — on EVERY node rather than only this one.
                 //
-                // Settling used to happen on consensus approval, which merely arms the coinbase
-                // of some future block. A `None` snapshot means this block paid the fallback
-                // coinbase and settles nothing.
-                if let Some(snapshot) = info.payout_snapshot {
-                    match tp_for_block.get_proposal(&snapshot) {
-                        Some(paid) => {
-                            // #601: settle from the coinbase that was actually MINED, not from
-                            // the ratified proposal — this node's coinbase carries its own
-                            // fee-drift adjustment, so the treasury amount the chain paid is not
-                            // the one the fleet ratified. Every observing node derives the same
-                            // amounts from the same on-chain coinbase, so the fleet still
-                            // converges. A parse failure falls back to the ratified amounts
-                            // (loudly) rather than not settling at all — under-settling is the
-                            // double-payment path.
-                            let mined_outputs =
-                                ghost_pool::coinbase_verifier::CoinbaseOutput::parse_from_coinbase(
-                                    &info.coinbase,
-                                )
-                                .map_err(|e| {
-                                    error!(
-                                        error = %e,
-                                        "could not parse our own submitted coinbase — settling \
-                                         from the ratified proposal instead"
-                                    );
-                                })
-                                .ok();
-                            // The block hash keys the settlement, so this node's immediate settle
-                            // and the same block's later observation by every other node collapse
-                            // onto one row instead of applying twice.
-                            if let Err(e) = ghost_pool::payout::settle_paid_block(
-                                &db_for_block,
-                                &paid,
-                                PAYOUT_ADDRESS_GROUPING_HEIGHT,
-                                &hex::encode(info.block_hash),
-                                mined_outputs.as_deref(),
-                            ) {
-                                error!(
-                                    error = %e,
-                                    hash = %hex::encode(&snapshot[..8]),
-                                    "Failed to settle the ledger for a PAID block — its miners' \
-                                     shares remain unpaid and will be swept again next block"
-                                );
-                            }
-                        }
-                        None => error!(
-                            hash = %hex::encode(&snapshot[..8]),
-                            "Block paid a payout proposal we no longer hold; cannot settle the \
-                             ledger — those shares will be paid twice unless reconciled"
-                        ),
-                    }
-                } else {
-                    warn!(
-                        height = info.height,
-                        "Block carried the FALLBACK coinbase (no approved payout was armed when \
-                         its template was built) — the miners were not paid from this block"
-                    );
-                }
+                // The submitting node is not special here any more, and that is the point.
 
                 // Gather data for payout proposal
                 let node_shares = rm_for_block.get_node_shares(round_id);
@@ -10379,28 +10310,26 @@ async fn main() -> Result<()> {
             .with_chain_health(Arc::clone(&verification_state.chain_health))
             .with_height_getter(move || rm_for_reorg.current_height());
         reorg_handler.start(block_events);
-
-        // Settle won blocks by observing the chain, on EVERY node rather than only the one that
-        // submitted the block. Takes its own subscription rather than extending ReorgHandler:
-        // that handler's job is round orphaning and alerts, and settlement failing should not take
-        // reorg detection down with it.
+        // Stage 6: the SettlementObserver is DELETED. It settled the LEGACY unpaid ledger from
+        // an observed coinbase at tip, and existed because the seven non-winning nodes would
+        // otherwise still owe work the pool had paid — and, being the majority, would carry that
+        // view into the next BFT proposal and pay it twice.
         //
-        // Below `OBSERVED_SETTLEMENT_HEIGHT` this matches and logs without writing, so the dry run
-        // proves matching works before the ledger behaviour changes fleet-wide.
+        // Release B removes the vote, so there is no majority view to poison, and the shard is
+        // the only ledger a payout is built from. The shard settles the same way from the same
+        // evidence — `ShareShard::settle_matured`, chain-derived, on every node — but at
+        // COINBASE_MATURITY rather than at tip. That depth is what lets it carry no reversal
+        // machinery at all: the tip-time settler needed `reverse_settlement` for reorgs, and a
+        // block 100 deep is not coming back.
+        //
+        // The 100-block window in which `owed` still counts work already paid is deliberate,
+        // not a gap: `owed` is signed and never clamped, so a second payment inside the window
+        // leaves a residual the next block corrects (SHARE_SHARD.md §4.4, §4.6).
+        //
+        // The proposal-sync handler below OUTLIVES it on purpose. It answers peers as well as
+        // asking, and a node still on a pre-Stage-6 binary needs those answers to settle at all.
+        // Retire it once no fleet binary can ask.
         {
-            use ghost_pool::settlement::{SettleOutcome, SettlementObserver};
-
-            let mut settlement_events = zmq_subscriber.subscribe_block_events();
-            let rm_for_settlement = Arc::clone(&round_manager);
-
-            // Recovering a proposal a won block names but this node never received. Proposals are
-            // gossiped once and never rebroadcast, so a node that was down at that moment cannot
-            // settle the block at all — it keeps owing work the pool has already paid.
-            //
-            // Registered on the mesh so this node both asks and answers: the recovery only works
-            // because the peers that do hold the proposal serve it unprompted. The fetch needs no
-            // trust — the coinbase names the payout, and a response is accepted only if it hashes
-            // to that identity.
             let (psync_tx, mut psync_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
             {
                 let mesh_for_psync = Arc::clone(&mesh);
@@ -10436,118 +10365,6 @@ async fn main() -> Result<()> {
             );
             mesh.register_handler(Arc::clone(&proposal_sync)
                 as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-            let observer = Arc::new(
-                SettlementObserver::new(
-                    Arc::clone(&db),
-                    Arc::clone(&rpc),
-                    PAYOUT_ADDRESS_GROUPING_HEIGHT,
-                    ghost_pool::observed_settlement_height(),
-                )
-                .with_proposal_sync(Arc::clone(&proposal_sync)),
-            );
-
-            // Waking reconciliation early, when the event loop knows it has fallen behind.
-            let reconcile_wake = Arc::new(tokio::sync::Notify::new());
-
-            // Reconciliation is the safety net under the event stream, and it runs on a timer
-            // rather than only at startup.
-            //
-            // Two holes need it while the node is up, not just after a restart. A proposal fetched
-            // from a peer arrives *after* its block was observed, so something has to come back and
-            // settle it; and a lagged broadcast receiver drops events outright. Leaving either to
-            // the next restart would mean the ledger self-heals only when an operator happens to
-            // deploy, which is the same as not self-healing.
-            //
-            // Both passes are idempotent and cursor-driven, so a tick in steady state costs one or
-            // two block reads.
-            let reconcile_observer = Arc::clone(&observer);
-            let reconcile_woken = Arc::clone(&reconcile_wake);
-            let db_for_recheck = Arc::clone(&db);
-            let rm_for_recheck = Arc::clone(&round_manager);
-            tokio::spawn(async move {
-                const RECONCILE_INTERVAL_SECS: u64 = 300;
-                let period = std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS);
-                // Start the timer one period out: the loop reconciles before it waits, so the
-                // startup pass is the first iteration rather than a separate task.
-                let mut ticker =
-                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    if let Err(e) = reconcile_observer.reconcile().await {
-                        warn!(error = %e, "settlement reconciliation failed");
-                    }
-                    // Same tick, same reason: a share whose coinbase skeleton had not arrived was
-                    // judged with the evidence missing, and must be re-judged once it is there.
-                    // Sharing the tick keeps one place that repairs what the live paths could not.
-                    if let Err(e) = ghost_pool::binding_recheck::recheck_bindings(
-                        &db_for_recheck,
-                        rm_for_recheck.current_height(),
-                        // The batch chain finalises nothing yet, so skeletons are released on
-                        // the reorg floor alone. Once it runs, this carries its head.
-                        None,
-                    )
-                    .await
-                    {
-                        warn!(error = %e, "share-binding recheck failed");
-                    }
-                    tokio::select! {
-                        _ = ticker.tick() => {}
-                        _ = reconcile_woken.notified() => {
-                            debug!("settlement reconciliation woken early");
-                        }
-                    }
-                }
-            });
-
-            tokio::spawn(async move {
-                loop {
-                    match settlement_events.recv().await {
-                        Ok(ghost_common::zmq::BlockEvent::Connected { hash }) => {
-                            let height = rm_for_settlement.current_height();
-                            match observer.on_block_connected(&hash, height).await {
-                                SettleOutcome::Settled(applied) => info!(
-                                    block = %hash,
-                                    shares_marked = applied.shares_marked,
-                                    treasury_sats = applied.treasury_bumped,
-                                    "settled a won block observed on-chain"
-                                ),
-                                SettleOutcome::ProposalMissing { payout_id } => warn!(
-                                    block = %hash,
-                                    payout_id = %hex::encode(payout_id),
-                                    "observed a block carrying our payout tag but hold no matching \
-                                     proposal — requested it and deferred the block for retry"
-                                ),
-                                SettleOutcome::DryRunMatch { .. }
-                                | SettleOutcome::AlreadySettled
-                                | SettleOutcome::NotOurs => {}
-                            }
-                        }
-                        Ok(ghost_common::zmq::BlockEvent::Disconnected { hash }) => {
-                            observer.on_block_disconnected(&hash);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            // Dropped events mean a won block may have gone unseen. The forward
-                            // scan covers exactly that, so wake it now instead of leaving the hole
-                            // open until the next tick — a log line here would be a report of a
-                            // problem nothing is acting on.
-                            warn!(
-                                skipped,
-                                "settlement observer lagged behind block events — reconciling now"
-                            );
-                            reconcile_wake.notify_one();
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            info!("settlement observer shutting down — block events closed");
-                            break;
-                        }
-                    }
-                }
-            });
-            info!(
-                activation_height = ghost_pool::observed_settlement_height(),
-                "Settlement observer started (dry run below the activation height)"
-            );
         }
 
         info!("ZMQ block watcher connected to {}", zmq_endpoint);
