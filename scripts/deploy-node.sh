@@ -267,6 +267,25 @@ miner_connections() {
 # way to exercise it would be to break production again.
 #
 # 0 = regressed (roll back), 1 = fine or not measurable.
+# Decide whether a node's config may receive this binary. Pure, and takes the four measured
+# values rather than a node, so scripts/test-deploy-gate.sh can drive every branch without one.
+#
+# Echoes the reasons to refuse, one per line. EMPTY output means "may proceed".
+#
+# ⚠ `parse` is the POSITIVE CONTROL. It is always `ok` or `FAIL` when the probe ran at all, so an
+# empty value means the probe itself did not run — which is not a passing config and must refuse.
+config_gate_failures() {
+    local parse="${1:-}" dead="${2:-}" mode="${3:-}" tdp="${4:-}"
+    if [ -z "$parse" ]; then
+        echo "the config gate produced no verdict — the probe did not run"
+        return
+    fi
+    [ "$parse" = "ok" ] || echo "pool.toml does NOT parse with the incoming binary — the node would not come back from its next restart"
+    [ -z "$dead" ] || echo "config carries key(s) for removed features: $dead"
+    [ -n "$mode" ] || echo "mining_mode is not set — resolved from MiningMode::default(), which decides whether payouts go through BFT"
+    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "no [tdp] block — template distribution would run on compiled defaults"
+}
+
 throughput_regressed() {
     local baseline="${1:-}" post="${2:-}" loglines="${3:-}" submits="${4:-}"
     # No traffic before the swap: nothing to lose, and nothing to conclude.
@@ -632,6 +651,63 @@ if [ -z "$copied" ]; then
     echo "         $NODE is UNCHANGED for this binary, but if you are mid-roll it may be" >&2
     echo "         running a MIXED set. Check: ssh $NODE 'sha256sum /opt/ghost/bin/*'" >&2
     exit 2
+fi
+
+# ---------------------------------------------------------------- config gate (#759)
+#
+# The staged binary is on the node and verified, but NOT yet installed. This is the only moment
+# where the INCOMING binary and the node's config can be tested against each other while the swap
+# is still free to abandon.
+#
+# It exists because config on this fleet is whatever successive hand-edits left behind, and nothing
+# converged it. Measured 2026-08-23: vm4 carried `bond_ledger_*` for a feature deleted in #699;
+# vm2-4 carried the deprecated `public_mining` while LACKING `mining_mode`, so the setting that
+# decides whether payouts go through BFT was resolved by `MiningMode::default()`; vm1 had no `[tdp]`
+# block at all. Every one was correct-by-accident — a value nobody chose — and every one would have
+# survived any number of deploys, because a deploy has never looked at a config file.
+#
+# ⚠ The parse check runs the STAGED binary, not the installed one. Asking the old binary whether
+# the file is acceptable answers the wrong question: what matters is whether the node comes back
+# after the swap, and that is the new binary's opinion.
+if [ "$BINARY" = "ghost-pool" ]; then
+    info "config gate: checking /etc/ghost/pool.toml against the INCOMING $BINARY"
+    cfg_out="$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
+        S=$SUDO
+        \$S chmod 755 /tmp/$BINARY.new 2>/dev/null || true
+        dead=\$(\$S grep -ohE '^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=' /etc/ghost/pool.toml 2>/dev/null | tr -d ' =' | sort -u | paste -sd, -)
+        mode=\$(\$S grep -oP '^\\s*mining_mode\\s*=\\s*"\\K[^"]+' /etc/ghost/pool.toml 2>/dev/null | head -1)
+        tdp=\$(\$S grep -cE '^\\[tdp\\]' /etc/ghost/pool.toml 2>/dev/null)
+        /tmp/$BINARY.new --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && parse=ok || parse=FAIL
+        printf 'dead=%s\\nmode=%s\\ntdp=%s\\nparse=%s\\n' "\$dead" "\$mode" "\$tdp" "\$parse"
+    " 2>/dev/null || true)"
+
+    cg_dead="$(printf '%s\n' "$cfg_out" | sed -n 's/^dead=//p')"
+    cg_mode="$(printf '%s\n' "$cfg_out" | sed -n 's/^mode=//p')"
+    cg_tdp="$(printf '%s\n' "$cfg_out" | sed -n 's/^tdp=//p')"
+    cg_parse="$(printf '%s\n' "$cfg_out" | sed -n 's/^parse=//p')"
+
+    # A gate that cannot read its evidence must not pass. `parse` is the positive control: it is
+    # always either `ok` or `FAIL`, so an EMPTY value means the probe itself did not run.
+    if [ -z "$cg_parse" ]; then
+        echo "REFUSED: the config gate could not run on $NODE — no verdict was produced." >&2
+        echo "         That is not the same as a passing config. $NODE is UNCHANGED." >&2
+        timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
+        exit 2
+    fi
+
+    cg_fail="$(config_gate_failures "$cg_parse" "$cg_dead" "$cg_mode" "$cg_tdp")"
+
+    if [ -n "$cg_fail" ]; then
+        echo "REFUSED: config gate failed on $NODE:" >&2
+        # quoted + read, because the reasons contain spaces: `printf ... $cg_fail` word-splits
+        # and prints one WORD per line, which turns a readable refusal into confetti.
+        printf '%s\n' "$cg_fail" | while IFS= read -r line; do echo "         - $line" >&2; done
+        echo "         $NODE is UNCHANGED. Fix the config, then re-run." >&2
+        echo "         (see scripts/ops/check-fleet-uniformity.sh for the fleet-wide view)" >&2
+        timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
+        exit 2
+    fi
+    info "config gate: parses with the incoming binary, no dead keys, mining_mode and [tdp] set"
 fi
 
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
