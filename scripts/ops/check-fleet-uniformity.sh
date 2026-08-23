@@ -42,6 +42,7 @@ MIN_EXTRANONCE2_SIZE=7
 
 # Fields collected per node. Keep the remote side to one ssh round trip per node.
 COLLECT='
+  SUDO=$(command -v sudo >/dev/null && echo sudo || echo)
   printf "gp_sha=%s\n"        "$(sha256sum /opt/ghost/bin/ghost-pool 2>/dev/null | cut -c1-12)"
   printf "poolsv2_sha=%s\n"   "$(sha256sum /opt/ghost/bin/pool_sv2 2>/dev/null | cut -c1-12)"
   printf "trans_sha=%s\n"     "$(sha256sum /opt/ghost/bin/translator_sv2 2>/dev/null | cut -c1-12)"
@@ -56,6 +57,36 @@ COLLECT='
   printf "pool_svc=%s\n"      "$(systemctl is-active ghost-pool 2>/dev/null)"
   printf "sripool_svc=%s\n"   "$(systemctl is-active sri-pool 2>/dev/null)"
   printf "trans_svc=%s\n"     "$(systemctl is-active sri-translator 2>/dev/null)"
+
+  # --- duplicates and impostors (#756) -------------------------------------------------
+  # ghost-vm1 ran TWO translators: a Feb-dated `ghost-translator` grabbed :3333 at boot and
+  # `sri-translator` could then never bind, sitting in `activating` for FIVE DAYS while eight
+  # miners fed a superseded binary that could not open a session with pool_sv2. Every check
+  # this script had read green throughout, because each one asked "is the right unit enabled"
+  # and none asked "is anything ELSE also running, and who actually holds the port".
+  printf "procs_translator=%s\n" "$(pgrep -c -x translator_sv2 2>/dev/null || echo 0),$(pgrep -c -x translator 2>/dev/null || echo 0)"
+  printf "procs_poolsv2=%s\n"    "$(pgrep -c -x pool_sv2 2>/dev/null || echo 0),$(pgrep -c -x pool 2>/dev/null || echo 0)"
+  printf "procs_ghostpool=%s\n"  "$(pgrep -c -x ghost-pool 2>/dev/null || echo 0)"
+  # Who actually holds each load-bearing port. The binary NAME, not the unit that claims it.
+  printf "owner_3333=%s\n"       "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":3333\s.*users:\(\(\"\K[^\"]+" | head -1)"
+  printf "owner_34255=%s\n"      "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":34255\s.*users:\(\(\"\K[^\"]+" | head -1)"
+  printf "owner_8442=%s\n"       "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":8442\s.*users:\(\(\"\K[^\"]+" | head -1)"
+  # Units wedged in activating/failed. `activating` is the one that hid for five days: it is
+  # neither active (so no is-active check fires) nor absent (so nothing looks orphaned).
+  printf "stuck_units=%s\n"      "$(systemctl list-units --type=service --state=activating,failed,deactivating --no-legend --plain 2>/dev/null | awk "{print \$1}" | paste -sd, - )"
+  # Superseded units that should not exist on any node at all.
+  printf "stale_units=%s\n"      "$(for u in ghost-translator ghost-pool-sv2 ghost-sri-pool sri-pool-old; do systemctl cat \$u >/dev/null 2>&1 && printf "%s " \$u; done | xargs)"
+  # Superseded binaries left in the deploy dir alongside the real ones.
+  printf "stale_bins=%s\n"       "$(for b in translator pool jd-client jd-server; do [ -f /opt/ghost/bin/\$b ] && printf "%s " \$b; done | xargs)"
+  # BOOT ENABLEMENT. `is-active` says a service is running NOW; `is-enabled` says it comes back.
+  # A service that is active-but-disabled survives until the next reboot and no further, and no
+  # health check that asks "is it running" will ever notice.
+  printf "en_ghostd=%s\n"        "$(systemctl is-enabled ghostd 2>/dev/null | head -1)"
+  printf "en_ghostpool=%s\n"     "$(systemctl is-enabled ghost-pool 2>/dev/null | head -1)"
+  printf "en_sripool=%s\n"       "$(systemctl is-enabled sri-pool 2>/dev/null | head -1)"
+  printf "en_sritrans=%s\n"      "$(systemctl is-enabled sri-translator 2>/dev/null | head -1)"
+  printf "en_bitcoind=%s\n"      "$(systemctl is-enabled bitcoind 2>/dev/null | head -1)"
+  printf "en_poolgate=%s\n"      "$(systemctl is-enabled ghost-pool-gate 2>/dev/null | head -1)"
 '
 
 declare -A VALUES   # VALUES[node|field] = value
@@ -129,6 +160,71 @@ for n in "${REACHED[@]}"; do
     done
     [ "${VALUES[$n|journal]:-}" = "persistent" ] || { echo "  WARN $n journal is volatile — logs die with the service being diagnosed (#414)"; }
     [ "${VALUES[$n|watchdog]:-}" = "active" ] || { echo "  WARN $n restart watchdog timer not active (#412)"; }
+
+    # ---- duplicates and impostors (#756) ----------------------------------------------
+    # Exactly one process per role. The second copy is never harmless: on ghost-vm1 a Feb-dated
+    # `translator` held :3333 for five days and eight miners' work went nowhere.
+    IFS=, read -r n_tsv2 n_told <<<"${VALUES[$n|procs_translator]:-0,0}"
+    IFS=, read -r n_psv2 n_pold <<<"${VALUES[$n|procs_poolsv2]:-0,0}"
+    n_gp="${VALUES[$n|procs_ghostpool]:-0}"
+    [ "${n_tsv2:-0}" -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_tsv2} translator_sv2 processes (expected 1)"; rc=1; }
+    [ "${n_psv2:-0}" -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_psv2} pool_sv2 processes (expected 1)"; rc=1; }
+    [ "${n_gp:-0}"   -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_gp} ghost-pool processes (expected 1)"; rc=1; }
+    [ "${n_told:-0}" -eq 0 ] 2>/dev/null || { echo "  FAIL $n ${n_told} SUPERSEDED 'translator' process(es) running — this is the #756 outage"; rc=1; }
+    [ "${n_pold:-0}" -eq 0 ] 2>/dev/null || { echo "  FAIL $n ${n_pold} SUPERSEDED 'pool' process(es) running"; rc=1; }
+
+    # The port must be held by the binary we think serves it. An impostor answers happily.
+    for spec in "owner_3333:translator_sv2:SV1 miners" "owner_34255:pool_sv2:SV2 upstream" "owner_8442:ghost-pool:template provider"; do
+        IFS=: read -r fld want what <<<"$spec"
+        got="${VALUES[$n|$fld]:-}"
+        if [ -z "$got" ]; then
+            echo "  WARN $n ${fld#owner_} has NO listener ($what) — or ss could not read it"
+        elif [ "$got" != "$want" ]; then
+            echo "  FAIL $n ${fld#owner_} is held by '$got', expected '$want' ($what)"; rc=1
+        fi
+    done
+
+    # `activating` is neither active nor absent, so every is-active check reads past it.
+    stuck="${VALUES[$n|stuck_units]:-}"
+    [ -z "$stuck" ] || { echo "  FAIL $n units wedged in activating/failed: $stuck"; rc=1; }
+
+    stale_u="${VALUES[$n|stale_units]:-}"
+    [ -z "$stale_u" ] || { echo "  FAIL $n superseded unit(s) still installed: $stale_u"; rc=1; }
+    stale_b="${VALUES[$n|stale_bins]:-}"
+    [ -z "$stale_b" ] || { echo "  FAIL $n superseded binary/binaries in /opt/ghost/bin: $stale_b"; rc=1; }
+
+    # Running is not surviving. Measured 2026-08-23: ghost-pool was DISABLED on all eight nodes
+    # and ghostd on all four production nodes — every one of them active, so every check that
+    # asked `is-active` read green. A reboot would have taken the pool down fleet-wide and the
+    # chain daemon with it on vm1-4, and nothing here would have said so first.
+    # ghost-pool is DELIBERATELY disabled where `ghost-pool-gate` owns its start: the gate is a
+    # oneshot that blocks until ghostd leaves initial block download and only then starts the pool.
+    # Enabling ghost-pool directly there would race the gate and start it against an unsynced
+    # chain. So the invariant is "something brings it back", not "this unit is enabled".
+    gate="${VALUES[$n|en_poolgate]:-}"
+    case "$gate" in
+        enabled|enabled-runtime|static) gp_units="en_sripool:sri-pool" ;;
+        *)                              gp_units="en_ghostpool:ghost-pool en_sripool:sri-pool"
+                                        echo "  WARN $n no ghost-pool-gate — ghost-pool must be enabled directly here" ;;
+    esac
+    for spec in "en_ghostd:ghostd" $gp_units "en_sritrans:sri-translator"; do
+        IFS=: read -r fld unit <<<"$spec"
+        e="${VALUES[$n|$fld]:-}"
+        case "$e" in
+            enabled|enabled-runtime|static|indirect) ;;
+            "")        echo "  WARN $n could not read is-enabled for $unit — boot survival UNKNOWN" ;;
+            not-found) echo "  FAIL $n $unit unit is MISSING"; rc=1 ;;
+            *)         echo "  FAIL $n $unit is $e — running now, will NOT come back after a reboot"; rc=1 ;;
+        esac
+    done
+    # The superseded chain unit must not be enabled anywhere; on vm1 it was enabled AND
+    # crash-looping while the real ghostd ran disabled beside it.
+    eb="${VALUES[$n|en_bitcoind]:-}"
+    case "$eb" in
+        not-found|"") ;;
+        enabled|enabled-runtime) echo "  FAIL $n superseded 'bitcoind' unit is ENABLED (ghostd is the chain daemon)"; rc=1 ;;
+        *) echo "  WARN $n superseded 'bitcoind' unit still installed ($eb) — remove it" ;;
+    esac
 done
 [ "$rc" -eq 0 ] && echo "  all invariants hold"
 echo
