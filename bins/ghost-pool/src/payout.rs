@@ -38,11 +38,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use ghost_common::config::MiningMode;
 use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::{NodeId, PayoutEntry, PayoutProposal, PayoutType, RoundId};
-use ghost_consensus::vote_handler::{compute_proposal_hash, VoteHandler};
+use ghost_consensus::vote_handler::compute_proposal_hash;
 use ghost_storage::Database;
 use ghost_verification::QualifiedCapabilityProvider;
 
@@ -2533,37 +2532,15 @@ impl PayoutProposalCreator {
 /// Handler for block found events that creates and submits payout proposals
 pub struct PayoutHandler {
     creator: PayoutProposalCreator,
-    vote_handler: Arc<VoteHandler>,
     template_processor: Arc<TemplateProcessor>,
     /// H-MINE-1: Qualification provider for calculating VERIFIED capabilities - REQUIRED
     /// This is mandatory because node rewards must only be distributed based on
     /// verified capabilities, never unverified claimed ones.
     qualification_provider: Arc<QualifiedCapabilityProvider>,
-    /// Which mining mode this node runs — the thing that decides whether a payout proposal is
-    /// VOTED on or approved locally. See [`PayoutHandler::is_single_operator`].
-    mining_mode: MiningMode,
 }
 
 /// Does this mining mode have exactly ONE operator, and therefore nobody to vote with?
 ///
-/// Free function rather than a method so the property can be tested exhaustively without
-/// standing up a whole `PayoutHandler` (which needs a vote handler, a template processor and a
-/// qualification provider). The thing being protected here is small and absolute:
-/// **`PublicPool` must never be single-operator**, because that is the one mode with independent
-/// operators and the only one a vote can protect.
-fn is_single_operator_mode(mode: MiningMode) -> bool {
-    match mode {
-        // One operator paying only themselves.
-        MiningMode::PrivateSolo => true,
-        // One operator paying their own miners. Those miners trust the operator the same way
-        // miners trust any centralised pool; a quorum would be that operator's own nodes agreeing
-        // with themselves.
-        MiningMode::PrivatePool => true,
-        // Independent operators. This is what BFT is for.
-        MiningMode::PublicPool => false,
-    }
-}
-
 impl PayoutHandler {
     /// Create a new PayoutHandler with REQUIRED QualifiedCapabilityProvider
     ///
@@ -2572,62 +2549,32 @@ impl PayoutHandler {
     /// claimed capabilities. The provider validates capabilities through the
     /// challenge-response system before they count toward payout shares.
     ///
+    /// Stage 6 removed `vote_handler` and `mining_mode` from this signature.
+    ///
+    /// Both existed solely to decide whether a payout proposal was VOTED on or approved locally.
+    /// With the vote gone from the payout path a `PayoutHandler` has no relationship with the
+    /// vote handler at all — that dependency is deleted, not merely unused. The mode no longer
+    /// changes what happens to a payout either: every node commits from its own shard view.
+    ///
     /// # Errors
-    /// Returns error if:
-    /// - treasury_address is not configured in PayoutConfig
+    ///
+    /// Returns an error if `treasury_address` is not configured in `PayoutConfig`.
     pub fn new(
         identity: Arc<NodeIdentity>,
         config: PayoutConfig,
         db: Arc<Database>,
-        vote_handler: Arc<VoteHandler>,
         template_processor: Arc<TemplateProcessor>,
         qualification_provider: Arc<QualifiedCapabilityProvider>,
-        mining_mode: MiningMode,
     ) -> GhostResult<Self> {
         let creator = PayoutProposalCreator::new(identity, config, db)?;
 
-        info!(
-            ?mining_mode,
-            single_operator = matches!(
-                mining_mode,
-                MiningMode::PrivatePool | MiningMode::PrivateSolo
-            ),
-            "PayoutHandler initialized with required verification provider"
-        );
+        info!("PayoutHandler initialized with required verification provider");
 
         Ok(Self {
             creator,
-            vote_handler,
             template_processor,
             qualification_provider,
-            mining_mode,
         })
-    }
-
-    /// Whether this node is the ONLY operator of its pool, and so has nobody to vote with.
-    ///
-    /// This decides whether a payout proposal goes to BFT or is approved locally, and it is
-    /// deliberately answered from the DECLARED MODE rather than from a live peer count.
-    ///
-    /// ⚠ That distinction is the whole safety argument. "How many peers can I see right now" is
-    /// exactly the wrong question: a public-pool node that transiently lost its mesh would start
-    /// self-approving its own payouts, which is precisely the attack the vote exists to prevent.
-    /// The mode is a static operator declaration and cannot be induced by a network condition.
-    ///
-    /// What a vote actually buys is protection against ONE operator among INDEPENDENT operators
-    /// paying themselves everyone's money. Both private modes have a single operator by
-    /// definition:
-    ///
-    /// - `PrivateSolo` — the coinbase pays only the operator; there is no other party at all.
-    /// - `PrivatePool` — the coinbase pays the operator's own miners. Those miners are trusting
-    ///   the operator, exactly as miners trust any centralised pool. A quorum here would be the
-    ///   same operator's own nodes agreeing with themselves: no added security, and — because
-    ///   mainnet clamps `min_voters_for_bft` to at least 4 — it made a one-node private pool
-    ///   structurally unable to pay ANYONE. It mined, accepted shares, built proposals, and
-    ///   failed every one with `InsufficientVoters`.
-    /// - `PublicPool` — genuinely multi-operator. Keeps the vote; nothing here changes that.
-    fn is_single_operator(&self) -> bool {
-        is_single_operator_mode(self.mining_mode)
     }
 
     /// PO4-M2: Get a snapshot of the treasury address
@@ -2761,79 +2708,34 @@ impl PayoutHandler {
         // Share validity is unaffected and lives where it always did: per-share at receive time
         // (GHOST-09 signature with receiver and address binding, PoW preimage, difficulty-tier
         // commitment), plus §6 sampling. Delete the gate, keep the rule.
-        if proposal.block_height >= crate::payout_from_shard_height() {
-            info!(
-                round_id = proposal.round_id,
-                height = proposal.block_height,
-                miners = proposal.miner_payouts.len(),
-                nodes = proposal.node_payouts.len(),
-                hash = %hex::encode(&proposal_hash[..8]),
-                "Paying from this node's own shard view (no vote — Stage 6 step 3)"
-            );
-            self.template_processor.set_local_payout(proposal);
-            return Ok(proposal_hash);
-        }
-
-        // Submit to vote handler for BFT consensus
-        // A single-operator pool has nobody to vote with, so it approves its own proposal.
+        // Stage 6 step 3: the payout is committed from this node's own shard view. No vote.
         //
-        // This is the same resolution #592 reached for solo, applied to the other mode that has
-        // exactly one operator. A private pool is one person letting their miners mine through
-        // their node; requiring `min_voters_for_bft` (>= 4 on mainnet) meant that person had to
-        // run four nodes — all their own — before anyone could be paid. Four nodes belonging to
-        // one operator voting with each other is not a security property, it is a quorum of one
-        // person. Meanwhile a single-node private pool could never pay at all.
+        // `SHARE_SHARD.md` §8 — "No consensus on the ledger. Each node pays from its own view."
         //
-        // ⚠ `is_single_operator` keys on the DECLARED MODE, never on how many peers happen to be
-        // reachable — see its doc. Public pool is untouched and still votes.
-        if self.is_single_operator() {
-            info!(
-                round_id = proposal.round_id,
-                miners = proposal.miner_payouts.len(),
-                nodes = proposal.node_payouts.len(),
-                mode = ?self.mining_mode,
-                hash = %hex::encode(&proposal_hash[..8]),
-                "Single-operator pool: approving own payout proposal (no BFT — no second operator \
-                 to vote with)"
-            );
-            // Same two steps the solo path takes: the proposal must be in the cache before it can
-            // be approved (`set_approved_payout` refuses a hash whose data it cannot find,
-            // MED-POOL-6), and `set_approved_payout` is what sets the M-28 coinbase commitment
-            // that `submitblock` requires.
-            proposal.proposal_hash = proposal_hash;
-            self.template_processor.store_proposal(proposal.clone());
-            self.template_processor.set_approved_payout(proposal_hash);
-            return Ok(proposal_hash);
-        }
-
+        // The `PAYOUT_FROM_SHARD_HEIGHT` conditional that used to guard this is gone, and it had
+        // to be: you cannot delete a branch and keep the conditional that selects it. The gate
+        // did its job — it let the no-vote path run on the live fleet and be observed before the
+        // BFT machinery was removed. The constant itself is now inert and is retired by the
+        // tip-keyed gate collapse, a later release.
+        //
+        // What the removed vote actually did: `validate_proposal_split` recomputed the miner
+        // split from the VOTER's own table and demanded an exact match (GHOST-02). It never
+        // inspected a share. Its whole guarantee was "your arithmetic matches mine", which is
+        // only ever as strong as the two tables already agreeing — and when they did not, it
+        // converted divergence into a total payment HALT (nothing finalised 18-21 Aug 2026).
+        //
+        // Share validity is untouched and lives where it always did: per-share at receive time —
+        // GHOST-09 signature with receiver and address binding, the PoW preimage check, the
+        // difficulty-tier commitment — plus §6 sampling. Delete the gate, keep the rule.
         info!(
             round_id = proposal.round_id,
+            height = proposal.block_height,
             miners = proposal.miner_payouts.len(),
             nodes = proposal.node_payouts.len(),
-            "Submitting payout proposal to consensus"
-        );
-
-        let returned_hash = self.vote_handler.handle_proposal(proposal)?;
-
-        // SECURITY: Verify hash matches - this catches implementation bugs where
-        // the vote handler modifies the proposal or computes the hash differently
-        if proposal_hash != returned_hash {
-            tracing::error!(
-                expected = %hex::encode(&proposal_hash[..8]),
-                actual = %hex::encode(&returned_hash[..8]),
-                "CRITICAL: Proposal hash mismatch between local computation and vote handler"
-            );
-            return Err(ghost_common::error::GhostError::HashMismatch {
-                expected: hex::encode(proposal_hash),
-                actual: hex::encode(returned_hash),
-            });
-        }
-
-        info!(
             hash = %hex::encode(&proposal_hash[..8]),
-            "Payout proposal submitted for voting"
+            "Paying from this node's own shard view (no vote)"
         );
-
+        self.template_processor.set_local_payout(proposal);
         Ok(proposal_hash)
     }
 
@@ -5024,68 +4926,6 @@ mod tests {
             tx_fees_sats: 1_500_000,
             node_shares: vec![([1u8; 32], 10)],
             treasury_state: TreasuryState::new(),
-        }
-    }
-
-    /// #592: solo must use the SAME fee model as pool mode. This calls `create_solo_proposal` —
-    /// the two older `test_solo_mode_*` tests call `FeeDistribution::calculate` directly and then
-    /// recompute the solo sum in the test body, so they pass whatever the solo path does.
-    ///
-    /// Above the gate the 1% is levied on `subsidy + fees`. The previous implementation levied it
-    /// on the subsidy alone and added the fees whole, paying the solo miner 1% of the fees more
-    /// than every validator recomputes in `validate_proposal_split` — so this asserts the exact
-    /// figure rather than a bound.
-    /// `PublicPool` must NEVER be treated as single-operator, and both private modes must be.
-    ///
-    /// This is the whole security boundary of local payout approval, so it is asserted
-    /// exhaustively over the enum rather than by example — if a fourth mode is ever added, this
-    /// test forces an explicit decision about which side of the line it falls on instead of
-    /// letting it inherit a default.
-    ///
-    /// Getting `PublicPool` wrong here would let a node approve its own payout proposal without a
-    /// vote, on the pool that actually has independent operators — the exact attack BFT exists to
-    /// stop. Getting a private mode wrong restores the `InsufficientVoters` deadlock that made a
-    /// one-node private pool unable to pay anyone.
-    #[test]
-    fn only_the_private_modes_are_single_operator() {
-        assert!(
-            !is_single_operator_mode(MiningMode::PublicPool),
-            "PublicPool has INDEPENDENT operators — it must always require a BFT vote"
-        );
-        assert!(
-            is_single_operator_mode(MiningMode::PrivateSolo),
-            "solo pays only its own operator; there is no second party to protect"
-        );
-        assert!(
-            is_single_operator_mode(MiningMode::PrivatePool),
-            "a private pool has one operator, so a quorum would be their own nodes agreeing \
-             with themselves — and demanding one made a single-node private pool unable to pay"
-        );
-    }
-
-    /// The predicate must depend ONLY on the declared mode, never on anything observable at
-    /// runtime.
-    ///
-    /// Keying it on a live peer count is the obvious-looking alternative and is dangerous: a
-    /// public-pool node that transiently lost its mesh would begin self-approving payouts, which
-    /// is indistinguishable from the attack. A mode is an operator declaration in a config file
-    /// and cannot be induced by a network condition, which is precisely why it is the input.
-    #[test]
-    fn single_operator_is_decided_by_mode_alone_and_is_stable() {
-        for mode in [
-            MiningMode::PublicPool,
-            MiningMode::PrivatePool,
-            MiningMode::PrivateSolo,
-        ] {
-            let first = is_single_operator_mode(mode);
-            for _ in 0..100 {
-                assert_eq!(
-                    is_single_operator_mode(mode),
-                    first,
-                    "{mode:?} changed its answer — the decision must be a pure function of the \
-                     declared mode, with no ambient input"
-                );
-            }
         }
     }
 

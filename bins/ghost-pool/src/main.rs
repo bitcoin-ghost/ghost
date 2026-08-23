@@ -3669,7 +3669,7 @@ async fn main() -> Result<()> {
         let oracle_c = block_hash_oracle.clone();
         let shard_c = Arc::clone(&shard_for_checkpoint);
         Arc::new(move |cutoff_ts, height| {
-            let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
+            // (the block subsidy was only needed by the legacy ledger source, removed in Stage 6)
             // #722: at and above the gate the miner half comes from the SHARD, not the legacy
             // unpaid ledger. v56 disabled the GHOST-03 sweep that repaired `shares` while this
             // computation kept reading it, so its holes became permanent and no two nodes could
@@ -7596,24 +7596,18 @@ async fn main() -> Result<()> {
         Arc::clone(&identity),
         payout_config.clone(),
         Arc::clone(&db),
-        Arc::clone(&vote_handler),
         Arc::clone(&template_processor),
         Arc::clone(&qualification_provider_for_health), // Reuse provider from health_handler
-        config.network.mining_mode,
     )?);
 
-    // GHOST-02: install the ledger-recompute validator on the vote handler now
-    // that the PayoutHandler exists. A peer's payout proposal is vote-approved
-    // only if its split matches what THIS node recomputes from its own converged
-    // share ledger (GHOST-03) and converged payout addresses (Option A).
-    {
-        let validator = ghost_pool::payout::make_proposal_validator(
-            Arc::clone(&payout_handler),
-            Arc::clone(&db),
-            ghost_pool::cluster_enforcement_height(),
-        );
-        vote_handler.set_proposal_validator(validator);
-    }
+    // Stage 6: the GHOST-02 ledger-recompute validator is gone with the payout vote.
+    //
+    // It only ever judged PAYOUT proposals — recomputing a peer's split from this node's own
+    // ledger and demanding an exact match. Above `PAYOUT_FROM_SHARD_HEIGHT` no payout proposal
+    // is broadcast at all, so there is nothing for it to judge.
+    //
+    // ⚠ The vote handler itself STAYS. Elder revocation still proposes BFT revocation votes,
+    // and those are a different proposal type that this validator never inspected.
 
     // Phase 4: install the active-voter-set resolver. Below ACTIVE_VOTER_SET_HEIGHT it returns
     // None and the vote handler keeps using the static MPC elder set. At and above it, the
