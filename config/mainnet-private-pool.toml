@@ -6,6 +6,11 @@
 # rewards aggregated across its miners and paid out in proportion to the work
 # each contributed.
 #
+# Every setting here is also in `config/mainnet.toml`, which carries the full annotations —
+# ranges, defaults and the reasoning behind each value. This file is the minimal form: the same
+# settings with the commentary stripped. Read mainnet.toml when you want to know WHY a value is
+# what it is; use this one when you already know.
+#
 # This is the "let my friends mine through my node" setup. You run it; they
 # point their miners at it with the password; everyone is paid their share.
 #

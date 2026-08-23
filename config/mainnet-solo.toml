@@ -6,6 +6,11 @@
 # 99% of block rewards go to your address, 1% pool fee.
 # Not registered in DNS - requires direct connection with password.
 #
+# Every setting here is also in `config/mainnet.toml`, which carries the full annotations —
+# ranges, defaults and the reasoning behind each value. This file is the minimal form: the same
+# settings with the commentary stripped. Read mainnet.toml when you want to know WHY a value is
+# what it is; use this one when you already know.
+#
 # =============================================================================
 
 [identity]
