@@ -2318,6 +2318,26 @@ impl BackupSchedule {
 ///
 /// ⚠ A key here is not necessarily WRONG — it is unread. That distinction matters: an unread key
 /// is a setting the operator believes is in force and which is doing nothing at all.
+///
+/// ## Accuracy, and the one way this could go wrong
+///
+/// The round-trip asks what the struct SERIALIZES, so a field that deserializes but is never
+/// written back would look unread when it is not. Checked 2026-08-23: **no such field exists
+/// here.** All 31 skip attributes in this file are conditional — 30 `Option::is_none` and one
+/// `Vec::is_empty` — and both skip only when the value is ABSENT, so anything the operator
+/// actually wrote round-trips and is reported correctly.
+///
+/// ⚠ Two things would break that, and neither is true today:
+/// - an unconditional `#[serde(skip_serializing)]`, or a `skip_serializing_if` predicate that can
+///   fire on a value the operator SET (e.g. "skip if default")
+/// - the degenerate case of writing an explicitly empty value — `seed_nodes = []` serializes away
+///   under `Vec::is_empty` and would be reported. Writing an empty list is equivalent to omitting
+///   it, so this is harmless, but it is the one shape that can produce a spurious name.
+///
+/// ⛔ I nearly documented a false-positive class that does not exist, from a grep that matched a
+/// DIFFERENT struct's `http_port` and a neighbouring attribute. `ghost_pay.http_port` is genuinely
+/// ignored — `GhostPayConfig` has no such field. **Confirm against the struct, not against a grep,
+/// before believing either this function or a claim that it is wrong.**
 pub fn ignored_config_keys(raw: &str) -> Result<Vec<String>, String> {
     fn walk(v: &toml::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
         if let Some(t) = v.as_table() {

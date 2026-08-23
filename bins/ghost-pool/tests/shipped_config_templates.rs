@@ -174,7 +174,10 @@ fn every_shipped_template_deserializes_as_a_node_config() {
         checked += 1;
     }
     // A loop that inspected nothing must fail rather than pass silently.
-    assert!(checked > 0, "no templates were checked — the glob found nothing");
+    assert!(
+        checked > 0,
+        "no templates were checked — the glob found nothing"
+    );
 }
 
 /// Keys the operator wrote that the struct SILENTLY IGNORED.
@@ -199,5 +202,8 @@ fn no_shipped_template_contains_a_key_the_struct_ignores() {
         );
         checked += 1;
     }
-    assert!(checked > 0, "no templates were checked — the glob found nothing");
+    assert!(
+        checked > 0,
+        "no templates were checked — the glob found nothing"
+    );
 }
