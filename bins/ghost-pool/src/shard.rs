@@ -2186,6 +2186,26 @@ impl ShardRuntime {
             discharged_micro = settlement.discharged_micro,
             "share shard: settled a matured pool block"
         );
+        // `blocks_found` (public API) counts `won_blocks`, and until now the ONLY writer was
+        // `settle_paid_block` on the node that submitted the block. Every other node reported
+        // zero for a block the pool genuinely won, so the number meant "blocks I submitted",
+        // not "blocks the pool found" — and which node that was is an accident of timing.
+        //
+        // Recording it here makes every node agree, because this path is chain-derived: each
+        // node reaches it from the same coinbase at the same maturity. It also needs no reorg
+        // reversal, which the tip-time writer does need — a block COINBASE_MATURITY deep is
+        // not coming back. `INSERT OR IGNORE` keeps the two writers idempotent against each
+        // other on the winning node.
+        //
+        // The cost is a ~16-hour lag before a win appears. That is the honest number: it
+        // counts blocks whose coins exist and are spendable.
+        if let Err(e) = self.db.record_won_block(height) {
+            warn!(
+                error = %e,
+                height,
+                "share shard: settled a matured block but could not record the win —                  `blocks_found` will under-report on this node"
+            );
+        }
         Ok(SettleBlockOutcome::Settled(settlement))
     }
 }
@@ -3424,6 +3444,66 @@ mod tests {
             rt2.settle_block_from_coinbase(702, "00aa", 602, &sig, &outs)
                 .expect("re-run after restart"),
             SettleBlockOutcome::AlreadySettled
+        );
+    }
+
+    /// `blocks_found` must count what the POOL won, not what this node happened to submit.
+    ///
+    /// The only writer used to be `settle_paid_block`, which runs on the submitting node alone —
+    /// so seven of eight nodes reported 0 for a block the pool genuinely won, and which node
+    /// reported 1 was an accident of who got the share in first. This asserts the chain-derived
+    /// path records it too, and that doing so stays idempotent: the winning node reaches BOTH
+    /// writers for the same height and must still count one.
+    #[test]
+    fn a_settled_block_is_counted_as_a_win_on_every_node_and_only_once() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            0,
+            "nothing settled yet — a fresh node must not claim a win"
+        );
+
+        let sig = tagged_scriptsig();
+        let outs = pay(&[(ADDR_A, 250_000)]);
+
+        // Immature first: a win that cannot be counted yet must not be counted early.
+        assert_eq!(
+            rt.settle_block_from_coinbase(701, "00cc", 602, &sig, &outs)
+                .expect("attempt"),
+            SettleBlockOutcome::Immature
+        );
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            0,
+            "an immature block is not a win yet — a reorg can still take it"
+        );
+
+        // At maturity it settles and counts.
+        rt.settle_block_from_coinbase(702, "00cc", 602, &sig, &outs)
+            .expect("settle at maturity");
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            1,
+            "a matured, settled pool block is a win on this node"
+        );
+
+        // The submitting node also runs `settle_paid_block`, which writes the same height.
+        db.record_won_block(602).expect("winner's own writer");
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            1,
+            "both writers naming the same height must count one win, not two"
+        );
+
+        // A re-run of settlement (restart, cursor rewind) must not inflate it either.
+        rt.settle_block_from_coinbase(702, "00cc", 602, &sig, &outs)
+            .expect("re-run");
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            1,
+            "re-settling the same block must not manufacture a second win"
         );
     }
 
