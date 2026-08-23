@@ -102,3 +102,10 @@ payout_interval_blocks = 100
 
 [ghost_pay]
 enabled = false
+# Required even when `enabled = false`. GhostPayConfig has no serde default for these three, so a
+# [ghost_pay] section missing any of them fails to parse and the node will NOT START. They are
+# inert while disabled; `epoch_blocks` and `virtual_block_secs` mirror config/mainnet.toml, and
+# `wraith_enabled` is false here because this mode has no coordinator to talk to.
+virtual_block_secs = 10
+epoch_blocks = 2160
+wraith_enabled = false

@@ -2300,6 +2300,56 @@ impl BackupSchedule {
 ///
 /// Due when the task has never run this process (`last_run_unix` is `None`) or
 /// at least `period_secs` have elapsed since the last completed attempt.
+/// Keys present in a config file that the config struct SILENTLY IGNORED.
+///
+/// There is no `#[serde(deny_unknown_fields)]` on `NodeConfig`, so a key that no longer exists —
+/// or one with a typo — is read, discarded, and never complained about. That is not hypothetical:
+/// `public_mining` was removed from the struct and went on sitting in shipped templates and live
+/// configs for months, annotated with behaviour it no longer had. On 2026-08-23 the fleet was
+/// carrying `bond_ledger_url`/`bond_ledger_token` for a system deleted in #699, and three nodes
+/// had no `mining_mode` at all while still declaring the key it replaced.
+///
+/// Rather than maintain a list of valid field names — which would rot exactly like the configs it
+/// polices — this round-trips the file: parse it as raw TOML for the keys the OPERATOR wrote, parse
+/// it as a `NodeConfig` and serialize back for the keys the STRUCT understood, and report the
+/// difference. The struct is its own oracle, so this cannot drift away from the type.
+///
+/// Returns dotted paths (`coordinator.bond_ledger_url`), sorted, so the caller can name them.
+///
+/// ⚠ A key here is not necessarily WRONG — it is unread. That distinction matters: an unread key
+/// is a setting the operator believes is in force and which is doing nothing at all.
+pub fn ignored_config_keys(raw: &str) -> Result<Vec<String>, String> {
+    fn walk(v: &toml::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+        if let Some(t) = v.as_table() {
+            for (k, sub) in t {
+                let path = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                if sub.as_table().is_some() {
+                    walk(sub, &path, out);
+                } else {
+                    out.insert(path);
+                }
+            }
+        }
+    }
+
+    let written: toml::Value = toml::from_str(raw).map_err(|e| format!("not valid TOML: {e}"))?;
+    let parsed: NodeConfig =
+        toml::from_str(raw).map_err(|e| format!("does not parse as NodeConfig: {e}"))?;
+    let understood = toml::Value::try_from(&parsed)
+        .map_err(|e| format!("could not re-serialize NodeConfig: {e}"))?;
+
+    let mut a = std::collections::BTreeSet::new();
+    let mut b = std::collections::BTreeSet::new();
+    walk(&written, "", &mut a);
+    walk(&understood, "", &mut b);
+
+    Ok(a.difference(&b).cloned().collect())
+}
+
 pub fn backup_is_due(last_run_unix: Option<u64>, now_unix: u64, period_secs: u64) -> bool {
     match last_run_unix {
         None => true,
