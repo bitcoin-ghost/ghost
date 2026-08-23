@@ -373,9 +373,9 @@ stale_case "a non-numeric stamp -> not measurable, do not block"  "x" 100 no
 # ---------------------------------------------------------------------------
 eval "$(sed -n '/^throughput_regressed()/,/^}/p' "$DEPLOY")"
 
-verdict_case() {  # label baseline post conns want_regressed
-    local label="$1" baseline="$2" post="$3" conns="$4" want="$5" got=no
-    throughput_regressed "$baseline" "$post" "$conns" && got=yes
+verdict_case() {  # label baseline post loglines submits want_regressed
+    local label="$1" baseline="$2" post="$3" loglines="$4" submits="$5" want="$6" got=no
+    throughput_regressed "$baseline" "$post" "$loglines" "$submits" && got=yes
     if [ "$got" = "$want" ]; then
         printf "  [ok ] %s\n" "$label"
         pass=$((pass+1))
@@ -385,26 +385,42 @@ verdict_case() {  # label baseline post conns want_regressed
     fi
 }
 
-# The outage itself: traffic before, silence after, miners still CONNECTED and feeding work into
-# the void. Nothing else in the deploy path sees this.
-verdict_case "traffic before, silence after, miners still attached -> ROLL BACK" 52 0 3 yes
-verdict_case "traffic before and after -> proceed"                               52 47 3 no
+# The outage itself: traffic before, silence after, and pool_sv2 CONFIRMS work kept arriving.
+# Nothing else in the deploy path sees this.
+verdict_case "traffic before, silence after, work still arriving -> ROLL BACK"  52 0 400 30 yes
+verdict_case "traffic before and after -> proceed"                              52 47 400 30 no
 # A single share is enough to prove the path is credited; this must not gate on a rate.
-verdict_case "one share after a busy baseline -> proceed"                        52 1 3 no
+verdict_case "one share after a busy baseline -> proceed"                       52 1 400 30 no
+
 # THE 2026-08-11 CASE. All eight nodes are in the mining DNS, so the swap's own restart sheds
 # every miner the node had and they rehome elsewhere within seconds (measured: avalonQ's first
-# share on vm2 landed 24s after its last on vm3). Silence with NO miners attached is the
-# expected aftermath of the restart, not H-13 — four healthy binaries (vm6, vm3, vm1 twice)
-# were rolled back for it in one night.
-verdict_case "silence after, but the restart shed every miner -> proceed"        52 0 0 no
+# share on vm2 landed 24s after its last on vm3). Silence with NO work arriving is the expected
+# aftermath of the restart, not H-13 — four healthy binaries (vm6, vm3, vm1 twice) were rolled
+# back for it in one night.
+verdict_case "silence after, and pool_sv2 got no submissions -> proceed"        52 0 400 0 no
+
+# THE 2026-08-23 CASE (#753). The previous discriminator was the CONNECTION count, and it rolled
+# back a healthy v1.11.27 on ghost-vm6: the node's one miner had rehomed during the restart and a
+# leftover socket read as "still sending". Measured the same hour, ghost-vm1 was healthy at zero
+# local shares with EIGHT established non-loopback connections. An idle socket must not convict.
+verdict_case "silence, sockets attached, but NO submissions -> proceed"         52 0 400 0 no
+
 # A canary with no miners must not be able to PASS this either — silence there is "not measured".
-verdict_case "no baseline, no post -> not measurable, proceed"                    0 0 0 no
-verdict_case "no baseline but shares appear -> proceed"                           0 9 1 no
-# The counts come off a remote sqlite3/ss through ssh; an empty or failed read must not read as
-# an outage and trigger a spurious rollback of a healthy binary.
-verdict_case "unreadable baseline -> not measurable, proceed"                    "" "" "" no
-verdict_case "unreadable post with a real baseline -> proceed"                   52 "" 3 no
-verdict_case "unreadable connection count with silence -> proceed"               52 0 "" no
+verdict_case "no baseline, no post -> not measurable, proceed"                   0 0 400 0 no
+verdict_case "no baseline but shares appear -> proceed"                          0 9 400 30 no
+
+# The counts come off a remote sqlite3/journalctl through ssh; an empty or failed read must not
+# read as an outage and trigger a spurious rollback of a healthy binary.
+verdict_case "unreadable baseline -> not measurable, proceed"                   "" "" "" "" no
+verdict_case "unreadable post with a real baseline -> proceed"                  52 "" 400 30 no
+verdict_case "unreadable submit count with silence -> proceed"                  52 0 400 "" no
+
+# ⛔ THE PROBE ITSELF FAILING. `loglines` is the positive control: zero means journalctl returned
+# nothing — no sudo, rotated journal, ssh trouble — which is NOT the same as "no work arrived".
+# Without this the gate reads a broken probe as a clean shed and proceeds on evidence it never
+# collected; with `submits` also 0 it would look identical to the healthy shed case above.
+verdict_case "probe returned NOTHING -> not measurable, proceed"                52 0 0 0 no
+verdict_case "probe unreadable -> not measurable, proceed"                      52 0 "" 30 no
 
 # ---------------------------------------------------------------------------
 # 11. The remote-read validator. Its predecessor was `tr -cd '0-9'`, which cannot fail: any
