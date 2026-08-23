@@ -4717,8 +4717,9 @@ async fn main() -> Result<()> {
     }
 
     // Component A sweep: rotate through bounded windows of the verification
-    // ledger, advertising the keys we hold so peers backfill what we lack. Mirrors
-    // the GHOST-03 ledger sweep. One 1-hour bucket per tick keeps each request a
+    // ledger, advertising the keys we hold so peers backfill what we lack. This is a
+    // SEPARATE subsystem from the GHOST-03 unpaid-ledger sweep deleted in Stage 6 —
+    // it reconciles capability-challenge verdicts. One 1-hour bucket per tick keeps a request a
     // sane size; the rotation covers the trailing 7 days that qualification reads.
     {
         let vconv_handler = Arc::clone(&verification_result_handler);
@@ -4866,114 +4867,10 @@ async fn main() -> Result<()> {
         let conv_handler = Arc::clone(&convergence_handler);
         let rm_for_conv = Arc::clone(&round_manager);
         let conv_tx = conv_tx.clone();
-        let db_for_conv = Arc::clone(&db);
-        // Latched once, here, rather than read per tick: `owns_evidence` is fixed for the life
-        // of the runtime, and a per-tick lock on the shard from the convergence loop would be a
-        // new lock-ordering edge for no benefit.
-        let shard_owns_evidence = shard.as_ref().is_some_and(|s| s.owns_evidence());
-        if shard_owns_evidence {
-            info!(
-                "GHOST-03: ledger sweep DISABLED — the shard owns `shares` (migration v56), so \
-                 the legacy unpaid ledger is no longer this node's to repair"
-            );
-        }
         tokio::spawn(async move {
             const CONVERGENCE_INTERVAL_SECS: u64 = 30;
-
-            // GHOST-03 ledger sweep. The round-scoped exchange only ever repairs the round in
-            // flight, and rounds rotate every ~90s with signed proofs pruned after 10 of them —
-            // so anything dropped outside a ~15-minute window was unrecoverable and the ledgers
-            // diverged permanently. Since the payout is computed from the unpaid ledger and
-            // GHOST-02 compares the split for EXACT equality, that divergence means every node
-            // rejects every payout with nothing able to repair it.
-            //
-            // So we also sweep the unpaid ledger in bounded windows, one bucket per tick,
-            // rotating back through `LEDGER_SWEEP_SPAN_SECS`. Bucketing keeps each advertisement
-            // a sane size; the rotation covers the whole span.
-            const LEDGER_BUCKET_SECS: i64 = 1_800; // 30 min per advertisement
-
-            // The span must cover the UNPAID HORIZON, not a fixed number of days.
-            //
-            // It was 7 days, and that was still too short. The window SLIDES, so a hole ages out
-            // of it whether or not it was repaired first — measured on 2026-07-30, vm7 had 6,121
-            // shares frozen on 07-20, 3,552 on 07-21, and 4,321 on 07-22 that had aged out
-            // MID-REPAIR (that day was 4,397 and had come down by only 76 before the boundary
-            // passed it). Meanwhile 07-25, still inside the window, went 17,862 -> 9,404. So the
-            // mechanism works and simply loses the race against its own boundary.
-            //
-            // The payout ledger compares EVERY unpaid share, and nothing has settled since
-            // 2026-06-02 (won_blocks = 0, see #556), so the horizon is ~2 months and growing. A
-            // fixed span can never track that. Derive it from the oldest unpaid share instead,
-            // with a cap so a pathological backlog cannot make the rotation unbounded.
-            const LEDGER_SPAN_MIN_SECS: i64 = 7 * 86_400;
-            const LEDGER_SPAN_MAX_SECS: i64 = 90 * 86_400;
-            // Fast lane: recent holes must not wait for a full long rotation. Every other tick
-            // sweeps within the last day, so a fresh drop is still repaired within ~24 min while
-            // the long rotation guarantees everything is eventually reached.
-            const LEDGER_RECENT_SPAN_SECS: i64 = 86_400;
-            const LEDGER_RECENT_BUCKETS: i64 = LEDGER_RECENT_SPAN_SECS / LEDGER_BUCKET_SECS;
-
-            // Max share hashes in ONE request. The request advertises every unpaid hash in its
-            // window and nothing bounded it, so a busy 30-minute bucket (~5,800 hashes) built a
-            // 1.58 MB message against the 1 MB cap and was dropped BEFORE reaching a peer —
-            // silently, since an undelivered request produces neither an error nor a discard
-            // count. Repair worked in thin buckets and stalled exactly where divergence was.
-            //
-            // Measured: 3,000 hashes -> 817 KB as an envelope, 5,799 -> 1,577,942 bytes. This is
-            // the request-side twin of the response bound in #559/#561/#562.
-            const MAX_HASHES_PER_REQUEST: i64 = 3_000;
-
-            // How many long-lane buckets to enqueue per tick.
-            //
-            // One bucket per long tick means the cursor walks 30 minutes of history per
-            // minute of wall-clock. Measured on vm7 2026-07-30: after 95 minutes of uptime
-            // the sweep had reached only 47 hours back, and the divergent region (07-25, five
-            // days back) needs FOUR HOURS from a cold start before it is even looked at. A
-            // full rotation over the ~58-day unpaid horizon takes 46 hours.
-            //
-            // There is no server-side throttle on serving these requests, so fan-out is the
-            // lever. 12 buckets per long tick covers 6 hours of history per minute — a full
-            // horizon sweep in ~4 hours instead of 46 — and each request is bounded by
-            // MAX_HASHES_PER_REQUEST, so the wire cost stays flat.
-            //
-            // Was 12. That made the rotation 12x faster but the binding constraint was never
-            // visits-per-hour — it was proofs-per-visit, which the truncation signal now fixes
-            // directly (#558). 12 cost real capacity for nothing: vm5's `/health` went from
-            // sub-millisecond to 10.06s, having read 887 GB since restart at 36% CPU with
-            // 1,329 MB available, because each tick runs 12x the ledger queries against a
-            // 2.6 GB database on a node whose working set already exceeds RAM (#556).
-            //
-            // 4 keeps a useful improvement on the original 46-hour rotation (~11.6h) at a third
-            // of the query load. With truncation now drained in-place, rotation speed only
-            // governs how quickly a NEW hole is discovered, not how long one takes to clear.
-            const LONG_BUCKETS_PER_TICK: i64 = 4;
-            /// Hard cap on requests emitted in one tick. Sized above LONG_BUCKETS_PER_TICK so a
-            /// tick's buckets are never silently dropped, with room for windows that split.
-            const MAX_REQUESTS_PER_TICK: usize = 24;
-
-            // Where the cursor is persisted. A restart used to reset it to bucket 0, throwing
-            // away the entire walk-back: five deploys on 2026-07-30 each cost up to 46 hours of
-            // traversal, which is why repair appeared to stall for a whole day.
-            const SWEEP_CURSOR_KEY: &str = "ghost03.ledger_sweep.bucket";
-
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
-            // Resume the cursor rather than restarting the walk-back on every process start.
-            let mut bucket: i64 = db_for_conv
-                .kv_get(SWEEP_CURSOR_KEY)
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            if bucket != 0 {
-                info!(
-                    bucket,
-                    "GHOST-03: resuming ledger sweep from persisted cursor"
-                );
-            }
-            let mut recent_bucket: i64 = 0;
-            let mut long_lane = true;
-
             loop {
                 ticker.tick().await;
 
@@ -4982,142 +4879,6 @@ async fn main() -> Result<()> {
                 if let Ok(bytes) = conv_handler.request_bytes(round_id) {
                     // An advertisement: every peer is a legitimate recipient, so it fans out.
                     conv_tx.enqueue(bytes, None).await;
-                }
-
-                // The ledger sweep repairs the LEGACY unpaid ledger, and since migration v56
-                // there is no longer one to repair: `shares_archive` is frozen and never
-                // advertised, while `shares` holds only the retention window.
-                //
-                // Leaving it running is not merely wasteful, it is actively harmful. The sweep
-                // advertises the unpaid hashes it can see — a few HOURS of them — across a span
-                // clamped to a 7-DAY minimum (`LEDGER_SPAN_MIN_SECS`). Every peer therefore
-                // concludes this node is missing a week of shares and tries to serve all of it
-                // back. Measured on 2026-08-18, the hour the cutover landed: inbound
-                // `ShareConvergence` went from 0/h to 691/h on ghost-vm7 and 322/h on ghost-vm6,
-                // saturating the convergence channel (#647) and pushing `/health` to 14-15s.
-                //
-                // Nothing was corrupted — the `shares_all` guard in `import_unpaid_shares*`
-                // refused every re-offered row, which is precisely why it exists — but the
-                // traffic bought nothing. `SHARE_SHARD_BUILD.md` always said the sweep switches
-                // off at the flip; this is that switch, and it is why it cannot wait for the
-                // Stage 6 deletion release.
-                //
-                // The round-in-flight repair above is deliberately KEPT: it is one request per
-                // tick, scoped to the current round, and is not what floods.
-                if shard_owns_evidence {
-                    continue;
-                }
-
-                // Repair one window of the unpaid ledger (the slow path that actually keeps the
-                // ledgers converged), alternating between the long rotation over the whole
-                // unpaid horizon and a fast lane over the last day.
-                let now = chrono::Utc::now().timestamp();
-
-                // Span tracks the oldest unpaid share, clamped. Cheap query, and it must be
-                // re-read rather than cached: the horizon grows for as long as nothing settles.
-                //
-                // Anchored to the oldest SERVABLE share, not the oldest unpaid one. Pre-v41
-                // shares carry no proof and can never be served, so buckets holding only those
-                // have no reachable outcome — walking them is pure cost. 63% of the unpaid
-                // ledger was in that class on 2026-07-31, which put ~2,500 dead buckets (~12 h)
-                // in front of every rotation. See `oldest_servable_unpaid_share_timestamp`.
-                let servable_oldest = db_for_conv
-                    .oldest_servable_unpaid_share_timestamp()
-                    .ok()
-                    .flatten();
-                let span = servable_oldest
-                    .map(|oldest| (now - oldest).clamp(LEDGER_SPAN_MIN_SECS, LEDGER_SPAN_MAX_SECS))
-                    .unwrap_or(LEDGER_SPAN_MIN_SECS);
-                let long_buckets = (span / LEDGER_BUCKET_SECS).max(1);
-
-                // Report how much history the anchor skipped, once per rotation. Without this
-                // the saving is invisible: a shorter span and a stalled sweep look identical
-                // from outside, which is how #558 stayed unexplained for days.
-                if bucket == 0 {
-                    let unpaid_oldest = db_for_conv
-                        .oldest_unpaid_share_timestamp()
-                        .ok()
-                        .flatten()
-                        .unwrap_or(now);
-                    let skipped = servable_oldest.unwrap_or(now).saturating_sub(unpaid_oldest);
-                    info!(
-                        span_hours = span / 3_600,
-                        long_buckets,
-                        dead_prefix_hours = skipped / 3_600,
-                        "GHOST-03: sweep span anchored to oldest servable share"
-                    );
-                }
-
-                // Collect this tick's windows. The long lane advances several buckets at
-                // once so the horizon is traversed in hours rather than days; the recent lane
-                // stays at one bucket because it is already covered every other tick.
-                let mut lane_windows: Vec<(i64, i64)> = Vec::new();
-                if long_lane {
-                    for _ in 0..LONG_BUCKETS_PER_TICK {
-                        let until = now - bucket * LEDGER_BUCKET_SECS;
-                        lane_windows.push((until - LEDGER_BUCKET_SECS, until));
-                        bucket = (bucket + 1) % long_buckets;
-                    }
-                    // Persist after advancing so a restart resumes here, not at bucket 0.
-                    if let Err(e) = db_for_conv.kv_set(SWEEP_CURSOR_KEY, &bucket.to_string()) {
-                        debug!(error = %e, "GHOST-03: could not persist sweep cursor");
-                    }
-                } else {
-                    let until = now - recent_bucket * LEDGER_BUCKET_SECS;
-                    lane_windows.push((until - LEDGER_BUCKET_SECS, until));
-                    recent_bucket = (recent_bucket + 1) % LEDGER_RECENT_BUCKETS;
-                }
-                long_lane = !long_lane;
-
-                // #558: log the outbound sweep request. A silent client and a client whose
-                // requests are all answered "nothing to serve" produced identical logs, so
-                // there was no way to tell a broken sweep from a converged one.
-                // Split the window until each request fits on the wire. A window with more
-                // than MAX_HASHES_PER_REQUEST hashes is halved repeatedly; each sub-window is
-                // sent separately. Without this the busiest windows — the ones actually holding
-                // divergence — produced messages no peer ever received.
-                let mut windows: Vec<(i64, i64)> = lane_windows;
-                let mut sent = 0usize;
-                while let Some((ws, wu)) = windows.pop() {
-                    let n = db_for_conv.count_unpaid_shares_in(ws, wu).unwrap_or(0);
-                    if n > MAX_HASHES_PER_REQUEST && wu - ws > 1 {
-                        let mid = ws + (wu - ws) / 2;
-                        windows.push((ws, mid));
-                        windows.push((mid, wu));
-                        continue;
-                    }
-                    if n == 0 {
-                        continue; // nothing to advertise in this slice
-                    }
-                    match conv_handler.ledger_request_bytes(ws, wu) {
-                        Ok(bytes) => {
-                            tracing::debug!(
-                                since = ws,
-                                until = wu,
-                                advertised = n,
-                                bytes = bytes.len(),
-                                "GHOST-03: window convergence request sent"
-                            );
-                            conv_tx.enqueue(bytes, None).await;
-                            sent += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, since = ws, until = wu,
-                                "GHOST-03: could not build window convergence request");
-                        }
-                    }
-                    // Bound the fan-out from one tick so a pathological window cannot flood.
-                    // Must exceed LONG_BUCKETS_PER_TICK or the extra buckets are enqueued and
-                    // then silently dropped, which would make the faster traversal a no-op.
-                    // Headroom above it covers windows that split into several requests.
-                    if sent >= MAX_REQUESTS_PER_TICK {
-                        debug!(
-                            sent,
-                            remaining = windows.len(),
-                            "GHOST-03: sweep fan-out cap reached this tick"
-                        );
-                        break;
-                    }
                 }
             }
         });

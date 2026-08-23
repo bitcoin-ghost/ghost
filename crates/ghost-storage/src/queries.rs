@@ -580,49 +580,6 @@ impl Database {
         })
     }
 
-    /// How many unpaid share hashes a window would advertise. Cheap COUNT, used to split a
-    /// window before building a request that would not fit on the wire.
-    ///
-    /// The convergence REQUEST carries every unpaid hash in its window, and nothing bounded it.
-    /// A busy 30-minute bucket holds ~5,800 hashes, which serialises to **1.58 MB** against the
-    /// 1 MB cap — so the request was dropped before reaching any peer. Silently: an oversized
-    /// request produces no error and no discard counter, because there is no peer to count it.
-    /// Repair therefore worked only in thin buckets and stalled wherever the divergence actually
-    /// was. Mirror image of the response-side bug in #559/#561/#562 (#558).
-    pub fn count_unpaid_shares_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<i64> {
-        self.with_connection(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM shares
-                 WHERE paid_in_proposal_hash IS NULL AND valid = 1
-                   AND timestamp >= ?1 AND timestamp < ?2",
-                params![since_ts, until_ts],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))
-        })
-    }
-
-    pub fn unpaid_share_hashes_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT share_hash FROM shares
-                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
-                       AND timestamp >= ?1 AND timestamp < ?2
-                     ORDER BY timestamp",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            let rows = stmt
-                .query_map(params![since_ts, until_ts], |r| r.get::<_, String>(0))
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(|e| GhostError::Database(e.to_string()))?);
-            }
-            Ok(out)
-        })
-    }
-
     /// GHOST-03: the stored proofs for unpaid shares at/after `since_ts` that the requester
     /// does NOT hold. This is what a node SERVES during ledger convergence.
     ///
@@ -6279,7 +6236,7 @@ impl Database {
 
     /// The dedup keys `(challenger|target|capability|timestamp)` of the verification records
     /// this node holds in `[since_ts, until_ts)`. A convergence requester advertises these so
-    /// the responder only sends back what's missing. Mirrors `unpaid_share_hashes_in`.
+    /// the responder only sends back what's missing. Mirrored the GHOST-03 unpaid-ledger sweep, deleted in Stage 6.
     pub fn verification_keys_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
         self.with_connection(|conn| {
             let mut stmt = conn
