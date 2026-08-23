@@ -1132,7 +1132,26 @@ impl PayoutProposalCreator {
                         .saturating_add(invalid_sats),
                 )
             }
-            None => self.calculate_miner_payouts(&data.miner_work, fee_dist.miner_pool)?,
+            // Stage 6: there is no legacy fallback any more. The shard IS the ledger.
+            //
+            // This used to recompute the split from `data.miner_work` — the unpaid share ledger —
+            // whenever the shard was absent or unarmed. That source is being deleted, so a node
+            // without a running, genesis-installed shard can no longer construct a payout at all
+            // and must say so, rather than silently paying from something that no longer exists.
+            //
+            // ⚠ This makes `pool.share_shard` plus installed genesis a HARD REQUIREMENT for
+            // taking part in payouts. It is the same position `CHECKPOINT_FROM_SHARD_HEIGHT`
+            // already took for the checkpoint, which abstains loudly instead of falling back —
+            // a silent fall back to a second source is exactly the mixed-source divergence that
+            // gate exists to end.
+            None => {
+                return Err(ghost_common::error::GhostError::PayoutCalculation(
+                    "no shard balances available and the legacy ledger source was removed in \
+                     Stage 6 — this node cannot build a payout. Set `pool.share_shard` and \
+                     install genesis."
+                        .to_string(),
+                ))
+            }
         };
 
         // Add miner dust to node reward pool - no satoshis are lost!
@@ -3280,7 +3299,7 @@ mod tests {
     /// anyone-can-spend coinbase output.
     #[test]
     fn a_miner_with_no_resolvable_address_becomes_dust_not_an_empty_output() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         // A miner_id that is not itself an address and has no row in `miners`, so
         // `get_miner_address` yields empty.
         let miner_work: Vec<(String, u128)> = vec![("worker-with-no-address".to_string(), 1_000)];
@@ -3390,6 +3409,21 @@ mod tests {
         assert!(!expected_map.is_empty(), "the fixture paid nobody");
     }
 
+    /// A regtest `PayoutProposalCreator`, for the shard-payout tests below.
+    ///
+    /// Reinstated under a plain name when the GHOST-02 vote tests were deleted with the vote —
+    /// it was called `ghost02_creator`, but it never had anything to do with GHOST-02, and the
+    /// tests that still need it are about shard address validation (#726).
+    fn regtest_creator() -> PayoutProposalCreator {
+        let config = PayoutConfig {
+            treasury_address: Some(vec![1u8; 20]),
+            network: ghost_common::config::BitcoinNetwork::Regtest,
+            ..Default::default()
+        };
+        let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+        PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
+    }
+
     // ── #726: shard payouts must pass the same address validation the validator applies ─────
 
     /// A regtest-valid address, so `ghost02_creator` (Regtest) accepts it.
@@ -3401,7 +3435,7 @@ mod tests {
     /// the whole block. One bad address cost every miner in it.
     #[test]
     fn an_invalid_shard_address_becomes_dust_instead_of_a_dropped_output() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let payouts = vec![
             (RT_ADDR_A.to_string(), 1_000u64),
             ("not a bitcoin address".to_string(), 250u64),
@@ -3423,7 +3457,7 @@ mod tests {
     /// instead re-weight every surviving miner — silently changing what the block pays.
     #[test]
     fn dropping_an_invalid_address_does_not_redistribute_to_the_others() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let with_bad = vec![
             (RT_ADDR_A.to_string(), 1_000u64),
             ("!!not-an-address!!".to_string(), 999u64),
@@ -3447,7 +3481,7 @@ mod tests {
     /// unspendable, and the issue calls this out explicitly.
     #[test]
     fn a_wrong_network_shard_address_is_also_dusted() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         // Valid bech32, valid mainnet — wrong network for this Regtest creator.
         let payouts = vec![
             (RT_ADDR_A.to_string(), 500u64),
@@ -3471,7 +3505,7 @@ mod tests {
     /// The common case must cost nothing and change nothing.
     #[test]
     fn an_all_valid_shard_split_is_passed_through_untouched() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let payouts = vec![
             (RT_ADDR_A.to_string(), 1_000u64),
             (RT_ADDR_B.to_string(), 2_000u64),
@@ -3481,64 +3515,6 @@ mod tests {
 
         assert_eq!(kept, payouts);
         assert_eq!(invalid_sats, 0);
-    }
-
-    fn ghost02_creator() -> PayoutProposalCreator {
-        let config = PayoutConfig {
-            treasury_address: Some(vec![1u8; 20]),
-            network: ghost_common::config::BitcoinNetwork::Regtest,
-            ..Default::default()
-        };
-        let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
-        PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
-    }
-
-    fn ghost02_proposal(subsidy: u64, miner_payouts: Vec<PayoutEntry>) -> PayoutProposal {
-        // Conserve value (GHOST-02 requires it): with no node payouts, everything not
-        // paid to miners is the treasury's — the same remainder a real empty-node block
-        // routes there. Without this the proposal would make `subsidy - miner` sats
-        // vanish and be rejected on conservation before the miner recompute is even
-        // reached.
-        let miner_sum: u64 = miner_payouts.iter().map(|e| e.amount).sum();
-        PayoutProposal {
-            proposal_hash: [0u8; 32],
-            round_id: 1,
-            block_hash: [0u8; 32],
-            block_height: 100,
-            proposer: [0u8; 32],
-            miner_payouts,
-            node_payouts: vec![],
-            treasury_amount: subsidy.saturating_sub(miner_sum),
-            treasury_address: vec![1u8; 20],
-            tx_fees: 0,
-            subsidy,
-            timestamp: 1_700_000_000,
-            tx_fees_unallocated: 0,
-        }
-    }
-
-    #[test]
-    fn ghost02_rejects_payout_unsupported_by_local_ledger() {
-        let creator = ghost02_creator();
-        let ts = TreasuryState::new();
-        // This node's ledger is empty → no miner is owed anything for the round.
-        let local_work: Vec<(String, u128)> = vec![];
-        // The proposal nonetheless claims a 1 BTC miner payout.
-        let proposal = ghost02_proposal(
-            5_000_000_000,
-            vec![PayoutEntry {
-                address: vec![2u8; 22],
-                amount: 100_000_000,
-                recipient_id: [3u8; 32],
-                payout_type: PayoutType::Mining,
-            }],
-        );
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &ts)
-                .is_err(),
-            "GHOST-02: a payout the local ledger does not support must be rejected"
-        );
     }
 
     // The honest-accept case is covered by `ghost02_ledger_proposal_survives_validator_recompute`
@@ -3721,13 +3697,20 @@ mod tests {
         // Give the node a payout address so its share lands as a node output rather than
         // falling back to the treasury (which would make treasury_amount decay-independent).
         seed_node_with_addr(&db, [9u8; 32], &addrs[0]);
+        // Stage 6: the balances come from the shard, since the legacy ledger source is gone.
+        // What this test is actually about — that the fee split anchors to the CUTOFF and not to
+        // the block timestamp — is unaffected by where the miner balances came from.
         let miner_work =
             select_ledger_miner_work(&db, cutoff_ts, LEDGER_TEST_HEIGHT, LEDGER_TEST_SUBSIDY)
                 .expect("ledger work");
+        let owed: std::collections::BTreeMap<String, i64> = miner_work
+            .iter()
+            .map(|(addr, work)| (addr.clone(), *work as i64))
+            .collect();
 
         let proposal = creator
             .create_proposal(BlockFoundData {
-                shard_owed: None,
+                shard_owed: Some(owed),
                 round_id: LEDGER_ROUNDS,
                 ledger_cutoff_ts: cutoff_ts,
                 block_hash: [7u8; 32],
@@ -3777,192 +3760,6 @@ mod tests {
         assert_ne!(
             proposal.treasury_amount, now_treasury,
             "must NOT reflect the wall-clock block_timestamp's decay year"
-        );
-    }
-
-    /// The fix: a validator recomputing from the unpaid ledger — over the cutoff the
-    /// proposal carries — reproduces the proposer's split exactly and approves it.
-    #[test]
-    fn ghost02_ledger_proposal_survives_validator_recompute() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-
-        let proposal = ledger_proposal(&creator, &db, &addrs, now);
-        assert!(
-            !proposal.miner_payouts.is_empty(),
-            "the ledger-built proposal pays the miners"
-        );
-        assert_eq!(
-            proposal.timestamp as i64, now,
-            "the proposal must carry the ledger cutoff its split was computed against, \
-             so validators can reproduce the proposer's exact window"
-        );
-
-        // What a validating node recomputes (main.rs GHOST-02 validator): same function,
-        // same source, cutoff taken from the proposal.
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-
-        let ts = TreasuryState::new();
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &ts)
-                .is_ok(),
-            "GHOST-02: an honest ledger-built proposal must survive an honest node's \
-             recompute — if this fails, the fleet rejects its own payout and the coinbase \
-             falls back to paying pool_payout_address alone"
-        );
-    }
-
-    /// GHOST-02 (extended): a coinbase that doesn't conserve value — a satoshi minted or
-    /// destroyed — is rejected even though its miner split recomputes cleanly.
-    #[test]
-    fn ghost02_rejects_non_conserving_coinbase() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
-
-        // Mint one satoshi from nothing: treasury up by one, nothing else moved.
-        proposal.treasury_amount += 1;
-
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
-                .is_err(),
-            "GHOST-02: a coinbase that doesn't conserve value must be rejected"
-        );
-    }
-
-    /// GHOST-02 (extended): the treasury output must pay the configured treasury script.
-    /// A same-amount redirect to another address is rejected.
-    #[test]
-    fn ghost02_rejects_redirected_treasury() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
-        assert!(
-            proposal.treasury_amount > 0,
-            "the ledger proposal funds the treasury (node_shares empty → fallback)"
-        );
-
-        // Same amount, attacker's address.
-        proposal.treasury_address = vec![0xabu8; 22];
-
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
-                .is_err(),
-            "GHOST-02: a redirected treasury address must be rejected"
-        );
-    }
-
-    /// GHOST-02 (extended): the treasury can't be shorted below its deterministic floor
-    /// (base rate + sub-dust fees), even if the shortfall is moved to a node so the
-    /// coinbase still conserves. NB: the node-vs-treasury split ABOVE the floor is NOT
-    /// pinned — node eligibility isn't validator-reproducible (see the node-split
-    /// decision doc) — so this only asserts the floor.
-    #[test]
-    fn ghost02_rejects_treasury_below_floor() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
-
-        // The floor is the base treasury rate (this fixture has no tx fees).
-        let block_time =
-            chrono::DateTime::<chrono::Utc>::from_timestamp(proposal.timestamp as i64, 0).unwrap();
-        let floor = FeeDistribution::calculate_at_height(
-            proposal.subsidy,
-            proposal.tx_fees,
-            &TreasuryState::new(),
-            block_time,
-            proposal.block_height >= crate::coinbase_fee_split_height(),
-        )
-        .treasury_amount;
-        if floor == 0 {
-            return; // no positive floor at this height/decay — nothing to violate
-        }
-        assert!(
-            proposal.treasury_amount >= floor,
-            "the honest proposal sits at or above the treasury floor"
-        );
-
-        // Short the treasury one satoshi below its floor, moving the shortfall to a node
-        // so the coinbase still conserves value.
-        let target = floor - 1;
-        let shortfall = proposal.treasury_amount - target;
-        proposal.treasury_amount = target;
-        proposal.node_payouts.push(PayoutEntry {
-            address: vec![0x33u8; 22],
-            amount: shortfall,
-            recipient_id: [0x33u8; 32],
-            payout_type: PayoutType::NodeReward,
-        });
-
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
-                .is_err(),
-            "GHOST-02: treasury shorted below its deterministic floor must be rejected"
-        );
-    }
-
-    /// Regression pin: recomputing from the winning job-round — what the validator used to
-    /// do — rejects the pool's own honest proposal. This is the bug the fix removes; if a
-    /// future change reintroduces a round-scoped recompute, this test starts failing.
-    #[test]
-    fn ghost02_round_scoped_recompute_rejects_honest_ledger_proposal() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-
-        let proposal = ledger_proposal(&creator, &db, &addrs, now);
-
-        // `rm.get_miner_work_scaled(proposal.round_id)`: only the winning ~90s round.
-        // Carol is owed by the ledger but idle during that round, so she vanishes here.
-        let round_work = winning_round_work(&addrs);
-        assert_eq!(
-            round_work.len(),
-            2,
-            "the winning round only saw the two still-active miners"
-        );
-
-        let ts = TreasuryState::new();
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &round_work, &ts)
-                .is_err(),
-            "a round-scoped recompute cannot reproduce a ledger-built split — this is \
-             precisely why the validator must not use the round"
         );
     }
 
@@ -4931,7 +4728,7 @@ mod tests {
 
     #[test]
     fn solo_uses_the_pool_fee_model_above_the_gate() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let data = solo_data_at_height(crate::coinbase_fee_split_height());
 
         let subsidy = data.subsidy_sats;
@@ -4970,7 +4767,7 @@ mod tests {
     /// finder. A mixed-version fleet must not split on coinbase construction.
     #[test]
     fn solo_keeps_the_legacy_model_below_the_gate() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let data = solo_data_at_height(crate::coinbase_fee_split_height() - 1);
 
         let subsidy = data.subsidy_sats;
