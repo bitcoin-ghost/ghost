@@ -214,23 +214,43 @@ local_shares_since() {
     one_clean_integer "$out"
 }
 
+# What `pool_sv2` actually did at the share boundary since $2 (epoch seconds).
+#
+# Echoes "loglines batches submits":
+#   loglines - total sri-pool journal lines in the window. POSITIVE CONTROL: zero means the probe
+#              itself did not work (no sudo, journald rotated, ssh trouble), which is a different
+#              thing from "nothing happened" and must never be read as evidence.
+#   batches  - "Share batch sent successfully": pool_sv2 POSTed a batch and ghost-pool ACCEPTED the
+#              POST. Work provably crossed the boundary.
+#   submits  - "SubmitShares": work provably ARRIVED at pool_sv2 from a miner.
+#
+# This exists because the connection count could not carry the weight put on it (#753). It was
+# meant to answer "is somebody still sending work", and an established TCP socket does not answer
+# that: on 2026-08-23 ghost-vm1 sat at zero local shares with EIGHT established non-loopback
+# stratum connections while perfectly healthy, and the gate would have rolled back a deploy to it.
+# These counters are the event itself rather than a proxy for it.
+webhook_activity_since() {
+    timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
+        "S=\$(sudo journalctl -u sri-pool --since '@$2' --no-pager 2>/dev/null); \
+         printf '%s %s %s' \
+           \"\$(printf '%s\\n' \"\$S\" | grep -c .)\" \
+           \"\$(printf '%s\\n' \"\$S\" | grep -c 'Share batch sent successfully')\" \
+           \"\$(printf '%s\\n' \"\$S\" | grep -c 'SubmitShares')\"" \
+        2>/dev/null || true
+}
+
 # Count ESTABLISHED miner connections on the node's stratum ports (SV1 :3333, farm tier :4444,
 # direct SV2 :34255), excluding loopback peers — the node's own translator holds a permanent
 # 127.0.0.1 connection to pool_sv2 on :34255 and must not read as a miner.
 #
-# This is what separates the two causes of post-swap silence:
+# ⚠ #753: this count is now REPORTED, not DECIDED on. It was the discriminator between H-13 and a
+# routine DNS shed, on the reasoning that a still-attached miner means work is still arriving. It
+# does not mean that. An idle, half-open or just-reconnected socket counts identically to a busy
+# one, and on 2026-08-23 ghost-vm1 sat healthy at zero local shares with EIGHT established
+# non-loopback stratum connections — the gate would have rolled back a deploy to it for nothing.
 #
-#   * H-13: miners still CONNECTED, work arriving and silently discarded  -> conns > 0
-#   * a shed: ALL EIGHT nodes are in the mining DNS, so the restart this script just issued
-#     drops the node's miners and they rehome on another node in seconds  -> conns == 0
-#
-# Measured on the night of 2026-08-10/11: avalonQ's last share on vm3 landed at 1786408429 and
-# its first on vm2 at 1786408453 — 24 seconds after vm3's restart. Four healthy binaries were
-# rolled back that night (vm6, vm3, vm1 twice) because the silence they left behind was read as
-# the H-13 signature.
-#
-# `wc -l` runs REMOTELY, so a transport failure yields an empty string (unreadable), never 0:
-# "no miners attached" is only ever a genuine measurement.
+# `webhook_activity_since` now carries that decision, because it counts the EVENT (work arriving at
+# pool_sv2, batches crossing to ghost-pool) rather than a socket that might carry one.
 miner_connections() {
     local out
     out=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
@@ -248,7 +268,7 @@ miner_connections() {
 #
 # 0 = regressed (roll back), 1 = fine or not measurable.
 throughput_regressed() {
-    local baseline="${1:-}" post="${2:-}" conns="${3:-}"
+    local baseline="${1:-}" post="${2:-}" loglines="${3:-}" submits="${4:-}"
     # No traffic before the swap: nothing to lose, and nothing to conclude.
     [ -n "$baseline" ] || return 1
     [ "$baseline" -gt 0 ] 2>/dev/null || return 1
@@ -267,10 +287,23 @@ throughput_regressed() {
     # the deploy chased one cohort of miners around the fleet all night, and every node they had
     # just been shed FROM reported the H-13 signature.
     #
-    # An unreadable connection count gets the same treatment as an unreadable share count: not
-    # measurable, and a binary is not rolled back on evidence that was never collected.
-    [ -n "$conns" ] || return 1
-    [ "$conns" -gt 0 ] 2>/dev/null || return 1
+    # An unreadable count gets the same treatment as an unreadable share count: not measurable,
+    # and a binary is not rolled back on evidence that was never collected.
+    #
+    # #753: the discriminator is no longer the CONNECTION count. `conns > 0` was standing in for
+    # "somebody is still sending work", and it does not mean that — an idle or half-open socket
+    # counts the same as a busy miner. Measured 2026-08-23, ghost-vm1 was healthy at zero local
+    # shares with EIGHT established non-loopback stratum connections, so this function would have
+    # rolled back a deploy to it. It did roll back a healthy v1.11.27 on ghost-vm6 for exactly
+    # that reason: the node's single miner had rehomed via the mining DNS during the restart this
+    # script issued, and the leftover socket read as "still sending".
+    #
+    # `submits` is the event itself: work provably arriving at pool_sv2 from a miner.
+    [ -n "$loglines" ] || return 1
+    [ "$loglines" -gt 0 ] 2>/dev/null || return 1   # probe did not work -> conclude nothing
+    [ -n "$submits" ] || return 1
+    [ "$submits" -gt 0 ] 2>/dev/null || return 1    # nothing arrived -> a shed, not a discard
+    # Work arrived and NOTHING was credited. That is the H-13 signature.
     return 0
 }
 
@@ -690,21 +723,23 @@ if [ -z "${ROLLBACK:-}" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
     # a healthy binary. `select count(*)` returning "0" is the only genuine zero.
     POST_SHARES=$(local_shares_since "$NODE" "$SWAP_EPOCH" || true)
     MINER_CONNS=$(miner_connections "$NODE" || true)
-    info "post-swap window ($SWAP_EPOCH, $(date +%s)] epoch, raw count '${POST_SHARES}', established miner connections '${MINER_CONNS}'"
+    read -r WH_LINES WH_BATCHES WH_SUBMITS <<<"$(webhook_activity_since "$NODE" "$SWAP_EPOCH")"
+    info "post-swap window ($SWAP_EPOCH, $(date +%s)] epoch, credited '${POST_SHARES}', pool_sv2 submits '${WH_SUBMITS:-?}', batches delivered '${WH_BATCHES:-?}', sri-pool loglines '${WH_LINES:-?}', miner conns '${MINER_CONNS}'"
     if [ -z "$POST_SHARES" ]; then
         info "WARNING: could not read the share count from $NODE — throughput NOT verified"
-    elif throughput_regressed "$BASELINE_SHARES" "$POST_SHARES" "$MINER_CONNS"; then
-        echo "NO LOCAL SHARES CREDITED in ${SETTLE}s after the swap, but $BASELINE_SHARES arrived in the" >&2
-        echo "  $((BASELINE_WINDOW / 60))m before it, and $MINER_CONNS miner connection(s) are still ESTABLISHED." >&2
-        echo "  Work is arriving and being discarded. This is the H-13 signature. Rolling back." >&2
+    elif throughput_regressed "$BASELINE_SHARES" "$POST_SHARES" "$WH_LINES" "$WH_SUBMITS"; then
+        echo "NO LOCAL SHARES CREDITED in ${SETTLE}s after the swap, but pool_sv2 logged" >&2
+        echo "  ${WH_SUBMITS} SubmitShares and delivered ${WH_BATCHES} batch(es) in the same window." >&2
+        echo "  Work IS arriving and is being discarded. This is the H-13 signature. Rolling back." >&2
         ROLLBACK=1
-    elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null && [ "$MINER_CONNS" = "0" ]; then
-        info "no local shares since the swap, and NO miners are attached: the restart shed them and"
-        info "  they have rehomed via the mining DNS (all eight nodes are in it). Not H-13 —"
-        info "  throughput on this node is UNVERIFIED, not regressed. Proceeding."
+    elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null && [ -n "${WH_LINES:-}" ] && [ "${WH_LINES:-0}" -gt 0 ] 2>/dev/null && [ "${WH_SUBMITS:-0}" -eq 0 ] 2>/dev/null; then
+        info "no local shares since the swap, and pool_sv2 received NO submissions either: the"
+        info "  restart shed this node's miners and they have rehomed via the mining DNS (all eight"
+        info "  nodes are in it). Not H-13 — throughput here is UNVERIFIED, not regressed. Proceeding."
     elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null; then
-        info "WARNING: no shares since the swap and the miner connection count is UNREADABLE —"
-        info "  cannot distinguish H-13 from a routine DNS shed; NOT rolling back on unmeasured evidence"
+        info "WARNING: no shares since the swap and pool_sv2's activity is UNREADABLE"
+        info "  (loglines='${WH_LINES:-}' submits='${WH_SUBMITS:-}') — cannot distinguish H-13 from a"
+        info "  routine DNS shed; NOT rolling back on unmeasured evidence"
     else
         info "throughput OK: $POST_SHARES local shares credited since the swap (baseline $BASELINE_SHARES/$((BASELINE_WINDOW / 60))m)"
     fi
