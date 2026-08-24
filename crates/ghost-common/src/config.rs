@@ -3949,7 +3949,9 @@ rpc_ur1 = "http://localhost:8332"
             checked += 1;
         }
         // Guard against the directory moving and this silently checking nothing.
-        assert!(checked >= 4, "expected the shipped templates, found {checked}");
+        assert!(
+            checked >= 4,
+            "expected the shipped templates, found {checked}"
+        );
     }
-
 }
