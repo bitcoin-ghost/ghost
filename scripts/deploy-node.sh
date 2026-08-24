@@ -171,6 +171,16 @@ fi
 # A fixed sleep is either too short on a slow node or wasted on a fast one.
 wait_for_tcp() {
     local host="$1" port="$2" secs="${3:-150}" waited=0
+    # `0` means do not wait at all and assume reachable. The deploy-gate self-test sets this:
+    # it drives the submission path through a stub smoke script, so a real TCP poll would make
+    # the test non-hermetic AND blow its `timeout 60` per-run cap (this wait is up to 150s).
+    #
+    # ⚠ Found the hard way. The self-test passed locally only because `ssh_host_for ghost-vm1`
+    # resolves to the REAL production node and this machine can reach vm1:3333, so the poll
+    # returned instantly. In CI, with no such access, packets are dropped rather than refused,
+    # every attempt burned its full 2s timeout, the run hit the 60s cap and two cases failed.
+    # A test that reaches production to pass is not testing what it claims to.
+    [ "$secs" -eq 0 ] 2>/dev/null && return 0
     while [ "$waited" -lt "$secs" ]; do
         if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
             return 0
@@ -193,7 +203,7 @@ exercise_submission_path() {
     #
     # The smoke test then read that as a broken build and halted the roll. It was a race, not a
     # fault — the node converged on its own minutes later. Wait for the port the probe needs.
-    if ! wait_for_tcp "$host" 3333 150; then
+    if ! wait_for_tcp "$host" 3333 "${GHOST_DEPLOY_PORT_WAIT_SECS:-150}"; then
         echo "      :3333 never opened on $node within 150s — the translator did not come up" >&2
         return 1
     fi

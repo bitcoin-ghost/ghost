@@ -90,6 +90,7 @@ run_gate() {
         STUB_CONF="${STUB_CONF:-}" STUB_CONF_UNREADABLE="${STUB_CONF_UNREADABLE:-0}" \
         STUB_MTIME="${STUB_MTIME:-}" STUB_START="${STUB_START:-}" \
         GHOST_DEPLOY_SSH="${GHOST_DEPLOY_SSH:-ssh}" \
+        GHOST_DEPLOY_PORT_WAIT_SECS=0 \
         timeout 60 bash "$DEPLOY" "$node" "$binary" 2>&1 )
 }
 
