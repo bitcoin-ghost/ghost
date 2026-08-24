@@ -106,6 +106,14 @@ COLLECT='
   printf "dead_keys=%s\n"        "$(grep -ohE "^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=" /etc/ghost/pool.toml /etc/ghost/translator-config.toml 2>/dev/null | tr -d " =" | sort -u | paste -sd, -)"
   printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
   printf "cfg_parses=%s\n"       "$(/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
+  # Ops scripts are deployed by NOTHING — `deploy-node.sh` handles ghost-pool, pool_sv2 and
+  # translator_sv2 and nothing else. So these drift silently and stay drifted: the restart
+  # watchdog sat on a pre-fix version on all eight for months, posting to an ALERT_WEBHOOK
+  # from a config file that does not exist, and nobody could tell.
+  printf "ops_restart_watch=%s\n" "$($SUDO sha256sum /opt/ghost/bin/ghost-restart-watch.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_auto_update=%s\n"   "$($SUDO sha256sum /opt/ghost/bin/ghost-auto-update.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_pool_sig=%s\n"      "$($SUDO sha256sum /opt/ghost/bin/update-pool-signature.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_wait_sync=%s\n"     "$($SUDO sha256sum /opt/ghost/bin/wait-for-ghostd-sync.sh 2>/dev/null | cut -c1-16)"
   # #761: the dead_keys grep above can only ever find the three names written into it, so a clean
   # report from it proves nothing about any OTHER unknown key. --check-config is the generic
   # oracle: it round-trips the file through NodeConfig and diffs written-vs-understood, so the
@@ -304,6 +312,27 @@ for n in "${REACHED[@]}"; do
         enabled|enabled-runtime) echo "  FAIL $n superseded 'bitcoind' unit is ENABLED (ghostd is the chain daemon)"; rc=1 ;;
         *) echo "  WARN $n superseded 'bitcoind' unit still installed ($eb) — remove it" ;;
     esac
+    # ⛔ Compare ops scripts against the REPO, not just node-to-node.
+    #
+    # Cross-node drift detection alone would have called the watchdog healthy: all eight were
+    # stale IDENTICALLY, so they agreed perfectly with each other and disagreed with the source
+    # of truth. Uniform staleness is the failure mode that hid the pre-fix watchdog for months
+    # and put a February binary on vm1's :3333 for five days.
+    #
+    # Only files that HAVE a repo source are compared. `update-pool-signature.sh` and
+    # `wait-for-ghostd-sync.sh` are node-local, so they are still gathered above for cross-node
+    # drift, which is all that can honestly be said about them.
+    for ops in "ops_restart_watch:scripts/ghost-restart-watch.sh" "ops_auto_update:scripts/ghost-auto-update.sh"; do
+        field="${ops%%:*}"; src="$REPO_ROOT/${ops#*:}"
+        [ -r "$src" ] || { echo "  WARN $n cannot read $src to compare $field"; continue; }
+        want="$(sha256sum "$src" 2>/dev/null | cut -c1-16)"
+        got="${VALUES[$n|$field]:-}"
+        if [ -z "$got" ]; then
+            echo "  WARN $n $field not readable on the node"
+        elif [ "$got" != "$want" ]; then
+            echo "  FAIL $n ${ops#*:} is STALE (node $got, repo $want) — nothing deploys it; copy it by hand"; rc=1
+        fi
+    done
 done
 # #759: reported once for the fleet, not failed per node. See the note above — `[tdp]` is not a
 # NodeConfig section, so its absence is the only possible state, and it is identical everywhere.
