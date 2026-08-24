@@ -164,10 +164,39 @@ fi
 # rather than a remembered manual step.
 #
 # Returns 0 if the submission path answered correctly.
+# Poll a TCP port until it accepts, or give up. Uses bash's /dev/tcp so it needs no `nc`.
+#
+# Polling beats sleeping: the dependency chain here is ghost-pool -> pool_sv2 resolving its node
+# identity -> :34255 -> translator -> :3333, and only the last link is what the smoke test needs.
+# A fixed sleep is either too short on a slow node or wasted on a fast one.
+wait_for_tcp() {
+    local host="$1" port="$2" secs="${3:-150}" waited=0
+    while [ "$waited" -lt "$secs" ]; do
+        if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+            return 0
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 1
+}
+
 exercise_submission_path() {
     local node="$1" host
     host=$(ssh_host_for "$node") || return 1
     [ -n "$host" ] || return 1
+
+    # ⚠ Restarting ghost-pool makes pool_sv2 re-resolve its identity, and until it does it exits
+    # with "share_tier_binding is configured but this node's identity could not ...". Measured on
+    # ghost-vm6 during the v1.11.28 roll: 9 restarts and ~60s before :34255 bound, during which
+    # the translator crash-looped on "All upstreams failed" and :3333 was CLOSED.
+    #
+    # The smoke test then read that as a broken build and halted the roll. It was a race, not a
+    # fault — the node converged on its own minutes later. Wait for the port the probe needs.
+    if ! wait_for_tcp "$host" 3333 150; then
+        echo "      :3333 never opened on $node within 150s — the translator did not come up" >&2
+        return 1
+    fi
 
     timeout 120 python3 "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" \
         "$host" 3333 2>&1 | sed 's/^/      /'
@@ -899,7 +928,10 @@ if echo "$CANARY_NODES" | grep -qw "$NODE"; then
     info "exercising the share-submission path on $NODE before starting the clock"
     if ! exercise_submission_path "$NODE"; then
         die "submission-path smoke FAILED on $NODE — no soak clock started for $BINARY @ $SHORT
-       a canary cannot vouch for a build whose miners cannot handshake"
+       a canary cannot vouch for a build whose miners cannot handshake
+       ⚠ THE SWAP ALREADY HAPPENED: $NODE is running $BINARY @ $SHORT UNVERIFIED. This is not a
+         refusal that left the node untouched — check it, and roll back with
+         /opt/ghost/bin/$BINARY.bak.* if it is not serving work."
     fi
     info "submission path OK on $NODE"
 
