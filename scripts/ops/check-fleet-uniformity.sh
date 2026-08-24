@@ -106,6 +106,15 @@ COLLECT='
   printf "dead_keys=%s\n"        "$(grep -ohE "^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=" /etc/ghost/pool.toml /etc/ghost/translator-config.toml 2>/dev/null | tr -d " =" | sort -u | paste -sd, -)"
   printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
   printf "cfg_parses=%s\n"       "$(/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
+  # #761: the dead_keys grep above can only ever find the three names written into it, so a clean
+  # report from it proves nothing about any OTHER unknown key. --check-config is the generic
+  # oracle: it round-trips the file through NodeConfig and diffs written-vs-understood, so the
+  # struct is its own source of truth. Prints key NAMES only, never values.
+  #
+  # The flag does not exist in binaries older than the #761 release. Distinguish "no unknown keys"
+  # from "this binary cannot answer" — reporting the second as the first is how a check that
+  # cannot fail gets built.
+  printf "cfg_unknown=%s\n"      "$(if ! /opt/ghost/bin/ghost-pool --help 2>&1 | grep -q -- "--check-config"; then echo unsupported; elif /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --check-config >/dev/null 2>&1; then echo none; else /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --check-config 2>&1 | sed -n "s/^  //p" | paste -sd, -; fi)"
 '
 
 declare -A VALUES   # VALUES[node|field] = value
@@ -259,6 +268,14 @@ for n in "${REACHED[@]}"; do
     [ -z "$dk" ] || { echo "  FAIL $n config carries dead key(s) for removed features: $dk (#759)"; rc=1; }
     [ "${VALUES[$n|tdp_cfg]:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n no [tdp] block — template distribution is running on compiled defaults (#759)"; rc=1; }
     # The strongest single check available: does the shipped binary actually accept this file?
+    # #761: generic unknown-key oracle. `unsupported` is a WARN, not a pass — the check arms
+    # itself once the #761 release is deployed and must not read as clean before then.
+    case "${VALUES[$n|cfg_unknown]:-}" in
+        none) ;;
+        unsupported) echo "  WARN $n binary predates --check-config; unknown-key check did not run (#761)" ;;
+        "") echo "  WARN $n could not run the unknown-key check" ;;
+        *) echo "  FAIL $n config carries key(s) this binary does not understand: ${VALUES[$n|cfg_unknown]} (#761)"; rc=1 ;;
+    esac
     case "${VALUES[$n|cfg_parses]:-}" in
         ok) ;;
         "") echo "  WARN $n could not run the config parse check" ;;

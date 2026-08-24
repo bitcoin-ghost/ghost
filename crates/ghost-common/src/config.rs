@@ -94,6 +94,7 @@ pub fn validate_config_permissions(
 
 /// Main node configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Node identity configuration
     pub identity: IdentityConfig,
@@ -140,6 +141,7 @@ pub struct NodeConfig {
 /// reaper flags (`ghost-setup apply-reaper`), because ghostd only reads them at
 /// startup — a running daemon can't switch them mid-flight.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeLaunchConfig {
     /// Route all of ghostd's outbound P2P connections through Tor and publish an
     /// onion service (`-tormode=1`). Off by default (clearnet). ghostd's
@@ -271,6 +273,7 @@ impl NodeLaunchConfig {
 /// any Wraith mixing or consensus message. With `wraith_election_enabled =
 /// false` (the default) it is inert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoordinatorConfig {
     /// Compute the per-epoch coordinator election and expose it read-only via
     /// `GET /api/v1/pool/coordinator`. Default false — dead code when off.
@@ -1071,6 +1074,7 @@ impl NodeConfig {
 
 /// Identity configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     /// Path to Ed25519 private key file (legacy, use signer.key_path instead)
     #[serde(default = "default_key_path")]
@@ -1113,6 +1117,7 @@ impl Default for IdentityConfig {
 
 /// Bitcoin Core RPC configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BitcoinConfig {
     /// RPC host
     pub rpc_host: String,
@@ -1252,6 +1257,7 @@ impl BitcoinNetwork {
 /// automatically generated at startup. For mainnet, operator-provided certificates
 /// are REQUIRED (see `validate_mainnet_security`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Path to PEM-encoded certificate file. If unset, a self-signed cert is auto-generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1263,6 +1269,7 @@ pub struct TlsConfig {
 
 /// Network configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Public IP address or hostname
     pub public_address: Option<String>,
@@ -1441,6 +1448,7 @@ impl Default for NetworkConfig {
 
 /// P2P consensus port configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct P2PPortConfig {
     /// Share propagation port
     pub share_propagation: u16,
@@ -1477,6 +1485,7 @@ impl Default for P2PPortConfig {
 
 /// Policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Policy profile name
     pub profile: PolicyProfile,
@@ -1599,6 +1608,7 @@ impl PolicyProfile {
 
 /// Custom policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomPolicyConfig {
     /// Allowed BUDS tiers
     pub allowed_tiers: Vec<BudsTier>,
@@ -1691,6 +1701,7 @@ pub const VALIDATOR_WINDOW_BLOCKS: u64 = 288;
 
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// Database directory path
     pub db_path: PathBuf,
@@ -1796,6 +1807,7 @@ impl StorageConfig {
 
 /// Ghost Pay L2 configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GhostPayConfig {
     /// Enable Ghost Pay
     pub enabled: bool,
@@ -1833,6 +1845,7 @@ impl Default for GhostPayConfig {
 /// enabled = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReaperSettings {
     /// Master switch. When false, every detector is off on both layers.
     #[serde(default = "default_true")]
@@ -2002,6 +2015,7 @@ impl ReaperSettings {
 /// node_offline = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AlertsConfig {
     /// Master switch. When false, no alert is delivered on any channel,
     /// regardless of the per-channel `enabled` flags.
@@ -2017,6 +2031,7 @@ pub struct AlertsConfig {
 
 /// The set of delivery channels an operator can enable.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AlertChannels {
     #[serde(default)]
     pub email: EmailChannel,
@@ -2032,6 +2047,7 @@ pub struct AlertChannels {
 /// Postmark, a self-hosted SMTP-bridge, etc.). This keeps the node free of a
 /// heavyweight SMTP client while still delivering a real email end-to-end.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EmailChannel {
     #[serde(default)]
     pub enabled: bool,
@@ -2046,6 +2062,7 @@ pub struct EmailChannel {
 /// Push delivery via a generic / ntfy-style HTTP webhook. The node POSTs
 /// `{ "title", "message" }` JSON to `webhook_url`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PushChannel {
     #[serde(default)]
     pub enabled: bool,
@@ -2071,6 +2088,7 @@ pub struct PushChannel {
 
 /// Telegram delivery via the Bot API `sendMessage` method.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TelegramChannel {
     #[serde(default)]
     pub enabled: bool,
@@ -2087,6 +2105,7 @@ pub struct TelegramChannel {
 /// the feature is useful out of the box; an operator narrows the set as they
 /// like. These names are the stable wire keys shared with the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertEvents {
     /// Node became unreachable / unhealthy (health monitor).
     #[serde(default = "default_true")]
@@ -2246,6 +2265,7 @@ fn default_backup_target_dir() -> String {
 /// timestamped file into `target_dir` every `interval`, then pruning to the
 /// most recent `retention` files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupSchedule {
     /// Master switch. Off by default.
     #[serde(default)]
@@ -2396,6 +2416,7 @@ pub fn backups_to_prune(mut filenames: Vec<String>, retention: u32) -> Vec<Strin
 /// why `last_run_unix` starting at `None` triggers a first run shortly after
 /// startup when the schedule is enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BackupRunStatus {
     /// Unix seconds of the last completed attempt (success or failure).
     /// `None` = the task has not run since startup.
@@ -2439,6 +2460,7 @@ pub enum BlockPriority {
 
 /// Pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     /// DNS name miners are expected to reach this pool on, e.g. `pool.example.org`.
     ///
@@ -3866,5 +3888,70 @@ mod tests {
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeLaunchConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.ghostd_flags(), cfg.ghostd_flags());
+    }
+
+    // ── #761: deny_unknown_fields ────────────────────────────────────
+    //
+    // Before this, serde silently ignored any key it did not recognise, so a typo
+    // (`mining_moode`) or a key for a deleted feature sat in a production config
+    // looking configured while the binary ran on the compiled default. That is a
+    // value nobody chose — and it is invisible, because the node starts happily.
+
+    #[test]
+    fn an_unknown_key_is_now_rejected_rather_than_ignored() {
+        // Positive control FIRST: without this, a test asserting "the good config
+        // parses" would pass even if the attribute were never applied.
+        let typo = r#"
+[bitcoin]
+network = "regtest"
+mining_moode = "public_pool"
+"#;
+        let err = toml::from_str::<NodeConfig>(typo)
+            .expect_err("a misspelled key must be rejected, not silently ignored");
+        assert!(
+            err.to_string().contains("mining_moode"),
+            "the error must NAME the offending key so an operator can fix it, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_known_section_is_rejected_too() {
+        // The section is real; the key is not. Catching only unknown SECTIONS would
+        // have missed every dead key actually found on the fleet — they all sat
+        // inside sections that exist.
+        let raw = r#"
+[bitcoin]
+network = "regtest"
+rpc_ur1 = "http://localhost:8332"
+"#;
+        let err = toml::from_str::<NodeConfig>(raw)
+            .expect_err("an unknown key inside a known section must be rejected");
+        assert!(err.to_string().contains("rpc_ur1"), "got: {err}");
+    }
+
+    #[test]
+    fn every_shipped_template_still_parses() {
+        // The attribute is only safe if it accepts what we actually ship. A template
+        // that stopped parsing would take every node that uses it down at restart.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config")
+            .canonicalize()
+            .expect("config/ must exist");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read config/") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("read template");
+            toml::from_str::<NodeConfig>(&raw)
+                .unwrap_or_else(|e| panic!("{} no longer parses: {e}", path.display()));
+            checked += 1;
+        }
+        // Guard against the directory moving and this silently checking nothing.
+        assert!(
+            checked >= 4,
+            "expected the shipped templates, found {checked}"
+        );
     }
 }
