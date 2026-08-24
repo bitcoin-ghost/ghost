@@ -108,3 +108,9 @@ gsp-data/
 # docker-compose.yml bind-mounts these, so they must still EXIST on disk; rebuild with:
 #   cargo build --release -p ghost-pool && cp target/release/ghost-pool docker/regtest-cluster/bin/
 docker/regtest-cluster/bin/
+
+# SV2 integration-test fixtures, downloaded and extracted at run time (#617).
+# 201 MB of them — a full bitcoin-30.2 distribution, an sv2-tp build and LevelDB chainstate —
+# were committed by accident in 8b77fb352 because the tests populate this directory and a
+# `git add -A` swept it in. They are build products, not source: the harness fetches them.
+tests/integration-sv2/template-provider/
