@@ -123,3 +123,27 @@ pub async fn require_regtest() -> Option<Arc<BitcoinRpc>> {
     );
     None
 }
+
+/// The same decision, for callers that must build their own client.
+///
+/// [`require_regtest`] is the right entry point for almost everything, but a caller that has to
+/// configure the client before use cannot use it — `empty_template_e2e` needs
+/// `set_network(Regtest)` — and would otherwise open-code its own `eprintln!("SKIP: ...")`.
+/// That open-coded form is exactly the shape that let seven e2e tests report green without
+/// executing (#770), so the decision lives here instead of being re-made per file.
+///
+/// Panics when `GHOST_REGTEST_REQUIRED` is set, naming what was tried: the failure this
+/// replaces was a credential mismatch that read as an absent node for months.
+pub fn skip_or_fail(reason: &str) {
+    let (host, port, user, _) = regtest_params();
+    assert!(
+        std::env::var("GHOST_REGTEST_REQUIRED").is_err(),
+        "GHOST_REGTEST_REQUIRED is set but regtest is unusable at {user}@{host}:{port}: \
+         {reason} — start it (docker start rc-bitcoind) or unset the variable. This is a \
+         FAILURE rather than a skip on purpose: a silent skip is why these tests went unrun."
+    );
+    eprintln!(
+        "SKIP: {reason} at {user}@{host}:{port} \
+         (set GHOST_REGTEST_REQUIRED=1 to make this a failure)"
+    );
+}
