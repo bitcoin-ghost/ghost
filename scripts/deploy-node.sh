@@ -728,7 +728,7 @@ if [ "$BINARY" = "ghost-pool" ]; then
         timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
         exit 2
     fi
-    info "config gate: parses with the incoming binary, no dead keys, mining_mode and [tdp] set"
+    info "config gate: parses with the incoming binary, no dead keys, mining_mode set"
 fi
 
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
