@@ -691,6 +691,10 @@ if [ "$BINARY" = "ghost-pool" ]; then
     if [ -z "$cg_parse" ]; then
         echo "REFUSED: the config gate could not run on $NODE — no verdict was produced." >&2
         echo "         That is not the same as a passing config. $NODE is UNCHANGED." >&2
+        # A gate that refuses without saying what it saw sends you hunting the wrong thing.
+        # Print the raw probe output so the next person does not have to reconstruct it by hand.
+        echo "         raw probe output follows (empty means the ssh itself produced nothing):" >&2
+        printf '%s\n' "$cfg_out" | sed 's/^/         | /' >&2
         timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
         exit 2
     fi
