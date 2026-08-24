@@ -1545,7 +1545,24 @@ impl Default for MaintenanceConfig {
             keep_rounds: 1000,          // Keep ~1000 rounds of data
             keep_health_ping_days: 7,   // 7 days of health pings
             keep_uptime_sample_days: 7, // 7 days of uptime samples (STOR-1)
-            keep_challenge_days: 30,    // 30 days of challenge results (STOR-2/3/4/5)
+            // 18 days of challenge results and verification_ledger rows (STOR-2/3/4/5).
+            //
+            // The floor is TWO seven-day windows, not one: qualification reads 7 days
+            // (`UPTIME_WINDOW_DAYS`), and convergence reconciles the last 7 — so a row must
+            // survive long enough that a peer which has not pruned yet cannot re-fetch one this
+            // node has already dropped. 14 is that floor; 18 leaves four days of margin.
+            //
+            // It was 30, which is well clear of the floor but four times the read window.
+            // Measured on ghost-vm8, 2026-08-24: `verification_ledger` held 837,222 rows at
+            // 27,907/day, of which 672,224 (80%) were older than anything that reads them. The
+            // table plus its indexes was 1,249 MB of a 5.0 GB database — the second largest
+            // object in it after the frozen `shares_archive`.
+            //
+            // At 18 days this prunes ~386,000 rows (~46%, ~540 MB). ⚠ That stops the growth; it
+            // does NOT shrink the file. `auto_vacuum=0` and `freelist_count=0`, so freed pages
+            // are reused internally and only VACUUM returns them to the OS — and VACUUM needs
+            // twice the database free, which took ghost-vm6 down once already.
+            keep_challenge_days: 18,
             keep_verification_days: 30, // 30 days of verification records (STOR-6)
             keep_checkpoint_days: 90,   // 90 days of L2 checkpoint block_data
             force_optimize: false,
@@ -1601,6 +1618,35 @@ impl DatabaseStats {
 
 #[cfg(test)]
 mod tests {
+
+    /// ⛔ The retention floor is TWO seven-day windows, not one.
+    ///
+    /// `keep_challenge_days` governs both `prune_old_challenges` and
+    /// `prune_old_verification_ledger`. Qualification reads `UPTIME_WINDOW_DAYS` (7); convergence
+    /// separately reconciles the last 7. A row must therefore outlive BOTH, or a peer that has not
+    /// pruned yet re-fetches a row this node already dropped and the ledgers oscillate.
+    ///
+    /// This exists because the obvious optimisation is to set it to the read window. Measured
+    /// 2026-08-24, 80% of `verification_ledger` was older than anything that reads it, which makes
+    /// "just set it to 7" look correct and is exactly the change this test refuses.
+    #[test]
+    fn challenge_retention_never_drops_below_two_seven_day_windows() {
+        let floor = (ghost_common::constants::UPTIME_WINDOW_DAYS as u32) * 2;
+        let actual = MaintenanceConfig::default().keep_challenge_days;
+        assert!(
+            actual >= floor,
+            "keep_challenge_days is {actual}, below the {floor}-day floor \
+             (qualification window {w} + convergence window {w}). A row pruned inside that floor \
+             can be re-fetched from a peer that has not pruned it yet.",
+            w = ghost_common::constants::UPTIME_WINDOW_DAYS
+        );
+        // And it should not be so wide that it stops being a retention policy at all.
+        assert!(
+            actual <= floor * 3,
+            "keep_challenge_days is {actual}, more than 3x the {floor}-day floor — that is not \
+             margin, it is an unbounded table with extra steps"
+        );
+    }
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
