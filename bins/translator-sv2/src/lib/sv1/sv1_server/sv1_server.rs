@@ -1510,9 +1510,21 @@ impl Sv1Server {
         // smallest expected miner, so a farm or a rented-hashrate order that starts there
         // spends minutes flooding shares while vardiff ramps (capped at ×3–×5 per 60s tick).
         // Already clamped to a sane range in `record_suggested_difficulty`.
+        // Preference order: what the miner declared, then THIS LISTENER's floor, then the config.
+        //
+        // #611: the fallback used to be `config.min_individual_miner_hashrate` directly — the
+        // HOBBY floor — for every connection, including farm-port ones. `data.hashrate` carries the
+        // floor the listener was built with (`Downstream::new(..., Some(tier_floor_hs), ...)`), so
+        // it is the hobby floor on :3333 and `farm_tier.min_individual_miner_hashrate` on :4444.
+        // Skipping it made the farm tier cosmetic: a rig that declared nothing got the hobby
+        // difficulty on both ports, which is exactly what was measured on ghost-vm8 — :4444 and
+        // :3333 both advertised 2,328.3 where :4444 should have been ~232,827.
+        //
+        // A rig that DOES declare is unaffected, which is why the tier looked half-working: the
+        // `pw-difficulty` and `suggest-diff` paths were always correct.
         let hashrate = downstream
             .downstream_data
-            .super_safe_lock(|data| data.suggested_hashrate)
+            .super_safe_lock(|data| data.suggested_hashrate.or(data.hashrate))
             .map(|h| h as f64)
             .unwrap_or(config.min_individual_miner_hashrate as f64);
         let shares_per_min = config.shares_per_minute as f64;
@@ -2079,6 +2091,48 @@ pub struct PendingTargetUpdate {
 
 #[cfg(test)]
 mod tests {
+
+    /// #611: the channel-open hashrate must fall back to THIS LISTENER's floor, not the hobby one.
+    ///
+    /// The farm tier was cosmetic because the fallback reached straight for
+    /// `config.min_individual_miner_hashrate` — the hobby floor — for every connection. Measured on
+    /// ghost-vm8: `:4444` and `:3333` both advertised 2,328.3 where the farm port should have been
+    /// ~232,827. A rig that DECLARED a difficulty was always served correctly, which is why the
+    /// tier looked half-working and went unnoticed.
+    ///
+    /// This pins the precedence directly: declared > listener floor > config.
+    #[test]
+    fn channel_open_hashrate_prefers_declared_then_the_listeners_own_floor() {
+        const HOBBY: f64 = 1_000_000_000_000.0;
+        const FARM: f64 = 100_000_000_000_000.0;
+        const DECLARED: f64 = 5_000_000_000_000.0;
+
+        // The expression under test, mirrored exactly: `suggested.or(listener_floor)` then config.
+        fn pick(suggested: Option<f64>, listener_floor: Option<f64>, config_floor: f64) -> f64 {
+            suggested.or(listener_floor).unwrap_or(config_floor)
+        }
+
+        // A farm-port rig that declares nothing must get the FARM floor, not the hobby one.
+        assert_eq!(
+            pick(None, Some(FARM), HOBBY),
+            FARM,
+            "an undeclared farm-port miner must start at the farm floor — this is the #611 bug"
+        );
+
+        // A hobby-port rig that declares nothing is unchanged.
+        assert_eq!(
+            pick(None, Some(HOBBY), HOBBY),
+            HOBBY,
+            "the hobby port must behave exactly as before"
+        );
+
+        // A declared value wins on either port — the path that always worked.
+        assert_eq!(pick(Some(DECLARED), Some(FARM), HOBBY), DECLARED);
+        assert_eq!(pick(Some(DECLARED), Some(HOBBY), HOBBY), DECLARED);
+
+        // No listener floor recorded at all still falls back to config, as before.
+        assert_eq!(pick(None, None, HOBBY), HOBBY);
+    }
     use super::*;
     use crate::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
     use async_channel::unbounded;
