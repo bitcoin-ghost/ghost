@@ -53,9 +53,17 @@ impl SnifferSV1 {
         let messages_from_downstream = self.messages_from_downstream.clone();
         let messages_from_upstream = self.messages_from_upstream.clone();
         tokio::spawn(async move {
-            let listener = TcpListener::bind(listening_address)
-                .await
-                .expect("Failed to listen on given address");
+            // Claim the reservation rather than binding directly. `get_available_address` holds
+            // the port from the moment it is chosen, so an independent bind here fails with
+            // AddrInUse — `claim_listener`'s own doc says EVERY path that listens on a reserved
+            // address must go through it.
+            //
+            // #612 fixed exactly this in the SV2 `Sniffer::start` and missed the SV1 one, so
+            // `tests/sv1.rs` has been failing both its tests on
+            // `Os { code: 98, kind: AddrInUse }` ever since — visible only because the target is
+            // compiled but never run in CI (#617).
+            let listener = TcpListener::from_std(crate::utils::claim_listener(listening_address))
+                .expect("Sv1Sniffer: cannot adopt listener");
             let sniffer_to_upstream_stream = loop {
                 match TcpStream::connect(upstream_address).await {
                     Ok(s) => break s,
