@@ -718,6 +718,11 @@ S=$SUDO
 \$S cp /tmp/$BINARY.new /opt/ghost/bin/$BINARY.staged
 \$S chmod 755 /opt/ghost/bin/$BINARY.staged
 \$S mv /opt/ghost/bin/$BINARY.staged /opt/ghost/bin/$BINARY
+# Every failure path above removes the staging copy; the success path did not, so a
+# ~30-50 MB binary was left in /tmp on every successful deploy. Bounded (same name each
+# time) but it is dead weight on nodes that run close to full, and a full root disk is
+# how state files stop persisting.
+\$S rm -f /tmp/$BINARY.new
 " || exit 2
 
 case "$BINARY" in
