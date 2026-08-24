@@ -1922,12 +1922,24 @@ RESTART_RENOTIFY_SECS=3600
 # Fall back to the node's own configured secret so an operator does not have to copy it
 # into a second file — the whole point of this change is to stop duplicating config.
 if [ -z "$INTERNAL_AUTH_KEY" ]; then
+    # ⚠ The key is `internal_api_secret` under [network] — that is what ghost-pool reads
+    # (`config.network.internal_api_secret` -> `InternalAuth::from_hex`). This used to grep for
+    # `internal_auth_key`, a name that exists nowhere in the codebase or any config, so the
+    # lookup ALWAYS came back empty, the POST always went unsigned, and the endpoint always
+    # answered 401 — reported only to syslog. The replacement for a silent alerting path was
+    # silent in exactly the same way.
     for f in /etc/ghost/pool.toml /etc/ghost/ghost-pool.toml; do
         [ -r "$f" ] || continue
-        INTERNAL_AUTH_KEY=$(grep -aoE '^[[:space:]]*internal_auth_key[[:space:]]*=[[:space:]]*"[^"]+"' "$f" 2>/dev/null \
+        INTERNAL_AUTH_KEY=$(grep -aoE '^[[:space:]]*internal_api_secret[[:space:]]*=[[:space:]]*"[^"]+"' "$f" 2>/dev/null \
                             | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
         [ -n "$INTERNAL_AUTH_KEY" ] && break
     done
+    if [ -z "$INTERNAL_AUTH_KEY" ]; then
+        # Say so. A watchdog that cannot authenticate will 401 on every alert it ever raises,
+        # and the whole point of this script is to not fail quietly.
+        logger -t ghost-restart-watch -p daemon.warning -- \
+            "no internal_api_secret found in /etc/ghost/pool.toml — alerts will be REJECTED (401)" 2>/dev/null || true
+    fi
 fi
 
 # POST a restart-loop signal to the node's alert centre.
