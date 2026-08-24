@@ -66,6 +66,12 @@ case "$cmd" in
         # Two lines: config mtime, then sri-pool's ActiveEnterTimestamp as an epoch. Either may
         # be empty, which is how an unreadable stamp reaches the caller.
         printf '%s\n%s\n' "${STUB_MTIME:-}" "${STUB_START:-}" ;;
+    *"grep -ac X-Ghost-Signature"*)
+        # ONE ssh call carries both greps, so this returns BOTH counts, in order: the
+        # signing marker, then the control. Defaults mirror the live fleet measured on
+        # 2026-08-24 (sig=1, ctrl=3). Either may be set EMPTY to play a probe that did
+        # not run — `${VAR-default}` so an explicit empty survives.
+        printf '%s\n%s\n' "${STUB_SIGN_HITS-1}" "${STUB_SIGN_CTRL-3}" ;;
     *)  exit 1 ;;
 esac
 SSH_STUB
@@ -89,6 +95,7 @@ run_gate() {
         GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK="${GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK:-}" \
         STUB_CONF="${STUB_CONF:-}" STUB_CONF_UNREADABLE="${STUB_CONF_UNREADABLE:-0}" \
         STUB_MTIME="${STUB_MTIME:-}" STUB_START="${STUB_START:-}" \
+        STUB_SIGN_HITS="${STUB_SIGN_HITS-1}" STUB_SIGN_CTRL="${STUB_SIGN_CTRL-3}" \
         GHOST_DEPLOY_SSH="${GHOST_DEPLOY_SSH:-ssh}" \
         GHOST_DEPLOY_PORT_WAIT_SECS=0 \
         timeout 60 bash "$DEPLOY" "$node" "$binary" 2>&1 )
@@ -295,6 +302,40 @@ for b in pool_sv2 translator_sv2; do
     check_absent "$b is NOT gated on the webhook secret" "cannot sign share batches" "$out"
     check "$b still reaches the deploy stage" "not built" "$out"
 done
+
+# 8b. The BINARY, not just the config (#752).
+#
+# The config gate above and this one answer different questions, and #745 only ever asked the
+# first. Signing ships in the pool_sv2 binary, so a perfect config on a pre-#742 binary passes
+# everything above it and then 401s every share batch — permanently, destroying them.
+# Measured 2026-08-23: all eight nodes were in exactly that state and the gate said yes.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
+      STUB_MTIME=1787036059 STUB_START=1787036059 \
+      STUB_SIGN_HITS=0 STUB_SIGN_CTRL=3 run_gate ghost-vm5 ghost-pool)"
+check "a pre-#742 pool_sv2 binary is refused despite a perfect config" "predates #742" "$out"
+check "the refusal names the remedy in the right order" "deploy-node.sh ghost-vm5 pool_sv2" "$out"
+
+# The positive control is the whole reason this is trustworthy. An unreadable path, a missing
+# sudo or a renamed binary all return 0 hits, which is indistinguishable from "cannot sign" —
+# so a zero CONTROL must read as "the check did not run", never as a verdict about signing.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
+      STUB_MTIME=1787036059 STUB_START=1787036059 \
+      STUB_SIGN_HITS=0 STUB_SIGN_CTRL=0 run_gate ghost-vm5 ghost-pool)"
+check "a zero control is a PROBE failure, not a signing verdict" "signing probe did not run" "$out"
+check_absent "a failed probe does not claim the binary predates #742" "predates #742" "$out"
+
+# An ssh that returns nothing at all is the same class of non-answer.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
+      STUB_MTIME=1787036059 STUB_START=1787036059 \
+      STUB_SIGN_HITS= STUB_SIGN_CTRL= run_gate ghost-vm5 ghost-pool)"
+check "an empty probe refuses rather than assuming" "signing probe did not run" "$out"
+
+# And the mirror: a signing binary must be PERMITTED, or the gate is just a wall.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
+      STUB_MTIME=1787036059 STUB_START=1787036059 \
+      STUB_SIGN_HITS=1 STUB_SIGN_CTRL=3 run_gate ghost-vm5 ghost-pool)"
+check_absent "a signing pool_sv2 is not refused" "predates #742|signing probe did not run" "$out"
+check "a signing pool_sv2 is reported as carrying the code" "carries the share-batch signing code" "$out"
 
 # The escape hatch, which exists for exactly one thing: rolling back to a ghost-pool that
 # predates #742. It must work, and it must be impossible to miss in a transcript.

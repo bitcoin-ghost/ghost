@@ -533,6 +533,62 @@ if [ "$BINARY" = "ghost-pool" ]; then
        wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
     fi
 
+    # The secret is in the file — but can the RUNNING pool_sv2 binary even sign? (#752)
+    #
+    # #745 gated on the config alone, which is a different claim. Signing ships in the pool_sv2
+    # BINARY (#742), so a node can hold a perfect config, restarted cleanly, and still run a
+    # pre-#742 pool_sv2 with no signing code in it at all. Measured on the live fleet on
+    # 2026-08-23: all eight nodes satisfied the config gate while being unable to sign — the
+    # gate would have permitted the exact deploy it exists to refuse.
+    #
+    # `grep -ac` on the binary rather than `strings`, which is absent on some nodes.
+    #
+    # ⚠ The positive control is NOT optional. An unreadable path, a missing `sudo` or a renamed
+    # binary all return 0, which is indistinguishable from "cannot sign" — and on a deploy gate
+    # "the check did not run" must never look like a verdict.
+    #
+    # ⚠ `grep -c` prints its count AND exits 1 when that count is zero, so `|| echo 0` would
+    # emit a SECOND line and shift every field below it. `|| true` keeps the count and drops
+    # only the status.
+    POOL_SV2_BIN="/opt/ghost/bin/pool_sv2"
+    WEBHOOK_BIN_PROBE=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
+S=\$(command -v sudo >/dev/null && echo sudo || echo)
+\$S grep -ac X-Ghost-Signature $POOL_SV2_BIN 2>/dev/null || true
+\$S grep -ac share_webhook $POOL_SV2_BIN 2>/dev/null || true
+" 2>/dev/null) || WEBHOOK_BIN_PROBE=""
+    SIGN_HITS=$(one_clean_integer "$(printf '%s\n' "$WEBHOOK_BIN_PROBE" | sed -n 1p)" || true)
+    SIGN_CTRL=$(one_clean_integer "$(printf '%s\n' "$WEBHOOK_BIN_PROBE" | sed -n 2p)" || true)
+
+    if [ -z "$SIGN_CTRL" ] || [ "$SIGN_CTRL" = "0" ]; then
+        die "the pool_sv2 signing probe did not run on $NODE — control returned '${SIGN_CTRL:-<nothing>}'
+       ($POOL_SV2_BIN)
+
+       The control greps for a string every pool_sv2 has ever contained, so a zero there means
+       the PROBE failed — unreadable path, no sudo, or a renamed binary — not that the binary
+       cannot sign. Refusing rather than guessing: those two must not look alike on a gate.
+
+       Check by hand:
+         ssh $NODE 'sudo grep -ac share_webhook $POOL_SV2_BIN'"
+    fi
+
+    if [ -z "$SIGN_HITS" ] || [ "$SIGN_HITS" = "0" ]; then
+        die "pool_sv2 on $NODE predates #742 and cannot sign share batches
+       ($POOL_SV2_BIN carries no X-Ghost-Signature; the control matched $SIGN_CTRL times)
+
+       The config is correct, but signing ships in the BINARY, not the config. Deploying
+       ghost-pool here now would make every batch this node's own pool_sv2 submits 401 — and
+       pool_sv2 treats a 401 as PERMANENT, so those shares are DESTROYED, not delayed.
+
+       Do this, in this order:
+         1. scripts/deploy-node.sh $NODE pool_sv2      <- deliberately NOT gated on this
+         2. re-run this command
+
+       Rolling BACK to a ghost-pool that predates #742 is the one case where this gate is
+       wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
+    fi
+
+    info "pool_sv2 on $NODE carries the share-batch signing code (marker $SIGN_HITS, control $SIGN_CTRL)"
+
     # The secret is in the file. Is the pool_sv2 that is RUNNING actually using it?
     WEBHOOK_STAMPS=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
 S=\$(command -v sudo >/dev/null && echo sudo || echo)
