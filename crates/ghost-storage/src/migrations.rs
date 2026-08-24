@@ -4654,10 +4654,32 @@ mod tests {
 
         let live = get_column_names(&conn, "shares");
         let archive = get_column_names(&conn, "shares_archive");
-        assert_eq!(
-            live, archive,
-            "the two arms of `shares_all` must have identical columns, in the same order"
+
+        // ⚠ These were identical until v58, which drops `proof` from the ARCHIVE only — nothing
+        // reads an archived proof, and it was 2.2 GB. So the invariant is no longer "the tables
+        // match"; it is "the archive is a SUBSET of the live table, and the view selects the
+        // intersection". A column the archive has and `shares` does not would still be a bug:
+        // the UNION ALL could not name it from both arms.
+        let missing_from_live: Vec<_> = archive.iter().filter(|c| !live.contains(c)).collect();
+        assert!(
+            missing_from_live.is_empty(),
+            "`shares_archive` has column(s) the live table lacks: {missing_from_live:?} — \
+             `shares_all` is a UNION ALL and cannot select them from both arms"
         );
+        let live_only: Vec<_> = live.iter().filter(|c| !archive.contains(c)).collect();
+        assert_eq!(
+            live_only,
+            vec![&"proof".to_string()],
+            "the ONLY column the live table may hold beyond the archive is `proof` (v58). \
+             Anything else means a migration diverged the two arms without rebuilding the view"
+        );
+
+        // The view is what actually has to work, so assert on the view rather than inferring it
+        // from the tables. It fails only when queried, which on a live node means hours later.
+        conn.query_row("SELECT COUNT(*) FROM shares_all", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .expect("`shares_all` must be queryable at head");
         for col in [
             "id",
             "round_id",
