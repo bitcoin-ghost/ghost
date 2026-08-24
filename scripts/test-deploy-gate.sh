@@ -461,8 +461,11 @@ cfg_case "does not parse with the incoming binary -> REFUSE" FAIL ""            
 cfg_case "dead key for a removed feature -> REFUSE"         ok   "bond_ledger_url" public_pool 1 1
 cfg_case "deprecated public_mining -> REFUSE"               ok   "public_mining"   public_pool 1 1
 cfg_case "mining_mode unset -> REFUSE"                      ok   ""                ""          1 1
-cfg_case "no [tdp] block -> REFUSE"                         ok   ""                public_pool 0 1
-cfg_case "several faults -> one reason each"                FAIL "public_mining"   ""          0 4
+# ⚠ `[tdp]` is a WARNING, not a refusal, and the count below pins that deliberately. No node on
+#    the fleet carries the block, so making it blocking would refuse every deploy on every node.
+#    Compiled defaults are the status quo and break nothing; convergence is #759's job.
+cfg_case "no [tdp] block -> allowed, warned elsewhere"      ok   ""                public_pool 0 0
+cfg_case "several faults -> one reason each"                FAIL "public_mining"   ""          0 3
 
 # ⛔ THE PROBE ITSELF NOT RUNNING. `parse` is always `ok` or `FAIL` when the probe ran, so empty
 #    means it did not. A gate that cannot read its evidence must REFUSE, not pass: "the config is

@@ -283,7 +283,21 @@ config_gate_failures() {
     [ "$parse" = "ok" ] || echo "pool.toml does NOT parse with the incoming binary — the node would not come back from its next restart"
     [ -z "$dead" ] || echo "config carries key(s) for removed features: $dead"
     [ -n "$mode" ] || echo "mining_mode is not set — resolved from MiningMode::default(), which decides whether payouts go through BFT"
-    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "no [tdp] block — template distribution would run on compiled defaults"
+}
+
+# Conditions worth saying out loud that must NOT stop a deploy.
+#
+# ⚠ `[tdp]` was a blocking failure here and should never have been. No node on the fleet carries
+# the block — it has been absent on all eight for the life of the config — so the moment the gate
+# above started working, it would have refused every deploy on every node, during a release.
+#
+# A missing `[tdp]` means template distribution runs on compiled defaults. That is the status quo
+# and breaks nothing; it is unconverged config, not a node that fails to start. Blocking belongs to
+# "this binary will not come back": a config that does not parse, keys for deleted features, an
+# unset `mining_mode`. Convergence is #759's job and wants its own change, not a release hostage.
+config_gate_warnings() {
+    local tdp="${1:-}"
+    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "no [tdp] block — template distribution runs on compiled defaults (#759)"
 }
 
 throughput_regressed() {
@@ -675,10 +689,10 @@ if [ "$BINARY" = "ghost-pool" ]; then
         S=$SUDO
         \$S chmod 755 /tmp/$BINARY.new 2>/dev/null || true
         dead=\$(\$S grep -ohE '^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=' /etc/ghost/pool.toml 2>/dev/null | tr -d ' =' | sort -u | paste -sd, -)
-        mode=\$(\$S grep -oP '^\\s*mining_mode\\s*=\\s*"\\K[^"]+' /etc/ghost/pool.toml 2>/dev/null | head -1)
+        mode=\$(\$S grep -oP '^\\s*mining_mode\\s*=\\s*\"\\K[^\"]+' /etc/ghost/pool.toml 2>/dev/null | head -1)
         tdp=\$(\$S grep -cE '^\\[tdp\\]' /etc/ghost/pool.toml 2>/dev/null)
-        /tmp/$BINARY.new --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && parse=ok || parse=FAIL
-        printf 'dead=%s\\nmode=%s\\ntdp=%s\\nparse=%s\\n' "\$dead" "\$mode" "\$tdp" "\$parse"
+        \$S /tmp/$BINARY.new --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && parse=ok || parse=FAIL
+        printf 'dead=%s\\nmode=%s\\ntdp=%s\\nparse=%s\\n' \"\$dead\" \"\$mode\" \"\$tdp\" \"\$parse\"
     " 2>/dev/null || true)"
 
     cg_dead="$(printf '%s\n' "$cfg_out" | sed -n 's/^dead=//p')"
@@ -698,6 +712,9 @@ if [ "$BINARY" = "ghost-pool" ]; then
         timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
         exit 2
     fi
+
+    cg_warn="$(config_gate_warnings "$cg_tdp")"
+    [ -z "$cg_warn" ] || printf '  WARN: %s\n' "$cg_warn" >&2
 
     cg_fail="$(config_gate_failures "$cg_parse" "$cg_dead" "$cg_mode" "$cg_tdp")"
 
