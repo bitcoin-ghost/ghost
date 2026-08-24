@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 57;
+const SCHEMA_VERSION: u32 = 58;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -134,6 +134,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (55, migrate_v55),
         (56, migrate_v56),
         (57, migrate_v57),
+        (58, migrate_v58),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2744,6 +2745,103 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 /// recollection. A non-empty table aborts the migration with the row count,
 /// leaving the database untouched at v56 — those sats were withheld from
 /// someone's spendable balance and they need resolving, not deleting.
+/// v58: drop `proof` from `shares_archive` (#764).
+///
+/// `shares_archive` was 2,723 MB of a 5.0 GB database — 54%, the largest object in it. 2,203 MB of
+/// that is one column: `proof`, a signed-share blob averaging 1,108 bytes and NOT NULL on every one
+/// of ~1.98 M rows.
+///
+/// **Nothing reads it.** Both consumers of a share proof — the peer-serving window
+/// (`unpaid_share_proofs_in`) and the λ-sampling audit — query `FROM shares`, the LIVE table, never
+/// `shares_all` and never the archive. That has been true since v56 froze the table: the column
+/// became unreachable at the cutover and has been carried ever since.
+///
+/// Every other column stays. The archive is read from more places than "frozen legacy" suggests —
+/// round history and per-miner history select nine columns through `shares_all`, `pool/records`
+/// ranks rarity across it, and `paid_in_proposal_hash` is read through the view — so this drops
+/// exactly the one column with no reader, not a narrowed rewrite.
+///
+/// ⚠ What is genuinely given up: the ability to re-verify a pre-cutover share's GHOST-09 signature
+/// from this database. That is theoretical rather than operational — `shares` has 24-hour
+/// retention, so peers only ever exchange proofs for the last day, and the archive is not payable
+/// (the shard's genesis column absorbed the work), so re-verifying it could not change a payout.
+/// The pre-cutover backups still hold the proofs if forensics ever needs them.
+///
+/// ⚠ This frees pages; it does NOT shrink the file. `auto_vacuum=0` and the freelist is empty, so
+/// the space is reused internally and growth stops. Returning ~2.2 GB to the OS needs `VACUUM`,
+/// which needs twice the database free and took ghost-vm6 down once — deliberately not done here.
+fn migrate_v58(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v58: drop `shares_archive.proof`");
+
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shares_archive'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        debug!("v58: no `shares_archive` table — nothing to do");
+        return Ok(());
+    }
+
+    let has_proof: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('shares_archive') WHERE name = 'proof'")
+        .and_then(|mut st| st.exists([]))
+        .unwrap_or(false);
+    if !has_proof {
+        debug!("v58: `shares_archive.proof` already dropped");
+        return Ok(());
+    }
+
+    // `shares_all` is a UNION ALL of `shares` and `shares_archive`, so its column list is pinned to
+    // whatever both tables share. Dropping a column from one arm invalidates the view, and SQLite
+    // will not tell us until something queries it. Rebuild it from the LIVE table's columns minus
+    // `proof`, so the two arms still line up.
+    let mut cols: Vec<String> = {
+        let mut st = conn
+            .prepare("SELECT name FROM pragma_table_info('shares') ORDER BY cid")
+            .map_err(|e| {
+                GhostError::Migration(format!("v58: cannot read `shares` columns: {e}"))
+            })?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(|e| {
+            GhostError::Migration(format!("v58: cannot list `shares` columns: {e}"))
+        })?;
+        rows.filter_map(Result::ok).collect()
+    };
+    cols.retain(|c| c != "proof");
+    if cols.is_empty() {
+        return Err(GhostError::Migration(
+            "v58: `shares` reports no columns — refusing to rebuild `shares_all` from nothing"
+                .into(),
+        ));
+    }
+    let col_list = cols.join(", ");
+
+    // ALTER TABLE ... DROP COLUMN needs SQLite >= 3.35 and refuses a column an index depends on.
+    // No index references `proof`, so this is the cheap path: no table copy, no doubled disk.
+    conn.execute_batch(&format!(
+        "DROP VIEW IF EXISTS shares_all;
+         ALTER TABLE shares_archive DROP COLUMN proof;
+         CREATE VIEW shares_all AS
+             SELECT {col_list} FROM shares
+             UNION ALL
+             SELECT {col_list} FROM shares_archive;"
+    ))
+    .map_err(|e| GhostError::Migration(format!("v58: cannot drop `proof`: {e}")))?;
+
+    // A view that names a column neither arm has fails only when queried. Prove it works now.
+    conn.query_row("SELECT COUNT(*) FROM shares_all", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map_err(|e| {
+        GhostError::Migration(format!("v58: `shares_all` is broken after the drop: {e}"))
+    })?;
+
+    debug!("v58: dropped `shares_archive.proof` and rebuilt `shares_all`");
+    Ok(())
+}
+
 fn migrate_v57(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v57: drop wraith_bonds");
 
@@ -3879,6 +3977,81 @@ mod tests {
     /// so dropping the table with rows in it would silently release or strand
     /// those sats. The migration establishes emptiness itself rather than
     /// inheriting anyone's recollection that nothing was ever escrowed.
+    /// v58 drops the one archive column nothing reads — and must leave `shares_all` QUERYABLE.
+    ///
+    /// The trap is that `shares_all` is a `UNION ALL` of `shares` and `shares_archive`. Dropping a
+    /// column from one arm does not error at drop time; it produces a view that fails only when
+    /// something queries it, which on a live node means the next round-history or hashrate read.
+    #[test]
+    fn v58_drops_proof_and_leaves_shares_all_queryable() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+
+        // `proof` must be gone from the archive...
+        let archive_has_proof: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('shares_archive') WHERE name='proof'")
+            .and_then(|mut st| st.exists([]))
+            .unwrap_or(false);
+        assert!(
+            !archive_has_proof,
+            "v58 did not drop `shares_archive.proof`"
+        );
+
+        // ...but must remain on the LIVE table, which is the one both proof readers query.
+        let live_has_proof: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('shares') WHERE name='proof'")
+            .and_then(|mut st| st.exists([]))
+            .unwrap_or(false);
+        assert!(
+            live_has_proof,
+            "v58 removed `proof` from the LIVE `shares` table — peer proof-serving and \
+             lambda-sampling both read it from there and would silently return nothing"
+        );
+
+        // The view must actually answer, not merely exist.
+        conn.query_row("SELECT COUNT(*) FROM shares_all", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .expect("`shares_all` must still be queryable after the column drop");
+
+        // And it must still expose every column its readers select.
+        for col in [
+            "id",
+            "round_id",
+            "miner_id",
+            "difficulty",
+            "work",
+            "share_hash",
+            "timestamp",
+            "received_by",
+            "valid",
+            "paid_in_proposal_hash",
+        ] {
+            conn.query_row(&format!("SELECT {col} FROM shares_all LIMIT 1"), [], |_| {
+                Ok(())
+            })
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(()),
+                other => Err(other),
+            })
+            .unwrap_or_else(|e| {
+                panic!("`shares_all` lost column `{col}`, which a reader selects: {e}")
+            });
+        }
+    }
+
+    /// Re-running v58 must be a no-op, not an error — migrations replay.
+    #[test]
+    fn v58_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+        migrate_v58(&conn).expect("v58 must be safe to re-run after the column is already gone");
+        conn.query_row("SELECT COUNT(*) FROM shares_all", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .expect("`shares_all` must survive a replay");
+    }
+
     #[test]
     fn v57_refuses_to_drop_a_wraith_bonds_table_that_still_holds_rows() {
         let conn = Connection::open_in_memory().unwrap();
@@ -4481,10 +4654,32 @@ mod tests {
 
         let live = get_column_names(&conn, "shares");
         let archive = get_column_names(&conn, "shares_archive");
-        assert_eq!(
-            live, archive,
-            "the two arms of `shares_all` must have identical columns, in the same order"
+
+        // ⚠ These were identical until v58, which drops `proof` from the ARCHIVE only — nothing
+        // reads an archived proof, and it was 2.2 GB. So the invariant is no longer "the tables
+        // match"; it is "the archive is a SUBSET of the live table, and the view selects the
+        // intersection". A column the archive has and `shares` does not would still be a bug:
+        // the UNION ALL could not name it from both arms.
+        let missing_from_live: Vec<_> = archive.iter().filter(|c| !live.contains(c)).collect();
+        assert!(
+            missing_from_live.is_empty(),
+            "`shares_archive` has column(s) the live table lacks: {missing_from_live:?} — \
+             `shares_all` is a UNION ALL and cannot select them from both arms"
         );
+        let live_only: Vec<_> = live.iter().filter(|c| !archive.contains(c)).collect();
+        assert_eq!(
+            live_only,
+            vec![&"proof".to_string()],
+            "the ONLY column the live table may hold beyond the archive is `proof` (v58). \
+             Anything else means a migration diverged the two arms without rebuilding the view"
+        );
+
+        // The view is what actually has to work, so assert on the view rather than inferring it
+        // from the tables. It fails only when queried, which on a live node means hours later.
+        conn.query_row("SELECT COUNT(*) FROM shares_all", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .expect("`shares_all` must be queryable at head");
         for col in [
             "id",
             "round_id",
