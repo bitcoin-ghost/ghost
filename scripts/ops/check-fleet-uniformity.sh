@@ -266,7 +266,23 @@ for n in "${REACHED[@]}"; do
     # #759: keys for features that no longer exist, and required keys covered for by a default.
     dk="${VALUES[$n|dead_keys]:-}"
     [ -z "$dk" ] || { echo "  FAIL $n config carries dead key(s) for removed features: $dk (#759)"; rc=1; }
-    [ "${VALUES[$n|tdp_cfg]:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n no [tdp] block — template distribution is running on compiled defaults (#759)"; rc=1; }
+    # ⛔ #759: this used to FAIL on a missing `[tdp]` block. That invariant was UNSATISFIABLE.
+    #
+    # `[tdp]` is not a section of `NodeConfig` — the accepted set is identity, bitcoin, network,
+    # policy, storage, pool, ghost_pay, reaper, coordinator, node_launch, alerts, backup. It is not
+    # in `pool-config.toml` either (that carries `[share_tier_binding]` and `[share_webhook]`), and
+    # no shipped template contains it. TDP is pool_sv2's concern, configured by `--tdp-port` /
+    # `--tdp-pubkey-from-keyfile`, not by a block in pool.toml.
+    #
+    # So the check demanded something that could never be present, on any node, ever — and since
+    # #761 added `deny_unknown_fields`, satisfying it would REFUSE TO START the node:
+    #
+    #     unknown field `tdp`, expected one of `identity`, `bitcoin`, ...
+    #
+    # The underlying worry was real — TDP does run on compiled defaults, because the sri-pool unit
+    # passes no `--tdp-port`. But that is a statement about the unit file, not a missing config
+    # block, and it is the same on all eight, so it is not drift. Reported, not failed.
+    [ "${VALUES[$n|tdp_cfg]:-0}" -gt 0 ] 2>/dev/null || tdp_default_nodes="${tdp_default_nodes:-}$n "
     # The strongest single check available: does the shipped binary actually accept this file?
     # #761: generic unknown-key oracle. `unsupported` is a WARN, not a pass — the check arms
     # itself once the #761 release is deployed and must not read as clean before then.
@@ -289,6 +305,12 @@ for n in "${REACHED[@]}"; do
         *) echo "  WARN $n superseded 'bitcoind' unit still installed ($eb) — remove it" ;;
     esac
 done
+# #759: reported once for the fleet, not failed per node. See the note above — `[tdp]` is not a
+# NodeConfig section, so its absence is the only possible state, and it is identical everywhere.
+if [ -n "${tdp_default_nodes:-}" ]; then
+    echo "  NOTE TDP runs on compiled defaults (no --tdp-port in the sri-pool unit): ${tdp_default_nodes% }"
+    echo "       Not drift and not fixable in pool.toml — adding [tdp] there fails deny_unknown_fields (#759, #761)"
+fi
 [ "$rc" -eq 0 ] && echo "  all invariants hold"
 echo
 

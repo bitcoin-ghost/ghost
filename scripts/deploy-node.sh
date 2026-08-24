@@ -326,7 +326,7 @@ config_gate_failures() {
 # unset `mining_mode`. Convergence is #759's job and wants its own change, not a release hostage.
 config_gate_warnings() {
     local tdp="${1:-}"
-    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "no [tdp] block — template distribution runs on compiled defaults (#759)"
+    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "TDP runs on compiled defaults (the sri-pool unit passes no --tdp-port). NOT fixable in pool.toml: [tdp] is not a NodeConfig section and adding it fails deny_unknown_fields (#759, #761)"
 }
 
 throughput_regressed() {
