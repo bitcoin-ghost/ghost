@@ -9783,6 +9783,12 @@ async fn main() -> Result<()> {
                                 votes = result.votes_deleted,
                                 uptime = result.uptime_deleted,
                                 challenges = result.challenges_deleted.total(),
+                                // The single largest prune, and it was absent from this line:
+                                // `verification_ledger` is the second biggest object in the
+                                // database after the frozen `shares_archive`, so a retention
+                                // change here was invisible in the logs that would show whether
+                                // it worked.
+                                verification_ledger = result.verification_ledger_deleted,
                                 verifications = result.verifications_deleted,
                                 checkpoints = result.checkpoints_pruned,
                                 db_size_mb = result.db_size_bytes / (1024 * 1024),
