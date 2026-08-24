@@ -299,13 +299,20 @@ echo
 if $PROBE; then
     SMOKE="$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py"
     if [ -r "$SMOKE" ]; then
+        # #774: probe BOTH listeners. Checking :3333 only is how #611 stayed invisible for
+        # weeks — the farm tier was enabled fleet-wide on 2026-08-23 and served the HOBBY floor
+        # to undeclared miners the whole time, while `farm_cfg`, `farm_listen` and `farm_ufw` all
+        # read green. Configured, listening and permitted is not the same as serving the right
+        # thing.
         echo "Live probe (default difficulty served to a miner that requests nothing):"
         for n in "${REACHED[@]}"; do
             ip="$(ssh -o ConnectTimeout=10 "$n" "hostname -I | awk '{print \$1}'" 2>/dev/null)"
             [ -n "$ip" ] || { echo "  $n: no address"; rc=1; continue; }
-            line="$(python3 "$SMOKE" "$ip" 3333 2>/dev/null | grep -E "default-diff")" || true
-            printf "  %-11s %s\n" "$n" "${line:-probe produced no result}"
-            case "$line" in *FAIL*) rc=1 ;; esac
+            for port in 3333 4444; do
+                line="$(python3 "$SMOKE" "$ip" "$port" 2>/dev/null | grep -E "default-diff")" || true
+                printf "  %-11s :%s %s\n" "$n" "$port" "${line:-probe produced no result}"
+                case "$line" in *FAIL*) rc=1 ;; esac
+            done
         done
         echo
     else
