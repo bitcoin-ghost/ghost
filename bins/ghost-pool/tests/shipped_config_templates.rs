@@ -147,3 +147,63 @@ fn every_mining_mode_has_a_template() {
         );
     }
 }
+
+/// ⛔ Syntactically-valid TOML that the BINARY REJECTS.
+///
+/// `every_shipped_template_parses_as_toml` reads green on a file `ghost-pool` will not start with,
+/// because "parses" there means TOML grammar and nothing more. Measured 2026-08-23: BOTH
+/// `mainnet-solo.toml` and `mainnet-private-pool.toml` were valid TOML and failed to deserialize —
+/// their `[ghost_pay]` sections omitted `virtual_block_secs`, `epoch_blocks` and `wraith_enabled`,
+/// none of which carry a serde default. An operator pasting either into production got a node that
+/// would not start, and the suite said the templates were fine.
+///
+/// This asserts the thing that matters: the shipped struct accepts the shipped file.
+#[test]
+fn every_shipped_template_deserializes_as_a_node_config() {
+    let mut checked = 0usize;
+    for path in templates() {
+        let raw = std::fs::read_to_string(&path).expect("read template");
+        let parsed: Result<ghost_common::config::NodeConfig, _> = toml::from_str(&raw);
+        assert!(
+            parsed.is_ok(),
+            "{} is valid TOML but does NOT deserialize as NodeConfig — an operator pasting this \
+             into production gets a node that will not start.\n  {}",
+            path.display(),
+            parsed.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+        checked += 1;
+    }
+    // A loop that inspected nothing must fail rather than pass silently.
+    assert!(
+        checked > 0,
+        "no templates were checked — the glob found nothing"
+    );
+}
+
+/// Keys the operator wrote that the struct SILENTLY IGNORED.
+///
+/// There is no `#[serde(deny_unknown_fields)]`, so a removed key or a typo is read, discarded and
+/// never mentioned. `public_mining` outlived its own struct field in every shipped template that
+/// way, annotated with behaviour it no longer had — and a template is documentation people paste
+/// into production, so a wrong one is worse than a missing one because it is believed.
+#[test]
+fn no_shipped_template_contains_a_key_the_struct_ignores() {
+    let mut checked = 0usize;
+    for path in templates() {
+        let raw = std::fs::read_to_string(&path).expect("read template");
+        let ignored = ghost_common::config::ignored_config_keys(&raw)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            ignored.is_empty(),
+            "{} sets key(s) the config struct ignores: {}\n  An ignored key is a setting the \
+             operator believes is in force and which does nothing at all.",
+            path.display(),
+            ignored.join(", ")
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no templates were checked — the glob found nothing"
+    );
+}

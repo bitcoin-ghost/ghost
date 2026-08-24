@@ -434,6 +434,52 @@ verdict_case "probe returned NOTHING -> not measurable, proceed"                
 verdict_case "probe unreadable -> not measurable, proceed"                      52 0 "" 30 no
 
 # ---------------------------------------------------------------------------
+# 10b. The config gate (#759). A deploy has never looked at a config file, so config on the fleet
+#     was whatever successive hand-edits left behind: vm4 carried `bond_ledger_*` for a feature
+#     DELETED in #699; vm2-4 carried the deprecated `public_mining` while LACKING `mining_mode`,
+#     so the setting that decides whether payouts go through BFT came from MiningMode::default();
+#     vm1 had no `[tdp]` block at all. Each was correct-by-accident and each would have survived
+#     any number of deploys.
+#
+#     Driven by sourcing the verdict function out of the real script, so this tests the code that
+#     runs rather than a copy of it.
+# ---------------------------------------------------------------------------
+eval "$(sed -n '/^config_gate_failures()/,/^}/p' "$DEPLOY")"
+
+cfg_case() {  # label parse dead mode tdp want_reasons
+    local label="$1" got
+    got="$(config_gate_failures "$2" "$3" "$4" "$5" | grep -c .)"
+    if [ "$got" = "$6" ]; then
+        printf "  [ok ] %s\n" "$label"; pass=$((pass+1))
+    else
+        printf "  [BAD] %s (wanted %s reason(s), got %s)\n" "$label" "$6" "$got"; fail=$((fail+1))
+    fi
+}
+
+cfg_case "clean config -> proceed"                          ok   ""                public_pool 1 0
+cfg_case "does not parse with the incoming binary -> REFUSE" FAIL ""               public_pool 1 1
+cfg_case "dead key for a removed feature -> REFUSE"         ok   "bond_ledger_url" public_pool 1 1
+cfg_case "deprecated public_mining -> REFUSE"               ok   "public_mining"   public_pool 1 1
+cfg_case "mining_mode unset -> REFUSE"                      ok   ""                ""          1 1
+cfg_case "no [tdp] block -> REFUSE"                         ok   ""                public_pool 0 1
+cfg_case "several faults -> one reason each"                FAIL "public_mining"   ""          0 4
+
+# ⛔ THE PROBE ITSELF NOT RUNNING. `parse` is always `ok` or `FAIL` when the probe ran, so empty
+#    means it did not. A gate that cannot read its evidence must REFUSE, not pass: "the config is
+#    fine" and "I could not tell" are different answers and only one of them is safe to act on.
+cfg_case "probe produced no verdict -> REFUSE"              ""   ""                public_pool 1 1
+
+#    ...and it must say the RIGHT thing. Counting reasons is not enough: with the no-verdict guard
+#    removed, an empty `parse` still refuses (it is not "ok"), so the count is identical — but the
+#    reason it gives is "does not parse", which sends the reader to debug a config file that may be
+#    perfectly fine. Mutation-testing caught this test being weaker than it looked; assert the text.
+if config_gate_failures "" "" public_pool 1 | grep -q "the probe did not run"; then
+    printf "  [ok ] no-verdict is reported as a PROBE failure, not a parse failure\n"; pass=$((pass+1))
+else
+    printf "  [BAD] no-verdict was misreported (got: %s)\n" "$(config_gate_failures "" "" public_pool 1 | head -1)"; fail=$((fail+1))
+fi
+
+# ---------------------------------------------------------------------------
 # 11. The remote-read validator. Its predecessor was `tr -cd '0-9'`, which cannot fail: any
 #    stray stdout line has its digits CONCATENATED into the count, so a read that half-worked
 #    came back as a confident wrong number instead of as "unreadable".
