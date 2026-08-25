@@ -72,13 +72,24 @@ scripts/deploy-node.sh ghost-vm1 ghost-pool            # vm1 is genesis — last
 
 ### Verifying it took
 
-The startup gate report names the resolved heights. Confirm on each node:
+⛔ **The node never says which activation heights it is enforcing.** `init_activation_heights`
+resolves every gate into a `OnceLock` and logs nothing — there is no `info!` for it anywhere. So
+there is NO journal evidence of which gate a running binary carries, and any verification step
+built on grepping the log for a height is a check that cannot succeed. (Tracked separately: the
+node should report what it enforces at startup.)
+
+Verify by **binary identity** instead, which is exact and immediate:
 
 ```sh
-ssh ghost-vmN "sudo journalctl -u ghost-pool --since '5 min ago' | grep -i 'payout_from_shard'"
+sha256sum target/release/ghost-pool                      # the staged rollback build
+ssh ghost-vmN "sha256sum /opt/ghost/bin/ghost-pool"      # what the node is running
 ```
 
-and that the no-vote line has **stopped** appearing while
+They must match on every node. `deploy-node.sh` already records this hash for its soak check, so
+a mismatch also means the soak marker is void.
+
+Then confirm by BEHAVIOUR, over a window rather than a single sample: the
+`Paying from this node's own shard view (no vote` line must **stop** appearing, while
 `payout ledger checkpoint FINALISED` continues.
 
 ⚠ Do not judge any of this from a single sample — [the deploy smoke has passed by reaching
