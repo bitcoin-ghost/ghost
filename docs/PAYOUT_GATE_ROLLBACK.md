@@ -24,10 +24,29 @@ Producing that under incident pressure is what this branch removes.
 
 | step | state |
 |---|---|
-| constant disarmed + test flipped to assert it | ✅ done |
-| `scripts/record-tests.sh` (fmt, clippy, docs, tests, deploy-gate self-test) | ✅ done — SHA recorded deployable |
-| release binary built with `--features zk-production` | ✅ done |
+| constant disarmed + test flipped to assert it | ✅ `1d2940c85` |
+| `scripts/record-tests.sh` — fmt, clippy as CI runs it, docs under `-D warnings`, deploy-gate self-test, SV1 smoke, fuzz build, 718 tests | ✅ passed; `1d2940c85` recorded deployable |
+| release binary, `--features zk-production` (required for mainnet) | ✅ built 2026-08-25 |
 | canary soak | ❌ **cannot be pre-done** — see below |
+
+**Staged artefact**
+
+```
+~/.ghost-deploy/staged/ghost-pool-rollback-1d2940c85
+sha256  fa5ac5ab69a2a5d0c5a4579a74e4c59ec27b62145e2a274e65f81257328eb181
+```
+
+⚠ Kept outside `target/release/`, which the next `cargo build` of any branch overwrites. If the
+copy is gone, rebuild it: `git checkout ops/payout-gate-rollback && cargo build --release -p
+ghost-pool --features zk-production` — about 4 minutes with a warm cache. The expensive half is
+`record-tests.sh`, and that record is keyed to the SHA and survives.
+
+⚠ `deploy-node.sh` deploys from `target/release/ghost-pool`, so a rollback means checking the
+branch out and rebuilding (or copying the staged file into place) — the staged copy is insurance
+against a cold cache and a bad moment, not a shortcut around the deploy script.
+
+For reference, what is deployed today (`v1.11.28`, gate ARMED at 964_100):
+`sha256 711179a8f721659af972db0c707c3585a700f83385b59dec955f858e9e54110e`
 
 ⚠ **The soak cannot be staged.** `deploy-node.sh` records the soak against the binary's hash and
 deletes the marker if the node is no longer running what it soaked. Soaking this build on a canary
