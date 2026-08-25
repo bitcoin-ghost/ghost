@@ -47,11 +47,24 @@ start() {
     mkdir -p "$RUNDIR"
     if [ ! -x "$BIN" ]; then
         echo "fetching ghostd $GHOSTD_VERSION from the published release"
+        # No --clobber: it is not accepted by every gh version in circulation, and a stale
+        # tarball is removed here anyway, which is what --clobber was guarding against.
+        rm -f "$RUNDIR"/*x86_64-unknown-linux-gnu.tar.gz
         gh release download "$GHOSTD_VERSION" \
             --pattern '*x86_64-unknown-linux-gnu.tar.gz' \
-            --dir "$RUNDIR" --clobber
+            --dir "$RUNDIR"
         tar xzf "$RUNDIR"/*x86_64-unknown-linux-gnu.tar.gz -C "$RUNDIR" ghostd
         chmod +x "$BIN"
+    fi
+    # Check that it can actually EXEC before anything depends on it. This binary is dynamically
+    # linked and the first CI run failed on a missing libevent — but the failure surfaced 90
+    # seconds later as "never answered RPC", which points at the wrong thing entirely. A linker
+    # error should read as a linker error.
+    if ! "$BIN" --version >/dev/null 2>&1; then
+        echo "FAIL: ghostd will not execute — its shared libraries are probably missing:" >&2
+        "$BIN" --version >&2 2>&1 | head -3
+        ldd "$BIN" 2>/dev/null | grep "not found" >&2
+        return 1
     fi
     "$BIN" --version | head -1
 

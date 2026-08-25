@@ -33,6 +33,23 @@ set -euo pipefail
 DEB_CACHE=/tmp/apt-debs
 PKGS=${LINUX_DEPS:-"libsqlite3-dev capnproto libcapnp-dev"}
 
+# Runtime libraries for the released `ghostd`, which the Integration tests job runs as a regtest
+# node (#770). That binary is dynamically linked, and the hosted image does not carry libevent:
+#
+#     ghostd: error while loading shared libraries: libevent_extra-2.1.so.7
+#
+# Appended unconditionally rather than folded into LINUX_DEPS, and that is deliberate:
+#
+# ⚠ The cache key is `hashFiles('.github/scripts/install-linux-deps.sh')` — THIS file — but
+# LINUX_DEPS is set in the workflow env. Adding packages there would NOT rotate the key, so the
+# job would restore a cache of the old .debs and install exactly what it had before, while
+# looking like it had been given more. Package changes have to land here to be picked up.
+#
+# The `-dev` names are chosen over the runtime ones on purpose: Ubuntu 24.04 renamed the runtime
+# packages for the 64-bit time_t transition (`libevent-2.1-7` -> `libevent-2.1-7t64`), while the
+# dev package names are stable across releases and pull the right runtime libs as dependencies.
+PKGS="$PKGS libevent-dev libzmq3-dev"
+
 # `dpkg -i` on a partial set can leave unmet dependencies; `apt-get -f install` repairs it.
 # That repair CAN touch the network, so it is a fallback and never the happy path.
 install_from_cache() {
