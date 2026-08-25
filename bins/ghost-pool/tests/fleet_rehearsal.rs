@@ -281,6 +281,21 @@ fn ratifying(nodes: &[Node], proposal: &PayoutProposal) -> usize {
 }
 
 #[tokio::test]
+// KNOWN RED, and deleted by #750 (Stage 6 Release B) rather than fixed.
+//
+// The fixture sets `now = Utc::now() - 3_600` while `PRE_GATE_FRESHNESS_SECS` is 1800, so the
+// proposal can never be fresh enough and 0 of 8 nodes ratify where it asserts 8. It cannot have
+// passed since that freshness window was introduced; it reported green only because it was
+// silently skipping for want of a regtest node (#770).
+//
+// Ignored rather than repaired because Release B deletes this file outright — the BFT
+// ratification it exercises is the thing being removed. Ignored rather than left silently
+// skipping because CI is gaining a regtest node, and a test that fails there is worse than one
+// that is visibly not running.
+//
+// ⚠ Its step 2 asserts `0/8` and passes VACUOUSLY — it would read as success even with
+// ratification completely broken. Do not resurrect this file as a coverage argument.
+#[ignore = "known red, deleted by #750: proposal freshness window makes ratification impossible"]
 async fn divergent_fleet_is_reconciled_ratifies_and_pays_its_miners_on_a_real_chain() {
     let Some(rpc) = rpc() else {
         eprintln!("SKIP: no regtest ghostd on 127.0.0.1:18443");

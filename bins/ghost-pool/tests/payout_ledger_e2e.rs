@@ -751,6 +751,21 @@ fn ghost02_round_scoped_recompute_is_rejected() {
 /// address-grouped path is what `block_win_is_ratified_and_pays_every_miner_the_ledger_owes`
 /// covers. Between them both ledger groupings are proven.
 #[tokio::test]
+// KNOWN RED, and deleted by #750 rather than fixed.
+//
+// The pool computes the coinbase witness commitment over the template's full transaction set,
+// but this test assembles a block containing only the coinbase. Against a populated mempool the
+// commitment covers a transaction the block does not carry, and ghostd answers
+// `bad-witness-merkle-match`. It is environment-dependent and never asserts which environment it
+// has — it passes against an empty mempool and fails against a busy one.
+//
+// ⚠ `empty_template_e2e` in this same package deliberately puts a fee-paying transaction in the
+// mempool, and cargo runs test binaries in parallel against one shared chain, so these two
+// sabotage each other by design.
+//
+// Block-acceptance coverage does NOT depend on this test: `regtest_shard_coinbase_e2e` submits a
+// real block on the shard path and drains the mempool first, which is the fix this one never got.
+#[ignore = "known red, deleted by #750: coinbase-only block vs a populated mempool"]
 async fn mined_block_is_accepted_by_ghostd_and_pays_the_miners() {
     let Some(rpc) = regtest_rpc() else {
         eprintln!("SKIP: no regtest ghostd on 127.0.0.1:18443");

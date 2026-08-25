@@ -179,6 +179,42 @@ jobs:
             --exclude ghost-mpc \
             --exclude mpc-xproc-harness \
             --exclude integration_tests_sv2
+      # Run the ghost-pool e2e targets against a REAL regtest node (#770).
+      #
+      # Until now these reported green without ever executing. Nothing in CI started a regtest
+      # ghostd, and the targets open with a skip-and-return, so they were compiled, run, printed
+      # SKIP, and passed by doing nothing — seven tests' worth. `GHOST_REGTEST_REQUIRED=1` makes
+      # an unreachable node a FAILURE rather than a skip, so that cannot silently recur.
+      #
+      # ⚠ Deliberately a SEPARATE step from the bulk `cargo test` above, and the targets run ONE
+      # AT A TIME. cargo runs test binaries in parallel and these share a single chain:
+      # `empty_template_e2e` parks a fee-paying transaction in the mempool on purpose, while
+      # `regtest_shard_coinbase_e2e` requires an empty one and drains it. Run concurrently they
+      # sabotage each other, so the sequencing is load-bearing rather than tidiness.
+      #
+      # Verified end to end on a blank chain before landing: 4 passed + 1 ignored, 1 passed,
+      # 1 passed, including a real `submitblock` accepted by ghostd.
+      - name: Start regtest ghostd
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/regtest-node.sh start
+      - name: Run ghost-pool e2e tests against regtest
+        timeout-minutes: 15
+        env:
+          GHOST_REGTEST_REQUIRED: "1"
+          GHOST_REGTEST_PORT: "18453"
+          BITCOIN_RPC_USER: ghost
+          BITCOIN_RPC_PASSWORD: ghostpass
+        run: |
+          for t in payout_ledger_e2e empty_template_e2e regtest_shard_coinbase_e2e; do
+            echo "::group::$t"
+            cargo test -p ghost-pool --test "$t"
+            echo "::endgroup::"
+          done
+      - name: Stop regtest ghostd
+        if: always()
+        run: .github/scripts/regtest-node.sh stop
       # COMPILE the 18 sv2 integration targets without running them (#580).
       #
       # They cannot be run here: 191 `start_pool`/`start_template_provider`/`start_sniffer` call sites
