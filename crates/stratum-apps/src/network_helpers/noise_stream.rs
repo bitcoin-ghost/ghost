@@ -352,7 +352,23 @@ async fn receive_message<Message: Serialize + Deserialize<'static> + GetSize + S
     decoder: &mut StandardNoiseDecoder<Message>,
     timeout: Duration,
 ) -> Result<StandardEitherFrame<Message>, Error> {
-    let mut buffer = vec![0u8; decoder.writable_len()];
+    // ⛔ A zero-length read is not a read.
+    //
+    // `read_exact` on an EMPTY buffer returns `Ok` immediately without touching the socket, so
+    // the timeout wrapped around it can never fire — it is timing an operation that always
+    // completes instantly. The decoder then reports `MissingBytes` on state nothing has changed,
+    // and the handshake loop calls straight back in.
+    //
+    // The result is an infinite loop that makes NO syscalls and burns 100% of a core, which no
+    // I/O timeout can break. Measured in the SV2 integration tests: a sniffer dialling its
+    // upstream got stuck exactly here, its task never reached the relay stage, and the test
+    // binary never exited (#617).
+    let expected = decoder.writable_len();
+    if expected == 0 {
+        return Err(Error::DecoderStalled);
+    }
+
+    let mut buffer = vec![0u8; expected];
     tokio::time::timeout(timeout, reader.read_exact(&mut buffer))
         .await
         .map_err(|_| Error::HandshakeTimeout)?
