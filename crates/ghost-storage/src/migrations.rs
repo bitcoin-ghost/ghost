@@ -155,6 +155,29 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         }
     }
 
+    // A migration that rewrites a large table leaves the whole rewrite sitting in the WAL, and
+    // `journal_size_limit` is -1, so that file does not come back on its own timescale. v58
+    // rewrote ~1.98M rows of `shares_archive` in ~81s and parked a **~2.5GB WAL** on six of
+    // eight nodes, where it stayed until an unrelated maintenance tick happened to run
+    // `Database::optimize()` — which truncates for its own reasons (#776).
+    //
+    // Checkpointing here bounds that transient to the migration that caused it, on a node that
+    // has just demonstrated it had the disk for the rewrite. Only when something actually ran:
+    // an ordinary startup with nothing to migrate should not pay for a checkpoint.
+    //
+    // ⚠ Deliberately NOT fatal. The database is correct either way — the WAL is merely large —
+    // and refusing to start over a housekeeping step would turn a disk-space nuisance into an
+    // outage on every node at once. It must also run OUTSIDE a transaction, which is why it sits
+    // here rather than inside `run_migration_tx`.
+    if current_version < SCHEMA_VERSION {
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            warn!(
+                "post-migration WAL checkpoint failed; the WAL will shrink at the next \
+                 maintenance tick instead: {e}"
+            );
+        }
+    }
+
     info!("Database migrations complete");
     Ok(())
 }
@@ -3209,6 +3232,51 @@ fn migrate_v50(conn: &Connection) -> GhostResult<()> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// The WAL must not survive a migration run (#776).
+    ///
+    /// A migration that rewrites a large table leaves the rewrite in the WAL, and
+    /// `journal_size_limit` is -1, so it never shrinks on its own: v58 parked ~2.5GB on six of
+    /// eight nodes until an unrelated maintenance tick cleared it.
+    ///
+    /// ⚠ On disk deliberately. Every other test here uses `open_in_memory`, which has no WAL
+    /// file at all — so an in-memory version of this test would pass without proving anything.
+    ///
+    /// The assertion is `== 0`, not "small": `wal_checkpoint(TRUNCATE)` truncates to exactly
+    /// zero, whereas a migration run that never checkpoints leaves a non-empty WAL from its own
+    /// table creation. That is what makes this able to fail.
+    #[test]
+    fn migrations_do_not_leave_a_wal_behind() {
+        let path = std::env::temp_dir().join(format!(
+            "ghost-migration-wal-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let shm = std::path::PathBuf::from(format!("{}-shm", path.display()));
+        for f in [&path, &wal, &shm] {
+            let _ = std::fs::remove_file(f);
+        }
+
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("wal mode");
+
+        run_migrations(&conn).expect("migrate");
+
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+
+        drop(conn);
+        for f in [&path, &wal, &shm] {
+            let _ = std::fs::remove_file(f);
+        }
+
+        assert_eq!(
+            wal_len, 0,
+            "migrations left a {wal_len}-byte WAL — it will not shrink on its own \
+             (journal_size_limit is -1) and waits on an unrelated maintenance tick"
+        );
+    }
 
     /// v47 creates the mesh node-list checkpoint table, and doing so must be idempotent —
     /// vm6 and vm8 already have it from a `pool-hardening` build, so this migration meets an
