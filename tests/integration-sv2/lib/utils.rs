@@ -7,7 +7,7 @@ use crate::{
 use async_channel::{Receiver, Sender};
 use once_cell::sync::Lazy;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     net::{SocketAddr, TcpListener},
     sync::{Arc, Mutex},
@@ -52,15 +52,49 @@ use stratum_apps::{
 static RESERVED: Lazy<Mutex<HashMap<SocketAddr, TcpListener>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Ports this process has ever handed out.
+///
+/// The old `UNIQUE_PORTS` set was removed with good reason: on its own it could not fix #612,
+/// because the hazard there was the port being UNBOUND between choice and use, which uniqueness
+/// does not address. Holding the listener fixed that, and still does.
+///
+/// It is needed again for a different reason. [`release_reservation`] lets an external process
+/// bind a reserved port, and once released the OS can hand that port straight back to the next
+/// caller. Callers derive per-port state from it — `BitcoinCore` names its datadir
+/// `.bitcoin-{port}` — so a reissued port would mean two nodes sharing one datadir.
+///
+/// ⚠ This guards a hazard that releasing CREATES, not one that has been observed failing. It is
+/// cheap and the failure it prevents would be obscure (a second node dying on `Error loading
+/// block database`, pointing at the datadir rather than at port reuse), so it is worth having on
+/// those terms — but it should not be described as fixing a measured regression.
+///
+/// So this does NOT replace the reservation. The reservation stops the port being stolen; this
+/// stops it being handed to two owners in sequence.
+static ISSUED: Lazy<Mutex<HashSet<u16>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
 /// Reserve a free loopback address, keeping it bound until [`bind_listener`] claims it.
 pub fn get_available_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    let addr = listener.local_addr().expect("read the bound address");
-    RESERVED
-        .lock()
-        .expect("reserved-port registry")
-        .insert(addr, listener);
-    addr
+    for _ in 0..64 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read the bound address");
+
+        if !ISSUED
+            .lock()
+            .expect("issued-port registry")
+            .insert(addr.port())
+        {
+            // Already handed out once in this process. Dropping `listener` here frees it again,
+            // which is fine: we are rejecting this port, not reserving it.
+            continue;
+        }
+
+        RESERVED
+            .lock()
+            .expect("reserved-port registry")
+            .insert(addr, listener);
+        return addr;
+    }
+    panic!("no unused loopback port after 64 attempts — the ephemeral range may be exhausted");
 }
 pub async fn wait_for_client(listen_socket: SocketAddr) -> tokio::net::TcpStream {
     accept_one(bind_listener(listen_socket).await).await
@@ -84,6 +118,30 @@ pub async fn wait_for_client(listen_socket: SocketAddr) -> tokio::net::TcpStream
 /// the moment reservations started being held.
 ///
 /// Returned non-blocking, ready for `tokio::net::TcpListener::from_std`.
+/// Release a reserved port so an EXTERNAL PROCESS can bind it.
+///
+/// [`get_available_address`] holds the port open, and a Rust component later takes ownership of
+/// that exact socket with [`claim_listener`] — which is what closes the probe-and-release race
+/// from #408.
+///
+/// A child process cannot be handed a `TcpListener`. `sv2-tp` was told to bind a port this
+/// registry was still holding, so it never listened at all: a dial reached the idle reservation
+/// listener, completed at TCP level because the socket has a backlog, and then hung until the
+/// 10-second Noise handshake timeout. Ten of the eighteen SV2 integration targets failed that way
+/// and it read as a hang (#617).
+///
+/// ⚠ Releasing reopens the race `claim_listener` exists to close. The caller MUST follow this by
+/// waiting until the child is genuinely accepting on the port — see
+/// `TemplateProvider::wait_until_listening`. Observing the child listening is what closes the
+/// window; holding the port never could, because holding it is what broke the child.
+pub fn release_reservation(listen_socket: SocketAddr) {
+    // Dropping the listener closes it.
+    RESERVED
+        .lock()
+        .expect("reserved-port registry")
+        .remove(&listen_socket);
+}
+
 pub fn claim_listener(listen_socket: SocketAddr) -> TcpListener {
     let reserved = RESERVED
         .lock()
