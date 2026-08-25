@@ -559,7 +559,17 @@ pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 963_388;
 /// appear ~22x/day and `"Payout consensus approved"` should stop. The payout ledger CHECKPOINT
 /// is a separate path and must keep finalising — if it stops, this gate is not the cause but the
 /// standoff it produces looks identical, so check both.
-pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = 964_100;
+// ⛔ ROLLBACK BUILD — NOT FOR NORMAL DEPLOY. See `docs/PAYOUT_GATE_ROLLBACK.md`.
+//
+// `u64::MAX` disarms the gate: every node keeps taking the BFT vote path, which is what it did
+// before 964_100. Staged in advance because there is no fast way to produce it later — the env
+// override `GHOST_PAYOUT_FROM_SHARD_HEIGHT` is IGNORED on mainnet (`gates::from_env` returns the
+// default before reading it), so undoing this gate has always meant a rebuild, and a rebuild
+// under incident pressure is the thing this branch exists to avoid.
+//
+// ⚠ Deploying this AFTER the gate has fired makes that node disagree with the rest of the fleet
+// about how the coinbase is committed. It is all-or-nothing: every node or none.
+pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = u64::MAX;
 
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
@@ -1176,14 +1186,21 @@ mod in_dns_tests {
 mod payout_from_shard_gate_tests {
     use super::PAYOUT_FROM_SHARD_HEIGHT;
 
-    /// The gate is a fleet-wide agreement: every node must flip on the SAME block or they
-    /// disagree about how the coinbase was committed. Pinned to the exact value so a typo is
-    /// distinguishable from an intended change.
+    /// ⛔ ROLLBACK BRANCH — this asserts the gate is DISARMED, the opposite of what `main` asserts.
+    ///
+    /// On `main` this pins 964_100. Here it pins `u64::MAX`, so the branch cannot silently drift
+    /// back into being an ordinary build: if someone rebases this onto a `main` that changed the
+    /// constant, this test fails rather than quietly producing a binary that arms the gate.
+    ///
+    /// The gate is a fleet-wide agreement — every node flips on the SAME block or they disagree
+    /// about how the coinbase was committed — so it is all-or-nothing in both directions.
     #[test]
-    fn the_no_vote_gate_is_armed_at_the_intended_height() {
+    fn the_no_vote_gate_is_disarmed_in_this_rollback_build() {
         assert_eq!(
-            PAYOUT_FROM_SHARD_HEIGHT, 964_100,
-            "the no-vote gate height is a fleet-wide agreement — changing it is a deliberate act"
+            PAYOUT_FROM_SHARD_HEIGHT,
+            u64::MAX,
+            "this is the staged ROLLBACK build — the no-vote gate must be disarmed here, and \
+             every node must run the same one"
         );
     }
 }
