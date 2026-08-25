@@ -279,7 +279,10 @@ where
                     // sat in exactly this state — thread pinned in `R`, ~80% CPU, `stime` flat,
                     // an empty `/proc/<tid>/syscall` — so the remaining tests in that target
                     // never ran and the whole target read as a hang (#617).
-                    if expected == 0 {
+                    // Same rule as `receive_message`: a zero length BEFORE the call is how the
+                    // decoder is primed. Only a decoder that still cannot accept a byte AFTER
+                    // `next_frame` has run is genuinely unable to progress.
+                    if expected == 0 && self.decoder.writable_len() == 0 {
                         return Err(Error::DecoderStalled);
                     }
                     tokio::task::yield_now().await;
@@ -364,15 +367,45 @@ async fn receive_message<Message: Serialize + Deserialize<'static> + GetSize + S
     // upstream got stuck exactly here, its task never reached the relay stage, and the test
     // binary never exited (#617).
     let expected = decoder.writable_len();
-    if expected == 0 {
-        return Err(Error::DecoderStalled);
+
+    // A zero length here is NOT automatically an error: it also means the decoder already holds a
+    // complete frame and simply wants `next_frame` called to hand it over. Skipping the read but
+    // still calling `next_frame` is what tells the two cases apart.
+    if expected > 0 {
+        let mut buffer = vec![0u8; expected];
+        tokio::time::timeout(timeout, reader.read_exact(&mut buffer))
+            .await
+            .map_err(|_| Error::HandshakeTimeout)?
+            .map_err(|_| Error::SocketClosed)?;
+        decoder.writable().copy_from_slice(&buffer);
     }
 
-    let mut buffer = vec![0u8; expected];
-    tokio::time::timeout(timeout, reader.read_exact(&mut buffer))
-        .await
-        .map_err(|_| Error::HandshakeTimeout)?
-        .map_err(|_| Error::SocketClosed)?;
-    decoder.writable().copy_from_slice(&buffer);
-    decoder.next_frame(state).map_err(Error::CodecError)
+    match decoder.next_frame(state) {
+        Ok(frame) => Ok(frame),
+        // ⛔ Wants more bytes AND can accept none: nothing read, nothing changed, and the caller's
+        // handshake loop retries with no yield and no sleep.
+        //
+        // `read_exact` on an EMPTY buffer returns `Ok` immediately without touching the socket, so
+        // the timeout above cannot fire — it would be timing an operation that always completes
+        // instantly. The result is an infinite loop making NO syscalls, burning 100% of a core,
+        // which no I/O deadline can break and strace cannot see (#617).
+        // ⛔ Still cannot accept a byte AFTER `next_frame` has run: nothing was read, nothing
+        // changed, and the caller's handshake loop retries with no yield and no sleep.
+        //
+        // The post-call check is the load-bearing part. A zero length BEFORE the call is normal —
+        // it is how the decoder is primed, since `next_frame` returning `MissingBytes(n)` is what
+        // sets `writable_len()` to `n`. Erroring on that alone breaks every healthy handshake,
+        // which is exactly what an earlier version of this guard did.
+        //
+        // `read_exact` on an EMPTY buffer returns `Ok` immediately without touching the socket, so
+        // the timeout above cannot fire — it would be timing an operation that always completes
+        // instantly. The result is an infinite loop making NO syscalls and burning 100% of a core,
+        // which no I/O deadline breaks and strace cannot see (#617).
+        Err(stratum_core::codec_sv2::Error::MissingBytes(_))
+            if expected == 0 && decoder.writable_len() == 0 =>
+        {
+            Err(Error::DecoderStalled)
+        }
+        Err(e) => Err(Error::CodecError(e)),
+    }
 }
