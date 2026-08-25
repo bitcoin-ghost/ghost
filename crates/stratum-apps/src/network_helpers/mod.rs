@@ -51,6 +51,11 @@ pub enum Error {
     InvalidKey,
     /// DNS resolution failed for a hostname
     DnsResolutionFailed(String),
+    /// The decoder asked for more bytes while reporting it can accept none.
+    ///
+    /// No read can satisfy that, so the stream cannot make progress. It exists so the caller
+    /// gets an error instead of a loop — see the guard in `NoiseStream::read_frame`.
+    DecoderStalled,
 }
 
 impl fmt::Display for Error {
@@ -73,6 +78,11 @@ impl fmt::Display for Error {
             Error::InvalidKey => write!(f, "Invalid key provided for handshake"),
 
             Error::DnsResolutionFailed(msg) => write!(f, "DNS resolution failed: {msg}"),
+
+            Error::DecoderStalled => write!(
+                f,
+                "decoder needs more bytes but can accept none — the stream cannot progress"
+            ),
         }
     }
 }

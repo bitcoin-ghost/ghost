@@ -266,6 +266,22 @@ where
             match self.decoder.next_frame(&mut self.state) {
                 Ok(frame) => return Ok(frame),
                 Err(stratum_core::codec_sv2::Error::MissingBytes(_)) => {
+                    // ⛔ The decoder wants more bytes while reporting it can accept NONE.
+                    //
+                    // `expected == 0` means the read loop above was skipped entirely, so not one
+                    // byte was taken from the socket and the decoder's state is exactly what it
+                    // was a moment ago. Yielding and re-polling cannot change it — this is an
+                    // infinite loop, and on a current-thread runtime it is a 100% CPU spin that
+                    // makes NO syscalls at all. It is invisible to strace, and to any timeout
+                    // that waits on I/O rather than on wall-clock.
+                    //
+                    // Measured in the SV2 integration tests: after one test failed, its binary
+                    // sat in exactly this state — thread pinned in `R`, ~80% CPU, `stime` flat,
+                    // an empty `/proc/<tid>/syscall` — so the remaining tests in that target
+                    // never ran and the whole target read as a hang (#617).
+                    if expected == 0 {
+                        return Err(Error::DecoderStalled);
+                    }
                     tokio::task::yield_now().await;
                     continue;
                 }
