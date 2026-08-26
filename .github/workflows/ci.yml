@@ -139,6 +139,12 @@ jobs:
   # already in the sequence below. The rationale is kept because the failure mode it describes —
   # a test that nothing runs — is what this job exists to prevent.
   #
+  # `regtest_mining_modes_e2e` arrived with this same release and was NOT in the sequence, which
+  # is that exact failure mode again: `common::require_regtest()` returns `None` and the test
+  # SKIPS rather than fails whenever `GHOST_REGTEST_REQUIRED` is unset, so a bulk `cargo test`
+  # would have reported it green without ever starting a node. It runs FIRST, on a clean mempool,
+  # because `empty_template_e2e` parks a transaction on purpose.
+  #
   # This is a SEPARATE job, not a step on `test`, deliberately: adding it there pushed that job
   # from ~28 min past its 45-minute timeout and it was cancelled mid-run. Here it runs in
   # parallel and cannot slow the critical path. Linux only — the same rationale the
@@ -212,7 +218,7 @@ jobs:
           BITCOIN_RPC_USER: ghost
           BITCOIN_RPC_PASSWORD: ghostpass
         run: |
-          for t in empty_template_e2e regtest_shard_coinbase_e2e; do
+          for t in regtest_mining_modes_e2e empty_template_e2e regtest_shard_coinbase_e2e; do
             echo "::group::$t"
             cargo test -p ghost-pool --test "$t"
             echo "::endgroup::"
