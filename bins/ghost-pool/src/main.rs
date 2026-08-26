@@ -689,6 +689,14 @@ struct Args {
     #[arg(long)]
     show_identity: bool,
 
+    /// Report config keys the binary does not understand, then exit.
+    ///
+    /// Prints key NAMES only, never values — safe to run on a production node
+    /// whose config carries secrets. Exits non-zero if any key is unknown, so
+    /// it can gate a deploy.
+    #[arg(long)]
+    check_config: bool,
+
     /// Initialize MPC genesis (only use on first node in network)
     #[arg(long)]
     genesis: bool,
@@ -2337,6 +2345,12 @@ async fn main() -> Result<()> {
 
     // Load configuration first (needed for signer config)
     let config = load_config(&args.config)?;
+
+    // --check-config: run BEFORE identity, keys, or storage, so a config problem
+    // is reported as a config problem rather than as whatever fails next.
+    if args.check_config {
+        return handle_check_config(&args.config);
+    }
 
     // Policy master/slave reconciliation. `pool.toml [policy] profile` is the single
     // MASTER the operator edits (directly or via the dashboard); ghostd's
@@ -11095,6 +11109,41 @@ fn reaper_config_from_settings(s: &ReaperSettings) -> ReaperConfig {
 }
 
 /// Load configuration from file
+/// `--check-config`: report keys this binary does not understand.
+///
+/// The oracle is `ignored_config_keys`, which round-trips the file through
+/// `NodeConfig` and diffs written-vs-understood, so the struct is its own
+/// source of truth and this cannot drift from it the way a hand-maintained
+/// list of dead key names does.
+///
+/// ⚠ A missing file is an ERROR here, unlike `load_config`, which falls back to
+/// defaults. A check that silently passes on a path that does not exist is a
+/// check that cannot fail.
+fn handle_check_config(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no config file at {} — nothing to check", path.display());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    match ghost_common::config::ignored_config_keys(&raw) {
+        Err(e) => anyhow::bail!("{}: {e}", path.display()),
+        Ok(keys) if keys.is_empty() => {
+            println!("{}: ok — every key is understood", path.display());
+            Ok(())
+        }
+        Ok(keys) => {
+            println!(
+                "{}: {} key(s) NOT understood by this binary:",
+                path.display(),
+                keys.len()
+            );
+            for k in &keys {
+                println!("  {k}");
+            }
+            anyhow::bail!("config carries {} unknown key(s)", keys.len())
+        }
+    }
+}
+
 fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
     let mut config = if path.exists() {
         let content = std::fs::read_to_string(path)?;

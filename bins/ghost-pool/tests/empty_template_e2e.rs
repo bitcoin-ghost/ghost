@@ -7,8 +7,9 @@
 //! empty path emits a coinbase-only template (no txs, no fees) while the forced
 //! full path includes that transaction and its fee.
 //!
-//! SKIPs (does not fail) when no regtest ghostd is reachable on 127.0.0.1:18443,
-//! matching the other ghost-pool e2e tests (see `fleet_rehearsal.rs`).
+//! Skips when no regtest ghostd is reachable, UNLESS `GHOST_REGTEST_REQUIRED` is set, in which
+//! case an unreachable node is a failure — see `common::skip_or_fail`. A silent skip is why
+//! seven e2e tests reported green without ever executing (#770).
 
 use std::sync::Arc;
 
@@ -42,16 +43,28 @@ fn addr(seed: u8) -> String {
 #[tokio::test]
 async fn empty_template_is_coinbase_only_while_forced_full_includes_mempool() {
     let Some(rpc) = rpc() else {
-        eprintln!("SKIP: no regtest ghostd on 127.0.0.1:18443");
+        common::skip_or_fail("no regtest ghostd");
         return;
     };
     if rpc.get_block_count().await.is_err() {
-        eprintln!("SKIP: regtest ghostd not responding");
+        common::skip_or_fail("regtest ghostd not responding");
         return;
     }
 
     // A single loaded wallet lets wallet RPCs resolve on the base URL.
-    let _ = rpc.call_raw("createwallet", vec![json!("etest")]).await;
+    //
+    // `createwallet` fails once the wallet exists, and ghostd does not load a wallet
+    // automatically, so the SECOND run against a given node reached `getnewaddress` with
+    // nothing loaded and died on `RPC error -18: No wallet is loaded`. Discarding the result
+    // hid which of the two had happened. Create, then fall back to loading; `loadwallet` in
+    // turn fails harmlessly when it is already loaded, which is the steady state.
+    if rpc
+        .call_raw("createwallet", vec![json!("etest")])
+        .await
+        .is_err()
+    {
+        let _ = rpc.call_raw("loadwallet", vec![json!("etest")]).await;
+    }
     let mining_addr = rpc
         .call_raw("getnewaddress", vec![])
         .await

@@ -106,6 +106,23 @@ COLLECT='
   printf "dead_keys=%s\n"        "$(grep -ohE "^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=" /etc/ghost/pool.toml /etc/ghost/translator-config.toml 2>/dev/null | tr -d " =" | sort -u | paste -sd, -)"
   printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
   printf "cfg_parses=%s\n"       "$(/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
+  # Ops scripts are deployed by NOTHING — `deploy-node.sh` handles ghost-pool, pool_sv2 and
+  # translator_sv2 and nothing else. So these drift silently and stay drifted: the restart
+  # watchdog sat on a pre-fix version on all eight for months, posting to an ALERT_WEBHOOK
+  # from a config file that does not exist, and nobody could tell.
+  printf "ops_restart_watch=%s\n" "$($SUDO sha256sum /opt/ghost/bin/ghost-restart-watch.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_auto_update=%s\n"   "$($SUDO sha256sum /opt/ghost/bin/ghost-auto-update.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_pool_sig=%s\n"      "$($SUDO sha256sum /opt/ghost/bin/update-pool-signature.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_wait_sync=%s\n"     "$($SUDO sha256sum /opt/ghost/bin/wait-for-ghostd-sync.sh 2>/dev/null | cut -c1-16)"
+  # #761: the dead_keys grep above can only ever find the three names written into it, so a clean
+  # report from it proves nothing about any OTHER unknown key. --check-config is the generic
+  # oracle: it round-trips the file through NodeConfig and diffs written-vs-understood, so the
+  # struct is its own source of truth. Prints key NAMES only, never values.
+  #
+  # The flag does not exist in binaries older than the #761 release. Distinguish "no unknown keys"
+  # from "this binary cannot answer" — reporting the second as the first is how a check that
+  # cannot fail gets built.
+  printf "cfg_unknown=%s\n"      "$(if ! /opt/ghost/bin/ghost-pool --help 2>&1 | grep -q -- "--check-config"; then echo unsupported; elif /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --check-config >/dev/null 2>&1; then echo none; else /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --check-config 2>&1 | sed -n "s/^  //p" | paste -sd, -; fi)"
 '
 
 declare -A VALUES   # VALUES[node|field] = value
@@ -268,8 +285,32 @@ for n in "${REACHED[@]}"; do
     # #759: keys for features that no longer exist, and required keys covered for by a default.
     dk="${VALUES[$n|dead_keys]:-}"
     [ -z "$dk" ] || { echo "  FAIL $n config carries dead key(s) for removed features: $dk (#759)"; rc=1; }
-    [ "${VALUES[$n|tdp_cfg]:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n no [tdp] block — template distribution is running on compiled defaults (#759)"; rc=1; }
+    # ⛔ #759: this used to FAIL on a missing `[tdp]` block. That invariant was UNSATISFIABLE.
+    #
+    # `[tdp]` is not a section of `NodeConfig` — the accepted set is identity, bitcoin, network,
+    # policy, storage, pool, ghost_pay, reaper, coordinator, node_launch, alerts, backup. It is not
+    # in `pool-config.toml` either (that carries `[share_tier_binding]` and `[share_webhook]`), and
+    # no shipped template contains it. TDP is pool_sv2's concern, configured by `--tdp-port` /
+    # `--tdp-pubkey-from-keyfile`, not by a block in pool.toml.
+    #
+    # So the check demanded something that could never be present, on any node, ever — and since
+    # #761 added `deny_unknown_fields`, satisfying it would REFUSE TO START the node:
+    #
+    #     unknown field `tdp`, expected one of `identity`, `bitcoin`, ...
+    #
+    # The underlying worry was real — TDP does run on compiled defaults, because the sri-pool unit
+    # passes no `--tdp-port`. But that is a statement about the unit file, not a missing config
+    # block, and it is the same on all eight, so it is not drift. Reported, not failed.
+    [ "${VALUES[$n|tdp_cfg]:-0}" -gt 0 ] 2>/dev/null || tdp_default_nodes="${tdp_default_nodes:-}$n "
     # The strongest single check available: does the shipped binary actually accept this file?
+    # #761: generic unknown-key oracle. `unsupported` is a WARN, not a pass — the check arms
+    # itself once the #761 release is deployed and must not read as clean before then.
+    case "${VALUES[$n|cfg_unknown]:-}" in
+        none) ;;
+        unsupported) echo "  WARN $n binary predates --check-config; unknown-key check did not run (#761)" ;;
+        "") echo "  WARN $n could not run the unknown-key check" ;;
+        *) echo "  FAIL $n config carries key(s) this binary does not understand: ${VALUES[$n|cfg_unknown]} (#761)"; rc=1 ;;
+    esac
     case "${VALUES[$n|cfg_parses]:-}" in
         ok) ;;
         "") echo "  WARN $n could not run the config parse check" ;;
@@ -282,7 +323,34 @@ for n in "${REACHED[@]}"; do
         enabled|enabled-runtime) echo "  FAIL $n superseded 'bitcoind' unit is ENABLED (ghostd is the chain daemon)"; rc=1 ;;
         *) echo "  WARN $n superseded 'bitcoind' unit still installed ($eb) — remove it" ;;
     esac
+    # ⛔ Compare ops scripts against the REPO, not just node-to-node.
+    #
+    # Cross-node drift detection alone would have called the watchdog healthy: all eight were
+    # stale IDENTICALLY, so they agreed perfectly with each other and disagreed with the source
+    # of truth. Uniform staleness is the failure mode that hid the pre-fix watchdog for months
+    # and put a February binary on vm1's :3333 for five days.
+    #
+    # Only files that HAVE a repo source are compared. `update-pool-signature.sh` and
+    # `wait-for-ghostd-sync.sh` are node-local, so they are still gathered above for cross-node
+    # drift, which is all that can honestly be said about them.
+    for ops in "ops_restart_watch:scripts/ghost-restart-watch.sh" "ops_auto_update:scripts/ghost-auto-update.sh"; do
+        field="${ops%%:*}"; src="$REPO_ROOT/${ops#*:}"
+        [ -r "$src" ] || { echo "  WARN $n cannot read $src to compare $field"; continue; }
+        want="$(sha256sum "$src" 2>/dev/null | cut -c1-16)"
+        got="${VALUES[$n|$field]:-}"
+        if [ -z "$got" ]; then
+            echo "  WARN $n $field not readable on the node"
+        elif [ "$got" != "$want" ]; then
+            echo "  FAIL $n ${ops#*:} is STALE (node $got, repo $want) — nothing deploys it; copy it by hand"; rc=1
+        fi
+    done
 done
+# #759: reported once for the fleet, not failed per node. See the note above — `[tdp]` is not a
+# NodeConfig section, so its absence is the only possible state, and it is identical everywhere.
+if [ -n "${tdp_default_nodes:-}" ]; then
+    echo "  NOTE TDP runs on compiled defaults (no --tdp-port in the sri-pool unit): ${tdp_default_nodes% }"
+    echo "       Not drift and not fixable in pool.toml — adding [tdp] there fails deny_unknown_fields (#759, #761)"
+fi
 [ "$rc" -eq 0 ] && echo "  all invariants hold"
 echo
 
@@ -293,13 +361,20 @@ echo
 if $PROBE; then
     SMOKE="$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py"
     if [ -r "$SMOKE" ]; then
+        # #774: probe BOTH listeners. Checking :3333 only is how #611 stayed invisible for
+        # weeks — the farm tier was enabled fleet-wide on 2026-08-23 and served the HOBBY floor
+        # to undeclared miners the whole time, while `farm_cfg`, `farm_listen` and `farm_ufw` all
+        # read green. Configured, listening and permitted is not the same as serving the right
+        # thing.
         echo "Live probe (default difficulty served to a miner that requests nothing):"
         for n in "${REACHED[@]}"; do
             ip="$(ssh -o ConnectTimeout=10 "$n" "hostname -I | awk '{print \$1}'" 2>/dev/null)"
             [ -n "$ip" ] || { echo "  $n: no address"; rc=1; continue; }
-            line="$(python3 "$SMOKE" "$ip" 3333 2>/dev/null | grep -E "default-diff")" || true
-            printf "  %-11s %s\n" "$n" "${line:-probe produced no result}"
-            case "$line" in *FAIL*) rc=1 ;; esac
+            for port in 3333 4444; do
+                line="$(python3 "$SMOKE" "$ip" "$port" 2>/dev/null | grep -E "default-diff")" || true
+                printf "  %-11s :%s %s\n" "$n" "$port" "${line:-probe produced no result}"
+                case "$line" in *FAIL*) rc=1 ;; esac
+            done
         done
         echo
     else

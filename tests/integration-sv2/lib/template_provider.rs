@@ -1,9 +1,11 @@
 use corepc_node::{types::GetBlockchainInfo, Conf, ConnectParams, Node};
 use std::{
     env,
-    fs::create_dir_all,
+    fs::{create_dir_all, File},
+    net::{SocketAddr, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
 use stratum_apps::stratum_core::bitcoin::{Address, Amount, Txid};
 use tracing::warn;
@@ -343,8 +345,21 @@ impl TemplateProvider {
             }
         }
 
+        // Hand the port to the child.
+        //
+        // `get_available_address` reserved it by BINDING it, and that reservation is held for the
+        // life of the test so a Rust component can adopt the exact socket via `claim_listener`.
+        // sv2-tp is a separate process and cannot be given a `TcpListener`, so while the
+        // reservation stood it could not bind, and a dial hit an idle listener that accepted at
+        // TCP level and answered nothing (#617).
+        let sv2_addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        crate::utils::release_reservation(sv2_addr);
+
         // Launch sv2-tp process
         let datadir = bitcoin_core.data_dir();
+        let stderr_log = File::create(datadir.join("sv2-tp.stderr.log"))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
         let network = if bitcoin_core.is_signet() {
             "-signet"
         } else {
@@ -360,12 +375,21 @@ impl TemplateProvider {
             .arg("-debug=sv2")
             .arg("-loglevel=sv2:trace")
             .stdout(Stdio::null()) // Suppress output in tests
-            .stderr(Stdio::null())
+            // ⚠ stderr is NOT discarded. It used to go to /dev/null, so when sv2-tp could not
+            // bind its port it said so to nobody, and the only symptom was a Noise handshake
+            // timing out ten seconds later in a different component (#617). A process whose
+            // diagnostics are thrown away cannot tell you why it did not start.
+            .stderr(stderr_log)
             .spawn()
             .expect("Failed to start sv2-tp process");
 
-        // Wait for sv2-tp to start and connect to Bitcoin Core
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Wait until sv2-tp is genuinely ACCEPTING on its sv2 port.
+        //
+        // This replaces a blind `sleep(3)`, which could not distinguish a template provider that
+        // had started from one that never bound at all — exactly the state the harness had put it
+        // in — so every downstream failure surfaced as an unrelated timeout in whichever
+        // component dialled it first.
+        Self::wait_until_listening(sv2_addr, Duration::from_secs(30));
 
         TemplateProvider {
             bitcoin_core,
@@ -377,6 +401,26 @@ impl TemplateProvider {
     /// Mine `n` blocks.
     pub fn generate_blocks(&self, n: u64) {
         self.bitcoin_core.generate_blocks(n);
+    }
+
+    /// Block until something is accepting connections on `addr`, or panic with what was tried.
+    ///
+    /// Deliberately fails LOUDLY and at the source. The alternative — the `sleep(3)` this
+    /// replaced — let a template provider that never bound its port look identical to a healthy
+    /// one, and moved the symptom to whichever component dialled it, ten seconds later, as a
+    /// Noise handshake timeout naming neither the port nor the process.
+    fn wait_until_listening(addr: SocketAddr, deadline: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "sv2-tp never listened on {addr} within {deadline:?} — see sv2-tp.stderr.log in the \
+             node datadir. A port still held by the reserved-port registry is the usual cause."
+        );
     }
 
     /// Return the node's RPC info.

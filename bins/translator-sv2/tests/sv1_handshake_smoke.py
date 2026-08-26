@@ -274,7 +274,18 @@ def test_default_difficulty():
     it is pointed at: with a second listener running it must be run once per port or it
     silently stops checking half the surface.
     """
-    expected = float(os.environ.get("GHOST_EXPECT_DEFAULT_DIFFICULTY", "2328.27"))
+    # The expected floor depends on WHICH listener answered. `:4444` is the farm tier and has its
+    # own `min_individual_miner_hashrate`, so comparing it against the hobby floor reports a
+    # correctly-configured node as drifted — which is exactly what happened after #611 shipped:
+    # this case FAILED ghost-vm5 for serving 131,072 (right) while PASSING the un-deployed nodes
+    # for serving 2,048 (wrong). A check that passes the broken nodes and fails the fixed one is
+    # worse than no check.
+    #
+    # ⚠ The default is keyed to the port because the probe runs from the deploy host and cannot
+    # read the node's config. Any node deliberately configured otherwise still needs the env
+    # override — this makes the common case right, not every case.
+    _default_expected = "232831.0" if PORT == 4444 else "2328.27"
+    expected = float(os.environ.get("GHOST_EXPECT_DEFAULT_DIFFICULTY", _default_expected))
     tol = float(os.environ.get("GHOST_DEFAULT_DIFFICULTY_TOLERANCE", "0.02"))
     s = socket.create_connection((HOST, PORT), timeout=10)
     send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})

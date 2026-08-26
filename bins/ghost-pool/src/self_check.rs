@@ -28,6 +28,19 @@ const ARCHIVE_MIN_FREE_BYTES: u64 = 700 * 1024 * 1024 * 1024;
 /// partition (independent of the Archive claim). A node needs headroom for the
 /// growing SQLite DB + WAL; dropping below this warrants operator attention.
 const LOW_DISK_MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Second, much lower floor for the SAME LowDisk event, fired under its own edge key.
+///
+/// ⚠ Edge-triggered alerts latch. A node parked just under the warning threshold has already
+/// fired and stays `active`, so the drop that actually matters raises nothing. Measured on
+/// ghost-vm8 on 2026-08-24: it sat at 5,282 MB against a 5 GiB (5,368 MB) threshold — just
+/// below — so when free space collapsed to **21 MB**, filling the disk, truncating
+/// `settings.json` to zero bytes and crash-looping ghostd 260 times over 2h15m, `fire_edge`
+/// correctly concluded nothing had changed and stayed silent.
+///
+/// A second, independent edge at 1 GiB fires on that collapse even while the 5 GiB warning is
+/// latched. Two tiers rather than removing the latch: un-latching would re-alert every 30s tick
+/// for as long as the condition holds, which is how a channel becomes something people mute.
+const CRITICAL_DISK_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CapabilityCheck {
@@ -183,6 +196,26 @@ async fn fire_low_disk_alert(alerts: &Arc<AlertDispatcher>, config: &NodeConfig)
     );
     alerts
         .fire_edge(AlertEvent::LowDisk, "data_dir", active, &detail)
+        .await;
+
+    // Separate edge key, so this latches independently of the warning above and still fires when
+    // a node that was already below 5 GiB falls off a cliff. Reports MiB, because at this point
+    // "0 GiB free" is the only thing the warning above could have said.
+    let critical = free < CRITICAL_DISK_MIN_FREE_BYTES;
+    let critical_detail = format!(
+        "CRITICAL disk space: only {} MiB free at {} (critical threshold {} MiB). \
+         A full data partition corrupts state files and crash-loops ghostd.",
+        free / (1024 * 1024),
+        probe_path.display(),
+        CRITICAL_DISK_MIN_FREE_BYTES / (1024 * 1024)
+    );
+    alerts
+        .fire_edge(
+            AlertEvent::LowDisk,
+            "data_dir_critical",
+            critical,
+            &critical_detail,
+        )
         .await;
 }
 

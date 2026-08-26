@@ -164,10 +164,49 @@ fi
 # rather than a remembered manual step.
 #
 # Returns 0 if the submission path answered correctly.
+# Poll a TCP port until it accepts, or give up. Uses bash's /dev/tcp so it needs no `nc`.
+#
+# Polling beats sleeping: the dependency chain here is ghost-pool -> pool_sv2 resolving its node
+# identity -> :34255 -> translator -> :3333, and only the last link is what the smoke test needs.
+# A fixed sleep is either too short on a slow node or wasted on a fast one.
+wait_for_tcp() {
+    local host="$1" port="$2" secs="${3:-150}" waited=0
+    # `0` means do not wait at all and assume reachable. The deploy-gate self-test sets this:
+    # it drives the submission path through a stub smoke script, so a real TCP poll would make
+    # the test non-hermetic AND blow its `timeout 60` per-run cap (this wait is up to 150s).
+    #
+    # ⚠ Found the hard way. The self-test passed locally only because `ssh_host_for ghost-vm1`
+    # resolves to the REAL production node and this machine can reach vm1:3333, so the poll
+    # returned instantly. In CI, with no such access, packets are dropped rather than refused,
+    # every attempt burned its full 2s timeout, the run hit the 60s cap and two cases failed.
+    # A test that reaches production to pass is not testing what it claims to.
+    [ "$secs" -eq 0 ] 2>/dev/null && return 0
+    while [ "$waited" -lt "$secs" ]; do
+        if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+            return 0
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 1
+}
+
 exercise_submission_path() {
     local node="$1" host
     host=$(ssh_host_for "$node") || return 1
     [ -n "$host" ] || return 1
+
+    # ⚠ Restarting ghost-pool makes pool_sv2 re-resolve its identity, and until it does it exits
+    # with "share_tier_binding is configured but this node's identity could not ...". Measured on
+    # ghost-vm6 during the v1.11.28 roll: 9 restarts and ~60s before :34255 bound, during which
+    # the translator crash-looped on "All upstreams failed" and :3333 was CLOSED.
+    #
+    # The smoke test then read that as a broken build and halted the roll. It was a race, not a
+    # fault — the node converged on its own minutes later. Wait for the port the probe needs.
+    if ! wait_for_tcp "$host" 3333 "${GHOST_DEPLOY_PORT_WAIT_SECS:-150}"; then
+        echo "      :3333 never opened on $node within 150s — the translator did not come up" >&2
+        return 1
+    fi
 
     timeout 120 python3 "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" \
         "$host" 3333 2>&1 | sed 's/^/      /'
@@ -283,7 +322,21 @@ config_gate_failures() {
     [ "$parse" = "ok" ] || echo "pool.toml does NOT parse with the incoming binary — the node would not come back from its next restart"
     [ -z "$dead" ] || echo "config carries key(s) for removed features: $dead"
     [ -n "$mode" ] || echo "mining_mode is not set — resolved from MiningMode::default(), which decides whether payouts go through BFT"
-    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "no [tdp] block — template distribution would run on compiled defaults"
+}
+
+# Conditions worth saying out loud that must NOT stop a deploy.
+#
+# ⚠ `[tdp]` was a blocking failure here and should never have been. No node on the fleet carries
+# the block — it has been absent on all eight for the life of the config — so the moment the gate
+# above started working, it would have refused every deploy on every node, during a release.
+#
+# A missing `[tdp]` means template distribution runs on compiled defaults. That is the status quo
+# and breaks nothing; it is unconverged config, not a node that fails to start. Blocking belongs to
+# "this binary will not come back": a config that does not parse, keys for deleted features, an
+# unset `mining_mode`. Convergence is #759's job and wants its own change, not a release hostage.
+config_gate_warnings() {
+    local tdp="${1:-}"
+    [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "TDP runs on compiled defaults (the sri-pool unit passes no --tdp-port). NOT fixable in pool.toml: [tdp] is not a NodeConfig section and adding it fails deny_unknown_fields (#759, #761)"
 }
 
 throughput_regressed() {
@@ -480,6 +533,62 @@ if [ "$BINARY" = "ghost-pool" ]; then
        wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
     fi
 
+    # The secret is in the file — but can the RUNNING pool_sv2 binary even sign? (#752)
+    #
+    # #745 gated on the config alone, which is a different claim. Signing ships in the pool_sv2
+    # BINARY (#742), so a node can hold a perfect config, restarted cleanly, and still run a
+    # pre-#742 pool_sv2 with no signing code in it at all. Measured on the live fleet on
+    # 2026-08-23: all eight nodes satisfied the config gate while being unable to sign — the
+    # gate would have permitted the exact deploy it exists to refuse.
+    #
+    # `grep -ac` on the binary rather than `strings`, which is absent on some nodes.
+    #
+    # ⚠ The positive control is NOT optional. An unreadable path, a missing `sudo` or a renamed
+    # binary all return 0, which is indistinguishable from "cannot sign" — and on a deploy gate
+    # "the check did not run" must never look like a verdict.
+    #
+    # ⚠ `grep -c` prints its count AND exits 1 when that count is zero, so `|| echo 0` would
+    # emit a SECOND line and shift every field below it. `|| true` keeps the count and drops
+    # only the status.
+    POOL_SV2_BIN="/opt/ghost/bin/pool_sv2"
+    WEBHOOK_BIN_PROBE=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
+S=\$(command -v sudo >/dev/null && echo sudo || echo)
+\$S grep -ac X-Ghost-Signature $POOL_SV2_BIN 2>/dev/null || true
+\$S grep -ac share_webhook $POOL_SV2_BIN 2>/dev/null || true
+" 2>/dev/null) || WEBHOOK_BIN_PROBE=""
+    SIGN_HITS=$(one_clean_integer "$(printf '%s\n' "$WEBHOOK_BIN_PROBE" | sed -n 1p)" || true)
+    SIGN_CTRL=$(one_clean_integer "$(printf '%s\n' "$WEBHOOK_BIN_PROBE" | sed -n 2p)" || true)
+
+    if [ -z "$SIGN_CTRL" ] || [ "$SIGN_CTRL" = "0" ]; then
+        die "the pool_sv2 signing probe did not run on $NODE — control returned '${SIGN_CTRL:-<nothing>}'
+       ($POOL_SV2_BIN)
+
+       The control greps for a string every pool_sv2 has ever contained, so a zero there means
+       the PROBE failed — unreadable path, no sudo, or a renamed binary — not that the binary
+       cannot sign. Refusing rather than guessing: those two must not look alike on a gate.
+
+       Check by hand:
+         ssh $NODE 'sudo grep -ac share_webhook $POOL_SV2_BIN'"
+    fi
+
+    if [ -z "$SIGN_HITS" ] || [ "$SIGN_HITS" = "0" ]; then
+        die "pool_sv2 on $NODE predates #742 and cannot sign share batches
+       ($POOL_SV2_BIN carries no X-Ghost-Signature; the control matched $SIGN_CTRL times)
+
+       The config is correct, but signing ships in the BINARY, not the config. Deploying
+       ghost-pool here now would make every batch this node's own pool_sv2 submits 401 — and
+       pool_sv2 treats a 401 as PERMANENT, so those shares are DESTROYED, not delayed.
+
+       Do this, in this order:
+         1. scripts/deploy-node.sh $NODE pool_sv2      <- deliberately NOT gated on this
+         2. re-run this command
+
+       Rolling BACK to a ghost-pool that predates #742 is the one case where this gate is
+       wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
+    fi
+
+    info "pool_sv2 on $NODE carries the share-batch signing code (marker $SIGN_HITS, control $SIGN_CTRL)"
+
     # The secret is in the file. Is the pool_sv2 that is RUNNING actually using it?
     WEBHOOK_STAMPS=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
 S=\$(command -v sudo >/dev/null && echo sudo || echo)
@@ -675,10 +784,10 @@ if [ "$BINARY" = "ghost-pool" ]; then
         S=$SUDO
         \$S chmod 755 /tmp/$BINARY.new 2>/dev/null || true
         dead=\$(\$S grep -ohE '^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=' /etc/ghost/pool.toml 2>/dev/null | tr -d ' =' | sort -u | paste -sd, -)
-        mode=\$(\$S grep -oP '^\\s*mining_mode\\s*=\\s*"\\K[^"]+' /etc/ghost/pool.toml 2>/dev/null | head -1)
+        mode=\$(\$S grep -oP '^\\s*mining_mode\\s*=\\s*\"\\K[^\"]+' /etc/ghost/pool.toml 2>/dev/null | head -1)
         tdp=\$(\$S grep -cE '^\\[tdp\\]' /etc/ghost/pool.toml 2>/dev/null)
-        /tmp/$BINARY.new --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && parse=ok || parse=FAIL
-        printf 'dead=%s\\nmode=%s\\ntdp=%s\\nparse=%s\\n' "\$dead" "\$mode" "\$tdp" "\$parse"
+        \$S /tmp/$BINARY.new --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && parse=ok || parse=FAIL
+        printf 'dead=%s\\nmode=%s\\ntdp=%s\\nparse=%s\\n' \"\$dead\" \"\$mode\" \"\$tdp\" \"\$parse\"
     " 2>/dev/null || true)"
 
     cg_dead="$(printf '%s\n' "$cfg_out" | sed -n 's/^dead=//p')"
@@ -691,9 +800,16 @@ if [ "$BINARY" = "ghost-pool" ]; then
     if [ -z "$cg_parse" ]; then
         echo "REFUSED: the config gate could not run on $NODE — no verdict was produced." >&2
         echo "         That is not the same as a passing config. $NODE is UNCHANGED." >&2
+        # A gate that refuses without saying what it saw sends you hunting the wrong thing.
+        # Print the raw probe output so the next person does not have to reconstruct it by hand.
+        echo "         raw probe output follows (empty means the ssh itself produced nothing):" >&2
+        printf '%s\n' "$cfg_out" | sed 's/^/         | /' >&2
         timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
         exit 2
     fi
+
+    cg_warn="$(config_gate_warnings "$cg_tdp")"
+    [ -z "$cg_warn" ] || printf '  WARN: %s\n' "$cg_warn" >&2
 
     cg_fail="$(config_gate_failures "$cg_parse" "$cg_dead" "$cg_mode" "$cg_tdp")"
 
@@ -707,7 +823,7 @@ if [ "$BINARY" = "ghost-pool" ]; then
         timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
         exit 2
     fi
-    info "config gate: parses with the incoming binary, no dead keys, mining_mode and [tdp] set"
+    info "config gate: parses with the incoming binary, no dead keys, mining_mode set"
 fi
 
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
@@ -718,6 +834,11 @@ S=$SUDO
 \$S cp /tmp/$BINARY.new /opt/ghost/bin/$BINARY.staged
 \$S chmod 755 /opt/ghost/bin/$BINARY.staged
 \$S mv /opt/ghost/bin/$BINARY.staged /opt/ghost/bin/$BINARY
+# Every failure path above removes the staging copy; the success path did not, so a
+# ~30-50 MB binary was left in /tmp on every successful deploy. Bounded (same name each
+# time) but it is dead weight on nodes that run close to full, and a full root disk is
+# how state files stop persisting.
+\$S rm -f /tmp/$BINARY.new
 " || exit 2
 
 case "$BINARY" in
@@ -873,7 +994,10 @@ if echo "$CANARY_NODES" | grep -qw "$NODE"; then
     info "exercising the share-submission path on $NODE before starting the clock"
     if ! exercise_submission_path "$NODE"; then
         die "submission-path smoke FAILED on $NODE — no soak clock started for $BINARY @ $SHORT
-       a canary cannot vouch for a build whose miners cannot handshake"
+       a canary cannot vouch for a build whose miners cannot handshake
+       ⚠ THE SWAP ALREADY HAPPENED: $NODE is running $BINARY @ $SHORT UNVERIFIED. This is not a
+         refusal that left the node untouched — check it, and roll back with
+         /opt/ghost/bin/$BINARY.bak.* if it is not serving work."
     fi
     info "submission path OK on $NODE"
 
