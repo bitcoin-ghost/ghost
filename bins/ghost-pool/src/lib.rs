@@ -561,6 +561,42 @@ pub const CHECKPOINT_FROM_SHARD_HEIGHT: u64 = 963_388;
 /// standoff it produces looks identical, so check both.
 pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = 964_100;
 
+/// Height at and above which fee DRIFT is shared in the ratified proposal's own proportions —
+/// 99% to the miners, 1% split treasury/node — instead of landing wholly on the treasury and
+/// node pool.
+///
+/// # Why this is needed
+///
+/// The tip-change proposal cannot know what fees its block will collect, so it records an
+/// estimate: `TemplateProcessor::payout_fee_estimate`, which falls back to `last_filled_fees`
+/// because the tip-change fast-path template is structurally empty. That estimate is a per-node,
+/// per-block LOTTERY — measured on mainnet 2026-08-26, consecutive proposals on one node ran
+/// 2,562,564 → 621,742 → 25,030 → 4,056,247 sats, and two nodes at the same height differed by
+/// 125x (vm1 25,030 against vm6 3,137,573) while their actual available fees agreed to within a
+/// few percent.
+///
+/// `adjust_proposal_for_available_fees` already corrects the estimate to the fees actually
+/// available, but it corrects ONLY the treasury and the node pool — "Miner entries are NEVER
+/// touched in either direction". So the lottery permanently sets the miners' share: a node that
+/// guessed 25,030 against ~2.8M real fees pays its miners 99% of `subsidy + 25,030` and routes
+/// the remaining ~2.8M to the treasury and node pool. That is the very outcome #601 was written
+/// to prevent, reproduced by an estimate that is merely small rather than zero.
+///
+/// Before `PAYOUT_FROM_SHARD_HEIGHT` the mesh vote collapsed all eight nodes onto one proposer's
+/// estimate — still wrong, but uniform. Paying from each node's own shard view made every node's
+/// own lottery live, which is why this surfaced at that gate and not before.
+///
+/// # Why a height gate
+///
+/// This changes coinbase construction, so it is consensus-visible: two nodes on different sides
+/// of it would build different coinbases from the same proposal. Both paths exist in the new
+/// binary and every node switches at the same block.
+///
+/// `u64::MAX` = never. Arm only once the whole fleet runs a binary that knows this path, and not
+/// within the settling window of another gate — one behaviour change per height, or a divergence
+/// cannot be attributed.
+pub const FEE_DRIFT_MINER_SHARE_HEIGHT: u64 = u64::MAX;
+
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
 ///
@@ -713,6 +749,7 @@ mod gates {
     pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
     pub(super) static CHECKPOINT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
     pub(super) static PAYOUT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
+    pub(super) static FEE_DRIFT_MINER_SHARE: OnceLock<u64> = OnceLock::new();
     /// Not a height — the difficulty-tier floor the shard will ingest. Same reasoning as the
     /// gates: a regtest fleet cannot mine one, so without an override the rehearsal exercises an
     /// empty shard. See [`crate::network_tier_log2`].
@@ -803,6 +840,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         PAYOUT_FROM_SHARD_HEIGHT,
     );
+    let fee_drift_miner_share = gates::from_env(
+        "GHOST_FEE_DRIFT_MINER_SHARE_HEIGHT",
+        network,
+        FEE_DRIFT_MINER_SHARE_HEIGHT,
+    );
     let checkpoint_from_shard = gates::from_env(
         "GHOST_CHECKPOINT_FROM_SHARD_HEIGHT",
         network,
@@ -835,6 +877,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
     let _ = gates::CHECKPOINT_FROM_SHARD.set(checkpoint_from_shard);
     let _ = gates::PAYOUT_FROM_SHARD.set(payout_from_shard);
+    let _ = gates::FEE_DRIFT_MINER_SHARE.set(fee_drift_miner_share);
 
     // Not a height, but resolved here for the same reason and under the same mainnet lock, so
     // there is one place to look for "what did this run actually enforce".
@@ -994,6 +1037,12 @@ pub fn checkpoint_from_shard_height() -> u64 {
 /// view, with no BFT vote in the path (Stage 6 step 3).
 pub fn payout_from_shard_height() -> u64 {
     *gates::PAYOUT_FROM_SHARD.get_or_init(|| PAYOUT_FROM_SHARD_HEIGHT)
+}
+
+/// Height at and above which fee drift is shared with the miners in the ratified proposal's own
+/// proportions, rather than landing wholly on the treasury and node pool.
+pub fn fee_drift_miner_share_height() -> u64 {
+    *gates::FEE_DRIFT_MINER_SHARE.get_or_init(|| FEE_DRIFT_MINER_SHARE_HEIGHT)
 }
 
 /// Height at and above which the checkpoint adopts the per-address median of voters' own

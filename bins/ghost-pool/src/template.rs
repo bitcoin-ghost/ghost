@@ -160,6 +160,235 @@ type CoinbaseBuildResult = (
 /// treasury first, then the node pool largest-entry-first (ties broken by address, so every node
 /// reduces the same entries in the same order). Miner entries are NEVER touched in either
 /// direction.
+/// Canonical ordering for drift distribution: largest amount first, ties broken by address.
+///
+/// Every node must add to — and subtract from — the same entries in the same order, or two nodes
+/// holding the identical proposal would build different coinbases. This is the same comparator
+/// the shortfall path and `calculate_node_payouts` already use for their own dust and remainder.
+fn sort_for_drift(entries: &mut [ghost_common::types::PayoutEntry]) {
+    entries.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.address.cmp(&b.address)));
+}
+
+/// Add `amount` across `entries` pro rata to their ratified amounts, remainder to the first entry.
+///
+/// `entries` must already be sorted by [`sort_for_drift`]. Returns the amount actually allocated,
+/// which is `amount` whenever `entries` is non-empty and their total is non-zero.
+fn add_pro_rata(entries: &mut [ghost_common::types::PayoutEntry], amount: u64) -> u64 {
+    if amount == 0 || entries.is_empty() {
+        return 0;
+    }
+    let total: u64 = entries
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+    if total == 0 {
+        // Nothing to be proportional TO. Put it all on the first entry rather than lose it;
+        // the ordering above makes "first" the same entry on every node.
+        entries[0].amount = entries[0].amount.saturating_add(amount);
+        return amount;
+    }
+    let mut allocated: u64 = 0;
+    for entry in entries.iter_mut() {
+        let add = ((amount as u128).saturating_mul(entry.amount as u128) / total as u128) as u64;
+        entry.amount = entry.amount.saturating_add(add);
+        allocated = allocated.saturating_add(add);
+    }
+    let remainder = amount.saturating_sub(allocated);
+    if remainder > 0 {
+        entries[0].amount = entries[0].amount.saturating_add(remainder);
+        allocated = allocated.saturating_add(remainder);
+    }
+    allocated
+}
+
+/// Take `amount` from `entries` pro rata, flooring each entry at zero, then sweeping any residual
+/// largest-first. Returns what could NOT be taken because the entries ran out of value.
+///
+/// `entries` must already be sorted by [`sort_for_drift`].
+fn take_pro_rata(entries: &mut [ghost_common::types::PayoutEntry], amount: u64) -> u64 {
+    if amount == 0 || entries.is_empty() {
+        return amount;
+    }
+    let total: u64 = entries
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+    if total == 0 {
+        return amount;
+    }
+    let mut taken: u64 = 0;
+    for entry in entries.iter_mut() {
+        let want = ((amount as u128).saturating_mul(entry.amount as u128) / total as u128) as u64;
+        let take = want.min(entry.amount);
+        entry.amount -= take;
+        taken = taken.saturating_add(take);
+    }
+    // Integer division under-takes; sweep the residual largest-first so the result is still a
+    // pure function of the proposal.
+    let mut residual = amount.saturating_sub(taken);
+    if residual > 0 {
+        for entry in entries.iter_mut() {
+            if residual == 0 {
+                break;
+            }
+            let take = residual.min(entry.amount);
+            entry.amount -= take;
+            residual -= take;
+        }
+    }
+    residual
+}
+
+/// Share fee drift in the ratified proposal's OWN proportions — 99% to the miners, 1% split
+/// treasury/node — instead of landing the whole of it on the treasury and node pool.
+///
+/// See [`crate::FEE_DRIFT_MINER_SHARE_HEIGHT`] for why this exists. In short: the tip-change
+/// proposal records an ESTIMATE of the block's fees, that estimate is a per-node per-block
+/// lottery, and the legacy adjustment corrects it only in the treasury and node buckets — so the
+/// lottery, not the fees actually collected, decides what the miners are paid.
+///
+/// This is a pure function of `(prop, available_fees)`. It reads no node-local state — notably not
+/// `TreasuryState`, which would fork the coinbase across nodes — so the two callers of
+/// `adjust_proposal_for_available_fees` (the coinbase builder and settlement) stay in step.
+///
+/// `None` means the drift could not be absorbed even after draining every bucket, and the caller
+/// must fall back rather than build a coinbase the network would reject.
+fn share_fee_drift_pro_rata(
+    mut prop: PayoutProposal,
+    available_fees: u64,
+    height: u64,
+) -> Option<PayoutProposal> {
+    let original_fees = prop.tx_fees;
+
+    // Sort once, before anything moves, so both buckets are visited in the canonical order.
+    sort_for_drift(&mut prop.miner_payouts);
+    sort_for_drift(&mut prop.node_payouts);
+
+    if available_fees >= original_fees {
+        let delta = available_fees - original_fees;
+
+        // The SAME levy the ratified split used (`FeeDistribution::calculate_at_height`), so drift
+        // is shaped exactly like the reward it is drifting against: 1% pool fee, 99% to miners.
+        let pool_fee_delta =
+            ((delta as u128) * crate::treasury::POOL_FEE_BASIS_POINTS as u128 / 10_000) as u64;
+        let miner_delta = delta - pool_fee_delta;
+
+        // Split the 1% between treasury and node pool in the proportion the checkpoint ratified,
+        // rather than a fresh decay-schedule read — `prop.treasury_amount` IS that schedule's
+        // output for this block, and it is part of the ratified object every node holds.
+        let node_total: u64 = prop
+            .node_payouts
+            .iter()
+            .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+        let fee_base = prop.treasury_amount.saturating_add(node_total);
+        let to_treasury = if fee_base == 0 {
+            0
+        } else {
+            ((pool_fee_delta as u128).saturating_mul(prop.treasury_amount as u128)
+                / fee_base as u128) as u64
+        };
+        let to_nodes = pool_fee_delta - to_treasury;
+
+        prop.treasury_amount = prop.treasury_amount.saturating_add(to_treasury);
+        let nodes_allocated = add_pro_rata(&mut prop.node_payouts, to_nodes);
+        // No node entries to receive the share (or none ratified): it belongs to the miners
+        // rather than to nobody — the decay schedule's end state, one bucket earlier.
+        let miner_delta = miner_delta.saturating_add(to_nodes - nodes_allocated);
+        let miners_allocated = add_pro_rata(&mut prop.miner_payouts, miner_delta);
+        // Symmetrically: with no miner entries at all, the surplus falls back to the treasury,
+        // which is the only bucket that always exists.
+        prop.treasury_amount = prop
+            .treasury_amount
+            .saturating_add(miner_delta - miners_allocated);
+    } else {
+        let delta = original_fees - available_fees;
+        let pool_fee_delta =
+            ((delta as u128) * crate::treasury::POOL_FEE_BASIS_POINTS as u128 / 10_000) as u64;
+        let miner_delta = delta - pool_fee_delta;
+
+        let node_total: u64 = prop
+            .node_payouts
+            .iter()
+            .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+        let fee_base = prop.treasury_amount.saturating_add(node_total);
+        let from_treasury = if fee_base == 0 {
+            0
+        } else {
+            ((pool_fee_delta as u128).saturating_mul(prop.treasury_amount as u128)
+                / fee_base as u128) as u64
+        };
+        let from_treasury = from_treasury.min(prop.treasury_amount);
+        let from_nodes = pool_fee_delta - from_treasury;
+
+        prop.treasury_amount -= from_treasury;
+        let mut shortfall = take_pro_rata(&mut prop.node_payouts, from_nodes);
+        shortfall = shortfall.saturating_add(take_pro_rata(&mut prop.miner_payouts, miner_delta));
+
+        // Whatever no bucket could absorb in its own share is swept across the others, in a fixed
+        // order, before giving up: treasury, then nodes, then miners.
+        if shortfall > 0 {
+            let take = shortfall.min(prop.treasury_amount);
+            prop.treasury_amount -= take;
+            shortfall -= take;
+        }
+        if shortfall > 0 {
+            shortfall = take_pro_rata(&mut prop.node_payouts, shortfall);
+        }
+        if shortfall > 0 {
+            shortfall = take_pro_rata(&mut prop.miner_payouts, shortfall);
+        }
+        if shortfall > 0 {
+            warn!(
+                shortfall,
+                height, "Fee drift exceeds the whole ratified payout — using fallback coinbase"
+            );
+            return None;
+        }
+    }
+
+    // An entry driven to zero must not become a zero-value output.
+    prop.miner_payouts.retain(|e| e.amount > 0);
+    prop.node_payouts.retain(|e| e.amount > 0);
+
+    prop.tx_fees = available_fees;
+
+    // Conservation, checked rather than assumed: this is the exact identity GHOST-02 enforces,
+    // and a coinbase that misses it is rejected by the network. Falling back is always available;
+    // shipping an unbalanced coinbase is not.
+    let miner_sum: u64 = prop
+        .miner_payouts
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+    let node_sum: u64 = prop
+        .node_payouts
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+    let allocated = miner_sum
+        .saturating_add(node_sum)
+        .saturating_add(prop.treasury_amount);
+    let expected = prop.subsidy.saturating_add(available_fees);
+    if allocated != expected {
+        error!(
+            allocated,
+            expected,
+            original_fees,
+            available_fees,
+            height,
+            "Fee-drift redistribution did not conserve value — using fallback coinbase"
+        );
+        return None;
+    }
+
+    info!(
+        original_fees,
+        available_fees,
+        miner_sum,
+        node_sum,
+        treasury = prop.treasury_amount,
+        height,
+        "Adjusted payout: fee drift shared with the miners in the ratified proportions"
+    );
+    Some(prop)
+}
+
 /// Pre-gate: the legacy block-finder adjustment with the H-04 2x cap.
 pub(crate) fn adjust_proposal_for_available_fees(
     mut prop: PayoutProposal,
@@ -183,6 +412,15 @@ pub(crate) fn adjust_proposal_for_available_fees(
         // The drift lands on the TREASURY (GHOST-13 precedent: tx-fee dust already goes
         // there), which keeps the miner split and the node split untouched.
         if prop.block_height >= crate::coinbase_fee_split_height() {
+            // The estimate the tip-change proposal recorded is a per-node, per-block lottery, and
+            // the legacy path below corrects it only in the treasury and node buckets — so that
+            // lottery, not the fees actually collected, decides the miners' share. At and above
+            // this gate the drift is shared in the ratified proportions instead.
+            // See `crate::FEE_DRIFT_MINER_SHARE_HEIGHT`.
+            if prop.block_height >= crate::fee_drift_miner_share_height() {
+                return share_fee_drift_pro_rata(prop, available_fees, height);
+            }
+
             if available_fees > original_fees {
                 let extra = available_fees - original_fees;
 
@@ -6777,6 +7015,182 @@ mod tests {
             "pro-rata shares, remainder on the top entry, ties broken by address"
         );
         assert_eq!(adj_total(&adjusted), total_value);
+    }
+
+    // ---- fee drift shared with the miners (FEE_DRIFT_MINER_SHARE_HEIGHT) ----
+    //
+    // These call `share_fee_drift_pro_rata` directly. The gate is a process-wide `OnceLock`, so a
+    // test cannot arm it without arming it for every other test in the binary — and the dormancy
+    // test below depends on it staying at `u64::MAX`.
+
+    /// Two miners in 3:1, so a pro-rata claim is falsifiable rather than "the only entry got it".
+    fn drift_proposal(
+        subsidy: u64,
+        tx_fees: u64,
+        treasury: u64,
+    ) -> ghost_common::types::PayoutProposal {
+        let mut prop = adj_proposal(subsidy, tx_fees, treasury);
+        prop.miner_payouts = vec![
+            ghost_common::types::PayoutEntry {
+                address: b"bc1qminer_big".to_vec(),
+                amount: 225_000_000,
+                recipient_id: [8u8; 32],
+                payout_type: ghost_common::types::PayoutType::Mining,
+            },
+            ghost_common::types::PayoutEntry {
+                address: b"bc1qminer_small".to_vec(),
+                amount: 75_000_000,
+                recipient_id: [9u8; 32],
+                payout_type: ghost_common::types::PayoutType::Mining,
+            },
+        ];
+        prop
+    }
+
+    fn miner_by(prop: &ghost_common::types::PayoutProposal, addr: &[u8]) -> u64 {
+        prop.miner_payouts
+            .iter()
+            .find(|e| e.address == addr)
+            .map(|e| e.amount)
+            .unwrap_or(0)
+    }
+
+    /// THE REGRESSION. vm1's real numbers, 2026-08-26: it recorded an estimate of 25,030 sats
+    /// against ~2.8M actually available, and the legacy path handed the miners NONE of the
+    /// difference — 2,806,260 sats of drift went to the treasury and node pool while the miner
+    /// entries stayed exactly as ratified. Post-gate the miners take 99% of it.
+    #[test]
+    fn the_vm1_lottery_no_longer_decides_what_the_miners_are_paid() {
+        let subsidy = 312_500_000;
+        let prop = drift_proposal(subsidy, 25_030, 525_030);
+        let ratified_miner_total: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum();
+
+        // What the LEGACY path does with the same drift: miners untouched.
+        let legacy = adjust_proposal_for_available_fees(prop.clone(), subsidy + 2_806_260, 964_176)
+            .expect("legacy must absorb it");
+        assert_eq!(
+            legacy.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
+            ratified_miner_total,
+            "legacy path leaves the miners on the estimate — this is the defect"
+        );
+
+        let shared =
+            share_fee_drift_pro_rata(prop, 2_806_260, 964_176).expect("shared path must absorb it");
+        let delta = 2_806_260 - 25_030;
+        let pool_fee_delta = delta / 100;
+        let miner_delta = delta - pool_fee_delta;
+        assert_eq!(
+            shared.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
+            ratified_miner_total + miner_delta,
+            "miners must receive 99% of the drift"
+        );
+        assert_eq!(
+            adj_total(&shared),
+            subsidy + 2_806_260,
+            "the coinbase must still spend exactly subsidy + available fees"
+        );
+    }
+
+    /// The 99% is split BETWEEN miners in their ratified proportions, not handed to the largest.
+    #[test]
+    fn a_shared_surplus_is_pro_rata_between_miners() {
+        let subsidy = 312_500_000;
+        let prop = drift_proposal(subsidy, 500_000, 1_000_000);
+        let shared = share_fee_drift_pro_rata(prop, 1_500_000, 960_000).expect("absorbable");
+
+        let delta = 1_000_000u64;
+        let miner_delta = delta - delta / 100;
+        // Ratified 225M : 75M is 3:1, so the split of `miner_delta` is too.
+        assert_eq!(
+            miner_by(&shared, b"bc1qminer_big"),
+            225_000_000 + miner_delta * 3 / 4
+        );
+        assert_eq!(
+            miner_by(&shared, b"bc1qminer_small"),
+            75_000_000 + miner_delta / 4
+        );
+        assert_eq!(adj_total(&shared), subsidy + 1_500_000);
+    }
+
+    /// A shortfall comes out of the miners too — the correction has to be symmetric, or the
+    /// estimate still decides the outcome whenever it guessed high.
+    #[test]
+    fn a_shared_shortfall_reduces_every_bucket_and_conserves() {
+        let subsidy = 312_500_000;
+        let prop = drift_proposal(subsidy, 2_000_000, 2_500_000);
+        let shared = share_fee_drift_pro_rata(prop, 500_000, 960_000).expect("absorbable");
+
+        assert!(
+            shared.miner_payouts.iter().map(|e| e.amount).sum::<u64>() < 300_000_000,
+            "miners must absorb their share of a shortfall"
+        );
+        assert!(
+            shared.treasury_amount < 2_500_000,
+            "treasury takes its share"
+        );
+        assert_eq!(
+            adj_total(&shared),
+            subsidy + 500_000,
+            "conservation holds in the shortfall direction too"
+        );
+    }
+
+    /// Determinism is a money property here: settlement re-runs this function against the mined
+    /// block and must reconstruct the winner's outputs exactly. Entry order must not matter.
+    #[test]
+    fn shared_drift_is_independent_of_the_input_entry_order() {
+        let subsidy = 312_500_000;
+        let forward = share_fee_drift_pro_rata(
+            drift_proposal(subsidy, 500_000, 1_000_000),
+            1_500_000,
+            960_000,
+        )
+        .expect("absorbable");
+
+        let mut reversed_in = drift_proposal(subsidy, 500_000, 1_000_000);
+        reversed_in.miner_payouts.reverse();
+        let reversed =
+            share_fee_drift_pro_rata(reversed_in, 1_500_000, 960_000).expect("absorbable");
+
+        assert_eq!(
+            miner_by(&forward, b"bc1qminer_big"),
+            miner_by(&reversed, b"bc1qminer_big")
+        );
+        assert_eq!(
+            miner_by(&forward, b"bc1qminer_small"),
+            miner_by(&reversed, b"bc1qminer_small")
+        );
+        assert_eq!(forward.treasury_amount, reversed.treasury_amount);
+    }
+
+    /// Drift larger than the entire ratified payout cannot be absorbed by anything: fall back
+    /// rather than emit a coinbase that does not balance.
+    #[test]
+    fn a_shared_shortfall_bigger_than_the_whole_payout_falls_back() {
+        let prop = drift_proposal(312_500_000, 320_000_000, 1_000_000);
+        assert!(
+            share_fee_drift_pro_rata(prop, 0, 960_000).is_none(),
+            "a shortfall exceeding every bucket must fall back"
+        );
+    }
+
+    /// The gate ships DORMANT. Until it is armed, a live-height proposal must still take the
+    /// legacy path — this is what makes the change safe to merge before it is scheduled.
+    #[test]
+    fn the_miner_share_gate_ships_dormant() {
+        assert_eq!(crate::FEE_DRIFT_MINER_SHARE_HEIGHT, u64::MAX);
+        assert_eq!(crate::fee_drift_miner_share_height(), u64::MAX);
+
+        let subsidy = 312_500_000;
+        let prop = drift_proposal(subsidy, 25_030, 525_030);
+        let ratified: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum();
+        let adjusted = adjust_proposal_for_available_fees(prop, subsidy + 2_806_260, 964_176)
+            .expect("absorbable");
+        assert_eq!(
+            adjusted.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
+            ratified,
+            "while dormant the miners must stay exactly where the legacy path leaves them"
+        );
     }
 
     /// A surplus beyond the cap with NO node pool to absorb it cannot be placed: fail closed
