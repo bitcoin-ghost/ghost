@@ -54,6 +54,16 @@ pub struct DownstreamData {
     // `channel_id` is still None, which would burn a second upstream channel for one miner.
     // This is set the moment the request goes out and is the real guard.
     pub channel_open_requested: bool,
+    // Whether THIS channel was opened before `mining.authorize`, under the provisional
+    // identity — which decides what the per-share TLV must carry.
+    //
+    // It is a property of the connection, NOT of the config. With the subscribe-open
+    // debounced, a pipelining miner still opens on authorize with its own
+    // `<address>.<worker>` as the channel identity, while a serialising one opens early under
+    // the sentinel. Keying the TLV on the config flag instead credited a pipelining miner as
+    // `<addr>.<addr>.<worker>`, because the pool spliced a full identity onto a channel that
+    // already carried the address.
+    pub channel_opened_provisionally: bool,
     // Stores pending shares to be sent to the sv1_server
     pub pending_share: Option<SubmitShareWithChannelId>,
     // Tracks the upstream target for this downstream, used for vardiff target comparison
@@ -98,6 +108,7 @@ impl DownstreamData {
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
             channel_open_requested: false,
+            channel_opened_provisionally: false,
             pending_share: None,
             upstream_target: None,
             last_job_received_time: None,

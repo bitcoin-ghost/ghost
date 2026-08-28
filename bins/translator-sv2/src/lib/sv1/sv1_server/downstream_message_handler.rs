@@ -235,9 +235,6 @@ impl IsServer<'static> for Sv1Server {
         // address and worker name. Leaving the directive on would corrupt attribution.
         let (name, _) = super::split_username_difficulty(name);
         let is_authorized = self.is_authorized(client_id, name);
-        // Read before the lock: the closure below borrows `data`, and this decides what the
-        // TLV must carry.
-        let open_channel_on_subscribe = self.config.open_channel_on_subscribe;
         downstream.downstream_data.super_safe_lock(|data| {
             if !is_authorized {
                 data.authorized_worker_name = name.to_string();
@@ -254,7 +251,11 @@ impl IsServer<'static> for Sv1Server {
             //
             // Sending the worker alone in the second case is not a lesser form of correct —
             // the pool cannot resolve an address from it and refuses to credit the share.
-            let tlv_identity = if open_channel_on_subscribe {
+            // Key this on how THIS channel actually opened, never on the config flag. With
+            // the subscribe-open debounced, a pipelining miner opens on authorize and its
+            // channel identity already holds the address; sending the full identity as well
+            // makes the pool splice one onto the other and credit `<addr>.<addr>.<worker>`.
+            let tlv_identity = if data.channel_opened_provisionally {
                 name
             } else {
                 super::extract_worker_name(name)

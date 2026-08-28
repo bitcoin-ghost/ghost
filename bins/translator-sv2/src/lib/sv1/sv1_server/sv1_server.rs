@@ -941,6 +941,9 @@ impl Sv1Server {
                                         data.channel_open_requested || data.channel_id.is_some();
                                     if !seen {
                                         data.channel_open_requested = true;
+                                        // Claimed by THIS path, so the channel identity will be
+                                        // the sentinel and the TLV must carry the address.
+                                        data.channel_opened_provisionally = true;
                                     }
                                     seen
                                 });
