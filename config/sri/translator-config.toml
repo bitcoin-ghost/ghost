@@ -25,6 +25,26 @@ user_identity = "ghost_miner"
 # false = each miner gets its own channel
 aggregate_channels = false
 
+# Open the upstream channel on mining.subscribe instead of mining.authorize.
+#
+# Serialising SV1 clients — proxies and rented-hashrate marketplaces such as Braiins
+# Hashpower — wait for the subscribe RESPONSE before they will authorise. Deferring the
+# channel open to authorize deadlocks them, and the 1.5s fallback answers subscribe with an
+# 8-byte all-zero placeholder extranonce while the real prefix is 12 bytes. The coinbase
+# reserves exactly 20 bytes for extranonce1+extranonce2, so a client that builds on the
+# placeholder is 4 bytes short: malformed coinbase, wrong merkle root, every share invalid.
+# mining.set_extranonce cannot rescue it — that is an OPTIONAL extension and these clients
+# never send mining.extranonce.subscribe.
+#
+# With this on, the channel opens at subscribe under a provisional identity, the subscribe
+# response carries the real extranonce first time, and the payout address travels per share
+# in the worker TLV instead of in the channel identity.
+#
+# ROLLOUT GATE, default false. pool_sv2 must already understand a provisional channel
+# identity on EVERY node before this is turned on anywhere — rolled the other way round the
+# pool credits shares to nobody. Roll order: pool_sv2 fleet-wide, THEN flip this.
+open_channel_on_subscribe = false
+
 # Protocol extensions
 # Worker-Specific Hashrate Tracking (0x0002) carries the per-share worker identity that the
 # pool recombines with the channel-level address for attribution. REQUIRED here, and the pool

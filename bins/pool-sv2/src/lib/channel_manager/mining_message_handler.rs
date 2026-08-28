@@ -15,7 +15,8 @@ use stratum_apps::stratum_core::{
         Vardiff, VardiffState,
     },
     extensions_sv2::{
-        UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+        UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, PROVISIONAL_CHANNEL_IDENTITY,
+        TLV_FIELD_TYPE_USER_IDENTITY,
     },
     handlers_sv2::{HandleMiningMessagesFromClientAsync, SupportedChannelTypes},
     mining_sv2::*,
@@ -34,24 +35,6 @@ use crate::{
     utils::{create_close_channel_msg, PayoutMode},
 };
 
-/// Channel-level `user_identity` a translator sends when it opens a channel on
-/// `mining.subscribe`, before the miner has authorised and its payout address is knowable.
-///
-/// A serialising SV1 client — proxies and rented-hashrate marketplaces — waits for the
-/// subscribe RESPONSE before it will authorise. The response must carry the real, channel
-/// allocated extranonce, and only the pool can mint that, so the channel has to open before
-/// `mining.authorize` arrives. The address therefore cannot be in the channel identity, and
-/// travels per share in the Worker-Specific Hashrate Tracking TLV instead.
-///
-/// The value is chosen so `PayoutMode::try_from` parses it as `FullDonation`: it must be a
-/// shape the pool already accepts, or the channel open is rejected outright. It is
-/// deliberately a three-segment `sri/donate/…` so it cannot collide with a miner that
-/// genuinely authorises as `sri/donate`.
-///
-/// ⚠ This identity carries NO payout target. Every share on such a channel MUST be attributed
-/// from the TLV; see [`build_webhook_user_identity`], which fails closed rather than splice a
-/// worker onto a sentinel.
-pub(crate) const PROVISIONAL_CHANNEL_IDENTITY: &str = "sri/donate/provisional";
 
 /// Builds the `user_identity` string the share_webhook should report to the downstream
 /// accounting service (ghost-pool).
