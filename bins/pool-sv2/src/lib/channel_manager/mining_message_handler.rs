@@ -35,7 +35,6 @@ use crate::{
     utils::{create_close_channel_msg, PayoutMode},
 };
 
-
 /// Builds the `user_identity` string the share_webhook should report to the downstream
 /// accounting service (ghost-pool).
 ///
