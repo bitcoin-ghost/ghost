@@ -54,6 +54,38 @@ mod template_distribution_message_handler;
 
 const POOL_ALLOCATION_BYTES: usize = 4;
 const CLIENT_SEARCH_SPACE_BYTES: usize = 16;
+
+/// Bytes of [`POOL_ALLOCATION_BYTES`] spent on the fixed server id. Everything left over is
+/// the per-process channel counter, and that counter is the only thing bounding how many
+/// channels this pool can ever open — a prefix is never handed back on `CloseChannel`.
+///
+/// This was 2, because the id was written as a `u16`. That left a 16-bit counter: 65,535
+/// channels for the lifetime of the process, which at the ~250/h measured on vm1 is about ten
+/// days of uptime before every `OpenExtendedMiningChannel` fails while the pool still reports
+/// healthy. The two bytes were not buying anything either — every node in the fleet runs
+/// `server_id = 1`, so both of them encoded a constant.
+///
+/// One byte distinguishes 256 mining servers against a fleet of eight, and hands the counter
+/// 24 bits — 16,777,215 channels, ~7.6 years at the same rate. Lengths are unchanged: the
+/// prefix is still [`POOL_ALLOCATION_BYTES`] wide on the wire, so nothing downstream moves.
+const POOL_STATIC_PREFIX_BYTES: usize = 1;
+
+/// Builds the allocator's static prefix from the configured server id.
+///
+/// Single owner, called by the pool and by its tests, so the layout cannot drift between what
+/// ships and what is asserted — which is exactly how `MAX_USER_IDENTITY_LENGTH` went wrong.
+///
+/// Fails closed above [`POOL_STATIC_PREFIX_BYTES`]: silently truncating would let two nodes
+/// configured 1 and 257 mint identical prefixes.
+pub(crate) fn server_static_prefix(server_id: u16) -> Result<Vec<u8>, String> {
+    let max = (1u32 << (POOL_STATIC_PREFIX_BYTES * 8)) - 1;
+    if u32::from(server_id) > max {
+        return Err(format!(
+            "server_id {server_id} does not fit in {POOL_STATIC_PREFIX_BYTES} byte(s)              (max {max}) — it is the static half of the extranonce prefix"
+        ));
+    }
+    Ok(server_id.to_be_bytes()[2 - POOL_STATIC_PREFIX_BYTES..].to_vec())
+}
 pub const FULL_EXTRANONCE_SIZE: usize = POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES;
 
 pub struct ChannelManagerData {
@@ -129,11 +161,15 @@ impl ChannelManager {
         let range_1 = 0..POOL_ALLOCATION_BYTES;
         let range_2 = POOL_ALLOCATION_BYTES..POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES;
 
+        // Fail closed at construction rather than truncating: the prefix is what keeps two
+        // mining servers from minting the same extranonce.
+        let static_prefix = server_static_prefix(config.server_id())
+            .map_err(|e| PoolError::shutdown(PoolErrorKind::Custom(e)))?;
+
         let make_extranonce_factory = || {
-            // simulating a scenario where there are multiple mining servers
-            // this static prefix allows unique extranonce_prefix allocation
-            // for this mining server
-            let static_prefix = config.server_id().to_be_bytes().to_vec();
+            // The static prefix identifies THIS mining server; the bytes after it are the
+            // per-channel counter.
+            let static_prefix = static_prefix.clone();
 
             ExtendedExtranonce::new(
                 range_0.clone(),

@@ -96,9 +96,10 @@ pub(crate) const EXTRANONCE_SPACE_EXHAUSTED: &str = "extranonce-space-exhausted"
 /// extranonce prefix for the channel it will open.
 ///
 /// The order here is the whole point. The extended allocator is `server_id || counter` over
-/// `POOL_ALLOCATION_BYTES`, of which the two-byte server id is fixed, leaving a 16-bit
-/// counter — 65,535 prefixes for the lifetime of the process, measured by
-/// `extended_prefix_space_is_only_sixteen_bits` — and a prefix is never handed back. Any
+/// `POOL_ALLOCATION_BYTES`, of which `POOL_STATIC_PREFIX_BYTES` is the fixed server id,
+/// leaving a 24-bit counter — 16,777,215 prefixes for the lifetime of the process, measured
+/// by `extended_prefix_space_matches_the_configured_split` — and a prefix is never handed
+/// back. Any
 /// check performed *after* `next_prefix_extended` therefore turns a rejected open into a
 /// permanently burnt prefix, so an unauthenticated client looping deliberately invalid opens
 /// can exhaust the space and stop every honest miner from opening a channel until `pool_sv2`
@@ -1653,7 +1654,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 #[cfg(test)]
 mod extranonce_allocation_tests {
     use super::*;
-    use crate::channel_manager::POOL_ALLOCATION_BYTES;
+    use crate::channel_manager::{POOL_ALLOCATION_BYTES, POOL_STATIC_PREFIX_BYTES};
 
     /// A `user_identity` this pool rejects: `sri/<mode>` with an unrecognised mode.
     const INVALID_IDENTITY: &str = "sri/nonsense";
@@ -1665,12 +1666,13 @@ mod extranonce_allocation_tests {
     /// Builds the extranonce factory with exactly the geometry `ChannelManager::new` uses, so
     /// these tests exercise the real allocation space rather than a convenient toy one.
     fn pool_factory() -> ExtendedExtranonce {
-        let server_id: u16 = 0;
+        // Built through the same helper the pool uses, so a change to the split cannot pass
+        // the tests while shipping something else.
         ExtendedExtranonce::new(
             0..0,
             0..POOL_ALLOCATION_BYTES,
             POOL_ALLOCATION_BYTES..POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES,
-            Some(server_id.to_be_bytes().to_vec()),
+            Some(crate::channel_manager::server_static_prefix(0).expect("0 fits")),
         )
         .expect("valid ranges")
     }
@@ -1690,11 +1692,17 @@ mod extranonce_allocation_tests {
     }
 
     /// Positive control plus the number the DoS turns on: how many extended channels the pool
-    /// can ever open. Two of the four allocation bytes are the fixed server id, leaving a
-    /// 16-bit counter. If this ever grows, the tests below should still hold — but the loop
-    /// counts need revisiting.
+    /// can ever open, derived from the split rather than hardcoded so it tracks
+    /// `POOL_STATIC_PREFIX_BYTES` instead of silently disagreeing with it.
+    ///
+    /// Was 16 bits — 65,535, about ten days of uptime at the ~250/h measured on vm1, after
+    /// which every open fails while the pool still reports healthy. Now 24.
     #[test]
-    fn extended_prefix_space_is_only_sixteen_bits() {
+    fn extended_prefix_space_matches_the_configured_split() {
+        let counter_bits = (POOL_ALLOCATION_BYTES - POOL_STATIC_PREFIX_BYTES) * 8;
+        let capacity = 1usize << counter_bits;
+        assert_eq!(counter_bits, 24, "the split changed — is that deliberate?");
+
         let mut factory = pool_factory();
         let mut minted = 0usize;
         loop {
@@ -1705,9 +1713,21 @@ mod extranonce_allocation_tests {
                     break;
                 }
             }
-            assert!(minted <= 1 << 16, "allocator did not run out");
+            assert!(minted <= capacity, "allocator did not run out");
         }
-        assert_eq!(minted, (1 << 16) - 1);
+        assert_eq!(minted, capacity - 1);
+    }
+
+    /// The static prefix must fail closed rather than truncate: servers configured 1 and 257
+    /// truncating to the same octet would mint identical prefixes on two different pools.
+    #[test]
+    fn server_id_that_does_not_fit_the_prefix_is_refused() {
+        use crate::channel_manager::server_static_prefix;
+        assert_eq!(server_static_prefix(0).unwrap(), vec![0]);
+        assert_eq!(server_static_prefix(1).unwrap(), vec![1]);
+        assert_eq!(server_static_prefix(255).unwrap(), vec![255]);
+        assert!(server_static_prefix(256).is_err());
+        assert!(server_static_prefix(257).is_err());
     }
 
     /// The regression test for #744.
