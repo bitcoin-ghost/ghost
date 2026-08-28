@@ -75,7 +75,21 @@ fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) ->
                 .split_once('.')
                 .map(|(a, _)| a)
                 .unwrap_or(&channel_uid);
-            format!("{}.{}", addr, worker)
+            // Do not splice an address onto itself. The invariant is that a full
+            // `<addr>.<worker>` TLV only ever accompanies a provisional channel, but a
+            // translator that has the subscribe-open flag on while sending the full identity
+            // unconditionally breaks it — and the result, `<addr>.<addr>.<worker>`, is a
+            // phantom miner_id that looks like a real one. Observed on ghost-vm5 for 16
+            // shares on 2026-08-28. The payout address survived (it is the segment before the
+            // FIRST dot) but the worker did not.
+            //
+            // A worker is never legitimately named after the address it sits behind, so
+            // treating that shape as an already-complete identity is safe, and it keeps a
+            // mixed-version window from minting phantoms.
+            match worker.strip_prefix(addr) {
+                Some(rest) if rest.starts_with('.') => worker.to_string(),
+                _ => format!("{}.{}", addr, worker),
+            }
         }
         None => channel_uid,
     })
@@ -1905,6 +1919,24 @@ mod extranonce_allocation_tests {
                 Some("bc1qAAA.rig1")
             ),
             Some("bc1qAAA.rig1".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_identity_never_splices_an_address_onto_itself() {
+        // ghost-vm5, 2026-08-28: a translator with the subscribe-open flag on sent the full
+        // identity for a channel that had opened on authorize and already carried the
+        // address. The pool spliced them and credited a phantom
+        // `<addr>.<addr>.<worker>` for 16 shares.
+        assert_eq!(
+            build_webhook_user_identity("bc1qAAA.bitaxe3".to_string(), Some("bc1qAAA.bitaxe3")),
+            Some("bc1qAAA.bitaxe3".to_string())
+        );
+        // A worker that merely starts with the same letters is NOT the address, and must
+        // still be spliced.
+        assert_eq!(
+            build_webhook_user_identity("bc1qAAA.rig".to_string(), Some("bc1qAAAB")),
+            Some("bc1qAAA.bc1qAAAB".to_string())
         );
     }
 
