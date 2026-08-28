@@ -65,6 +65,20 @@ use tracing::{debug, error, info, trace, warn};
 ///
 /// The server maintains state for multiple downstream connections and implements
 /// variable difficulty adjustment based on share submission rates.
+/// How long a `mining.subscribe` waits for `mining.authorize` before the channel is opened
+/// under a provisional identity.
+///
+/// Sized from measured client behaviour, not guessed: a pipelining miner's authorize follows
+/// its subscribe by ~12ms, and a rented-hashrate capability probe disconnects ~10-30ms in.
+/// Both finish well inside this window, so neither changes behaviour and neither costs an
+/// extranonce prefix — which matters because the pool's extended prefix space is a 16-bit
+/// per-process counter that is never reclaimed (#746).
+///
+/// Only a client still holding the connection open after this — the serialising shape — opens
+/// early. It then waits the channel-open round trip (~50-300ms) instead of the old 1500ms
+/// placeholder timeout, and gets the real extranonce rather than one it cannot mine with.
+const SUBSCRIBE_OPEN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 #[derive(Clone)]
 pub struct Sv1Server {
     pub(crate) sv1_server_channel_state: Sv1ServerChannelState,
@@ -886,28 +900,67 @@ impl Sv1Server {
                 // every share it submits is invalid. The flag exists to retire this branch.
                 if is_mining_subscribe(&downstream_message) {
                     if self.config.open_channel_on_subscribe {
-                        let already_requested =
-                            downstream.downstream_data.super_safe_lock(|data| {
-                                let seen = data.channel_open_requested;
-                                data.channel_open_requested = true;
-                                seen
-                            });
-                        if !already_requested {
+                        // DEBOUNCE, and it is load-bearing twice over.
+                        //
+                        // 1. Prefix exhaustion. The pool's extended allocator is
+                        //    `server_id || counter` with a two-byte server id, leaving a
+                        //    16-BIT counter — 65,535 prefixes for the lifetime of the
+                        //    process, never handed back (#746). vm1 burns ~250/h, so a node
+                        //    that stays up ~10 days stops being able to open channels at all.
+                        //    Opening on every subscribe would add the subscribe-only probes
+                        //    (~15% more) to that burn for no benefit: they disconnect without
+                        //    ever mining.
+                        // 2. #746 deliberately moved allocation AFTER validation so an
+                        //    UNAUTHENTICATED client cannot burn the space. A subscribe
+                        //    arrives before any authorize, so opening on it immediately hands
+                        //    that capability straight back — a drive-by prober could exhaust
+                        //    the pool for every honest miner.
+                        //
+                        // A pipelining miner's authorize lands ~12ms after subscribe and a
+                        // marketplace capability probe disconnects ~10-30ms in; neither
+                        // reaches this timer, so neither costs a prefix and the pipelining
+                        // path is byte-identical to today. Only a client that genuinely holds
+                        // the connection open waiting for its subscribe reply — the
+                        // serialising shape this exists to serve — opens early, and it still
+                        // gets the REAL extranonce, never a placeholder.
+                        let server = self.clone();
+                        let did = downstream_id;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(SUBSCRIBE_OPEN_DEBOUNCE).await;
+                            let Some(downstream) =
+                                server.downstreams.get(&did).map(|r| r.value().clone())
+                            else {
+                                // Already gone: a probe that subscribed and hung up. Costs
+                                // nothing, which is the point.
+                                return;
+                            };
+                            // Claim the open iff authorize has not already taken it.
+                            let already_requested =
+                                downstream.downstream_data.super_safe_lock(|data| {
+                                    let seen =
+                                        data.channel_open_requested || data.channel_id.is_some();
+                                    if !seen {
+                                        data.channel_open_requested = true;
+                                    }
+                                    seen
+                                });
+                            if already_requested {
+                                return;
+                            }
                             debug!(
-                                "Down: subscribe received for downstream {} — opening upstream \
-                                 channel now under a provisional identity so the subscribe \
-                                 response can carry the real extranonce",
-                                downstream_id
+                                "Down: downstream {} is still waiting on its subscribe reply — \
+                                 opening the channel under a provisional identity so the reply \
+                                 can carry the real extranonce",
+                                did
                             );
-                            if let Err(e) = self.handle_open_channel_request(downstream_id).await {
+                            if let Err(e) = server.handle_open_channel_request(did).await {
                                 error!(
                                     "Down: failed to open upstream channel on subscribe for \
                                      downstream {}: {:?}",
-                                    downstream_id, e
+                                    did, e
                                 );
-                                return Err(e);
                             }
-                        }
+                        });
                         return Ok(());
                     }
 
