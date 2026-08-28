@@ -46,6 +46,14 @@ pub struct DownstreamData {
     pub pending_hashrate: Option<Hashrate>,
     // Queue of Sv1 handshake messages received while waiting for SV2 channel to open
     pub queued_sv1_handshake_messages: Vec<json_rpc::Message>,
+    // Whether an OpenExtendedMiningChannel has already been SENT for this downstream.
+    //
+    // `channel_id` is only populated when OpenExtendedMiningChannelSuccess comes back, so it
+    // cannot guard the request itself: with the channel opening on `mining.subscribe`, a
+    // pipelining miner's `mining.authorize` arrives while the open is still in flight and
+    // `channel_id` is still None, which would burn a second upstream channel for one miner.
+    // This is set the moment the request goes out and is the real guard.
+    pub channel_open_requested: bool,
     // Stores pending shares to be sent to the sv1_server
     pub pending_share: Option<SubmitShareWithChannelId>,
     // Tracks the upstream target for this downstream, used for vardiff target comparison
@@ -89,6 +97,7 @@ impl DownstreamData {
             pending_target: None,
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
+            channel_open_requested: false,
             pending_share: None,
             upstream_target: None,
             last_job_received_time: None,

@@ -15,7 +15,8 @@ use stratum_apps::stratum_core::{
         Vardiff, VardiffState,
     },
     extensions_sv2::{
-        UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+        UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, PROVISIONAL_CHANNEL_IDENTITY,
+        TLV_FIELD_TYPE_USER_IDENTITY,
     },
     handlers_sv2::{HandleMiningMessagesFromClientAsync, SupportedChannelTypes},
     mining_sv2::*,
@@ -37,16 +38,38 @@ use crate::{
 /// Builds the `user_identity` string the share_webhook should report to the downstream
 /// accounting service (ghost-pool).
 ///
-/// When the Worker-Specific Hashrate Tracking TLV is present (`tlv_worker = Some("bitaxe1")`),
-/// splice that worker name onto the address portion of the channel's `user_identity` so the
-/// resulting payload is `<addr>.<worker>` — the format ghost-pool's `parse_user_identity`
-/// expects to derive both a per-miner `miner_id` AND a payout `<addr>`. When the TLV is absent
-/// or empty, fall back to the channel `user_identity` verbatim, matching pre-TLV behavior.
+/// Two shapes of channel identity reach this function:
+///
+/// - **A channel opened on `mining.authorize`** — the identity is the miner's own
+///   `<addr>.<worker>`. The TLV carries only the worker segment, so splice that worker onto
+///   the address portion of the channel identity. This is the long-standing path and is what
+///   every currently-connected miner uses.
+/// - **A channel opened on `mining.subscribe`** ([`PROVISIONAL_CHANNEL_IDENTITY`]) — the
+///   identity has no payout target at all, so the TLV is authoritative and is used verbatim.
+///   It carries the full `<addr>.<worker>`.
+///
+/// The caller distinguishes the two by the channel identity, never by inspecting the TLV.
+/// A worker name may legitimately contain a `.` (`addr.farm1.rig1` yields worker `farm1.rig1`,
+/// #481), so "the TLV looks dotted" does NOT imply it carries an address, and keying on that
+/// would silently reassign `farm1` as a payout address.
+///
+/// Returns `None` when the share cannot be attributed — a provisional channel with no usable
+/// TLV. Splicing a worker onto the sentinel would produce `sri/donate/provisional.worker`,
+/// whose address portion is `sri`, so the share would be credited to nobody while looking
+/// entirely normal. The caller must not credit a `None`.
 ///
 /// The "address portion" is the prefix before the first `.` in the channel user_identity. If
 /// the channel user_identity has no `.` we treat the whole thing as the address.
-fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) -> String {
-    match tlv_worker.filter(|s| !s.is_empty()) {
+fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) -> Option<String> {
+    let tlv = tlv_worker.filter(|s| !s.is_empty());
+
+    if channel_uid == PROVISIONAL_CHANNEL_IDENTITY {
+        // The TLV is the only source of a payout target on this channel. It must already be
+        // the full `<addr>.<worker>`; a bare worker has no address and cannot be paid.
+        return tlv.filter(|t| t.contains('.')).map(str::to_string);
+    }
+
+    Some(match tlv {
         Some(worker) => {
             let addr = channel_uid
                 .split_once('.')
@@ -55,7 +78,7 @@ fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) ->
             format!("{}.{}", addr, worker)
         }
         None => channel_uid,
-    }
+    })
 }
 
 /// Error code returned when the extended extranonce allocator has no prefixes left.
@@ -1038,14 +1061,24 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let extension_negotiated = negotiated_extensions
                     .as_ref()
                     .is_ok_and(|exts| exts.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING));
-                let attributable = !(extension_negotiated && tlv_worker.is_none());
+
+                // Resolve the payout target ONCE, and let that resolution decide
+                // attributability. `build_webhook_user_identity` returns `None` for a channel
+                // opened on `mining.subscribe` (identity `PROVISIONAL_CHANNEL_IDENTITY`) whose
+                // TLV does not carry a full `<addr>.<worker>` — that channel has no payout
+                // target of its own, so there is nothing to fall back to.
+                let channel_identity = extended_channel.get_user_identity().to_string();
+                let webhook_identity =
+                    build_webhook_user_identity(channel_identity.clone(), tlv_worker);
+
+                let attributable =
+                    webhook_identity.is_some() && !(extension_negotiated && tlv_worker.is_none());
                 if !attributable {
                     error!(
-                        "share attribution FAILED: channel {} (identity {:?}) negotiated the \
-                         worker-identity extension but submitted a share with no TLV — share \
-                         accepted for the miner but NOT credited, as the payout target is unknown",
-                        channel_id,
-                        extended_channel.get_user_identity()
+                        "share attribution FAILED: channel {} (identity {:?}) submitted a share \
+                         with no usable worker TLV — share accepted for the miner but NOT \
+                         credited, as the payout target is unknown",
+                        channel_id, channel_identity
                     );
                 }
 
@@ -1103,10 +1136,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 job_id: msg.job_id,
                                 downstream_id,
                                 is_block: false,
-                                user_identity: build_webhook_user_identity(
-                                    extended_channel.get_user_identity().to_string(),
-                                    tlv_worker,
-                                ),
+                                // `attributable` above guarantees `Some` on the share path;
+                                // the block path is deliberately ungated, so fall back to the
+                                // raw channel identity rather than dropping the record.
+                                user_identity: webhook_identity
+                                    .clone()
+                                    .unwrap_or_else(|| channel_identity.clone()),
                                 header: Some(hex::encode(&header80)),
                                 extranonce,
                                 skeleton_id,
@@ -1191,10 +1226,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 job_id: msg.job_id,
                                 downstream_id,
                                 is_block: true,
-                                user_identity: build_webhook_user_identity(
-                                    extended_channel.get_user_identity().to_string(),
-                                    tlv_worker,
-                                ),
+                                // `attributable` above guarantees `Some` on the share path;
+                                // the block path is deliberately ungated, so fall back to the
+                                // raw channel identity rather than dropping the record.
+                                user_identity: webhook_identity
+                                    .clone()
+                                    .unwrap_or_else(|| channel_identity.clone()),
                                 header: Some(hex::encode(&header80)),
                                 extranonce,
                                 skeleton_id,
@@ -1795,5 +1832,81 @@ mod extranonce_allocation_tests {
             open(&mut drained, VALID_IDENTITY).err(),
             Some(EXTRANONCE_SPACE_EXHAUSTED)
         );
+    }
+
+    // ---- build_webhook_user_identity -------------------------------------------------
+    //
+    // Two channel-identity shapes reach this function and they are told apart by the
+    // CHANNEL identity, never by inspecting the TLV. A worker name may legitimately contain
+    // a dot (#481), so "the TLV looks dotted" proves nothing about whether it holds an
+    // address.
+
+    #[test]
+    fn webhook_identity_splices_worker_onto_channel_address() {
+        // Channel opened on mining.authorize: the channel identity owns the address, the TLV
+        // owns the worker. This is what every currently-connected miner does.
+        assert_eq!(
+            build_webhook_user_identity("bc1qAAA.rig1".to_string(), Some("bitaxe1")),
+            Some("bc1qAAA.bitaxe1".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_identity_falls_back_to_channel_when_no_tlv() {
+        // A direct SV2 miner never negotiates the extension; its channel identity IS the
+        // payout target and must pass through untouched.
+        assert_eq!(
+            build_webhook_user_identity("bc1qAAA.rig1".to_string(), None),
+            Some("bc1qAAA.rig1".to_string())
+        );
+        assert_eq!(
+            build_webhook_user_identity("bc1qAAA.rig1".to_string(), Some("")),
+            Some("bc1qAAA.rig1".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_identity_keeps_a_dotted_worker_on_a_real_channel() {
+        // `addr.farm1.rig1` yields worker `farm1.rig1`. The dot must NOT be read as an
+        // address separator, or `farm1` silently becomes the payout target.
+        assert_eq!(
+            build_webhook_user_identity("bc1qAAA.farm1.rig1".to_string(), Some("farm1.rig1")),
+            Some("bc1qAAA.farm1.rig1".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_identity_uses_a_provisional_channels_tlv_verbatim() {
+        // Channel opened on mining.subscribe: the TLV is authoritative and already carries
+        // the full `<addr>.<worker>`.
+        assert_eq!(
+            build_webhook_user_identity(
+                PROVISIONAL_CHANNEL_IDENTITY.to_string(),
+                Some("bc1qAAA.rig1")
+            ),
+            Some("bc1qAAA.rig1".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_identity_fails_closed_on_a_provisional_channel_without_a_full_tlv() {
+        // Splicing would yield `sri/donate/provisional.rig1`, whose address portion is `sri`
+        // — a share credited to nobody while looking entirely normal. Refuse instead.
+        for tlv in [None, Some(""), Some("rig1")] {
+            assert_eq!(
+                build_webhook_user_identity(PROVISIONAL_CHANNEL_IDENTITY.to_string(), tlv),
+                None,
+                "provisional channel must not resolve a payout target from {tlv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provisional_identity_parses_as_a_payout_mode_the_pool_accepts() {
+        // The channel open is rejected outright if `PayoutMode::try_from` errors, so the
+        // sentinel has to be a shape the pool already parses. It must also NOT be reachable
+        // by a miner authorising as plain `sri/donate`.
+        assert!(PayoutMode::try_from(PROVISIONAL_CHANNEL_IDENTITY).is_ok());
+        assert_ne!(PROVISIONAL_CHANNEL_IDENTITY, "sri/donate");
     }
 }

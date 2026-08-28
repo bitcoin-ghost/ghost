@@ -61,6 +61,28 @@ pub struct TranslatorConfig {
     /// Whether to aggregate all downstream connections into a single upstream channel.
     /// If true, all miners share one channel. If false, each miner gets its own channel.
     pub aggregate_channels: bool,
+    /// Open the upstream channel on `mining.subscribe` instead of `mining.authorize`.
+    ///
+    /// A serialising SV1 client — proxies and rented-hashrate marketplaces — waits for the
+    /// subscribe RESPONSE before it will authorise. Deferring the channel open to authorize
+    /// deadlocks them, and the fallback answers subscribe with an 8-byte all-zero placeholder
+    /// while the real prefix is 12 bytes. The coinbase reserves exactly 20 bytes
+    /// (`extranonce1` + `extranonce2`), so a client that builds on the placeholder is 4 bytes
+    /// short: malformed coinbase, wrong merkle root, every share invalid. `set_extranonce`
+    /// cannot rescue it — that is an OPTIONAL extension and these clients never send
+    /// `mining.extranonce.subscribe`.
+    ///
+    /// With this on, the channel opens at subscribe under
+    /// `PROVISIONAL_CHANNEL_IDENTITY`, the subscribe response carries the real extranonce
+    /// first time, and the payout address travels per share in the worker TLV instead of in
+    /// the channel identity.
+    ///
+    /// ⛔ ROLLOUT GATE, default OFF. `pool_sv2` must already understand a provisional channel
+    /// identity on EVERY node before this is switched on anywhere. Rolled the other way round
+    /// the pool splices a worker onto the sentinel and credits `sri` — nobody — which is how
+    /// #447 misattributed ~395 shares in July. Remove this flag once the fleet is on it.
+    #[serde(default)]
+    pub open_channel_on_subscribe: bool,
     /// Protocol extensions that the translator supports (will request if supported by server).
     #[serde(default)]
     pub supported_extensions: Vec<u16>,
@@ -149,6 +171,10 @@ impl TranslatorConfig {
             user_identity,
             downstream_difficulty_config,
             aggregate_channels,
+            // Rollout gate, off unless a config file turns it on. Not a constructor
+            // parameter: every caller wants the shipped default, and the operator flips it
+            // in TOML once `pool_sv2` understands provisional channels fleet-wide.
+            open_channel_on_subscribe: false,
             supported_extensions,
             required_extensions,
             log_file: None,

@@ -27,6 +27,25 @@ use alloc::{
 /// constant as evidence that the TLV carries a payout address — on `main` it does not.
 pub const MAX_USER_IDENTITY_LENGTH: usize = 255;
 
+/// Channel-level `user_identity` a translator sends when it opens a channel on
+/// `mining.subscribe`, before the miner has authorised and its payout address is knowable.
+///
+/// A serialising SV1 client waits for the subscribe RESPONSE before it will authorise, and
+/// that response must carry the real, pool-allocated extranonce — so the channel has to open
+/// first, with no address to name. The address then travels per share in this extension's
+/// [`UserIdentity`] TLV, which for such a channel carries the full `<address>.<worker>`
+/// rather than the worker segment alone.
+///
+/// ⚠ Single owner, deliberately. The translator stamps it and the pool matches on it; a
+/// second copy that drifted would leave the pool splicing a worker onto a sentinel and
+/// crediting the address portion — `sri` — to nobody. Two copies of
+/// [`MAX_USER_IDENTITY_LENGTH`] drifting is what produced that exact failure once already.
+///
+/// The value must be a shape `PayoutMode::try_from` already parses (it resolves to full
+/// donation) or the channel open is rejected outright, and has three segments so it cannot
+/// collide with a miner that genuinely authorises as `sri/donate`.
+pub const PROVISIONAL_CHANNEL_IDENTITY: &str = "sri/donate/provisional";
+
 /// Extension type for Worker-Specific Hashrate Tracking
 pub const EXTENSION_TYPE: u16 = 0x0002;
 

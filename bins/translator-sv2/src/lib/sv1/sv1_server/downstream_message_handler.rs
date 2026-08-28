@@ -235,15 +235,36 @@ impl IsServer<'static> for Sv1Server {
         // address and worker name. Leaving the directive on would corrupt attribution.
         let (name, _) = super::split_username_difficulty(name);
         let is_authorized = self.is_authorized(client_id, name);
+        // Read before the lock: the closure below borrows `data`, and this decides what the
+        // TLV must carry.
+        let open_channel_on_subscribe = self.config.open_channel_on_subscribe;
         downstream.downstream_data.super_safe_lock(|data| {
             if !is_authorized {
                 data.authorized_worker_name = name.to_string();
             }
-            // Extract the worker-name portion of `<addr>.<worker>` so the TLV carries the
-            // per-device identifier (which fits in 32 bytes) rather than the wallet address
-            // (which doesn't and would duplicate the channel-level user_identity anyway).
-            data.user_identity =
-                tlv_compatible_username(super::extract_worker_name(name)).to_string();
+            // What the per-share TLV carries depends on what the CHANNEL identity carries,
+            // because the pool recombines the two and exactly one of them must hold the
+            // payout address:
+            //
+            //   - channel opened on authorize → the channel already holds `<addr>.<worker>`,
+            //     so the TLV carries the worker segment alone and the pool splices them.
+            //   - channel opened on subscribe → the channel holds only the provisional
+            //     sentinel, so the TLV must carry the FULL `<addr>.<worker>`; it is the sole
+            //     source of a payout target and the pool uses it verbatim.
+            //
+            // Sending the worker alone in the second case is not a lesser form of correct —
+            // the pool cannot resolve an address from it and refuses to credit the share.
+            let tlv_identity = if open_channel_on_subscribe {
+                name
+            } else {
+                super::extract_worker_name(name)
+            };
+            // `None` here means the identity is over the wire ceiling. Leave the field empty
+            // rather than truncating: the share submit path omits the TLV, and the pool
+            // declines to credit rather than paying an address nobody holds.
+            data.user_identity = tlv_compatible_username(tlv_identity)
+                .unwrap_or_default()
+                .to_string();
             debug!(
                 "Down: Set user_identity to '{}' for downstream {}",
                 data.user_identity, downstream_id
