@@ -450,6 +450,18 @@ impl Configure {
         }
         res
     }
+
+    /// Whether the client opted in to the `subscribe-extranonce` extension.
+    ///
+    /// `mining.set_extranonce` is an OPT-IN notification: a client only accepts it if it
+    /// asked for it here. `extensions` is private and the only readers were the
+    /// version-rolling pair, so the translator had no way to consult this and sent the
+    /// notification unconditionally.
+    pub fn subscribes_extranonce(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|ext| matches!(ext, ConfigureExtension::SubcribeExtraNonce))
+    }
 }
 
 impl From<Configure> for Message {

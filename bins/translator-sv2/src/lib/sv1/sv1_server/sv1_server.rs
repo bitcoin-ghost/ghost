@@ -1322,7 +1322,15 @@ impl Sv1Server {
                             // initial DownstreamData::new value (8 bytes of zero) as the
                             // placeholder. Any other prior value means we shouldn't send a
                             // post-hoc set_extranonce (would be confusing for the miner).
-                            let was_placeholder = d.extranonce1.as_ref().len() == 8
+                            // The placeholder test alone cannot distinguish "subscribe was
+                            // answered with a placeholder" from "subscribe has not been
+                            // answered yet" — both leave the DownstreamData::new default of
+                            // 8 zero bytes. In the defer-open path the subscribe response is
+                            // still pending and will carry the REAL extranonce, so the
+                            // notification is not merely unnegotiated, it is redundant.
+                            // Require the client to have opted in via `mining.configure`.
+                            let was_placeholder = d.extranonce_subscribe_negotiated
+                                && d.extranonce1.as_ref().len() == 8
                                 && d.extranonce1.as_ref().iter().all(|b| *b == 0);
                             d.extranonce1 = real_extranonce1.clone();
                             d.extranonce2_len = real_extranonce2_size;
