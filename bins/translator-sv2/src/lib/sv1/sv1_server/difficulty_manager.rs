@@ -277,6 +277,91 @@ impl Sv1Server {
         }
     }
 
+    /// Push a miner-declared difficulty to the wire NOW, instead of waiting for vardiff.
+    ///
+    /// `record_suggested_difficulty` stages the target when the channel is already open, but
+    /// staging alone strands it: this loop ticks every 60s, and `try_vardiff` returns `None`
+    /// for a downstream that has not submitted a share yet — so the staged value can wait far
+    /// longer than one tick, or never arrive at all.
+    ///
+    /// That is invisible on a fast link, because `mining.authorize` (carrying `d=`) wins the
+    /// race against channel open and the open path sizes the channel directly. At 320ms RTT on
+    /// vm4 the 300ms subscribe debounce opens the channel FIRST, so the miner was told the
+    /// 2,048 floor and never the 1,000,000 it asked for. Rented-hashrate marketplaces declare
+    /// their size exactly this way, so it hits the clients the feature exists for.
+    ///
+    /// Uses the SAME upstream-target rule as `handle_vardiff_updates` — send `set_difficulty`
+    /// only when `new_target >= upstream_target`, otherwise queue it for the `SetTarget`
+    /// response — because sending a target the pool has not yet acknowledged makes the miner
+    /// submit against a target upstream will reject.
+    pub(super) async fn push_declared_target(&self, downstream_id: DownstreamId) {
+        let Some(downstream) = self.downstreams.get(&downstream_id) else {
+            return;
+        };
+        let (channel_id, target, hashrate, upstream_target) =
+            downstream.downstream_data.super_safe_lock(|d| {
+                (
+                    d.channel_id,
+                    d.pending_target.unwrap_or(d.target),
+                    d.pending_hashrate.or(d.hashrate),
+                    d.upstream_target,
+                )
+            });
+        let (Some(channel_id), Some(hashrate)) = (channel_id, hashrate) else {
+            // No channel: the open path will size itself from the staged hashrate instead,
+            // which is the fast-link case and needs nothing here.
+            return;
+        };
+
+        // Keep upstream's view in step first, exactly as the vardiff path does.
+        self.send_update_channel_messages(vec![(downstream_id, channel_id, target, hashrate)])
+            .await;
+
+        let send_now = match upstream_target {
+            Some(upstream) => target >= upstream,
+            None => true,
+        };
+        if !send_now {
+            trace!(
+                "declared difficulty for downstream {} is below the upstream target — queued for SetTarget",
+                downstream_id
+            );
+            self.pending_target_updates.super_safe_lock(|updates| {
+                updates.push(PendingTargetUpdate {
+                    downstream_id,
+                    new_target: target,
+                    new_hashrate: hashrate,
+                })
+            });
+            return;
+        }
+
+        let Ok(set_difficulty_msg) = build_sv1_set_difficulty_from_sv2_target(target) else {
+            error!(
+                "failed to build set_difficulty for declared target on downstream {}",
+                downstream_id
+            );
+            return;
+        };
+        let sender = self
+            .sv1_server_channel_state
+            .sv1_server_to_downstream_sender
+            .super_safe_lock(|map| map.get(&downstream_id).cloned());
+        if let Some(sender) = sender {
+            if let Err(e) = sender.send(set_difficulty_msg).await {
+                error!(
+                    "failed to send declared set_difficulty to downstream {}: {:?}",
+                    downstream_id, e
+                );
+            } else {
+                info!(
+                    "pushed miner-declared difficulty to downstream {} immediately (no vardiff wait)",
+                    downstream_id
+                );
+            }
+        }
+    }
+
     /// Sends UpdateChannel messages for all target updates.
     ///
     /// Always sends UpdateChannel to keep upstream informed about target changes.
