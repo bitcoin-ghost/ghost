@@ -540,19 +540,24 @@ def test_unnegotiated_set_extranonce():
 
 
 def test_negotiated_set_extranonce():
-    """Positive control for `[unneg-extranonce]`: a client that DOES ask for
-    `subscribe-extranonce` must STILL receive `mining.set_extranonce`.
+    """Guards the invariant that makes suppressing the re-key SAFE: an opt-in client's
+    subscribe response must carry a REAL extranonce, never the 8-zero placeholder.
 
-    Identical to the `[unneg-extranonce]` shape in every respect but one — this client
-    lists `subscribe-extranonce` in `mining.configure`. The opt-in is the only variable,
-    so the pair reads as a truth table:
+    ⚠ This case previously asserted the opposite — that an opt-in client MUST receive
+    `mining.set_extranonce`. That was written while the opt-in was believed to be the
+    discriminator, and it is wrong: it drove the same handshake as `[braiins-shape]` and
+    demanded the opposite outcome, so the two could never both pass. The real
+    discriminator is whether the subscribe response has already gone out.
 
-        opt-in absent  -> notification must NOT arrive   ([unneg-extranonce])
-        opt-in present -> notification MUST arrive       (this case)
+    What can actually go wrong now is the reverse of a stray notification: the response
+    carries a PLACEHOLDER and the correction is suppressed, leaving the miner mining on an
+    extranonce the pool does not expect — every share invalid, silently. So assert the
+    response is real. If that ever regresses, suppression stops being safe and this fails.
 
-    ⚠ This must pass BOTH before and after the fix. A suppression that silenced the
-    notification for everyone would leave `[unneg-extranonce]` green and break every
-    client that legitimately re-keys; this is the only case that would catch it.
+    ⚠ The legacy 1.5s placeholder path (`open_channel_on_subscribe = false`) is NOT
+    reachable from the wire on a node with the flag on, which is the fleet default. Its
+    behaviour — subscribe removed from the queue, answered with a placeholder, corrected by
+    a re-key — is covered by the Rust-side guard, not here.
     """
     s = socket.create_connection((HOST, PORT), timeout=10)
     send(s, {"id": 1, "method": "mining.configure",
@@ -565,16 +570,68 @@ def test_negotiated_set_extranonce():
         and cfg_res[0]["result"].get("subscribe-extranonce") is True
 
     send(s, {"id": 2, "method": "mining.subscribe", "params": []})
-    msgs = recv_until(s, 4.0, lambda m: False)
+    msgs = recv_until(s, 5.0, lambda m: m.get("id") == 2 and "result" in m)
     s.close()
 
-    got = any(m.get("method") == "mining.set_extranonce" for m in msgs)
-    # The notification is what this case guards. Servers may legitimately decline to ack
-    # the extension by name, so a missing ack is reported but does not fail the gate.
-    ok = got
-    print(f"  [neg-extranonce]  {'PASS' if ok else 'FAIL'} — opted in via mining.configure; "
-          f"set_extranonce received: {'yes' if got else 'NO — opt-in clients would never re-key'}"
+    sub = [m for m in msgs if m.get("id") == 2 and "result" in m]
+    en1 = sub[0]["result"][1] if sub and isinstance(sub[0].get("result"), list) else None
+    real = isinstance(en1, str) and en1 != PLACEHOLDER and set(en1) != {"0"}
+    rekey = any(m.get("method") == "mining.set_extranonce" for m in msgs)
+    ok = real
+    print(f"  [neg-extranonce]  {'PASS' if ok else 'FAIL'} — opted in; subscribe extranonce1="
+          f"{en1}{'' if real else ' — PLACEHOLDER, suppressing the re-key would break every share'}"
+          f"; re-key: {'yes' if rekey else 'no (response already real)'}"
           f"; extension acked: {'yes' if acked else 'no'}")
+    return ok
+
+
+def test_braiins_shape():
+    """Braiins farm-proxy's ACTUAL handshake, byte-for-byte from tcpdump on vm7.
+
+        {"id":1,"method":"mining.configure",
+         "params":[["version-rolling","subscribe-extranonce"],
+                   {"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":16}]}
+        {"id":2,"method":"mining.subscribe","params":[]}
+        (no mining.authorize at all)
+
+    ⚠ Braiins DOES request `subscribe-extranonce`, so `[unneg-extranonce]` cannot catch
+    this — that case drives a client which never asks, and the fix for it correctly skips
+    a client which does. This case is the one that matters for the farm-port churn.
+
+    With `open_channel_on_subscribe` the subscribe sits QUEUED while the channel opens
+    (300ms debounce), and the re-key used to fire before the queue drained — announcing a
+    new extranonce for a subscription the client did not have yet, to the value its own
+    subscribe response delivers ~19ms later. Braiins answers that with
+    `protocol error: invalid-message-type` and closes: 12,929 connects/24h on one node.
+
+    So: no `mining.set_extranonce` before the subscribe response, and the subscribe
+    response must carry a REAL extranonce (never the 8-zero placeholder).
+    """
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.configure",
+             "params": [["version-rolling", "subscribe-extranonce"],
+                        {"version-rolling.mask": "1fffe000",
+                         "version-rolling.min-bit-count": 16}]})
+    recv_until(s, 4.0, lambda m: m.get("id") == 1 and "result" in m)
+    send(s, {"id": 2, "method": "mining.subscribe", "params": []})
+    # Well past the 300ms channel-open debounce, so absence here is real.
+    msgs = recv_until(s, 5.0, lambda m: False)
+    s.close()
+
+    order = [m.get("method") or f"id{m.get('id')}" for m in msgs]
+    rekey = "mining.set_extranonce" in order
+    sub = [m for m in msgs if m.get("id") == 2 and "result" in m]
+    en1 = sub[0]["result"][1] if sub and isinstance(sub[0].get("result"), list) else None
+    real = isinstance(en1, str) and en1 != PLACEHOLDER and set(en1) != {"0"}
+    # A re-key arriving BEFORE the subscribe response is the exact defect.
+    early = rekey and (
+        "mining.set_extranonce" in order[: order.index("id2")] if "id2" in order else rekey
+    )
+    ok = (not rekey) and real
+    print(f"  [braiins-shape]   {'PASS' if ok else 'FAIL'} — configure(+subscribe-extranonce), "
+          f"subscribe, no authorize; set_extranonce: "
+          f"{'YES' + (' BEFORE the subscribe reply — Braiins closes on this' if early else '') if rekey else 'no'}"
+          f"; subscribe extranonce1={en1}")
     return ok
 
 
@@ -591,6 +648,7 @@ def main():
         "pipeliner": test_pipeliner(),
         "unneg-extranonce": test_unnegotiated_set_extranonce(),
         "neg-extranonce": test_negotiated_set_extranonce(),
+        "braiins-shape": test_braiins_shape(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
     }
