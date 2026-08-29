@@ -36,7 +36,7 @@ use stratum_apps::{
             target::{hash_rate_from_target, hash_rate_to_target},
             Vardiff, VardiffState,
         },
-        extensions_sv2::UserIdentity,
+        extensions_sv2::{UserIdentity, PROVISIONAL_CHANNEL_IDENTITY},
         mining_sv2::{CloseChannel, SetNewPrevHash, SetTarget},
         parsers_sv2::{Mining, Tlv, TlvField},
         stratum_translation::{
@@ -65,6 +65,20 @@ use tracing::{debug, error, info, trace, warn};
 ///
 /// The server maintains state for multiple downstream connections and implements
 /// variable difficulty adjustment based on share submission rates.
+/// How long a `mining.subscribe` waits for `mining.authorize` before the channel is opened
+/// under a provisional identity.
+///
+/// Sized from measured client behaviour, not guessed: a pipelining miner's authorize follows
+/// its subscribe by ~12ms, and a rented-hashrate capability probe disconnects ~10-30ms in.
+/// Both finish well inside this window, so neither changes behaviour and neither costs an
+/// extranonce prefix — which matters because the pool's extended prefix space is a 16-bit
+/// per-process counter that is never reclaimed (#746).
+///
+/// Only a client still holding the connection open after this — the serialising shape — opens
+/// early. It then waits the channel-open round trip (~50-300ms) instead of the old 1500ms
+/// placeholder timeout, and gets the real extranonce rather than one it cannot mine with.
+const SUBSCRIBE_OPEN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 #[derive(Clone)]
 pub struct Sv1Server {
     pub(crate) sv1_server_channel_state: Sv1ServerChannelState,
@@ -867,20 +881,92 @@ impl Sv1Server {
                         .push(downstream_message.clone())
                 });
 
-                // mining.subscribe timeout fallback (serializer safety).
+                // A queued `mining.subscribe` has to be answered eventually, and the answer
+                // must carry the REAL channel extranonce. Two ways to get there:
                 //
-                // PIPELINING miners (AxeOS/bitaxe) fire subscribe + authorize back-to-back, so
-                // the channel opens within ~100ms and the queued subscribe is answered with the
-                // REAL extranonce by the channel-open path (no set_extranonce needed). But
-                // SERIALIZING miners (cgminer / Avalon) wait for the subscribe RESPONSE before
-                // sending authorize — and the channel only opens on authorize. Queuing subscribe
-                // with no fallback deadlocks them: no response → no authorize → no channel → no
-                // response. After ~1.5s with no channel, answer subscribe with the placeholder
-                // extranonce so the serializer proceeds; the channel then opens and the existing
-                // set_extranonce path corrects the extranonce (serializing miners support that
-                // extension). The channel-open path and this timer both claim the queued subscribe
-                // atomically under the data lock, so exactly one of them answers it.
+                // `open_channel_on_subscribe` ON — open the channel NOW, under a provisional
+                // identity. The subscribe response is built when the open succeeds and the
+                // queue is drained, so it carries the real 12-byte prefix first time, for
+                // pipelining and serialising miners alike. This is the path that fixes rented
+                // hashrate; see the flag's docs for why the old placeholder could not.
+                //
+                // OFF (shipped default) — keep the legacy 1.5s fallback. PIPELINING miners
+                // (AxeOS/bitaxe) fire subscribe + authorize back-to-back, so the channel opens
+                // within ~100ms and the drain answers subscribe correctly. SERIALIZING miners
+                // deadlock — no response, no authorize, no channel, no response — so after
+                // ~1.5s answer with the placeholder extranonce and let `set_extranonce` try to
+                // correct it. ⚠ That correction is an OPTIONAL extension: a client that never
+                // sends `mining.extranonce.subscribe` builds its coinbase 4 bytes short and
+                // every share it submits is invalid. The flag exists to retire this branch.
                 if is_mining_subscribe(&downstream_message) {
+                    if self.config.open_channel_on_subscribe {
+                        // DEBOUNCE, and it is load-bearing twice over.
+                        //
+                        // 1. Prefix exhaustion. The pool's extended allocator is
+                        //    `server_id || counter` with a two-byte server id, leaving a
+                        //    16-BIT counter — 65,535 prefixes for the lifetime of the
+                        //    process, never handed back (#746). vm1 burns ~250/h, so a node
+                        //    that stays up ~10 days stops being able to open channels at all.
+                        //    Opening on every subscribe would add the subscribe-only probes
+                        //    (~15% more) to that burn for no benefit: they disconnect without
+                        //    ever mining.
+                        // 2. #746 deliberately moved allocation AFTER validation so an
+                        //    UNAUTHENTICATED client cannot burn the space. A subscribe
+                        //    arrives before any authorize, so opening on it immediately hands
+                        //    that capability straight back — a drive-by prober could exhaust
+                        //    the pool for every honest miner.
+                        //
+                        // A pipelining miner's authorize lands ~12ms after subscribe and a
+                        // marketplace capability probe disconnects ~10-30ms in; neither
+                        // reaches this timer, so neither costs a prefix and the pipelining
+                        // path is byte-identical to today. Only a client that genuinely holds
+                        // the connection open waiting for its subscribe reply — the
+                        // serialising shape this exists to serve — opens early, and it still
+                        // gets the REAL extranonce, never a placeholder.
+                        let server = self.clone();
+                        let did = downstream_id;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(SUBSCRIBE_OPEN_DEBOUNCE).await;
+                            let Some(downstream) =
+                                server.downstreams.get(&did).map(|r| r.value().clone())
+                            else {
+                                // Already gone: a probe that subscribed and hung up. Costs
+                                // nothing, which is the point.
+                                return;
+                            };
+                            // Claim the open iff authorize has not already taken it.
+                            let already_requested =
+                                downstream.downstream_data.super_safe_lock(|data| {
+                                    let seen =
+                                        data.channel_open_requested || data.channel_id.is_some();
+                                    if !seen {
+                                        data.channel_open_requested = true;
+                                        // Claimed by THIS path, so the channel identity will be
+                                        // the sentinel and the TLV must carry the address.
+                                        data.channel_opened_provisionally = true;
+                                    }
+                                    seen
+                                });
+                            if already_requested {
+                                return;
+                            }
+                            debug!(
+                                "Down: downstream {} is still waiting on its subscribe reply — \
+                                 opening the channel under a provisional identity so the reply \
+                                 can carry the real extranonce",
+                                did
+                            );
+                            if let Err(e) = server.handle_open_channel_request(did).await {
+                                error!(
+                                    "Down: failed to open upstream channel on subscribe for \
+                                     downstream {}: {:?}",
+                                    did, e
+                                );
+                            }
+                        });
+                        return Ok(());
+                    }
+
                     let server = self.clone();
                     let did = downstream_id;
                     tokio::spawn(async move {
@@ -972,11 +1058,22 @@ impl Sv1Server {
                     // `authorized_worker_name` — when `handle_authorize` returns true, so an
                     // empty name here means the miner failed validation and we'd otherwise burn
                     // an upstream channel for a connection that's about to be torn down.
-                    let (channel_open, name_set) =
+                    //
+                    // `channel_open` alone is not a sufficient guard once the channel can open
+                    // on subscribe: a pipelining miner's authorize lands while that open is
+                    // still in flight, so `channel_id` is still None and this would burn a
+                    // second upstream channel. `channel_open_requested` is set the moment the
+                    // request goes out, and claiming it here is what makes the two paths
+                    // mutually exclusive.
+                    let (already_requested, name_set) =
                         downstream.downstream_data.super_safe_lock(|d| {
-                            (d.channel_id.is_some(), !d.authorized_worker_name.is_empty())
+                            let seen = d.channel_open_requested || d.channel_id.is_some();
+                            if !seen {
+                                d.channel_open_requested = true;
+                            }
+                            (seen, !d.authorized_worker_name.is_empty())
                         });
-                    if !channel_open && name_set {
+                    if !already_requested && name_set {
                         debug!(
                             "Down: Authorize handled, opening upstream channel for downstream {} now that user_identity is known",
                             downstream_id
@@ -1580,7 +1677,16 @@ impl Sv1Server {
         //     and fall to FullDonation, leaving such miners without a payout target.
         //   - empty authorize (shouldn't happen but defensive) → classic config-prefix.miner{N}
         //   - SRI test patterns (`sri/…`) → keep unchanged for solo/donate parsing.
-        let user_identity = if authorize_name.contains('.') {
+        //   - opening on subscribe, before authorize has said anything → the provisional
+        //     sentinel. There is no address to put here yet, and the one thing we must NOT do
+        //     is fall through to the config-prefix branches below: that names the OPERATOR's
+        //     wallet, which the pool would then credit for every share this miner submits.
+        //     That is precisely how #447 misdirected ~395 shares. The address instead travels
+        //     per share in the worker TLV, which `handle_submit_share` fills with the full
+        //     `<addr>.<worker>` whenever the channel is provisional.
+        let user_identity = if self.config.open_channel_on_subscribe && authorize_name.is_empty() {
+            PROVISIONAL_CHANNEL_IDENTITY.to_string()
+        } else if authorize_name.contains('.') {
             authorize_name
         } else if !authorize_name.is_empty() {
             if self.config.user_identity.starts_with("sri/") {

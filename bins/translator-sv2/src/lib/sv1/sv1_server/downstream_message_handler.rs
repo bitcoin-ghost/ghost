@@ -239,11 +239,33 @@ impl IsServer<'static> for Sv1Server {
             if !is_authorized {
                 data.authorized_worker_name = name.to_string();
             }
-            // Extract the worker-name portion of `<addr>.<worker>` so the TLV carries the
-            // per-device identifier (which fits in 32 bytes) rather than the wallet address
-            // (which doesn't and would duplicate the channel-level user_identity anyway).
-            data.user_identity =
-                tlv_compatible_username(super::extract_worker_name(name)).to_string();
+            // What the per-share TLV carries depends on what the CHANNEL identity carries,
+            // because the pool recombines the two and exactly one of them must hold the
+            // payout address:
+            //
+            //   - channel opened on authorize → the channel already holds `<addr>.<worker>`,
+            //     so the TLV carries the worker segment alone and the pool splices them.
+            //   - channel opened on subscribe → the channel holds only the provisional
+            //     sentinel, so the TLV must carry the FULL `<addr>.<worker>`; it is the sole
+            //     source of a payout target and the pool uses it verbatim.
+            //
+            // Sending the worker alone in the second case is not a lesser form of correct —
+            // the pool cannot resolve an address from it and refuses to credit the share.
+            // Key this on how THIS channel actually opened, never on the config flag. With
+            // the subscribe-open debounced, a pipelining miner opens on authorize and its
+            // channel identity already holds the address; sending the full identity as well
+            // makes the pool splice one onto the other and credit `<addr>.<addr>.<worker>`.
+            let tlv_identity = if data.channel_opened_provisionally {
+                name
+            } else {
+                super::extract_worker_name(name)
+            };
+            // `None` here means the identity is over the wire ceiling. Leave the field empty
+            // rather than truncating: the share submit path omits the TLV, and the pool
+            // declines to credit rather than paying an address nobody holds.
+            data.user_identity = tlv_compatible_username(tlv_identity)
+                .unwrap_or_default()
+                .to_string();
             debug!(
                 "Down: Set user_identity to '{}' for downstream {}",
                 data.user_identity, downstream_id
