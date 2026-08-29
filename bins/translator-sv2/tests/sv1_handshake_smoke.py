@@ -539,6 +539,45 @@ def test_unnegotiated_set_extranonce():
     return ok
 
 
+def test_negotiated_set_extranonce():
+    """Positive control for `[unneg-extranonce]`: a client that DOES ask for
+    `subscribe-extranonce` must STILL receive `mining.set_extranonce`.
+
+    Identical to the `[unneg-extranonce]` shape in every respect but one — this client
+    lists `subscribe-extranonce` in `mining.configure`. The opt-in is the only variable,
+    so the pair reads as a truth table:
+
+        opt-in absent  -> notification must NOT arrive   ([unneg-extranonce])
+        opt-in present -> notification MUST arrive       (this case)
+
+    ⚠ This must pass BOTH before and after the fix. A suppression that silenced the
+    notification for everyone would leave `[unneg-extranonce]` green and break every
+    client that legitimately re-keys; this is the only case that would catch it.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.configure",
+             "params": [["version-rolling", "subscribe-extranonce"],
+                        {"version-rolling.mask": "1fffe000",
+                         "version-rolling.min-bit-count": 2}]})
+    cfg = recv_until(s, 5.0, lambda m: m.get("id") == 1 and "result" in m)
+    cfg_res = [m for m in cfg if m.get("id") == 1 and "result" in m]
+    acked = bool(cfg_res) and isinstance(cfg_res[0].get("result"), dict) \
+        and cfg_res[0]["result"].get("subscribe-extranonce") is True
+
+    send(s, {"id": 2, "method": "mining.subscribe", "params": []})
+    msgs = recv_until(s, 4.0, lambda m: False)
+    s.close()
+
+    got = any(m.get("method") == "mining.set_extranonce" for m in msgs)
+    # The notification is what this case guards. Servers may legitimately decline to ack
+    # the extension by name, so a missing ack is reported but does not fail the gate.
+    ok = got
+    print(f"  [neg-extranonce]  {'PASS' if ok else 'FAIL'} — opted in via mining.configure; "
+          f"set_extranonce received: {'yes' if got else 'NO — opt-in clients would never re-key'}"
+          f"; extension acked: {'yes' if acked else 'no'}")
+    return ok
+
+
 def main():
     print(f"SV1 handshake smoke test vs {HOST}:{PORT}")
     results = {
@@ -551,6 +590,7 @@ def main():
         "attribution": test_worker_attribution(),
         "pipeliner": test_pipeliner(),
         "unneg-extranonce": test_unnegotiated_set_extranonce(),
+        "neg-extranonce": test_negotiated_set_extranonce(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
     }
