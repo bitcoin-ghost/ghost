@@ -1317,19 +1317,36 @@ impl Sv1Server {
                     let already_subscribed = downstream
                         .downstream_data
                         .safe_lock(|d| {
-                            // Detect whether subscribe was already responded to with a placeholder
-                            // extranonce — i.e. the public-pool defer-open path. We treat the
-                            // initial DownstreamData::new value (8 bytes of zero) as the
-                            // placeholder. Any other prior value means we shouldn't send a
-                            // post-hoc set_extranonce (would be confusing for the miner).
-                            // The placeholder test alone cannot distinguish "subscribe was
-                            // answered with a placeholder" from "subscribe has not been
-                            // answered yet" — both leave the DownstreamData::new default of
-                            // 8 zero bytes. In the defer-open path the subscribe response is
-                            // still pending and will carry the REAL extranonce, so the
-                            // notification is not merely unnegotiated, it is redundant.
-                            // Require the client to have opted in via `mining.configure`.
-                            let was_placeholder = d.extranonce_subscribe_negotiated
+                            // Send the post-hoc `mining.set_extranonce` ONLY when the
+                            // subscribe response has already gone out carrying a placeholder,
+                            // so the miner is genuinely holding a wrong extranonce that must
+                            // be corrected.
+                            //
+                            // The 8-zero test alone cannot establish that. It is the
+                            // `DownstreamData::new` default, so it is equally true of
+                            // "answered with a placeholder" and "not answered yet" — and in
+                            // the `open_channel_on_subscribe` path it is the SECOND of those.
+                            // There the subscribe is still sitting in the queue and is drained
+                            // moments later carrying the REAL extranonce, so the notification
+                            // announces a re-key for a subscription the client does not have
+                            // yet, to a value it is about to receive anyway.
+                            //
+                            // Measured on vm7 (2026-08-29) against Braiins' own farm proxy:
+                            //     16.021595 Out mining.set_extranonce ["010009eb…",8]
+                            //     16.040722 Out {"id":2,…,"010009eb…",8]}   <- same value, 19ms later
+                            // The client answers that with `protocol error: invalid-message-type`
+                            // and closes, which is the farm-port churn (12,929 connects/24h).
+                            //
+                            // The queue is the discriminator: the legacy 1.5s fallback REMOVES
+                            // the subscribe from `queued_sv1_handshake_messages` before
+                            // answering it with a placeholder, so there the correction is real
+                            // and still fires. Here it is still queued, so it is redundant.
+                            let subscribe_still_queued = d
+                                .queued_sv1_handshake_messages
+                                .iter()
+                                .any(is_mining_subscribe);
+                            let was_placeholder = !subscribe_still_queued
+                                && d.extranonce_subscribe_negotiated
                                 && d.extranonce1.as_ref().len() == 8
                                 && d.extranonce1.as_ref().iter().all(|b| *b == 0);
                             d.extranonce1 = real_extranonce1.clone();
