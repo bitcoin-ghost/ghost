@@ -561,6 +561,64 @@ impl CoinbaseVerifier {
     }
 }
 
+/// Pull the coinbase scriptSig and outputs out of a block, from this node's own Core.
+///
+/// Both come from the same coinbase: the scriptSig carries the tag naming the payout, the
+/// outputs are what the chain actually paid — which is what settlement credits (#601), since
+/// the mined amounts carry the winner's fee-drift adjustment and the stored proposal does not.
+///
+/// ⛔ **Rehomed here from `settlement.rs` by the Stage 6 deletion, deliberately and before that
+/// file was removed.** It used to be shared by both ledgers' settlements; the legacy
+/// tip-observing one is gone and the shard's maturity settlement (`shard.rs`) is now the only
+/// caller. It stays a free function next to [`CoinbaseOutput`] rather than moving into `shard.rs`
+/// because what it encodes is how to READ a coinbase, not how to settle one.
+///
+/// ⚠ It carries the internal-vs-display hash-order fix below. A fresh implementation would
+/// re-hit that trap — which is exactly why this was moved rather than rewritten.
+pub(crate) async fn fetch_coinbase_parts(
+    rpc: &ghost_common::rpc::BitcoinRpc,
+    block_hash: &str,
+) -> ghost_common::error::GhostResult<(Vec<u8>, Vec<CoinbaseOutput>)> {
+    // Normalise to display order first. `BlockEvent` hashes arrive in internal order despite
+    // the parser's doc claiming otherwise (observed on vm5, 2026-08-01: every settlement probe
+    // got "Block not found" for a block that existed). Settlement is the first consumer to
+    // take one of these to an RPC call, which is why it surfaced here.
+    let block_hash = &ghost_common::zmq::block_hash_to_display_order(block_hash);
+    // Verbosity 0: raw hex. Parsing the block ourselves avoids depending on the shape of the
+    // verbose JSON, which differs between Core versions.
+    let raw = rpc.get_block(block_hash, 0).await?;
+    let hex_str = raw.as_str().unwrap_or_default();
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        ghost_common::error::GhostError::Rpc(format!("block {block_hash} not hex: {e}"))
+    })?;
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).map_err(|e| {
+        ghost_common::error::GhostError::Rpc(format!("block {block_hash} undecodable: {e}"))
+    })?;
+    let coinbase = block.txdata.first().ok_or_else(|| {
+        ghost_common::error::GhostError::Rpc(format!("block {block_hash} has no transactions"))
+    })?;
+    let script_sig = coinbase
+        .input
+        .first()
+        .ok_or_else(|| {
+            ghost_common::error::GhostError::Rpc(format!(
+                "block {block_hash} coinbase has no input"
+            ))
+        })?
+        .script_sig
+        .as_bytes()
+        .to_vec();
+    let outputs = coinbase
+        .output
+        .iter()
+        .map(|o| crate::coinbase_verifier::CoinbaseOutput {
+            value: o.value.to_sat(),
+            script_pubkey: o.script_pubkey.as_bytes().to_vec(),
+        })
+        .collect();
+    Ok((script_sig, outputs))
+}
+
 #[cfg(test)]
 mod tests {
 

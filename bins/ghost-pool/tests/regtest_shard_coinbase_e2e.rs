@@ -14,26 +14,19 @@
 //!
 //! # What makes the no-vote claim real rather than assumed
 //!
-//! Two things, deliberately:
+//! The fixture is `PublicPool` with **no MPC elders seeded**. Before Stage 6 that combination
+//! could not arm a coinbase at all: `handle_proposal` resolved its voter set from
+//! `mpc_contributions`, so with none there was no quorum and no approval.
 //!
-//! 1. **The mode is `PublicPool`.** A `PrivatePool` or solo node approves its own proposal
-//!    without a vote regardless of any gate (#592, `f3736bc33`), so a test in those modes would
-//!    pass whether or not `PAYOUT_FROM_SHARD_HEIGHT` worked at all — it would be a check that
-//!    cannot fail.
-//! 2. **No MPC elders are seeded.** `handle_proposal` resolves its voter set from
-//!    `mpc_contributions`; with none, the BFT path cannot reach quorum and cannot arm a coinbase.
+//! ⚠ **That is no longer a live control, and the change is the point.** Release B removed the
+//! payout vote outright, so there is no longer a path this test could accidentally be taking
+//! instead — `handle_block_found` commits from the shard unconditionally. The companion
+//! `regtest_shard_coinbase_control.rs`, which asserted the fixture could NOT arm a coinbase
+//! below `PAYOUT_FROM_SHARD_HEIGHT`, was deleted with that gate: its premise was the existence
+//! of the branch this release deletes, and it failed honestly the moment the branch went.
 //!
-//! Together those mean a coinbase that exists at all is proof the gate bypassed the vote.
-//!
-//! ⛔ The negative control — that the SAME fixture cannot arm a coinbase BELOW the gate — lives in
-//! `regtest_shard_coinbase_control.rs`, in its own test binary, and it is not optional: without
-//! it this file would pass even if the gate did nothing.
-//!
-//! It cannot live here. `PAYOUT_FROM_SHARD_HEIGHT` resolves through a `OnceLock`, so the first
-//! test to touch it fixes it for the whole process. Running both in one binary meant the armed
-//! test won the race and the control then ran WITH the gate on — it failed for the right reason
-//! and told us nothing about the gate. Two tests that disagree about a process-global cannot
-//! share a process.
+//! The elder-free fixture is kept anyway, because it still proves something: no vote is
+//! reachable even in principle, so a coinbase here cannot have been ratified by anything.
 //!
 //! # Running it
 //!
@@ -51,8 +44,6 @@ use ghost_common::config::{BitcoinNetwork, MiningMode};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::types::TreasuryAddress;
-use ghost_consensus::vote_handler::VoteHandler;
-use ghost_consensus::voting::VotingManager;
 use ghost_pool::payout::{BlockFoundData, PayoutConfig, PayoutHandler};
 use ghost_pool::template::{TemplateConfig, TemplateProcessor};
 use ghost_storage::Database;
@@ -132,11 +123,6 @@ fn build_node(rpc: Arc<BitcoinRpc>) -> Node {
         Default::default(),
     ));
 
-    let vote_handler = Arc::new(
-        VoteHandler::new(Arc::clone(&identity), Arc::new(VotingManager::new(100)))
-            .with_database(Arc::clone(&db)),
-    );
-
     let handler = Arc::new(
         PayoutHandler::new(
             identity,
@@ -146,10 +132,8 @@ fn build_node(rpc: Arc<BitcoinRpc>) -> Node {
                 ..Default::default()
             },
             Arc::clone(&db),
-            vote_handler,
             Arc::clone(&template),
             Arc::new(QualifiedCapabilityProvider::new(Arc::clone(&db))),
-            MiningMode::PublicPool,
         )
         .expect("payout handler"),
     );

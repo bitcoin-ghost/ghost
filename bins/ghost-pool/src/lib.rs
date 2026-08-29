@@ -69,7 +69,6 @@ pub mod binding_recheck;
 pub mod proposal_sync;
 
 /// Settling the ledger from blocks observed on-chain.
-pub mod settlement;
 pub mod skeleton_store;
 
 /// Remembering share proofs whose verification failure can never be undone.
@@ -413,42 +412,13 @@ pub const TIER_BIND_ACTIVATION_KEY: &str = "tier_bind_activation_round";
 /// `rounds` table, the boundary survives rather than re-deriving later and later.
 pub const POW_VERIFY_ACTIVATION_KEY: &str = "pow_verify_activation_round";
 
-/// Settle a won block by observing it on-chain, on every node rather than only the submitter.
+/// Historical gate, kept only so old logs and `PAYOUT_MEDIAN_ADOPTION_HEIGHT`'s ordering remain
+/// interpretable. **The behaviour it gated is DELETED.**
 ///
-/// Today `settle_paid_block` has one reachable call site, in the block-submitted path, so only the
-/// node that submitted a winning block marks its shares paid. The other seven still owe the whole
-/// paid set — and being the majority, their view is the one that reaches quorum on the next
-/// proposal, which pays the same work twice.
-///
-/// At and above this height every node settles from its own view of the chain: the coinbase names
-/// the payout it pays, so the block itself is the record. Below it the observer still matches and
-/// logs, writing nothing — that dry run is what proves matching works before the behaviour turns on.
-///
-/// Gated because settlement changes the unpaid ledger every node votes with. A mixed fleet where
-/// some nodes observe-settle and others do not would diverge on the first won block, so the flip
-/// has to be simultaneous, like [`PAYOUT_TOLERANCE_V2_HEIGHT`].
-///
-/// ARMED at `961_400` (2026-08-03). Tip was `960_847` when this was cut — ~553 blocks, roughly
-/// 3.5 days, and deliberately ~46h AFTER [`SHARE_ADDR_BIND_HEIGHT`] so the two behaviour changes
-/// land on different blocks and a problem is attributable to one of them.
-///
-/// The emitting prerequisite is met and was verified on the wire rather than assumed: a live
-/// stratum probe shows the coinbase scriptSig carrying `47485050` ("GHPP") plus the 16-byte payout
-/// id, and that id matches the `Set approved payout for coinbase` the node logged. So peers are
-/// writing the tag before any node reads it.
-///
-/// The "dry-run window showing matches across all eight" that this doc originally asked for cannot
-/// be obtained: the pool has never won a block (`won_blocks` is empty), so the observer has had
-/// nothing to match. `bins/ghost-pool/tests/regtest_settlement_rehearsal.rs` is the substitute —
-/// it mines a genuinely tagged block, settles it over real RPC, orphans it with a real reorg,
-/// reverses, reconsiders and re-settles. That proves the path; it is not eight production nodes
-/// agreeing on a real win, and the difference is worth remembering.
-///
-/// KNOWN GAP at arming: settlement records the amounts the fleet RATIFIED, not the amounts the
-/// coinbase actually paid, because fee drift mutates the approved proposal per node (#601). Share
-/// marking is correct; the treasury figure may not be. Arming is still the right trade — without
-/// it the seven non-winning nodes never settle at all and the next proposal pays the same work
-/// twice (#589), which is the larger error.
+/// It armed observed settlement at `961_400`: every node settling a won block from its own view
+/// of the chain, at tip. Stage 6 removed that path entirely — settlement is now the shard's, at
+/// `COINBASE_MATURITY`, which is what lets it carry no reorg-reversal machinery. Nothing reads
+/// this value; do not wire anything new to it.
 pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 
 /// Report-and-median adoption of the payout checkpoint (#606). **ARMED at 961_700.**
@@ -745,7 +715,6 @@ mod gates {
     pub(super) static ADDRESS_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
-    pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
     pub(super) static CHECKPOINT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
     pub(super) static PAYOUT_FROM_SHARD: OnceLock<u64> = OnceLock::new();
@@ -808,11 +777,6 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         SHARE_ADDR_BIND_HEIGHT,
     );
-    let observed_settlement = gates::from_env(
-        "GHOST_OBSERVED_SETTLEMENT_HEIGHT",
-        network,
-        OBSERVED_SETTLEMENT_HEIGHT,
-    );
     let payout_median = gates::from_env(
         "GHOST_PAYOUT_MEDIAN_ADOPTION_HEIGHT",
         network,
@@ -869,7 +833,6 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::SHARE_TIER_BIND.set(share_tier_bind);
     let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
     let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
-    let _ = gates::OBSERVED_SETTLEMENT.set(observed_settlement);
     let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
     let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
     let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
@@ -905,7 +868,6 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         || share_tier_bind != SHARE_TIER_BIND_HEIGHT
         || active_voter_set != ACTIVE_VOTER_SET_HEIGHT
         || share_addr_bind != SHARE_ADDR_BIND_HEIGHT
-        || observed_settlement != OBSERVED_SETTLEMENT_HEIGHT
         || mesh_node_list_checkpoint != MESH_NODE_LIST_CHECKPOINT_HEIGHT
     {
         tracing::warn!(
@@ -917,7 +879,6 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
             share_tier_bind_height = share_tier_bind,
             active_voter_set_height = active_voter_set,
             share_addr_bind_height = share_addr_bind,
-            observed_settlement_height = observed_settlement,
             mesh_node_list_checkpoint_height = mesh_node_list_checkpoint,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
@@ -1020,11 +981,6 @@ pub fn crosses_network_tier(tier_log2: Option<u32>) -> bool {
         Some(tier) => tier >= network_tier_log2(),
         None => true,
     }
-}
-
-/// Height at and above which every node settles won blocks by observing them on-chain.
-pub fn observed_settlement_height() -> u64 {
-    *gates::OBSERVED_SETTLEMENT.get_or_init(|| OBSERVED_SETTLEMENT_HEIGHT)
 }
 
 /// Height at and above which the payout checkpoint computes its miner work from the shard

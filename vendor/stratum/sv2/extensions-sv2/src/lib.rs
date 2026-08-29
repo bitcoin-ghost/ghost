@@ -44,4 +44,5 @@ pub use extensions_negotiation::{
 pub use worker_specific_hashrate_tracking::{
     UserIdentity, EXTENSION_TYPE as EXTENSION_TYPE_WORKER_HASHRATE_TRACKING,
     FIELD_TYPE_USER_IDENTITY as TLV_FIELD_TYPE_USER_IDENTITY, MAX_USER_IDENTITY_LENGTH,
+    PROVISIONAL_CHANNEL_IDENTITY,
 };

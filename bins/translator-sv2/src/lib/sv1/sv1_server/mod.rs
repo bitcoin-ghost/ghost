@@ -1,4 +1,7 @@
-use stratum_apps::stratum_core::sv1_api::{json_rpc, Message};
+use stratum_apps::stratum_core::{
+    extensions_sv2::MAX_USER_IDENTITY_LENGTH,
+    sv1_api::{json_rpc, Message},
+};
 
 pub(super) mod channel;
 mod difficulty_manager;
@@ -229,29 +232,39 @@ pub(super) fn check_username_attributable(name: &str) -> Result<(), UsernameReje
     Ok(())
 }
 
-/// Truncates a string to [`MAX_USER_IDENTITY_BYTES`], respecting UTF-8 character boundaries.
+/// Checks a string fits the TLV wire ceiling, returning `None` if it does not.
 ///
-/// If the input string exceeds the limit, it is truncated at the last valid UTF-8 character
-/// boundary before or at [`MAX_USER_IDENTITY_BYTES`] and a warning is logged.
-fn tlv_compatible_username(s: &str) -> &str {
-    const MAX_USER_IDENTITY_BYTES: usize = 32;
-    let len = s.len();
-
-    if len <= MAX_USER_IDENTITY_BYTES {
-        return s;
+/// ⚠ This does NOT truncate, and must not be changed to. A truncated identity is not a
+/// shorter identity, it is a DIFFERENT one:
+///
+/// - Once the TLV carries a full `<address>.<worker>`, cutting it mangles the payout address
+///   and the share is credited to an address nobody holds.
+/// - Even for a worker-only TLV, two workers sharing a prefix collapse onto one `miner_id`,
+///   silently merging two people's earnings.
+///
+/// The previous 32-byte cap here was a third, independent copy of a limit owned by
+/// `extensions_sv2::MAX_USER_IDENTITY_LENGTH`. Two copies of it had already drifted once:
+/// raising the extension crate's constant fixed `UserIdentity::new` while a stale 32 in
+/// `parsers-sv2` still gated `to_tlv`, so a full identity failed to encode, the caller
+/// discarded the error, and the share went out with no TLV at all — the ~395 misattributed
+/// shares behind the revert of #447. This now defers to the single owner of the limit.
+///
+/// Returning `None` makes the caller omit the identity, which the pool treats as
+/// unattributable and refuses to credit. That is loud and costs one share; guessing is
+/// silent and costs someone their earnings.
+fn tlv_compatible_username(s: &str) -> Option<&str> {
+    if s.len() <= MAX_USER_IDENTITY_LENGTH {
+        return Some(s);
     }
-    // Find the last valid UTF-8 char boundary at or before MAX_USER_IDENTITY_BYTES
-    let mut end = MAX_USER_IDENTITY_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let truncated = &s[..end];
     warn!(
-        "Username '{}' exceeds {} bytes ({} bytes), truncating to '{}'. \
-         Consider using a shorter username for full visibility on the pool dashboard.",
-        s, MAX_USER_IDENTITY_BYTES, len, truncated
+        "Username '{}' exceeds the {}-byte TLV ceiling ({} bytes) — omitting the identity \
+         rather than truncating it, so shares on this connection will NOT be credited. \
+         Use a shorter username.",
+        s,
+        MAX_USER_IDENTITY_LENGTH,
+        s.len()
     );
-    truncated
+    None
 }
 
 #[cfg(test)]
@@ -399,22 +412,53 @@ mod username_difficulty_tests {
         assert_eq!(extract_worker_name(name), "braiins");
     }
 
-    /// Pins what the per-share TLV identity actually is on `main`: the WORKER SEGMENT ONLY.
+    /// Pins what the per-share TLV identity is in each channel-open mode.
     ///
-    /// #447 briefly made the TLV carry the full `<address>.<worker>`; #456 reverted it. The
-    /// stale description outlived the code and #416 was filed against it, asserting this
-    /// function was dead and should be deleted — it is neither dead nor safe to delete. This
-    /// test exists so the next reader learns the contract from an assertion rather than a
-    /// comment: the address travels in the channel-level identity, the worker in the TLV, and
-    /// the pool recombines them.
+    /// Exactly ONE of the channel identity and the TLV holds the payout address, and which
+    /// one depends on when the channel opened. #447 made the TLV always carry the full
+    /// `<address>.<worker>` and #456 reverted it; the stale description outlived the code and
+    /// produced #416. So assert both halves of the contract rather than describing one.
     #[test]
-    fn tlv_identity_is_the_worker_segment_only() {
+    fn tlv_identity_is_the_worker_segment_when_the_channel_holds_the_address() {
+        // Channel opened on authorize: it already carries `<addr>.<worker>`, so the TLV is
+        // the worker alone and the pool splices them.
         let username = format!("{ADDR}.bitaxe1");
-        let identity = tlv_compatible_username(extract_worker_name(&username));
+        let identity = tlv_compatible_username(extract_worker_name(&username)).unwrap();
         assert_eq!(identity, "bitaxe1");
         assert!(
             !identity.contains(ADDR),
             "TLV must not carry the payout address; the channel identity does"
+        );
+    }
+
+    #[test]
+    fn tlv_identity_is_the_full_username_when_the_channel_is_provisional() {
+        // Channel opened on subscribe: the channel holds only the sentinel, so the TLV is the
+        // sole source of a payout target and must carry the address too. A bc1q address plus
+        // a worker is ~50 bytes — comfortably over the old 32-byte cap that silently cut it.
+        let username = format!("{ADDR}.bitaxe1");
+        let identity = tlv_compatible_username(&username).unwrap();
+        assert_eq!(identity, username);
+        assert!(
+            identity.contains(ADDR),
+            "a provisional channel's TLV is the only place the payout address can travel"
+        );
+        assert!(username.len() > 32, "the case the old 32-byte cap mangled");
+    }
+
+    #[test]
+    fn tlv_identity_is_refused_rather_than_truncated() {
+        // A truncated identity is not a shorter identity, it is a different one: it mangles
+        // the payout address, or collapses two workers sharing a prefix onto one miner_id.
+        // Refusing makes the pool decline to credit, which is loud; truncating is silent.
+        let too_long = "w".repeat(MAX_USER_IDENTITY_LENGTH + 1);
+        assert_eq!(tlv_compatible_username(&too_long), None);
+
+        let at_ceiling = "w".repeat(MAX_USER_IDENTITY_LENGTH);
+        assert_eq!(
+            tlv_compatible_username(&at_ceiling),
+            Some(at_ceiling.as_str()),
+            "the ceiling itself must still be accepted"
         );
     }
 

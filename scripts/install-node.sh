@@ -951,6 +951,13 @@ user_identity = "${PAYOUT_ADDRESS}"
 # Each miner gets its own upstream channel (per-miner share attribution).
 aggregate_channels = false
 
+# Open the upstream channel on mining.subscribe rather than mining.authorize, so serialising
+# clients (proxies, rented-hashrate marketplaces) get the real extranonce in the subscribe
+# response instead of a placeholder that makes every share they build invalid.
+# ROLLOUT GATE, default false: pool_sv2 must understand a provisional channel identity on
+# every node before this is turned on anywhere.
+open_channel_on_subscribe = false
+
 # Protocol extensions — negotiate the Ghost per-miner TLV extension (0x0002).
 supported_extensions = []
 required_extensions = [0x0002]

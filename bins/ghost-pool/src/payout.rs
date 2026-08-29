@@ -38,11 +38,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use ghost_common::config::MiningMode;
 use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::{NodeId, PayoutEntry, PayoutProposal, PayoutType, RoundId};
-use ghost_consensus::vote_handler::{compute_proposal_hash, VoteHandler};
+use ghost_consensus::vote_handler::compute_proposal_hash;
 use ghost_storage::Database;
 use ghost_verification::QualifiedCapabilityProvider;
 
@@ -552,315 +551,6 @@ pub fn make_proposal_validator(
     })
 }
 
-/// Settle a payout: mark its shares paid and bump the treasury.
-///
-/// CALL THIS ONLY WHEN THE COINS EXIST — i.e. when a block WE mined has been accepted and its
-/// coinbase carries `proposal`. It must never run merely because a proposal was approved.
-///
-/// Approval only ARMS the coinbase (`set_approved_payout`); the coins do not appear until a
-/// later block is actually won carrying that snapshot. Settling at approval time therefore
-/// marks a miner's work paid before a single satoshi has moved — and if the pool never wins
-/// again, that work is marked paid and never paid. With payouts ratified at every tip, settling
-/// on approval would wipe the ledger every ~10 minutes while paying nobody at all.
-///
-/// Returns the number of share rows marked paid, or 0 if the block was already settled.
-///
-/// Thin wrapper over [`apply_settlement`]: the node that submits a winning block settles it
-/// immediately, every other node settles the same block when it observes it on-chain, and both
-/// must go through one implementation or they will drift.
-///
-/// `mined_outputs` is the coinbase the chain actually accepted; see [`apply_settlement`] for why
-/// settling without it credits amounts the chain never paid (#601).
-pub fn settle_paid_block(
-    db: &ghost_storage::Database,
-    proposal: &PayoutProposal,
-    grouping_height: u64,
-    block_hash: &str,
-    mined_outputs: Option<&[crate::coinbase_verifier::CoinbaseOutput]>,
-) -> GhostResult<usize> {
-    Ok(
-        apply_settlement(db, proposal, grouping_height, block_hash, mined_outputs)?
-            .map(|applied| applied.shares_marked)
-            .unwrap_or(0),
-    )
-}
-
-/// Resolve which local `miner_id`s a proposal's payout entries refer to.
-///
-/// Pre-gate, `recipient_id` is `sha256(miner_id)` — one entry per worker, matched directly.
-/// Post-gate it is `sha256(payout_address)` — one entry per address, so hash every unpaid miner's
-/// address, match against the proposal's set, then resolve those addresses back to ALL their
-/// miner_ids so the per-share UPDATE catches every worker under a paid address.
-///
-/// Split out from settlement because it is the half that depends on the ledger's current contents,
-/// and it is worth being able to test the resolution independently of the write.
-pub fn resolve_paid_miner_ids(
-    db: &ghost_storage::Database,
-    proposal: &PayoutProposal,
-    grouping_height: u64,
-) -> GhostResult<Vec<String>> {
-    let cutoff_ts = proposal.timestamp as i64;
-    let wanted: std::collections::HashSet<[u8; 32]> = proposal
-        .miner_payouts
-        .iter()
-        .map(|e| e.recipient_id)
-        .collect();
-
-    // Reverse-resolve each PayoutEntry's recipient_id hash back to local miner_id strings.
-    //
-    // Pre-gate, recipient_id is sha256(miner_id) — one entry per worker, matched directly.
-    // Post-gate it is sha256(payout_address) — one entry per address, so we hash every unpaid
-    // miner's address, match against the proposal's set, then resolve those addresses back to
-    // ALL their miner_ids so the per-share UPDATE catches every worker under a paid address.
-    let matched: Vec<String> = if proposal.block_height >= grouping_height {
-        let groups = db.get_top_unpaid_addresses(cutoff_ts, u32::MAX)?;
-        let mut acc = Vec::new();
-        for (addr, _work, miner_ids) in groups {
-            let h = ghost_common::identity::hash_message(addr.as_bytes());
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&h);
-            if wanted.contains(&arr) {
-                acc.extend(miner_ids);
-            }
-        }
-        acc
-    } else {
-        db.get_distinct_unpaid_miner_ids(cutoff_ts)?
-            .into_iter()
-            .filter(|id| {
-                let h = ghost_common::identity::hash_message(id.as_bytes());
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&h);
-                wanted.contains(&arr)
-            })
-            .collect()
-    };
-
-    Ok(matched)
-}
-
-/// What settlement decided to credit and record, and on what evidence.
-///
-/// Split out of [`apply_settlement`] so the money decision — WHAT the treasury is credited and
-/// WHICH outputs hash the settlement records — is a pure function of the ratified proposal and
-/// the mined coinbase, testable without a database.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SettlementAmounts {
-    /// Satoshis the treasury is credited.
-    pub treasury_amount: u64,
-    /// The outputs hash recorded on the settlement row.
-    pub outputs_hash: [u8; 32],
-    /// True when the mined outputs were PROVEN to be the deterministic fee-drift adjustment of
-    /// the ratified proposal (hash match). False means the amounts were measured directly from
-    /// the mined outputs because reconstruction did not verify — alarmed by the caller.
-    pub verified: bool,
-}
-
-/// Derive what settlement should credit from the coinbase the chain actually accepted.
-///
-/// #601: the mined coinbase is built from a per-node fee-drift adjustment of the ratified
-/// proposal (`template::adjust_proposal_for_available_fees`), so the treasury and node amounts
-/// the chain PAID differ from the ones the fleet RATIFIED — on the live fleet by the entire fee
-/// value of the block (`original_fees=0, available_fees≈4M sats` on every template). Crediting
-/// `proposal.treasury_amount` books money that never existed on-chain.
-///
-/// Two paths, in order of preference:
-///
-/// 1. **Reconstruct and prove.** The adjustment is deterministic in (ratified proposal, total
-///    mined value), so re-apply it and require the commitment of the result to hash-match the
-///    mined outputs — the same `CoinbaseOutputs/v1` commitment M-28 verified before submission.
-///    On a match the adjusted `treasury_amount` is exactly what the treasury output carries.
-/// 2. **Measure.** If reconstruction does not verify (a winner on different code, a tampered
-///    coinbase, or a rehearsal block mined outside the builder), fall back to summing the mined
-///    outputs that pay the treasury script directly. Exact unless another payout entry shares
-///    the treasury address, which is logged. The share marking is unaffected either way — miner
-///    entries are never touched by any version of the adjustment.
-///
-/// In both paths the recorded `outputs_hash` is the hash of the MINED outputs, so the settlement
-/// row describes the chain rather than the proposal.
-pub fn settlement_amounts_from_mined_coinbase(
-    proposal: &PayoutProposal,
-    mined: &[crate::coinbase_verifier::CoinbaseOutput],
-) -> SettlementAmounts {
-    use crate::coinbase_verifier::{address_to_script_pubkey, CoinbaseCommitment};
-
-    let mined_hash = CoinbaseCommitment::outputs_hash(mined);
-    let mined_total: u64 = mined
-        .iter()
-        .filter(|o| o.value > 0)
-        .map(|o| o.value)
-        .fold(0u64, u64::saturating_add);
-
-    // Path 1: reconstruct the winner's adjustment and prove it against the mined outputs.
-    if let Some(adjusted) = crate::template::adjust_proposal_for_available_fees(
-        proposal.clone(),
-        mined_total,
-        proposal.block_height,
-    ) {
-        let treasury_addr = if !adjusted.treasury_address.is_empty() {
-            adjusted.treasury_address.clone()
-        } else {
-            Vec::new()
-        };
-        let commitment = CoinbaseCommitment::from_proposal(&adjusted, &treasury_addr);
-        if commitment.verify(mined).is_ok() {
-            return SettlementAmounts {
-                treasury_amount: adjusted.treasury_amount,
-                outputs_hash: mined_hash,
-                verified: true,
-            };
-        }
-    }
-
-    // Path 2: the block is provably ours (it carries the payout tag) but its outputs are not the
-    // deterministic adjustment of the proposal we hold. Credit what the chain measurably paid the
-    // treasury script — never the ratified figure, which the chain did not pay.
-    let treasury_spk = address_to_script_pubkey(&proposal.treasury_address)
-        .unwrap_or_else(|| proposal.treasury_address.clone());
-    let measured: u64 = if treasury_spk.is_empty() {
-        0
-    } else {
-        mined
-            .iter()
-            .filter(|o| o.value > 0 && o.script_pubkey == treasury_spk)
-            .map(|o| o.value)
-            .fold(0u64, u64::saturating_add)
-    };
-
-    // If a miner or node entry pays the treasury address too, the direct sum includes their
-    // outputs — say so, because the credit is then an upper bound.
-    let treasury_addr_shared = proposal
-        .miner_payouts
-        .iter()
-        .chain(proposal.node_payouts.iter())
-        .any(|e| {
-            address_to_script_pubkey(&e.address).unwrap_or_else(|| e.address.clone())
-                == treasury_spk
-        });
-    if treasury_addr_shared && measured > 0 {
-        warn!(
-            measured,
-            "#601: treasury address is also a payout entry address — the measured treasury \
-             credit is an upper bound, not exact"
-        );
-    }
-
-    SettlementAmounts {
-        treasury_amount: measured,
-        outputs_hash: mined_hash,
-        verified: false,
-    }
-}
-
-/// Settle a won block: mark its shares paid, bump the treasury, record the win — once, atomically.
-///
-/// `Ok(None)` means the block was already settled and nothing changed. Three paths reach this for
-/// the same block — the submitting node when it submits, every other node when it observes the
-/// block on-chain, and the startup rescan — and they must converge on a single application rather
-/// than crediting the treasury once per caller.
-///
-/// `mined_outputs` is the coinbase the chain actually accepted. When present, the treasury credit
-/// and the recorded outputs hash come from IT (#601, via
-/// [`settlement_amounts_from_mined_coinbase`]) — the ratified `proposal.treasury_amount` is what
-/// the fleet agreed to, not what the winner's fee-adjusted coinbase paid, and the two differ on
-/// every block with fee drift. `None` preserves the old ratified-amount behaviour for callers
-/// that genuinely have no coinbase in hand (some tests); production callers all pass the mined
-/// outputs, and settling without them is warned about because the treasury ledger then diverges
-/// from the chain by the drift.
-///
-/// The share marking is identical in every case: miner entries are never touched by the fee
-/// adjustment, so WHO gets marked paid depends only on the ratified proposal.
-///
-/// The share marking, the won-block record and the treasury bump all land in one transaction. They
-/// used to be three separate writes, so a crash between them could leave shares marked paid by a
-/// block never recorded as won.
-pub fn apply_settlement(
-    db: &ghost_storage::Database,
-    proposal: &PayoutProposal,
-    grouping_height: u64,
-    block_hash: &str,
-    mined_outputs: Option<&[crate::coinbase_verifier::CoinbaseOutput]>,
-) -> GhostResult<Option<ghost_storage::queries::SettlementApplied>> {
-    let cutoff_ts = proposal.timestamp as i64;
-    let matched = resolve_paid_miner_ids(db, proposal, grouping_height)?;
-
-    let amounts = match mined_outputs {
-        Some(mined) => {
-            let amounts = settlement_amounts_from_mined_coinbase(proposal, mined);
-            if !amounts.verified {
-                error!(
-                    block_hash,
-                    height = proposal.block_height,
-                    ratified_treasury = proposal.treasury_amount,
-                    measured_treasury = amounts.treasury_amount,
-                    "#601: mined coinbase is NOT the deterministic fee adjustment of the \
-                     ratified proposal — settling the measured treasury amount and alarming. \
-                     A winner on different code, a tampered coinbase, or a hand-mined block."
-                );
-            } else if amounts.treasury_amount != proposal.treasury_amount {
-                info!(
-                    block_hash,
-                    height = proposal.block_height,
-                    ratified_treasury = proposal.treasury_amount,
-                    paid_treasury = amounts.treasury_amount,
-                    "#601: fee drift — the chain paid the treasury a different amount than \
-                     ratified; settling what was paid"
-                );
-            }
-            amounts
-        }
-        None => {
-            // Legacy path: no coinbase in hand. The ratified amounts are the only thing to
-            // credit, and they are known-wrong by the drift — say so.
-            warn!(
-                block_hash,
-                height = proposal.block_height,
-                treasury = proposal.treasury_amount,
-                "#601: settling WITHOUT the mined coinbase — crediting the ratified treasury \
-                 amount, which differs from what the chain paid by this block's fee drift"
-            );
-            SettlementAmounts {
-                treasury_amount: proposal.treasury_amount,
-                outputs_hash: crate::coinbase_verifier::CoinbaseCommitment::from_proposal(
-                    proposal,
-                    &proposal.treasury_address,
-                )
-                .output_hash,
-                verified: false,
-            }
-        }
-    };
-
-    let applied = db.settle_block_atomic(
-        block_hash,
-        proposal.block_height,
-        &proposal.proposal_hash,
-        &amounts.outputs_hash,
-        &matched,
-        cutoff_ts,
-        amounts.treasury_amount,
-        ghost_reconciliation::fee_distribution::TREASURY_THRESHOLD_SATS,
-    )?;
-
-    match &applied {
-        Some(a) => info!(
-            shares_marked = a.shares_marked,
-            miners = matched.len(),
-            height = proposal.block_height,
-            treasury_sats = a.treasury_bumped,
-            threshold_crossed = a.threshold_crossed,
-            verified_against_chain = amounts.verified,
-            block_hash,
-            "Ledger settled: shares marked paid because a block carrying this payout was accepted"
-        ),
-        None => debug!(
-            height = proposal.block_height,
-            block_hash, "Block already settled — nothing to apply"
-        ),
-    }
-    Ok(applied)
-}
-
 /// Data needed to create a payout proposal
 #[derive(Debug, Clone)]
 pub struct BlockFoundData {
@@ -1133,7 +823,26 @@ impl PayoutProposalCreator {
                         .saturating_add(invalid_sats),
                 )
             }
-            None => self.calculate_miner_payouts(&data.miner_work, fee_dist.miner_pool)?,
+            // Stage 6: there is no legacy fallback any more. The shard IS the ledger.
+            //
+            // This used to recompute the split from `data.miner_work` — the unpaid share ledger —
+            // whenever the shard was absent or unarmed. That source is being deleted, so a node
+            // without a running, genesis-installed shard can no longer construct a payout at all
+            // and must say so, rather than silently paying from something that no longer exists.
+            //
+            // ⚠ This makes `pool.share_shard` plus installed genesis a HARD REQUIREMENT for
+            // taking part in payouts. It is the same position `CHECKPOINT_FROM_SHARD_HEIGHT`
+            // already took for the checkpoint, which abstains loudly instead of falling back —
+            // a silent fall back to a second source is exactly the mixed-source divergence that
+            // gate exists to end.
+            None => {
+                return Err(ghost_common::error::GhostError::PayoutCalculation(
+                    "no shard balances available and the legacy ledger source was removed in \
+                     Stage 6 — this node cannot build a payout. Set `pool.share_shard` and \
+                     install genesis."
+                        .to_string(),
+                ))
+            }
         };
 
         // Add miner dust to node reward pool - no satoshis are lost!
@@ -2533,37 +2242,15 @@ impl PayoutProposalCreator {
 /// Handler for block found events that creates and submits payout proposals
 pub struct PayoutHandler {
     creator: PayoutProposalCreator,
-    vote_handler: Arc<VoteHandler>,
     template_processor: Arc<TemplateProcessor>,
     /// H-MINE-1: Qualification provider for calculating VERIFIED capabilities - REQUIRED
     /// This is mandatory because node rewards must only be distributed based on
     /// verified capabilities, never unverified claimed ones.
     qualification_provider: Arc<QualifiedCapabilityProvider>,
-    /// Which mining mode this node runs — the thing that decides whether a payout proposal is
-    /// VOTED on or approved locally. See [`PayoutHandler::is_single_operator`].
-    mining_mode: MiningMode,
 }
 
 /// Does this mining mode have exactly ONE operator, and therefore nobody to vote with?
 ///
-/// Free function rather than a method so the property can be tested exhaustively without
-/// standing up a whole `PayoutHandler` (which needs a vote handler, a template processor and a
-/// qualification provider). The thing being protected here is small and absolute:
-/// **`PublicPool` must never be single-operator**, because that is the one mode with independent
-/// operators and the only one a vote can protect.
-fn is_single_operator_mode(mode: MiningMode) -> bool {
-    match mode {
-        // One operator paying only themselves.
-        MiningMode::PrivateSolo => true,
-        // One operator paying their own miners. Those miners trust the operator the same way
-        // miners trust any centralised pool; a quorum would be that operator's own nodes agreeing
-        // with themselves.
-        MiningMode::PrivatePool => true,
-        // Independent operators. This is what BFT is for.
-        MiningMode::PublicPool => false,
-    }
-}
-
 impl PayoutHandler {
     /// Create a new PayoutHandler with REQUIRED QualifiedCapabilityProvider
     ///
@@ -2572,62 +2259,32 @@ impl PayoutHandler {
     /// claimed capabilities. The provider validates capabilities through the
     /// challenge-response system before they count toward payout shares.
     ///
+    /// Stage 6 removed `vote_handler` and `mining_mode` from this signature.
+    ///
+    /// Both existed solely to decide whether a payout proposal was VOTED on or approved locally.
+    /// With the vote gone from the payout path a `PayoutHandler` has no relationship with the
+    /// vote handler at all — that dependency is deleted, not merely unused. The mode no longer
+    /// changes what happens to a payout either: every node commits from its own shard view.
+    ///
     /// # Errors
-    /// Returns error if:
-    /// - treasury_address is not configured in PayoutConfig
+    ///
+    /// Returns an error if `treasury_address` is not configured in `PayoutConfig`.
     pub fn new(
         identity: Arc<NodeIdentity>,
         config: PayoutConfig,
         db: Arc<Database>,
-        vote_handler: Arc<VoteHandler>,
         template_processor: Arc<TemplateProcessor>,
         qualification_provider: Arc<QualifiedCapabilityProvider>,
-        mining_mode: MiningMode,
     ) -> GhostResult<Self> {
         let creator = PayoutProposalCreator::new(identity, config, db)?;
 
-        info!(
-            ?mining_mode,
-            single_operator = matches!(
-                mining_mode,
-                MiningMode::PrivatePool | MiningMode::PrivateSolo
-            ),
-            "PayoutHandler initialized with required verification provider"
-        );
+        info!("PayoutHandler initialized with required verification provider");
 
         Ok(Self {
             creator,
-            vote_handler,
             template_processor,
             qualification_provider,
-            mining_mode,
         })
-    }
-
-    /// Whether this node is the ONLY operator of its pool, and so has nobody to vote with.
-    ///
-    /// This decides whether a payout proposal goes to BFT or is approved locally, and it is
-    /// deliberately answered from the DECLARED MODE rather than from a live peer count.
-    ///
-    /// ⚠ That distinction is the whole safety argument. "How many peers can I see right now" is
-    /// exactly the wrong question: a public-pool node that transiently lost its mesh would start
-    /// self-approving its own payouts, which is precisely the attack the vote exists to prevent.
-    /// The mode is a static operator declaration and cannot be induced by a network condition.
-    ///
-    /// What a vote actually buys is protection against ONE operator among INDEPENDENT operators
-    /// paying themselves everyone's money. Both private modes have a single operator by
-    /// definition:
-    ///
-    /// - `PrivateSolo` — the coinbase pays only the operator; there is no other party at all.
-    /// - `PrivatePool` — the coinbase pays the operator's own miners. Those miners are trusting
-    ///   the operator, exactly as miners trust any centralised pool. A quorum here would be the
-    ///   same operator's own nodes agreeing with themselves: no added security, and — because
-    ///   mainnet clamps `min_voters_for_bft` to at least 4 — it made a one-node private pool
-    ///   structurally unable to pay ANYONE. It mined, accepted shares, built proposals, and
-    ///   failed every one with `InsufficientVoters`.
-    /// - `PublicPool` — genuinely multi-operator. Keeps the vote; nothing here changes that.
-    fn is_single_operator(&self) -> bool {
-        is_single_operator_mode(self.mining_mode)
     }
 
     /// PO4-M2: Get a snapshot of the treasury address
@@ -2761,79 +2418,34 @@ impl PayoutHandler {
         // Share validity is unaffected and lives where it always did: per-share at receive time
         // (GHOST-09 signature with receiver and address binding, PoW preimage, difficulty-tier
         // commitment), plus §6 sampling. Delete the gate, keep the rule.
-        if proposal.block_height >= crate::payout_from_shard_height() {
-            info!(
-                round_id = proposal.round_id,
-                height = proposal.block_height,
-                miners = proposal.miner_payouts.len(),
-                nodes = proposal.node_payouts.len(),
-                hash = %hex::encode(&proposal_hash[..8]),
-                "Paying from this node's own shard view (no vote — Stage 6 step 3)"
-            );
-            self.template_processor.set_local_payout(proposal);
-            return Ok(proposal_hash);
-        }
-
-        // Submit to vote handler for BFT consensus
-        // A single-operator pool has nobody to vote with, so it approves its own proposal.
+        // Stage 6 step 3: the payout is committed from this node's own shard view. No vote.
         //
-        // This is the same resolution #592 reached for solo, applied to the other mode that has
-        // exactly one operator. A private pool is one person letting their miners mine through
-        // their node; requiring `min_voters_for_bft` (>= 4 on mainnet) meant that person had to
-        // run four nodes — all their own — before anyone could be paid. Four nodes belonging to
-        // one operator voting with each other is not a security property, it is a quorum of one
-        // person. Meanwhile a single-node private pool could never pay at all.
+        // `SHARE_SHARD.md` §8 — "No consensus on the ledger. Each node pays from its own view."
         //
-        // ⚠ `is_single_operator` keys on the DECLARED MODE, never on how many peers happen to be
-        // reachable — see its doc. Public pool is untouched and still votes.
-        if self.is_single_operator() {
-            info!(
-                round_id = proposal.round_id,
-                miners = proposal.miner_payouts.len(),
-                nodes = proposal.node_payouts.len(),
-                mode = ?self.mining_mode,
-                hash = %hex::encode(&proposal_hash[..8]),
-                "Single-operator pool: approving own payout proposal (no BFT — no second operator \
-                 to vote with)"
-            );
-            // Same two steps the solo path takes: the proposal must be in the cache before it can
-            // be approved (`set_approved_payout` refuses a hash whose data it cannot find,
-            // MED-POOL-6), and `set_approved_payout` is what sets the M-28 coinbase commitment
-            // that `submitblock` requires.
-            proposal.proposal_hash = proposal_hash;
-            self.template_processor.store_proposal(proposal.clone());
-            self.template_processor.set_approved_payout(proposal_hash);
-            return Ok(proposal_hash);
-        }
-
+        // The `PAYOUT_FROM_SHARD_HEIGHT` conditional that used to guard this is gone, and it had
+        // to be: you cannot delete a branch and keep the conditional that selects it. The gate
+        // did its job — it let the no-vote path run on the live fleet and be observed before the
+        // BFT machinery was removed. The constant itself is now inert and is retired by the
+        // tip-keyed gate collapse, a later release.
+        //
+        // What the removed vote actually did: `validate_proposal_split` recomputed the miner
+        // split from the VOTER's own table and demanded an exact match (GHOST-02). It never
+        // inspected a share. Its whole guarantee was "your arithmetic matches mine", which is
+        // only ever as strong as the two tables already agreeing — and when they did not, it
+        // converted divergence into a total payment HALT (nothing finalised 18-21 Aug 2026).
+        //
+        // Share validity is untouched and lives where it always did: per-share at receive time —
+        // GHOST-09 signature with receiver and address binding, the PoW preimage check, the
+        // difficulty-tier commitment — plus §6 sampling. Delete the gate, keep the rule.
         info!(
             round_id = proposal.round_id,
+            height = proposal.block_height,
             miners = proposal.miner_payouts.len(),
             nodes = proposal.node_payouts.len(),
-            "Submitting payout proposal to consensus"
-        );
-
-        let returned_hash = self.vote_handler.handle_proposal(proposal)?;
-
-        // SECURITY: Verify hash matches - this catches implementation bugs where
-        // the vote handler modifies the proposal or computes the hash differently
-        if proposal_hash != returned_hash {
-            tracing::error!(
-                expected = %hex::encode(&proposal_hash[..8]),
-                actual = %hex::encode(&returned_hash[..8]),
-                "CRITICAL: Proposal hash mismatch between local computation and vote handler"
-            );
-            return Err(ghost_common::error::GhostError::HashMismatch {
-                expected: hex::encode(proposal_hash),
-                actual: hex::encode(returned_hash),
-            });
-        }
-
-        info!(
             hash = %hex::encode(&proposal_hash[..8]),
-            "Payout proposal submitted for voting"
+            "Paying from this node's own shard view (no vote)"
         );
-
+        self.template_processor.set_local_payout(proposal);
         Ok(proposal_hash)
     }
 
@@ -3378,7 +2990,7 @@ mod tests {
     /// anyone-can-spend coinbase output.
     #[test]
     fn a_miner_with_no_resolvable_address_becomes_dust_not_an_empty_output() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         // A miner_id that is not itself an address and has no row in `miners`, so
         // `get_miner_address` yields empty.
         let miner_work: Vec<(String, u128)> = vec![("worker-with-no-address".to_string(), 1_000)];
@@ -3488,6 +3100,21 @@ mod tests {
         assert!(!expected_map.is_empty(), "the fixture paid nobody");
     }
 
+    /// A regtest `PayoutProposalCreator`, for the shard-payout tests below.
+    ///
+    /// Reinstated under a plain name when the GHOST-02 vote tests were deleted with the vote —
+    /// it was called `ghost02_creator`, but it never had anything to do with GHOST-02, and the
+    /// tests that still need it are about shard address validation (#726).
+    fn regtest_creator() -> PayoutProposalCreator {
+        let config = PayoutConfig {
+            treasury_address: Some(vec![1u8; 20]),
+            network: ghost_common::config::BitcoinNetwork::Regtest,
+            ..Default::default()
+        };
+        let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+        PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
+    }
+
     // ── #726: shard payouts must pass the same address validation the validator applies ─────
 
     /// A regtest-valid address, so `ghost02_creator` (Regtest) accepts it.
@@ -3499,7 +3126,7 @@ mod tests {
     /// the whole block. One bad address cost every miner in it.
     #[test]
     fn an_invalid_shard_address_becomes_dust_instead_of_a_dropped_output() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let payouts = vec![
             (RT_ADDR_A.to_string(), 1_000u64),
             ("not a bitcoin address".to_string(), 250u64),
@@ -3521,7 +3148,7 @@ mod tests {
     /// instead re-weight every surviving miner — silently changing what the block pays.
     #[test]
     fn dropping_an_invalid_address_does_not_redistribute_to_the_others() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let with_bad = vec![
             (RT_ADDR_A.to_string(), 1_000u64),
             ("!!not-an-address!!".to_string(), 999u64),
@@ -3545,7 +3172,7 @@ mod tests {
     /// unspendable, and the issue calls this out explicitly.
     #[test]
     fn a_wrong_network_shard_address_is_also_dusted() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         // Valid bech32, valid mainnet — wrong network for this Regtest creator.
         let payouts = vec![
             (RT_ADDR_A.to_string(), 500u64),
@@ -3569,7 +3196,7 @@ mod tests {
     /// The common case must cost nothing and change nothing.
     #[test]
     fn an_all_valid_shard_split_is_passed_through_untouched() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let payouts = vec![
             (RT_ADDR_A.to_string(), 1_000u64),
             (RT_ADDR_B.to_string(), 2_000u64),
@@ -3579,64 +3206,6 @@ mod tests {
 
         assert_eq!(kept, payouts);
         assert_eq!(invalid_sats, 0);
-    }
-
-    fn ghost02_creator() -> PayoutProposalCreator {
-        let config = PayoutConfig {
-            treasury_address: Some(vec![1u8; 20]),
-            network: ghost_common::config::BitcoinNetwork::Regtest,
-            ..Default::default()
-        };
-        let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
-        PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
-    }
-
-    fn ghost02_proposal(subsidy: u64, miner_payouts: Vec<PayoutEntry>) -> PayoutProposal {
-        // Conserve value (GHOST-02 requires it): with no node payouts, everything not
-        // paid to miners is the treasury's — the same remainder a real empty-node block
-        // routes there. Without this the proposal would make `subsidy - miner` sats
-        // vanish and be rejected on conservation before the miner recompute is even
-        // reached.
-        let miner_sum: u64 = miner_payouts.iter().map(|e| e.amount).sum();
-        PayoutProposal {
-            proposal_hash: [0u8; 32],
-            round_id: 1,
-            block_hash: [0u8; 32],
-            block_height: 100,
-            proposer: [0u8; 32],
-            miner_payouts,
-            node_payouts: vec![],
-            treasury_amount: subsidy.saturating_sub(miner_sum),
-            treasury_address: vec![1u8; 20],
-            tx_fees: 0,
-            subsidy,
-            timestamp: 1_700_000_000,
-            tx_fees_unallocated: 0,
-        }
-    }
-
-    #[test]
-    fn ghost02_rejects_payout_unsupported_by_local_ledger() {
-        let creator = ghost02_creator();
-        let ts = TreasuryState::new();
-        // This node's ledger is empty → no miner is owed anything for the round.
-        let local_work: Vec<(String, u128)> = vec![];
-        // The proposal nonetheless claims a 1 BTC miner payout.
-        let proposal = ghost02_proposal(
-            5_000_000_000,
-            vec![PayoutEntry {
-                address: vec![2u8; 22],
-                amount: 100_000_000,
-                recipient_id: [3u8; 32],
-                payout_type: PayoutType::Mining,
-            }],
-        );
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &ts)
-                .is_err(),
-            "GHOST-02: a payout the local ledger does not support must be rejected"
-        );
     }
 
     // The honest-accept case is covered by `ghost02_ledger_proposal_survives_validator_recompute`
@@ -3819,13 +3388,20 @@ mod tests {
         // Give the node a payout address so its share lands as a node output rather than
         // falling back to the treasury (which would make treasury_amount decay-independent).
         seed_node_with_addr(&db, [9u8; 32], &addrs[0]);
+        // Stage 6: the balances come from the shard, since the legacy ledger source is gone.
+        // What this test is actually about — that the fee split anchors to the CUTOFF and not to
+        // the block timestamp — is unaffected by where the miner balances came from.
         let miner_work =
             select_ledger_miner_work(&db, cutoff_ts, LEDGER_TEST_HEIGHT, LEDGER_TEST_SUBSIDY)
                 .expect("ledger work");
+        let owed: std::collections::BTreeMap<String, i64> = miner_work
+            .iter()
+            .map(|(addr, work)| (addr.clone(), *work as i64))
+            .collect();
 
         let proposal = creator
             .create_proposal(BlockFoundData {
-                shard_owed: None,
+                shard_owed: Some(owed),
                 round_id: LEDGER_ROUNDS,
                 ledger_cutoff_ts: cutoff_ts,
                 block_hash: [7u8; 32],
@@ -3875,192 +3451,6 @@ mod tests {
         assert_ne!(
             proposal.treasury_amount, now_treasury,
             "must NOT reflect the wall-clock block_timestamp's decay year"
-        );
-    }
-
-    /// The fix: a validator recomputing from the unpaid ledger — over the cutoff the
-    /// proposal carries — reproduces the proposer's split exactly and approves it.
-    #[test]
-    fn ghost02_ledger_proposal_survives_validator_recompute() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-
-        let proposal = ledger_proposal(&creator, &db, &addrs, now);
-        assert!(
-            !proposal.miner_payouts.is_empty(),
-            "the ledger-built proposal pays the miners"
-        );
-        assert_eq!(
-            proposal.timestamp as i64, now,
-            "the proposal must carry the ledger cutoff its split was computed against, \
-             so validators can reproduce the proposer's exact window"
-        );
-
-        // What a validating node recomputes (main.rs GHOST-02 validator): same function,
-        // same source, cutoff taken from the proposal.
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-
-        let ts = TreasuryState::new();
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &ts)
-                .is_ok(),
-            "GHOST-02: an honest ledger-built proposal must survive an honest node's \
-             recompute — if this fails, the fleet rejects its own payout and the coinbase \
-             falls back to paying pool_payout_address alone"
-        );
-    }
-
-    /// GHOST-02 (extended): a coinbase that doesn't conserve value — a satoshi minted or
-    /// destroyed — is rejected even though its miner split recomputes cleanly.
-    #[test]
-    fn ghost02_rejects_non_conserving_coinbase() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
-
-        // Mint one satoshi from nothing: treasury up by one, nothing else moved.
-        proposal.treasury_amount += 1;
-
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
-                .is_err(),
-            "GHOST-02: a coinbase that doesn't conserve value must be rejected"
-        );
-    }
-
-    /// GHOST-02 (extended): the treasury output must pay the configured treasury script.
-    /// A same-amount redirect to another address is rejected.
-    #[test]
-    fn ghost02_rejects_redirected_treasury() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
-        assert!(
-            proposal.treasury_amount > 0,
-            "the ledger proposal funds the treasury (node_shares empty → fallback)"
-        );
-
-        // Same amount, attacker's address.
-        proposal.treasury_address = vec![0xabu8; 22];
-
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
-                .is_err(),
-            "GHOST-02: a redirected treasury address must be rejected"
-        );
-    }
-
-    /// GHOST-02 (extended): the treasury can't be shorted below its deterministic floor
-    /// (base rate + sub-dust fees), even if the shortfall is moved to a node so the
-    /// coinbase still conserves. NB: the node-vs-treasury split ABOVE the floor is NOT
-    /// pinned — node eligibility isn't validator-reproducible (see the node-split
-    /// decision doc) — so this only asserts the floor.
-    #[test]
-    fn ghost02_rejects_treasury_below_floor() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
-
-        // The floor is the base treasury rate (this fixture has no tx fees).
-        let block_time =
-            chrono::DateTime::<chrono::Utc>::from_timestamp(proposal.timestamp as i64, 0).unwrap();
-        let floor = FeeDistribution::calculate_at_height(
-            proposal.subsidy,
-            proposal.tx_fees,
-            &TreasuryState::new(),
-            block_time,
-            proposal.block_height >= crate::coinbase_fee_split_height(),
-        )
-        .treasury_amount;
-        if floor == 0 {
-            return; // no positive floor at this height/decay — nothing to violate
-        }
-        assert!(
-            proposal.treasury_amount >= floor,
-            "the honest proposal sits at or above the treasury floor"
-        );
-
-        // Short the treasury one satoshi below its floor, moving the shortfall to a node
-        // so the coinbase still conserves value.
-        let target = floor - 1;
-        let shortfall = proposal.treasury_amount - target;
-        proposal.treasury_amount = target;
-        proposal.node_payouts.push(PayoutEntry {
-            address: vec![0x33u8; 22],
-            amount: shortfall,
-            recipient_id: [0x33u8; 32],
-            payout_type: PayoutType::NodeReward,
-        });
-
-        let local_work = select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        )
-        .expect("validator recompute");
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
-                .is_err(),
-            "GHOST-02: treasury shorted below its deterministic floor must be rejected"
-        );
-    }
-
-    /// Regression pin: recomputing from the winning job-round — what the validator used to
-    /// do — rejects the pool's own honest proposal. This is the bug the fix removes; if a
-    /// future change reintroduces a round-scoped recompute, this test starts failing.
-    #[test]
-    fn ghost02_round_scoped_recompute_rejects_honest_ledger_proposal() {
-        let (creator, db) = ledger_creator();
-        let now = 1_800_000_000i64;
-        let addrs = seed_unpaid_ledger(&db, now);
-
-        let proposal = ledger_proposal(&creator, &db, &addrs, now);
-
-        // `rm.get_miner_work_scaled(proposal.round_id)`: only the winning ~90s round.
-        // Carol is owed by the ledger but idle during that round, so she vanishes here.
-        let round_work = winning_round_work(&addrs);
-        assert_eq!(
-            round_work.len(),
-            2,
-            "the winning round only saw the two still-active miners"
-        );
-
-        let ts = TreasuryState::new();
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &round_work, &ts)
-                .is_err(),
-            "a round-scoped recompute cannot reproduce a ledger-built split — this is \
-             precisely why the validator must not use the round"
         );
     }
 
@@ -5027,71 +4417,9 @@ mod tests {
         }
     }
 
-    /// #592: solo must use the SAME fee model as pool mode. This calls `create_solo_proposal` —
-    /// the two older `test_solo_mode_*` tests call `FeeDistribution::calculate` directly and then
-    /// recompute the solo sum in the test body, so they pass whatever the solo path does.
-    ///
-    /// Above the gate the 1% is levied on `subsidy + fees`. The previous implementation levied it
-    /// on the subsidy alone and added the fees whole, paying the solo miner 1% of the fees more
-    /// than every validator recomputes in `validate_proposal_split` — so this asserts the exact
-    /// figure rather than a bound.
-    /// `PublicPool` must NEVER be treated as single-operator, and both private modes must be.
-    ///
-    /// This is the whole security boundary of local payout approval, so it is asserted
-    /// exhaustively over the enum rather than by example — if a fourth mode is ever added, this
-    /// test forces an explicit decision about which side of the line it falls on instead of
-    /// letting it inherit a default.
-    ///
-    /// Getting `PublicPool` wrong here would let a node approve its own payout proposal without a
-    /// vote, on the pool that actually has independent operators — the exact attack BFT exists to
-    /// stop. Getting a private mode wrong restores the `InsufficientVoters` deadlock that made a
-    /// one-node private pool unable to pay anyone.
-    #[test]
-    fn only_the_private_modes_are_single_operator() {
-        assert!(
-            !is_single_operator_mode(MiningMode::PublicPool),
-            "PublicPool has INDEPENDENT operators — it must always require a BFT vote"
-        );
-        assert!(
-            is_single_operator_mode(MiningMode::PrivateSolo),
-            "solo pays only its own operator; there is no second party to protect"
-        );
-        assert!(
-            is_single_operator_mode(MiningMode::PrivatePool),
-            "a private pool has one operator, so a quorum would be their own nodes agreeing \
-             with themselves — and demanding one made a single-node private pool unable to pay"
-        );
-    }
-
-    /// The predicate must depend ONLY on the declared mode, never on anything observable at
-    /// runtime.
-    ///
-    /// Keying it on a live peer count is the obvious-looking alternative and is dangerous: a
-    /// public-pool node that transiently lost its mesh would begin self-approving payouts, which
-    /// is indistinguishable from the attack. A mode is an operator declaration in a config file
-    /// and cannot be induced by a network condition, which is precisely why it is the input.
-    #[test]
-    fn single_operator_is_decided_by_mode_alone_and_is_stable() {
-        for mode in [
-            MiningMode::PublicPool,
-            MiningMode::PrivatePool,
-            MiningMode::PrivateSolo,
-        ] {
-            let first = is_single_operator_mode(mode);
-            for _ in 0..100 {
-                assert_eq!(
-                    is_single_operator_mode(mode),
-                    first,
-                    "{mode:?} changed its answer — the decision must be a pure function of the \
-                     declared mode, with no ambient input"
-                );
-            }
-        }
-    }
-
     #[test]
     fn solo_uses_the_pool_fee_model_above_the_gate() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let data = solo_data_at_height(crate::coinbase_fee_split_height());
 
         let subsidy = data.subsidy_sats;
@@ -5130,7 +4458,7 @@ mod tests {
     /// finder. A mixed-version fleet must not split on coinbase construction.
     #[test]
     fn solo_keeps_the_legacy_model_below_the_gate() {
-        let creator = ghost02_creator();
+        let creator = regtest_creator();
         let data = solo_data_at_height(crate::coinbase_fee_split_height() - 1);
 
         let subsidy = data.subsidy_sats;
@@ -5608,186 +4936,5 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp() as u64,
             tx_fees_unallocated: 0,
         }
-    }
-
-    /// The outputs a winner's coinbase carries, in builder order: miners, nodes, treasury.
-    fn mined_601(
-        miner: u64,
-        node: u64,
-        treasury: u64,
-    ) -> Vec<crate::coinbase_verifier::CoinbaseOutput> {
-        let mut v = Vec::new();
-        if miner > 0 {
-            v.push(crate::coinbase_verifier::CoinbaseOutput {
-                value: miner,
-                script_pubkey: spk_601(P2WPKH),
-            });
-        }
-        if node > 0 {
-            v.push(crate::coinbase_verifier::CoinbaseOutput {
-                value: node,
-                script_pubkey: spk_601(P2WPKH),
-            });
-        }
-        if treasury > 0 {
-            v.push(crate::coinbase_verifier::CoinbaseOutput {
-                value: treasury,
-                script_pubkey: spk_601(P2WSH),
-            });
-        }
-        v
-    }
-
-    /// **The #601 defect, pinned.** The fleet ratified treasury 0.01 with fees 0.005; the winner's
-    /// template had fees 0.008, so its coinbase paid treasury 0.013. Settlement must credit the
-    /// 0.013 the chain paid — crediting the ratified 0.01 books money that never existed.
-    #[test]
-    fn surplus_fee_drift_credits_the_treasury_amount_the_chain_paid() {
-        let ratified = ratified_601(500_000, 1_000_000);
-        let mined = mined_601(300_000_000, 12_000_000, 1_300_000); // winner saw 800_000 fees
-
-        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
-        assert!(
-            amounts.verified,
-            "the mined outputs ARE the deterministic adjustment"
-        );
-        assert_eq!(amounts.treasury_amount, 1_300_000, "credit what was paid");
-        assert_ne!(
-            amounts.treasury_amount, ratified.treasury_amount,
-            "the ratified amount is precisely what must NOT be credited"
-        );
-        assert_eq!(
-            amounts.outputs_hash,
-            crate::coinbase_verifier::CoinbaseCommitment::outputs_hash(&mined),
-            "the settlement row must describe the chain, not the proposal"
-        );
-    }
-
-    /// Shortfall: winner's fees fell to zero, so the drift drained the treasury then the largest
-    /// node entry. Settlement follows the same deterministic path and credits what remains.
-    #[test]
-    fn shortfall_fee_drift_drains_treasury_then_nodes_and_settles_what_remains() {
-        // Shortfall 500_000 absorbed entirely by the 1_000_000 treasury.
-        let ratified = ratified_601(500_000, 1_000_000);
-        let mined = mined_601(300_000_000, 12_000_000, 500_000);
-        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
-        assert!(amounts.verified);
-        assert_eq!(amounts.treasury_amount, 500_000);
-
-        // Shortfall 2_000_000 empties the treasury and takes 1_000_000 from the node entry.
-        let ratified = ratified_601(2_000_000, 1_000_000);
-        let mined = mined_601(300_000_000, 11_000_000, 0);
-        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
-        assert!(amounts.verified);
-        assert_eq!(
-            amounts.treasury_amount, 0,
-            "the chain paid the treasury nothing"
-        );
-    }
-
-    /// A 0-value witness commitment output rides along on every real coinbase and must not
-    /// disturb verification.
-    #[test]
-    fn witness_commitment_output_does_not_break_verification() {
-        let ratified = ratified_601(500_000, 1_000_000);
-        let mut mined = mined_601(300_000_000, 12_000_000, 1_300_000);
-        mined.push(crate::coinbase_verifier::CoinbaseOutput {
-            value: 0,
-            script_pubkey: vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed],
-        });
-        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
-        assert!(amounts.verified);
-        assert_eq!(amounts.treasury_amount, 1_300_000);
-    }
-
-    /// A tagged block whose outputs are NOT the deterministic adjustment — a winner on different
-    /// code, a tampered coinbase, or a hand-mined rehearsal block. The treasury credit falls back
-    /// to direct measurement of the treasury script, never to the ratified figure.
-    #[test]
-    fn an_unreconstructable_coinbase_is_measured_not_trusted() {
-        let ratified = ratified_601(500_000, 1_000_000);
-
-        // Fallback-shaped block: one big output to the miner script, 750_000 to the treasury.
-        let mined = vec![
-            crate::coinbase_verifier::CoinbaseOutput {
-                value: 200_000_000,
-                script_pubkey: spk_601(P2WPKH),
-            },
-            crate::coinbase_verifier::CoinbaseOutput {
-                value: 750_000,
-                script_pubkey: spk_601(P2WSH),
-            },
-        ];
-        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
-        assert!(
-            !amounts.verified,
-            "this is not the adjustment of the ratified proposal"
-        );
-        assert_eq!(
-            amounts.treasury_amount, 750_000,
-            "credit what the treasury script received"
-        );
-
-        // No treasury output at all: credit nothing, not the ratified 1_000_000.
-        let mined = vec![crate::coinbase_verifier::CoinbaseOutput {
-            value: 312_500_000,
-            script_pubkey: spk_601(P2WPKH),
-        }];
-        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
-        assert!(!amounts.verified);
-        assert_eq!(amounts.treasury_amount, 0);
-    }
-
-    /// End to end through the database: `apply_settlement` books the ADJUSTED treasury amount,
-    /// and reversal restores exactly what was booked — the recorded amounts, not the ratified.
-    #[test]
-    fn apply_settlement_books_the_mined_amounts_and_reversal_inverts_them() {
-        let db = ghost_storage::Database::in_memory().expect("db");
-        let ratified = ratified_601(500_000, 1_000_000);
-        let mined = mined_601(300_000_000, 12_000_000, 1_300_000);
-
-        let applied = apply_settlement(
-            &db,
-            &ratified,
-            crate::PAYOUT_ADDRESS_GROUPING_HEIGHT,
-            "601_block",
-            Some(&mined),
-        )
-        .expect("settle")
-        .expect("applied");
-        assert_eq!(
-            applied.treasury_bumped, 1_300_000,
-            "the ledger must book what the chain paid, not the ratified 1_000_000"
-        );
-        assert_eq!(db.get_treasury_balance().expect("balance"), 1_300_000);
-
-        let reversed = db
-            .reverse_settlement("601_block")
-            .expect("reverse")
-            .expect("was settled");
-        assert_eq!(reversed.treasury_bumped, 1_300_000);
-        assert_eq!(
-            db.get_treasury_balance().expect("balance"),
-            0,
-            "reversal must debit exactly what settlement credited"
-        );
-    }
-
-    /// Without the mined coinbase in hand, behaviour is unchanged from before #601: the ratified
-    /// amounts are booked. This is the legacy path some tests rely on, and production warns on it.
-    #[test]
-    fn settling_without_the_mined_coinbase_books_the_ratified_amounts_unchanged() {
-        let db = ghost_storage::Database::in_memory().expect("db");
-        let ratified = ratified_601(500_000, 1_000_000);
-        let applied = apply_settlement(
-            &db,
-            &ratified,
-            crate::PAYOUT_ADDRESS_GROUPING_HEIGHT,
-            "601_legacy",
-            None,
-        )
-        .expect("settle")
-        .expect("applied");
-        assert_eq!(applied.treasury_bumped, 1_000_000);
     }
 }
