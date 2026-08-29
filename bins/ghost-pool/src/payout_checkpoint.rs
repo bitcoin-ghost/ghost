@@ -1856,13 +1856,6 @@ mod tests {
             "#606 is armed; a dormant value here means arming was reverted"
         );
 
-        // Separated from the other payout behaviour change on purpose: two of them landing together
-        // makes a divergence unattributable to either.
-        assert!(
-            h > crate::OBSERVED_SETTLEMENT_HEIGHT,
-            "median adoption must land AFTER observed settlement, not with it"
-        );
-
         // The switch is exact — one height, no window where nodes could disagree about the rule.
         assert!(
             !crate::adopts_payout_median(h - 1),

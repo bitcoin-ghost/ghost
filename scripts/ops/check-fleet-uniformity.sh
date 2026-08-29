@@ -185,6 +185,17 @@ for n in "${REACHED[@]}"; do
         echo "  FAIL $n extranonce2_size=$en2 (< $MIN_EXTRANONCE2_SIZE — marketplaces reject this)"
         rc=1
     fi
+    # ⛔ This gate is CORRECT, not leftover caution — do not relax it (scoped under #411,
+    # 2026-08-23). Aggregated mode is not broken and not unfinished: the translator already
+    # mints real per-downstream extranonces locally, with no upstream round trip. What is
+    # missing is that the per-share TLV carries only the WORKER NAME, not the payout address,
+    # so payout derivation has nothing per-miner to key on and every miner in the aggregate
+    # collapses onto ONE channel address. Turning this on pays the wrong people.
+    #
+    # Making it safe means moving payout derivation to the per-share TLV for every SV1 miner —
+    # a money-path change needing a height gate and a fleet roll. Deferred deliberately: the
+    # pool runs ~4 miners against a cap of 1,000, so aggregation optimises a problem it does
+    # not have. Revisit with multi-operator, when scale makes per-channel overhead real.
     agg="${VALUES[$n|aggregate]:-}"
     if [ "$agg" = "true" ]; then
         echo "  FAIL $n aggregate_channels=true (collapses per-miner channels; breaks attribution)"

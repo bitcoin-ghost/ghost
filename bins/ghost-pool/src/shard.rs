@@ -289,32 +289,6 @@ pub struct SettleReport {
     pub deferred: usize,
 }
 
-/// How far the shard's balances have drifted from the legacy ledger's.
-///
-/// This is the soak signal the cutover is judged on: if the two agree, a coinbase built from the
-/// shard pays what the coinbase built from the ledger would have paid, and the switch is safe. If
-/// they disagree, the disagreement is visible here BEFORE any money moves rather than afterwards.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DriftReport {
-    /// Addresses both sides know, whose micro-work totals differ, with `shard − ledger`.
-    pub differing: Vec<(String, i64)>,
-    /// Addresses the shard credits that the legacy ledger does not.
-    pub only_shard: Vec<String>,
-    /// Addresses the legacy ledger credits that the shard does not.
-    pub only_ledger: Vec<String>,
-    /// Addresses agreeing exactly. The number that should be ~everything.
-    pub agreeing: usize,
-    /// Net `shard − ledger` across every address, in micro-work.
-    pub net_micro: i64,
-}
-
-impl DriftReport {
-    /// Whether the two ledgers agree completely.
-    pub fn is_clean(&self) -> bool {
-        self.differing.is_empty() && self.only_shard.is_empty() && self.only_ledger.is_empty()
-    }
-}
-
 /// The shard's view on this node: the merged table, plus the fold watermark.
 pub struct ShardRuntime {
     identity: Arc<NodeIdentity>,
@@ -845,18 +819,6 @@ impl ShardRuntime {
         self.table.lock().owed()
     }
 
-    /// Compare the shard's balances against the legacy unpaid ledger.
-    ///
-    /// ⚠ **Call this once per EPOCH, never per tick.** It runs `get_top_unpaid_addresses`, which is
-    /// the 2.76M-row, ~1.6 s scan already running at roughly 40% duty on the propose and vote
-    /// paths — the very load this design exists to delete. Hourly it is lost in the noise; every
-    /// thirty seconds it would be a meaningful share of the node, and we would have rebuilt the
-    /// problem while measuring the cure for it.
-    ///
-    /// Compares in integer micro-work, converted the same way [`micro_work`] converts, so a
-    /// difference here is a real difference and not a rounding artefact of the comparison.
-    ///
-    /// [`micro_work`]: ghost_common::work_fold::micro_work
     /// Build this node's §12.6 whole-table sync REQUEST.
     ///
     /// Carries our own root so the responder can see the drift too — either side can log it.
@@ -1512,39 +1474,6 @@ impl ShardRuntime {
         }
     }
 
-    pub fn drift_against_legacy_ledger(&self, cutoff_ts: i64) -> GhostResult<DriftReport> {
-        let ledger = self.db.get_top_unpaid_addresses(cutoff_ts, u32::MAX)?;
-        let ledger: BTreeMap<String, i64> = ledger
-            .into_iter()
-            .map(|(addr, work, _)| (addr, ghost_common::work_fold::micro_work(work)))
-            .collect();
-
-        let owed = self.table.lock().owed();
-        let mut report = DriftReport::default();
-
-        for (addr, &shard_micro) in &owed {
-            match ledger.get(addr) {
-                Some(&ledger_micro) if ledger_micro == shard_micro => report.agreeing += 1,
-                Some(&ledger_micro) => {
-                    let delta = shard_micro.saturating_sub(ledger_micro);
-                    report.net_micro = report.net_micro.saturating_add(delta);
-                    report.differing.push((addr.clone(), delta));
-                }
-                None => {
-                    report.net_micro = report.net_micro.saturating_add(shard_micro);
-                    report.only_shard.push(addr.clone());
-                }
-            }
-        }
-        for (addr, &ledger_micro) in &ledger {
-            if !owed.contains_key(addr) {
-                report.net_micro = report.net_micro.saturating_sub(ledger_micro);
-                report.only_ledger.push(addr.clone());
-            }
-        }
-        Ok(report)
-    }
-
     /// Record the height seen on a template refresh. Returns true iff this height crossed into
     /// a new epoch.
     ///
@@ -1852,7 +1781,7 @@ impl ShardRuntime {
         let mut skipped_unreadable = Vec::new();
         for height in from..=to {
             let read = match rpc.get_block_hash(height).await {
-                Ok(hash) => crate::settlement::fetch_coinbase_parts(rpc, &hash)
+                Ok(hash) => crate::coinbase_verifier::fetch_coinbase_parts(rpc, &hash)
                     .await
                     .map(|(scriptsig, outputs)| FetchedCoinbase {
                         block_hash: hash,
@@ -2186,6 +2115,26 @@ impl ShardRuntime {
             discharged_micro = settlement.discharged_micro,
             "share shard: settled a matured pool block"
         );
+        // `blocks_found` (public API) counts `won_blocks`, and until now the ONLY writer was
+        // `settle_paid_block` on the node that submitted the block. Every other node reported
+        // zero for a block the pool genuinely won, so the number meant "blocks I submitted",
+        // not "blocks the pool found" — and which node that was is an accident of timing.
+        //
+        // Recording it here makes every node agree, because this path is chain-derived: each
+        // node reaches it from the same coinbase at the same maturity. It also needs no reorg
+        // reversal, which the tip-time writer does need — a block COINBASE_MATURITY deep is
+        // not coming back. `INSERT OR IGNORE` keeps the two writers idempotent against each
+        // other on the winning node.
+        //
+        // The cost is a ~16-hour lag before a win appears. That is the honest number: it
+        // counts blocks whose coins exist and are spendable.
+        if let Err(e) = self.db.record_won_block(height) {
+            warn!(
+                error = %e,
+                height,
+                "share shard: settled a matured block but could not record the win —                  `blocks_found` will under-report on this node"
+            );
+        }
         Ok(SettleBlockOutcome::Settled(settlement))
     }
 }
@@ -3424,6 +3373,66 @@ mod tests {
             rt2.settle_block_from_coinbase(702, "00aa", 602, &sig, &outs)
                 .expect("re-run after restart"),
             SettleBlockOutcome::AlreadySettled
+        );
+    }
+
+    /// `blocks_found` must count what the POOL won, not what this node happened to submit.
+    ///
+    /// The only writer used to be `settle_paid_block`, which runs on the submitting node alone —
+    /// so seven of eight nodes reported 0 for a block the pool genuinely won, and which node
+    /// reported 1 was an accident of who got the share in first. This asserts the chain-derived
+    /// path records it too, and that doing so stays idempotent: the winning node reaches BOTH
+    /// writers for the same height and must still count one.
+    #[test]
+    fn a_settled_block_is_counted_as_a_win_on_every_node_and_only_once() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            0,
+            "nothing settled yet — a fresh node must not claim a win"
+        );
+
+        let sig = tagged_scriptsig();
+        let outs = pay(&[(ADDR_A, 250_000)]);
+
+        // Immature first: a win that cannot be counted yet must not be counted early.
+        assert_eq!(
+            rt.settle_block_from_coinbase(701, "00cc", 602, &sig, &outs)
+                .expect("attempt"),
+            SettleBlockOutcome::Immature
+        );
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            0,
+            "an immature block is not a win yet — a reorg can still take it"
+        );
+
+        // At maturity it settles and counts.
+        rt.settle_block_from_coinbase(702, "00cc", 602, &sig, &outs)
+            .expect("settle at maturity");
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            1,
+            "a matured, settled pool block is a win on this node"
+        );
+
+        // The submitting node also runs `settle_paid_block`, which writes the same height.
+        db.record_won_block(602).expect("winner's own writer");
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            1,
+            "both writers naming the same height must count one win, not two"
+        );
+
+        // A re-run of settlement (restart, cursor rewind) must not inflate it either.
+        rt.settle_block_from_coinbase(702, "00cc", 602, &sig, &outs)
+            .expect("re-run");
+        assert_eq!(
+            db.get_blocks_found_count().expect("count"),
+            1,
+            "re-settling the same block must not manufacture a second win"
         );
     }
 
