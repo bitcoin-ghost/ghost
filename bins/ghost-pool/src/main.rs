@@ -84,22 +84,6 @@ use ghost_pool::treasury::TreasuryState;
 /// Used when config is updated via API and requires restart to apply
 const EXIT_CODE_RESTART: i32 = 100;
 
-/// Block height at which the payout proposal switches from per-`miner_id` grouping to
-/// per-`payout_address` grouping.
-///
-/// Below this height: a user running N workers under one address takes N coinbase output
-/// slots. At/above this height: their unpaid work is summed across workers and they take
-/// ONE slot — freeing the rest for other miners.
-///
-/// This is a BFT-voted payout calculation. If any node uses a different algorithm than its
-/// peers, its proposal diverges and never reaches the 67 % supermajority. Baking the
-/// activation as a block-height gate (not a feature flag) means every node makes the same
-/// decision at the same block. See `tasks/plan_payout_address_grouping.md` for the rollout.
-///
-/// Defined in the library so that the proposer and the GHOST-02 validator — which must
-/// group the ledger identically — cannot drift apart. Re-exported here for the binary.
-use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
-
 /// Trailing window for the per-node realized hashrate gossiped in health pings
 /// and summed into the mesh-wide pool total. 10 minutes smooths small-miner
 /// share variance while still tracking real changes within a few minutes.
@@ -3683,7 +3667,7 @@ async fn main() -> Result<()> {
         let oracle_c = block_hash_oracle.clone();
         let shard_c = Arc::clone(&shard_for_checkpoint);
         Arc::new(move |cutoff_ts, height| {
-            let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
+            // (the block subsidy was only needed by the legacy ledger source, removed in Stage 6)
             // #722: at and above the gate the miner half comes from the SHARD, not the legacy
             // unpaid ledger. v56 disabled the GHOST-03 sweep that repaired `shares` while this
             // computation kept reading it, so its holes became permanent and no two nodes could
@@ -3716,8 +3700,19 @@ async fn main() -> Result<()> {
                 }
                 ghost_pool::payout::select_shard_miner_work(&rt.owed_snapshot())
             } else {
-                ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
-                    .ok()?
+                // Stage 6: the legacy ledger source is gone. Below the gate there is nothing to
+                // fall back TO, so abstain loudly rather than compute a root from a source that
+                // no longer exists.
+                //
+                // ⚠ Unreachable in practice — `CHECKPOINT_FROM_SHARD_HEIGHT` (963,388) passed on
+                // 2026-08-21, so no live height takes this arm. The branch survives only until
+                // the tip-keyed gate collapse removes the gate itself, which is a later release.
+                error!(
+                    height,
+                    "checkpoint: below CHECKPOINT_FROM_SHARD_HEIGHT, whose legacy source was \
+                     removed in the Stage 6 deletion — abstaining"
+                );
+                return None;
             };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()));
@@ -4429,57 +4424,6 @@ async fn main() -> Result<()> {
                             remaining = report.remaining,
                             "shard: folded closed epochs"
                         );
-
-                        // The soak signal, run ONCE PER EPOCH because a fold happens once per
-                        // epoch — never on the tick itself. It scans the legacy unpaid ledger,
-                        // which is the ~1.6 s query already running at ~40% duty on the propose
-                        // and vote paths; hourly it is lost in the noise, every 30 s it would
-                        // rebuild the load this design exists to remove.
-                        match rt.drift_against_legacy_ledger(chrono::Utc::now().timestamp()) {
-                            Ok(d) if d.is_clean() => info!(
-                                agreeing = d.agreeing,
-                                "shard: balances agree with the legacy ledger exactly"
-                            ),
-                            Ok(d) => {
-                                // Name WHICH addresses drift and by how much, largest first.
-                                //
-                                // `differing` has carried these deltas all along and only the
-                                // COUNT was logged, so "net_micro=-355e12" could not be attributed
-                                // to anything. The build doc records the drift as flat at
-                                // -87.3e12 (-0.117%); it is now -355e12 (-0.464%), a 4.1x growth
-                                // the documented causes — genesis truncation and the epoch floor —
-                                // are both one-off and bounded, so cannot explain. Four hypotheses
-                                // (tier filter, fold starvation, era boundary, sub-tier work) were
-                                // each killed by measurement while this line withheld the answer.
-                                //
-                                // Addresses are reported as the SHA-256 handle, never plaintext:
-                                // it is stable across nodes so a delta can be followed fleet-wide,
-                                // and it keeps the address↔miner link out of the log.
-                                use sha2::{Digest, Sha256};
-                                let mut worst = d.differing.clone();
-                                worst.sort_by_key(|(_, delta)| *delta);
-                                let detail: Vec<String> = worst
-                                    .iter()
-                                    .take(5)
-                                    .map(|(addr, delta)| {
-                                        format!(
-                                            "{}:{delta}",
-                                            hex::encode(&Sha256::digest(addr.as_bytes())[..6])
-                                        )
-                                    })
-                                    .collect();
-                                warn!(
-                                    agreeing = d.agreeing,
-                                    differing = d.differing.len(),
-                                    only_shard = d.only_shard.len(),
-                                    only_ledger = d.only_ledger.len(),
-                                    net_micro = d.net_micro,
-                                    worst_addresses = %detail.join(","),
-                                    "shard: DRIFT against the legacy ledger"
-                                );
-                            }
-                            Err(e) => warn!(error = %e, "shard: drift comparison failed"),
-                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -4720,8 +4664,9 @@ async fn main() -> Result<()> {
     }
 
     // Component A sweep: rotate through bounded windows of the verification
-    // ledger, advertising the keys we hold so peers backfill what we lack. Mirrors
-    // the GHOST-03 ledger sweep. One 1-hour bucket per tick keeps each request a
+    // ledger, advertising the keys we hold so peers backfill what we lack. This is a
+    // SEPARATE subsystem from the GHOST-03 unpaid-ledger sweep deleted in Stage 6 —
+    // it reconciles capability-challenge verdicts. One 1-hour bucket per tick keeps a request a
     // sane size; the rotation covers the trailing 7 days that qualification reads.
     {
         let vconv_handler = Arc::clone(&verification_result_handler);
@@ -4869,114 +4814,10 @@ async fn main() -> Result<()> {
         let conv_handler = Arc::clone(&convergence_handler);
         let rm_for_conv = Arc::clone(&round_manager);
         let conv_tx = conv_tx.clone();
-        let db_for_conv = Arc::clone(&db);
-        // Latched once, here, rather than read per tick: `owns_evidence` is fixed for the life
-        // of the runtime, and a per-tick lock on the shard from the convergence loop would be a
-        // new lock-ordering edge for no benefit.
-        let shard_owns_evidence = shard.as_ref().is_some_and(|s| s.owns_evidence());
-        if shard_owns_evidence {
-            info!(
-                "GHOST-03: ledger sweep DISABLED — the shard owns `shares` (migration v56), so \
-                 the legacy unpaid ledger is no longer this node's to repair"
-            );
-        }
         tokio::spawn(async move {
             const CONVERGENCE_INTERVAL_SECS: u64 = 30;
-
-            // GHOST-03 ledger sweep. The round-scoped exchange only ever repairs the round in
-            // flight, and rounds rotate every ~90s with signed proofs pruned after 10 of them —
-            // so anything dropped outside a ~15-minute window was unrecoverable and the ledgers
-            // diverged permanently. Since the payout is computed from the unpaid ledger and
-            // GHOST-02 compares the split for EXACT equality, that divergence means every node
-            // rejects every payout with nothing able to repair it.
-            //
-            // So we also sweep the unpaid ledger in bounded windows, one bucket per tick,
-            // rotating back through `LEDGER_SWEEP_SPAN_SECS`. Bucketing keeps each advertisement
-            // a sane size; the rotation covers the whole span.
-            const LEDGER_BUCKET_SECS: i64 = 1_800; // 30 min per advertisement
-
-            // The span must cover the UNPAID HORIZON, not a fixed number of days.
-            //
-            // It was 7 days, and that was still too short. The window SLIDES, so a hole ages out
-            // of it whether or not it was repaired first — measured on 2026-07-30, vm7 had 6,121
-            // shares frozen on 07-20, 3,552 on 07-21, and 4,321 on 07-22 that had aged out
-            // MID-REPAIR (that day was 4,397 and had come down by only 76 before the boundary
-            // passed it). Meanwhile 07-25, still inside the window, went 17,862 -> 9,404. So the
-            // mechanism works and simply loses the race against its own boundary.
-            //
-            // The payout ledger compares EVERY unpaid share, and nothing has settled since
-            // 2026-06-02 (won_blocks = 0, see #556), so the horizon is ~2 months and growing. A
-            // fixed span can never track that. Derive it from the oldest unpaid share instead,
-            // with a cap so a pathological backlog cannot make the rotation unbounded.
-            const LEDGER_SPAN_MIN_SECS: i64 = 7 * 86_400;
-            const LEDGER_SPAN_MAX_SECS: i64 = 90 * 86_400;
-            // Fast lane: recent holes must not wait for a full long rotation. Every other tick
-            // sweeps within the last day, so a fresh drop is still repaired within ~24 min while
-            // the long rotation guarantees everything is eventually reached.
-            const LEDGER_RECENT_SPAN_SECS: i64 = 86_400;
-            const LEDGER_RECENT_BUCKETS: i64 = LEDGER_RECENT_SPAN_SECS / LEDGER_BUCKET_SECS;
-
-            // Max share hashes in ONE request. The request advertises every unpaid hash in its
-            // window and nothing bounded it, so a busy 30-minute bucket (~5,800 hashes) built a
-            // 1.58 MB message against the 1 MB cap and was dropped BEFORE reaching a peer —
-            // silently, since an undelivered request produces neither an error nor a discard
-            // count. Repair worked in thin buckets and stalled exactly where divergence was.
-            //
-            // Measured: 3,000 hashes -> 817 KB as an envelope, 5,799 -> 1,577,942 bytes. This is
-            // the request-side twin of the response bound in #559/#561/#562.
-            const MAX_HASHES_PER_REQUEST: i64 = 3_000;
-
-            // How many long-lane buckets to enqueue per tick.
-            //
-            // One bucket per long tick means the cursor walks 30 minutes of history per
-            // minute of wall-clock. Measured on vm7 2026-07-30: after 95 minutes of uptime
-            // the sweep had reached only 47 hours back, and the divergent region (07-25, five
-            // days back) needs FOUR HOURS from a cold start before it is even looked at. A
-            // full rotation over the ~58-day unpaid horizon takes 46 hours.
-            //
-            // There is no server-side throttle on serving these requests, so fan-out is the
-            // lever. 12 buckets per long tick covers 6 hours of history per minute — a full
-            // horizon sweep in ~4 hours instead of 46 — and each request is bounded by
-            // MAX_HASHES_PER_REQUEST, so the wire cost stays flat.
-            //
-            // Was 12. That made the rotation 12x faster but the binding constraint was never
-            // visits-per-hour — it was proofs-per-visit, which the truncation signal now fixes
-            // directly (#558). 12 cost real capacity for nothing: vm5's `/health` went from
-            // sub-millisecond to 10.06s, having read 887 GB since restart at 36% CPU with
-            // 1,329 MB available, because each tick runs 12x the ledger queries against a
-            // 2.6 GB database on a node whose working set already exceeds RAM (#556).
-            //
-            // 4 keeps a useful improvement on the original 46-hour rotation (~11.6h) at a third
-            // of the query load. With truncation now drained in-place, rotation speed only
-            // governs how quickly a NEW hole is discovered, not how long one takes to clear.
-            const LONG_BUCKETS_PER_TICK: i64 = 4;
-            /// Hard cap on requests emitted in one tick. Sized above LONG_BUCKETS_PER_TICK so a
-            /// tick's buckets are never silently dropped, with room for windows that split.
-            const MAX_REQUESTS_PER_TICK: usize = 24;
-
-            // Where the cursor is persisted. A restart used to reset it to bucket 0, throwing
-            // away the entire walk-back: five deploys on 2026-07-30 each cost up to 46 hours of
-            // traversal, which is why repair appeared to stall for a whole day.
-            const SWEEP_CURSOR_KEY: &str = "ghost03.ledger_sweep.bucket";
-
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
-            // Resume the cursor rather than restarting the walk-back on every process start.
-            let mut bucket: i64 = db_for_conv
-                .kv_get(SWEEP_CURSOR_KEY)
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            if bucket != 0 {
-                info!(
-                    bucket,
-                    "GHOST-03: resuming ledger sweep from persisted cursor"
-                );
-            }
-            let mut recent_bucket: i64 = 0;
-            let mut long_lane = true;
-
             loop {
                 ticker.tick().await;
 
@@ -4985,142 +4826,6 @@ async fn main() -> Result<()> {
                 if let Ok(bytes) = conv_handler.request_bytes(round_id) {
                     // An advertisement: every peer is a legitimate recipient, so it fans out.
                     conv_tx.enqueue(bytes, None).await;
-                }
-
-                // The ledger sweep repairs the LEGACY unpaid ledger, and since migration v56
-                // there is no longer one to repair: `shares_archive` is frozen and never
-                // advertised, while `shares` holds only the retention window.
-                //
-                // Leaving it running is not merely wasteful, it is actively harmful. The sweep
-                // advertises the unpaid hashes it can see — a few HOURS of them — across a span
-                // clamped to a 7-DAY minimum (`LEDGER_SPAN_MIN_SECS`). Every peer therefore
-                // concludes this node is missing a week of shares and tries to serve all of it
-                // back. Measured on 2026-08-18, the hour the cutover landed: inbound
-                // `ShareConvergence` went from 0/h to 691/h on ghost-vm7 and 322/h on ghost-vm6,
-                // saturating the convergence channel (#647) and pushing `/health` to 14-15s.
-                //
-                // Nothing was corrupted — the `shares_all` guard in `import_unpaid_shares*`
-                // refused every re-offered row, which is precisely why it exists — but the
-                // traffic bought nothing. `SHARE_SHARD_BUILD.md` always said the sweep switches
-                // off at the flip; this is that switch, and it is why it cannot wait for the
-                // Stage 6 deletion release.
-                //
-                // The round-in-flight repair above is deliberately KEPT: it is one request per
-                // tick, scoped to the current round, and is not what floods.
-                if shard_owns_evidence {
-                    continue;
-                }
-
-                // Repair one window of the unpaid ledger (the slow path that actually keeps the
-                // ledgers converged), alternating between the long rotation over the whole
-                // unpaid horizon and a fast lane over the last day.
-                let now = chrono::Utc::now().timestamp();
-
-                // Span tracks the oldest unpaid share, clamped. Cheap query, and it must be
-                // re-read rather than cached: the horizon grows for as long as nothing settles.
-                //
-                // Anchored to the oldest SERVABLE share, not the oldest unpaid one. Pre-v41
-                // shares carry no proof and can never be served, so buckets holding only those
-                // have no reachable outcome — walking them is pure cost. 63% of the unpaid
-                // ledger was in that class on 2026-07-31, which put ~2,500 dead buckets (~12 h)
-                // in front of every rotation. See `oldest_servable_unpaid_share_timestamp`.
-                let servable_oldest = db_for_conv
-                    .oldest_servable_unpaid_share_timestamp()
-                    .ok()
-                    .flatten();
-                let span = servable_oldest
-                    .map(|oldest| (now - oldest).clamp(LEDGER_SPAN_MIN_SECS, LEDGER_SPAN_MAX_SECS))
-                    .unwrap_or(LEDGER_SPAN_MIN_SECS);
-                let long_buckets = (span / LEDGER_BUCKET_SECS).max(1);
-
-                // Report how much history the anchor skipped, once per rotation. Without this
-                // the saving is invisible: a shorter span and a stalled sweep look identical
-                // from outside, which is how #558 stayed unexplained for days.
-                if bucket == 0 {
-                    let unpaid_oldest = db_for_conv
-                        .oldest_unpaid_share_timestamp()
-                        .ok()
-                        .flatten()
-                        .unwrap_or(now);
-                    let skipped = servable_oldest.unwrap_or(now).saturating_sub(unpaid_oldest);
-                    info!(
-                        span_hours = span / 3_600,
-                        long_buckets,
-                        dead_prefix_hours = skipped / 3_600,
-                        "GHOST-03: sweep span anchored to oldest servable share"
-                    );
-                }
-
-                // Collect this tick's windows. The long lane advances several buckets at
-                // once so the horizon is traversed in hours rather than days; the recent lane
-                // stays at one bucket because it is already covered every other tick.
-                let mut lane_windows: Vec<(i64, i64)> = Vec::new();
-                if long_lane {
-                    for _ in 0..LONG_BUCKETS_PER_TICK {
-                        let until = now - bucket * LEDGER_BUCKET_SECS;
-                        lane_windows.push((until - LEDGER_BUCKET_SECS, until));
-                        bucket = (bucket + 1) % long_buckets;
-                    }
-                    // Persist after advancing so a restart resumes here, not at bucket 0.
-                    if let Err(e) = db_for_conv.kv_set(SWEEP_CURSOR_KEY, &bucket.to_string()) {
-                        debug!(error = %e, "GHOST-03: could not persist sweep cursor");
-                    }
-                } else {
-                    let until = now - recent_bucket * LEDGER_BUCKET_SECS;
-                    lane_windows.push((until - LEDGER_BUCKET_SECS, until));
-                    recent_bucket = (recent_bucket + 1) % LEDGER_RECENT_BUCKETS;
-                }
-                long_lane = !long_lane;
-
-                // #558: log the outbound sweep request. A silent client and a client whose
-                // requests are all answered "nothing to serve" produced identical logs, so
-                // there was no way to tell a broken sweep from a converged one.
-                // Split the window until each request fits on the wire. A window with more
-                // than MAX_HASHES_PER_REQUEST hashes is halved repeatedly; each sub-window is
-                // sent separately. Without this the busiest windows — the ones actually holding
-                // divergence — produced messages no peer ever received.
-                let mut windows: Vec<(i64, i64)> = lane_windows;
-                let mut sent = 0usize;
-                while let Some((ws, wu)) = windows.pop() {
-                    let n = db_for_conv.count_unpaid_shares_in(ws, wu).unwrap_or(0);
-                    if n > MAX_HASHES_PER_REQUEST && wu - ws > 1 {
-                        let mid = ws + (wu - ws) / 2;
-                        windows.push((ws, mid));
-                        windows.push((mid, wu));
-                        continue;
-                    }
-                    if n == 0 {
-                        continue; // nothing to advertise in this slice
-                    }
-                    match conv_handler.ledger_request_bytes(ws, wu) {
-                        Ok(bytes) => {
-                            tracing::debug!(
-                                since = ws,
-                                until = wu,
-                                advertised = n,
-                                bytes = bytes.len(),
-                                "GHOST-03: window convergence request sent"
-                            );
-                            conv_tx.enqueue(bytes, None).await;
-                            sent += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, since = ws, until = wu,
-                                "GHOST-03: could not build window convergence request");
-                        }
-                    }
-                    // Bound the fan-out from one tick so a pathological window cannot flood.
-                    // Must exceed LONG_BUCKETS_PER_TICK or the extra buckets are enqueued and
-                    // then silently dropped, which would make the faster traversal a no-op.
-                    // Headroom above it covers windows that split into several requests.
-                    if sent >= MAX_REQUESTS_PER_TICK {
-                        debug!(
-                            sent,
-                            remaining = windows.len(),
-                            "GHOST-03: sweep fan-out cap reached this tick"
-                        );
-                        break;
-                    }
                 }
             }
         });
@@ -7599,24 +7304,18 @@ async fn main() -> Result<()> {
         Arc::clone(&identity),
         payout_config.clone(),
         Arc::clone(&db),
-        Arc::clone(&vote_handler),
         Arc::clone(&template_processor),
         Arc::clone(&qualification_provider_for_health), // Reuse provider from health_handler
-        config.network.mining_mode,
     )?);
 
-    // GHOST-02: install the ledger-recompute validator on the vote handler now
-    // that the PayoutHandler exists. A peer's payout proposal is vote-approved
-    // only if its split matches what THIS node recomputes from its own converged
-    // share ledger (GHOST-03) and converged payout addresses (Option A).
-    {
-        let validator = ghost_pool::payout::make_proposal_validator(
-            Arc::clone(&payout_handler),
-            Arc::clone(&db),
-            ghost_pool::cluster_enforcement_height(),
-        );
-        vote_handler.set_proposal_validator(validator);
-    }
+    // Stage 6: the GHOST-02 ledger-recompute validator is gone with the payout vote.
+    //
+    // It only ever judged PAYOUT proposals — recomputing a peer's split from this node's own
+    // ledger and demanding an exact match. Above `PAYOUT_FROM_SHARD_HEIGHT` no payout proposal
+    // is broadcast at all, so there is nothing for it to judge.
+    //
+    // ⚠ The vote handler itself STAYS. Elder revocation still proposes BFT revocation votes,
+    // and those are a different proposal type that this validator never inspected.
 
     // Phase 4: install the active-voter-set resolver. Below ACTIVE_VOTER_SET_HEIGHT it returns
     // None and the vote handler keeps using the static MPC elder set. At and above it, the
@@ -8938,69 +8637,16 @@ async fn main() -> Result<()> {
                     "Block submitted to Ghost Core, creating payout proposal..."
                 );
 
-                // SETTLE THE LEDGER — the coins now exist.
+                // Settlement is the SHARD's, and it happens at COINBASE_MATURITY — not here, and
+                // not at tip. Stage 6 removed the tip-time settler entirely.
                 //
-                // This block's coinbase carries the payout named by the snapshot its template
-                // was built against, so THIS is the moment the miners in that payout are
-                // genuinely paid, and the only safe moment to mark their shares paid.
+                // Marking shares paid the moment a block is submitted means settling a payment a
+                // reorg can still undo, which is why the deleted path needed `reverse_settlement`
+                // and a deferred-settlement table to go with it. Settling 100 blocks deep needs
+                // none of that, and `ShareShard::settle_matured` reaches the same conclusion from
+                // the same evidence — the coinbase — on EVERY node rather than only this one.
                 //
-                // Settling used to happen on consensus approval, which merely arms the coinbase
-                // of some future block. A `None` snapshot means this block paid the fallback
-                // coinbase and settles nothing.
-                if let Some(snapshot) = info.payout_snapshot {
-                    match tp_for_block.get_proposal(&snapshot) {
-                        Some(paid) => {
-                            // #601: settle from the coinbase that was actually MINED, not from
-                            // the ratified proposal — this node's coinbase carries its own
-                            // fee-drift adjustment, so the treasury amount the chain paid is not
-                            // the one the fleet ratified. Every observing node derives the same
-                            // amounts from the same on-chain coinbase, so the fleet still
-                            // converges. A parse failure falls back to the ratified amounts
-                            // (loudly) rather than not settling at all — under-settling is the
-                            // double-payment path.
-                            let mined_outputs =
-                                ghost_pool::coinbase_verifier::CoinbaseOutput::parse_from_coinbase(
-                                    &info.coinbase,
-                                )
-                                .map_err(|e| {
-                                    error!(
-                                        error = %e,
-                                        "could not parse our own submitted coinbase — settling \
-                                         from the ratified proposal instead"
-                                    );
-                                })
-                                .ok();
-                            // The block hash keys the settlement, so this node's immediate settle
-                            // and the same block's later observation by every other node collapse
-                            // onto one row instead of applying twice.
-                            if let Err(e) = ghost_pool::payout::settle_paid_block(
-                                &db_for_block,
-                                &paid,
-                                PAYOUT_ADDRESS_GROUPING_HEIGHT,
-                                &hex::encode(info.block_hash),
-                                mined_outputs.as_deref(),
-                            ) {
-                                error!(
-                                    error = %e,
-                                    hash = %hex::encode(&snapshot[..8]),
-                                    "Failed to settle the ledger for a PAID block — its miners' \
-                                     shares remain unpaid and will be swept again next block"
-                                );
-                            }
-                        }
-                        None => error!(
-                            hash = %hex::encode(&snapshot[..8]),
-                            "Block paid a payout proposal we no longer hold; cannot settle the \
-                             ledger — those shares will be paid twice unless reconciled"
-                        ),
-                    }
-                } else {
-                    warn!(
-                        height = info.height,
-                        "Block carried the FALLBACK coinbase (no approved payout was armed when \
-                         its template was built) — the miners were not paid from this block"
-                    );
-                }
+                // The submitting node is not special here any more, and that is the point.
 
                 // Gather data for payout proposal
                 let node_shares = rm_for_block.get_node_shares(round_id);
@@ -10627,28 +10273,26 @@ async fn main() -> Result<()> {
             .with_chain_health(Arc::clone(&verification_state.chain_health))
             .with_height_getter(move || rm_for_reorg.current_height());
         reorg_handler.start(block_events);
-
-        // Settle won blocks by observing the chain, on EVERY node rather than only the one that
-        // submitted the block. Takes its own subscription rather than extending ReorgHandler:
-        // that handler's job is round orphaning and alerts, and settlement failing should not take
-        // reorg detection down with it.
+        // Stage 6: the SettlementObserver is DELETED. It settled the LEGACY unpaid ledger from
+        // an observed coinbase at tip, and existed because the seven non-winning nodes would
+        // otherwise still owe work the pool had paid — and, being the majority, would carry that
+        // view into the next BFT proposal and pay it twice.
         //
-        // Below `OBSERVED_SETTLEMENT_HEIGHT` this matches and logs without writing, so the dry run
-        // proves matching works before the ledger behaviour changes fleet-wide.
+        // Release B removes the vote, so there is no majority view to poison, and the shard is
+        // the only ledger a payout is built from. The shard settles the same way from the same
+        // evidence — `ShareShard::settle_matured`, chain-derived, on every node — but at
+        // COINBASE_MATURITY rather than at tip. That depth is what lets it carry no reversal
+        // machinery at all: the tip-time settler needed `reverse_settlement` for reorgs, and a
+        // block 100 deep is not coming back.
+        //
+        // The 100-block window in which `owed` still counts work already paid is deliberate,
+        // not a gap: `owed` is signed and never clamped, so a second payment inside the window
+        // leaves a residual the next block corrects (SHARE_SHARD.md §4.4, §4.6).
+        //
+        // The proposal-sync handler below OUTLIVES it on purpose. It answers peers as well as
+        // asking, and a node still on a pre-Stage-6 binary needs those answers to settle at all.
+        // Retire it once no fleet binary can ask.
         {
-            use ghost_pool::settlement::{SettleOutcome, SettlementObserver};
-
-            let mut settlement_events = zmq_subscriber.subscribe_block_events();
-            let rm_for_settlement = Arc::clone(&round_manager);
-
-            // Recovering a proposal a won block names but this node never received. Proposals are
-            // gossiped once and never rebroadcast, so a node that was down at that moment cannot
-            // settle the block at all — it keeps owing work the pool has already paid.
-            //
-            // Registered on the mesh so this node both asks and answers: the recovery only works
-            // because the peers that do hold the proposal serve it unprompted. The fetch needs no
-            // trust — the coinbase names the payout, and a response is accepted only if it hashes
-            // to that identity.
             let (psync_tx, mut psync_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
             {
                 let mesh_for_psync = Arc::clone(&mesh);
@@ -10684,118 +10328,6 @@ async fn main() -> Result<()> {
             );
             mesh.register_handler(Arc::clone(&proposal_sync)
                 as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-            let observer = Arc::new(
-                SettlementObserver::new(
-                    Arc::clone(&db),
-                    Arc::clone(&rpc),
-                    PAYOUT_ADDRESS_GROUPING_HEIGHT,
-                    ghost_pool::observed_settlement_height(),
-                )
-                .with_proposal_sync(Arc::clone(&proposal_sync)),
-            );
-
-            // Waking reconciliation early, when the event loop knows it has fallen behind.
-            let reconcile_wake = Arc::new(tokio::sync::Notify::new());
-
-            // Reconciliation is the safety net under the event stream, and it runs on a timer
-            // rather than only at startup.
-            //
-            // Two holes need it while the node is up, not just after a restart. A proposal fetched
-            // from a peer arrives *after* its block was observed, so something has to come back and
-            // settle it; and a lagged broadcast receiver drops events outright. Leaving either to
-            // the next restart would mean the ledger self-heals only when an operator happens to
-            // deploy, which is the same as not self-healing.
-            //
-            // Both passes are idempotent and cursor-driven, so a tick in steady state costs one or
-            // two block reads.
-            let reconcile_observer = Arc::clone(&observer);
-            let reconcile_woken = Arc::clone(&reconcile_wake);
-            let db_for_recheck = Arc::clone(&db);
-            let rm_for_recheck = Arc::clone(&round_manager);
-            tokio::spawn(async move {
-                const RECONCILE_INTERVAL_SECS: u64 = 300;
-                let period = std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS);
-                // Start the timer one period out: the loop reconciles before it waits, so the
-                // startup pass is the first iteration rather than a separate task.
-                let mut ticker =
-                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    if let Err(e) = reconcile_observer.reconcile().await {
-                        warn!(error = %e, "settlement reconciliation failed");
-                    }
-                    // Same tick, same reason: a share whose coinbase skeleton had not arrived was
-                    // judged with the evidence missing, and must be re-judged once it is there.
-                    // Sharing the tick keeps one place that repairs what the live paths could not.
-                    if let Err(e) = ghost_pool::binding_recheck::recheck_bindings(
-                        &db_for_recheck,
-                        rm_for_recheck.current_height(),
-                        // The batch chain finalises nothing yet, so skeletons are released on
-                        // the reorg floor alone. Once it runs, this carries its head.
-                        None,
-                    )
-                    .await
-                    {
-                        warn!(error = %e, "share-binding recheck failed");
-                    }
-                    tokio::select! {
-                        _ = ticker.tick() => {}
-                        _ = reconcile_woken.notified() => {
-                            debug!("settlement reconciliation woken early");
-                        }
-                    }
-                }
-            });
-
-            tokio::spawn(async move {
-                loop {
-                    match settlement_events.recv().await {
-                        Ok(ghost_common::zmq::BlockEvent::Connected { hash }) => {
-                            let height = rm_for_settlement.current_height();
-                            match observer.on_block_connected(&hash, height).await {
-                                SettleOutcome::Settled(applied) => info!(
-                                    block = %hash,
-                                    shares_marked = applied.shares_marked,
-                                    treasury_sats = applied.treasury_bumped,
-                                    "settled a won block observed on-chain"
-                                ),
-                                SettleOutcome::ProposalMissing { payout_id } => warn!(
-                                    block = %hash,
-                                    payout_id = %hex::encode(payout_id),
-                                    "observed a block carrying our payout tag but hold no matching \
-                                     proposal — requested it and deferred the block for retry"
-                                ),
-                                SettleOutcome::DryRunMatch { .. }
-                                | SettleOutcome::AlreadySettled
-                                | SettleOutcome::NotOurs => {}
-                            }
-                        }
-                        Ok(ghost_common::zmq::BlockEvent::Disconnected { hash }) => {
-                            observer.on_block_disconnected(&hash);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            // Dropped events mean a won block may have gone unseen. The forward
-                            // scan covers exactly that, so wake it now instead of leaving the hole
-                            // open until the next tick — a log line here would be a report of a
-                            // problem nothing is acting on.
-                            warn!(
-                                skipped,
-                                "settlement observer lagged behind block events — reconciling now"
-                            );
-                            reconcile_wake.notify_one();
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            info!("settlement observer shutting down — block events closed");
-                            break;
-                        }
-                    }
-                }
-            });
-            info!(
-                activation_height = ghost_pool::observed_settlement_height(),
-                "Settlement observer started (dry run below the activation height)"
-            );
         }
 
         info!("ZMQ block watcher connected to {}", zmq_endpoint);

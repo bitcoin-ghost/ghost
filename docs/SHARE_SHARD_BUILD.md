@@ -533,7 +533,13 @@ coinbase. Roughly 4–6k lines against an unusually complete substrate — but `
 1. **λ-sampling verifier** → early September. Verify-before-merge of signatures plus your own fold is
    sufficient among nodes you own. ⛔ **Hard precondition for admitting any foreign node — do not
    open the mesh without it.**
-2. **Stage 6 physical deletion** → first September release.
+2. ~~**Stage 6 physical deletion** → first September release.~~ **SUPERSEDED 2026-08-23: Stage 6
+   deletion happens BEFORE v1, not after it, and is under way now.** Step 3 shipped dark
+   (#731), was armed (#738, gate 964,100) and Release B is written. Two reasons the ordering
+   flipped: a public release should not carry a dead payout path plus a sweep doing ~5,000
+   pointless DB writes per node per day, and the person this release exists for — a stranger
+   running the ninth node — should never meet the legacy machinery at all. ⚠ #608 said "after
+   the release"; that has been corrected to match.
 3. **Raising R above 1** → after a week of shard soak.
 4. Cosmetics: `ShareProof` hex serde, refusing `OpenStandardMiningChannel`.
 
