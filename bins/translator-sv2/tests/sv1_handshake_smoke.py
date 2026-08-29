@@ -503,6 +503,81 @@ def probe_serializer_extranonce_rekey():
     return met
 
 
+def test_unnegotiated_set_extranonce():
+    """Braiins/marketplace proxy shape: NO `mining.configure`, then `mining.subscribe`
+    and `mining.authorize` pipelined into ONE TCP segment.
+
+    `mining.set_extranonce` is opt-in — a client accepts it only after asking for
+    `subscribe-extranonce` in `mining.configure`. This client never asks, so it must
+    never receive one. Sending it anyway is a protocol violation, and it is redundant
+    besides: the deferred subscribe response carries the same real extranonce.
+
+    ⚠ This is NOT the serializer shape that `[411-rekey]` probes. There, subscribe is
+    answered before authorize arrives, so the post-hoc path never fires and the probe
+    reports MET while this defect is live. Measured on vm1 2026-08-28 and again
+    2026-08-29: set_extranonce at 1.2 ms, subscribe answered at 1.3 ms with the same
+    value. 12,929 farm-port connections in 24 h, median session 0.107 s.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    # ONE segment, both methods, no configure — exactly what the tcpdump showed.
+    payload = (json.dumps({"id": 1, "method": "mining.subscribe", "params": []}) + "\n" +
+               json.dumps({"id": 2, "method": "mining.authorize",
+                           "params": [USER, "x"]}) + "\n")
+    s.sendall(payload.encode())
+    # Collect past the subscribe response; the offending notify fires ~1 ms in, well
+    # before it, so a clean window here is real evidence of absence rather than of haste.
+    msgs = recv_until(s, 4.0, lambda m: False)
+    s.close()
+
+    unnegotiated = [m for m in msgs if m.get("method") == "mining.set_extranonce"]
+    sub = [m for m in msgs if m.get("id") == 1 and "result" in m]
+    en1 = sub[0]["result"][1] if sub and isinstance(sub[0].get("result"), list) else None
+    ok = not unnegotiated
+    print(f"  [unneg-extranonce] {'PASS' if ok else 'FAIL'} — no mining.configure sent; "
+          f"set_extranonce received: {'YES — never negotiated, Braiins closes on this' if unnegotiated else 'no'}"
+          f"; subscribe extranonce1={en1}")
+    return ok
+
+
+def test_negotiated_set_extranonce():
+    """Positive control for `[unneg-extranonce]`: a client that DOES ask for
+    `subscribe-extranonce` must STILL receive `mining.set_extranonce`.
+
+    Identical to the `[unneg-extranonce]` shape in every respect but one — this client
+    lists `subscribe-extranonce` in `mining.configure`. The opt-in is the only variable,
+    so the pair reads as a truth table:
+
+        opt-in absent  -> notification must NOT arrive   ([unneg-extranonce])
+        opt-in present -> notification MUST arrive       (this case)
+
+    ⚠ This must pass BOTH before and after the fix. A suppression that silenced the
+    notification for everyone would leave `[unneg-extranonce]` green and break every
+    client that legitimately re-keys; this is the only case that would catch it.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.configure",
+             "params": [["version-rolling", "subscribe-extranonce"],
+                        {"version-rolling.mask": "1fffe000",
+                         "version-rolling.min-bit-count": 2}]})
+    cfg = recv_until(s, 5.0, lambda m: m.get("id") == 1 and "result" in m)
+    cfg_res = [m for m in cfg if m.get("id") == 1 and "result" in m]
+    acked = bool(cfg_res) and isinstance(cfg_res[0].get("result"), dict) \
+        and cfg_res[0]["result"].get("subscribe-extranonce") is True
+
+    send(s, {"id": 2, "method": "mining.subscribe", "params": []})
+    msgs = recv_until(s, 4.0, lambda m: False)
+    s.close()
+
+    got = any(m.get("method") == "mining.set_extranonce" for m in msgs)
+    # The notification is what this case guards. Servers may legitimately decline to ack
+    # the extension by name, so a missing ack is reported but does not fail the gate.
+    ok = got
+    print(f"  [neg-extranonce]  {'PASS' if ok else 'FAIL'} — opted in via mining.configure; "
+          f"set_extranonce received: {'yes' if got else 'NO — opt-in clients would never re-key'}"
+          f"; extension acked: {'yes' if acked else 'no'}")
+    return ok
+
+
 def main():
     print(f"SV1 handshake smoke test vs {HOST}:{PORT}")
     results = {
@@ -514,6 +589,8 @@ def main():
         "suggest-diff": test_suggest_difficulty(),
         "attribution": test_worker_attribution(),
         "pipeliner": test_pipeliner(),
+        "unneg-extranonce": test_unnegotiated_set_extranonce(),
+        "neg-extranonce": test_negotiated_set_extranonce(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
     }

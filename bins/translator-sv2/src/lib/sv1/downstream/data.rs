@@ -64,6 +64,14 @@ pub struct DownstreamData {
     // `<addr>.<addr>.<worker>`, because the pool spliced a full identity onto a channel that
     // already carried the address.
     pub channel_opened_provisionally: bool,
+    // Whether the client opted in to `subscribe-extranonce` via `mining.configure`.
+    //
+    // `mining.set_extranonce` is opt-in. Sending it to a client that never asked is a
+    // protocol violation; Braiins' hashrate proxy closes the connection on receipt
+    // (observed 2026-08-28: valid job delivered, then a clean FIN ~13 ms later, 12,929
+    // reconnects in 24 h on one node). Miners that send no `mining.configure` at all
+    // leave this false.
+    pub extranonce_subscribe_negotiated: bool,
     // Stores pending shares to be sent to the sv1_server
     pub pending_share: Option<SubmitShareWithChannelId>,
     // Tracks the upstream target for this downstream, used for vardiff target comparison
@@ -107,6 +115,7 @@ impl DownstreamData {
             pending_target: None,
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
+            extranonce_subscribe_negotiated: false,
             channel_open_requested: false,
             channel_opened_provisionally: false,
             pending_share: None,

@@ -37,6 +37,10 @@ impl IsServer<'static> for Sv1Server {
 
             data.version_rolling_min_bit = request.version_rolling_min_bit_count();
 
+            // Record the `subscribe-extranonce` opt-in so the channel-open path can tell
+            // whether a post-hoc `mining.set_extranonce` is welcome or fatal.
+            data.extranonce_subscribe_negotiated = request.subscribes_extranonce();
+
             debug!(
                 "Negotiated version_rolling_mask: {:?}",
                 data.version_rolling_mask
