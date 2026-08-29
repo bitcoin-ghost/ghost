@@ -137,19 +137,19 @@ type CoinbaseBuildResult = (
 /// subsidy + the winner's own available fees, so the winner's coinbase pays these ADJUSTED
 /// amounts — not the ratified ones.
 ///
-/// One function, two callers, deliberately (#601):
+/// One caller since Stage 6 Release B (#750): the coinbase builder
+/// (`build_coinbase_parts_with_payout_snapshot`) applies it before emitting outputs, and the
+/// M-28 commitment is computed from the result.
 ///
-/// - the coinbase builder (`build_coinbase_parts_with_payout_snapshot`) applies it before
-///   emitting outputs, and the M-28 commitment is computed from the result;
-/// - settlement (`payout::apply_settlement`) re-applies it to the ratified proposal using the
-///   mined block's total output value, then proves the reconstruction against the mined outputs
-///   before crediting anything.
+/// It was extracted for #601 because there were TWO callers — the builder and tip-time
+/// settlement (`payout::apply_settlement`) — and if the two ever diverged, every node would
+/// settle a treasury amount the chain never paid. Release B deleted tip-time settlement; the
+/// shard now settles at maturity against the mined outputs and does not re-derive the split.
+/// The extraction still earns its keep: keep this a pure function of its arguments, because a
+/// second caller reading node-local state would reintroduce exactly that defect.
 ///
-/// If these two computations ever diverged, every node would settle a treasury amount the chain
-/// never paid — which is exactly the defect this function was extracted to close. Do not fork it.
-///
-/// `None` means the drift cannot be absorbed and the caller must fall back (builder: fallback
-/// coinbase; settlement: measure from the mined outputs instead).
+/// `None` means the drift cannot be absorbed and the builder must fall back to a fallback
+/// coinbase.
 ///
 /// Post-gate (`prop.block_height >= coinbase_fee_split_height()`):
 /// surplus fees go to the treasury, capped at the treasury's own RATIFIED allocation (drift can
@@ -246,8 +246,8 @@ fn take_pro_rata(entries: &mut [ghost_common::types::PayoutEntry], amount: u64) 
 /// lottery, not the fees actually collected, decides what the miners are paid.
 ///
 /// This is a pure function of `(prop, available_fees)`. It reads no node-local state — notably not
-/// `TreasuryState`, which would fork the coinbase across nodes — so the two callers of
-/// `adjust_proposal_for_available_fees` (the coinbase builder and settlement) stay in step.
+/// `TreasuryState`, which would fork the coinbase across nodes — so every node holding the same
+/// ratified proposal builds byte-identical outputs from it.
 ///
 /// `None` means the drift could not be absorbed even after draining every bucket, and the caller
 /// must fall back rather than build a coinbase the network would reject.
@@ -1687,10 +1687,11 @@ impl TemplateProcessor {
         // portion to match actual available fees — no BFT re-proposal needed.
         //
         // #601: this adjustment is PER NODE — every node's coinbase differs from the ratified
-        // proposal by its own fee drift. Settlement therefore reconstructs the same adjustment
-        // from the mined block's total output value (`payout::apply_settlement`), which is why
-        // the logic lives in one shared function: if the builder and settlement ever computed
-        // this differently, every node would credit a treasury amount the chain never paid.
+        // proposal by its own fee drift. It used to be reconstructed a second time by tip-time
+        // settlement, and the two computations had to agree or every node would credit a
+        // treasury amount the chain never paid. Stage 6 Release B (#750) deleted that second
+        // caller: the shard settles at maturity against the mined outputs instead of
+        // re-deriving the split, so this is now the only place the adjustment is computed.
         let proposal =
             proposal.and_then(|prop| adjust_proposal_for_available_fees(prop, total_value, height));
 
