@@ -875,6 +875,45 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::PAYOUT_FROM_SHARD.set(payout_from_shard);
     let _ = gates::FEE_DRIFT_MINER_SHARE.set(fee_drift_miner_share);
 
+    // #780: state UNCONDITIONALLY what this run will enforce.
+    //
+    // The two `warn!`s further down are both conditional — one on a lowered tier floor, the
+    // other on heights overridden from the environment, which `gates::from_env` refuses on
+    // mainnet. So on the production fleet NEITHER fires and the node logged nothing at all
+    // about its gates: the only way to know which heights a running binary carried was to
+    // read the binary. That cost real time while arming FEE_DRIFT_MINER_SHARE_HEIGHT on
+    // 2026-08-30, when "is this node armed, and at what height?" had no answer in the logs.
+    //
+    // Dormant gates print as `never` rather than 18446744073709551615, because a wall of
+    // u64::MAX is exactly the sort of output people stop reading.
+    fn h(v: u64) -> String {
+        if v == u64::MAX {
+            "never".to_string()
+        } else {
+            v.to_string()
+        }
+    }
+    tracing::info!(
+        network = ?network,
+        cluster_enforcement = %h(enforcement),
+        coinbase_fee_split = %h(fee),
+        voter_set_qualification = %h(voter_set),
+        challenger_assignment = %h(challenger_assignment),
+        share_pow_verify = %h(share_pow_verify),
+        share_tier_bind = %h(share_tier_bind),
+        active_voter_set = %h(active_voter_set),
+        share_addr_bind = %h(share_addr_bind),
+        payout_median_adoption = %h(payout_median),
+        stratum_handshake_proof = %h(stratum_proof),
+        archive_tx_proof = %h(archive_tx),
+        address_proof = %h(address_proof),
+        mesh_node_list_checkpoint = %h(mesh_node_list_checkpoint),
+        checkpoint_from_shard = %h(checkpoint_from_shard),
+        payout_from_shard = %h(payout_from_shard),
+        fee_drift_miner_share = %h(fee_drift_miner_share),
+        "Activation heights resolved — these are the gates this node will enforce"
+    );
+
     // Not a height, but resolved here for the same reason and under the same mainnet lock, so
     // there is one place to look for "what did this run actually enforce".
     let tier_floor = gates::from_env(
@@ -1338,5 +1377,73 @@ mod tier_floor_tests {
     #[test]
     fn an_absent_tier_passes_at_any_floor() {
         assert!(crosses_network_tier(None));
+    }
+}
+
+#[cfg(test)]
+mod activation_height_logging_tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// A `MakeWriter` that captures everything into a buffer, so the test asserts on what the
+    /// node would ACTUALLY print rather than on the code's shape.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #780: a node must STATE which gates it enforces.
+    ///
+    /// Regression guard with teeth: the two pre-existing `warn!`s are conditional on a lowered
+    /// tier floor or env overrides, and `gates::from_env` refuses overrides on mainnet — so on
+    /// the production fleet neither fired and the node logged nothing at all. Asserting on the
+    /// captured output is the only way to tell "logs it" from "has a log statement".
+    #[test]
+    fn init_activation_heights_states_what_it_enforces() {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(sub, || {
+            crate::init_activation_heights(&ghost_common::config::BitcoinNetwork::Mainnet);
+        });
+
+        let out = String::from_utf8_lossy(&cap.0.lock().expect("capture lock").clone()).to_string();
+
+        assert!(
+            out.contains("Activation heights resolved"),
+            "the node must state its gates on startup; captured output was: {out}"
+        );
+        // An ARMED gate must appear as its height...
+        assert!(
+            out.contains(&crate::FEE_DRIFT_MINER_SHARE_HEIGHT.to_string()),
+            "the armed fee-drift height must be visible; got: {out}"
+        );
+        // ...and a DORMANT one as `never`, not a wall of u64::MAX nobody reads.
+        assert!(
+            out.contains("never"),
+            "dormant gates must render as `never`; got: {out}"
+        );
+        assert!(
+            !out.contains("18446744073709551615"),
+            "u64::MAX must never be printed raw; got: {out}"
+        );
     }
 }
