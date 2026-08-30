@@ -562,10 +562,43 @@ pub const PAYOUT_FROM_SHARD_HEIGHT: u64 = 964_100;
 /// of it would build different coinbases from the same proposal. Both paths exist in the new
 /// binary and every node switches at the same block.
 ///
-/// `u64::MAX` = never. Arm only once the whole fleet runs a binary that knows this path, and not
-/// within the settling window of another gate — one behaviour change per height, or a divergence
-/// cannot be attributed.
-pub const FEE_DRIFT_MINER_SHARE_HEIGHT: u64 = u64::MAX;
+/// **ARMED at 964_695** (2026-08-29). Both preconditions in the paragraph above were met first:
+///
+/// - the whole fleet runs a binary that knows this path — it shipped dormant in v1.11.29 and
+///   has been fleet-wide on all 8 nodes since, so no node can be on the wrong side of the gate
+///   for lack of the code;
+/// - it is not inside another gate's settling window — the last armed gate,
+///   `PAYOUT_FROM_SHARD_HEIGHT = 964_100`, fired 2026-08-26 and was verified clean on all 8
+///   nodes three days earlier. No other gate is armed anywhere near this height.
+///
+/// Height picked for MARGIN, not for a precise firing time — because the first attempt at this
+/// got it wrong. That one used a 144-block average of 585 s/block to put activation "ten hours"
+/// out at 964_695; the chain then ran at **443 s/block** and reached 964,694 in 7h16m, so the
+/// height was about to pass with no node yet carrying the armed binary. It was caught before
+/// anything shipped, and nothing was deployed, so no node could act on it.
+///
+/// ⛔ A 144-block average does NOT predict ten hours ahead. Block intervals are exponentially
+/// distributed; the sample mean over a day is a poor bound on the next sixty blocks. Choose a
+/// height that is safely BEYOND the roll under the FASTEST plausible rate, and accept that the
+/// firing time is a range.
+///
+/// Sized against the PIPELINE, not a target clock time. Getting this binary live takes about
+/// 4.5 h — build, `record-tests.sh`, two CI cycles (fix + version bump), a canary, a 60-minute
+/// soak, then eight nodes. The height has to clear that even if blocks run at their fastest.
+///
+/// From 964,725 at 12:00 UTC on 2026-08-30, 80 blocks out:
+///   - at the fastest rate observed in 24 h (443 s/block) -> ~9.8 h, about 21:50 UTC
+///   - at the slowest observed        (630 s/block)       -> ~14.0 h, about 02:00 UTC
+///
+/// So roughly twice the pipeline even in the worst case. ⚠ Re-verify the remaining margin
+/// immediately BEFORE the production roll and push the height out if the chain has run hot —
+/// the 443-630 s/block spread measured over one night is why this cannot be set and forgotten.
+///
+/// ⚠ What changes at this height: miners stop being pinned to a flat sats floor. Measured live at
+/// h964,479, `treasury == available_fees - 804768` EXACTLY on every re-proposal — the treasury
+/// was taking 100% of every sat above that floor, against a policy of 99% miners / 1% treasury.
+/// After this, drift is shared in the ratified proposal's own proportions.
+pub const FEE_DRIFT_MINER_SHARE_HEIGHT: u64 = 964_805;
 
 /// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
 /// 962_000.**
