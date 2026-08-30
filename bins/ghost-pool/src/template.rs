@@ -7194,8 +7194,8 @@ mod tests {
         let mut below = drift_proposal(subsidy, 25_030, 525_030);
         below.block_height = 964_804;
         let ratified: u64 = below.miner_payouts.iter().map(|e| e.amount).sum();
-        let adjusted = adjust_proposal_for_available_fees(below, available, 964_804)
-            .expect("absorbable");
+        let adjusted =
+            adjust_proposal_for_available_fees(below, available, 964_804).expect("absorbable");
         assert_eq!(
             adjusted.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
             ratified,
@@ -7206,8 +7206,8 @@ mod tests {
         let mut at = drift_proposal(subsidy, 25_030, 525_030);
         at.block_height = 964_805;
         let ratified_at: u64 = at.miner_payouts.iter().map(|e| e.amount).sum();
-        let shared = adjust_proposal_for_available_fees(at, available, 964_805)
-            .expect("absorbable");
+        let shared =
+            adjust_proposal_for_available_fees(at, available, 964_805).expect("absorbable");
         let after: u64 = shared.miner_payouts.iter().map(|e| e.amount).sum();
         assert!(
             after > ratified_at,
