@@ -7175,22 +7175,43 @@ mod tests {
         );
     }
 
-    /// The gate ships DORMANT. Until it is armed, a live-height proposal must still take the
-    /// legacy path — this is what makes the change safe to merge before it is scheduled.
+    /// The gate is ARMED at 964_805, and the switch happens at exactly that height.
+    ///
+    /// ⚠ This replaces `the_miner_share_gate_ships_dormant`, which asserted the constant was
+    /// `u64::MAX` and then "checked" a live height by passing 964_176 as the `height`
+    /// ARGUMENT. The gate reads `prop.block_height`, which `adj_proposal` pins at 960_000 —
+    /// so that half of the test never exercised the gate at all and would have passed
+    /// whatever the constant said. Both sides are driven here by setting `block_height`.
     #[test]
-    fn the_miner_share_gate_ships_dormant() {
-        assert_eq!(crate::FEE_DRIFT_MINER_SHARE_HEIGHT, u64::MAX);
-        assert_eq!(crate::fee_drift_miner_share_height(), u64::MAX);
+    fn the_miner_share_gate_switches_at_its_armed_height() {
+        assert_eq!(crate::FEE_DRIFT_MINER_SHARE_HEIGHT, 964_805);
+        assert_eq!(crate::fee_drift_miner_share_height(), 964_805);
 
         let subsidy = 312_500_000;
-        let prop = drift_proposal(subsidy, 25_030, 525_030);
-        let ratified: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum();
-        let adjusted = adjust_proposal_for_available_fees(prop, subsidy + 2_806_260, 964_176)
-            .expect("absorbable");
+        let available = subsidy + 2_806_260;
+
+        // One block BELOW the gate: the legacy path, miners exactly where it leaves them.
+        let mut below = drift_proposal(subsidy, 25_030, 525_030);
+        below.block_height = 964_804;
+        let ratified: u64 = below.miner_payouts.iter().map(|e| e.amount).sum();
+        let adjusted =
+            adjust_proposal_for_available_fees(below, available, 964_804).expect("absorbable");
         assert_eq!(
             adjusted.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
             ratified,
-            "while dormant the miners must stay exactly where the legacy path leaves them"
+            "one block below the gate the miners must stay on the legacy path"
+        );
+
+        // AT the gate: the drift is shared, so the miners must come out strictly ahead.
+        let mut at = drift_proposal(subsidy, 25_030, 525_030);
+        at.block_height = 964_805;
+        let ratified_at: u64 = at.miner_payouts.iter().map(|e| e.amount).sum();
+        let shared =
+            adjust_proposal_for_available_fees(at, available, 964_805).expect("absorbable");
+        let after: u64 = shared.miner_payouts.iter().map(|e| e.amount).sum();
+        assert!(
+            after > ratified_at,
+            "at the gate the miners must share the drift — got {after}, ratified {ratified_at}"
         );
     }
 
