@@ -47,6 +47,9 @@ USER = sys.argv[3] if len(sys.argv) > 3 else "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9
 _tls_arg = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("GHOST_TLS_PORT")
 TLS_PORT = int(_tls_arg) if _tls_arg else None
 PLACEHOLDER = "0000000000000000"
+# A declared d=1,000,000 clamps/quantises well above every port floor
+# (:3333 = 2,048, :4444 = 131,072), so this separates "applied" from "floor".
+DECLARED_MIN = 200_000.0
 # Minimum extranonce2_size a pool must advertise to be accepted by rented-hashrate
 # marketplaces (Braiins requires >= 7). Override with GHOST_MIN_EXTRANONCE2_SIZE.
 MIN_EXTRANONCE2_SIZE = int(os.environ.get("GHOST_MIN_EXTRANONCE2_SIZE", "7"))
@@ -635,6 +638,53 @@ def test_braiins_shape():
     return ok
 
 
+def test_declared_difficulty_after_open():
+    """A `d=` difficulty declared AFTER the channel has opened must still reach the miner.
+
+    The vm4 defect, reproduced without 320ms of real latency — the race is about ORDER, not
+    delay. Waiting past the 300ms subscribe debounce before authorizing puts the channel open
+    first, which is exactly what happens naturally to a distant miner:
+
+        fast link : authorize arrives first -> channel is SIZED from `d=`, and the difficulty
+                    the miner ends on already reflects it        (hides the bug)
+        320ms link: debounce fires first -> channel already open -> the declaration is only
+                    STAGED, and the miner is left on the floor
+
+    Staging strands it: the vardiff loop ticks every 60s AND `try_vardiff` yields nothing for
+    a miner that has not submitted, so "next tick" can be indefinite. Measured on vm4: told
+    2,048, never the 1,000,000 requested. Rented-hashrate marketplaces declare their size this
+    way, so it hits precisely the clients the feature exists for.
+
+    ⚠ Nothing is sent before authorize: `set_difficulty` is cached until the first
+    `mining.notify`, which waits on handshake completion. So both the floor and the declared
+    value arrive after authorize, and what separates fixed from broken is whether the miner
+    ends up ABOVE the floor rather than parked on it.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=15)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+    recv_until(s, 2.0, lambda m: m.get("id") == 1 and "result" in m)
+    # Past the 300ms channel-open debounce, so the channel opens WITHOUT the declaration.
+    time.sleep(1.2)
+
+    send(s, {"id": 2, "method": "mining.authorize", "params": [USER, "d=1000000"]})
+    # Generous, but far below the 60s vardiff interval: this is about arriving PROMPTLY.
+    msgs = recv_until(s, 12.0, lambda m: False)
+    s.close()
+
+    diffs = [m["params"][0] for m in msgs
+             if m.get("method") == "mining.set_difficulty" and m.get("params")]
+    if not diffs:
+        print("  [declared-late]   FAIL — declared d=1,000,000 after channel open; "
+              "pool sent NO set_difficulty at all")
+        return False
+    first, last = diffs[0], diffs[-1]
+    # Correct either way: the declaration lands on the first value, or the pool raises to it.
+    ok = last > first or first >= DECLARED_MIN
+    print(f"  [declared-late]   {'PASS' if ok else 'FAIL'} — declared d=1,000,000 AFTER channel "
+          f"open; set_difficulty seen: {[format(d, ',') for d in diffs]}"
+          f"{'' if ok else ' — parked on the floor, declaration stranded until vardiff (60s, or never)'}")
+    return ok
+
 def main():
     print(f"SV1 handshake smoke test vs {HOST}:{PORT}")
     results = {
@@ -649,6 +699,7 @@ def main():
         "unneg-extranonce": test_unnegotiated_set_extranonce(),
         "neg-extranonce": test_negotiated_set_extranonce(),
         "braiins-shape": test_braiins_shape(),
+        "declared-late": test_declared_difficulty_after_open(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
     }

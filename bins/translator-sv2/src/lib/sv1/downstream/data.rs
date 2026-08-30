@@ -72,6 +72,17 @@ pub struct DownstreamData {
     // reconnects in 24 h on one node). Miners that send no `mining.configure` at all
     // leave this false.
     pub extranonce_subscribe_negotiated: bool,
+    // Set when a miner-declared difficulty (`d=` in the authorize password, or
+    // `mining.suggest_difficulty`) arrives AFTER the channel is already open, so the
+    // channel-open path can no longer size itself from it.
+    //
+    // Without an explicit push it would sit until the next vardiff tick — the loop runs on a
+    // 60s interval and `try_vardiff` returns None for a miner that has not submitted yet, so
+    // "next tick" can be far longer than 60s. Measured on vm4 (320ms RTT): the miner was told
+    // the 2,048 floor and never the 1,000,000 it asked for. On a fast link authorize wins the
+    // race against channel open and the first `set_difficulty` already carries the declared
+    // value, which is why this is invisible except to distant miners.
+    pub declared_difficulty_needs_push: bool,
     // Stores pending shares to be sent to the sv1_server
     pub pending_share: Option<SubmitShareWithChannelId>,
     // Tracks the upstream target for this downstream, used for vardiff target comparison
@@ -116,6 +127,7 @@ impl DownstreamData {
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
             extranonce_subscribe_negotiated: false,
+            declared_difficulty_needs_push: false,
             channel_open_requested: false,
             channel_opened_provisionally: false,
             pending_share: None,

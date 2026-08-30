@@ -269,14 +269,21 @@ impl Sv1Server {
         downstream.downstream_data.super_safe_lock(|data| {
             data.suggested_hashrate = Some(clamped as Hashrate);
             data.hashrate = Some(clamped as Hashrate);
-            // Channel already open: the open path can no longer pick this up, so stage it for
-            // the vardiff loop, which pushes UpdateChannel upstream and mining.set_difficulty
-            // downstream on its next tick.
+            // Channel already open: the open path can no longer size itself from this, so stage
+            // it AND mark it for an immediate push.
+            //
+            // Staging alone is not enough. The vardiff loop ticks every 60s and only retargets
+            // when `try_vardiff` returns a new hashrate, which it does not for a miner that has
+            // not submitted yet — so a staged declaration can wait far longer than one tick, or
+            // indefinitely. Measured on vm4 (320ms RTT): told the 2,048 floor, never the
+            // 1,000,000 requested. `push_declared_target` sends it now, using the same
+            // upstream-target rule vardiff uses.
             if data.channel_id.is_some() {
                 data.set_pending_hashrate(Some(clamped as Hashrate), downstream_id);
                 if let Some(target) = pending_target {
                     data.set_pending_target(target, downstream_id);
                 }
+                data.declared_difficulty_needs_push = true;
             }
         });
     }
@@ -1095,6 +1102,17 @@ impl Sv1Server {
                 error!("Down: Error handling downstream message: {:?}", e);
                 return Err(TproxyError::disconnect(e, downstream_id));
             }
+        }
+
+        // A miner-declared difficulty that arrived after the channel opened has to be pushed
+        // here: `record_suggested_difficulty` runs inside the SYNC `IsServer` handler and cannot
+        // await, and the vardiff loop will not carry it (60s interval, and `try_vardiff` yields
+        // nothing for a miner with no shares yet).
+        let needs_push = downstream
+            .downstream_data
+            .super_safe_lock(|d| std::mem::take(&mut d.declared_difficulty_needs_push));
+        if needs_push {
+            self.push_declared_target(downstream_id).await;
         }
 
         // Check if there's a pending share to send to the Sv1Server
