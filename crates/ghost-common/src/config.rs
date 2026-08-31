@@ -615,6 +615,49 @@ impl NodeConfig {
             }
         }
 
+        // Node reward address (#588). The field's own doc says "must be a valid bech32 address
+        // for the configured network", and until now nothing enforced it: the string went
+        // straight into `nodes.payout_address` unparsed, and every consumer reaches it through
+        // `assume_checked()` — which does not check, it asserts. A testnet or typo'd address
+        // therefore parsed happily and yielded a scriptPubKey paying to nothing spendable on
+        // mainnet, silently burning this node's share of the node rewards.
+        //
+        // Parsed with `require_network` rather than the `bc1` prefix test used for the treasury
+        // above: node rewards legitimately accept P2PKH, P2SH, P2WPKH, P2WSH and P2TR (see
+        // `template.rs`, which uses rust-bitcoin's generic parser), so a `bc1`-only test would
+        // reject valid mainnet addresses that pay out correctly today.
+        if let Some(ref addr) = self.pool.node_payout_address {
+            let want = self.bitcoin.network.to_bitcoin_network();
+            if addr.trim().is_empty() {
+                result.add_error(
+                    "pool.node_payout_address",
+                    "Set to an empty string — remove the key entirely to disable node rewards",
+                );
+            } else {
+                match addr
+                    .trim()
+                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                {
+                    Err(e) => result.add_error(
+                        "pool.node_payout_address",
+                        &format!("Not a valid Bitcoin address: {}", e),
+                    ),
+                    Ok(parsed) => {
+                        if parsed.require_network(want).is_err() {
+                            result.add_error(
+                                "pool.node_payout_address",
+                                &format!(
+                                    "Address is not valid on the {} network — node rewards paid \
+                                     to it would be unspendable",
+                                    format!("{:?}", self.bitcoin.network).to_lowercase()
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Minimum payout validation
         const DUST_LIMIT: u64 = 546;
         if self.pool.min_payout_sats < DUST_LIMIT {
@@ -3952,6 +3995,124 @@ rpc_ur1 = "http://localhost:8332"
         assert!(
             checked >= 4,
             "expected the shipped templates, found {checked}"
+        );
+    }
+
+    // ---------------------------------------------------------------- #588
+    // `node_payout_address` went unvalidated while its own doc promised otherwise. Every
+    // consumer reaches it via `assume_checked()`, which asserts rather than checks, so a
+    // wrong-network address became an unspendable scriptPubKey and burned the node reward.
+
+    /// Build a config that is otherwise quiet on `pool.node_payout_address`.
+    fn cfg_with_node_payout(addr: Option<&str>, network: BitcoinNetwork) -> NodeConfig {
+        let mut config = NodeConfig::default();
+        config.bitcoin.network = network;
+        config.pool.node_payout_address = addr.map(|a| a.to_string());
+        config
+    }
+
+    fn node_payout_errors(config: &NodeConfig) -> Vec<String> {
+        config
+            .validate()
+            .errors
+            .iter()
+            .filter(|e| e.field == "pool.node_payout_address")
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn mainnet_node_payout_address_of_every_supported_type_is_accepted() {
+        // The control. If this ever fails the check is rejecting addresses that pay out
+        // correctly today, which is worse than not checking at all. All five types are
+        // reachable because template.rs parses with rust-bitcoin's generic parser.
+        for (kind, addr) in [
+            ("P2PKH", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"),
+            ("P2SH", "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
+            ("P2WPKH", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            (
+                "P2WSH",
+                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3",
+            ),
+            (
+                "P2TR",
+                "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+            ),
+        ] {
+            let config = cfg_with_node_payout(Some(addr), BitcoinNetwork::Mainnet);
+            assert!(
+                node_payout_errors(&config).is_empty(),
+                "mainnet {} address must be accepted, got: {:?}",
+                kind,
+                node_payout_errors(&config)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unset_node_payout_address_is_not_an_error() {
+        // Node rewards are opt-in; absence must stay silent or every node without one
+        // fails to start.
+        let config = cfg_with_node_payout(None, BitcoinNetwork::Mainnet);
+        assert!(node_payout_errors(&config).is_empty());
+    }
+
+    #[test]
+    fn a_testnet_node_payout_address_is_rejected_on_mainnet() {
+        // The live footgun: this parses, and `assume_checked()` would hand back a
+        // scriptPubKey that pays to nothing spendable on mainnet.
+        let config = cfg_with_node_payout(
+            Some("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"),
+            BitcoinNetwork::Mainnet,
+        );
+        let errs = node_payout_errors(&config);
+        assert_eq!(errs.len(), 1, "expected exactly one error, got {:?}", errs);
+        assert!(
+            errs[0].contains("not valid on the mainnet network"),
+            "message must name the network mismatch, got: {}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn a_mainnet_node_payout_address_is_rejected_on_regtest() {
+        // The mirror image — the check must be about agreement, not about "is it bc1".
+        let config = cfg_with_node_payout(
+            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            BitcoinNetwork::Regtest,
+        );
+        assert_eq!(node_payout_errors(&config).len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_node_payout_address_is_rejected() {
+        // A transposed character fails bech32's checksum rather than the network test,
+        // so it must come back as a parse error and still be caught.
+        let config = cfg_with_node_payout(
+            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"),
+            BitcoinNetwork::Mainnet,
+        );
+        let errs = node_payout_errors(&config);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert!(
+            errs[0].contains("Not a valid Bitcoin address"),
+            "got: {}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn an_empty_node_payout_address_is_rejected_with_advice() {
+        // `node_payout_address = ""` is a distinct mistake from omitting the key, and the
+        // empty string reaches vote_handler's `payout.address.is_empty()` check as a
+        // proposal that cannot be voted through.
+        let config = cfg_with_node_payout(Some("   "), BitcoinNetwork::Mainnet);
+        let errs = node_payout_errors(&config);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert!(
+            errs[0].contains("remove the key entirely"),
+            "got: {}",
+            errs[0]
         );
     }
 }
