@@ -86,13 +86,26 @@ impl TranslatorSv2 {
     /// protocol translation, job management, and status reporting.
     pub async fn start(self) {
         info!("Starting Translator Proxy...");
-        // only initialized once
-        TPROXY_MODE
-            .set(self.config.aggregate_channels.into())
-            .expect("TPROXY_MODE initialized more than once");
-        VARDIFF_ENABLED
-            .set(self.config.downstream_difficulty_config.enable_vardiff)
-            .expect("VARDIFF_ENABLED initialized more than once");
+        // These are process-global `OnceLock`s, so a second `start()` in the same process used to
+        // abort on `.set(...).expect(...)` even when it was re-setting the IDENTICAL value. In a
+        // long-lived binary that never happens; in a test binary it happens the moment a second
+        // target starts a translator, which is why the SV2 integration targets could not run more
+        // than one translator each (#617) — `--test-threads=1` does not help, because it
+        // serialises tests without giving them separate processes.
+        //
+        // Re-initialising with the SAME value is a no-op and is now allowed. Re-initialising with
+        // a DIFFERENT value stays fatal, and must: one global cannot represent two translators
+        // that disagree, so the second would silently run under the first one's mode.
+        set_once_or_assert_same(
+            &TPROXY_MODE,
+            self.config.aggregate_channels.into(),
+            "TPROXY_MODE",
+        );
+        set_once_or_assert_same(
+            &VARDIFF_ENABLED,
+            self.config.downstream_difficulty_config.enable_vardiff,
+            "VARDIFF_ENABLED",
+        );
 
         let cancellation_token = self.cancellation_token.clone();
         let mut fallback_coordinator = FallbackCoordinator::new();
@@ -579,6 +592,29 @@ impl From<bool> for TproxyMode {
     }
 }
 
+/// Set a process-global `OnceLock` that is expected to be initialised once per process.
+///
+/// Setting it again to the same value is accepted silently; setting it to a different value
+/// panics, naming both values. See the call site in `TranslatorSv2::start` for why (#617).
+fn set_once_or_assert_same<T: PartialEq + std::fmt::Debug>(
+    cell: &OnceLock<T>,
+    value: T,
+    name: &str,
+) {
+    if let Err(rejected) = cell.set(value) {
+        // `OnceLock::set` hands back the value it refused, and only fails when already set,
+        // so `get()` is guaranteed to be `Some` here.
+        let current = cell
+            .get()
+            .expect("OnceLock::set only fails once initialised");
+        assert!(
+            *current == rejected,
+            "{name} re-initialised with a different value: already {current:?}, then {rejected:?} \
+             — one process-global cannot represent two translators that disagree"
+        );
+    }
+}
+
 static TPROXY_MODE: OnceLock<TproxyMode> = OnceLock::new();
 static VARDIFF_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -620,5 +656,55 @@ impl Drop for TranslatorSv2 {
     fn drop(&mut self) {
         info!("TranslatorSv2 dropped");
         self.cancellation_token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod once_lock_reinit_tests {
+    use super::*;
+
+    // #617: these globals are set in `TranslatorSv2::start()`. Re-setting the same value used to
+    // abort the process, which made more than one translator per test binary impossible.
+
+    #[test]
+    fn setting_the_same_value_twice_is_accepted() {
+        let cell: OnceLock<u8> = OnceLock::new();
+        set_once_or_assert_same(&cell, 7, "CELL");
+        set_once_or_assert_same(&cell, 7, "CELL");
+        assert_eq!(*cell.get().unwrap(), 7, "the first value must survive");
+    }
+
+    #[test]
+    fn the_first_value_wins_and_is_not_overwritten() {
+        let cell: OnceLock<u8> = OnceLock::new();
+        set_once_or_assert_same(&cell, 7, "CELL");
+        assert_eq!(*cell.get().unwrap(), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "re-initialised with a different value")]
+    fn a_conflicting_value_still_panics() {
+        // Must stay fatal: one global cannot represent two translators that disagree, so the
+        // second would otherwise silently run under the first one's mode.
+        let cell: OnceLock<u8> = OnceLock::new();
+        set_once_or_assert_same(&cell, 7, "CELL");
+        set_once_or_assert_same(&cell, 9, "CELL");
+    }
+
+    #[test]
+    fn the_real_tproxy_mode_type_round_trips() {
+        // The production types, not just a stand-in: TproxyMode is what start() sets.
+        let cell: OnceLock<TproxyMode> = OnceLock::new();
+        set_once_or_assert_same(&cell, TproxyMode::NonAggregated, "TPROXY_MODE");
+        set_once_or_assert_same(&cell, TproxyMode::NonAggregated, "TPROXY_MODE");
+        assert_eq!(*cell.get().unwrap(), TproxyMode::NonAggregated);
+    }
+
+    #[test]
+    #[should_panic(expected = "TPROXY_MODE re-initialised with a different value")]
+    fn two_translators_disagreeing_on_mode_is_still_fatal() {
+        let cell: OnceLock<TproxyMode> = OnceLock::new();
+        set_once_or_assert_same(&cell, TproxyMode::NonAggregated, "TPROXY_MODE");
+        set_once_or_assert_same(&cell, TproxyMode::Aggregated, "TPROXY_MODE");
     }
 }
