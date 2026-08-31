@@ -5,6 +5,13 @@ use std::sync::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+/// Upper bound on how long [`FallbackCoordinator::trigger_fallback_and_wait`] will wait for
+/// registered components to acknowledge before giving up and proceeding.
+///
+/// Generous, because the normal path completes in milliseconds and this only has to be shorter
+/// than "for ever". It exists to keep a wedged component from blocking an upstream reconnect.
+pub const FALLBACK_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// coordinates fallback operations across multiple components with acknowledgement.
 ///
 /// this is meant to be used together with [`crate::task_manager::TaskManager`],
@@ -61,6 +68,17 @@ impl FallbackCoordinator {
     }
 
     /// trigger fallback and wait for all registered components to acknowledge
+    ///
+    /// The wait is BOUNDED by [`FALLBACK_CLEANUP_TIMEOUT`]. `pending_tasks` only reaches zero if
+    /// every handler runs `done()` or its `Drop`, so a component whose task is wedged — rather
+    /// than finished — runs neither, and an unbounded wait here never returns.
+    ///
+    /// That is not only a test problem. Both callers are the upstream-reconnection path
+    /// (`State::UpstreamShutdown` in translator-sv2 and jd-client-sv2): they trigger fallback,
+    /// wait for cleanup, then reconnect. Waiting for ever means the reconnect never happens and
+    /// miners stay pointed at an upstream that is already gone. Proceeding after a timeout is
+    /// strictly better — if it expires, a component is already broken, and continuing at least
+    /// restores service.
     pub async fn trigger_fallback_and_wait(&self) {
         tracing::debug!("FallbackCoordinator: triggering fallback");
         self.signal.cancel();
@@ -71,7 +89,19 @@ impl FallbackCoordinator {
 
         // there's still some tasks running,
         // wait for the last task to notify us
-        self.notify.notified().await;
+        if tokio::time::timeout(FALLBACK_CLEANUP_TIMEOUT, self.notify.notified())
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                outstanding = self.pending_tasks.load(Ordering::Acquire),
+                timeout_secs = FALLBACK_CLEANUP_TIMEOUT.as_secs(),
+                "FallbackCoordinator: component(s) did not acknowledge fallback cleanup in time — \
+                 proceeding anyway so the upstream reconnect is not blocked. A component that \
+                 never acknowledges has neither completed nor dropped its handler."
+            );
+            return;
+        }
         tracing::debug!("FallbackCoordinator: finished waiting for components to complete cleanup");
     }
 }
@@ -215,6 +245,72 @@ mod fallback_handler_drop_tests {
         let coordinator = FallbackCoordinator::new();
         let handler = coordinator.register();
         handler.done();
+        assert_eq!(coordinator.pending_tasks.load(Ordering::Acquire), 0);
+    }
+
+    // ---------------------------------------------------------------- #617
+    // `pending_tasks` only reaches zero if every handler runs `done()` or its `Drop`. A component
+    // whose task is wedged runs neither, so an unbounded wait here never returns — and both
+    // callers are the upstream-reconnection path, so that strands miners on a dead upstream.
+
+    /// The control. A handler that acknowledges normally must NOT wait out the timeout — if this
+    /// ever starts passing only because of the timeout, the bound has replaced the mechanism.
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledged_handler_returns_without_waiting() {
+        let coordinator = FallbackCoordinator::new();
+        let handler = coordinator.register();
+
+        let c = coordinator.clone();
+        let waiter = tokio::spawn(async move { c.trigger_fallback_and_wait().await });
+
+        tokio::task::yield_now().await;
+        handler.done();
+
+        let started = tokio::time::Instant::now();
+        waiter.await.expect("waiter must not panic");
+        assert!(
+            started.elapsed() < FALLBACK_CLEANUP_TIMEOUT,
+            "a normal acknowledgement must return promptly, not on the timeout"
+        );
+    }
+
+    /// A handler that never acknowledges and is never dropped: previously an infinite wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_never_acknowledges_does_not_block_for_ever() {
+        let coordinator = FallbackCoordinator::new();
+        let handler = coordinator.register();
+
+        // `forget` is the point: it models a task wedged mid-flight, so neither `done()` nor
+        // `Drop` ever runs and the slot is never released.
+        std::mem::forget(handler);
+
+        // start_paused auto-advances time when nothing is runnable, so this completes at once
+        // if the wait is bounded and hangs the test if it is not.
+        coordinator.trigger_fallback_and_wait().await;
+
+        assert_eq!(
+            coordinator.pending_tasks.load(Ordering::Acquire),
+            1,
+            "the slot is still held — we proceeded despite it, rather than pretending it cleared"
+        );
+    }
+
+    /// The timeout must not fire early when one of several handlers is still working.
+    #[tokio::test(start_paused = true)]
+    async fn it_waits_for_the_last_handler_not_the_first() {
+        let coordinator = FallbackCoordinator::new();
+        let first = coordinator.register();
+        let second = coordinator.register();
+
+        let c = coordinator.clone();
+        let waiter = tokio::spawn(async move { c.trigger_fallback_and_wait().await });
+
+        tokio::task::yield_now().await;
+        first.done();
+        tokio::task::yield_now().await;
+        second.done();
+
+        waiter.await.expect("waiter must not panic");
         assert_eq!(coordinator.pending_tasks.load(Ordering::Acquire), 0);
     }
 }
