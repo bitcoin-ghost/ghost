@@ -20,7 +20,7 @@ use stratum_apps::{
 use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use translator_sv2::TranslatorSv2;
-use utils::get_available_address;
+use utils::{get_available_address, release_reservation};
 
 pub mod interceptor;
 pub mod message_aggregator;
@@ -165,6 +165,15 @@ pub async fn start_pool(
         monitoring_cache_refresh_secs,
         None, // no JDS
     );
+    // `get_available_address` keeps the port BOUND so nothing can steal it between choice and
+    // use (#408, #612). `PoolSv2` binds the address itself, so that reservation has to be handed
+    // back first or the pool's own bind fails with `AddrInUse` — which is exactly what was
+    // happening: the harness was holding the port against the component it had chosen it for.
+    release_reservation(listening_address);
+    if let Some(addr) = monitoring_address {
+        release_reservation(addr);
+    }
+
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
     tokio::spawn(async move {
@@ -263,6 +272,15 @@ pub fn start_jdc(
         monitoring_address,
         monitoring_cache_refresh_secs,
     );
+    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
+    // component binds the address itself, so the reservation must be handed back first or its
+    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
+    // it for. That was the root cause behind 14 of the 18 targets (#617).
+    release_reservation(jdc_address);
+    if let Some(addr) = monitoring_address {
+        release_reservation(addr);
+    }
+
     let ret = jd_client_sv2::JobDeclaratorClient::new(jd_client_proxy);
     let ret_clone = ret.clone();
     tokio::spawn(async move { ret_clone.start().await });
@@ -322,6 +340,16 @@ pub async fn start_pool_with_jds(
         monitoring_cache_refresh_secs,
         Some(JDSPartialConfig::new(jds_address)),
     );
+
+    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
+    // component binds the address itself, so the reservation must be handed back first or its
+    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
+    // it for. That was the root cause behind 14 of the 18 targets (#617).
+    release_reservation(pool_address);
+    release_reservation(jds_address);
+    if let Some(addr) = monitoring_address {
+        release_reservation(addr);
+    }
 
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
@@ -397,6 +425,15 @@ pub async fn start_sv2_translator(
         monitoring_address,
         monitoring_cache_refresh_secs,
     );
+    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
+    // component binds the address itself, so the reservation must be handed back first or its
+    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
+    // it for. That was the root cause behind 14 of the 18 targets (#617).
+    release_reservation(listening_address);
+    if let Some(addr) = monitoring_address {
+        release_reservation(addr);
+    }
+
     let translator_v2 = translator_sv2::TranslatorSv2::new(config);
     let clone_translator_v2 = translator_v2.clone();
     tokio::spawn(async move {
