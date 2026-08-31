@@ -110,15 +110,39 @@ impl BitcoinCore {
                 let signet_datadir = data_dir.join(staticdir.clone()).join("signet");
                 create_dir_all(signet_datadir.clone()).expect("Failed to create signet directory");
 
-                // Download and cache high difficulty chain if not exists
-                if !high_diff_chain_dir.exists() {
+                // Download and cache the high difficulty chain if it is not already there.
+                //
+                // Judged by a FILE the chain cannot work without, not by the directory existing.
+                // `blocks/blk00000.dat` holds the blocks themselves; the guard used to be
+                // `!high_diff_chain_dir.exists()`, which is satisfied by a half-unpacked
+                // directory — so one interrupted unpack poisoned the cache permanently, with no
+                // path back. Measured: a truncated cache of 4 files/32K against a correct
+                // 38 files/29M, and Core then refuses to start with
+                // "LoadBlockIndex: block index is non-contiguous, index of height 1 missing",
+                // which points at the block database rather than at the unpack that produced it.
+                let chain_is_complete = high_diff_chain_dir
+                    .join("blocks")
+                    .join("blk00000.dat")
+                    .exists();
+                if !chain_is_complete {
+                    if high_diff_chain_dir.exists() {
+                        // `println!`, not `warn!`: these tests install no tracing
+                        // subscriber, so every `warn!` in this file is mute. A silent
+                        // re-fetch is exactly what made the poisoned cache hard to see.
+                        println!(
+                            "high_diff_chain cache at {} is incomplete — re-fetching",
+                            high_diff_chain_dir.display()
+                        );
+                        std::fs::remove_dir_all(&high_diff_chain_dir)
+                            .expect("Failed to clear the incomplete high_diff_chain cache");
+                    }
                     let local_tarball =
                         current_dir.join("resources").join("high_diff_chain.tar.gz");
                     let tarball_bytes = if local_tarball.exists() {
-                        warn!("Using local high_diff_chain.tar.gz");
+                        println!("Using local high_diff_chain.tar.gz");
                         tarball::read_from_file(local_tarball.to_str().unwrap())
                     } else {
-                        warn!("Downloading high_diff_chain for the testing session...");
+                        println!("Downloading high_diff_chain for the testing session...");
                         //this is pinning to the commit right before the current one, where I added
                         //the tar.gz file with the chain data.
                         let url = "https://raw.githubusercontent.com/stratum-mining/sv2-apps/eb41b790626fb51ce55e74be8fa0b4f07d4029bf/integration-tests/resources/high_diff_chain.tar.gz";
@@ -183,8 +207,18 @@ impl BitcoinCore {
             "-logtimemicros=1",
         ]);
 
-        // Launch bitcoin-node using corepc-node (which will manage the process for us)
-        let timeout = std::time::Duration::from_secs(10);
+        // Launch bitcoin-node using corepc-node (which will manage the process for us).
+        //
+        // The budget has to exceed `Node::with_conf`'s OWN internal wait, or this loop cannot
+        // retry even once. At 10s it could not: `with_conf` blocked for longer than that before
+        // returning "it appears that bitcoind is not reachable", so the elapsed check was already
+        // over budget on the first error and panicked immediately — zero retries, despite being
+        // written as a retry loop (#617).
+        //
+        // Core here runs with `-txindex=1` and can be verifying blocks on startup; the first
+        // attempt legitimately takes a while.
+        let timeout = std::time::Duration::from_secs(90);
+        let retry_pause = std::time::Duration::from_secs(2);
         let current_time = std::time::Instant::now();
         let bitcoind = loop {
             match Node::with_conf(&bitcoin_node_bin, &conf) {
@@ -192,10 +226,21 @@ impl BitcoinCore {
                     break bitcoind;
                 }
                 Err(e) => {
+                    // Logged BEFORE the budget check, so the failure that ends the loop is
+                    // visible too. Previously the panic came first and swallowed it.
+                    println!(
+                        "bitcoin-node not up after {:?}: {e}",
+                        current_time.elapsed()
+                    );
                     if current_time.elapsed() > timeout {
-                        panic!("Failed to start bitcoin-node: {e}");
+                        panic!(
+                            "Failed to start bitcoin-node after {:?}: {e}",
+                            current_time.elapsed()
+                        );
                     }
-                    println!("Failed to start bitcoin-node due to {e}");
+                    // Without a pause this spins, re-spawning a node while the previous
+                    // attempt may still be holding the datadir.
+                    std::thread::sleep(retry_pause);
                 }
             }
         };
