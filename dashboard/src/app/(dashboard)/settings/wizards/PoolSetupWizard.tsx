@@ -6,6 +6,7 @@ import { WizardDialog } from '@/components/ui/Wizard';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
+import { isMainnetBech32Address } from '@/lib/bitcoinAddress';
 import {
   useSetPublicMiningConfig,
   useSetMiningPayoutAddress,
@@ -28,19 +29,10 @@ interface PoolSetupWizardProps {
   onClose: () => void;
 }
 
-function isValidBech32Address(address: string): boolean {
-  if (!address) return false;
-  const trimmed = address.trim().toLowerCase();
-  const validPrefixes = ['bc1', 'tb1', 'bcrt1'];
-  const hasValidPrefix = validPrefixes.some((prefix) => trimmed.startsWith(prefix));
-  if (!hasValidPrefix) return false;
-  // Basic length check: bech32 addresses are typically 42-62 characters for segwit v0,
-  // or 62 characters for segwit v1 (taproot). Allow a reasonable range.
-  if (trimmed.length < 14 || trimmed.length > 90) return false;
-  // Character set: bech32 uses lowercase alphanumeric excluding 1, b, i, o
-  const bech32Chars = /^(bc1|tb1|bcrt1)[0-9a-z]{6,87}$/;
-  return bech32Chars.test(trimmed);
-}
+// Ghost is Bitcoin MAINNET. This used to accept `tb1` and `bcrt1` too, so a testnet or regtest
+// address could be saved and its rewards silently burned (#588). Shared with the other wizards
+// rather than reimplemented a third time.
+const isValidBech32Address = isMainnetBech32Address;
 
 const MODES: { key: MiningMode; label: string; desc: string }[] = [
   { key: 'private_solo', label: 'Private Solo', desc: 'Your miners only. Stratum port closed to external connections. All block rewards go to you.' },
@@ -81,7 +73,7 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
           return 'Payout address is required for pool modes';
         }
         if (data.payout_address.trim() && !isValidBech32Address(data.payout_address)) {
-          return 'Invalid address. Must be a valid bech32 address starting with bc1, tb1, or bcrt1';
+          return 'Invalid address. Must be a mainnet bech32 address starting with bc1';
         }
         return null;
       },
@@ -207,11 +199,12 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   label="Mining Payout Address"
                   value={data.payout_address}
                   onChange={(e) => setData({ payout_address: e.target.value })}
-                  placeholder="bc1q... / tb1q... / bcrt1q..."
+                  placeholder="bc1q..."
                 />
                 <p className="text-sm text-[color:var(--dim)] mt-1">
-                  Enter a bech32 Bitcoin address to receive mining payouts. Must start with
-                  bc1 (mainnet), tb1 (testnet/signet), or bcrt1 (regtest).
+                  Enter a mainnet bech32 Bitcoin address to receive mining payouts. It must start
+                  with bc1. Use an address you do not also mine to, so node and mining income stay
+                  separately attributable.
                 </p>
               </div>
               {data.payout_address.trim() && (
@@ -227,13 +220,9 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   {isValidBech32Address(data.payout_address) && (
                     <div className="mt-2">
                       <span className="text-[color:var(--dim)] text-sm">Network: </span>
-                      <span className="text-[color:var(--accent)] text-sm">
-                        {data.payout_address.trim().toLowerCase().startsWith('bc1')
-                          ? 'Mainnet'
-                          : data.payout_address.trim().toLowerCase().startsWith('bcrt1')
-                          ? 'Regtest'
-                          : 'Testnet/Signet'}
-                      </span>
+                      {/* Only mainnet validates, so the testnet and regtest branches this
+                          readout used to carry were unreachable once #588 tightened the check. */}
+                      <span className="text-[color:var(--accent)] text-sm">Mainnet</span>
                     </div>
                   )}
                 </div>
