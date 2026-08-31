@@ -110,6 +110,21 @@ struct ThisNode {
     /// 0 = peer (ghost-pool) hasn't reported capacity yet (very early boot).
     #[serde(default)]
     max_capacity: u32,
+    /// Whether this node's own Ghost Core is reachable (#778).
+    ///
+    /// Defaults to TRUE when absent, which is the opposite of how ghost-pool computes it — and
+    /// deliberately so. Absence here means the colocated ghost-pool predates the field, not that
+    /// Core is down; assuming the worst would make every translator divert all of its miners the
+    /// moment it out-ran the pool binary in a rolling deploy. ghost-pool, which can actually see
+    /// the probe, treats unknown as unhealthy.
+    #[serde(default = "default_core_healthy")]
+    core_healthy: bool,
+}
+
+/// serde default for [`ThisNode::core_healthy`] — see the field's note on why absence is trusted
+/// here but not in ghost-pool.
+fn default_core_healthy() -> bool {
+    true
 }
 
 /// Which listener a connection arrived on, and therefore which listener it may be sent to.
@@ -355,6 +370,29 @@ impl LoadBalancer {
         let idx = self.rr_index.fetch_add(1, Ordering::Relaxed) as usize % tied.len();
         let best = tied[idx];
 
+        // #778: an unreachable Ghost Core beats every utilisation consideration. This node
+        // cannot build a template, so the miner must go to a peer whatever the percentages say.
+        //
+        // Placed AFTER candidate selection so it can only ever divert to a peer that passed the
+        // same eligibility filter — public_mining, capacity reported, under its own reject
+        // threshold, serving this tier. An unhealthy node with no eligible peer returns `None`
+        // above and keeps serving locally: degraded beats unreachable.
+        //
+        // The threshold below is not merely insufficient here, it is inverted: a node whose Core
+        // is dead sheds miners, so `my_util_pct` FALLS, making it look ever more attractive the
+        // worse it gets. vm8 held 2 miners for 2h15m on 2026-08-24 while ghostd crash-looped 260
+        // times, gossiping `peer_count: 7` the whole while — mesh liveness is independent of Core.
+        if !cache.this_node.core_healthy {
+            tracing::warn!(
+                my_util_pct,
+                peer = %best.public_address,
+                peer_util_pct = peer_util_pct(best),
+                "load balancer: this node's Ghost Core is unreachable — diverting a new miner to \
+                 a peer regardless of utilisation"
+            );
+            return best.target_for(tier);
+        }
+
         // Only redirect if we exceed the best peer by the threshold percentage.
         // Without this guard, perfectly-balanced clusters ping-pong every tick.
         if my_util_pct < min_pct.saturating_add(self.config.proxy_threshold_pct) {
@@ -378,6 +416,29 @@ impl LoadBalancer {
                 p.public_mining && !p.public_address.is_empty() && p.port_for(tier).is_some()
             })
             .min_by_key(|p| p.miner_count)?;
+
+        // #778: if this node's own Ghost Core is unreachable it cannot build a template, so send
+        // the miner to a peer regardless of utilisation.
+        //
+        // The utilisation threshold below is actively WRONG in that state: a node whose Core is
+        // dead sheds miners, which lowers its count, which makes `local_count < best + 2` MORE
+        // likely — so the worse it gets, the more firmly it keeps new miners. vm8 sat like that
+        // for 2h15m on 2026-08-24 while ghostd crash-looped 260 times.
+        //
+        // ⚠ This can only ever divert to a peer that exists: `best` is the result of `?` above,
+        // so an unhealthy node with NO reachable peer keeps serving locally rather than routing
+        // to nothing. Degraded beats unreachable.
+        if !cache.this_node.core_healthy {
+            tracing::warn!(
+                local_count,
+                peer = %best.public_address,
+                peer_miner_count = best.miner_count,
+                "load balancer: this node's Ghost Core is unreachable — diverting a new miner to \
+                 a peer regardless of utilisation"
+            );
+            return best.target_for(tier);
+        }
+
         // Conservative fallback threshold: only divert if local exceeds peer by 2.
         if local_count < best.miner_count + 2 {
             return None;
@@ -547,10 +608,20 @@ mod tests {
     }
 
     fn cache_with(this_count: u32, this_cap: u32, peers: Vec<(u32, u32, &str)>) -> Cache {
+        cache_with_health(this_count, this_cap, peers, true)
+    }
+
+    fn cache_with_health(
+        this_count: u32,
+        this_cap: u32,
+        peers: Vec<(u32, u32, &str)>,
+        core_healthy: bool,
+    ) -> Cache {
         Cache {
             this_node: ThisNode {
                 miner_count: this_count,
                 max_capacity: this_cap,
+                core_healthy,
             },
             peers: peers
                 .into_iter()
@@ -582,6 +653,50 @@ mod tests {
 
     /// A peer too old to advertise ports is still a valid HOBBY target — that is where every
     /// node served SV1 before the farm tier existed, so assuming it preserves old behaviour.
+    /// #778: a node whose Ghost Core is unreachable must hand new miners to a peer even when
+    /// utilisation says keep them.
+    ///
+    /// The local node here is IDLE (0 miners) and the peer is busier (5), so every utilisation
+    /// rule in the balancer says "keep it" — which is exactly the trap: a dying node sheds
+    /// miners, so it looks idle, and idle is what the balancer optimises for.
+    #[test]
+    fn an_unreachable_core_diverts_regardless_of_utilisation() {
+        let cache = cache_with_health(0, 100, vec![(5, 100, "10.0.0.1:8080")], false);
+        let lb = LoadBalancer::new(cfg());
+        assert_eq!(
+            lb.fallback_pick_by_count(0, &cache, Tier::Hobby),
+            Some("10.0.0.1:3333".parse().unwrap()),
+            "an unhealthy node must divert even though it is the least loaded"
+        );
+    }
+
+    /// The same shape with a HEALTHY core must NOT divert — otherwise the test above would pass
+    /// for the wrong reason and the balancer would ping-pong every idle node.
+    #[test]
+    fn a_healthy_idle_node_keeps_its_miners() {
+        let cache = cache_with_health(0, 100, vec![(5, 100, "10.0.0.1:8080")], true);
+        let lb = LoadBalancer::new(cfg());
+        assert_eq!(
+            lb.fallback_pick_by_count(0, &cache, Tier::Hobby),
+            None,
+            "a healthy under-utilised node must keep serving locally"
+        );
+    }
+
+    /// ⚠ Degraded beats unreachable. With no eligible peer there is nowhere to send the miner,
+    /// so an unhealthy node must still serve it rather than route to nothing — the failure mode
+    /// #778 explicitly warns about when every node is unhealthy.
+    #[test]
+    fn an_unreachable_core_with_no_peer_still_serves_locally() {
+        let cache = cache_with_health(0, 100, vec![], false);
+        let lb = LoadBalancer::new(cfg());
+        assert_eq!(
+            lb.fallback_pick_by_count(0, &cache, Tier::Hobby),
+            None,
+            "with no peer to divert to, serving degraded beats serving nothing"
+        );
+    }
+
     #[test]
     fn a_peer_that_advertises_nothing_is_still_a_hobby_target() {
         let p = peer("10.0.0.1:8080", None, None);
