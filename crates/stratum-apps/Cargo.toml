@@ -79,6 +79,9 @@ translator = ["network", "config", "sv1", "with_buffer_pool", "core"]
 mining_device = ["config"]
 
 [dev-dependencies]
+# `test-util` gives `#[tokio::test(start_paused = true)]`, so the bounded fallback wait (#617)
+# can be tested without spending its real 30s timeout.
+tokio = { version = "1.44.1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1.1.0"
