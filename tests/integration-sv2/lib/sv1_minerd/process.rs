@@ -18,6 +18,14 @@ use super::error::MinerdError;
 
 const VERSION_MINERD: &str = "2.5.1";
 
+/// How many CONSECUTIVE refused upstream dials the minerd proxy tolerates before giving up.
+///
+/// minerd reconnects about once a second and each reconnect makes the proxy dial upstream, so
+/// this is roughly a 30-second grace period — long enough for an upstream that is merely slow to
+/// bind, short enough that an upstream which never binds fails the target in seconds instead of
+/// spinning out its whole timeout (#617).
+const MAX_CONSECUTIVE_UPSTREAM_FAILURES: u32 = 30;
+
 fn get_minerd_filename(os: &str, arch: &str) -> Result<String, MinerdError> {
     match (os, arch) {
         ("macos", "aarch64") => Ok(format!(
@@ -184,6 +192,8 @@ impl MinerdProcess {
         tokio::spawn(async move {
             info!("Proxy server started, waiting for connections...");
 
+            let mut consecutive_upstream_failures: u32 = 0;
+
             loop {
                 tokio::select! {
                     accept_result = listener.accept() => {
@@ -194,6 +204,11 @@ impl MinerdProcess {
                                 // Connect to upstream server
                                 match TcpStream::connect(upstream_address).await {
                                     Ok(upstream_stream) => {
+                                        // A success clears the count: the bound is on
+                                        // CONSECUTIVE failures, so an upstream that is slow to
+                                        // come up but does arrive is never killed off.
+                                        consecutive_upstream_failures = 0;
+
                                         // Split streams for bidirectional communication
                                         let (downstream_read, downstream_write) = downstream_stream.into_split();
                                         let (upstream_read, upstream_write) = upstream_stream.into_split();
@@ -232,7 +247,43 @@ impl MinerdProcess {
                                         });
                                     }
                                     Err(e) => {
-                                        error!("Failed to connect to upstream server {}: {}", upstream_address, e);
+                                        // Bounded, because this cannot recover on its own.
+                                        //
+                                        // minerd reconnects roughly once a second, and each
+                                        // reconnect makes the proxy dial upstream again. If the
+                                        // upstream never binds — the translator only starts its
+                                        // SV1 server AFTER its own upstream connect completes —
+                                        // every dial is refused instantly and the pair spin
+                                        // until the target is killed. Measured: 884 identical
+                                        // `Connection refused` lines in one run, and the target
+                                        // consumed its whole 600s timeout without ever printing
+                                        // a `test result` line (#617).
+                                        //
+                                        // An unbounded wait on a peer that is never coming turns
+                                        // a failure into a hang, which is the same shape as the
+                                        // fallback wait fixed in #801. Give up and say why.
+                                        consecutive_upstream_failures += 1;
+                                        error!(
+                                            "Failed to connect to upstream server {}: {} (attempt {}/{})",
+                                            upstream_address,
+                                            e,
+                                            consecutive_upstream_failures,
+                                            MAX_CONSECUTIVE_UPSTREAM_FAILURES
+                                        );
+                                        if consecutive_upstream_failures
+                                            >= MAX_CONSECUTIVE_UPSTREAM_FAILURES
+                                        {
+                                            error!(
+                                                "Giving up: upstream {} refused {} consecutive \
+                                                 connections. Nothing is listening there — the \
+                                                 component that should own this port never bound \
+                                                 it. Shutting the minerd proxy down rather than \
+                                                 spinning until the test times out.",
+                                                upstream_address,
+                                                consecutive_upstream_failures
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -404,6 +455,12 @@ impl MinerdProcess {
         // Capture stderr to parse the hashrate output (minerd outputs to stderr)
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
+
+        // The mining path at `start` sets this; this one did not. It matters MORE here, not
+        // less: `--benchmark` mines flat out on a full thread, so a panic between this spawn and
+        // the explicit kill below leaks a process that pegs a core for as long as it lives. The
+        // networked miner that leaks the same way sits at 0% CPU because it cannot connect.
+        cmd.kill_on_drop(true);
 
         info!("Running minerd benchmark: {:?}", cmd);
 
