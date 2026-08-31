@@ -1,6 +1,6 @@
 [package]
 name = "ghost-miner-proxy"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Decentralised mining discovery shim — verifies the signed Ghost node-list checkpoint and stratum-proxies a miner to a live pool node"
 license = "MIT"

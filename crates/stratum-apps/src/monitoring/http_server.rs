@@ -355,7 +355,10 @@ struct Sv1ClientsResponse {
 async fn handle_root() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "service": "SRI Monitoring API",
-        "version": "0.1.0",
+        // Reported from the build, not hardcoded. This said "0.1.0" while the binary serving it
+        // was 1.11.32 — an endpoint whose whole job is to say what is running, stating a version
+        // nobody chose (#759).
+        "version": env!("CARGO_PKG_VERSION"),
         "endpoints": {
             "/": "This endpoint - API listing",
             "/swagger-ui": "Swagger UI (interactive API documentation)",

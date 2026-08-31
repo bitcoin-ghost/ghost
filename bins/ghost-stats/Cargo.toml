@@ -21,7 +21,7 @@
 
 [package]
 name = "ghost-stats"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Public pool-stats aggregator - one server-side snapshot instead of a per-viewer fan-out"
 license = "MIT"

@@ -22,7 +22,7 @@
 
 [package]
 name = "ghost-gsp-bin"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Ghost Service Provider - Light wallet server for Ghost Pay"
 license = "MIT"
