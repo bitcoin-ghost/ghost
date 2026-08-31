@@ -8,6 +8,7 @@ import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useToast } from '@/components/ui/Toast';
+import { isMainnetBech32Address } from '@/lib/bitcoinAddress';
 import {
   useFullConfig,
   useSetNickname,
@@ -55,10 +56,9 @@ const MEMPOOL_PROFILES = [
   },
 ];
 
-function isValidBech32(address: string): boolean {
-  if (!address) return false;
-  return /^(bc1|tb1|bcrt1)[a-zA-HJ-NP-Z0-9]{25,87}$/i.test(address);
-}
+// Ghost is Bitcoin MAINNET (#588). The old regex also accepted `tb1`/`bcrt1`, and its character
+// class was the base58 one applied case-insensitively, so it did not describe bech32 either.
+const isValidBech32 = isMainnetBech32Address;
 
 export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizardProps) {
   const { data: fullConfig, isLoading: configLoading } = useFullConfig();
@@ -135,7 +135,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           return 'Payout address is required when public mining is enabled';
         }
         if (data.payout_address.trim() && !isValidBech32(data.payout_address.trim())) {
-          return 'Please enter a valid bech32 Bitcoin address (starts with bc1, tb1, or bcrt1)';
+          return 'Please enter a valid mainnet bech32 Bitcoin address (starts with bc1)';
         }
         return null;
       },

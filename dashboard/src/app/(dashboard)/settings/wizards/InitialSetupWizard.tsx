@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/Input';
 import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
+import { isMainnetBech32Address } from '@/lib/bitcoinAddress';
 import {
   useSetNickname,
   useSetPublicMiningConfig,
@@ -53,11 +54,8 @@ const MEMPOOL_PROFILES = [
   },
 ];
 
-function isValidBech32(address: string): boolean {
-  if (!address) return false;
-  // Basic bech32/bech32m validation: bc1 or tb1 prefix, correct character set
-  return /^(bc1|tb1|bcrt1)[a-zA-HJ-NP-Z0-9]{25,87}$/i.test(address);
-}
+// Ghost is Bitcoin MAINNET (#588). Previously accepted `tb1`/`bcrt1` as well.
+const isValidBech32 = isMainnetBech32Address;
 
 export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWizardProps) {
   const setNickname = useSetNickname();
@@ -98,7 +96,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
           return 'Payout address is required when public mining is enabled';
         }
         if (data.payout_address.trim() && !isValidBech32(data.payout_address.trim())) {
-          return 'Please enter a valid bech32 Bitcoin address (starts with bc1, tb1, or bcrt1)';
+          return 'Please enter a valid mainnet bech32 Bitcoin address (starts with bc1)';
         }
         return null;
       },
