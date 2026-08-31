@@ -18,15 +18,17 @@
   <meta name="twitter:title" content="Ghost Pool · Bitcoin Ghost">
   <meta name="twitter:description" content="Decentralised mining pool on Bitcoin Ghost. Live leaderboard, ledger-model payouts, BFT-voted coinbase — no operator, no fee.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
-  <!-- The Quasar tab is the DEFAULT view and renders through three.js, which is fetched from
-       unpkg: 257 KB gzipped (1.27 MB raw) plus OrbitControls. Without these hints the browser
-       cannot even open the connection until it has parsed the importmap and reached the module
-       script near the end of the body. preconnect gets DNS+TLS out of the way immediately and
-       modulepreload starts the download in parallel with the rest of the page.
+  <!-- The Quasar tab is the DEFAULT view and renders through three.js. It is SELF-HOSTED
+       (#686): it used to come from unpkg, so every visitor pulled 257 KB gzipped from a third
+       party — ~10x this page — before the default view could render, and the default tab did
+       not render at all if unpkg was slow, rate-limited or blocked on their network. importmap
+       has no `integrity`, so it was unpinned against tampering too.
+       Same-origin now, over the connection already open for the page itself. modulepreload
+       still matters: without it the browser cannot start the download until it has parsed the
+       importmap and reached the module script near the end of the body.
        ⚠ This does not make it smaller — self-hosting or lazy-loading it behind the tab switch
        would, and both are worth considering; this only stops it starting late. -->
-  <link rel="preconnect" href="https://unpkg.com" crossorigin>
-  <link rel="modulepreload" href="https://unpkg.com/three@0.160.0/build/three.module.js">
+  <link rel="modulepreload" href="/vendor/three@0.160.0/build/three.module.js">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -41,8 +43,8 @@
   <script type="importmap">
   {
     "imports": {
-      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      "three": "/vendor/three@0.160.0/build/three.module.js",
+      "three/addons/": "/vendor/three@0.160.0/examples/jsm/"
     }
   }
   </script>
