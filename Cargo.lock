@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp-bin"
-version = "0.1.0"
+version = "1.11.32"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -3393,7 +3393,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-miner-proxy"
-version = "0.1.0"
+version = "1.11.32"
 dependencies = [
  "anyhow",
  "clap",
@@ -3583,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-stats"
-version = "0.1.0"
+version = "1.11.32"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
