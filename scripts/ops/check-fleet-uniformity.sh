@@ -179,6 +179,31 @@ echo
 # ---------------------------------------------------------------- invariants
 # Agreement is not correctness — all four production nodes agreed on a stale value.
 echo "Invariants:"
+
+# Ops scripts under scripts/ops/fleet-files/ are canonical: the fleet must match the
+# REPO, not merely match each other. Node-to-node agreement was the only test these
+# files had, and it passed happily while wait-for-ghostd-sync.sh sat in three variants
+# that no repo file governed (#759). Deploy with scripts/ops/deploy-fleet-file.sh.
+#
+# This is the comparison the header says the config check deliberately avoids, and the
+# reason it is safe HERE is that these files are deployed FROM the repo copy, so the
+# reference is what the fleet was given — not an aspirational template nothing reads.
+for cf in "$REPO_ROOT"/scripts/ops/fleet-files/*; do
+    [ -f "$cf" ] || continue
+    cname="$(basename "$cf")"
+    case "$cname" in wait-for-ghostd-sync.sh) cfield=ops_wait_sync ;; *) continue ;; esac
+    cwant="$(sha256sum "$cf" | cut -c1-16)"
+    cbad=""
+    for n in "${REACHED[@]}"; do
+        [ "${VALUES[$n|$cfield]:-<missing>}" = "$cwant" ] || cbad="$cbad $n"
+    done
+    if [ -n "$cbad" ]; then
+        echo "  FAIL$cbad $cname differs from the canonical copy in scripts/ops/fleet-files/"
+        echo "       run: scripts/ops/deploy-fleet-file.sh $cname"
+        rc=1
+    fi
+done
+
 for n in "${REACHED[@]}"; do
     en2="${VALUES[$n|en2_size]:-}"
     if [ -n "$en2" ] && [ "$en2" -lt "$MIN_EXTRANONCE2_SIZE" ] 2>/dev/null; then
