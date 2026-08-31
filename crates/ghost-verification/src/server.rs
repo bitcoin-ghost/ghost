@@ -2983,6 +2983,15 @@ impl VerificationState {
         &self.ws_state
     }
 
+    /// Whether Ghost Core is currently reachable, or `None` when no probe is wired.
+    ///
+    /// Split out of `get_health` so the load-balancer endpoint (#778) can consult the same
+    /// signal without building a whole `HealthResponse`. Callers deciding whether to ROUTE to
+    /// this node must treat `None` as unhealthy, as `get_health` does.
+    pub fn core_health_reachable(&self) -> Option<bool> {
+        self.get_core_health.as_ref().map(|probe| probe().0)
+    }
+
     /// Get health response
     pub async fn get_health(&self) -> HealthResponse {
         let core = self.get_core_health.as_ref().map(|probe| probe());

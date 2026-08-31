@@ -12135,6 +12135,20 @@ fn fxhash(s: &str) -> u32 {
 /// Returns peers with public_mining enabled and their miner counts.
 /// Used by the colocated translator for transparent TCP load balancing.
 async fn pool_nodes_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
+    // #778: publish whether THIS node's Ghost Core is reachable, so the colocated balancer can
+    // send new miners elsewhere instead of onto a node that cannot build them a template.
+    //
+    // Without it the failure is not merely unhandled, it is INVERTED: a node whose Core is dead
+    // loses miners, which lowers its utilisation, and utilisation is exactly what the balancer
+    // optimises for — so it becomes a MORE attractive destination the worse it gets. vm8 spent
+    // 2h15m in that state on 2026-08-24 while `ghostd` crash-looped 260 times, reporting
+    // `peer_count: 7` throughout, because mesh gossip is independent of Core.
+    //
+    // ⚠ Unknown is NOT healthy, matching `get_health` exactly: "If nothing wired a probe, this
+    // node cannot demonstrate it can reach Ghost Core, and saying `healthy` on that basis is what
+    // hid vm7's outage." Diverting new miners away from a node that cannot prove itself is the
+    // survivable error — they land on a peer. Keeping them is the one that stranded vm8.
+    let core_healthy = state.core_health_reachable().unwrap_or(false);
     Json(serde_json::json!({
         "this_node": {
             "miner_count": state.miner_count(),
@@ -12142,6 +12156,7 @@ async fn pool_nodes_handler(State(state): State<Arc<VerificationState>>) -> impl
             // Deduped share attributed to this node; `this_node` + every peer's
             // `deduped_miner_count` sum to the deduped `mesh_active_miners`.
             "deduped_miner_count": state.self_deduped_miner_count(),
+            "core_healthy": core_healthy,
         },
         "peers": state.pool_peers(),
     }))
