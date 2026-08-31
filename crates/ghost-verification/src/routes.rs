@@ -5300,9 +5300,18 @@ fn apply_maxconnections_update(
     let recommended = crate::maxconnections::recommended_max(mem_available_mb);
     if let Some(rec) = recommended {
         if payload.value > rec && !payload.force {
+            // #614: say that the ceiling came from a MOMENTARY reading. `MemAvailable` is not a
+            // property of the host — it swung 7.8x on one machine minutes apart (1,307,632 kB
+            // then 10,237,308 kB), moving this ceiling between ~197 and the 500 hard cap. So a
+            // refusal is a snapshot, not a verdict, and the same request can succeed on a retry.
+            // Without saying so, an operator reads "this node's maximum" as a fact about the
+            // node and either forces past a real limit or abandons a value that was fine.
             return bad(format!(
                 "{} is above this node's memory-derived maximum of {rec} \
-                 ({}MB available, {}MB per peer, {}MB headroom); pass force=true to override",
+                 ({}MB available, {}MB per peer, {}MB headroom). That ceiling is derived from \
+                 memory free RIGHT NOW, not from a fixed property of this host, so it moves as \
+                 other processes come and go — retrying may succeed. Pass force=true to set it \
+                 anyway.",
                 payload.value,
                 mem_available_mb.unwrap_or(0),
                 crate::maxconnections::PER_PEER_MB,
