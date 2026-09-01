@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use stratum_apps::stratum_core::sv1_api::{
     client_to_server, json_rpc,
     server_to_client::{self, Notify},
@@ -191,6 +192,15 @@ impl IsServer<'static> for Sv1Server {
             .and_then(|jobs| find_job(jobs.as_ref()));
 
         let Some(job) = job else {
+            // Silently dropped before this: no log, no counter, indistinguishable from a share
+            // that was never sent. A share arriving for a job we no longer hold is ordinary
+            // (the job rolled), but it is not nothing — if it becomes the dominant reason a
+            // channel is refusing work, that is a fact worth being able to see (#810).
+            let n = self.shares_for_unknown_job.fetch_add(1, Ordering::Relaxed) + 1;
+            debug!(
+                "share for channel {channel_id} referenced job {job_id}, which is no longer held \
+                 — dropping it (total dropped for unknown jobs: {n})"
+            );
             return false;
         };
 
@@ -211,17 +221,52 @@ impl IsServer<'static> for Sv1Server {
                 channel_id
             );
 
-            let is_valid = validate_sv1_share(
+            // THREE outcomes, and they are not the same thing. `.unwrap_or(false)` used to
+            // collapse them into one `error!`, so a node failing every merkle root looked
+            // exactly like one doing routine vardiff convergence (#810).
+            let validated = validate_sv1_share(
                 request,
                 data.target,
                 data.extranonce1.clone().into(),
                 data.version_rolling_mask.clone(),
                 job,
-            )
-            .unwrap_or(false);
+            );
+
+            let is_valid = match validated {
+                Ok(true) => true,
+                Ok(false) => {
+                    // Below the downstream target. EXPECTED, and routine: vardiff raises the
+                    // target and shares already in flight against the previous, easier one no
+                    // longer qualify (#811). Not an error, and not logged per share — at
+                    // 1 PH/s that is a great deal of journal for a normal condition.
+                    let n = self.shares_below_target.fetch_add(1, Ordering::Relaxed) + 1;
+                    debug!("share below target on channel {channel_id} (total: {n})");
+                    if n.is_multiple_of(500) {
+                        info!(
+                            "channel {channel_id}: {n} shares below target so far — routine \
+                             during difficulty changes; compare against \
+                             shares_failed_validation, which is not routine"
+                        );
+                    }
+                    false
+                }
+                Err(e) => {
+                    // A FAULT. The share could not be validated at all — the merkle root could
+                    // not be built from the job, or prev_hash would not deserialise. This is the
+                    // outcome that was invisible, and the one worth waking someone for.
+                    let n = self
+                        .shares_failed_validation
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    error!(
+                        "share validation FAILED on channel {channel_id}: {e:?} \
+                         (total validation failures: {n}) — this is NOT a below-target share"
+                    );
+                    false
+                }
+            };
 
             if !is_valid {
-                error!("Invalid share for channel id: {}", channel_id);
                 return false;
             }
 
@@ -521,6 +566,34 @@ mod vanished_downstream_tests {
         assert_eq!(s.set_extranonce1(Some(4242), None).len(), 8);
         s.set_version_rolling_mask(Some(4242), None);
         s.set_version_rolling_min_bit(Some(4242), None);
+    }
+
+    // #810: the three refusal reasons must be counted separately. Before this they were
+    // collapsed by `.unwrap_or(false)` into one `error!("Invalid share")`, so a node failing
+    // every merkle root was indistinguishable from one doing routine vardiff convergence —
+    // which is why the 15-20% on ghost-vm2 could not be diagnosed from logs at all.
+
+    #[test]
+    fn the_three_refusal_counters_start_at_zero_and_are_separate() {
+        let s = server();
+        assert_eq!(s.shares_below_target.load(Ordering::Relaxed), 0);
+        assert_eq!(s.shares_failed_validation.load(Ordering::Relaxed), 0);
+        assert_eq!(s.shares_for_unknown_job.load(Ordering::Relaxed), 0);
+
+        // They must be distinct counters, not aliases of one another — the whole point is that
+        // "below target" and "failed validation" can be told apart.
+        s.shares_below_target.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(s.shares_below_target.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            s.shares_failed_validation.load(Ordering::Relaxed),
+            0,
+            "a below-target share must not increment the validation-failure counter"
+        );
+        assert_eq!(
+            s.shares_for_unknown_job.load(Ordering::Relaxed),
+            0,
+            "a below-target share must not increment the unknown-job counter"
+        );
     }
 
     #[test]
