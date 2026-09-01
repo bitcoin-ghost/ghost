@@ -116,6 +116,12 @@ pub struct Sv1Server {
     /// submission (#810).
     pub(crate) shares_below_target: Arc<AtomicU64>,
     pub(crate) shares_failed_validation: Arc<AtomicU64>,
+    /// Shares that missed the current target but met the one they were computed against (#811).
+    ///
+    /// Work this node recovered rather than discarded. Counted separately from
+    /// `shares_below_target` so the two can be compared: this is how much of the reject rate the
+    /// vardiff swap was responsible for, which was never quantified.
+    pub(crate) shares_accepted_late: Arc<AtomicU64>,
     pub(crate) shares_for_unknown_job: Arc<AtomicU64>,
 }
 
@@ -216,6 +222,7 @@ impl Sv1Server {
         Self {
             shares_below_target: Arc::new(AtomicU64::new(0)),
             shares_failed_validation: Arc::new(AtomicU64::new(0)),
+            shares_accepted_late: Arc::new(AtomicU64::new(0)),
             shares_for_unknown_job: Arc::new(AtomicU64::new(0)),
             sv1_server_channel_state,
             config,

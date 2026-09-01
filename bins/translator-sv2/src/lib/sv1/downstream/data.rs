@@ -43,6 +43,21 @@ pub struct DownstreamData {
     pub cached_set_difficulty: Option<json_rpc::Message>,
     pub cached_notify: Option<json_rpc::Message>,
     pub pending_target: Option<Target>,
+    /// The target this downstream was working against BEFORE the most recent change, and when
+    /// the change happened.
+    ///
+    /// `target` is swapped the instant `mining.set_difficulty` is SENT. The miner's already
+    /// computed shares were made against the old, easier target and keep arriving for as long
+    /// as the network round trip and its own pipeline take — and every one of them then fails
+    /// `hash_as_target < target` and is thrown away. That is real work the miner performed and
+    /// the pool declined because the goalposts moved mid-flight.
+    ///
+    /// Measured under a 1 PH/s farm-tier test: on the two busiest nodes ~20% of all submitted
+    /// shares, tracking target-change frequency almost exactly (#811).
+    ///
+    /// Accepting against EITHER target for a short window is standard stratum practice.
+    pub previous_target: Option<Target>,
+    pub previous_target_since: Option<std::time::Instant>,
     pub pending_hashrate: Option<Hashrate>,
     // Queue of Sv1 handshake messages received while waiting for SV2 channel to open
     pub queued_sv1_handshake_messages: Vec<json_rpc::Message>,
@@ -124,6 +139,8 @@ impl DownstreamData {
             cached_set_difficulty: None,
             cached_notify: None,
             pending_target: None,
+            previous_target: None,
+            previous_target_since: None,
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
             extranonce_subscribe_negotiated: false,
@@ -139,6 +156,34 @@ impl DownstreamData {
     pub fn set_pending_target(&mut self, new_target: Target, downstream_id: DownstreamId) {
         self.pending_target = Some(new_target);
         debug!("Downstream {downstream_id}: Set pending target");
+    }
+
+    /// Adopt a staged target, remembering the one it replaces.
+    ///
+    /// One place, so the two call sites that swap the target cannot disagree about whether the
+    /// previous one is retained — they already drifted once on whether to adopt at all.
+    pub fn adopt_pending_target(&mut self) {
+        if let Some(new_target) = self.pending_target.take() {
+            // Only remember a target the miner actually worked against. Repeated adoptions
+            // inside one grace window must not overwrite it with an equally new value, or the
+            // window silently shrinks to nothing under exactly the churn it exists for.
+            if self.target != new_target {
+                self.previous_target = Some(self.target);
+                self.previous_target_since = Some(std::time::Instant::now());
+            }
+            self.target = new_target;
+        }
+    }
+
+    /// The superseded target, if it is still within the grace window.
+    ///
+    /// `None` once the window has passed, so a stale target cannot be used to accept a share
+    /// indefinitely — that would quietly hand every miner a permanent difficulty discount.
+    pub fn target_within_grace(&self, grace: std::time::Duration) -> Option<Target> {
+        match (self.previous_target, self.previous_target_since) {
+            (Some(t), Some(since)) if since.elapsed() <= grace => Some(t),
+            _ => None,
+        }
     }
 
     pub fn set_pending_hashrate(
@@ -182,5 +227,120 @@ mod tests {
             d.cached_set_difficulty.is_none(),
             "nothing should be cached before anything is received"
         );
+    }
+}
+
+#[cfg(test)]
+mod superseded_target_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // #811: `target` is swapped the instant mining.set_difficulty is SENT, so shares already
+    // computed against the previous, easier target keep arriving and were all discarded — ~20%
+    // of submitted work on the busiest nodes under a 1 PH/s farm-tier test.
+
+    fn data_with(target: Target) -> DownstreamData {
+        DownstreamData::new(None, target, 8)
+    }
+
+    fn target_from(byte: u8) -> Target {
+        // Larger array value = easier target. Two clearly different values are all these tests
+        // need; the ordering semantics are validate_sv1_share's business, not this type's.
+        let mut b = [0u8; 32];
+        b[0] = byte;
+        Target::from_le_bytes(b)
+    }
+
+    #[test]
+    fn adopting_a_target_remembers_the_one_it_replaces() {
+        let old = target_from(1);
+        let new = target_from(2);
+        let mut d = data_with(old);
+        d.pending_target = Some(new);
+        d.adopt_pending_target();
+
+        assert_eq!(d.target, new, "the new target must be live");
+        assert_eq!(
+            d.target_within_grace(Duration::from_secs(10)),
+            Some(old),
+            "the superseded target must still be reachable"
+        );
+    }
+
+    #[test]
+    fn the_superseded_target_expires() {
+        // Without expiry this is a permanent difficulty discount for every miner, which is
+        // strictly worse than the bug it fixes.
+        let mut d = data_with(target_from(1));
+        d.pending_target = Some(target_from(2));
+        d.adopt_pending_target();
+
+        assert!(d.target_within_grace(Duration::from_secs(10)).is_some());
+        // Anything genuinely older than the window is gone.
+        d.previous_target_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+        assert!(
+            d.target_within_grace(Duration::from_secs(10)).is_none(),
+            "a target superseded a minute ago must NOT still accept shares"
+        );
+    }
+
+    #[test]
+    fn repeated_adoptions_do_not_shrink_the_window_to_nothing() {
+        // The failure this guards: under churn, adopting again immediately would overwrite
+        // `previous_target` with an equally-new value and the grace window would cover a target
+        // no miner ever worked against — silently reintroducing the bug under exactly the
+        // conditions that caused it.
+        let first = target_from(1);
+        let second = target_from(2);
+        let mut d = data_with(first);
+
+        d.pending_target = Some(second);
+        d.adopt_pending_target();
+        assert_eq!(d.target_within_grace(Duration::from_secs(10)), Some(first));
+
+        // Adopt the SAME target again — nothing actually changed for the miner.
+        d.pending_target = Some(second);
+        d.adopt_pending_target();
+        assert_eq!(
+            d.target_within_grace(Duration::from_secs(10)),
+            Some(first),
+            "re-adopting the same target must not discard the real previous one"
+        );
+    }
+
+    #[test]
+    fn with_no_change_there_is_no_superseded_target() {
+        // The accept-side control: a downstream that has never had a difficulty change must not
+        // get a second target to validate against.
+        let d = data_with(target_from(1));
+        assert!(d.target_within_grace(Duration::from_secs(10)).is_none());
+    }
+
+    #[test]
+    fn a_harder_target_is_the_numerically_smaller_one() {
+        // The late-accept guard picks the harder of (previous downstream, upstream) with `min`,
+        // and the difficulty manager gates set_difficulty on `new_target >= upstream_target`.
+        // Both rest on Target ordering being numeric, smaller = harder. If that ever inverts,
+        // the guard silently starts accepting shares the pool will refuse.
+        let easier = target_from(2);
+        let harder = target_from(1);
+        assert!(
+            harder < easier,
+            "smaller target value must compare as harder"
+        );
+        assert_eq!(
+            easier.min(harder),
+            harder,
+            "min must select the harder target"
+        );
+    }
+
+    #[test]
+    fn adopting_with_nothing_pending_changes_nothing() {
+        let t = target_from(1);
+        let mut d = data_with(t);
+        d.adopt_pending_target();
+        assert_eq!(d.target, t);
+        assert!(d.target_within_grace(Duration::from_secs(10)).is_none());
     }
 }

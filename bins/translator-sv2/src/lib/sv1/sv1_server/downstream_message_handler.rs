@@ -1,4 +1,13 @@
 use std::sync::atomic::Ordering;
+
+/// How long a superseded target keeps accepting shares after a difficulty change.
+///
+/// Covers the miner's round trip plus its own submission pipeline. Long enough that work in
+/// flight when `mining.set_difficulty` went out is not thrown away; short enough that it cannot
+/// become a standing discount — vardiff on a busy node changes target roughly every 25 seconds,
+/// so a window near that would never close (#811).
+const SUPERSEDED_TARGET_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 use stratum_apps::stratum_core::sv1_api::{
     client_to_server, json_rpc,
     server_to_client::{self, Notify},
@@ -229,26 +238,71 @@ impl IsServer<'static> for Sv1Server {
                 data.target,
                 data.extranonce1.clone().into(),
                 data.version_rolling_mask.clone(),
-                job,
+                job.clone(),
             );
 
             let is_valid = match validated {
                 Ok(true) => true,
                 Ok(false) => {
-                    // Below the downstream target. EXPECTED, and routine: vardiff raises the
-                    // target and shares already in flight against the previous, easier one no
-                    // longer qualify (#811). Not an error, and not logged per share — at
-                    // 1 PH/s that is a great deal of journal for a normal condition.
-                    let n = self.shares_below_target.fetch_add(1, Ordering::Relaxed) + 1;
-                    debug!("share below target on channel {channel_id} (total: {n})");
-                    if n.is_multiple_of(500) {
-                        info!(
-                            "channel {channel_id}: {n} shares below target so far — routine \
-                             during difficulty changes; compare against \
-                             shares_failed_validation, which is not routine"
+                    // Below the CURRENT target — but the miner may have computed this against
+                    // the previous, easier one. `target` is swapped the instant
+                    // `mining.set_difficulty` is SENT, so everything already in flight was made
+                    // against a target that no longer applies. That is real work, and
+                    // discarding it was ~20% of submissions on the busiest nodes (#811).
+                    //
+                    // Only this arm retries. An `Err` below is a FAULT, not a target question,
+                    // and re-running it against a different target would just fail identically
+                    // while making a validation bug look like routine vardiff churn.
+                    let late = data
+                        .target_within_grace(SUPERSEDED_TARGET_GRACE)
+                        .map(|previous| {
+                            // Validate against whichever is HARDER. An accepted share is
+                            // forwarded upstream, where `pool_sv2` judges it against the channel
+                            // target and answers `difficulty-too-low`; accepting one the pool
+                            // will refuse relocates the rejection rather than fixing it.
+                            let bar = match data.upstream_target {
+                                Some(upstream) => previous.min(upstream),
+                                None => previous,
+                            };
+                            validate_sv1_share(
+                                request,
+                                bar,
+                                data.extranonce1.clone().into(),
+                                data.version_rolling_mask.clone(),
+                                job.clone(),
+                            )
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+
+                    if late {
+                        let n = self.shares_accepted_late.fetch_add(1, Ordering::Relaxed) + 1;
+                        debug!(
+                            "channel {channel_id}: share met the SUPERSEDED target — accepted \
+                             (total late accepts: {n}); it was computed before the miner saw \
+                             the new difficulty"
                         );
+                        // Yields the ARM's value rather than returning: this runs inside the
+                        // `super_safe_lock` closure, and an early `return` would skip the
+                        // `pending_share` assignment below — accepting the share and then never
+                        // forwarding it upstream, which is worse than the reject it replaces.
+                        true
+                    } else {
+                        // Genuinely below target, on both the current and the superseded value.
+                        // EXPECTED and routine, so not an error and not logged per share — at
+                        // 1 PH/s that is a great deal of journal for a normal condition.
+                        let n = self.shares_below_target.fetch_add(1, Ordering::Relaxed) + 1;
+                        debug!("share below target on channel {channel_id} (total: {n})");
+                        if n.is_multiple_of(500) {
+                            info!(
+                                "channel {channel_id}: {n} shares below target so far — routine \
+                                 during difficulty changes; compare against \
+                                 shares_failed_validation, which is not routine, and against \
+                                 shares_accepted_late, which is work this node recovered"
+                            );
+                        }
+                        false
                     }
-                    false
                 }
                 Err(e) => {
                     // A FAULT. The share could not be validated at all — the merkle root could
@@ -264,6 +318,50 @@ impl IsServer<'static> for Sv1Server {
                     );
                     false
                 }
+            };
+
+            // A share that misses the CURRENT target may still have satisfied the one the miner
+            // was working against when it computed it. `target` is swapped the instant
+            // `mining.set_difficulty` is SENT, so everything already in flight was made against
+            // the previous, easier value — real work, declined because the goalposts moved.
+            //
+            // Measured under a 1 PH/s farm-tier test: ~20% of all submitted shares on the two
+            // busiest nodes, tracking target-change frequency almost exactly (#811).
+            //
+            // Bounded by SUPERSEDED_TARGET_GRACE so this cannot become a permanent difficulty
+            // discount: outside the window there is no previous target to fall back to.
+            let is_valid = if is_valid {
+                true
+            } else if let Some(previous) = data.target_within_grace(SUPERSEDED_TARGET_GRACE) {
+                // Validate against whichever of the two is HARDER. An accepted share is
+                // forwarded upstream, where `pool_sv2` judges it against the channel target and
+                // answers `difficulty-too-low`; accepting something upstream will refuse would
+                // relocate the rejection rather than fix it, and cost a round trip doing so.
+                //
+                // `upstream_target` is the pool's own assignment via `SetTarget`, and is the
+                // same value the difficulty manager already gates `set_difficulty` on. Harder
+                // is the numerically smaller target, hence `min`.
+                let bar = match data.upstream_target {
+                    Some(upstream) => previous.min(upstream),
+                    None => previous,
+                };
+                let accepted_late = validate_sv1_share(
+                    request,
+                    bar,
+                    data.extranonce1.clone().into(),
+                    data.version_rolling_mask.clone(),
+                    job,
+                )
+                .unwrap_or(false);
+                if accepted_late {
+                    debug!(
+                        "channel {channel_id}: share met the SUPERSEDED target — accepted; it \
+                         was computed before the miner saw the new difficulty"
+                    );
+                }
+                accepted_late
+            } else {
+                false
             };
 
             if !is_valid {
