@@ -647,11 +647,23 @@ pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = u64::MAX;
 /// the whole message. Emitting before the fleet is uniform would therefore have every old
 /// peer discard every new verdict — and, worse, discard it silently.
 ///
-/// `u64::MAX` = never. Arm only once every node runs a binary that KNOWS the variant, and
-/// then only once a live pass rate has been observed — measured over 24h on 2026-08-21 at
-/// **9,681 pass / 181 fail across all 8 nodes (98.2%)**, with all 181 failures `Unreachable`
-/// and not one `WrongSigner`, `BadSignature`, or `NonceMismatch`.
-pub const ADDRESS_PROOF_HEIGHT: u64 = u64::MAX;
+/// ARMED at 966_000 on 2026-09-01. Both preconditions this comment demanded were checked
+/// immediately before arming, on the running fleet rather than from the source tree:
+///
+/// 1. **Every node knows the variant.** All eight run v1.11.33 at commit `bf3f822b5`, verified
+///    per binary via `--version` (which names the commit since #820) rather than by version
+///    string alone — the two are not the same claim, which is what #759 is about.
+/// 2. **A live pass rate.** Re-measured on the new binary after the roll: **722 pass / 0 fail**
+///    across all eight nodes, with zero `Unreachable`, `WrongSigner` or `BadSignature`. The
+///    earlier 24h figure (9,681 / 181, 98.2%, 2026-08-21) stands as the longer baseline; this
+///    confirms the rolled binary behaves the same.
+///
+/// 966_000 is ~785 blocks beyond where the arming roll lands (chain was at 965,065 when this
+/// was written, running ~150 blocks/day — 144 blocks took 23h), so roughly five days of margin.
+/// That is deliberately more than the ~2.2 days `SHARE_TIER_BIND_HEIGHT` used, because this
+/// gate's failure mode is SILENT: an old peer does not reject a verdict carrying `"address"`,
+/// it drops the entire message without saying so. Margin buys room to roll back and re-roll.
+pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
@@ -1445,5 +1457,52 @@ mod activation_height_logging_tests {
             !out.contains("18446744073709551615"),
             "u64::MAX must never be printed raw; got: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod address_proof_gate_tests {
+    /// The armed height is consensus-visible and must not drift silently.
+    ///
+    /// H-7 governs whether a challenger BROADCASTS its address proof. `CapabilityType` is a
+    /// plain serde enum with no unknown-variant fallback, so a node that emits `"address"` to a
+    /// peer which does not know the variant has that peer drop the WHOLE message — silently, not
+    /// as a rejection. Two nodes disagreeing about this height therefore do not error, they just
+    /// stop hearing each other's verdicts, and the qualified set diverges.
+    ///
+    /// Pinning the literal is the same treatment `FEE_DRIFT_MINER_SHARE_HEIGHT` gets, and for
+    /// the same reason: a constant nobody asserts on is a constant a refactor can move.
+    #[test]
+    fn the_armed_height_is_pinned() {
+        assert_eq!(
+            crate::ADDRESS_PROOF_HEIGHT,
+            966_000,
+            "changing an armed consensus height requires a fleet roll — see the const's docs"
+        );
+    }
+
+    /// Guards the specific regression of arming being UNDONE.
+    ///
+    /// `u64::MAX` reads as a perfectly ordinary value and a revert to it would leave every test
+    /// that merely checks "the gate exists" passing, while the behaviour silently returns to
+    /// never firing.
+    #[test]
+    fn the_gate_is_armed_not_dormant() {
+        assert_ne!(
+            crate::ADDRESS_PROOF_HEIGHT,
+            u64::MAX,
+            "ADDRESS_PROOF_HEIGHT is dormant again — arming was reverted"
+        );
+    }
+
+    /// The accessor must return the armed constant.
+    ///
+    /// ⚠ On mainnet `gates::from_env` returns the compiled default BEFORE reading the
+    /// environment, so `GHOST_ADDRESS_PROOF_HEIGHT` cannot move this — arming or rolling back is
+    /// always a binary plus a fleet roll. This asserts the accessor and the constant agree, so a
+    /// future wiring change cannot leave them out of step.
+    #[test]
+    fn the_accessor_agrees_with_the_constant() {
+        assert_eq!(crate::address_proof_height(), crate::ADDRESS_PROOF_HEIGHT);
     }
 }
