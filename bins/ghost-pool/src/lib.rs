@@ -1495,6 +1495,21 @@ mod address_proof_gate_tests {
         );
     }
 
+    /// The mirrored copy in `ghost-consensus` must equal the real constant.
+    ///
+    /// `ghost-consensus` sits below `ghost-pool` in the dependency graph and cannot import this,
+    /// so `ADDRESS_PROOF_SEPARATION_REFERENCE` mirrors it to assert the two v1.11.34 gates do not
+    /// share a height. A duplicated consensus height is exactly the kind of thing that drifts, so
+    /// it is asserted from the side that owns the original.
+    #[test]
+    fn the_mirror_in_ghost_consensus_matches() {
+        assert_eq!(
+            ghost_consensus::message::ADDRESS_PROOF_SEPARATION_REFERENCE,
+            crate::ADDRESS_PROOF_HEIGHT,
+            "the mirror in ghost-consensus has drifted from ADDRESS_PROOF_HEIGHT"
+        );
+    }
+
     /// The accessor must return the armed constant.
     ///
     /// ⚠ On mainnet `gates::from_env` returns the compiled default BEFORE reading the
