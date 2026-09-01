@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -103,6 +103,20 @@ pub struct Sv1Server {
     /// case of channels aggregation (aggregated mode)
     pub(crate) valid_sv1_jobs: Arc<DashMap<ChannelId, Vec<server_to_client::Notify<'static>>>>,
     pub(crate) load_balancer: Option<Arc<crate::load_balancer::LoadBalancer>>,
+    /// Why shares are being refused, counted separately because the reasons are not comparable.
+    ///
+    /// `validate_sv1_share` has THREE outcomes and they used to be collapsed into one
+    /// `error!("Invalid share")` by `.unwrap_or(false)`: a share below target (routine, expected
+    /// whenever vardiff raises the difficulty), a share whose merkle root could not be built,
+    /// and one whose prev_hash would not deserialise. The last two are faults; the first is not.
+    ///
+    /// Measured under a 1 PH/s farm-tier test: one node sat at 15-20% refused while another took
+    /// 890 shares with zero, on the same binary and config — and nothing in the logs could say
+    /// whether that was benign difficulty convergence or a validation failure on every
+    /// submission (#810).
+    pub(crate) shares_below_target: Arc<AtomicU64>,
+    pub(crate) shares_failed_validation: Arc<AtomicU64>,
+    pub(crate) shares_for_unknown_job: Arc<AtomicU64>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -200,6 +214,9 @@ impl Sv1Server {
         });
 
         Self {
+            shares_below_target: Arc::new(AtomicU64::new(0)),
+            shares_failed_validation: Arc::new(AtomicU64::new(0)),
+            shares_for_unknown_job: Arc::new(AtomicU64::new(0)),
             sv1_server_channel_state,
             config,
             listener_addr,
