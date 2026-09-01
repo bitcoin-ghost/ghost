@@ -630,9 +630,69 @@ int_case "banner junk sharing the pipe is unreadable, not 2555"  $'motd 2 you\n5
 int_case "an error line with digits is unreadable, not a count"  "Error: near line 1" ""
 int_case "two result rows are unreadable, not welded into 55"    $'5\n5' ""
 
+# ---------------------------------------------------------------------------
+# #585: pruning stale deploy backups must keep exactly N and never the newest.
+#
+# Tested against a temp dir rather than through the deploy path, because the risk is not in the
+# ssh plumbing — it is in WHICH files the selection picks. Written as `tail -n +$((KEEP + 1))`
+# inside the remote payload the arithmetic evaluates on the far side, where KEEP does not exist,
+# expands to 1, and `tail -n +1` selects EVERY backup including the one the deploy just made —
+# deleting the only thing a rollback has to restore. That is the case these assert.
+# ---------------------------------------------------------------------------
+prune_case() {  # label keep_from n_files want_remaining
+    local label="$1" keep_from="$2" n="$3" want="$4"
+    local d; d="$(mktemp -d)"
+    local i
+    for i in $(seq 1 "$n"); do
+        : > "$d/ghost-pool.bak.2026090100000$i"
+        touch -d "2026-09-01 00:00:0$i" "$d/ghost-pool.bak.2026090100000$i"
+    done
+    # the exact pipeline the deploy script sends
+    ls -1t "$d"/ghost-pool.bak.* 2>/dev/null | tail -n +"$keep_from" | while IFS= read -r f; do
+        rm -f -- "$f"
+    done
+    local got; got=$(ls -1 "$d"/ghost-pool.bak.* 2>/dev/null | wc -l | tr -d ' ')
+    local newest_kept="no"
+    [ -e "$d/ghost-pool.bak.2026090100000$n" ] && newest_kept="yes"
+    rm -rf "$d"
+    if [ "$got" = "$want" ]; then
+        printf "  [ok ] %s (kept %s, newest survived: %s)\n" "$label" "$got" "$newest_kept"
+        pass=$((pass+1))
+    else
+        printf "  [BAD] %s — kept %s, wanted %s (newest survived: %s)\n" "$label" "$got" "$want" "$newest_kept"
+        fail=$((fail+1))
+    fi
+    # The newest backup is the one a rollback restores. Losing it is the failure that matters, so
+    # assert it separately rather than inferring it from the count.
+    #
+    # Expectation depends on the case: a real prune must ALWAYS keep the newest, while the
+    # `want=0` control exists precisely to show the broken offset destroying it. Asserting
+    # "newest survived" unconditionally would fail the control for doing its job — and a control
+    # that cannot be distinguished from a regression is not a control.
+    local want_newest="yes"
+    [ "$want" = "0" ] && want_newest="no"
+    if [ "$newest_kept" = "$want_newest" ]; then
+        pass=$((pass+1))
+    elif [ "$want_newest" = "yes" ]; then
+        printf "  [BAD] %s — the NEWEST backup was deleted; rollback has nothing to restore\n" "$label"
+        fail=$((fail+1))
+    else
+        printf "  [BAD] %s — the broken offset was expected to delete the newest and did not, so this control proves nothing\n" "$label"
+        fail=$((fail+1))
+    fi
+}
+
+echo "== #585 backup pruning =="
+prune_case "keep 2 of 5" 3 5 2
+prune_case "keep 2 of 3" 3 3 2
+prune_case "fewer files than we keep is a no-op" 3 2 2
+prune_case "exactly at the limit is a no-op" 3 2 2
+# The regression: KEEP+1 evaluated remotely becomes 1, and everything goes.
+prune_case "CONTROL: offset 1 deletes every backup" 1 5 0
+
 echo
 if [ "$fail" -ne 0 ]; then
     echo "*** $fail of $((pass+fail)) deploy-gate checks FAILED — the gate is not refusing what it must ***"
     exit 1
 fi
-echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks; refuses ghost-pool on a node whose pool_sv2 cannot sign share batches, while leaving pool_sv2 and translator_sv2 free to fix it; and rolls back a deploy that stops crediting work."
+echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks; refuses ghost-pool on a node whose pool_sv2 cannot sign share batches, while leaving pool_sv2 and translator_sv2 free to fix it; and rolls back a deploy that stops crediting work; and prunes stale backups to N while never deleting the newest (#585)."

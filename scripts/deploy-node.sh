@@ -1145,4 +1145,37 @@ if [ "$START_SOAK" = "yes" ]; then
     info "soak clock started for $BINARY @ $SHORT on $NODE (${SOAK_MINUTES}m required before production)"
 fi
 
+# Keep the two most recent backups for this binary; delete the rest.
+#
+# #585 step 0: every deploy copies the live binary to `$BINARY.bak.$TS` (~25 MB) and NOTHING has
+# ever removed one. The July cleanup freed 16.3 GB fleet-wide by hand and the plan said to make it
+# automatic; it was not, so it came straight back — measured 2026-09-01 after the v1.11.33 roll:
+# vm1 39 files / 1.4 GB, vm4 38 / 765 MB, vm5 33 / 712 MB. A manual step that must run after every
+# deploy is a step that does not run.
+#
+# TWO, not one: rollback restores the most recent backup, so keeping only that leaves nothing to
+# fall back to if the rollback itself has to be undone.
+#
+# ⚠ KEEP+1 is computed HERE, not in the remote shell. Written as `\$((PRUNE_KEEP + 1))` the
+# arithmetic evaluates on the far side, where PRUNE_KEEP does not exist — it expands to 1, and
+# `tail -n +1` selects EVERY backup including the one this deploy just made, deleting the only
+# thing a rollback has to restore. `S=$SUDO` follows the same pattern as the swap payload above:
+# assigned locally, used remotely as `\$S`.
+#
+# Deliberately AFTER the soak record and the smoke test, and best-effort: this must never be what
+# fails a deploy that otherwise succeeded.
+PRUNE_KEEP=2
+PRUNE_FROM=$((PRUNE_KEEP + 1))
+if PRUNE_OUT=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
+S=$SUDO
+ls -1t /opt/ghost/bin/$BINARY.bak.* 2>/dev/null | tail -n +$PRUNE_FROM | while IFS= read -r f; do
+    \$S rm -f -- \"\$f\"
+done
+ls -1 /opt/ghost/bin/$BINARY.bak.* 2>/dev/null | wc -l
+" 2>&1); then
+    info "pruned old backups: $BINARY.bak.* now $(printf '%s' "$PRUNE_OUT" | tail -1) file(s) on $NODE (keeping $PRUNE_KEEP)"
+else
+    info "WARN: could not prune old $BINARY.bak.* on $NODE — the deploy itself is unaffected"
+fi
+
 info "OK: $BINARY @ $SHORT live on $NODE (backup: $BINARY.bak.$TS)"
