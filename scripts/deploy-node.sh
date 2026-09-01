@@ -91,8 +91,25 @@ info() { echo "  $*"; }
 
 [ -n "$NODE" ] && [ -n "$BINARY" ] || die "usage: deploy-node.sh <node> <binary> [--canary]"
 case "$BINARY" in
-  ghost-pool|pool_sv2|translator_sv2) ;;
+  ghost-pool|pool_sv2|translator_sv2|ghost-pay|ghost-gsp) ;;
   *) die "unknown binary '$BINARY'" ;;
+esac
+
+# Does this binary sit on the SHARE PATH?
+#
+# It decides two gates below, and getting it wrong is not a slow deploy but a WRONG VERDICT:
+#
+#   * the SV1 stratum smoke test, which dials :3333 — a port the TRANSLATOR owns. Run it for
+#     ghost-pay and it passes whether or not ghost-pay works, because it is not testing
+#     ghost-pay at all. A check that cannot fail, guarding a rollback.
+#   * the post-swap throughput check, which rolls back when shares stop being credited.
+#     ghost-pay and ghost-gsp do not carry shares, so their deploy would be judged — and
+#     could be rolled back — on traffic they never touch.
+#
+# So they get their own health check instead, on the port they actually serve.
+case "$BINARY" in
+  ghost-pool|pool_sv2|translator_sv2) SHARE_PATH_BINARY=yes ;;
+  *)                                  SHARE_PATH_BINARY=no  ;;
 esac
 
 cd "$REPO_ROOT"
@@ -142,6 +159,8 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
         ghost-pool)      SRC_PATHS="bins/ghost-pool crates" ;;
         pool_sv2)        SRC_PATHS="bins/pool-sv2 crates" ;;
         translator_sv2)  SRC_PATHS="bins/translator-sv2 crates" ;;
+        ghost-pay)       SRC_PATHS="bins/ghost-pay crates" ;;
+        ghost-gsp)       SRC_PATHS="bins/ghost-gsp crates" ;;
         *)               SRC_PATHS="" ;;
     esac
     if [ -n "$SRC_PATHS" ] && ! git diff --quiet "$SHA" origin/main -- $SRC_PATHS 2>/dev/null; then
@@ -845,6 +864,8 @@ case "$BINARY" in
   ghost-pool)      SERVICE=ghost-pool ;;
   pool_sv2)        SERVICE=sri-pool ;;
   translator_sv2)  SERVICE=sri-translator ;;
+  ghost-pay)       SERVICE=ghost-pay ;;
+  ghost-gsp)       SERVICE=ghost-gsp ;;
 esac
 
 SWAP_EPOCH=$(date +%s)
@@ -868,6 +889,8 @@ case "$BINARY" in
   ghost-pool)      READY_PORT=8442 ;;   # TDP, what pool_sv2 connects to
   pool_sv2)        READY_PORT=34255 ;;  # SV2, what the translator connects to
   translator_sv2)  READY_PORT=3333 ;;   # SV1, what miners connect to
+  ghost-pay)       READY_PORT=8800 ;;   # HTTPS API, what the dashboard reads
+  ghost-gsp)       READY_PORT=8900 ;;   # HTTPS API
 esac
 
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
@@ -894,7 +917,29 @@ fi
 
 # Smoke test the stratum path for anything that serves miners. A green service that
 # cannot complete a handshake is not a successful deploy.
-if [ -z "${ROLLBACK:-}" ] && [ "$BINARY" != "ghost-pool" ]; then
+if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "no" ]; then
+    # Not on the share path: verify the service answers on ITS OWN port. Same retry shape as
+    # the stratum smoke below — a listening socket is not a working service, and one failed
+    # attempt must not roll back a binary that is still settling.
+    #
+    # `-k` because the cert is identity-derived and we are on localhost; the integrity that
+    # matters here is the binary swap already verified by hash, not the transport.
+    HEALTH_OK=no
+    for attempt in 1 2 3; do
+        HCODE=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" \
+            "curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 https://127.0.0.1:$READY_PORT/health" 2>/dev/null || true)
+        if [ "$HCODE" = "200" ]; then HEALTH_OK=yes; break; fi
+        [ "$attempt" -lt 3 ] && { echo "  health attempt $attempt got '${HCODE:-none}', retrying in 20s"; sleep 20; }
+    done
+    if [ "$HEALTH_OK" != "yes" ]; then
+        echo "HEALTH CHECK FAILED: $SERVICE /health != 200 on :$READY_PORT — rolling back" >&2
+        ROLLBACK=1
+    else
+        info "health OK: $SERVICE /health=200 on :$READY_PORT"
+    fi
+fi
+
+if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "yes" ] && [ "$BINARY" != "ghost-pool" ]; then
     IP=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "hostname -I | awk '{print \$1}'")
     # Retry rather than judge on one attempt. A listening port means the process is accepting,
     # not that the whole SV1 -> SV2 -> TDP chain has settled — the translator can be listening
@@ -929,7 +974,7 @@ fi
 # The settle delay is not politeness. ghost-pool bypasses its own PoW height gate while
 # `current_height` is still 0, for roughly 90s after every restart, so a sample taken inside that
 # window can show shares flowing through a check that is not yet running. 180s clears it.
-if [ -z "${ROLLBACK:-}" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
+if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "yes" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
     SETTLE="${SETTLE:-180}"
     info "waiting ${SETTLE}s for the PoW height gate to establish, then re-checking throughput"
     sleep "$SETTLE"
