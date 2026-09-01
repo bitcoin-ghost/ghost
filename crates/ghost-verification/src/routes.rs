@@ -8555,16 +8555,27 @@ async fn api_alerts_failed_login_post_handler(
 }
 
 /// Payload from the restart watchdog. Carries only what the operator needs to
-/// act: which unit, how many restarts, over what window. No paths, no logs.
+/// act: which unit, what went wrong, over what window. No paths, no logs.
 #[derive(Debug, Deserialize)]
 struct ServiceRestartSignal {
-    /// systemd unit that restarted, e.g. `ghost-pool`.
+    /// systemd unit the signal is about, e.g. `ghost-pool`.
     unit: String,
-    /// Restarts observed within the window.
+    /// Restarts observed within the window. Zero for a signal that is not about restarts.
     restarts: u32,
-    /// Window (seconds) the restarts were counted over.
+    /// Window (seconds) the observation covers.
     #[serde(default)]
     window_secs: Option<u64>,
+    /// What actually went wrong, when it is not a restart loop.
+    ///
+    /// The watchdog now reports a second failure mode: a unit that is `active`, has NEVER
+    /// restarted, and is holding none of the sockets it exists to serve (#812, #813). Without
+    /// this field that alert would render through the restart wording as "restarted 0 times",
+    /// which describes the quietest possible reading of a healthy service — the exact opposite
+    /// of what happened, sent to an operator who then has to work out that it is a lie.
+    ///
+    /// Absent for restart-loop signals, which keep their existing wording unchanged.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Whether a string is a plausible systemd unit name.
@@ -8630,14 +8641,26 @@ async fn api_alerts_service_restart_post_handler(
             .into_response();
     }
 
-    let detail = match payload.window_secs {
-        Some(w) if w >= 60 => format!(
+    // A `reason` means this is NOT a restart loop, so the restart wording must not be used.
+    // Rendering a hung unit as "restarted 0 times" describes the calmest possible reading of a
+    // healthy service, which is the opposite of what happened (#812, #813).
+    let detail = match (payload.reason.as_deref(), payload.window_secs) {
+        (Some(reason), Some(w)) if w >= 60 => {
+            format!(
+                "{}: {} (observed over {} minutes).",
+                payload.unit,
+                reason,
+                w / 60
+            )
+        }
+        (Some(reason), _) => format!("{}: {}.", payload.unit, reason),
+        (None, Some(w)) if w >= 60 => format!(
             "{} restarted {} times in the last {} minutes.",
             payload.unit,
             payload.restarts,
             w / 60
         ),
-        _ => format!("{} restarted {} times.", payload.unit, payload.restarts),
+        (None, _) => format!("{} restarted {} times.", payload.unit, payload.restarts),
     };
 
     let dispatched = if let Some(dispatcher) = state.alert_dispatcher.get() {
