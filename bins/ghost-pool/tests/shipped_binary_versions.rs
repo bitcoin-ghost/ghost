@@ -133,3 +133,64 @@ fn the_parser_reads_package_version_and_not_dependency_versions() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The binaries that carry shares must be able to name the commit they were built from.
+///
+/// A version number is not a build identity. Measured on the live fleet on 2026-09-01: all eight
+/// nodes ran `ghost-pool 1.11.32` and `translator_sv2 1.11.32`, and those two binaries had been
+/// built from different commits a day apart — `ghost-pool` from the `v1.11.32` release commit
+/// `09fa48823`, `translator_sv2` from a later one carrying #796's `core_healthy`. Both reported
+/// their version correctly; neither could say what it actually was.
+///
+/// Answering it took probing `/proc/<MainPID>/exe`, grepping binaries for a marker string against
+/// a control, and comparing mtimes, because only `ghost-pool` exposed a hash (through
+/// `ghost-verification`) and the SV2 binaries exposed none. That is the gap this guards.
+const SHARE_PATH_BINARIES: &[&str] = &["ghost-pool", "pool-sv2", "translator-sv2"];
+
+#[test]
+fn every_share_path_binary_can_state_the_commit_it_was_built_from() {
+    let mut offenders = Vec::new();
+    for name in SHARE_PATH_BINARIES {
+        let dir = bins_dir().join(name);
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml"))
+            .unwrap_or_else(|e| panic!("{name}: manifest must be readable: {e}"));
+        if !manifest.contains("ghost-build-info") {
+            offenders.push(format!("{name}: does not depend on ghost-build-info"));
+            continue;
+        }
+        // clap's `version` prints the bare semver; only `long_version` carries the commit.
+        let sources = ["src/args.rs", "src/main.rs"];
+        let wired = sources.iter().any(|f| {
+            std::fs::read_to_string(dir.join(f))
+                .map(|s| s.contains("long_version = ghost_build_info::LONG_VERSION"))
+                .unwrap_or(false)
+        });
+        if !wired {
+            offenders.push(format!(
+                "{name}: depends on ghost-build-info but never sets clap's long_version, so \
+                 --version still reports only the semver"
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "share-path binaries that cannot name their own commit (#759):\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// The control for the check above: it must be able to fail.
+///
+/// A test that reads files and asserts a substring passes just as happily when the substring is
+/// everywhere as when the check is meaningless, so assert the negative case explicitly — a name
+/// that is not a share-path binary must not satisfy the wiring test.
+#[test]
+fn the_commit_check_rejects_a_binary_that_is_not_wired() {
+    let unwired = bins_dir().join("ghost-setup");
+    let manifest = std::fs::read_to_string(unwired.join("Cargo.toml")).unwrap_or_default();
+    assert!(
+        !manifest.contains("ghost-build-info"),
+        "ghost-setup was chosen as the negative control because it is NOT wired; it now is, so \
+         this control proves nothing and must be pointed at a different binary"
+    );
+}

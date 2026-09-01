@@ -3201,6 +3201,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-build-info"
+version = "1.11.32"
+
+[[package]]
 name = "ghost-cli"
 version = "1.11.32"
 dependencies = [
@@ -3510,6 +3514,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ghost-accounting",
  "ghost-buds",
+ "ghost-build-info",
  "ghost-common",
  "ghost-consensus",
  "ghost-glyph",
@@ -3708,6 +3713,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ghost-accounting",
  "ghost-buds",
+ "ghost-build-info",
  "ghost-common",
  "ghost-policy",
  "ghost-storage",
@@ -6267,6 +6273,7 @@ dependencies = [
  "bitcoin_core_sv2",
  "clap",
  "config",
+ "ghost-build-info",
  "ghost-common",
  "hex",
  "hotpath",
@@ -9310,6 +9317,7 @@ dependencies = [
  "clap",
  "config",
  "dashmap 6.2.1",
+ "ghost-build-info",
  "hex",
  "hotpath",
  "rustls",

@@ -10,7 +10,10 @@ use translator_sv2::{config::TranslatorConfig, error::TproxyErrorKind};
 
 /// Holds the parsed CLI arguments.
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Translator Proxy", long_about = None)]
+// #759: `version` alone reports only the workspace number, which does not identify a
+// build — two binaries both stamped 1.11.32 were live on the fleet from different
+// commits a day apart. `long_version` names the commit as well.
+#[command(author, version, long_version = ghost_build_info::LONG_VERSION, about = "Translator Proxy", long_about = None)]
 pub struct Args {
     #[arg(
         short = 'c',

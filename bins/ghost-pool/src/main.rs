@@ -667,7 +667,8 @@ enum HashrateSource {
 /// Ghost Pool - Decentralized Bitcoin Mining Pool
 #[derive(Parser, Debug)]
 #[command(name = "ghost-pool")]
-#[command(author, version, about, long_about = None)]
+// #759: the workspace number alone does not identify a build — see `ghost_build_info`.
+#[command(author, version, long_version = ghost_build_info::LONG_VERSION, about, long_about = None)]
 struct Args {
     /// Configuration file path
     #[arg(short, long, default_value = "ghost.toml")]

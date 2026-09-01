@@ -37,6 +37,7 @@ name = "ghost-pool"
 path = "src/main.rs"
 
 [dependencies]
+ghost-build-info.workspace = true
 # Self-check capability probes (statvfs for archive disk-free check)
 libc = "0.2"
 # Install rustls process-level crypto provider once at startup
