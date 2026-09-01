@@ -1880,6 +1880,19 @@ cat > /opt/ghost/bin/ghost-restart-watch.sh <<'GHOST_RESTART_WATCH_SH_EOF'
 # reports it `active` between crashes, so every dashboard and every `is-active` check
 # says the node is fine while it is in fact dying on a loop.
 #
+# It watches TWO failure modes, which are opposites and read oppositely:
+#
+#   * a unit restarting too often — a crash loop, below;
+#   * a unit that is `active`, has NEVER restarted, and is serving nothing.
+#
+# The second was found the hard way. ghost-vm2's translator deadlocked on downstream-disconnect
+# cleanup and held no listener for ~45 minutes while `systemctl is-active` said `active` and
+# NRestarts stayed at 0 — the calmest possible reading of the one number this script used to
+# examine (#812). It surfaced only because check-fleet-uniformity.sh happens to assert that
+# something must listen on a port ufw allows. A hang is the same lie as a crash loop, told more
+# quietly, and this script now asks the other question: is the unit holding the socket it
+# exists to serve?
+#
 # This watches the RATE, not the total. NRestarts is cumulative since the last
 # daemon-reload, so a node that crash-looped last week and has been stable since still
 # shows a large number; and a `systemctl daemon-reload` silently resets it to zero. What
@@ -1908,6 +1921,13 @@ cat > /opt/ghost/bin/ghost-restart-watch.sh <<'GHOST_RESTART_WATCH_SH_EOF'
 #                                 the node config automatically when not set here.
 #   RESTART_THRESHOLD=3           restarts within one window before alerting
 #   RESTART_RENOTIFY_SECS=3600    minimum gap between repeat alerts for the same unit
+#   LIVENESS_MISSES=3             consecutive runs active-but-not-listening before alerting.
+#                                 Never 1: a single miss is a legitimate restart in flight.
+#   LIVENESS_RESTART=false        also `systemctl restart` a unit judged hung. OFF by default —
+#                                 detection is the gap; restarting a production service from a
+#                                 watchdog is a policy the operator opts into. If enabled and the
+#                                 port still does not come back, the restart-rate check above
+#                                 catches the resulting loop, so the two compose.
 #
 # Usage:
 #   ghost-restart-watch.sh          # normal run, intended for the timer
@@ -1915,14 +1935,40 @@ cat > /opt/ghost/bin/ghost-restart-watch.sh <<'GHOST_RESTART_WATCH_SH_EOF'
 
 set -uo pipefail
 
-CONF=/etc/ghost/restart-watch.conf
-STATE_DIR=/var/lib/ghost/restart-watch
+# Both overridable so scripts/test-restart-watch.sh can drive this hermetically, exactly as
+# deploy-node.sh allows for its own self-test. A watchdog whose logic cannot be exercised is
+# the same class of problem as the hang it now looks for.
+CONF="${CONF:-/etc/ghost/restart-watch.conf}"
+STATE_DIR="${STATE_DIR:-/var/lib/ghost/restart-watch}"
 UNITS="ghost-pool sri-pool sri-translator ghostd"
 
 NODE_API="127.0.0.1:8080"
 INTERNAL_AUTH_KEY=""
 RESTART_THRESHOLD=3
 RESTART_RENOTIFY_SECS=3600
+# `${VAR:-default}` so these are settable from the environment as well as from CONF, which is
+# sourced below and still wins. Assigning unconditionally would make the knob unsettable — the
+# self-test caught exactly that: LIVENESS_RESTART=true was silently ignored.
+LIVENESS_MISSES="${LIVENESS_MISSES:-3}"
+LIVENESS_RESTART="${LIVENESS_RESTART:-false}"
+
+# The socket each unit exists to serve. Absence of this listener while the unit is `active`
+# is the definition of "running but not working".
+#
+# These are the SAME ports deploy-node.sh uses as its READY_PORT gate after a swap — that path
+# already treats "listening here" as the definition of a working unit, and it would be worse
+# than useless for the two to disagree about what healthy means. Measured on the fleet, not
+# assumed: ghost-pool also holds 8080/8443/8555-8563, sri-translator also holds 4444/9092; the
+# port named here is the one whose absence means the unit is not doing its job.
+liveness_port_for() {
+    case "$1" in
+        ghost-pool)      echo 8442 ;;   # TDP, what pool_sv2 connects to
+        sri-pool)        echo 34255 ;;  # SV2, what the translator connects to
+        sri-translator)  echo 3333 ;;   # SV1, what miners connect to
+        ghostd)          echo 8332 ;;   # RPC, what ghost-pool depends on
+        *)               echo "" ;;
+    esac
+}
 # shellcheck source=/dev/null
 [ -r "$CONF" ] && . "$CONF"
 
@@ -1953,9 +1999,17 @@ fi
 # Auth mirrors the dashboard proxy: HMAC-SHA256(secret, u64_le(timestamp) || body), hex,
 # in X-Ghost-Signature, with the unix timestamp in X-Ghost-Timestamp.
 send_alert() {
-    local unit="$1" restarts="$2" window="$3"
+    local unit="$1" restarts="$2" window="$3" reason="${4:-}"
     local body ts sig
-    body=$(printf '{"unit":"%s","restarts":%s,"window_secs":%s}' "$unit" "$restarts" "$window")
+    if [ -n "$reason" ]; then
+        # A reason means this is not a restart loop. The node renders it instead of the
+        # "restarted N times" wording, which for a hang would read "restarted 0 times" — the
+        # calmest possible description of the opposite of what happened (#812).
+        body=$(printf '{"unit":"%s","restarts":%s,"window_secs":%s,"reason":"%s"}' \
+                      "$unit" "$restarts" "$window" "$reason")
+    else
+        body=$(printf '{"unit":"%s","restarts":%s,"window_secs":%s}' "$unit" "$restarts" "$window")
+    fi
     ts=$(date +%s)
 
     local -a auth_headers=()
@@ -1989,20 +2043,61 @@ for unit in $UNITS; do
     [ -n "$n" ] || continue
 
     f="$STATE_DIR/$unit"
-    prev_n=""; prev_t=""; last_alert=0
-    [ -r "$f" ] && read -r prev_n prev_t last_alert < "$f" 2>/dev/null
-    : "${last_alert:=0}"
+    prev_n=""; prev_t=""; last_alert=0; misses=0; last_live_alert=0
+    # Five fields now. A file written by an older version has three, so the two new ones read
+    # as empty and fall back below — no migration, no reset of the restart counters.
+    [ -r "$f" ] && read -r prev_n prev_t last_alert misses last_live_alert < "$f" 2>/dev/null
+    : "${last_alert:=0}"; : "${misses:=0}"; : "${last_live_alert:=0}"
+
+    port=$(liveness_port_for "$unit")
+    active=$(systemctl is-active "$unit" 2>/dev/null)
+    listening=""
+    if [ -n "$port" ]; then
+        if ss -ltn 2>/dev/null | grep -q ":${port}\b"; then listening=yes; else listening=no; fi
+    fi
 
     if $CHECK_ONLY; then
-        printf "  %-16s NRestarts=%s active=%s\n" "$unit" "$n" "$(systemctl is-active "$unit")"
+        printf "  %-16s NRestarts=%-4s active=%-10s port=%-6s listening=%s\n" \
+               "$unit" "$n" "$active" "${port:-none}" "${listening:-n/a}"
         continue
+    fi
+
+    # ---- liveness: active, but holding nothing ----------------------------------------
+    #
+    # Only meaningful while the unit is `active`. A unit that is stopped, activating or failed
+    # is a different condition and systemd already represents it honestly; this exists for the
+    # case where systemd's own view is reassuring and wrong.
+    if [ -n "$port" ] && [ "$active" = "active" ] && [ "$listening" = "no" ]; then
+        misses=$(( misses + 1 ))
+        if [ "$misses" -ge "$LIVENESS_MISSES" ]; then
+            msg="$(hostname -s): ${unit} is active but has not been listening on :${port} for ${misses} consecutive checks — running, not working"
+            if [ $(( now - last_live_alert )) -ge "$RESTART_RENOTIFY_SECS" ]; then
+                logger -t ghost-restart-watch -p daemon.err -- "$msg" 2>/dev/null || true
+                echo "ALERT: $msg" >&2
+                send_alert "$unit" 0 "$(( misses * 60 ))" \
+                    "active but not listening on :${port} for ${misses} consecutive checks"
+                last_live_alert=$now
+            fi
+            problems+=("$msg")
+
+            if [ "$LIVENESS_RESTART" = "true" ]; then
+                logger -t ghost-restart-watch -p daemon.err -- \
+                    "$(hostname -s): restarting ${unit} — hung with no listener on :${port}" 2>/dev/null || true
+                systemctl restart "$unit" >/dev/null 2>&1 || true
+                # Reset so a restart that works is not immediately re-alerted, and so a restart
+                # that does NOT work re-arms from zero rather than firing every single run.
+                misses=0
+            fi
+        fi
+    else
+        misses=0
     fi
 
     # First run for this unit, or the counter went backwards because something ran
     # daemon-reload. Either way there is no meaningful delta — record and move on
     # rather than inventing one.
     if [ -z "$prev_n" ] || [ "$n" -lt "$prev_n" ]; then
-        printf '%s %s %s\n' "$n" "$now" "$last_alert" > "$f"
+        printf '%s %s %s %s %s\n' "$n" "$now" "$last_alert" "$misses" "$last_live_alert" > "$f"
         continue
     fi
 
@@ -2022,7 +2117,7 @@ for unit in $UNITS; do
         problems+=("$msg")
     fi
 
-    printf '%s %s %s\n' "$n" "$now" "$last_alert" > "$f"
+    printf '%s %s %s %s %s\n' "$n" "$now" "$last_alert" "$misses" "$last_live_alert" > "$f"
 done
 
 # Non-zero when something is looping, so this is usable as a check from elsewhere

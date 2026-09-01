@@ -49,6 +49,10 @@ echo "==> deploy-gate self-test"
 ./scripts/test-deploy-gate.sh \
     || { echo "FAILED: deploy-gate self-test" >&2; exit 1; }
 
+echo "==> restart-watch self-test"
+./scripts/test-restart-watch.sh \
+    || { echo "FAILED: restart-watch self-test" >&2; exit 1; }
+
 echo "==> fuzz targets build"
 ./scripts/check-fuzz-targets.sh \
     || { echo "FAILED: fuzz targets" >&2; exit 1; }
