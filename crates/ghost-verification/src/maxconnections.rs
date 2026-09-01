@@ -43,8 +43,33 @@ pub const NEAR_CEILING_FRACTION: f64 = 0.85;
 /// rather than presenting the bound as fact.
 pub const PER_PEER_MB: u64 = 4;
 
-/// Memory left for everything that is not peer connections, in MB.
+/// Memory left for the OS and burst slack, in MB, on top of [`SERVICE_RESERVE_FRACTION`].
+///
+/// This covers the kernel and short-lived processes, NOT the node's own long-running services —
+/// those are the reserve fraction's job. Measured on vm1 (2026-09-01): MemTotal 3867 MB,
+/// MemAvailable 2471 MB, so ~1396 MB is non-reclaimable, of which the services account for
+/// ~1172 MB and everything else ~224 MB. 512 sits above that deliberately.
 pub const HEADROOM_MB: u64 = 512;
+
+/// Share of MemTotal the node's own services hold, and which is therefore not available to peers.
+///
+/// Measured across two node sizes on 2026-09-01, summing RSS of `ghostd`, `ghost-pool` and the
+/// dashboard `node` process:
+///
+/// | node | MemTotal | services | share |
+/// |------|----------|----------|-------|
+/// | vm1  | 3867 MB  | 1172 MB  | 30.3% |
+/// | vm4  | 3867 MB  | 1030 MB  | 26.6% |
+/// | vm6  | 3868 MB  | 1387 MB  | 35.9% |
+/// | vm8  | 7894 MB  | 2816 MB  | 35.7% |
+///
+/// The share is stable across a 2x difference in host size because ghostd's own caches scale
+/// with the machine, which is why this is a fraction and not a fixed MB figure — a constant
+/// tuned for the 4 GB nodes would badly under-reserve on the 8 GB one.
+///
+/// 0.40 rounds the measured 27-36% up, because under-reserving kills the node and
+/// over-reserving only costs peer slots.
+pub const SERVICE_RESERVE_FRACTION: f64 = 0.40;
 
 /// Core's own default when `maxconnections` is absent from the config.
 pub const CORE_DEFAULT: u32 = 125;
@@ -131,15 +156,11 @@ pub fn inbound_capacity(maxconnections: u32) -> u32 {
     maxconnections.saturating_sub(RESERVED_OUTBOUND)
 }
 
-/// MemAvailable in MB, or `None` when `/proc/meminfo` cannot be read or lacks the field.
-///
-/// MemAvailable, not MemTotal: what matters is what this node can still allocate alongside
-/// everything already resident. vm6 has ~1376 MB available against a ghostd RSS of ~1441 MB —
-/// sizing that node off MemTotal would recommend a number it cannot survive (#417, #418).
-pub fn mem_available_mb() -> Option<u64> {
+/// Read one `/proc/meminfo` field, in MB.
+fn meminfo_field_mb(field: &str) -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+        if let Some(rest) = line.strip_prefix(field) {
             let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
             return Some(kb / 1024);
         }
@@ -147,13 +168,53 @@ pub fn mem_available_mb() -> Option<u64> {
     None
 }
 
-/// The largest `maxconnections` this node's available memory supports.
+/// MemAvailable in MB, or `None` when `/proc/meminfo` cannot be read or lacks the field.
+///
+/// Reported for context only — it is NOT what the recommendation is derived from. See
+/// [`recommended_max`].
+pub fn mem_available_mb() -> Option<u64> {
+    meminfo_field_mb("MemAvailable:")
+}
+
+/// MemTotal in MB — the basis for [`recommended_max`].
+///
+/// A newtype rather than a bare `u64` on purpose. Both readings are megabyte counts of the same
+/// type, so when this derivation moved from MemAvailable to MemTotal (#614) every call site kept
+/// compiling while silently feeding the wrong quantity in. The bug being fixed was a number that
+/// meant the wrong thing; passing it around untyped is how that happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemTotalMb(pub u64);
+
+/// MemTotal in MB, or `None` when `/proc/meminfo` cannot be read or lacks the field.
+///
+/// A fixed property of the host, so the same node gives the same answer twice.
+pub fn mem_total_mb() -> Option<MemTotalMb> {
+    meminfo_field_mb("MemTotal:").map(MemTotalMb)
+}
+
+/// The largest `maxconnections` this host can sustain.
+///
+/// Derived from **MemTotal**, not MemAvailable (#614). MemAvailable is a momentary reading, not
+/// a property of the host, so the answer to "is this value survivable?" changed minute to
+/// minute in both directions: a transient dip refused a legitimate value with a `400` telling
+/// the operator to pass `force=true`, and a transient spike accepted a value sized against a
+/// peak the node would not have when it actually held those connections. It swung 7.8x on one
+/// machine minutes apart (1,307,632 kB then 10,237,308 kB), moving this ceiling between ~197
+/// and the 500 hard cap, and made
+/// `maxconnections_post_rewrites_in_place_and_preserves_the_rest` fail about one run in seven.
+///
+/// MemTotal alone would over-recommend, which is what [`SERVICE_RESERVE_FRACTION`] exists to
+/// prevent: the node's own services are always resident and their memory is never available to
+/// peers. Reserving that share explicitly gives a number that is both stable and survivable,
+/// rather than trading one for the other.
 ///
 /// `None` when memory cannot be determined — the caller must then decline to recommend rather
 /// than substitute a guess, because a fabricated ceiling is worse than an absent one.
-pub fn recommended_max(mem_available_mb: Option<u64>) -> Option<u32> {
-    let available = mem_available_mb?;
-    let for_peers = available.saturating_sub(HEADROOM_MB);
+pub fn recommended_max(mem_total_mb: Option<MemTotalMb>) -> Option<u32> {
+    let MemTotalMb(total) = mem_total_mb?;
+    // Reserve what the node's own services hold, then OS slack on top; the rest is for peers.
+    let services = (total as f64 * SERVICE_RESERVE_FRACTION) as u64;
+    let for_peers = total.saturating_sub(services).saturating_sub(HEADROOM_MB);
     let peers = (for_peers / PER_PEER_MB) as u32;
     // Never recommend below Core's own reserve — a value under that leaves no inbound capacity
     // at all and is not a meaningful setting.
@@ -297,18 +358,69 @@ mod tests {
     }
 
     #[test]
-    fn the_recommendation_is_bounded_by_available_memory() {
-        // 4 GB available: (4096 - 512) / 4 = 896, clamped to the hard max.
-        assert_eq!(recommended_max(Some(4096)), Some(HARD_MAX));
-        // 1376 MB — vm6's real figure: (1376 - 512) / 4 = 216.
-        assert_eq!(recommended_max(Some(1376)), Some(216));
-        // A tight node gets a correspondingly small number: (600 - 512) / 4 = 22.
-        assert_eq!(recommended_max(Some(600)), Some(22));
-        // And once headroom eats nearly everything, the floor holds rather than
-        // recommending a value with no inbound capacity at all: (520 - 512) / 4 = 2 -> 11.
-        assert_eq!(recommended_max(Some(520)), Some(RESERVED_OUTBOUND + 1));
-        // Below the headroom reserve entirely, the floor still holds.
-        assert_eq!(recommended_max(Some(100)), Some(RESERVED_OUTBOUND + 1));
+    fn the_recommendation_is_bounded_by_total_memory() {
+        // vm1/vm4's real MemTotal, 3867 MB: services 40% = 1546, minus 512 headroom leaves
+        // 1809 for peers, / 4 = 452.
+        assert_eq!(recommended_max(Some(MemTotalMb(3867))), Some(452));
+        // vm8's real MemTotal, 7894 MB: 7894 - 3157 - 512 = 4225, / 4 = 1056 -> hard max.
+        assert_eq!(recommended_max(Some(MemTotalMb(7894))), Some(HARD_MAX));
+        // A tight host gets a correspondingly small number: 1024 - 409 - 512 = 103, / 4 = 25.
+        assert_eq!(recommended_max(Some(MemTotalMb(1024))), Some(25));
+        // Once the reserves eat nearly everything, the floor holds rather than recommending a
+        // value with no inbound capacity at all: 800 - 320 - 512 saturates to 0.
+        assert_eq!(
+            recommended_max(Some(MemTotalMb(800))),
+            Some(RESERVED_OUTBOUND + 1)
+        );
+        // Below the reserves entirely, the floor still holds.
+        assert_eq!(
+            recommended_max(Some(MemTotalMb(100))),
+            Some(RESERVED_OUTBOUND + 1)
+        );
+    }
+
+    /// The whole point of #614: the same host must give the same answer every time.
+    ///
+    /// MemTotal does not move while the machine is up, so this is really a guard that no future
+    /// change reintroduces a live reading into the derivation — the previous implementation
+    /// looked just as deterministic at this call site while swinging 7.8x underneath it.
+    #[test]
+    fn the_same_host_gives_the_same_answer_every_time() {
+        let host = Some(MemTotalMb(3867));
+        let first = recommended_max(host);
+        for _ in 0..100 {
+            assert_eq!(recommended_max(host), first);
+        }
+        // And it is not merely stable, it is stable at a USABLE number — a ceiling that always
+        // returned the floor would pass the check above while being useless.
+        assert!(
+            first.unwrap() > CORE_DEFAULT,
+            "a 3.87 GB node must support more than Core's default of {CORE_DEFAULT}, got {first:?}"
+        );
+    }
+
+    /// The reserve must scale with the host, which is why it is a fraction and not a constant.
+    #[test]
+    fn a_bigger_host_reserves_proportionally_more() {
+        // vm8 has 2.04x vm1's memory and holds 2.4x the service RSS. A flat MB reserve tuned
+        // for the 4 GB nodes would under-reserve here by more than a gigabyte.
+        let small = 3867u64;
+        let big = 7894u64;
+        let small_reserve = (small as f64 * SERVICE_RESERVE_FRACTION) as u64;
+        let big_reserve = (big as f64 * SERVICE_RESERVE_FRACTION) as u64;
+        assert!(
+            big_reserve > small_reserve + 1000,
+            "the reserve must grow with the host: {small_reserve} -> {big_reserve}"
+        );
+        // Measured service RSS must sit UNDER the reserve on both, or the fraction is too small.
+        assert!(
+            small_reserve > 1387,
+            "vm6 held 1387 MB against a {small_reserve} MB reserve"
+        );
+        assert!(
+            big_reserve > 2816,
+            "vm8 held 2816 MB against a {big_reserve} MB reserve"
+        );
     }
 
     /// Unknown memory must produce no recommendation at all. A fabricated ceiling is worse

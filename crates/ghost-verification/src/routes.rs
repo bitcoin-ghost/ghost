@@ -5205,7 +5205,8 @@ async fn api_config_maxconnections_handler(
     let near_ceiling = utilisation.map(|u| u >= crate::maxconnections::NEAR_CEILING_FRACTION);
 
     let mem_available_mb = crate::maxconnections::mem_available_mb();
-    let recommended_max = crate::maxconnections::recommended_max(mem_available_mb);
+    let mem_total = crate::maxconnections::mem_total_mb();
+    let recommended_max = crate::maxconnections::recommended_max(mem_total);
 
     (
         StatusCode::OK,
@@ -5229,7 +5230,13 @@ async fn api_config_maxconnections_handler(
             // The recommendation is a judgement, not a measurement. Return what produced it so
             // an operator can disagree with it on the evidence rather than on faith.
             "recommendation_basis": {
+                // The ceiling is derived from MemTotal (#614) — a fixed property of the host, so
+                // the same node answers the same way twice.
+                "mem_total_mb": mem_total.map(|m| m.0),
+                // Reported for context, NOT part of the derivation. Kept because an operator
+                // deciding whether to raise the setting wants to see what is free right now.
                 "mem_available_mb": mem_available_mb,
+                "service_reserve_fraction": crate::maxconnections::SERVICE_RESERVE_FRACTION,
                 "per_peer_mb": crate::maxconnections::PER_PEER_MB,
                 "headroom_mb": crate::maxconnections::HEADROOM_MB,
             },
@@ -5296,26 +5303,27 @@ fn apply_maxconnections_update(
         ));
     }
 
-    let mem_available_mb = crate::maxconnections::mem_available_mb();
-    let recommended = crate::maxconnections::recommended_max(mem_available_mb);
+    let mem_total = crate::maxconnections::mem_total_mb();
+    let recommended = crate::maxconnections::recommended_max(mem_total);
     if let Some(rec) = recommended {
         if payload.value > rec && !payload.force {
-            // #614: say that the ceiling came from a MOMENTARY reading. `MemAvailable` is not a
-            // property of the host — it swung 7.8x on one machine minutes apart (1,307,632 kB
-            // then 10,237,308 kB), moving this ceiling between ~197 and the 500 hard cap. So a
-            // refusal is a snapshot, not a verdict, and the same request can succeed on a retry.
-            // Without saying so, an operator reads "this node's maximum" as a fact about the
-            // node and either forces past a real limit or abandons a value that was fine.
+            // #614: state the whole derivation, and the fact that it will not move. This used to
+            // be read from MemAvailable, so the refusal was a snapshot rather than a verdict and
+            // the identical request could succeed on a retry — which meant an operator either
+            // forced past a real limit or abandoned a value that was fine. Now the number is a
+            // property of the host, so "retry and see" is no longer an answer and the message
+            // must not imply it is.
+            let total = mem_total.map(|m| m.0).unwrap_or(0);
             return bad(format!(
-                "{} is above this node's memory-derived maximum of {rec} \
-                 ({}MB available, {}MB per peer, {}MB headroom). That ceiling is derived from \
-                 memory free RIGHT NOW, not from a fixed property of this host, so it moves as \
-                 other processes come and go — retrying may succeed. Pass force=true to set it \
-                 anyway.",
+                "{} is above this node's memory-derived maximum of {rec} ({total}MB total, \
+                 less {:.0}% reserved for this node's own services, less {}MB headroom, at \
+                 {}MB per peer). That ceiling is a fixed property of this host and will not \
+                 change on a retry — raise it only with force=true, and only if you know this \
+                 machine can hold those connections.",
                 payload.value,
-                mem_available_mb.unwrap_or(0),
-                crate::maxconnections::PER_PEER_MB,
+                crate::maxconnections::SERVICE_RESERVE_FRACTION * 100.0,
                 crate::maxconnections::HEADROOM_MB,
+                crate::maxconnections::PER_PEER_MB,
             ));
         }
     } else if !payload.force {
@@ -15396,7 +15404,7 @@ mod tests {
         // Whatever this host reports, a value one above its own ceiling must be refused and the
         // file left untouched. Derive the target rather than hardcoding one, so the test says the
         // same thing on a laptop and on a 1GB VM.
-        let ceiling = maxconnections::recommended_max(maxconnections::mem_available_mb());
+        let ceiling = maxconnections::recommended_max(maxconnections::mem_total_mb());
         let too_big = ceiling.map(|c| c + 1).unwrap_or(maxconnections::HARD_MAX);
 
         let resp = super::apply_maxconnections_update(
@@ -15455,8 +15463,7 @@ mod tests {
         // call, and under parallel cargo test this host drops below 672MB, at which point the
         // ceiling falls under 40 and the handler refuses — correctly. The test was asserting a
         // property of the machine, not of the code.
-        let ceiling =
-            crate::maxconnections::recommended_max(crate::maxconnections::mem_available_mb());
+        let ceiling = crate::maxconnections::recommended_max(crate::maxconnections::mem_total_mb());
         let value = ceiling.map(|c| c.min(40)).unwrap_or(40);
         let resp = super::apply_maxconnections_update(
             &conf,
