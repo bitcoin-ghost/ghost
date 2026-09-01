@@ -1683,6 +1683,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-build-info"
+version = "1.11.32"
+
+[[package]]
 name = "ghost-common"
 version = "1.11.32"
 dependencies = [
@@ -1851,6 +1855,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ghost-accounting",
  "ghost-buds",
+ "ghost-build-info",
  "ghost-common",
  "ghost-consensus",
  "ghost-glyph",
@@ -1941,6 +1946,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ghost-accounting",
  "ghost-buds",
+ "ghost-build-info",
  "ghost-common",
  "ghost-policy",
  "ghost-storage",

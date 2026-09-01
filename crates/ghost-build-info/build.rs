@@ -33,7 +33,11 @@ fn main() {
                 None
             }
         })
-        .unwrap_or_default();
+        .filter(|h| !h.is_empty())
+        // Not `unwrap_or_default()`: an EMPTY value still satisfies `option_env!`, so the
+        // version string would render as "1.11.32 ( built ...)" — worse than saying unknown,
+        // because it looks like a hash that failed to print rather than one never captured.
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
 
     // Capture build timestamp (ISO 8601 UTC).

@@ -10,7 +10,10 @@ use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 
 /// Holds the parsed CLI arguments for the Pool binary.
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Pool CLI", long_about = None)]
+// #759: `version` alone reports only the workspace number, which does not identify a
+// build — two binaries both stamped 1.11.32 were live on the fleet from different
+// commits a day apart. `long_version` names the commit as well.
+#[command(author, version, long_version = ghost_build_info::LONG_VERSION, about = "Pool CLI", long_about = None)]
 pub struct Args {
     #[arg(
         short = 'c',

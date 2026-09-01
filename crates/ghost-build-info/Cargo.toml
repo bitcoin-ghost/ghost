@@ -1,0 +1,9 @@
+[package]
+name = "ghost-build-info"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Compile-time build provenance (commit and timestamp) for every shipped Ghost binary"
+
+[dependencies]

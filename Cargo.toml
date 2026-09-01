@@ -24,6 +24,7 @@
 resolver = "2"
 members = [
     # Core libraries
+    "crates/ghost-build-info",
     "crates/ghost-common",
     "crates/ghost-buds",
     "crates/ghost-reaper",
@@ -98,6 +99,7 @@ repository = "https://github.com/bitcoin-ghost/ghost"
 
 [workspace.dependencies]
 # Internal crates
+ghost-build-info = { path = "crates/ghost-build-info" }
 ghost-common = { path = "crates/ghost-common" }
 ghost-buds = { path = "crates/ghost-buds" }
 ghost-reaper = { path = "crates/ghost-reaper" }

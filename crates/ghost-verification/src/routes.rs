@@ -5414,8 +5414,10 @@ async fn api_system_version_handler(
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "build": if cfg!(debug_assertions) { "debug" } else { "release" },
-        "build_time": option_env!("BUILD_TIME").unwrap_or("unknown"),
-        "git_hash": option_env!("GIT_HASH").unwrap_or("unknown"),
+        // #759: captured once, in `ghost-build-info`, so every shipped binary answers this the
+        // same way — including the SV2 binaries, which could not answer it at all.
+        "build_time": ghost_build_info::BUILD_TIME,
+        "git_hash": ghost_build_info::GIT_HASH,
         "ghost_core_version": ghost_core_version,
         "rust_version": env!("CARGO_PKG_RUST_VERSION"),
         "target": std::env::consts::ARCH,
@@ -15725,8 +15727,11 @@ mod tests {
     /// override is set at build time, that it was actually used.
     #[test]
     fn build_time_stamp_is_well_formed_and_honours_source_date_epoch() {
-        let stamp = option_env!("BUILD_TIME").unwrap_or("unknown");
-        assert_ne!(stamp, "unknown", "build.rs must always set BUILD_TIME");
+        let stamp = ghost_build_info::BUILD_TIME;
+        assert_ne!(
+            stamp, "unknown",
+            "ghost-build-info's build.rs must always set BUILD_TIME"
+        );
 
         // ISO 8601 UTC to the second: 2026-07-26T21:26:58Z
         let b = stamp.as_bytes();
