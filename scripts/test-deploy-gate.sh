@@ -214,11 +214,15 @@ fi
 # ---------------------------------------------------------------------------
 rm -f "$TMP/state"/soaked-*
 
+# The FIRST node must be able to deploy — otherwise the relaxation is decorative and the
+# binaries stay undeployable, which is how #808 shipped: it made a production soak count and
+# made the clock start, but left nothing able to start it, because the remedy its refusal
+# named (`--canary`) is inert.
 out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
-check "a production-only binary with no soak anywhere is refused" \
-    "ghost-gsp @ .* has not soaked" "$out"
-check "and the refusal names the PRODUCTION remedy, not a canary" \
-    "No canary carries ghost-gsp.service" "$out"
+check_absent "the FIRST production node is not refused for want of a soak" \
+    "has not soaked" "$out"
+check "and it says this node becomes the canary for the build" \
+    "FIRST node for this build and becomes its canary" "$out"
 
 # A soak on ANOTHER production node is what this relaxation exists to accept.
 printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
@@ -228,6 +232,18 @@ check_absent "a 2h soak on another PRODUCTION node satisfies the soak gate" \
     "has not soaked" "$out"
 check "and it says a production node stood in as canary" \
     "no canary carries ghost-gsp.service" "$out"
+
+# The bootstrap applies ONLY while no other production node has a record. Once one exists but
+# is too young, the next node waits — otherwise every node would bootstrap itself and the soak
+# would never bind at all.
+rm -f "$TMP/state"/soaked-*
+printf '%s %s\n' "$(( $(date +%s) - 300 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm2-ghost-gsp"
+out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
+check "once another production node holds a young soak, the next node WAITS" \
+    "ghost-gsp @ .* has not soaked" "$out"
+check_absent "and it does not bootstrap itself past that wait" \
+    "becomes its canary" "$out"
 
 # ...but a node must not vouch for ITSELF. That would make the soak vacuous.
 rm -f "$TMP/state"/soaked-*

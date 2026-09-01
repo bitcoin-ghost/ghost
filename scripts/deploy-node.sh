@@ -749,13 +749,41 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
         fi
         break
     done
+    # Has ANY node recorded a soak for this build at all — including one too young, one that
+    # rolled back, or this node's own? If so we are NOT the first, and must wait like anyone
+    # else. Only a total absence of records means there is nothing to wait on.
+    #
+    # This distinction is the whole safety of the bootstrap. Keying it on "$SOAKED is empty"
+    # instead would fire for a soak that is merely 5 minutes old, and every node would
+    # bootstrap past the window in turn — the soak would never bind at all.
+    # Counted with a glob, NOT `ls | wc -l`: under `set -e` + `pipefail` an unmatched `ls`
+    # exits non-zero, takes the pipeline with it and kills the whole script — which silently
+    # broke three unrelated share-path cases that expected a refusal and got no output at all.
+    EXISTING_SOAKS=0
+    for _soak in "$STATE_DIR"/soaked-"$SHA"-*-"$BINARY"; do
+        if [ -e "$_soak" ]; then EXISTING_SOAKS=$((EXISTING_SOAKS + 1)); fi
+    done
+    if [ -z "$SOAKED" ] && [ "$EXISTING_SOAKS" -eq 0 ] \
+       && echo "$PRODUCTION_ONLY_BINARIES" | grep -qw "$BINARY"; then
+        # No canary can carry this binary, and no other production node has soaked it yet — so
+        # THIS node is the first, and there is nothing for it to wait on. It becomes the canary:
+        # the clock starts below, and every other production node then needs the full window.
+        #
+        # Permitted automatically rather than behind a flag. `--canary` is inert (assigned once
+        # at the top and never read), so the previous refusal named a remedy that could not
+        # work: the binaries stayed undeployable and the gate could still only refuse.
+        #
+        # This cannot be abused into a general soak bypass. It is reachable only for a binary in
+        # PRODUCTION_ONLY_BINARIES, only after the ssh probe has confirmed no canary carries it,
+        # and only while NO other production node holds a soak record for this commit. The
+        # second node finds one and waits.
+        info "$BINARY has soaked nowhere yet and no canary can carry it —"
+        info "  $NODE is the FIRST node for this build and becomes its canary."
+        info "  Every other production node will require ${SOAK_MINUTES}m before taking it."
+        SOAKED="$NODE (first node — soak starts here)"
+    fi
+
     if [ -z "$SOAKED" ]; then
-        if echo "$PRODUCTION_ONLY_BINARIES" | grep -qw "$BINARY"; then
-            die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on any OTHER production node
-       No canary carries $SERVICE.service, so one production node must soak first:
-         scripts/deploy-node.sh <the quietest node> $BINARY --canary
-       then wait ${SOAK_MINUTES}m before deploying it anywhere else."
-        fi
         die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on a canary
        deploy to a canary first: scripts/deploy-node.sh <canary> $BINARY --canary"
     fi
