@@ -125,6 +125,33 @@ pub struct Sv1Server {
     pub(crate) shares_for_unknown_job: Arc<AtomicU64>,
 }
 
+/// The share-outcome report line: totals since start, and the delta over the last interval.
+///
+/// Split out from the reporting task so the arithmetic is testable. The totals matter for
+/// comparing nodes; the deltas matter for spotting a node that has STARTED refusing, which a
+/// monotonically rising total hides.
+fn format_share_outcomes(
+    secs: u64,
+    now: (u64, u64, u64, u64),
+    prev: (u64, u64, u64, u64),
+) -> String {
+    format!(
+        "share outcomes ({secs}s): accepted_late={} (+{}) below_target={} (+{}) \
+         validation_failed={} (+{}) unknown_job={} (+{})",
+        now.0,
+        // `saturating_sub`, not `-`: these are process-lived counters and a report is emitted
+        // after a restart against a `prev` from before it. Subtracting would panic in debug and
+        // wrap to nonsense in release.
+        now.0.saturating_sub(prev.0),
+        now.1,
+        now.1.saturating_sub(prev.1),
+        now.2,
+        now.2.saturating_sub(prev.2),
+        now.3,
+        now.3.saturating_sub(prev.3),
+    )
+}
+
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1Server {
     /// Sends a message to downstream(s) for the given channel_id.
@@ -498,6 +525,50 @@ impl Sv1Server {
         }
     }
 
+    /// How often the share-outcome counters are written to the log.
+    const SHARE_OUTCOME_REPORT_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// Periodically report why shares were refused, at INFO.
+    ///
+    /// #810 separated the refusal reasons and #811 added the recovered-work count, but every one
+    /// of the four counters was only ever readable through a `debug!`. The fleet runs at INFO —
+    /// measured on vm1 and vm5 after the v1.11.33 roll: **zero** DEBUG lines in 30 minutes
+    /// against 492 and 2213 INFO lines. So the counters incremented in memory and nothing could
+    /// ever read them, and "late accepts = 0" was a check that could not fail rather than a
+    /// measurement. That is the whole point of having separated them.
+    ///
+    /// Emitted unconditionally, including when every counter is zero and unchanged. A reporter
+    /// that only speaks when something happened cannot be distinguished from one that died, and
+    /// an all-zero line is itself the evidence that the submission path is quiet rather than
+    /// unobserved.
+    fn spawn_share_outcome_reporter(self: Arc<Self>, cancellation_token: &CancellationToken) {
+        let token = cancellation_token.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Self::SHARE_OUTCOME_REPORT_INTERVAL);
+            // The first tick fires immediately; skip it so the first report describes a real
+            // interval rather than the instant of startup.
+            ticker.tick().await;
+            let mut prev = (0u64, 0u64, 0u64, 0u64);
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+                let now = (
+                    self.shares_accepted_late.load(Ordering::Relaxed),
+                    self.shares_below_target.load(Ordering::Relaxed),
+                    self.shares_failed_validation.load(Ordering::Relaxed),
+                    self.shares_for_unknown_job.load(Ordering::Relaxed),
+                );
+                info!(
+                    "{}",
+                    format_share_outcomes(Self::SHARE_OUTCOME_REPORT_INTERVAL.as_secs(), now, prev)
+                );
+                prev = now;
+            }
+        });
+    }
+
     /// Starts the SV1 server and begins accepting connections.
     ///
     /// This method:
@@ -528,6 +599,9 @@ impl Sv1Server {
         task_manager: Arc<TaskManager>,
     ) -> TproxyResult<(), error::Sv1Server> {
         info!("Starting SV1 server on {}", self.listener_addr);
+
+        self.clone()
+            .spawn_share_outcome_reporter(&cancellation_token);
 
         // Starting difficulty for the hobby listener (`downstream_port`). Vardiff moves from
         // here; this only sets where a connection begins.
@@ -2455,5 +2529,58 @@ mod tests {
         let seq_id = server.sequence_counter.fetch_add(1, Ordering::SeqCst);
         assert_eq!(seq_id, 1);
         assert_eq!(server.sequence_counter.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod share_outcome_report_tests {
+    use super::format_share_outcomes;
+
+    /// The line must name every counter AND its delta.
+    ///
+    /// #810 separated the refusal reasons and #811 added the recovered-work count; both were
+    /// only readable through a `debug!` the fleet never emits (measured after the v1.11.33 roll:
+    /// zero DEBUG lines in 30 minutes against 492 and 2213 INFO lines on vm1/vm5). A report that
+    /// omitted one of them would leave that outcome exactly as unobservable as before.
+    #[test]
+    fn the_report_names_every_counter_and_its_delta() {
+        let line = format_share_outcomes(300, (7, 500, 2, 1), (3, 480, 2, 0));
+        for expected in [
+            "accepted_late=7 (+4)",
+            "below_target=500 (+20)",
+            "validation_failed=2 (+0)",
+            "unknown_job=1 (+1)",
+            "(300s)",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in: {line}");
+        }
+    }
+
+    /// A quiet interval must still produce a full line.
+    ///
+    /// A reporter that only speaks when something happened is indistinguishable from one that
+    /// died, and the all-zero line is what proves the submission path is quiet rather than
+    /// unobserved.
+    #[test]
+    fn an_idle_interval_still_reports_every_counter() {
+        let line = format_share_outcomes(300, (0, 0, 0, 0), (0, 0, 0, 0));
+        assert!(line.contains("accepted_late=0 (+0)"), "got: {line}");
+        assert!(line.contains("below_target=0 (+0)"), "got: {line}");
+        assert!(line.contains("validation_failed=0 (+0)"), "got: {line}");
+        assert!(line.contains("unknown_job=0 (+0)"), "got: {line}");
+    }
+
+    /// Counters are process-lived, so `now` can be LOWER than `prev` after a restart.
+    /// Plain subtraction would panic in debug and wrap to ~1.8e19 in release — a number that
+    /// would look like a catastrophic share-loss event in the logs.
+    #[test]
+    fn a_counter_reset_reports_zero_rather_than_wrapping() {
+        let line = format_share_outcomes(300, (0, 0, 0, 0), (9, 12_000, 4, 2));
+        assert!(line.contains("accepted_late=0 (+0)"), "got: {line}");
+        assert!(line.contains("below_target=0 (+0)"), "got: {line}");
+        assert!(
+            !line.contains("1844674407"),
+            "a wrapped subtraction leaked into the report: {line}"
+        );
     }
 }
