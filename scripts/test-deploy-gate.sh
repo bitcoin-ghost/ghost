@@ -72,6 +72,12 @@ case "$cmd" in
         # 2026-08-24 (sig=1, ctrl=3). Either may be set EMPTY to play a probe that did
         # not run — `${VAR-default}` so an explicit empty survives.
         printf '%s\n%s\n' "${STUB_SIGN_HITS-1}" "${STUB_SIGN_CTRL-3}" ;;
+    *"test -f /etc/systemd/system/"*)
+        # "Does this canary carry the unit?" — the question the PRODUCTION_ONLY relaxation
+        # asks before allowing a production node to stand in as canary (#759). Default is NO,
+        # which is the live fleet: ghost-pay and ghost-gsp exist only on vm1-vm4.
+        [ "${STUB_CANARY_CARRIES:-0}" = 1 ] && exit 0
+        exit 1 ;;
     *)  exit 1 ;;
 esac
 SSH_STUB
@@ -97,6 +103,7 @@ run_gate() {
         STUB_MTIME="${STUB_MTIME:-}" STUB_START="${STUB_START:-}" \
         STUB_SIGN_HITS="${STUB_SIGN_HITS-1}" STUB_SIGN_CTRL="${STUB_SIGN_CTRL-3}" \
         GHOST_DEPLOY_SSH="${GHOST_DEPLOY_SSH:-ssh}" \
+        STUB_CANARY_CARRIES="${STUB_CANARY_CARRIES:-0}" \
         GHOST_DEPLOY_PORT_WAIT_SECS=0 \
         timeout 60 bash "$DEPLOY" "$node" "$binary" 2>&1 )
 }
@@ -196,6 +203,63 @@ else
     printf "  [ok ] a refused soak record is cleared, not left to be re-read\n"
     pass=$((pass+1))
 fi
+
+# ---------------------------------------------------------------------------
+# 5b. PRODUCTION-ONLY binaries (#759): ghost-pay and ghost-gsp are installed only on vm1-vm4,
+#     all of which are PRODUCTION nodes. The canary soak is not merely skipped for them, it is
+#     UNSATISFIABLE — so the gate could only ever refuse, and they had no enforced path at all.
+#     The first production node deployed stands in as the canary. These cases pin that the
+#     relaxation is NARROW: still a real 60m soak, still no vouching for yourself, still gone
+#     the moment a canary actually carries the unit.
+# ---------------------------------------------------------------------------
+rm -f "$TMP/state"/soaked-*
+
+out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
+check "a production-only binary with no soak anywhere is refused" \
+    "ghost-gsp @ .* has not soaked" "$out"
+check "and the refusal names the PRODUCTION remedy, not a canary" \
+    "No canary carries ghost-gsp.service" "$out"
+
+# A soak on ANOTHER production node is what this relaxation exists to accept.
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm2-ghost-gsp"
+out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
+check_absent "a 2h soak on another PRODUCTION node satisfies the soak gate" \
+    "has not soaked" "$out"
+check "and it says a production node stood in as canary" \
+    "no canary carries ghost-gsp.service" "$out"
+
+# ...but a node must not vouch for ITSELF. That would make the soak vacuous.
+rm -f "$TMP/state"/soaked-*
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm1-ghost-gsp"
+out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
+check "a node's own soak record does NOT satisfy its own deploy" \
+    "ghost-gsp @ .* has not soaked" "$out"
+
+# The relaxation must EXPIRE the moment a canary carries the unit, or a waiver outlives its
+# reason. Same 2h soak on another production node, but now a canary has ghost-gsp installed.
+rm -f "$TMP/state"/soaked-*
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm2-ghost-gsp"
+out="$(STUB_CANARY_CARRIES=1 GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
+check "once a canary carries the unit, the production stand-in is refused" \
+    "reason for treating a production node as its canary is gone" "$out"
+
+# CONTROL: none of this may touch a share-path binary. pool_sv2 must still demand a CANARY.
+rm -f "$TMP/state"/soaked-*
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm2-pool_sv2"
+out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 pool_sv2)"
+check "a production-node soak does NOT satisfy a share-path binary" \
+    "pool_sv2 @ .* has not soaked" "$out"
+check_absent "and share-path refusals still point at a canary, not a production node" \
+    "No canary carries" "$out"
+
+rm -f "$TMP/state"/soaked-*
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "deadbeef" \
+    > "$TMP/state/soaked-$SHA-ghost-vm5-translator_sv2"
+
 
 # ---------------------------------------------------------------------------
 # 6. The same soak with a PASSING submission path DOES satisfy the gate — so the
