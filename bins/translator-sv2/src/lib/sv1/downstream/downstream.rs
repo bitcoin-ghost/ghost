@@ -250,9 +250,9 @@ impl Downstream {
                                 // the cache; taking the direct path must not skip it or the
                                 // node's view of the miner's difficulty drifts from the miner's.
                                 self.downstream_data.super_safe_lock(|d| {
-                                    if let Some(new_target) = d.pending_target.take() {
-                                        d.target = new_target;
-                                    }
+                                    // Retains the superseded target so shares already in flight
+                                    // against it are not thrown away (#811).
+                                    d.adopt_pending_target();
                                     if let Some(new_hashrate) = d.pending_hashrate.take() {
                                         d.hashrate = Some(new_hashrate);
                                     }
@@ -291,9 +291,10 @@ impl Downstream {
                                             // Update target and hashrate if we're sending
                                             // set_difficulty
                                             if cached_set_difficulty.is_some() {
-                                                if let Some(new_target) = d.pending_target.take() {
-                                                    d.target = new_target;
-                                                }
+                                                // Third adoption site. All three go through the
+                                                // one method so none can quietly skip retaining
+                                                // the superseded target (#811).
+                                                d.adopt_pending_target();
                                                 if let Some(new_hashrate) =
                                                     d.pending_hashrate.take()
                                                 {
@@ -470,9 +471,9 @@ impl Downstream {
 
             // Update target and hashrate after sending set_difficulty
             self.downstream_data.super_safe_lock(|d| {
-                if let Some(new_target) = d.pending_target.take() {
-                    d.target = new_target;
-                }
+                // Same adoption as the immediate path above — one method so the two cannot
+                // disagree about whether the superseded target is retained (#811).
+                d.adopt_pending_target();
                 if let Some(new_hashrate) = d.pending_hashrate.take() {
                     d.hashrate = Some(new_hashrate);
                 }
