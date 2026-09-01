@@ -112,6 +112,28 @@ case "$BINARY" in
   *)                                  SHARE_PATH_BINARY=no  ;;
 esac
 
+# The systemd unit each binary runs as. Declared HERE rather than just before the restart,
+# because the soak gate below needs it to ask a canary whether it carries this binary at all.
+case "$BINARY" in
+  ghost-pool)      SERVICE=ghost-pool ;;
+  pool_sv2)        SERVICE=sri-pool ;;
+  translator_sv2)  SERVICE=sri-translator ;;
+  ghost-pay)       SERVICE=ghost-pay ;;
+  ghost-gsp)       SERVICE=ghost-gsp ;;
+esac
+
+# Binaries that NO canary node carries.
+#
+# `ghost-pay` and `ghost-gsp` are installed only on vm1-vm4, and every one of those is a
+# PRODUCTION node. The canary soak is therefore not merely skipped for them, it is
+# UNSATISFIABLE: there is no canary to soak on, so the gate could only ever refuse, and the
+# binaries had no enforced path to production at all (#759).
+#
+# For these the FIRST production node deployed acts as the canary: it soaks the full
+# SOAK_MINUTES before any other production node accepts the build. That keeps a real soak —
+# real traffic, real time — rather than waiving it.
+PRODUCTION_ONLY_BINARIES="ghost-pay ghost-gsp"
+
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------- preconditions
@@ -647,9 +669,37 @@ fi
 #    It also records the deployed binary's hash ON THE NODE. A soak asserts "this build ran
 #    here for N minutes"; if the node no longer runs that build the claim is void, which is
 #    exactly what a mid-roll rollback produces.
+#    ⚠ PRODUCTION-ONLY binaries (see PRODUCTION_ONLY_BINARIES) have no canary to soak on, so
+#    the pool of nodes whose soak counts becomes the OTHER production nodes. A node still
+#    cannot vouch for itself — it is excluded — so the first one deployed soaks alone for the
+#    full window before any second node accepts the build.
+#
+#    The "no canary carries it" claim is VERIFIED here, not trusted. If a canary has since had
+#    the unit installed, the relaxation is refused and the normal canary soak is demanded
+#    again. A static list that silently outlives its reason is how a waiver becomes permanent.
 if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
+    SOAK_POOL="$CANARY_NODES"
+    if echo "$PRODUCTION_ONLY_BINARIES" | grep -qw "$BINARY"; then
+        CARRIER=""
+        for c in $CANARY_NODES; do
+            # $SSH_BIN, not bare `ssh`: this is a GATE question, so it must be drivable by
+            # scripts/test-deploy-gate.sh. Using `ssh` here would make the self-test reach the
+            # real fleet to decide the case — the exact trap that file's header calls out.
+            if timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$c" \
+                 "test -f /etc/systemd/system/$SERVICE.service" 2>/dev/null; then
+                CARRIER="$c"; break
+            fi
+        done
+        if [ -n "$CARRIER" ]; then
+            die "$BINARY is listed in PRODUCTION_ONLY_BINARIES, but $CARRIER now carries
+       $SERVICE.service. The reason for treating a production node as its canary is gone.
+       Soak it on $CARRIER the normal way, and drop $BINARY from PRODUCTION_ONLY_BINARIES."
+        fi
+        SOAK_POOL=$(echo "$PRODUCTION_NODES" | tr ' ' '\n' | grep -vw "$NODE" | tr '\n' ' ')
+        info "no canary carries $SERVICE.service — a production node acts as canary for $BINARY"
+    fi
     SOAKED=""
-    for c in $CANARY_NODES; do
+    for c in $SOAK_POOL; do
         f="$STATE_DIR/soaked-$SHA-$c-$BINARY"
         [ -f "$f" ] || continue
         read -r started recorded_hash < "$f" 2>/dev/null || continue
@@ -699,8 +749,16 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
         fi
         break
     done
-    [ -n "$SOAKED" ] || die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on a canary
+    if [ -z "$SOAKED" ]; then
+        if echo "$PRODUCTION_ONLY_BINARIES" | grep -qw "$BINARY"; then
+            die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on any OTHER production node
+       No canary carries $SERVICE.service, so one production node must soak first:
+         scripts/deploy-node.sh <the quietest node> $BINARY --canary
+       then wait ${SOAK_MINUTES}m before deploying it anywhere else."
+        fi
+        die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on a canary
        deploy to a canary first: scripts/deploy-node.sh <canary> $BINARY --canary"
+    fi
     info "soak satisfied: $SOAKED"
 fi
 
@@ -859,14 +917,6 @@ S=$SUDO
 # how state files stop persisting.
 \$S rm -f /tmp/$BINARY.new
 " || exit 2
-
-case "$BINARY" in
-  ghost-pool)      SERVICE=ghost-pool ;;
-  pool_sv2)        SERVICE=sri-pool ;;
-  translator_sv2)  SERVICE=sri-translator ;;
-  ghost-pay)       SERVICE=ghost-pay ;;
-  ghost-gsp)       SERVICE=ghost-gsp ;;
-esac
 
 SWAP_EPOCH=$(date +%s)
 timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
@@ -1028,7 +1078,18 @@ S=$SUDO
 fi
 
 # Start the soak clock for this commit on this node.
+#
+# Canaries always soak. A production node soaks only when it is standing in for one, which is
+# exactly the PRODUCTION_ONLY case — otherwise every production deploy would start a clock and
+# the "soaked somewhere else first" requirement would dissolve.
+START_SOAK=no
 if echo "$CANARY_NODES" | grep -qw "$NODE"; then
+    START_SOAK=yes
+elif echo "$PRODUCTION_ONLY_BINARIES" | grep -qw "$BINARY"; then
+    START_SOAK=yes
+fi
+
+if [ "$START_SOAK" = "yes" ]; then
     # Record WHAT soaked, not just when. The hash lets the production gate confirm the node is
     # still running this build rather than something a rollback restored underneath it.
     LIVE_HASH=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" \
@@ -1036,6 +1097,11 @@ if echo "$CANARY_NODES" | grep -qw "$NODE"; then
 
     # Do not start a clock on a build whose submission path is already broken. Waiting an hour
     # to discover that is an hour spent proving nothing (#461).
+    # Only meaningful for a binary that carries shares. For the others the /health check
+    # above IS the equivalent gate, and dialling :3333 would prove nothing about them.
+    if [ "$SHARE_PATH_BINARY" = "no" ]; then
+        info "submission path not exercised: $BINARY carries no shares (its /health check is the equivalent)"
+    else
     info "exercising the share-submission path on $NODE before starting the clock"
     if ! exercise_submission_path "$NODE"; then
         die "submission-path smoke FAILED on $NODE — no soak clock started for $BINARY @ $SHORT
@@ -1045,6 +1111,7 @@ if echo "$CANARY_NODES" | grep -qw "$NODE"; then
          /opt/ghost/bin/$BINARY.bak.* if it is not serving work."
     fi
     info "submission path OK on $NODE"
+    fi
 
     printf '%s %s\n' "$(date +%s)" "${LIVE_HASH:-}" > "$STATE_DIR/soaked-$SHA-$NODE-$BINARY"
     info "soak clock started for $BINARY @ $SHORT on $NODE (${SOAK_MINUTES}m required before production)"
