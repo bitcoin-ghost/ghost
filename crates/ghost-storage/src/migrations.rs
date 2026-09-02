@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 58;
+const SCHEMA_VERSION: u32 = 59;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -135,6 +135,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (56, migrate_v56),
         (57, migrate_v57),
         (58, migrate_v58),
+        (59, migrate_v59),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2793,6 +2794,91 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 /// ⚠ This frees pages; it does NOT shrink the file. `auto_vacuum=0` and the freelist is empty, so
 /// the space is reused internally and growth stops. Returning ~2.2 GB to the OS needs `VACUUM`,
 /// which needs twice the database free and took ghost-vm6 down once — deliberately not done here.
+/// Drop the five retired share-batch-chain tables (#585).
+///
+/// SBC was deleted in #703 ("Delete the share-batch chain, keeping the four rules the shard
+/// inherited"), `share_batch_shadow` was turned off fleet-wide and the flag removed from config
+/// entirely, and #692 was closed on 2026-08-22. What survived the deletion is the DATA: migration
+/// v50/v51/v52 created these tables, nothing has read or written them since, and they have been
+/// carried in every backup and every page-cache read ever since.
+///
+/// Measured on ghost-vm5, 2026-09-02:
+///
+/// | table            | rows | size   |
+/// |------------------|------|--------|
+/// | `sbc_batches`    | 1390 | 133 MB |
+/// | `sbc_certs`      | 1389 |   2 MB |
+/// | `sbc_watermarks` |    6 |  ~0 MB |
+/// | `sbc_balances`   |    5 |  ~0 MB |
+/// | `sbc_quarantine` |    1 |  ~0 MB |
+///
+/// ~135 MB per node, so roughly 1.1 GB across the fleet. `sbc_batches` dominates because each row
+/// stored a verbatim JSON payload — ~95 KB apiece.
+///
+/// Verified before writing this: outside `migrations.rs` the only mentions of any of these tables
+/// are two doc comments in `shard_store.rs` that compare the shard's design to SBC's. There is no
+/// read path, no write path, and no config flag left to turn it back on.
+///
+/// ⚠ Unlike [`migrate_v57`], this does NOT refuse to drop a non-empty table. That guard exists on
+/// `wraith_bonds` because every row was escrowed VALUE — dropping it would silently release or
+/// strand sats. These rows are retired accounting history for a mechanism the shard replaced;
+/// they carry no balance anyone can spend, and `sbc_balances` (5 rows) is SBC's own internal
+/// bookkeeping, not the L2 ledger.
+///
+/// ⚠ What is genuinely given up: the ability to re-derive the pre-shard batch chain from this
+/// database. That is forensic, not operational — the shard has paid since the cutover and does
+/// not consult these tables, and pre-cutover backups still hold them if anyone ever needs to look.
+///
+/// ⚠ This frees pages; it does NOT shrink the file. `auto_vacuum=0` and the freelist is
+/// essentially empty, so the space is reused internally and growth slows rather than the file
+/// getting smaller. Returning it to the OS needs `VACUUM`, which needs twice the database free and
+/// took ghost-vm6 down once — deliberately not done here, and tracked separately on #585.
+fn migrate_v59(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v59: drop the retired SBC tables");
+
+    // Indexes first: dropping a table takes its auto-indexes with it, but the named ones are
+    // listed explicitly so a partially-applied run has nothing left dangling.
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_sbc_balances_seq;
+         DROP INDEX IF EXISTS idx_sbc_batches_hash;
+         DROP INDEX IF EXISTS idx_sbc_certs_hash;
+         DROP TABLE IF EXISTS sbc_batches;
+         DROP TABLE IF EXISTS sbc_certs;
+         DROP TABLE IF EXISTS sbc_watermarks;
+         DROP TABLE IF EXISTS sbc_balances;
+         DROP TABLE IF EXISTS sbc_quarantine;",
+    )
+    .map_err(|e| GhostError::Migration(format!("v59: cannot drop the SBC tables: {e}")))?;
+
+    // Prove it rather than assume it: a `DROP TABLE IF EXISTS` that silently matched nothing
+    // because of a typo looks identical to one that worked.
+    //
+    // Checking `name` alone is NOT enough, which a test caught: the indexes are called
+    // `idx_sbc_*` and `sqlite_autoindex_sbc_*`, so neither matches a name-prefix test and the
+    // check would have passed with indexes still present. `tbl_name` is the table an index
+    // belongs to, so it catches them whatever they are called.
+    //
+    // `_` is a single-character wildcard in SQL LIKE, so `'sbc_%'` would also match `sbcX...`.
+    // Escaped, this asserts on the actual prefix rather than something close to it.
+    let left: i64 = conn
+        .query_row(
+            r"SELECT COUNT(*) FROM sqlite_master
+              WHERE name     LIKE 'sbc\_%' ESCAPE '\'
+                 OR tbl_name LIKE 'sbc\_%' ESCAPE '\'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| GhostError::Migration(format!("v59: cannot verify the drop: {e}")))?;
+    if left != 0 {
+        return Err(GhostError::Migration(format!(
+            "v59: {left} SBC object(s) still present after the drop"
+        )));
+    }
+
+    debug!("v59: dropped the retired SBC tables and their indexes");
+    Ok(())
+}
+
 fn migrate_v58(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v58: drop `shares_archive.proof`");
 
@@ -4108,6 +4194,107 @@ mod tests {
         }
     }
 
+    /// v59 must remove every `sbc_%` object, including ones with rows in them.
+    ///
+    /// The whole point is reclaiming ~135 MB per node that a retired feature left behind, so a
+    /// migration that quietly skipped the populated tables would look successful and free nothing.
+    #[test]
+    fn v59_drops_every_sbc_object_even_when_populated() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+
+        // Head has already dropped them; rebuild a populated v50-era shape to drop again.
+        conn.execute_batch(
+            "CREATE TABLE sbc_batches (seq INTEGER PRIMARY KEY, batch_hash BLOB NOT NULL);
+             CREATE INDEX idx_sbc_batches_hash ON sbc_batches(batch_hash);
+             CREATE TABLE sbc_certs (seq INTEGER PRIMARY KEY, cert BLOB NOT NULL);
+             CREATE INDEX idx_sbc_certs_hash ON sbc_certs(cert);
+             CREATE TABLE sbc_balances (addr TEXT PRIMARY KEY, sats INTEGER NOT NULL);
+             CREATE INDEX idx_sbc_balances_seq ON sbc_balances(sats);
+             CREATE TABLE sbc_watermarks (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+             CREATE TABLE sbc_quarantine (id TEXT PRIMARY KEY);
+             INSERT INTO sbc_batches VALUES (1, X'00'), (2, X'01');
+             INSERT INTO sbc_certs   VALUES (1, X'02');
+             INSERT INTO sbc_balances VALUES ('addr', 42);
+             INSERT INTO sbc_watermarks VALUES ('w', 7);
+             INSERT INTO sbc_quarantine VALUES ('q');",
+        )
+        .expect("recreate the retired SBC shape");
+
+        // Count the way the migration verifies: by `tbl_name` as well as `name`, so the indexes
+        // are included. Counting `name` alone gives 5 (the tables) and silently ignores them.
+        let before: i64 = conn
+            .query_row(
+                r"SELECT COUNT(*) FROM sqlite_master
+                  WHERE name     LIKE 'sbc\_%' ESCAPE '\'
+                     OR tbl_name LIKE 'sbc\_%' ESCAPE '\'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count before");
+        assert!(
+            before >= 8,
+            "the fixture must create the tables AND their indexes, got {before}"
+        );
+
+        migrate_v59(&conn).expect("v59 must drop populated SBC tables");
+
+        let after: i64 = conn
+            .query_row(
+                r"SELECT COUNT(*) FROM sqlite_master
+                  WHERE name     LIKE 'sbc\_%' ESCAPE '\'
+                     OR tbl_name LIKE 'sbc\_%' ESCAPE '\'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count after");
+        assert_eq!(after, 0, "every SBC object must be gone, {after} remain");
+    }
+
+    /// Re-running v59 must be a no-op, not an error — migrations replay.
+    #[test]
+    fn v59_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+        migrate_v59(&conn).expect("v59 must be safe to re-run once the tables are already gone");
+    }
+
+    /// v59 must not touch anything that is not SBC.
+    ///
+    /// `LIKE 'sbc_%'` is a prefix match and the verification step asserts on it, so a table merely
+    /// NAMED like one would be swept up. This pins that the migration drops the five it names and
+    /// leaves the rest of the schema alone.
+    #[test]
+    fn v59_leaves_the_rest_of_the_schema_intact() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sbc_%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count non-sbc tables");
+        migrate_v59(&conn).expect("v59 replay");
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sbc_%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count non-sbc tables after");
+        assert_eq!(
+            before,
+            after,
+            "v59 removed {} non-SBC table(s)",
+            before - after
+        );
+        assert!(
+            before > 20,
+            "the fixture should have a real schema, got {before}"
+        );
+    }
+
     /// Re-running v58 must be a no-op, not an error — migrations replay.
     #[test]
     fn v58_is_idempotent() {
@@ -4267,61 +4454,43 @@ mod tests {
     /// `docs/archive/SHARE_BATCH_CHAIN.md` names the defect being replaced: today the payable state is
     /// 1.5M unpaid share rows rescanned to produce ~68 numbers. If a future change adds a
     /// share-per-row table here, that problem is rebuilt one layer down and the reason for the
-    /// whole programme is quietly lost. Shares live inside a batch, inside a bounded window.
+    /// v50's SBC schema is gone at head — v59 retired it (#585).
+    ///
+    /// This test used to assert the shape of `sbc_balances`/`sbc_batches`: keyed by seq rather
+    /// than per-share, `micro_work` an INTEGER matching the i64 fold type, negatives round-tripping
+    /// for reorg reversal. All of that guarded a mechanism the shard replaced, the code was deleted
+    /// in #703, and v59 drops the tables that outlived it.
+    ///
+    /// Kept and inverted rather than deleted, because the useful half survives: if a future
+    /// migration reintroduces the batch chain's tables, someone should have to argue for it rather
+    /// than have them reappear silently.
     #[test]
-    fn v50_stores_balances_and_a_bounded_chain_but_not_a_share_archive() {
+    fn v50s_sbc_schema_is_retired_at_head() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
         let tables = get_table_names(&conn);
-        for t in ["sbc_balances", "sbc_batches", "sbc_quarantine"] {
-            assert!(tables.contains(&t.to_string()), "{t} missing from schema");
+        for t in [
+            "sbc_balances",
+            "sbc_batches",
+            "sbc_certs",
+            "sbc_quarantine",
+            "sbc_watermarks",
+        ] {
+            assert!(
+                !tables.contains(&t.to_string()),
+                "`{t}` is present at head — the share-batch chain was retired in #703/#585"
+            );
         }
 
-        // The chain is keyed by seq — one row per adopted batch, prunable to a window — rather
-        // than by share. A share-keyed table here would be the regression this test guards.
-        let batch_cols = get_column_names(&conn, "sbc_batches");
-        assert!(
-            batch_cols.contains(&"seq".to_string()),
-            "sbc_batches must be keyed by seq, found: {batch_cols:?}"
-        );
-        assert!(
-            !batch_cols
-                .iter()
-                .any(|c| c == "share_hash" || c == "miner_id"),
-            "sbc_batches must not hold per-share columns — payable state is O(addresses); \
-             found: {batch_cols:?}"
-        );
-
-        // Balances hold i64 micro-work, matching `fold_shares`'s BTreeMap<String, i64> exactly.
-        // A different stored type means a conversion at every read, and the value the state root
-        // is computed over is the one that must round-trip.
-        let mut stmt = conn.prepare("PRAGMA table_info(sbc_balances)").unwrap();
-        let ty = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
-            .unwrap()
-            .filter_map(|c| c.ok())
-            .find(|(n, _)| n == "micro_work")
-            .map(|(_, t)| t)
-            .expect("micro_work column");
-        assert_eq!(ty, "INTEGER", "micro_work must match the i64 fold type");
-
-        // A balance must survive a round trip, including a negative one — settlement reversal on
-        // a reorg subtracts, and a column that cannot hold the result would corrupt the root.
-        conn.execute(
-            "INSERT INTO sbc_balances (address_hash, address_enc, micro_work, updated_seq) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![vec![1u8; 32], "enc", -42i64, 7i64],
-        )
-        .expect("insert");
-        let back: i64 = conn
-            .query_row(
-                "SELECT micro_work FROM sbc_balances WHERE address_hash = ?1",
-                rusqlite::params![vec![1u8; 32]],
-                |r| r.get(0),
-            )
-            .expect("read back");
-        assert_eq!(back, -42);
+        // The control: the shard tables that REPLACED it must still be here, or this test would
+        // pass just as happily against a database that failed to migrate at all.
+        for t in ["shard_counters", "shard_settled", "shard_epochs"] {
+            assert!(
+                tables.contains(&t.to_string()),
+                "`{t}` missing — the shard schema must exist, not merely SBC's absence"
+            );
+        }
     }
 
     #[test]
@@ -4418,7 +4587,12 @@ mod tests {
         };
         check_shape(&conn, "after a clean migration");
 
-        // Additive: the sbc_* tables this release explicitly does NOT touch are all present.
+        // This used to assert the `sbc_*` tables were still present, guarding that v53 was
+        // ADDITIVE and did not quietly remove the batch chain it ran alongside. That property was
+        // real, but it is asserted here against HEAD, and v59 now drops those tables deliberately
+        // (#585) — so the check became a claim about v59, not v53, and failed for the right
+        // reason. Inverted rather than deleted: at head they must be GONE, and if a future
+        // migration recreates them that is worth failing on.
         let tables = get_table_names(&conn);
         for sbc in [
             "sbc_balances",
@@ -4428,8 +4602,8 @@ mod tests {
             "sbc_watermarks",
         ] {
             assert!(
-                tables.contains(&sbc.to_string()),
-                "v53 must leave `{sbc}` alone. Found tables: {tables:?}"
+                !tables.contains(&sbc.to_string()),
+                "`{sbc}` is back at head — v59 retired the share-batch chain. Found: {tables:?}"
             );
         }
 
