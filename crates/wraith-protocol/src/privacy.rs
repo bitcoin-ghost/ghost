@@ -67,6 +67,12 @@ pub enum Violation {
         total: usize,
     },
 
+    /// An API response names a participant, linking identity to position.
+    IdentityInResponse {
+        /// The offending field name.
+        field: String,
+    },
+
     /// A value appears in every round, so it can be grepped for across the
     /// whole chain to enumerate participation.
     ConstantValueAcrossRounds {
@@ -150,6 +156,41 @@ pub fn attempt_amount_attack(tx: &Transaction, shape: RoundShape) -> Vec<Violati
     } else {
         Vec::new()
     }
+}
+
+/// Field names that must never appear in a response body.
+///
+/// Each one links an identity to a position, and a position to an output. The
+/// `/round-tx` leak was exactly this: `participant_id` per output, served
+/// unauthenticated alongside prevouts.
+pub const BANNED_RESPONSE_FIELDS: &[&str] = &[
+    "participant_id",
+    "participant_index",
+    "participant_ids",
+    "ghost_id",
+    "ghost_ids",
+    "owner",
+    "submitter",
+    "registered_by",
+];
+
+/// Scan a serialised API response for identity-to-position leakage.
+///
+/// Deliberately a string scan over the *serialised* body rather than a check on
+/// the struct: it catches a field added under a different name, a `HashMap` with
+/// identity keys, and anything that reaches the wire through `serde(flatten)` or
+/// a manual `Serialize`. A type-level check would have missed all three.
+///
+/// Requests are a different matter — a caller naming themselves is how they
+/// authenticate. This is for responses only.
+pub fn probe_api_response(json: &str) -> Vec<Violation> {
+    BANNED_RESPONSE_FIELDS
+        .iter()
+        .filter(|f| json.contains(**f))
+        .map(|f| Violation::IdentityInResponse {
+            field: (*f).to_string(),
+        })
+        .collect()
 }
 
 /// Look across many rounds for a value that never changes.
@@ -273,6 +314,42 @@ mod tests {
     fn a_clean_round_probes_clean() {
         let tx = tx_with_outputs(&[100_000, 100_000, 100_000, 100_000, 100_000, 1_000], 5);
         assert!(probe_round(&tx, Some(SHAPE)).is_empty());
+    }
+
+    #[test]
+    fn the_round_tx_leak_is_caught_by_the_api_probe() {
+        // The exact body that shipped, reduced. This is the regression the
+        // probe exists for.
+        let leaked =
+            r#"{"session_id":"s","output_provenance":[{"participant_id":3,"tx_output_index":0}]}"#;
+        assert_eq!(
+            probe_api_response(leaked),
+            vec![Violation::IdentityInResponse {
+                field: "participant_id".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_clean_response_probes_clean() {
+        let ok = r#"{"session_id":"s","state":"filling","slots_filled":3,"slots_total":20,
+                     "output_provenance":[{"tx_output_index":0,"kind":"mixed","amount_sats":100000}]}"#;
+        assert!(probe_api_response(ok).is_empty());
+    }
+
+    #[test]
+    fn a_renamed_field_is_still_caught() {
+        // Someone "fixes" the leak by renaming rather than removing it.
+        for body in [
+            r#"{"outputs":[{"owner":"gid-7"}]}"#,
+            r#"{"outputs":[{"submitter":"gid-7"}]}"#,
+            r#"{"roster":{"ghost_ids":["a","b"]}}"#,
+        ] {
+            assert!(
+                !probe_api_response(body).is_empty(),
+                "renamed attribution slipped through: {body}"
+            );
+        }
     }
 
     #[test]

@@ -3147,3 +3147,72 @@ async fn background_tick_sweeps_expired_signing_sessions_without_a_witness_ping(
     );
     run_one_pass(&state); // second pass: no panic, no double-sweep
 }
+
+/// Sweep every GET endpoint reachable in a live session and probe each response
+/// for identity-to-position leakage.
+///
+/// The `/round-tx` leak was found by reading code, not by a test. This is the
+/// net that catches the whole class: a string scan over the serialised body, so
+/// it also catches a field added under a different name, an identity-keyed map,
+/// or anything reaching the wire via `serde(flatten)`.
+///
+/// If a new endpoint is added and not listed here, that is the gap — add it.
+#[tokio::test]
+async fn no_endpoint_leaks_participant_attribution() {
+    use wraith_protocol::privacy::{probe_api_response, BANNED_RESPONSE_FIELDS};
+
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
+
+    for (i, addr) in FIVE_SIGNET_ADDRS.iter().enumerate() {
+        let (bn, sg) = run_blind_sig_for(
+            router.clone(),
+            &session_id,
+            &format!("wallet-{i}"),
+            addr.as_bytes().to_vec(),
+        )
+        .await;
+        let resp = router
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/session/{session_id}/outputs"),
+                serde_json::json!({
+                    "address": addr,
+                    "blinded_nonce_point": bn,
+                    "unblinded_signature_scalar": sg,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "outputs #{i}");
+    }
+
+    let endpoints = [
+        "/api/v1/pool/discover".to_string(),
+        format!("/api/v1/session/{session_id}"),
+        format!("/api/v1/session/{session_id}/round-tx"),
+    ];
+
+    for uri in endpoints {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+
+        let violations = probe_api_response(&body);
+        assert!(
+            violations.is_empty(),
+            "{uri} leaks participant attribution {violations:?}\nbody: {body}"
+        );
+    }
+
+    // The probe must be able to fail, or it proves nothing.
+    let planted = format!(r#"{{"outputs":[{{"{}":3}}]}}"#, BANNED_RESPONSE_FIELDS[0]);
+    assert!(
+        !probe_api_response(&planted).is_empty(),
+        "the probe cannot detect the leak it exists for"
+    );
+}
