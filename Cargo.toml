@@ -35,6 +35,7 @@ members = [
     "crates/ghost-verification",
     # Ghost Pay L2
     "crates/ghost-keys",
+    "crates/ghost-lock",
     "crates/ghost-locks",
     "crates/wraith-protocol",
     "crates/ghost-reconciliation",

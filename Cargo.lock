@@ -3383,6 +3383,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-lock"
+version = "1.11.34"
+dependencies = [
+ "bitcoin",
+ "rand 0.8.6",
+ "secp256k1 0.29.1",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ghost-locks"
 version = "1.11.35"
 dependencies = [
