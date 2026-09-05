@@ -193,22 +193,38 @@ pub fn probe_api_response(json: &str) -> Vec<Violation> {
         .collect()
 }
 
-/// Look across many rounds for a value that never changes.
+/// Look across many rounds for a *distinctive* value that never changes.
 ///
-/// A pinned seat price is exactly this: one constant makes every seat ever
-/// funded findable with a single grep, without touching the script.
+/// A pinned seat price or a fixed fee output is exactly this: one constant
+/// makes every round findable with a single grep, without touching the script.
+///
+/// # Why multiplicity matters
+///
+/// A denomination is also constant across rounds — deliberately. That is the
+/// anonymity set, and outputs must collide or there is no privacy at all. What
+/// distinguishes a fingerprint from a denomination is **how many times it
+/// appears within a round**: a denomination appears once per participant, while
+/// a fee output appears exactly once and shares its value with nothing else.
+///
+/// So only values that are constant across rounds *and* solitary within each
+/// one are reported. Getting this wrong in either direction is bad: flag
+/// denominations and the probe cries wolf on a correct design; ignore
+/// multiplicity and the fee output walks straight past.
 pub fn probe_value_constancy(rounds: &[Transaction]) -> Vec<Violation> {
     if rounds.len() < 2 {
         return Vec::new();
     }
     let mut appears_in: HashMap<u64, usize> = HashMap::new();
     for tx in rounds {
-        let mut seen = std::collections::HashSet::new();
+        let mut multiplicity: HashMap<u64, usize> = HashMap::new();
         for o in &tx.output {
-            seen.insert(o.value.to_sat());
+            *multiplicity.entry(o.value.to_sat()).or_insert(0) += 1;
         }
-        for v in seen {
-            *appears_in.entry(v).or_insert(0) += 1;
+        // Solitary within this round → a candidate fingerprint.
+        for (v, n) in multiplicity {
+            if n == 1 {
+                *appears_in.entry(v).or_insert(0) += 1;
+            }
         }
     }
     let mut out: Vec<Violation> = appears_in
@@ -354,10 +370,12 @@ mod tests {
 
     #[test]
     fn a_pinned_seat_price_is_greppable_across_rounds() {
-        // Every round carries 101_596 — the pinned constant. One grep finds
-        // every seat ever funded.
+        // The realistic shape: a seat-FUNDING transaction, one seat output plus
+        // change. The seat value is solitary in its own transaction, which is
+        // what makes the pinned constant greppable — every seat ever funded,
+        // from one query.
         let rounds: Vec<Transaction> = (0..5)
-            .map(|i| tx_with_outputs(&[101_596, 101_596, 50_000 + i * 7], 2))
+            .map(|i| tx_with_outputs(&[101_596, 50_000 + i * 7], 1))
             .collect();
         let v = probe_value_constancy(&rounds);
         assert!(
@@ -366,6 +384,44 @@ mod tests {
                 rounds: 5
             }),
             "a value present in every round is a marker: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_denomination_is_not_reported_as_a_fingerprint() {
+        // Every round carries five 100_000 outputs. That is the anonymity set
+        // working, not a leak — the probe must not cry wolf on it.
+        let rounds: Vec<Transaction> = (0..5u64)
+            .map(|i| {
+                tx_with_outputs(
+                    &[100_000, 100_000, 100_000, 100_000, 100_000, 50_000 + i * 7],
+                    5,
+                )
+            })
+            .collect();
+        let v = probe_value_constancy(&rounds);
+        assert!(
+            !v.contains(&Violation::ConstantValueAcrossRounds {
+                value: 100_000,
+                rounds: 5
+            }),
+            "the denomination is the anonymity set, not a fingerprint: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_solitary_constant_is_still_caught_beside_a_denomination() {
+        // The real shape of the fee-output leak: many equal outputs plus one
+        // constant, solitary one.
+        let rounds: Vec<Transaction> = (0..5u64)
+            .map(|i| tx_with_outputs(&[100_000, 100_000, 100_000, 5_000, 40_000 + i * 3], 5))
+            .collect();
+        assert!(
+            probe_value_constancy(&rounds).contains(&Violation::ConstantValueAcrossRounds {
+                value: 5_000,
+                rounds: 5
+            }),
+            "a solitary constant beside a denomination is exactly the fee output"
         );
     }
 

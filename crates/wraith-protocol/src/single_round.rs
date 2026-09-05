@@ -578,7 +578,7 @@ pub fn per_participant_mining_share(
 /// ChaCha20Rng output shuffle. Same construction as the legacy
 /// `shuffle_outputs` in executor.rs, just generic over the items so we can
 /// shuffle our `LiteOutputItem`s directly.
-fn shuffle_with_chacha<T>(items: &mut [T], seed: [u8; 32]) {
+pub(crate) fn shuffle_with_chacha<T>(items: &mut [T], seed: [u8; 32]) {
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
