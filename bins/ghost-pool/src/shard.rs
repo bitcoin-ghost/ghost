@@ -138,6 +138,11 @@ pub struct FoldReport {
     pub expired_epoch: Option<u64>,
     /// Evidence rows deleted for `expired_epoch`, inside the fold's own transaction.
     pub evidence_dropped: usize,
+    /// Rows swept at the same boundary that the fold's own delete could not reach (#830): peers'
+    /// gossiped shares, and this node's own below-tier ones. Reported ALWAYS, including zero —
+    /// a counter that only speaks when non-zero cannot be told apart from one that stopped
+    /// running, which is the trap #822 was raised for.
+    pub swept_expired: usize,
 }
 
 /// One epoch's fold outcome.
@@ -1687,6 +1692,27 @@ impl ShardRuntime {
             .db
             .shard_fold_epoch(&node, &column, &summary, to_delete)?;
 
+        // #830: the fold's delete only covers rows this node received AND that reached network
+        // tier. Peers' gossiped shares (~7/8 of the table on an eight-node fleet) and this node's
+        // own below-tier shares are excluded from it, so nothing reaped them and the table grew
+        // ~50,000 rows/day. Sweep the whole epoch at the SAME boundary the fold just used.
+        //
+        // Guarded by `expired_epoch` being `Some`, which `expired_evidence` only returns for an
+        // epoch this node has actually summarised — so this can never outrun the fold and remove
+        // evidence for work not yet credited.
+        //
+        // Gated on `owns_evidence` for the same reason the fold's own delete is: a node whose v56
+        // has not applied still shares `shares` with the legacy ledger, and deleting there would
+        // take money the old path would have paid.
+        let mut swept = 0usize;
+        if self.owns_evidence {
+            if let Some(expired) = expired_epoch {
+                swept = self
+                    .db
+                    .shard_reap_evidence_through_epoch(expired, EPOCH_BLOCKS)?;
+            }
+        }
+
         // Only after the transaction has committed does the in-memory table move — a failed
         // fold must leave the counters untouched, or memory and disk drift apart and the next
         // save persists the drift.
@@ -1703,12 +1729,14 @@ impl ShardRuntime {
             screened_out,
             expired_epoch,
             evidence_dropped,
+            swept_expired: swept,
         };
         info!(
             epoch,
             shares = report.shares_folded,
             addresses = report.addresses,
             evidence_dropped,
+            swept_expired = report.swept_expired,
             "share shard: epoch folded"
         );
         Ok(FoldOutcome::Folded(report))

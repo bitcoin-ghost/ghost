@@ -680,6 +680,72 @@ impl Database {
     /// v56: reads the LIVE `shares`, and that is the whole design. The fold's input is one
     /// epoch of evidence this node received itself; `shares_archive` holds work the genesis
     /// column already accrued, so folding it again would credit it twice.
+    /// Delete every evidence row whose epoch is at or below `expired_epoch`, regardless of who
+    /// received it (#830).
+    ///
+    /// [`Self::shard_epoch_shares`] — the input to the fold's own delete — filters
+    /// `received_by = <this node>` AND network tier. Everything it excludes was therefore written
+    /// and never reaped by anything:
+    ///
+    ///   * **peers' shares.** `share_handler.rs` persists every gossiped `ShareProof` under the
+    ///     ORIGINATING node's id so this node can serve a GHOST-03 backfill. On an eight-node
+    ///     fleet that is ~7/8 of the table.
+    ///   * **this node's own BELOW-TIER shares.** They are screened out of the fold, so they are
+    ///     never in its delete list either.
+    ///
+    /// Measured on ghost-vm1 before this existed: 60,879 shares arrived in 24h and 7,710 were
+    /// folded — 12.7%, exactly one node's share of eight — for net growth of ~50,000 rows/day and
+    /// a table 1.19M rows against a design bound of roughly 1,900.
+    ///
+    /// ⚠ This CANNOT take money. The payable claim is `shard_counters.accrued`, not a row here,
+    /// and [`Self::shard_fold_epoch`] moves it across inside one `BEGIN IMMEDIATE` transaction.
+    /// A peer's row was never credited by this node in the first place — each node folds only its
+    /// own column and the shard is the sum — so dropping it changes no balance anywhere.
+    ///
+    /// ⚠ What it DOES give up is GHOST-03 backfill beyond the retention window: a peer that lost
+    /// data can no longer be served evidence older than `RETENTION_EPOCHS` from here. That is the
+    /// design's intent (peers verify by SAMPLING inside the window against a signed `share_root`,
+    /// not by hoarding each other's history), and the boundary is the same one the fold already
+    /// uses, so nothing a peer could legitimately still ask for is removed.
+    ///
+    /// Keyed to BLOCK HEIGHT through `rounds`, never wall-clock — §12 of `SHARE_SHARD.md` requires
+    /// epochs be derivable from the chain, so both sides of an audit compute the same boundary.
+    ///
+    /// The caller must only pass an epoch it has actually summarised; see
+    /// `ShardRuntime::expired_evidence`, which refuses to expire an epoch this node never folded.
+    pub fn shard_reap_evidence_through_epoch(
+        &self,
+        expired_epoch: u64,
+        epoch_blocks: std::num::NonZeroU64,
+    ) -> GhostResult<usize> {
+        // Bounded at BOTH ends — this sweeps exactly `expired_epoch`, never everything below it.
+        //
+        // ⚠ An earlier version deleted every row `block_height <= hi`, and the existing test
+        // `evidence_past_retention_is_dropped_and_evidence_inside_it_is_kept` caught what that
+        // costs: it also swept up OLDER epochs this node never summarised. Evidence for an
+        // un-summarised epoch was never folded, so its work was never credited to
+        // `shard_counters` — deleting it destroys a miner's claim. The caller's guard proves only
+        // that THIS epoch was summarised; it says nothing about the ones before it.
+        //
+        // Sweeping one epoch per expiry is also sufficient: the fold walks epochs in order and
+        // expires them one at a time, so every epoch gets its sweep as it ages out. Rows already
+        // stranded below the window are a separate one-off backfill, deliberately not done here.
+        let lo = expired_epoch.saturating_mul(epoch_blocks.get());
+        let hi = lo.saturating_add(epoch_blocks.get() - 1);
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM shares
+                 WHERE round_id IN (
+                     SELECT round_id FROM rounds
+                     WHERE block_height >= ?1 AND block_height <= ?2
+                 )",
+                params![lo as i64, hi as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     pub fn shard_epoch_shares(
         &self,
         epoch: u64,
@@ -12990,6 +13056,14 @@ mod tests {
     }
 
     /// Which share hashes an epoch query returned, as their leading bytes.
+    fn count_all_shares(db: &Database) -> i64 {
+        db.with_connection(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("count")
+    }
+
     fn returned_bytes(input: &crate::queries::ShardFoldInput) -> Vec<u8> {
         let mut v: Vec<u8> = input.shares.iter().map(|s| s.share_hash[0]).collect();
         v.sort_unstable();
@@ -13038,6 +13112,139 @@ mod tests {
             "sub-tier and pre-gate shares are tallied"
         );
         assert_eq!(input.undecodable, 1, "a damaged blob is counted out loud");
+    }
+
+    /// The reaper must remove what the fold's own delete structurally cannot: peers' rows and
+    /// this node's below-tier rows (#830).
+    ///
+    /// Before this existed, `shard_epoch_shares` filtered `received_by = self` AND network tier,
+    /// and only its output was ever deleted — so on an eight-node fleet ~7/8 of the table had no
+    /// reaper at all and grew ~50,000 rows/day.
+    #[test]
+    fn reaping_an_expired_epoch_removes_foreign_and_below_tier_rows_alike() {
+        let db = Database::in_memory().unwrap();
+        let blocks = std::num::NonZeroU64::new(6).unwrap();
+        let ours = "aabbccdd00112233";
+        let theirs = "ffeeddcc99887766";
+
+        db.create_round(&shard_round(1, 600)).unwrap(); // epoch 100
+        db.create_round(&shard_round(2, 605)).unwrap(); // epoch 100, last height
+        db.create_round(&shard_round(3, 606)).unwrap(); // epoch 101 — must SURVIVE
+
+        for (record, blob) in [
+            shard_share(1, 0xA1, Some(12), ours, true, 1), // ours, network tier
+            shard_share(1, 0xA2, Some(2), ours, true, 2),  // ours, BELOW tier — fold skips it
+            shard_share(2, 0xB1, Some(12), theirs, true, 3), // a peer's — fold never sees it
+            shard_share(3, 0xC1, Some(12), theirs, true, 4), // epoch 101, inside the window
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+        assert_eq!(count_all_shares(&db), 4);
+
+        let reaped = db.shard_reap_evidence_through_epoch(100, blocks).unwrap();
+        assert_eq!(
+            reaped, 3,
+            "every row at or below epoch 100 goes, whoever received it"
+        );
+
+        // The control that matters: it stopped at the boundary rather than emptying the table.
+        assert_eq!(
+            count_all_shares(&db),
+            1,
+            "epoch 101 is inside the retention window and must survive"
+        );
+    }
+
+    /// ⛔ Rows BELOW the expired epoch must survive — they may never have been summarised.
+    ///
+    /// This is the money-safety property. Evidence for an epoch this node never folded was never
+    /// credited to `shard_counters`, so deleting it destroys the miner's claim to that work with
+    /// no record anywhere. The caller's guard proves the epoch being expired was summarised; it
+    /// proves nothing about older ones, which is why the sweep is bounded at BOTH ends.
+    ///
+    /// The first version of this reaper deleted every row `block_height <= hi` and was caught by
+    /// `evidence_past_retention_is_dropped_and_evidence_inside_it_is_kept` in ghost-pool. Pinned
+    /// here as well, at the layer where the mistake actually lives.
+    #[test]
+    fn reaping_never_reaches_below_the_expired_epoch() {
+        let db = Database::in_memory().unwrap();
+        let blocks = std::num::NonZeroU64::new(6).unwrap();
+        let ours = "aabbccdd00112233";
+
+        db.create_round(&shard_round(1, 480)).unwrap(); // epoch 80  — OLD, never summarised
+        db.create_round(&shard_round(2, 594)).unwrap(); // epoch 99  — one below the expiry
+        db.create_round(&shard_round(3, 600)).unwrap(); // epoch 100 — the one expiring
+        db.create_round(&shard_round(4, 606)).unwrap(); // epoch 101 — inside the window
+
+        for (record, blob) in [
+            shard_share(1, 0xF0, Some(12), ours, true, 1),
+            shard_share(2, 0xF1, Some(12), ours, true, 2),
+            shard_share(3, 0xF2, Some(12), ours, true, 3),
+            shard_share(4, 0xF3, Some(12), ours, true, 4),
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+
+        let reaped = db.shard_reap_evidence_through_epoch(100, blocks).unwrap();
+        assert_eq!(reaped, 1, "exactly the expired epoch, not a range below it");
+        assert_eq!(
+            count_all_shares(&db),
+            3,
+            "epochs 80 and 99 were never summarised — their work may be uncredited and must stay"
+        );
+    }
+
+    /// The boundary is keyed to BLOCK HEIGHT through `rounds`, never to the row's clock.
+    ///
+    /// §12 of `SHARE_SHARD.md` requires epoch boundaries be derivable from the chain, so both
+    /// sides of an audit compute the same one. A timestamp-keyed reaper would delete a different
+    /// set on every node.
+    #[test]
+    fn reaping_is_keyed_to_round_height_not_timestamp() {
+        let db = Database::in_memory().unwrap();
+        let blocks = std::num::NonZeroU64::new(6).unwrap();
+        let ours = "aabbccdd00112233";
+
+        db.create_round(&shard_round(1, 599)).unwrap(); // epoch 99  — expired
+        db.create_round(&shard_round(2, 606)).unwrap(); // epoch 101 — current
+
+        for (record, blob) in [
+            // Clocks deliberately contradict the heights, in both directions.
+            shard_share(1, 0xD1, Some(12), ours, true, 999_999),
+            shard_share(2, 0xD2, Some(12), ours, true, 1),
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+
+        let reaped = db.shard_reap_evidence_through_epoch(99, blocks).unwrap();
+        assert_eq!(
+            reaped, 1,
+            "the epoch-99 row goes despite the newest timestamp"
+        );
+        assert_eq!(
+            count_all_shares(&db),
+            1,
+            "the epoch-101 row stays despite the oldest timestamp"
+        );
+    }
+
+    /// Reaping an epoch with nothing in range must be a no-op, not a wipe.
+    ///
+    /// `saturating_*` arithmetic on the bound means a mistake here fails toward deleting MORE,
+    /// so the empty case is worth pinning explicitly.
+    #[test]
+    fn reaping_an_epoch_with_no_rows_deletes_nothing() {
+        let db = Database::in_memory().unwrap();
+        let blocks = std::num::NonZeroU64::new(6).unwrap();
+        let ours = "aabbccdd00112233";
+
+        db.create_round(&shard_round(1, 606)).unwrap(); // epoch 101
+        let (record, blob) = shard_share(1, 0xE1, Some(12), ours, true, 1);
+        db.insert_share_with_proof(&record, &blob).unwrap();
+
+        let reaped = db.shard_reap_evidence_through_epoch(50, blocks).unwrap();
+        assert_eq!(reaped, 0);
+        assert_eq!(count_all_shares(&db), 1);
     }
 
     /// The share→epoch binding is the round's recorded HEIGHT, never the share's timestamp
