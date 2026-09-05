@@ -75,6 +75,7 @@ pub use ownership::{ownership_challenge, OWNERSHIP_CHALLENGE_TAG};
 
 pub mod remix;
 
+pub mod attestation;
 pub mod epoch;
 pub mod ladder;
 pub mod service;
