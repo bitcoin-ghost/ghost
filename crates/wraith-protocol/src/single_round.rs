@@ -303,10 +303,19 @@ impl LiteRoundBuilder {
             ));
         }
 
-        // Inputs: one TxIn per participant, in registration order.
-        // Bitcoin doesn't care about input ordering for privacy because
-        // the inputs are observable on chain and in the mempool already.
-        // Output ordering is what matters.
+        // Inputs: one TxIn per participant, then SHUFFLED.
+        //
+        // The inputs themselves are observable on chain — but their *order*
+        // is not. Order is a coordinator choice, and registration order
+        // encodes arrival sequence into the transaction, which the chain
+        // would not otherwise reveal. Anyone who watched registrations (or
+        // who correlates submission timing) could then map position back to
+        // participant. Free to remove, so remove it.
+        //
+        // The permutation is derived from a DIFFERENT domain tag than the
+        // output shuffle. Reusing one seed for both would make input index i
+        // and output index i correlated, handing back the very mapping the
+        // output shuffle exists to destroy.
         let mut tx_inputs: Vec<TxIn> = Vec::with_capacity(self.participants.len());
         for p in &self.participants {
             tx_inputs.push(TxIn {
@@ -322,6 +331,8 @@ impl LiteRoundBuilder {
                 witness: Witness::new(),
             });
         }
+
+        shuffle_with_chacha(&mut tx_inputs, self.input_shuffle_seed(entropy));
 
         // Build the *outputs* in canonical order, then shuffle. We tag each
         // output with provenance so we can shuffle (kind, idx, address, sats)
@@ -428,6 +439,19 @@ impl LiteRoundBuilder {
     /// Same construction used by the legacy executor — keeps the privacy
     /// argument (output ordering is unpredictable per session, even to
     /// participants) consistent across versions.
+    /// Seed for the input permutation.
+    ///
+    /// Domain-separated from [`Self::shuffle_seed`] on purpose: a shared seed
+    /// would correlate input and output positions and undo the output shuffle.
+    fn input_shuffle_seed(&self, entropy: &[u8; 32]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"WraithLite/v1/input_shuffle");
+        h.update(self.session_id.as_bytes());
+        h.update(entropy);
+        h.finalize().into()
+    }
+
     fn shuffle_seed(&self, entropy: &[u8; 32]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -929,6 +953,67 @@ mod tests {
         let mining = total_in - total_out;
         assert_eq!(round.mining_fee_sats, mining);
         assert!(mining >= b.estimate_mining_fee_sats());
+    }
+
+    /// Registration order must not survive into the transaction. Nothing
+    /// asserted this before, which is why the leak lived so long: the inputs
+    /// are observable on chain, but their *order* was a coordinator choice
+    /// that encoded arrival sequence.
+    #[test]
+    fn inputs_do_not_appear_in_registration_order() {
+        let addrs = test_addrs();
+        let mut b = mix_builder_with_addrs(&addrs);
+        // Distinguishable txids so position is identifiable.
+        for (i, addr) in addrs.iter().enumerate().take(5) {
+            b.add_participant(fake_input(i as u32, exact_input_sats(), addr))
+                .unwrap();
+        }
+        let registered: Vec<OutPoint> = (0..5u32)
+            .map(|i| {
+                let p = fake_input(i, exact_input_sats(), &addrs[i as usize]);
+                OutPoint {
+                    txid: p.txid,
+                    vout: p.vout,
+                }
+            })
+            .collect();
+
+        let round = b.build_with_entropy(&[0x5A; 32]).unwrap();
+        let in_tx: Vec<OutPoint> = round.tx.input.iter().map(|i| i.previous_output).collect();
+
+        assert_ne!(
+            in_tx, registered,
+            "input order still leaks arrival sequence"
+        );
+
+        // Same coins, only reordered — nothing added, dropped or duplicated.
+        let mut a = in_tx.clone();
+        let mut b2 = registered.clone();
+        a.sort_unstable();
+        b2.sort_unstable();
+        assert_eq!(
+            a, b2,
+            "the shuffle must permute, never alter, the input set"
+        );
+    }
+
+    /// If input and output permutations shared a seed, index i on each side
+    /// would correlate and hand back the mapping the output shuffle exists to
+    /// destroy. Domain separation is what prevents that.
+    #[test]
+    fn input_and_output_permutations_are_independent() {
+        let addrs = test_addrs();
+        let mut b = mix_builder_with_addrs(&addrs);
+        for (i, addr) in addrs.iter().enumerate().take(5) {
+            b.add_participant(fake_input(i as u32, exact_input_sats(), addr))
+                .unwrap();
+        }
+        let entropy = [0x5A; 32];
+        assert_ne!(
+            b.input_shuffle_seed(&entropy),
+            b.shuffle_seed(&entropy),
+            "input and output shuffles must not share a seed"
+        );
     }
 
     #[test]

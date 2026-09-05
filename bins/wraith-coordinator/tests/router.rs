@@ -2397,6 +2397,58 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
         assert_eq!(p["amount_sats"].as_u64().unwrap(), 100_000);
     }
 
+    // No participant attribution may appear anywhere in the response. The
+    // endpoint is unauthenticated, and combined with prevouts this would be
+    // the complete input-to-output mapping the output shuffle exists to
+    // destroy.
+    let raw = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        !raw.contains("participant_id"),
+        "round-tx leaks participant attribution: {raw}"
+    );
+
+    // prevouts[i] MUST describe tx.input[i]. Inputs are shuffled, so a
+    // positional lookup into the registration-ordered store would pair each
+    // input with someone else's scriptPubKey and amount. BIP-341 commits to
+    // every prevout, so that surfaces as an opaque signature failure rather
+    // than as a lookup error — assert the alignment directly.
+    use bitcoin::consensus::encode::deserialize;
+    let tx_bytes = hex::decode(json["unsigned_tx_hex"].as_str().unwrap()).unwrap();
+    let tx: bitcoin::Transaction = deserialize(&tx_bytes).unwrap();
+    let prevouts = json["prevouts"].as_array().expect("array");
+    assert_eq!(prevouts.len(), tx.input.len(), "one prevout per input");
+
+    let registered: std::collections::HashMap<(String, u32), u64> = state
+        .inputs_store
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|i| {
+            (
+                (i.input.txid.trim().to_ascii_lowercase(), i.input.vout),
+                i.input.value_sats,
+            )
+        })
+        .collect();
+
+    for (i, txin) in tx.input.iter().enumerate() {
+        let key = (
+            txin.previous_output.txid.to_string().to_ascii_lowercase(),
+            txin.previous_output.vout,
+        );
+        let expected = registered
+            .get(&key)
+            .expect("input is a registered outpoint");
+        assert_eq!(
+            prevouts[i]["value_sats"].as_u64().unwrap(),
+            *expected,
+            "prevouts[{i}] does not describe tx.input[{i}] — sighashes would be wrong"
+        );
+    }
+
     // The session is still in Signing — assembly didn't advance it.
     let snapshot = state.sessions.get(&session_id).expect("present");
     assert!(matches!(

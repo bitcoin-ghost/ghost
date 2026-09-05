@@ -27,6 +27,7 @@
 //! test. Do not add a field that identifies whose output an output is, however
 //! useful it looks for debugging.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -39,6 +40,7 @@ use serde::Serialize;
 
 use wraith_protocol::{LiteOutputKind, LiteSessionState};
 
+use crate::inputs::TxInputRef;
 use crate::state::CoordinatorState;
 
 #[derive(Debug, Serialize)]
@@ -147,11 +149,17 @@ pub async fn get(
         })
         .collect();
 
-    // Walk inputs_store in tx-input order to build the prevouts
-    // wire array. The assembly path adds participants in
-    // arrival/registration order and the LiteRoundBuilder preserves
-    // that order for inputs (only outputs get shuffled), so
-    // inputs_store[i] aligns with assembled.tx.input[i].
+    // Build prevouts by looking each input up by OUTPOINT, walking the
+    // transaction's own input order.
+    //
+    // This used to index `inputs_store` positionally, on the assumption that
+    // registration order survived into the transaction. Inputs are now
+    // shuffled — arrival order was leaking the registration sequence — so a
+    // positional lookup would silently pair each input with another
+    // participant's scriptPubKey and amount. BIP-341 commits to every input's
+    // prevout, so that produces sighashes nobody's signature validates
+    // against, and it fails as an opaque signature error rather than as a
+    // lookup error.
     let inputs_snapshot = state
         .inputs_store
         .lock()
@@ -159,12 +167,37 @@ pub async fn get(
         .get(&session_id)
         .cloned()
         .unwrap_or_default();
-    let mut prevouts = Vec::with_capacity(inputs_snapshot.len());
+
+    let mut by_outpoint: HashMap<(String, u32), &TxInputRef> = HashMap::new();
     for inp in &inputs_snapshot {
-        prevouts.push(PrevOutWire {
-            scriptpubkey_hex: inp.input.scriptpubkey_hex.clone(),
-            value_sats: inp.input.value_sats,
-        });
+        by_outpoint.insert(
+            (inp.input.txid.trim().to_ascii_lowercase(), inp.input.vout),
+            &inp.input,
+        );
+    }
+
+    let mut prevouts = Vec::with_capacity(assembled.round.tx.input.len());
+    for txin in &assembled.round.tx.input {
+        let key = (
+            txin.previous_output.txid.to_string().to_ascii_lowercase(),
+            txin.previous_output.vout,
+        );
+        match by_outpoint.get(&key) {
+            Some(found) => prevouts.push(PrevOutWire {
+                scriptpubkey_hex: found.scriptpubkey_hex.clone(),
+                value_sats: found.value_sats,
+            }),
+            None => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "prevout_missing",
+                    format!(
+                        "assembled tx spends {}:{} which is not in the inputs store",
+                        key.0, key.1
+                    ),
+                );
+            }
+        }
     }
 
     let body = ResponseBody {
