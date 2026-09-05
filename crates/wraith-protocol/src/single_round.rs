@@ -1016,6 +1016,91 @@ mod tests {
         );
     }
 
+    /// The adversarial harness, run against a real round from this builder.
+    ///
+    /// Everything else in `privacy.rs` probes synthetic transactions. This is
+    /// the one that would actually fail if the production path regressed —
+    /// markers, non-uniform outputs, the lot.
+    #[test]
+    fn a_real_round_survives_the_privacy_probes() {
+        use crate::privacy::{probe_round, RoundShape};
+
+        let addrs = test_addrs();
+        let round = happy_mix_round(&addrs, &[0x11; 32]);
+        let shape = RoundShape {
+            denomination_sats: LiteTier::Denom100kSats.denomination_sats(),
+            fee_share_sats: LiteTier::Denom100kSats.service_fee_sats(),
+        };
+        let violations = probe_round(&round.tx, Some(shape));
+        assert!(
+            violations.is_empty(),
+            "the production round builder produces a deanonymisable round: {violations:?}"
+        );
+    }
+
+    /// Many rounds, priced from varying fee rates, must share no constant value.
+    #[test]
+    fn real_rounds_carry_no_greppable_constant() {
+        use crate::privacy::probe_value_constancy;
+
+        let addrs = test_addrs();
+        let rounds: Vec<_> = (0..6u8)
+            .map(|i| {
+                let mut b = mix_builder_with_addrs(&addrs);
+                b.fee_rate_sats_per_vb = 3 + u64::from(i) * 5;
+                for (j, addr) in addrs.iter().enumerate().take(5) {
+                    let need = b.min_participant_input();
+                    b.add_participant(fake_input(j as u32, need, addr)).unwrap();
+                }
+                b.build_with_entropy(&[i; 32]).unwrap().tx
+            })
+            .collect();
+
+        let violations = probe_value_constancy(&rounds);
+
+        // The mixed denomination is legitimately constant — that IS the
+        // anonymity set, and outputs must collide.
+        let denom = LiteTier::Denom100kSats.denomination_sats();
+
+        // ⚠ KNOWN VIOLATION, pinned here so it stays visible and cannot
+        // silently worsen. `service_fee_sats()` is a pure function of tier, so
+        // the fee output is always `fee * n` — a greppable constant that
+        // identifies every Mix round of a given size. Same class as the pinned
+        // seat price, one layer over: that fix addressed the INPUT side only.
+        //
+        // Fixing it needs a design decision, not a patch. The candidates:
+        //   1. derive the fee from the live fee rate, as the seat price now is
+        //   2. pay the fee in ladder rungs, indistinguishable from mixed outputs
+        //   3. take the fee as a spread and emit no fee output at all
+        // (3) is what the provider model already does and leaves nothing to grep.
+        let known_fee_constant = LiteTier::Denom100kSats.service_fee_sats() * 5;
+
+        let unexpected: Vec<_> = violations
+            .iter()
+            .filter(|v| {
+                !matches!(
+                    v,
+                    crate::privacy::Violation::ConstantValueAcrossRounds { value, .. }
+                        if *value == denom || *value == known_fee_constant
+                )
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "a NEW non-denomination constant appeared across rounds: {unexpected:?}"
+        );
+
+        // And assert the known one is still exactly what we think it is, so
+        // this pin cannot quietly grow to cover something else.
+        assert!(
+            violations.contains(&crate::privacy::Violation::ConstantValueAcrossRounds {
+                value: known_fee_constant,
+                rounds: 6,
+            }),
+            "the service-fee constant changed shape; re-examine rather than widen the pin"
+        );
+    }
+
     #[test]
     fn txid_is_stable_for_same_construction() {
         let addrs = test_addrs();
