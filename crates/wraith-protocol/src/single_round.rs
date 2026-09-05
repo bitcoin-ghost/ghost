@@ -940,49 +940,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod seat_price {
-    use super::*;
-
-    /// The exact input a seat costs, pinned per tier and round type.
-    ///
-    /// Rounds have no change output (#698), so this is the single value a
-    /// participant must bring — a wallet computes it, splits its coin to
-    /// match, and the coordinator refuses anything else. Pinning it means a
-    /// change to the fee maths has to be deliberate, and gives the
-    /// coordinator's fixtures a derived number instead of a guessed one.
-    #[test]
-    fn seat_prices_are_pinned() {
-        let price = |tier: LiteTier, st: SessionType| {
-            tier.denomination_sats()
-                + per_participant_mining_share(tier, st, DEFAULT_FEE_RATE_SATS_PER_VB)
-                + match st {
-                    SessionType::Mix => tier.service_fee_sats(),
-                    SessionType::Jump => 0,
-                }
-        };
-
-        assert_eq!(price(LiteTier::Denom100kSats, SessionType::Mix), 102_096);
-        assert_eq!(price(LiteTier::Denom100kSats, SessionType::Jump), 101_010);
-        assert_eq!(price(LiteTier::Denom1mSats, SessionType::Mix), 1_003_596);
-        assert_eq!(price(LiteTier::Denom10mSats, SessionType::Mix), 10_026_096);
-        assert_eq!(
-            price(LiteTier::Denom100mSats, SessionType::Mix),
-            100_251_096
-        );
-
-        // A Jump seat is cheaper than a Mix seat by the service fee itself
-        // plus each participant's share of the mining cost of the fee
-        // output that Jump rounds do not build.
-        let fee_output_share = (VBYTES_PER_OUTPUT as u64 * DEFAULT_FEE_RATE_SATS_PER_VB)
-            .div_ceil(LiteTier::Denom100kSats.min_participants() as u64);
-        for tier in LiteTier::all() {
-            let tier = *tier;
-            assert_eq!(
-                price(tier, SessionType::Mix) - price(tier, SessionType::Jump),
-                tier.service_fee_sats() + fee_output_share,
-                "tier {tier}: the gap is the service fee plus its output's mining cost"
-            );
-        }
-    }
-}
+// The seat price now lives in `crate::seat_price` — one calculation, taking a
+// live fee rate rather than a pinned constant. The old `seat_prices_are_pinned`
+// test asserted the very thing that made every seat greppable on chain; its
+// replacement, `the_price_is_not_a_constant`, fails if anyone re-pins it.

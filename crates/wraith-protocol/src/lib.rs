@@ -78,6 +78,7 @@ pub mod remix;
 pub mod attestation;
 pub mod epoch;
 pub mod ladder;
+pub mod seat_price;
 pub mod service;
 pub mod sortition;
 pub use epoch::{
