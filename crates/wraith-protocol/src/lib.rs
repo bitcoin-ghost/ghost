@@ -89,6 +89,7 @@ pub mod privacy;
 pub mod privacy_level;
 pub mod seat_price;
 pub mod service;
+pub mod signature_scope;
 pub mod signing_ledger;
 pub mod sortition;
 pub mod standing_order;
