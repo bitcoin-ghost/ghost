@@ -20,6 +20,7 @@ pub mod inputs;
 pub mod no_sign_sweep;
 pub mod outputs;
 pub mod rpc;
+pub mod set_report;
 pub mod state;
 pub mod tick;
 pub mod utxo_source;

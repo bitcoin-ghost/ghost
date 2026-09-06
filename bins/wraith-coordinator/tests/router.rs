@@ -3298,3 +3298,47 @@ async fn a_client_that_sends_no_role_is_treated_as_a_payer() {
         assert_eq!(r.status(), StatusCode::OK, "no-role client {i} must join");
     }
 }
+
+#[tokio::test]
+async fn session_status_reports_entities_not_seats() {
+    // The number a wallet compares its own arithmetic against. Seats and
+    // entities must both be present: the gap between them is what shows a
+    // round was padded, and either number alone hides it.
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "alice" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sid = json["session"]["session_id"].as_str().unwrap().to_string();
+
+    let r = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = to_bytes(r.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let a = &json["anonymity"];
+    assert!(a.is_object(), "anonymity must be served: {json}");
+    for field in ["seats", "entities", "discounted", "unverified", "payers"] {
+        assert!(a[field].is_number(), "missing {field}: {a}");
+    }
+    // Nobody has registered inputs yet, so there is nothing to count. An empty
+    // round must report zero rather than an optimistic default.
+    assert_eq!(a["entities"], 0, "an empty round is not a private one");
+    assert_eq!(a["seats"], 0);
+}

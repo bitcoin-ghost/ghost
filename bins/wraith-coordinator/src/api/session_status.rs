@@ -34,6 +34,32 @@ struct ErrorBody {
 #[derive(Serialize)]
 pub struct ResponseBody {
     pub session: SessionDescriptor,
+    /// The round's anonymity figure, counted in **entities**.
+    ///
+    /// Served so a wallet has something to check its own arithmetic against,
+    /// never so it can skip doing that arithmetic. Every input is public chain
+    /// data, so the two computations should agree exactly — a coordinator that
+    /// lies here disagrees with the wallet, which is a far louder failure than
+    /// serving nothing.
+    pub anonymity: AnonymityBody,
+}
+
+/// Wire form of `SetReport`. Flattened deliberately: a wallet comparing figures
+/// should not have to guess which field is the one that matters.
+#[derive(Debug, Serialize)]
+pub struct AnonymityBody {
+    /// Seats in the round — what a naive mixer would report as the set.
+    pub seats: usize,
+    /// **This is the anonymity set.** Distinct entities behind those seats.
+    pub entities: usize,
+    /// Seats that collapsed into another entity.
+    pub discounted: usize,
+    /// Entities whose distinctness rests on no linkage being found, rather than
+    /// on evidence of independence.
+    pub unverified: usize,
+    /// Real payers among the entities — cover that behaves like the user,
+    /// because it is doing the same thing the user is doing.
+    pub payers: usize,
 }
 
 pub async fn get(
@@ -48,10 +74,19 @@ pub async fn get(
     match state.sessions.get(&session_id) {
         Some(session) => {
             let descriptor = SessionDescriptor::from_session(&session);
+            let report = crate::set_report::session_set_report(&state, &session_id)
+                .unwrap_or_else(|| wraith_protocol::anonymity_set::assess(&[]));
             (
                 StatusCode::OK,
                 Json(ResponseBody {
                     session: descriptor,
+                    anonymity: AnonymityBody {
+                        seats: report.seats,
+                        entities: report.entities,
+                        discounted: report.discounted(),
+                        unverified: report.unverified,
+                        payers: report.payers,
+                    },
                 }),
             )
                 .into_response()
