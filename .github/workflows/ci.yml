@@ -154,10 +154,11 @@ jobs:
   #   ghost-mpc / mpc-xproc-harness  -> `mpc-tests` job; they need a per-package feature that a
   #                                    workspace-wide `--tests` cannot set
   #   integration_tests_sv2          -> 18 targets that spin up real SRI pool / template-provider
-  #                                    processes (58 `start_pool` call sites, only one
-  #                                    `#[ignore]`d). They need external services and a per-test
-  #                                    budget this job does not have, and have never run in CI.
-  #                                    Triaging them is separate work, tracked on #580.
+  #                                    processes (58 `start_pool` call sites; 4 of the 65 tests
+  #                                    are `#[ignore]`d, not 1 — two whole targets are entirely
+  #                                    ignored). They need external services and a per-test budget
+  #                                    this job does not have. The green subset now runs in a
+  #                                    dedicated step below; the rest stays on #617.
   integration-tests:
     name: Integration tests
     runs-on: ubuntu-latest
@@ -228,9 +229,14 @@ jobs:
         run: .github/scripts/regtest-node.sh stop
       # COMPILE the 18 sv2 integration targets without running them (#580).
       #
-      # They cannot be run here: 191 `start_pool`/`start_template_provider`/`start_sniffer` call sites
-      # spin up real SRI processes, and only one of the 18 is `#[ignore]`d. Un-excluding them would make
-      # main red and flaky, which is worse than not running them.
+      # They cannot ALL be run here: 191 `start_pool`/`start_template_provider`/`start_sniffer` call
+      # sites spin up real SRI processes. Un-excluding the lot would make main red and flaky, which is
+      # worse than not running them — 9 of the 18 currently fail and 2 more exceed 420s. The five that
+      # are genuinely green run in the step after this one.
+      #
+      # ⚠ 4 of the 65 tests are `#[ignore]`d, not 1 as this comment previously claimed, and two
+      # targets (`bitcoin_core_ipc_integration`, `jds_block_propagation`) are ignored ENTIRELY — they
+      # report `ok` having executed nothing.
       #
       # But COMPILING them is cheap — measured at 3m11s with no external services — and it catches the
       # rot that actually bit: `tests/integration` stopped compiling when f1c14cdb9 added a field to
@@ -242,6 +248,48 @@ jobs:
       # infrastructure for the SRI processes and stays tracked on #580.
       - name: Compile SV2 integration targets (no run)
         run: cargo test -p integration_tests_sv2 --no-run
+      # RUN the subset that is actually green (#617).
+      #
+      # The compile gate above is not the whole story: it proves the targets build, not that the
+      # SV2 path works. Triaged all 18 target-by-target on 2026-09-06, serially, with a 420s
+      # per-target budget and nothing else building:
+      #
+      #   PASS, real assertions   pool_solo_mining (8 tests, 198s), template_provider_integration
+      #                           (3, 11s), sniffer_integration (2, 9s), sv2_mining_device (1, 11s),
+      #                           mining_device_fast_hasher_equivalence (1, 0.01s)
+      #   PASS, but VACUOUS       bitcoin_core_ipc_integration (3/3 `#[ignore]`d),
+      #                           jds_block_propagation (1/1) — these report green having executed
+      #                           nothing, so they are NOT listed below; a green that cannot fail
+      #                           is worse than no green at all
+      #   FAIL                    extensions, jd_integration (8 pass/3 fail), jd_tproxy_integration,
+      #                           jd_provide_missing_transaction, jdc_block_propagation,
+      #                           jdc_receives_submit_shares_success, monitoring_integration (1/3),
+      #                           pool_integration (7 pass/2 fail), sv1 (1/1)
+      #   TIMEOUT >420s           jdc_cached_shares, translator_integration
+      #
+      # Nearly every failure is one shape: a sniffer `wait_for_message` timeout on a specific SV2
+      # message (`OpenExtendedMiningChannel`, `DeclareMiningJob`, `SubmitSolution`,
+      # `SubmitSharesSuccess`). Whether those are live defects or stale fixtures is the remaining
+      # triage and stays on #617.
+      #
+      # ⚠ The five below are listed EXPLICITLY rather than by exclusion. An exclusion list silently
+      # adopts every new target as blocking the moment someone adds one, which is how a job people
+      # trust becomes a job people disable.
+      #
+      # ⚠ `--test-threads=1`. These bind real ports and spawn real processes; running them
+      # concurrently is how the port-reservation work in #408/#612 got exercised the hard way.
+      - name: Run the green SV2 integration targets
+        timeout-minutes: 15
+        run: |
+          for t in pool_solo_mining \
+                   template_provider_integration \
+                   sniffer_integration \
+                   sv2_mining_device \
+                   mining_device_fast_hasher_equivalence; do
+            echo "::group::$t"
+            cargo test -p integration_tests_sv2 --test "$t" -- --test-threads=1
+            echo "::endgroup::"
+          done
 
   # MPC integration harnesses.
   #
