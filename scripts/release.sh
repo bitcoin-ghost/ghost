@@ -454,13 +454,28 @@ roll_ghostd() {
     # Verify it is SERVING, not merely started. A ghostd restart drops its RPC, so ghost-pool
     # may restart itself and read `activating` for a few seconds — that is normal, and is why
     # this waits on the RPC answering rather than on unit state.
+    #
+    # ⚠ `ghost-cli` with no flags does NOT work on every node, and the failure looks identical
+    # to a dead ghostd. The daemon runs with `-conf=/etc/bitcoin/bitcoin.conf
+    # -datadir=/var/lib/bitcoin`, so a bare `ghost-cli` as the ssh user (root on the canaries)
+    # looks in `/root/.bitcoin/` and reports "Could not locate RPC credentials". Taking that as
+    # "not serving" would abort the roll on a false negative. Derive the flags from the unit
+    # itself rather than assuming a default datadir.
+    local cli
+    cli=$(ssh -o ConnectTimeout=10 "$node" '
+        E=$(systemctl cat ghostd 2>/dev/null | grep -m1 "^ExecStart=")
+        C=$(printf "%s" "$E" | grep -oE "\-conf=[^ ]+" | head -1)
+        D=$(printf "%s" "$E" | grep -oE "\-datadir=[^ ]+" | head -1)
+        printf "sudo -u ghost /opt/ghost/bin/ghost-cli %s %s" "$C" "$D"' 2>/dev/null)
+    [ -n "$cli" ] || { echo "    could not derive a ghost-cli invocation" >&2; return 1; }
+
     local i
     for i in $(seq 1 60); do
         if ssh -o ConnectTimeout=10 "$node" \
-             "/opt/ghost/bin/ghost-cli getblockchaininfo >/dev/null 2>&1" 2>/dev/null; then
+             "$cli getblockchaininfo >/dev/null 2>&1" 2>/dev/null; then
             local v blocks
             v=$(ssh -o ConnectTimeout=10 "$node" "/opt/ghost/bin/ghostd --version 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1" 2>/dev/null)
-            blocks=$(ssh -o ConnectTimeout=10 "$node" "/opt/ghost/bin/ghost-cli getblockcount 2>/dev/null" 2>/dev/null)
+            blocks=$(ssh -o ConnectTimeout=10 "$node" "$cli getblockcount 2>/dev/null" 2>/dev/null)
             info "$node ghostd $v serving, height $blocks"
             [ "$v" = "v$VERSION" ] || { echo "    node reports $v after swap" >&2; return 1; }
             return 0
