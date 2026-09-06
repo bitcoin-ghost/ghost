@@ -248,6 +248,7 @@ mod tests {
     /// Build the exact wire shape `/health?nonce=…` returns.
     fn health_body(identity: &NodeIdentity, nonce: Option<&str>, signed_flag: bool) -> String {
         let payload = HealthResponse {
+            db_connection: None,
             mesh_validation: None,
             convergence_channels: None,
             healthy: true,

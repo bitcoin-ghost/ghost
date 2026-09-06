@@ -2288,7 +2288,34 @@ fn shard_coinbase_owed(
     Some(rt.owed_snapshot())
 }
 
-#[tokio::main]
+// Eight worker threads, not the default.
+//
+// `#[tokio::main]` with no argument sets `worker_threads = num_cpus`, and every node in this
+// fleet has **2 CPUs**. That number is not a throughput knob here, it is the number of
+// concurrent blocking database calls it takes to stall the entire runtime.
+//
+// `Database::with_connection` takes a `parking_lot::Mutex` around the single SQLite connection
+// and holds it for the whole closure (#537). `parking_lot` does not yield: a task waiting on it
+// blocks the OS thread it is running on rather than returning it to the runtime. With 2 workers,
+// **two** concurrent database callers park both, and at that point nothing else is polled — not
+// inbound HTTP, not RPC completions, not timers. That is the shape of the multi-second stalls in
+// #535, on nodes where the individual queries measure 0.03-0.2s.
+//
+// A parked worker consumes no CPU, so extra workers cost stack memory (~2 MB each, so ~12 MB
+// here) and nothing else. They do not add parallelism — there are still 2 cores — but they mean
+// a handful of blocked database calls no longer takes the whole reactor down with them.
+//
+// ⚠ This is a MITIGATION, not the fix, and the distinction matters for anyone reading #537 later:
+//
+//   * it removes the "every worker parked, nothing polled" failure mode;
+//   * it does NOT remove the serialisation. One connection behind one mutex is still a
+//     throughput ceiling, and 278 `with_connection` call sites still run on async workers.
+//
+// The structural fix is to move database work off the runtime (`spawn_blocking`, of which there
+// are currently 9 uses in routes.rs and 8 here, against those 278 call sites). ⛔ It is NOT a
+// read/write connection split: that was built and REVERTED in #571/#579 — see the notes there
+// before re-proposing it.
+#[tokio::main(worker_threads = 8)]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
