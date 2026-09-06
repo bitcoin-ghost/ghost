@@ -61,6 +61,7 @@ use bitcoin::{
 
 use crate::ladder::Ladder;
 use crate::single_round::shuffle_with_chacha;
+use crate::tier::{TX_OVERHEAD_VBYTES, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT};
 
 /// A coin a participant contributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,8 +204,9 @@ impl LadderRoundBuilder {
             .map(|p| p.outputs.len())
             .sum::<usize>()
             + self.coordinator_outputs.len();
-        // Measured on regtest: 100.50 vB per seat = 57.5 in + 43 out.
-        (11 + ins * 58 + outs * 43) as u64
+        // Derived from `tier`, never restated here — see the note on
+        // `privacy_level::VBYTES_PER_SEAT`.
+        (TX_OVERHEAD_VBYTES + ins * VBYTES_PER_INPUT + outs * VBYTES_PER_OUTPUT) as u64
     }
 
     /// The minimum mining fee this round's shape must pay.
@@ -271,7 +273,7 @@ impl LadderRoundBuilder {
         // two thresholds the remainder is genuinely unavoidable — no change can
         // be taken — so the bound must include the cost of the output it is
         // recommending, or it condemns rounds that had no better option.
-        let another_output_costs = 43 * self.fee_rate_sats_per_vb;
+        let another_output_costs = VBYTES_PER_OUTPUT as u64 * self.fee_rate_sats_per_vb;
         let recoverable = self.ladder.floor() + another_output_costs;
         if excess >= recoverable {
             return Err(LadderRoundError::ExcessiveOverpayment {
@@ -606,7 +608,7 @@ mod tests {
     /// produced no output at all, which is a far worse failure than a panic.
     fn absorb_surplus(b: &mut LadderRoundBuilder) {
         let ladder = Ladder::standard();
-        let per_output_fee = 43 * b.fee_rate_sats_per_vb;
+        let per_output_fee = VBYTES_PER_OUTPUT as u64 * b.fee_rate_sats_per_vb;
 
         for _ in 0..64 {
             let total_in: u64 = b

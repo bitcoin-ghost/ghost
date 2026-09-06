@@ -34,6 +34,13 @@ pub const VBYTES_PER_INPUT: usize = 58; // Rounded up from 57.5
 /// vbytes per P2TR output
 pub const VBYTES_PER_OUTPUT: usize = 43;
 
+/// Fixed transaction overhead: version, locktime, segwit marker, and the
+/// input/output count varints below 253.
+///
+/// Published so no caller re-derives it. Four independent copies of this
+/// arithmetic existed before it was; see `privacy_level::VBYTES_PER_SEAT`.
+pub const TX_OVERHEAD_VBYTES: usize = 11;
+
 /// Maximum transaction size budget in vbytes — 10% margin under Bitcoin's
 /// 100KB standardness limit.
 #[allow(dead_code)]

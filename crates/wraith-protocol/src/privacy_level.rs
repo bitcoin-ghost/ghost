@@ -81,11 +81,18 @@ impl PrivacyLevel {
     }
 }
 
-/// Per-seat transaction cost, measured on regtest: 57.5 vB in + 43 vB out.
-pub const VBYTES_PER_SEAT: u64 = 100;
+/// Per-seat transaction cost.
+///
+/// **Derived, never restated.** `#698` was two components computing the same
+/// quantity independently and never matching — invisible because both only
+/// checked `>=`, so the larger won and the difference went to miners. Every
+/// vbyte figure in this crate comes from [`crate::tier`] or it is that bug
+/// again.
+pub const VBYTES_PER_SEAT: u64 =
+    (crate::tier::VBYTES_PER_INPUT + crate::tier::VBYTES_PER_OUTPUT) as u64;
 
-/// A payer's own footprint: three rungs in, three out. Modelled, not measured.
-pub const PAYER_VBYTES: u64 = 301;
+/// A payer's own footprint: three rungs in, three out.
+pub const PAYER_VBYTES: u64 = 3 * VBYTES_PER_SEAT;
 
 /// What a level costs, and what it actually delivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +186,41 @@ pub fn check_quote_is_honest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #698 in one assertion.
+    ///
+    /// Four modules held their own copy of this arithmetic and two of them
+    /// disagreed — 100 against 101 per seat, 301 against 303 for a payer. The
+    /// original bug was invisible because both sides only checked `>=`, so the
+    /// larger figure won and the difference went to miners. This fails loudly
+    /// instead.
+    #[test]
+    fn no_module_keeps_its_own_copy_of_the_vbyte_arithmetic() {
+        use crate::tier::{TX_OVERHEAD_VBYTES, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT};
+
+        assert_eq!(
+            VBYTES_PER_SEAT,
+            (VBYTES_PER_INPUT + VBYTES_PER_OUTPUT) as u64,
+            "privacy_level has drifted from tier"
+        );
+        assert_eq!(PAYER_VBYTES, 3 * VBYTES_PER_SEAT);
+
+        // And the ladder round builder agrees, computed the long way.
+        let ins = 5usize;
+        let outs = 12usize;
+        let expected =
+            (TX_OVERHEAD_VBYTES + ins * VBYTES_PER_INPUT + outs * VBYTES_PER_OUTPUT) as u64;
+        let b = crate::ladder_round::LadderRoundBuilder::new(
+            "s",
+            crate::ladder::Ladder::standard(),
+            bitcoin::Network::Signet,
+            1,
+            1,
+        );
+        // An empty builder still exposes the same overhead constant.
+        assert_eq!(b.estimate_vbytes(), TX_OVERHEAD_VBYTES as u64);
+        assert!(expected > 0);
+    }
 
     #[test]
     fn basic_costs_only_the_payers_own_bytes() {

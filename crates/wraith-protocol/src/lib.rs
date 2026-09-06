@@ -52,7 +52,7 @@ pub use blind::{
 pub use error::WraithError;
 pub use tier::{
     LiteTier, LITE_FILL_WINDOW_SECS, LITE_SERVICE_FEE_BPS, LITE_SERVICE_FEE_FLOOR_SATS,
-    VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
+    TX_OVERHEAD_VBYTES, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
 };
 
 pub mod single_round;
