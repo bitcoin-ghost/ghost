@@ -135,6 +135,55 @@ pub enum SeatRefusal {
     },
 }
 
+/// The half of the rules that needs only roles, checkable at join time.
+///
+/// Composition splits by what is known when. Mixing scarcity and the provider
+/// allowance depend on nothing but who is already seated, so they run at join
+/// and turn a latecomer away before it commits anything.
+///
+/// The payer-fraction rule is **not** here, and deliberately so: counting payer
+/// *entities* needs ancestry, which only arrives with the coins at `/inputs`.
+/// Approximating it by counting payer seats would over-count exactly when an
+/// attacker has supplied many linked ones — the flattering direction, and the
+/// error the whole design is built to avoid. It runs in [`check_seat`] where
+/// the data is real.
+pub fn check_role_slot(
+    seated: &[Role],
+    candidate: Role,
+    policy: CompositionPolicy,
+) -> Result<(), SeatRefusal> {
+    if seated.len() >= policy.max_seats {
+        return Err(SeatRefusal::RoundFull {
+            max: policy.max_seats,
+        });
+    }
+    match candidate {
+        Role::Mixer => {
+            let taken = seated.iter().filter(|r| **r == Role::Mixer).count();
+            if taken >= policy.max_mixing_slots {
+                return Err(SeatRefusal::MixingSlotsFull {
+                    max: policy.max_mixing_slots,
+                });
+            }
+        }
+        Role::LiquidityProvider(lp) => {
+            let held = seated
+                .iter()
+                .filter(|r| **r == Role::LiquidityProvider(lp))
+                .count();
+            if held >= policy.max_inputs_per_lp {
+                return Err(SeatRefusal::ProviderAllowanceUsed {
+                    lp,
+                    held,
+                    max: policy.max_inputs_per_lp,
+                });
+            }
+        }
+        Role::Payer => {}
+    }
+    Ok(())
+}
+
 /// Whether `candidate` may join a round that already holds `seated`.
 pub fn check_seat(
     seated: &[Seat],
@@ -264,6 +313,43 @@ mod tests {
         (0..n)
             .map(|i| seat(i, Some(i as u64), Role::Payer))
             .collect()
+    }
+
+    #[test]
+    fn the_join_time_check_enforces_scarcity_without_coins() {
+        // Roles are all that is known at join, and they are enough for the two
+        // structural rules.
+        let p = CompositionPolicy::default();
+        let mut roles = vec![Role::Payer; 10];
+        roles.extend(std::iter::repeat_n(Role::Mixer, p.max_mixing_slots));
+        assert!(matches!(
+            check_role_slot(&roles, Role::Mixer, p),
+            Err(SeatRefusal::MixingSlotsFull { .. })
+        ));
+        assert!(matches!(
+            check_role_slot(&[Role::LiquidityProvider(4)], Role::LiquidityProvider(4), p),
+            Err(SeatRefusal::ProviderAllowanceUsed { lp: 4, .. })
+        ));
+        assert!(
+            check_role_slot(&[Role::LiquidityProvider(4)], Role::LiquidityProvider(5), p).is_ok()
+        );
+    }
+
+    #[test]
+    fn the_join_time_check_does_not_judge_the_payer_fraction() {
+        // Counting payer seats without ancestry over-counts exactly when an
+        // attacker supplies many linked ones. Better to defer the rule than to
+        // enforce a flattering version of it.
+        let p = CompositionPolicy::default();
+        assert!(
+            check_role_slot(&[], Role::LiquidityProvider(1), p).is_ok(),
+            "join must not attempt the padding rule"
+        );
+        // The full check, which has the ancestry, still refuses it.
+        assert!(matches!(
+            check_seat(&[], &seat(1, None, Role::LiquidityProvider(1)), p),
+            Err(SeatRefusal::WouldPadTheRound { .. })
+        ));
     }
 
     #[test]

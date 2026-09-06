@@ -32,6 +32,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use wraith_protocol::anonymity_set::Role;
+use wraith_protocol::composition::CompositionPolicy;
 use wraith_protocol::{
     find_or_create_session, LiteSessionError, LiteTier, SessionDescriptor, SessionType,
 };
@@ -52,6 +54,22 @@ pub struct Request {
     /// `/inputs` and `/sign` so the coordinator can correlate. Must be
     /// non-empty.
     pub ghost_id: String,
+    /// What this participant is doing: `payer` (default), `mixer`, or
+    /// `{"liquidity_provider": <id>}`.
+    ///
+    /// Declared at join because `composition` enforces mixing scarcity and the
+    /// provider allowance before a seat is given away — a rule applied after
+    /// the seat is taken has nothing left to refuse.
+    ///
+    /// Defaults to `payer`, which is the conservative choice: payers are the
+    /// uncapped role, so a client that does not send one is never handed a
+    /// scarce mixing slot by accident.
+    #[serde(default = "default_role")]
+    pub role: Role,
+}
+
+fn default_role() -> Role {
+    Role::Payer
 }
 
 #[derive(Debug, Serialize)]
@@ -110,10 +128,13 @@ pub async fn post(
         );
         let pre_count = descriptor.slots_filled;
         let now = state.now();
-        match state
-            .sessions
-            .add_participant(&descriptor.session_id, &req.ghost_id, now)
-        {
+        match state.sessions.add_participant(
+            &descriptor.session_id,
+            &req.ghost_id,
+            req.role,
+            CompositionPolicy::default(),
+            now,
+        ) {
             Ok(updated) => {
                 debug!(
                     session_id = %updated.session_id,
@@ -150,6 +171,20 @@ pub async fn post(
                     "session unavailable mid-claim, retrying with fresh find_or_create",
                 );
                 continue;
+            }
+            // Terminal, and deliberately NOT retried.
+            //
+            // `Full` and `NotAcceptingParticipants` retry, which can create a
+            // fresh session. A composition refusal must never reach that path:
+            // a new session carries a new set of mixing slots, so retrying on
+            // `MixingSlotsFull` would hand the refused participant the very
+            // seats the cap just denied. Scarcity per round means nothing if
+            // being turned away spawns another round.
+            //
+            // The honest answer is to wait for the next round, and the message
+            // says so.
+            Err(LiteSessionError::Composition(detail)) => {
+                return error(StatusCode::CONFLICT, "composition_refused", detail);
             }
             Err(other) => {
                 return error(

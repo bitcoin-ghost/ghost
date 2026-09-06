@@ -3219,3 +3219,82 @@ async fn no_endpoint_leaks_participant_attribution() {
         "the probe cannot detect the leak it exists for"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Composition rules over the wire
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refused_mixer_does_not_get_a_fresh_round_made_for_it() {
+    // The hole this closes: `Full` and `NotAcceptingParticipants` retry, and a
+    // retry can create a new session. A new session carries a new set of
+    // mixing slots, so retrying a composition refusal would hand the refused
+    // participant exactly the seats the cap just denied.
+    //
+    // Scarcity per round is worth nothing if being turned away spawns a round.
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+
+    let join = |role: serde_json::Value, who: &str| {
+        post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({
+                "tier_id": "100k_sats",
+                "ghost_id": who,
+                "role": role,
+            }),
+        )
+    };
+
+    // Fill the mixing slots (default policy allows 3).
+    for i in 0..3 {
+        let r = router
+            .clone()
+            .oneshot(join(serde_json::json!("mixer"), &format!("m-{i}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "mixer {i} should be seated");
+    }
+    assert_eq!(state.sessions.len(), 1);
+
+    // The fourth is refused, and no second session appears.
+    let r = router
+        .clone()
+        .oneshot(join(serde_json::json!("mixer"), "m-4"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let body = to_bytes(r.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "composition_refused");
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "a refusal must not create a round with fresh mixing slots"
+    );
+
+    // A payer still joins the same session — real traffic is never capped.
+    let r = router
+        .oneshot(join(serde_json::json!("payer"), "p-1"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(state.sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn a_client_that_sends_no_role_is_treated_as_a_payer() {
+    // Payers are the uncapped role, so an older client is never handed a
+    // scarce mixing slot by accident.
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    for i in 0..5 {
+        let r = router
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/session/find_or_create",
+                serde_json::json!({ "tier_id": "100k_sats", "ghost_id": format!("old-{i}") }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "no-role client {i} must join");
+    }
+}

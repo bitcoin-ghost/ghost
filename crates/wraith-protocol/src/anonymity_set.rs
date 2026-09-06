@@ -67,7 +67,8 @@ use std::collections::{HashMap, HashSet};
 use crate::admission::SeatCandidate;
 
 /// What a seat is doing in the round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     /// Making a real payment. The best cover there is, because they behave
     /// exactly like the user being protected.
