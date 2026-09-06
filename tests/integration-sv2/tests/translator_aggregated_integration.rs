@@ -48,6 +48,222 @@ use stratum_apps::stratum_core::{
 // shares.
 
 #[tokio::test]
+async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
+    start_tracing();
+
+    // first upstream server mock
+    let mock_upstream_addr_a = get_available_address();
+    let mock_upstream_a = MockUpstream::new(mock_upstream_addr_a, WithSetup::no());
+    let send_to_tproxy_a = mock_upstream_a.start().await;
+    let (sniffer_a, sniffer_addr_a) = start_sniffer("", mock_upstream_addr_a, false, vec![], None);
+
+    // fallback upstream server mock
+    let mock_upstream_addr_b = get_available_address();
+    let mock_upstream_b = MockUpstream::new(
+        mock_upstream_addr_b,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    );
+    let _send_to_tproxy_b = mock_upstream_b.start().await;
+    let (sniffer_b, sniffer_addr_b) = start_sniffer("", mock_upstream_addr_b, false, vec![], None);
+
+    let (translator, tproxy_addr, _) = start_sv2_translator(
+        &[sniffer_addr_a, sniffer_addr_b],
+        true,
+        vec![],
+        vec![],
+        None,
+        false,
+    )
+    .await;
+
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SETUP_CONNECTION,
+        )
+        .await;
+
+    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        SetupConnectionSuccess {
+            used_version: 2,
+            flags: 0,
+        },
+    ));
+    send_to_tproxy_a
+        .send(setup_connection_success)
+        .await
+        .unwrap();
+
+    // we need to keep references to each minerd
+    // otherwise they would be dropped
+    let mut minerd_vec = Vec::new();
+
+    let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+    minerd_vec.push(minerd_process);
+
+    sniffer_a
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+        match sniffer_a.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
+                break msg;
+            }
+            _ => continue,
+        };
+    };
+
+    let open_extended_mining_channel_success = AnyMessage::Mining(
+        parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+            request_id: open_extended_mining_channel.request_id,
+            channel_id: 0,
+            target: hex::decode("0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            // full extranonce has a total of 12 bytes
+            extranonce_size: 8,
+            extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
+            group_channel_id: 100,
+        }),
+    );
+    send_to_tproxy_a
+        .send(open_extended_mining_channel_success)
+        .await
+        .unwrap();
+
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+
+    let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+            channel_id: 0,
+            job_id: 1,
+            min_ntime: Sv2Option::new(None),
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            // scriptSig for a total of 8 bytes of extranonce
+            coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
+            coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
+        }));
+
+    send_to_tproxy_a
+        .send(new_extended_mining_job)
+        .await
+        .unwrap();
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+
+    let set_new_prev_hash =
+        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+            channel_id: 0,
+            job_id: 1,
+            prev_hash: hex::decode(
+                "3ab7089cd2cd30f133552cfde82c4cb239cd3c2310306f9d825e088a1772cc39",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            min_ntime: 1766782170,
+            nbits: 0x207fffff,
+        }));
+
+    send_to_tproxy_a.send(set_new_prev_hash).await.unwrap();
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+
+    // up until now, we have done the usual channel initialization process
+    // now, lets send a CloseChannel message for the channel
+    let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
+        channel_id: 0,
+        reason_code: "".to_string().try_into().unwrap(),
+    }));
+    send_to_tproxy_a.send(close_channel).await.unwrap();
+
+    // this should trigger fallback
+    sniffer_b
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    translator.shutdown().await;
+}
+
+// Verify's that the non-aggregated mode translator does not shut down if an
+// upstream message references a channel ID that is not associated with any
+// downstream in the tproxy.
+// See: https://github.com/stratum-mining/sv2-apps/issues/216
+
+#[tokio::test]
+async fn tproxy_sends_single_open_extended_mining_channel_in_aggregated_mode() {
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::High);
+    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+
+    let (pool_translator_sniffer, pool_translator_sniffer_addr) =
+        start_sniffer("0", pool_addr, false, vec![], None);
+    let (tproxy, tproxy_addr, _) = start_sv2_translator(
+        &[pool_translator_sniffer_addr],
+        true,
+        vec![],
+        vec![],
+        None,
+        false,
+    )
+    .await;
+
+    pool_translator_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    pool_translator_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    let mut minerd_vec = Vec::new();
+    // connect several Sv1 miners to tProxy
+    const N_MINERDS: u32 = 10;
+    for _i in 0..N_MINERDS {
+        let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+        minerd_vec.push(minerd_process);
+    }
+
+    pool_translator_sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+
+    assert!(
+        pool_translator_sniffer
+            .assert_message_not_present(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+
+    shutdown_all!(pool, tproxy);
+}
+
+#[tokio::test]
 async fn aggregated_translator_correctly_deals_with_group_channels() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
