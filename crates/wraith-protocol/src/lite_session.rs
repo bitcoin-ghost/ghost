@@ -195,6 +195,18 @@ pub struct LiteSession {
     pub created_at: u64,
     pub state: LiteSessionState,
     pub participants: Vec<LiteSessionParticipant>,
+    /// Which concurrent round of this tier the session is.
+    ///
+    /// A tier runs `assignment::open_rounds_for(volume)` rounds at once, and a
+    /// participant belongs in exactly one of them — derived from its own coins,
+    /// so neither it nor the coordinator picks. Sessions are matched on this as
+    /// well as tier, or every participant would land in whichever round happened
+    /// to be filling and the derivation would do nothing.
+    ///
+    /// `0` when the epoch runs a single round, which is also the fallback when
+    /// no beacon is available.
+    #[serde(default)]
+    pub round_index: u32,
 }
 
 impl LiteSession {
@@ -227,6 +239,9 @@ pub struct SessionDescriptor {
     pub slots_filled: u32,
     pub slots_total: u32,
     pub fill_window_expires_at: Option<u64>,
+    /// Which concurrent round of the tier this is. A wallet checks this against
+    /// its own derivation rather than accepting placement on trust.
+    pub round_index: u32,
 }
 
 impl SessionDescriptor {
@@ -244,6 +259,7 @@ impl SessionDescriptor {
             slots_filled: s.participants.len() as u32,
             slots_total: s.tier.max_participants() as u32,
             fill_window_expires_at,
+            round_index: s.round_index,
         }
     }
 }
@@ -653,6 +669,7 @@ impl LiteSessionRegistry {
         &self,
         tier: LiteTier,
         session_type: SessionType,
+        round_index: u32,
         now: u64,
         new_session: LiteSession,
     ) -> SessionDescriptor {
@@ -662,9 +679,13 @@ impl LiteSessionRegistry {
         let (descriptor, created) = {
             let mut guard = self.sessions.lock().expect("registry mutex");
             // Find first.
+            // Matched on `round_index` as well as tier. Without it every
+            // participant joins whichever round happens to be filling, and the
+            // derived assignment does nothing at all.
             if let Some(existing) = guard.values().find(|s| {
                 s.tier == tier
                     && s.session_type == session_type
+                    && s.round_index == round_index
                     && s.is_open_for_new_participants(now)
             }) {
                 return SessionDescriptor::from_session(existing);
@@ -927,6 +948,7 @@ impl Default for LiteSessionRegistry {
 pub fn find_or_create_session(
     tier: LiteTier,
     session_type: SessionType,
+    round_index: u32,
     registry: &LiteSessionRegistry,
     clock: &dyn Clock,
     id_gen: &dyn SessionIdGenerator,
@@ -943,13 +965,14 @@ pub fn find_or_create_session(
         session_id: id_gen.next_id(),
         tier,
         session_type,
+        round_index,
         created_at: now,
         state: LiteSessionState::Filling {
             fill_window_expires_at: now + fill_window_secs,
         },
         participants: Vec::new(),
     };
-    registry.find_or_create_open(tier, session_type, now, prospective)
+    registry.find_or_create_open(tier, session_type, round_index, now, prospective)
 }
 
 #[cfg(test)]
@@ -974,6 +997,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -994,6 +1018,7 @@ mod tests {
         let d1 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1002,6 +1027,7 @@ mod tests {
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1038,6 +1064,7 @@ mod tests {
                 find_or_create_session(
                     LiteTier::Denom100kSats,
                     SessionType::Mix,
+                    0,
                     &r,
                     &*c,
                     &*g,
@@ -1068,6 +1095,7 @@ mod tests {
         let d_small = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1076,6 +1104,7 @@ mod tests {
         let d_big = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1096,6 +1125,7 @@ mod tests {
         let mix = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1104,6 +1134,7 @@ mod tests {
         let jump = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Jump,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1119,6 +1150,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1142,6 +1174,7 @@ mod tests {
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1157,6 +1190,7 @@ mod tests {
         let d1 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1167,6 +1201,7 @@ mod tests {
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1183,6 +1218,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1207,6 +1243,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1241,6 +1278,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1279,6 +1317,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1308,6 +1347,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1337,6 +1377,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1370,6 +1411,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1391,6 +1433,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1422,6 +1465,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1445,6 +1489,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1465,6 +1510,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1534,6 +1580,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1556,6 +1603,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1592,6 +1640,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1626,6 +1675,7 @@ mod tests {
         let d_quorum = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1645,6 +1695,7 @@ mod tests {
         let _d_empty = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1674,6 +1725,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1713,6 +1765,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1737,6 +1790,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1760,6 +1814,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1830,6 +1885,7 @@ mod tests {
         let d_a = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1855,6 +1911,7 @@ mod tests {
         let d_b = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1907,6 +1964,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &registry,
             &clock,
             &gen,
@@ -1921,6 +1979,7 @@ mod tests {
         // Wire format must be stable across coordinator pool versions —
         // pin every variant.
         let session = LiteSession {
+            round_index: 0,
             session_id: "test".into(),
             tier: LiteTier::Denom100kSats,
             session_type: SessionType::Mix,
@@ -1963,6 +2022,7 @@ mod tests {
         let _open = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1971,6 +2031,7 @@ mod tests {
         let other_tier = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1992,6 +2053,7 @@ mod tests {
         let new_1m = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -2010,6 +2072,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -2056,6 +2119,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,

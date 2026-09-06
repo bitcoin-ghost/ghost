@@ -66,6 +66,25 @@ pub struct Request {
     /// scarce mixing slot by accident.
     #[serde(default = "default_role")]
     pub role: Role,
+    /// Which concurrent round of the tier the wallet computed it belongs in.
+    ///
+    /// # Why the wallet supplies this rather than the coordinator deriving it
+    ///
+    /// Placement is `H(tag ‖ epoch ‖ beacon ‖ coins) mod open_rounds`, so
+    /// deriving it needs the participant's coins — which do not arrive until
+    /// `/inputs`. Putting outpoints on the join request instead would let
+    /// anyone declare *someone else's* coins and learn which round that person
+    /// lands in, which is a disclosure for no gain.
+    ///
+    /// So the wallet asserts its placement here and `/inputs` **verifies** it
+    /// once the coins and their ownership proofs are present. A wallet that
+    /// lies picks its own round and then loses its seat, which costs it more
+    /// than it buys.
+    ///
+    /// `None` means the wallet did not compute one — treated as round 0, the
+    /// single-round case.
+    #[serde(default)]
+    pub round_index: Option<u32>,
 }
 
 fn default_role() -> Role {
@@ -121,6 +140,7 @@ pub async fn post(
         let descriptor = find_or_create_session(
             tier,
             session_type,
+            req.round_index.unwrap_or(0),
             &state.sessions,
             state.clock.as_ref(),
             state.id_gen.as_ref(),

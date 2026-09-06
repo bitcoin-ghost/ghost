@@ -82,6 +82,8 @@ pub const WITNESS_DEADLINE_SECS: u64 = 600;
 use crate::inputs::{AcceptedInputs, TxInputRef};
 use crate::state::CoordinatorState;
 use crate::utxo_source::parse_outpoint;
+use wraith_protocol::assignment::{assign, open_rounds_for};
+use wraith_protocol::signing_ledger::OutPointKey;
 
 /// One coin, with the proof that the submitter controls it.
 ///
@@ -433,6 +435,52 @@ pub async fn post(
             }
         };
         validated.push(rung.input.clone());
+    }
+
+    // Verify the placement the wallet asserted at join.
+    //
+    // The wallet declares a round index it cannot be checked on until now,
+    // because the derivation needs its coins. This is where that assertion
+    // costs something: a wallet that picked its own round loses the seat.
+    //
+    // Skipped when no beacon is available — placement then falls back to a
+    // single round for everyone, which is the low-volume behaviour and safe.
+    // `/session/{id}` reports the fallback rather than hiding it.
+    if let Some(src) = state.epoch_source.as_ref() {
+        if let Some(ctx) = src.epoch_context() {
+            let coins: Vec<OutPointKey> = validated
+                .iter()
+                .filter_map(|r| {
+                    let raw = hex::decode(r.txid.trim()).ok()?;
+                    if raw.len() != 32 {
+                        return None;
+                    }
+                    let mut txid = [0u8; 32];
+                    txid.copy_from_slice(&raw);
+                    Some(OutPointKey { txid, vout: r.vout })
+                })
+                .collect();
+
+            let open_rounds = open_rounds_for(ctx.committed_volume);
+            match assign(ctx.epoch, &ctx.beacon, &coins, open_rounds) {
+                Ok(derived) => {
+                    if derived != session.round_index {
+                        return error(
+                            StatusCode::CONFLICT,
+                            "wrong_round",
+                            format!(
+                                "these coins belong in round {derived} of {open_rounds}, not \
+                                 round {}; placement is derived from the coins, not chosen",
+                                session.round_index
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    return error(StatusCode::BAD_REQUEST, "unassignable", e.to_string());
+                }
+            }
+        }
     }
 
     //    The total must be exact.

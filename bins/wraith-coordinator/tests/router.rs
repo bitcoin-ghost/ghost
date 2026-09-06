@@ -3342,3 +3342,187 @@ async fn session_status_reports_entities_not_seats() {
     assert_eq!(a["entities"], 0, "an empty round is not a private one");
     assert_eq!(a["seats"], 0);
 }
+
+// ---------------------------------------------------------------------------
+// Derived round placement
+// ---------------------------------------------------------------------------
+
+/// An epoch source pinned to fixed values, so placement is deterministic.
+#[derive(Debug, Clone, Copy)]
+struct FixedEpoch {
+    volume: u64,
+}
+
+impl wraith_coordinator::state::EpochSource for FixedEpoch {
+    fn epoch_context(&self) -> Option<wraith_coordinator::state::EpochContext> {
+        Some(wraith_coordinator::state::EpochContext {
+            epoch: 7,
+            beacon: [11u8; 32],
+            committed_volume: self.volume,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_wallet_that_picks_its_own_round_loses_the_seat() {
+    // The wallet asserts a placement at join that cannot be checked until its
+    // coins arrive, because the derivation needs them. This drives the whole
+    // path to prove the assertion is actually tested there and refused.
+    use wraith_protocol::assignment::{assign, open_rounds_for};
+    use wraith_protocol::signing_ledger::OutPointKey;
+
+    let volume = 200;
+    let rounds = open_rounds_for(volume);
+    assert!(rounds > 1, "fixture needs several open rounds");
+
+    // Where fixture coin 0x00:0 actually belongs, and a round that is not it.
+    let coins = vec![OutPointKey {
+        txid: [0x00u8; 32],
+        vout: 0,
+    }];
+    let truthful = assign(7, &[11u8; 32], &coins, rounds).unwrap();
+    let lie = (truthful + 1) % rounds as u32;
+    assert_ne!(truthful, lie, "the fixture must actually be a lie");
+
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(MockClock::new(1_000_000)),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            None,
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source()))
+        .with_epoch_source(Arc::new(FixedEpoch { volume })),
+    );
+    let router = build_router(state.clone());
+
+    // Enrol enough wallets, all claiming the same (wrong) round.
+    let mut session_id = String::new();
+    for i in 0..MIN_5 {
+        let join = router
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/session/find_or_create",
+                serde_json::json!({
+                    "tier_id": "100k_sats",
+                    "ghost_id": format!("wallet-{i}"),
+                    "round_index": lie,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(join.status(), StatusCode::OK, "join is provisional");
+        let body = to_bytes(join.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session"]["round_index"], lie);
+        session_id = json["session"]["session_id"].as_str().unwrap().to_string();
+    }
+
+    state
+        .sessions
+        .apply_event(wraith_protocol::SessionGossipEvent::StateChanged {
+            session_id: session_id.clone(),
+            new_state: wraith_protocol::LiteSessionState::Locked,
+        })
+        .expect("apply Locked");
+
+    let r = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), StatusCode::CONFLICT, "the lie must be refused");
+    let body = to_bytes(r.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "wrong_round");
+    assert!(
+        json["detail"]
+            .as_str()
+            .unwrap()
+            .contains("derived from the coins"),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn participants_claiming_different_rounds_get_different_sessions() {
+    // Without matching on `round_index`, everyone joins whichever round happens
+    // to be filling and the derivation does nothing at all.
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+
+    for round in [0u32, 1u32] {
+        let r = router
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/session/find_or_create",
+                serde_json::json!({
+                    "tier_id": "100k_sats",
+                    "ghost_id": format!("w-{round}"),
+                    "round_index": round,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "two claimed rounds must be two sessions, not one"
+    );
+}
+
+#[tokio::test]
+async fn a_wallet_that_omits_a_round_index_lands_in_round_zero() {
+    // The single-round case, and the fallback when no beacon is available.
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let r = router
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "w-none" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = to_bytes(r.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["session"]["round_index"], 0);
+    assert_eq!(state.sessions.len(), 1);
+}
+
+#[test]
+fn the_derivation_places_a_participant_somewhere_it_did_not_choose() {
+    // The property the whole mechanism rests on: with several rounds open, a
+    // participant's placement follows from its coins rather than its preference.
+    use wraith_protocol::assignment::{assign, open_rounds_for};
+    use wraith_protocol::signing_ledger::OutPointKey;
+
+    let volume = 200;
+    let rounds = open_rounds_for(volume);
+    assert!(rounds > 1, "fixture needs several rounds to be meaningful");
+
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..80u8 {
+        let coins = vec![OutPointKey {
+            txid: [i; 32],
+            vout: 0,
+        }];
+        seen.insert(assign(7, &[11u8; 32], &coins, rounds).unwrap());
+    }
+    assert!(
+        seen.len() > 1,
+        "placement must spread across the open rounds, got {seen:?}"
+    );
+}

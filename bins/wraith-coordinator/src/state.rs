@@ -31,6 +31,38 @@ use crate::witnesses::AcceptedWitness;
 pub type SharedSigner = Arc<Mutex<CoordinatorSigner>>;
 
 /// Process-global state shared across HTTP handlers.
+/// Everything a round's placement derivation needs for the current epoch.
+///
+/// Supplied by the node rather than fetched here, so the coordinator has one
+/// source of truth for the epoch and the tests can pin it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochContext {
+    /// Current coordinator epoch.
+    pub epoch: u64,
+    /// The epoch's beacon, folded from several consecutive block hashes.
+    pub beacon: [u8; 32],
+    /// Committed payment volume, which fixes `open_rounds`.
+    ///
+    /// Committed rather than live: the modulus must not be something the
+    /// coordinator can narrow mid-epoch, because narrowing it to 1 funnels every
+    /// participant into one round while appearing to follow the rule.
+    pub committed_volume: u64,
+}
+
+/// Source of the current [`EpochContext`].
+///
+/// `None` means no beacon is available — a node still syncing, or an RPC that
+/// is down. Placement then falls back to a single round, which is the same
+/// behaviour as low volume and is safe: it removes the concentration defence
+/// rather than splitting participants incorrectly.
+///
+/// That fallback must be **visible**. A silently disabled defence is worse than
+/// an absent one, because it reads as protection in the status output.
+pub trait EpochSource: Send + Sync {
+    /// The current epoch context, or `None` when unavailable.
+    fn epoch_context(&self) -> Option<EpochContext>;
+}
+
 pub struct CoordinatorState {
     /// Bitcoin network this coordinator serves.
     pub network: Network,
@@ -57,6 +89,10 @@ pub struct CoordinatorState {
     /// while it is, because registration must never fall back to
     /// trusting the wallet's own account of its input (#699).
     pub utxo_source: Option<Arc<dyn UtxoSource>>,
+    /// Source of the epoch beacon that fixes round placement. `None` until an
+    /// operator wires a chain connection; placement then falls back to a single
+    /// round and `/session/{id}` reports that it is unavailable.
+    pub epoch_source: Option<Arc<dyn EpochSource>>,
     /// Coordinator's fee-collection address. Used as the destination for
     /// the per-Mix-round service-fee output. `None` until the operator
     /// supplies one (CLI flag / config). `/inputs` returns
@@ -155,6 +191,7 @@ impl CoordinatorState {
             id_gen,
             bans: BanList::new(),
             utxo_source: None,
+            epoch_source: None,
             coordinator_fee_address,
             inputs_store: Mutex::new(HashMap::new()),
             outputs_store: Mutex::new(HashMap::new()),
@@ -174,6 +211,17 @@ impl CoordinatorState {
     /// callers chain it: `with_components(..).with_utxo_source(src)`.
     pub fn with_utxo_source(mut self, source: Arc<dyn UtxoSource>) -> Self {
         self.utxo_source = Some(source);
+        self
+    }
+
+    /// Install the epoch beacon source that fixes round placement.
+    ///
+    /// Without one, every participant lands in round 0 — the single-round case.
+    /// That is safe but it is *not* the concentration defence running, so
+    /// `/session/{id}` reports its absence rather than leaving the difference
+    /// invisible.
+    pub fn with_epoch_source(mut self, source: Arc<dyn EpochSource>) -> Self {
+        self.epoch_source = Some(source);
         self
     }
 
