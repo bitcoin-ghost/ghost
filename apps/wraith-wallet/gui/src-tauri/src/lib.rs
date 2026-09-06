@@ -536,6 +536,44 @@ async fn wraith_mix_run(
 
 /// Derive a Ghost Lock's four lanes and report their balances.
 ///
+/// Remember a Ghost Lock's definition. Only public keys and two heights.
+#[tauri::command]
+async fn ghost_lock_save(
+    label: Option<String>,
+    backup_pubkey: String,
+    heir_pubkey: String,
+    quorum_pubkey: String,
+    anchor_height: u32,
+    inherit_height: u32,
+    bip86_index: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSave {
+        label,
+        backup_pubkey,
+        heir_pubkey,
+        quorum_pubkey,
+        anchor_height,
+        inherit_height,
+        bip86_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Every remembered Lock.
+#[tauri::command]
+async fn ghost_lock_list() -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockList).await?;
+    to_value(&resp)
+}
+
+/// Forget a Lock's definition. Does not touch the funds.
+#[tauri::command]
+async fn ghost_lock_forget(lock_id: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockForget { lock_id }).await?;
+    to_value(&resp)
+}
+
 /// The MuSig2 aggregates are derived by the daemon from the individual keys —
 /// BIP-327 aggregation is deterministic, so no ceremony is involved.
 #[tauri::command]
@@ -921,6 +959,9 @@ pub fn run() {
             wraith_resolve_coordinator,
             wraith_mix_run,
             ghost_lock_lanes,
+            ghost_lock_save,
+            ghost_lock_list,
+            ghost_lock_forget,
             wallet_ghost_id,
             wallet_glyph,
             wallet_glyph_claim,

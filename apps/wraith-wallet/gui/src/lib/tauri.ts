@@ -802,6 +802,55 @@ export interface GhostLockLanesArgs {
   bip86_index?: number;
 }
 
+/// A remembered Lock definition.
+export interface GhostLockRecord {
+  lock_id: string;
+  label: string | null;
+  backup_pubkey: string;
+  heir_pubkey: string;
+  quorum_pubkey: string;
+  anchor_height: number;
+  inherit_height: number;
+  bip86_index: number;
+}
+
+/// Remember a Lock. Saving the same keys twice updates one record — the id is
+/// derived from the fields, so re-entering them is a rename, not a duplicate.
+export async function ghostLockSave(args: {
+  label?: string;
+  backup_pubkey: string;
+  heir_pubkey: string;
+  quorum_pubkey: string;
+  anchor_height: number;
+  inherit_height: number;
+  bip86_index?: number;
+}): Promise<{ lock: GhostLockRecord; created: boolean }> {
+  const resp = await invoke("ghost_lock_save", {
+    label: args.label,
+    backupPubkey: args.backup_pubkey,
+    heirPubkey: args.heir_pubkey,
+    quorumPubkey: args.quorum_pubkey,
+    anchorHeight: args.anchor_height,
+    inheritHeight: args.inherit_height,
+    bip86Index: args.bip86_index,
+  });
+  return unwrap<{ lock: GhostLockRecord; created: boolean }>(resp).payload;
+}
+
+export async function ghostLockList(): Promise<GhostLockRecord[]> {
+  const resp = await invoke("ghost_lock_list");
+  return unwrap<{ locks: GhostLockRecord[] }>(resp).payload.locks;
+}
+
+/// Forget a definition. The funds are untouched — the lanes stay spendable by
+/// anyone holding the keys.
+export async function ghostLockForget(
+  lockId: string,
+): Promise<{ lock_id: string; existed: boolean }> {
+  const resp = await invoke("ghost_lock_forget", { lockId });
+  return unwrap<{ lock_id: string; existed: boolean }>(resp).payload;
+}
+
 /// Derive a Ghost Lock's four lanes and read their balances.
 ///
 /// The MuSig2 aggregates are derived by the daemon from these three keys.

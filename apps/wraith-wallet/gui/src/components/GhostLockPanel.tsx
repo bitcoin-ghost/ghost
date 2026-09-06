@@ -20,10 +20,15 @@
  */
 
 import { useEffect, useState } from "react";
-import { ghostLockLanes, type GhostLockLanes } from "../lib/tauri";
+import {
+  ghostLockForget,
+  ghostLockLanes,
+  ghostLockList,
+  ghostLockSave,
+  type GhostLockLanes,
+  type GhostLockRecord,
+} from "../lib/tauri";
 import { LockLanes } from "./LockLanes";
-
-const STORE_KEY = "ghost-lock-keys";
 
 type Keys = {
   backup_pubkey: string;
@@ -59,26 +64,39 @@ const FIELDS: { key: keyof Keys; label: string; hint: string }[] = [
   },
 ];
 
-function load(): Keys {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    return raw ? { ...EMPTY, ...JSON.parse(raw) } : EMPTY;
-  } catch {
-    // A corrupt or unavailable store is not worth failing the screen for.
-    return EMPTY;
-  }
-}
-
 export function GhostLockPanel() {
   const [keys, setKeys] = useState<Keys>(EMPTY);
   const [data, setData] = useState<GhostLockLanes | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(false);
+  const [saved, setSaved] = useState<GhostLockRecord[]>([]);
+  const [label, setLabel] = useState("");
+
+  const refresh = async () => {
+    try {
+      setSaved(await ghostLockList());
+    } catch (e) {
+      setErr((e as Error).message ?? String(e));
+    }
+  };
 
   useEffect(() => {
-    setKeys(load());
+    void refresh();
   }, []);
+
+  const pick = (r: GhostLockRecord) => {
+    setKeys({
+      backup_pubkey: r.backup_pubkey,
+      heir_pubkey: r.heir_pubkey,
+      quorum_pubkey: r.quorum_pubkey,
+      anchor_height: String(r.anchor_height),
+      inherit_height: String(r.inherit_height),
+    });
+    setLabel(r.label ?? "");
+    setData(null);
+    setOpen(true);
+  };
 
   const complete = FIELDS.every((f) => keys[f.key].trim().length > 0);
 
@@ -98,10 +116,21 @@ export function GhostLockPanel() {
         inherit_height: inherit,
         anchor_height: anchor,
       });
+      // Remember it only once the daemon has accepted the keys and read the
+      // chain with them. Saving first would store a Lock that does not build.
       try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(keys));
+        await ghostLockSave({
+          label: label.trim() || undefined,
+          backup_pubkey: keys.backup_pubkey.trim(),
+          heir_pubkey: keys.heir_pubkey.trim(),
+          quorum_pubkey: keys.quorum_pubkey.trim(),
+          anchor_height: anchor,
+          inherit_height: inherit,
+        });
+        await refresh();
       } catch {
-        // Not being able to remember them is a nuisance, not a failure.
+        // Failing to remember is a nuisance; the balances above are real and
+        // the user should still see them.
       }
       setData(r);
       setOpen(false);
@@ -127,6 +156,28 @@ export function GhostLockPanel() {
           different things and both are shown while the old one is retired.
         </p>
 
+        {saved.length > 0 && (
+          <div className="saved-locks">
+            {saved.map((r) => (
+              <div key={r.lock_id} className="saved-lock">
+                <button className="btn-secondary btn-sm" onClick={() => pick(r)}>
+                  {r.label || `Lock ${r.lock_id.slice(0, 8)}`}
+                </button>
+                <button
+                  className="btn-secondary btn-sm"
+                  title="Forget this definition. Your funds are untouched."
+                  onClick={async () => {
+                    await ghostLockForget(r.lock_id);
+                    await refresh();
+                  }}
+                >
+                  forget
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         {open && (
           <>
             <p className="muted">
@@ -135,6 +186,17 @@ export function GhostLockPanel() {
               out from these — deterministically, with nobody else online.
             </p>
             <div className="lock-key-form">
+              <label className="lock-key-field">
+                <span className="k">Name (optional)</span>
+                <input
+                  value={label}
+                  placeholder="e.g. Main"
+                  onChange={(e) => setLabel(e.target.value)}
+                />
+                <span className="muted lock-key-hint">
+                  Renaming does not make it a different Lock.
+                </span>
+              </label>
               {FIELDS.map((f) => (
                 <label key={f.key} className="lock-key-field">
                   <span className="k">{f.label}</span>

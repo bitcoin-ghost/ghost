@@ -1362,3 +1362,6 @@ code {
 .lock-key-field { display: flex; flex-direction: column; gap: 0.25rem; }
 .lock-key-field input { width: 100%; font-size: 0.8125rem; }
 .lock-key-hint { font-size: 0.75rem; }
+
+.saved-locks { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+.saved-lock { display: flex; align-items: center; gap: 0.25rem; }
