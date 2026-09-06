@@ -368,11 +368,6 @@ async fn gsp_auth() -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
-
-
-
-
-
 #[tauri::command]
 async fn light_send(
     recipient: String,
