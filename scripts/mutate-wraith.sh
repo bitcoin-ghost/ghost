@@ -63,23 +63,21 @@ PY
   # runs against the PREVIOUS build and reports "survived" for a mutation that
   # was applied and would have been caught — which is how this harness spent
   # several runs producing different answers to the same question.
-  touch "$file"
-  sleep 1
+  # Drop the crate's fingerprint so cargo must rebuild.
+  #
+  # Cargo fingerprints on mtime with one-second granularity, and a
+  # mutate/test/restore cycle races it — an early version of this harness gave
+  # three different answers to the same question across consecutive runs,
+  # because the test ran against the previous build. A `touch` and a `sleep`
+  # narrowed the window without closing it; deleting the fingerprint closes it,
+  # and costs one crate rebuild rather than the two full-suite runs it replaces.
+  rm -rf target/debug/.fingerprint/wraith-protocol-* 2>/dev/null
 
-  # Run the WHOLE suite, not a filter, and run it twice.
-  #
-  # Cargo's fingerprint is mtime-based and a mutate/test/restore cycle races it
-  # even with a touch and a sleep: an early version of this harness gave three
-  # different answers to the same question across consecutive runs. Filtering
-  # made it worse by shortening the cycle.
-  #
-  # Two agreeing runs is the bar. A guard that cannot give a stable answer must
-  # say so rather than pick one — reporting a confident wrong result is the
-  # failure this whole script exists to catch, one level up.
   local rc rc2
-  timeout 300 cargo test -j2 -p wraith-protocol --lib >/dev/null 2>&1
+  timeout 300 cargo test -j2 -p wraith-protocol --lib "$filter" >/dev/null 2>&1
   rc=$?
-  timeout 300 cargo test -j2 -p wraith-protocol --lib >/dev/null 2>&1
+  # Second run confirms the answer is stable. Cheap now: nothing rebuilds.
+  timeout 300 cargo test -j2 -p wraith-protocol --lib "$filter" >/dev/null 2>&1
   rc2=$?
   cp "$BAK/${rel//\//__}.bak" "$file"
   checked=$((checked + 1))
@@ -156,9 +154,8 @@ mutate "ladder accepts non-rungs" ladder_round.rs \
 # misclassifying and every result above is suspect.
 cp crates/wraith-protocol/src/mailbox.rs "$BAK/mailbox.rs.bak"
 printf '\n// harness control\n' >> crates/wraith-protocol/src/mailbox.rs
-touch crates/wraith-protocol/src/mailbox.rs
-sleep 1
-timeout 300 cargo test -j2 -p wraith-protocol --lib >/dev/null 2>&1
+rm -rf target/debug/.fingerprint/wraith-protocol-* 2>/dev/null
+timeout 300 cargo test -j2 -p wraith-protocol --lib mailbox >/dev/null 2>&1
 control_rc=$?
 cp "$BAK/mailbox.rs.bak" crates/wraith-protocol/src/mailbox.rs
 echo "  control rc=$control_rc"
