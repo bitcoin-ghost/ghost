@@ -71,11 +71,13 @@
 pub mod compartment;
 pub mod constants;
 pub mod error;
+pub mod key_agg;
 pub mod lane;
 
 pub use compartment::{Compartment, CompartmentError};
 pub use constants::*;
 pub use error::LockError;
+pub use key_agg::aggregate;
 pub use lane::{CashPolicy, InvestmentsPolicy, Lane, SavingsPolicy, SpendingPolicy};
 
 #[cfg(test)]
