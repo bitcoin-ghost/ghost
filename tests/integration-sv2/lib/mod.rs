@@ -410,7 +410,7 @@ pub async fn start_sv2_translator(
         None
     };
     let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let config = translator_sv2::config::TranslatorConfig::new(
+    let mut config = translator_sv2::config::TranslatorConfig::new(
         upstreams,
         listening_address.ip().to_string(),
         listening_port,
@@ -425,6 +425,23 @@ pub async fn start_sv2_translator(
         monitoring_address,
         monitoring_cache_refresh_secs,
     );
+    // ⛔ Match PRODUCTION. Every node runs `open_channel_on_subscribe = true`; the compiled
+    // default is `false`, so a harness that never sets it tests a configuration the fleet does
+    // not run — and specifically the one configuration in which the harness's own miner cannot
+    // submit a single valid share.
+    //
+    // minerd is a SERIALISING SV1 client: it waits for the subscribe RESPONSE before it will
+    // authorise. With the channel opening on authorize, that deadlocks, so the translator breaks
+    // it by answering subscribe with an 8-byte all-zero placeholder extranonce. `config.rs` spells
+    // out the consequence: the real prefix is 12 bytes, the coinbase reserves exactly 20, "so a
+    // client that builds on the placeholder is 4 bytes short: malformed coinbase, wrong merkle
+    // root, every share invalid. `set_extranonce` cannot rescue it — that is an OPTIONAL extension
+    // and these clients never send `mining.extranonce.subscribe`."
+    //
+    // Measured 2026-09-06: minerd submitted 154 shares and every one was rejected `share below
+    // target`, so `SubmitSharesExtended` never reached the pool and five targets failed as a
+    // 60s sniffer timeout — which reads like a broken SV2 path rather than a stale test config.
+    config.open_channel_on_subscribe = true;
     // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
     // component binds the address itself, so the reservation must be handed back first or its
     // bind fails with `AddrInUse` — the harness holding the port against the component it chose

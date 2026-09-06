@@ -248,60 +248,105 @@ jobs:
       # infrastructure for the SRI processes and stays tracked on #580.
       - name: Compile SV2 integration targets (no run)
         run: cargo test -p integration_tests_sv2 --no-run
-      # RUN the subset that is actually green (#617).
-      #
-      # The compile gate above is not the whole story: it proves the targets build, not that the
-      # SV2 path works. Triaged all 18 target-by-target on 2026-09-06, serially, with a 420s
-      # per-target budget and nothing else building:
-      #
-      #   PASS, real assertions   pool_solo_mining (8 tests, 198s), template_provider_integration
-      #                           (3, 11s), sniffer_integration (2, 9s),
-      #                           mining_device_fast_hasher_equivalence (1, 0.01s)
-      #   PASSED LOCALLY, HANGS   sv2_mining_device (1, 11s locally; hung >15min on CI) — a
-      #     ON CI                 single local run is not evidence of stability
-      #   PASS, but VACUOUS       bitcoin_core_ipc_integration (3/3 `#[ignore]`d),
-      #                           jds_block_propagation (1/1) — these report green having executed
-      #                           nothing, so they are NOT listed below; a green that cannot fail
-      #                           is worse than no green at all
-      #   FAIL                    extensions, jd_integration (8 pass/3 fail), jd_tproxy_integration,
-      #                           jd_provide_missing_transaction, jdc_block_propagation,
-      #                           jdc_receives_submit_shares_success, monitoring_integration (1/3),
-      #                           pool_integration (7 pass/2 fail), sv1 (1/1)
-      #   TIMEOUT >420s           jdc_cached_shares, translator_integration
-      #
-      # Nearly every failure is one shape: a sniffer `wait_for_message` timeout on a specific SV2
-      # message (`OpenExtendedMiningChannel`, `DeclareMiningJob`, `SubmitSolution`,
-      # `SubmitSharesSuccess`). Whether those are live defects or stale fixtures is the remaining
-      # triage and stays on #617.
-      #
-      # ⚠ The five below are listed EXPLICITLY rather than by exclusion. An exclusion list silently
-      # adopts every new target as blocking the moment someone adds one, which is how a job people
-      # trust becomes a job people disable.
-      #
-      # ⚠ `--test-threads=1`. These bind real ports and spawn real processes; running them
-      # concurrently is how the port-reservation work in #408/#612 got exercised the hard way.
-      #
-      # ⛔ `sv2_mining_device` is NOT in this list, and the reason matters more than the omission.
-      # It was in the first version of this step, on the strength of a single green local run
-      # (10.7s). On CI it reached "Measured CPU hashrate", logged `Reader task exited`, and then
-      # hung until the 15-minute step timeout — taking the whole job with it, including the
-      # target after it that never got to run.
-      #
-      # One green run is not evidence of stability, and that is precisely the mistake #617 warns
-      # against: promote a flaky target to blocking and the job stops being trusted. It measures
-      # real CPU hashrate against a wall-clock window, which is the least reproducible thing a
-      # shared runner can be asked to do. It stays compile-only until someone makes it
-      # deterministic.
-      #
-      # ⚠ Per-target `timeout` as well as the step timeout. Without it one hung target consumes
-      # the entire budget and every target after it is reported as "not run" rather than as
-      # anything a reader can act on — which is exactly how the failure above presented.
+      # The SV2 targets that actually run now live in their own `sv2-integration` job below.
+      # They took ~14 minutes of measured wall clock once repaired, and this job already sits at
+      # ~22 minutes against a 45-minute cap — bolting them on here would have spent the margin
+      # that exists for the regtest e2e work above.
+
+  # SV2 integration targets that pass, run for real.
+  #
+  # Its own job, not a step on `integration-tests`: the repaired set measures ~14 minutes and that
+  # job is already at ~22 against a 45-minute cap. A separate job also runs in parallel, so this
+  # costs no wall clock on the critical path.
+  #
+  # ## Why these targets and not the other four
+  #
+  # Triaged target-by-target on 2026-09-06. The failures were never in the SV2 path itself —
+  # they were three configuration faults in the harness:
+  #
+  #   1. Every target that starts an SV1 miner passed a bare username, which #479 makes a
+  #      REJECTED `mining.authorize`. No channel ever opened, and the test failed a minute later
+  #      as "timeout waiting for OpenExtendedMiningChannel" — which reads like a protocol fault.
+  #   2. The harness ran `open_channel_on_subscribe = false` while every production node runs
+  #      `true`. That is the one configuration in which a serialising miner (minerd) is handed a
+  #      placeholder extranonce and builds a 4-byte-short coinbase, so EVERY share is invalid:
+  #      154 submitted, 154 rejected, nothing forwarded upstream.
+  #   3. `TPROXY_MODE` is a process-global `OnceLock`; a file mixing aggregated and
+  #      non-aggregated translators aborts mid-binary. Each `tests/*.rs` is one process, so the
+  #      aggregated cases were split into their own files.
+  #
+  # Result: 5 green targets/15 real tests -> 17 targets/~47 tests.
+  #
+  # ⛔ Deliberately EXCLUDED, with reasons:
+  #
+  #   sv2_mining_device                  passes locally in 11s, hung >15min on a CI runner. It
+  #                                      measures real CPU hashrate against a wall clock, which
+  #                                      is the least reproducible thing a shared runner can do.
+  #   jd_integration                     11/0 locally, 10/1 on a CI runner — the
+  #                                      `jds_wont_exit_upon_receiving_unexpected_txids...` case
+  #                                      timed out waiting for ProvideMissingTransactions. Second
+  #                                      time local green has failed to hold on a runner, so it
+  #                                      does not gate until it is proven green THERE.
+  #   translator_integration             7 passed / 2 failed — real progress from "never
+  #                                      finished", but not green yet.
+  #   translator_aggregated_integration  all 4 pass INDIVIDUALLY; hang when run together, so
+  #                                      something beyond TPROXY_MODE is not isolated between
+  #                                      tests in that binary.
+  #   bitcoin_core_ipc_integration       3 of 3 `#[ignore]`d — reports ok having executed
+  #   jds_block_propagation              1 of 1 `#[ignore]`d    nothing. A green that cannot
+  #                                      fail is worse than no green at all.
+  #
+  # ⚠ Targets are listed EXPLICITLY. An exclusion list silently promotes every newly added target
+  # to blocking the moment someone writes one, which is how a job people trust becomes a job
+  # people disable.
+  sv2-integration:
+    name: SV2 integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apt-debs
+          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+      - name: Install Linux deps
+        timeout-minutes: 6
+        run: .github/scripts/install-linux-deps.sh
+      # Compile everything first, including the targets that are not run below. This is the gate
+      # that caught the rot that actually bit: `tests/integration` stopped compiling when
+      # f1c14cdb9 added a field to `ShareConvergenceResponse` and nobody noticed for weeks.
+      - name: Compile all SV2 integration targets
+        timeout-minutes: 20
+        run: cargo test -p integration_tests_sv2 --no-run
+      # ⚠ Per-target `timeout` as well as the job cap. Without it one hung target eats the whole
+      # budget and every target after it reports as "not run" rather than as something a reader
+      # can act on — which is exactly how sv2_mining_device's hang first presented.
       - name: Run the green SV2 integration targets
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           for t in pool_solo_mining \
-                   template_provider_integration \
+                   pool_integration \
+                   jd_provide_missing_transaction \
+                   jd_tproxy_integration \
+                   jd_aggregated_tproxy_integration \
+                   jdc_block_propagation \
+                   jdc_cached_shares \
+                   jdc_receives_submit_shares_success \
+                   monitoring_integration \
+                   monitoring_aggregated_topology \
+                   extensions \
+                   sv1 \
                    sniffer_integration \
+                   template_provider_integration \
                    mining_device_fast_hasher_equivalence; do
             echo "::group::$t"
             timeout 420 cargo test -p integration_tests_sv2 --test "$t" -- --test-threads=1 \
@@ -309,15 +354,6 @@ jobs:
             echo "::endgroup::"
           done
 
-  # MPC integration harnesses.
-  #
-  # Split out of the `test` job for two reasons. They require `--features mpc-test-cap` — without
-  # it both panic deliberately, because a real run would need 101 phase-2 transforms — and a
-  # workspace-wide `--tests` cannot set a per-package feature. They also take ~5 minutes each
-  # (289 s and 303 s measured), so running them here keeps them off the main job's critical path
-  # instead of adding ~10 minutes to it.
-  #
-  # Neither had ever run in CI before #580.
   mpc-tests:
     name: MPC integration
     runs-on: ubuntu-latest

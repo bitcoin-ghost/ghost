@@ -574,12 +574,40 @@ fn parse_hashrate_from_benchmark_line(line: &str) -> Option<f64> {
     None
 }
 
+/// Default SV1 username for the harness miner.
+///
+/// ⛔ It MUST be `<bitcoin_address>.<worker_name>`. #479 made a bare username a REJECTED
+/// `mining.authorize` — "shares from this username could not be attributed and would earn
+/// nothing" — and `deploy-node.sh`'s smoke suite asserts that rejection on every roll, so the
+/// behaviour is deliberate and is not going to change back.
+///
+/// Every target that starts a miner had been passing either `None` or a bare name, so authorize
+/// was refused, no channel was ever opened, and the test then failed a minute later as
+/// "timeout while waiting for message OpenExtendedMiningChannel to go upstream" — which reads
+/// like a protocol fault in the SV2 path rather than a stale fixture. That single mismatch
+/// accounted for every failing and timing-out target in the 2026-09-06 triage; the five that
+/// passed were exactly the five that never start an SV1 miner.
+///
+/// The address is the harness's own signet coinbase address, so it is valid for the network
+/// these tests run on.
+pub const DEFAULT_MINER_USERNAME: &str = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8.worker1";
+
 pub async fn start_minerd(
     upstream_address: SocketAddr,
     username: Option<String>,
     password: Option<String>,
     single_submit: bool,
 ) -> Result<(MinerdProcess, SocketAddr), MinerdError> {
+    // Default rather than reject: a caller that does not care about identity still needs an
+    // authorisable one, and every caller that passed None was silently getting a miner the
+    // translator would refuse.
+    let (username, password) = match (username, password) {
+        (None, None) => (
+            Some(DEFAULT_MINER_USERNAME.to_string()),
+            Some("x".to_string()),
+        ),
+        (u, p) => (u, p),
+    };
     if username.is_none() && password.is_some() || username.is_some() && password.is_none() {
         return Err(MinerdError::InvalidConfiguration(
             "Username and password must be provided together".to_string(),
