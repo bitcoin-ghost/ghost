@@ -9,7 +9,9 @@ import {
   type LightL1UtxoEntry,
   type WraithDiscoverTier,
   type WraithMixCompleted,
+  type WraithMixRefused,
 } from "../lib/tauri";
+import { AnonymitySet } from "../components/AnonymitySet";
 import { HelpTip } from "../components/HelpTip";
 import { HELP_TOPICS } from "../lib/help";
 
@@ -87,6 +89,7 @@ export function Mix({ activeWallet }: MixProps) {
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [refusal, setRefusal] = useState<WraithMixRefused | null>(null);
   const [result, setResult] = useState<WraithMixCompleted | null>(null);
 
   const [utxos, setUtxos] = useState<LightL1UtxoEntry[]>([]);
@@ -251,7 +254,7 @@ export function Mix({ activeWallet }: MixProps) {
     setBip86Index(String(u.bip86_index));
   };
 
-  const onRun = async () => {
+  const onRun = async (acceptFloorArg?: number) => {
     setErr(null);
     setResult(null);
 
@@ -312,8 +315,20 @@ export function Mix({ activeWallet }: MixProps) {
         utxo_scriptpubkey_hex: utxoScript.trim(),
         mix_output_address: mixOutAddr.trim(),
         bip86_index: idx,
+        // Passed as an argument, not read from state: a `setState` in the same
+        // tick is not visible here, so reading state would silently re-run with
+        // the old floor and refuse again for the same reason.
+        min_entities: acceptFloorArg ?? undefined,
       });
-      setResult(r);
+      if (r.kind === "refused") {
+        // Not an error. The wallet inspected the round and declined, and the
+        // report is the part the user acts on.
+        setRefusal(r.value);
+        setResult(null);
+      } else {
+        setRefusal(null);
+        setResult(r.value);
+      }
     } catch (e) {
       setErr((e as Error).message ?? String(e));
     } finally {
@@ -353,6 +368,64 @@ export function Mix({ activeWallet }: MixProps) {
       </div>
 
       {err && <div className="card error-card">{err}</div>}
+
+      {refusal && (
+        <div className="mix-refusal">
+          <AnonymitySet
+            report={refusal.report}
+            verified
+            problem={
+              refusal.lowering_the_floor_would_help
+                ? { kind: "thin", floor: refusal.min_entities }
+                : {
+                    kind: "over_claimed",
+                    // The claim itself is in the reason text; the report is what
+                    // the wallet counted.
+                    claimed: refusal.report.entities + refusal.report.discounted,
+                  }
+            }
+          />
+          <div className="card">
+            <div className="card-header">
+              <h2>Nothing was signed</h2>
+            </div>
+            <ul className="muted mix-reasons">
+              {refusal.reasons.map((r, i) => (
+                <li key={i}>{r}</li>
+              ))}
+            </ul>
+            {refusal.lowering_the_floor_would_help ? (
+              <>
+                <p className="muted">
+                  This round is honest — there simply are not many people paying
+                  right now. Waiting for a fuller one costs you time and nothing
+                  else.
+                </p>
+                <button
+                  className="btn-secondary"
+                  onClick={() => {
+                    // Re-run with the floor the user just accepted. Clearing
+                    // the panel alone would be a confirmation that confirmed
+                    // nothing.
+                    const accepted = refusal.report.entities;
+                    setRefusal(null);
+                    void onRun(accepted);
+                  }}
+                  disabled={busy}
+                >
+                  Accept a set of {refusal.report.entities} and try again
+                </button>
+              </>
+            ) : (
+              <p className="muted">
+                The coordinator reported a larger set than its own coins support.
+                There is no size at which that becomes acceptable, so there is
+                nothing to accept here — try a different coordinator.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {result && (
         <div className="card" style={{ borderColor: "var(--pass)" }}>
@@ -651,7 +724,7 @@ export function Mix({ activeWallet }: MixProps) {
       <div className="row" style={{ justifyContent: "flex-end" }}>
         <button
           className="btn-primary"
-          onClick={onRun}
+          onClick={() => void onRun()}
           disabled={busy}
           style={{ padding: "12px 28px", fontSize: 15 }}
         >

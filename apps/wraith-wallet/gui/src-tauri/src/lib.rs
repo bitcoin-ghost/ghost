@@ -513,6 +513,7 @@ async fn wraith_mix_run(
     mix_output_address: String,
     bip86_index: Option<u32>,
     bip86_scan_max: Option<u32>,
+    min_entities: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WraithMixOneShot {
         coordinator_url,
@@ -527,6 +528,7 @@ async fn wraith_mix_run(
         mix_output_address,
         bip86_index,
         bip86_scan_max,
+        min_entities,
     })
     .await?;
     to_value(&resp)

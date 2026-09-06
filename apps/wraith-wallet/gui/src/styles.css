@@ -1321,3 +1321,8 @@ code {
   color: var(--dim);
 }
 .anon-proof.anon-unchecked { color: var(--warn); }
+
+/* Refusal block: the panel and its explanation read as one unit. */
+.mix-refusal { display: flex; flex-direction: column; gap: 0.75rem; }
+.mix-reasons { margin: 0 0 0.75rem; padding-left: 1.25rem; font-size: 0.875rem; line-height: 1.6; }
+.mix-reasons li { margin-bottom: 0.25rem; }

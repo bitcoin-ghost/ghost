@@ -4046,6 +4046,7 @@ mod server {
                 utxo_value_sats,
                 utxo_scriptpubkey_hex,
                 mix_output_address,
+                min_entities,
             } => {
                 use wraith_wallet_core::wraith::{
                     MixRequest, ParticipantUtxo, WraithClientError, WraithSessionClient,
@@ -4092,7 +4093,8 @@ mod server {
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
                     mix_output_address,
-                    min_entities: wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                    min_entities: min_entities
+                        .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
                 };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
@@ -4131,7 +4133,9 @@ mod server {
                             Ok(mut ledger) => match prepared.inspect(&mut ledger) {
                                 Err(e) => match refusal_response(
                                     prepared.session_id.clone(),
-                                    wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                                    min_entities.unwrap_or(
+                                        wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                                    ),
                                     &e,
                                 ) {
                                     Some(r) => Response::WraithMixRefused(r),
@@ -4323,6 +4327,7 @@ mod server {
                 mix_output_address,
                 bip86_index,
                 bip86_scan_max,
+                min_entities,
             } => {
                 use wraith_wallet_core::wraith::{
                     MixRequest, ParticipantUtxo, WraithClientError, WraithSessionClient,
@@ -4372,7 +4377,8 @@ mod server {
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
                     mix_output_address,
-                    min_entities: wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                    min_entities: min_entities
+                        .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
                 };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
@@ -4430,7 +4436,8 @@ mod server {
                     Err(e) => {
                         let resp = match refusal_response(
                             prepared.session_id.clone(),
-                            wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                            min_entities
+                                .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
                             &e,
                         ) {
                             Some(r) => Response::WraithMixRefused(r),

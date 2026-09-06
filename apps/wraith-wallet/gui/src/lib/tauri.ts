@@ -700,14 +700,48 @@ export interface WraithMixRunArgs {
   mix_output_address: string;
   bip86_index?: number;
   bip86_scan_max?: number;
+  /// Smallest anonymity set, in distinct entities, worth signing into.
+  /// Omitted uses the wallet's default. Supplying a lower value is how a user
+  /// accepts a smaller set — a stated number rather than a dismissed dialog.
+  min_entities?: number;
 }
+
+/// The wallet's own count of a round. Derived from the chain by the wallet,
+/// never taken from the coordinator.
+export interface AnonymitySetReport {
+  seats: number;
+  entities: number;
+  discounted: number;
+  unverified: number;
+  payers: number;
+}
+
+/// The wallet inspected the round and refused to sign it.
+export interface WraithMixRefused {
+  session_id: string;
+  report: AnonymitySetReport;
+  reasons: string[];
+  min_entities: number;
+  /// Whether accepting a smaller set could make this round signable.
+  ///
+  /// False for an over-claim: the coordinator stated a figure the chain does
+  /// not support, and no floor makes that acceptable. The UI must not offer to
+  /// lower one in that case.
+  lowering_the_floor_would_help: boolean;
+}
+
+/// A mix either completed or was refused. The refusal is not an error — it is
+/// the wallet doing its job, and it carries what the user needs to decide.
+export type WraithMixResult =
+  | { kind: "completed"; value: WraithMixCompleted }
+  | { kind: "refused"; value: WraithMixRefused };
 
 /// One-shot Wraith Lite CoinJoin. Daemon enrols, signs the
 /// taproot key-path witness using the active wallet's BIP86
 /// keystore, and drives the round to broadcast.
 export async function wraithMixRun(
   args: WraithMixRunArgs,
-): Promise<WraithMixCompleted> {
+): Promise<WraithMixResult> {
   const resp = await invoke("wraith_mix_run", {
     coordinatorUrl: args.coordinator_url,
     coordinatorPeers: args.coordinator_peers ?? [],
@@ -721,8 +755,16 @@ export async function wraithMixRun(
     mixOutputAddress: args.mix_output_address,
     bip86Index: args.bip86_index,
     bip86ScanMax: args.bip86_scan_max,
+    minEntities: args.min_entities,
   });
-  return unwrap<WraithMixCompleted>(resp).payload;
+  // The daemon distinguishes the two by response variant. A refusal arriving
+  // as a thrown error would lose the report, which is the only part the user
+  // can act on.
+  const payload = unwrap<Record<string, unknown>>(resp).payload;
+  if (payload && typeof payload === "object" && "reasons" in payload) {
+    return { kind: "refused", value: payload as unknown as WraithMixRefused };
+  }
+  return { kind: "completed", value: payload as unknown as WraithMixCompleted };
 }
 
 // ----- GSP ---------------------------------------------------------------

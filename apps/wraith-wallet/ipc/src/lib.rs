@@ -433,6 +433,10 @@ pub enum Request {
         utxo_value_sats: u64,
         utxo_scriptpubkey_hex: String,
         mix_output_address: String,
+        /// Smallest anonymity set, in distinct entities, worth signing into.
+        /// `None` uses the wallet's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_entities: Option<usize>,
     },
     /// Phase 5b companion to [`Request::WraithMixPrepare`]. Submits
     /// the supplied witness for the previously-prepared session and
@@ -498,6 +502,14 @@ pub enum Request {
         /// Bound on the BIP86 scan. Default 1024.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bip86_scan_max: Option<u32>,
+        /// Smallest anonymity set, in distinct entities, worth signing into.
+        ///
+        /// `None` uses the wallet's default. A caller supplying a lower value
+        /// is accepting a smaller set deliberately — which is why the wallet
+        /// asks for the number rather than a "proceed anyway" flag: stating a
+        /// floor is a decision, dismissing a dialog is a reflex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_entities: Option<usize>,
     },
     /// Decode a PSBT and return a per-input / per-output summary.
     /// Pure function — does not touch any wallet state, so unlike
