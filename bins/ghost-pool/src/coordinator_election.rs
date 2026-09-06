@@ -32,10 +32,25 @@ use parking_lot::RwLock;
 
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::types::NodeCapabilities;
 use ghost_consensus::mesh::MeshNetwork;
 
+use ghost_common::types::NodeCapabilities;
 use wraith_protocol::eligibility::{eligible_roster, EligibilityPolicy, NodeFacts};
+
+/// Verified-capability lookup, matching `CapabilityVerifierCallback` in
+/// `ghost-consensus` so the same provider serves both.
+pub type QualifiedCapsFn = Arc<dyn Fn(&CoordinatorNodeId) -> NodeCapabilities + Send + Sync>;
+
+/// Did this node pass the qualification gatekeeper at all?
+///
+/// Judged on the **verified** capability flags. `coordinator` is deliberately
+/// excluded: it is documented as opt-in that "needs no verification challenge",
+/// so counting it would let a self-declared flag masquerade as a challenge
+/// result — which is exactly the confusion this whole roster change exists to
+/// remove.
+fn passed_gatekeeper(caps: &NodeCapabilities) -> bool {
+    caps.archive_mode || caps.ghost_pay || caps.public_mining || caps.reaper || caps.elder_status
+}
 use wraith_protocol::epoch::canonical_roster;
 use wraith_protocol::roster_snapshot::roster_commitment;
 use wraith_protocol::service::{CoordinatorView, EndpointMap};
@@ -188,8 +203,6 @@ pub struct CoordinatorElection {
     /// the same opt-in model as `public_mining`). Only opted-in nodes that also
     /// advertise an endpoint enter the roster.
     self_coordinator: bool,
-    /// Whether THIS node runs in archive mode. Coordination requires it.
-    self_archive: bool,
     /// This node's own advertised coordinator endpoint (public `host:port` or a
     /// `.onion`). Included in the roster + endpoint map only when
     /// `self_coordinator` and non-empty.
@@ -198,6 +211,12 @@ pub struct CoordinatorElection {
     mesh: Arc<MeshNetwork>,
     /// Ghost Core RPC — source of the beacon anchor (block hash at a height).
     rpc: Arc<BitcoinRpc>,
+    /// Verified capabilities for a node, from `QualifiedCapabilityProvider`.
+    ///
+    /// Returns what a node has **proved** through challenges, not what it
+    /// claims in its health ping. The distinction is the point: archive mode is
+    /// the Sybil cost, and a claimed one costs nothing.
+    qualified_caps: QualifiedCapsFn,
     /// Cached current-epoch view.
     cached: RwLock<Option<Cached>>,
 }
@@ -211,11 +230,12 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
+        qualified_caps: QualifiedCapsFn,
     ) -> Self {
         Self {
+            qualified_caps,
             self_id: identity.node_id(),
             self_coordinator: capabilities.coordinator,
-            self_archive: capabilities.archive_mode,
             self_endpoint,
             mesh,
             rpc,
@@ -232,6 +252,7 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
+        qualified_caps: QualifiedCapsFn,
     ) -> Option<Arc<Self>> {
         if !enabled {
             return None;
@@ -242,15 +263,17 @@ impl CoordinatorElection {
             self_endpoint,
             mesh,
             rpc,
+            qualified_caps,
         )))
     }
 
-    /// The opted-in, reachable coordinator roster for this epoch, plus the
-    /// endpoint map. A peer is eligible iff it (a) advertises the `coordinator`
-    /// capability AND (b) advertised a non-empty endpoint in a recent health
-    /// ping (so a wallet can actually dial it). Self is included iff it opted in
-    /// and has its own advertised endpoint. The roster is canonicalised (dedup +
-    /// sort), so a node's own collection order cannot change the result.
+    /// The eligible coordinator roster for this epoch, plus the endpoint map.
+    ///
+    /// A peer is eligible iff it opted in, advertises a dialable endpoint, has
+    /// **verified** archive capability, passed the qualification gatekeeper, is
+    /// mature, and is not long-absent. Self is judged by the same verified
+    /// verdict as everyone else. The roster is canonicalised (dedup + sort), so
+    /// a node's own collection order cannot change the result.
     ///
     /// # Declared facts only
     ///
@@ -286,19 +309,21 @@ impl CoordinatorElection {
         // honest nodes disagree.
         for p in self.mesh.peers().get_all_peers() {
             let endpoint = p.coordinator_endpoint.clone();
+            // Verified, not claimed. `p.capabilities.archive_mode` is what the
+            // peer says about itself; this is what it proved under challenge,
+            // and a claimed archive flag costs an attacker nothing.
+            let verified = (self.qualified_caps)(&p.node_id);
             let f = NodeFacts {
                 node_id: p.node_id,
+                // Opt-in stays declared: `coordinator` carries no challenge by
+                // design, and a node that has not asked to coordinate should
+                // not be conscripted.
                 opted_in: p.capabilities.coordinator,
-                archive: p.capabilities.archive_mode,
+                archive: verified.archive_mode,
                 endpoint: endpoint.clone(),
                 first_seen_secs: p.first_seen,
                 last_seen_secs: p.last_seen,
-                // TODO(roster): read the real verdict from
-                // `ghost-verification::qualification`. Until that handle is
-                // threaded in, `require_qualified` is off in the policy below
-                // rather than defaulted to `true` here — an unchecked `true`
-                // would silently assert a gate that never ran.
-                qualified: false,
+                qualified: passed_gatekeeper(&verified),
             };
             if let Some(ep) = endpoint {
                 if !ep.trim().is_empty() {
@@ -316,25 +341,23 @@ impl CoordinatorElection {
                 .filter(|e| !e.trim().is_empty())
             {
                 endpoints.insert(self.self_id, ep.to_string());
+                // Self is judged by the same verified verdict as everyone
+                // else. Trusting our own claim here would make this node the
+                // one peer that never has to prove anything.
+                let mine = (self.qualified_caps)(&self.self_id);
                 facts.push(NodeFacts {
                     node_id: self.self_id,
                     opted_in: true,
-                    archive: self.self_archive,
+                    archive: mine.archive_mode,
                     endpoint: Some(ep.to_string()),
                     first_seen_secs: 0,
                     last_seen_secs: now,
-                    qualified: false,
+                    qualified: passed_gatekeeper(&mine),
                 });
                 demand = demand.saturating_add(self.mesh.coordinator_sessions() as u64);
             }
         }
 
-        // Qualification is not wired yet, so it is explicitly disabled rather
-        // than asserted. See the TODO above.
-        let policy = EligibilityPolicy {
-            require_qualified: false,
-            ..policy
-        };
         let roster = eligible_roster(&facts, policy, now);
         endpoints.retain(|id, _| roster.contains(id));
         (canonical_roster(&roster), endpoints, demand)

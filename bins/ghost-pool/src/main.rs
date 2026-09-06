@@ -7826,6 +7826,15 @@ async fn main() -> Result<()> {
         config.coordinator.advertised_endpoint.clone(),
         Arc::clone(&mesh),
         Arc::clone(&rpc),
+        {
+            // The same verified-capability provider the health handler uses, so
+            // the election judges a node by what it PROVED under challenge
+            // rather than by what it claims in its health ping. A claimed
+            // archive flag costs an attacker nothing; a proved one costs
+            // storage.
+            let qp = Arc::clone(&qualification_provider_for_health);
+            Arc::new(move |node_id: &[u8; 32]| qp.get_qualified(node_id))
+        },
     );
     {
         let coord_for_api = coordinator_election.clone();
