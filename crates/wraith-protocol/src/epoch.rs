@@ -68,24 +68,29 @@ pub fn shard_key_for_tier_epoch(tier_id: &str, epoch: u64) -> [u8; 32] {
 /// Domain separator for the per-epoch beacon.
 const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
 
-/// Derive the 32-byte per-epoch beacon from the anchor block's hash:
-/// `SHA256(domain ‖ epoch_le ‖ anchor_hash)`.
+/// ⚠ **PLACEHOLDER. Grindable. Do not enable coordinator election on this.**
 ///
-/// Lives here, beside [`snapshot_height_for_epoch`], because a node and a
-/// wallet must derive the byte-identical beacon or every verification fails.
-/// It was previously defined in `ghost-pool`'s wiring layer, where a wallet
-/// could not reach it — and where it anchored on a different block than this
-/// module documents (see that function).
+/// Derives a beacon from the anchor block hash alone, which is exactly the
+/// construction `plan_decentralised_coordinators.md` names as the thing to
+/// avoid: *"where random + unriggable is won or lost"*.
 ///
-/// `anchor_hash` is the block hash **exactly as the node's JSON-RPC returns
-/// it**, hex-decoded with no byte reversal. Both sides must agree on that or
-/// the beacons differ silently.
+/// A pool miner grinds the extranonce, computes the rank the resulting hash
+/// would give them, and discards blocks that do not elect them. The cost is one
+/// block's expected value per attempt; the prize is a coordinator seat and the
+/// traffic that flows through it. At scale that is a rational trade, not an
+/// attack requiring unusual resources.
 ///
-/// SECURITY: the miner of the anchor block can choose among the candidate
-/// hashes it could publish, so this beacon's grinding-resistance is BOUNDED.
-/// The unbiasable construction is the threshold-VRF / DKG one, gated on an
-/// external crypto audit. Everything downstream takes the beacon as a value,
-/// so swapping it changes nothing else.
+/// This is safe today only because `[coordinator] wraith_election_enabled`
+/// defaults to **false** and nothing runs it. Turning that flag on without
+/// replacing this is the entire vulnerability.
+///
+/// Use [`crate::beacon::BeaconRound`] instead: roster members commit to nonces
+/// *before* the anchor is chosen, so grinding the anchor cannot help. That is
+/// increment 2 of the plan, and it was unbuilt until now.
+///
+/// Kept because `ghost-pool::coordinator_election` calls it and the replacement
+/// needs a commit/reveal transport that does not exist yet. Deleting it would
+/// break the build; leaving it unlabelled would be worse.
 pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(BEACON_DOMAIN);
@@ -200,6 +205,30 @@ mod tests {
         // an epoch's snapshot is in the PREVIOUS epoch (fixed before it starts)
         let e = 7u64;
         assert_eq!(epoch_for_height(snapshot_height_for_epoch(e)), e - 1);
+    }
+
+    /// Pins the relationship between the placeholder and its replacement, so
+    /// the two beacon derivations cannot drift apart unnoticed — one of them is
+    /// grindable and it is the one currently wired up.
+    #[test]
+    fn the_placeholder_beacon_is_not_the_real_one() {
+        use crate::beacon::{commitment, BeaconRound};
+
+        let anchor = [9u8; 32];
+        let placeholder = derive_beacon(7, &anchor);
+
+        let mut r = BeaconRound::new();
+        for i in 1..=5u8 {
+            let (node, nonce) = ([i; 32], [i + 100; 32]);
+            r.commit(node, commitment(&node, &nonce));
+            r.reveal(node, nonce).unwrap();
+        }
+        let real = r.finalise(&anchor, 1_001, 1_000, 5).unwrap();
+
+        assert_ne!(
+            placeholder, real,
+            "if these ever coincide, the commit-reveal contributions are being ignored"
+        );
     }
 
     #[test]
