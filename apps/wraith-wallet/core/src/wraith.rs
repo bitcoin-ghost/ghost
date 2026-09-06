@@ -62,6 +62,18 @@ pub enum WraithClientError {
     Coordinator { status: u16, detail: String },
     #[error("response body did not match expected shape: {0}")]
     Shape(String),
+    /// The round failed inspection, so nothing was signed.
+    ///
+    /// Carries every reason rather than the first: a wallet deciding between
+    /// retrying and walking away needs the whole picture, and a thin round is a
+    /// different decision from a coordinator that misreported.
+    #[error("refused to sign the round: {}", .reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    RefusedRound {
+        /// Everything wrong with it.
+        reasons: Vec<wraith_protocol::pre_sign::RefuseToSign>,
+        /// What this wallet counted for itself.
+        report: wraith_protocol::anonymity_set::SetReport,
+    },
     #[error("hex decode: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error("bitcoin consensus encode: {0}")]
@@ -100,7 +112,25 @@ pub struct MixRequest {
     /// output. Must NOT be linkable to the wallet's input UTXO —
     /// fresh address recommended.
     pub mix_output_address: String,
+    /// Smallest anonymity set, in **distinct entities**, worth signing into.
+    ///
+    /// Entities rather than seats: a round of fifty where one party supplied
+    /// forty-nine is a set of two, and a floor counted in seats passes exactly
+    /// the round it exists to catch.
+    ///
+    /// A starting parameter, not a measurement. `DEFAULT_MIN_ENTITIES` is twice
+    /// the protocol's round minimum, which is reachable at modest volume and
+    /// gives an observer a one-in-ten guess. It should be revised against
+    /// measured round volume rather than left as received wisdom.
+    pub min_entities: usize,
 }
+
+/// Default anonymity floor, in distinct entities.
+///
+/// `MIN_ROUND_PARTICIPANTS` is 5, but that is the smallest round the *protocol*
+/// will assemble, not a sensible privacy default — one in five is barely
+/// privacy. Unmeasured; revise against real volume.
+pub const DEFAULT_MIN_ENTITIES: usize = 10;
 
 /// The result of a successful mix.
 #[derive(Debug, Clone)]
@@ -178,6 +208,80 @@ pub struct PreparedMix {
     /// Wallet identity — kept for the /witness POST; not used by
     /// the caller.
     pub ghost_id: String,
+    /// The anonymity floor this mix was requested with, carried so the
+    /// split sign-then-submit path can apply the same check as `execute_mix`.
+    pub min_entities: usize,
+    /// The value the wallet's own output must carry.
+    pub expected_output_sats: u64,
+    /// The scriptPubKey the wallet's own output must pay.
+    pub expected_output_script: bitcoin::ScriptBuf,
+}
+
+impl PreparedMix {
+    /// Inspect the round before signing it.
+    ///
+    /// **This is what stops the wallet signing whatever it is handed.** Until it
+    /// existed, `execute_mix` went straight from `/round-tx` to `sign` — no
+    /// check that the wallet's own input was present, that its own output
+    /// existed for the right amount, that the fee was sane, or that the
+    /// anonymity set was worth anything.
+    ///
+    /// The recount is done here from the transaction and its prevouts rather
+    /// than taken from the coordinator, because a coordinator can lie about the
+    /// set but not about the chain.
+    pub fn inspect(&self) -> Result<wraith_protocol::anonymity_set::SetReport, WraithClientError> {
+        use wraith_protocol::client_session::Joined;
+        use wraith_protocol::pre_sign::Expectation;
+
+        let scripts: Vec<Vec<u8>> = self
+            .prevouts
+            .iter()
+            .map(|p| hex::decode(p.scriptpubkey_hex.trim()).unwrap_or_default())
+            .collect();
+
+        let total_input_sats = self
+            .prevouts
+            .iter()
+            .fold(0u64, |acc, p| acc.saturating_add(p.value_sats));
+
+        let mine = self.unsigned_tx.input[self.input_index].previous_output;
+        let want = Expectation {
+            my_input: (mine.txid, mine.vout),
+            my_output_script: self.expected_output_script.clone(),
+            my_output_sats: self.expected_output_sats,
+            total_input_sats,
+            // The coordinator's own arithmetic bounds this; a round paying more
+            // to miners than its inputs allow cannot assemble at all.
+            max_fee_sats: total_input_sats,
+            min_set: self.min_entities,
+            set_report: None,
+            claimed_set: None,
+        };
+
+        let report = wraith_protocol::anonymity_set::recount_from_inputs(
+            &self
+                .unsigned_tx
+                .input
+                .iter()
+                .zip(scripts.iter())
+                .map(|(txin, script)| wraith_protocol::clustering::CoinFacts {
+                    outpoint: wraith_protocol::signing_ledger::OutPointKey {
+                        txid: {
+                            use bitcoin::hashes::Hash;
+                            txin.previous_output.txid.to_byte_array()
+                        },
+                        vout: txin.previous_output.vout,
+                    },
+                    script_pubkey: script.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        match Joined::new(want).verify_response(&self.unsigned_tx, &scripts, None) {
+            Ok(_) => Ok(report),
+            Err(reasons) => Err(WraithClientError::RefusedRound { reasons, report }),
+        }
+    }
 }
 
 /// One input prevout reference. Mirrors the coordinator's wire-format
@@ -344,6 +448,9 @@ impl WraithSessionClient {
         PFut: std::future::Future<Output = Result<String, WraithClientError>>,
     {
         let prepared = self.prepare_mix(request, prove_ownership).await?;
+        // Inspect before signing. A signature is the only irreversible step in
+        // this protocol, so it is the one that has to be earned.
+        prepared.inspect()?;
         let witness = signer
             .sign(
                 &prepared.unsigned_tx,
@@ -534,6 +641,14 @@ impl WraithSessionClient {
             })
             .collect();
 
+        // What the wallet's own output must be, read from the transaction the
+        // coordinator served but at the index the wallet located itself. The
+        // check that follows compares the round against this, so it has to come
+        // from `locate_mix_output_index` rather than from anything the
+        // coordinator asserted about which output is ours.
+        let expected_output_script = tx.output[mixed_output_tx_index].script_pubkey.clone();
+        let expected_output_sats = tx.output[mixed_output_tx_index].value.to_sat();
+
         Ok(PreparedMix {
             session_id,
             unsigned_tx: tx,
@@ -542,6 +657,9 @@ impl WraithSessionClient {
             prevouts,
             mixed_output_tx_index,
             ghost_id: request.ghost_id,
+            min_entities: request.min_entities,
+            expected_output_sats,
+            expected_output_script,
         })
     }
 

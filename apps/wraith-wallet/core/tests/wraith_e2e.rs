@@ -140,6 +140,10 @@ async fn five_wallets_complete_a_full_mix_round() {
                 scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
             };
             let req = MixRequest {
+                // The flow is what is under test here, not the anonymity floor;
+                // a dedicated test covers the refusal. Set to 1 so a small
+                // fixture round does not fail for the wrong reason.
+                min_entities: 1,
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo,
@@ -316,6 +320,10 @@ async fn prepare_then_submit_works_via_split_api() {
             let client = WraithSessionClient::new(base_url, Network::Signet);
             let ghost = format!("wallet-{i}");
             let req = MixRequest {
+                // The flow is what is under test here, not the anonymity floor;
+                // a dedicated test covers the refusal. Set to 1 so a small
+                // fixture round does not fail for the wrong reason.
+                min_entities: 1,
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo: ParticipantUtxo {
@@ -466,6 +474,10 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
             let client = WraithSessionClient::new(base_url, Network::Signet);
             let ghost = format!("wallet-{i}");
             let req = MixRequest {
+                // The flow is what is under test here, not the anonymity floor;
+                // a dedicated test covers the refusal. Set to 1 so a small
+                // fixture round does not fail for the wrong reason.
+                min_entities: 1,
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo: ParticipantUtxo {
@@ -535,9 +547,15 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
     let final_tx = stub_broadcaster.last().expect("broadcast happened");
     assert_eq!(final_tx.input.len(), N);
 
-    // Reconstruct prevouts in tx order. inputs_store still holds the
-    // per-participant records; we walk it the same way the coordinator
-    // did when shipping prevouts on /round-tx.
+    // Reconstruct prevouts BY OUTPOINT, in transaction order.
+    //
+    // This used to walk `inputs_store` in registration order and claim that was
+    // "the same way the coordinator did". It no longer is: round inputs are
+    // shuffled, because registration order is close to arrival order and leaked
+    // who joined when. `/round-tx` keys its prevouts by outpoint for exactly
+    // this reason, and so must anything recomputing a sighash — a prevout list
+    // in the wrong order produces a wrong sighash and a signature that looks
+    // forged.
     let inputs = state
         .inputs_store
         .lock()
@@ -545,18 +563,45 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
         .get(&session_id)
         .cloned()
         .unwrap_or_default();
-    let mut prev_txouts: Vec<TxOut> = Vec::with_capacity(inputs.len());
-    for inp in &inputs {
+
+    let by_outpoint: std::collections::HashMap<(String, u32), _> = inputs
+        .iter()
+        .flat_map(|a| {
+            a.inputs
+                .iter()
+                .map(move |r| ((r.txid.trim().to_ascii_lowercase(), r.vout), (a, r)))
+        })
+        .collect();
+
+    let mut prev_txouts: Vec<TxOut> = Vec::with_capacity(final_tx.input.len());
+    for txin in &final_tx.input {
+        let key = (
+            txin.previous_output.txid.to_string().to_ascii_lowercase(),
+            txin.previous_output.vout,
+        );
+        let (_, r) = by_outpoint.get(&key).expect("prevout for every tx input");
         prev_txouts.push(TxOut {
-            value: bitcoin::Amount::from_sat(inp.input.value_sats),
-            script_pubkey: ScriptBuf::from_bytes(hex::decode(&inp.input.scriptpubkey_hex).unwrap()),
+            value: bitcoin::Amount::from_sat(r.value_sats),
+            script_pubkey: ScriptBuf::from_bytes(hex::decode(&r.scriptpubkey_hex).unwrap()),
         });
     }
 
     let secp = Secp256k1::new();
     use bitcoin::hashes::Hash as _;
     use bitcoin::key::TapTweak;
-    for (idx, inp) in inputs.iter().enumerate() {
+    // Iterate the TRANSACTION's inputs, not the registration list — the two
+    // are no longer in the same order, and using the registration index would
+    // verify each signature against somebody else's input.
+    for idx in 0..final_tx.input.len() {
+        let key = (
+            final_tx.input[idx]
+                .previous_output
+                .txid
+                .to_string()
+                .to_ascii_lowercase(),
+            final_tx.input[idx].previous_output.vout,
+        );
+        let (inp, _) = by_outpoint.get(&key).expect("record for every tx input");
         // Recompute the sighash for this input.
         let mut cache = SighashCache::new(&final_tx);
         let sighash = cache
@@ -600,5 +645,76 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
         secp.verify_schnorr(&sig, &msg, &xonly).unwrap_or_else(|e| {
             panic!("input {idx} (wallet-{wallet_idx}) signature failed verify: {e}")
         });
+    }
+}
+
+/// The floor refuses a round that is too small, and refuses it BEFORE signing.
+///
+/// The wallet used to go straight from `/round-tx` to `sign` with no inspection
+/// at all — no check that its own input was there, that its own output existed
+/// for the right amount, or that the anonymity set was worth anything. This
+/// pins the check that closed that.
+#[test]
+fn a_prepared_round_below_the_floor_is_refused_before_signing() {
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Transaction, TxIn,
+        TxOut,
+    };
+    use wraith_wallet_core::wraith::{PreparedMix, PreparedPrevOut, WraithClientError};
+
+    // Three inputs, all siblings of one funding transaction — one entity.
+    let shared = bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
+    let spk = ScriptBuf::from_bytes(
+        hex::decode("0014000102030405060708090a0b0c0d0e0f1011121314").unwrap(),
+    );
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: (0..3u32)
+            .map(|vout| TxIn {
+                previous_output: OutPoint { txid: shared, vout },
+                ..Default::default()
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+
+    let prepared = PreparedMix {
+        session_id: "s".into(),
+        unsigned_tx: tx,
+        input_index: 0,
+        prev_amount_sats: 150_000,
+        prevouts: (0..3)
+            .map(|_| PreparedPrevOut {
+                scriptpubkey_hex: hex::encode(spk.as_bytes()),
+                value_sats: 150_000,
+            })
+            .collect(),
+        mixed_output_tx_index: 0,
+        ghost_id: "g".into(),
+        min_entities: 5,
+        expected_output_sats: 100_000,
+        expected_output_script: spk,
+    };
+
+    match prepared.inspect() {
+        Err(WraithClientError::RefusedRound { reasons, report }) => {
+            assert_eq!(
+                report.entities, 1,
+                "three siblings of one funding tx are one entity, not three"
+            );
+            assert_eq!(report.seats, 3, "seats and entities must both be reported");
+            assert!(
+                reasons.iter().any(|r| matches!(
+                    r,
+                    wraith_protocol::pre_sign::RefuseToSign::SetTooSmall { .. }
+                )),
+                "{reasons:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
     }
 }

@@ -69,6 +69,8 @@ fn signet_addr_for(i: u8) -> String {
 
 fn fixture_request() -> MixRequest {
     MixRequest {
+        // Rotation is under test here, not the anonymity floor.
+        min_entities: 1,
         tier_id: "100k_sats".into(),
         ghost_id: "rotation-test".into(),
         utxo: ParticipantUtxo {
