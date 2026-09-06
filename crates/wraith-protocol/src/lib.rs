@@ -77,6 +77,7 @@ pub mod remix;
 
 pub mod admission;
 pub mod attestation;
+pub mod consolidation;
 pub mod epoch;
 pub mod ladder;
 pub mod ladder_round;
