@@ -86,6 +86,28 @@ pub enum ExitRisk {
     },
 }
 
+impl ExitConfig {
+    /// A config anchored to the real hot-lane escape leaf.
+    ///
+    /// `exit_delay_blocks` is read from [`ghost_lock::HOT_EXIT_BLOCKS`] rather
+    /// than restated. The two crates do not otherwise know about each other, so
+    /// a change to the leaf would silently leave this analysis reasoning about
+    /// a delay that no longer exists — drift a grep inside either crate cannot
+    /// see.
+    pub fn for_hot_lane(
+        remix_interval_blocks: u32,
+        outstanding_presignatures: u32,
+        round_settlement_blocks: u32,
+    ) -> Self {
+        Self {
+            exit_delay_blocks: ghost_lock::HOT_EXIT_BLOCKS,
+            remix_interval_blocks,
+            outstanding_presignatures,
+            round_settlement_blocks,
+        }
+    }
+}
+
 /// Blocks from an exit request to a unilateral exit becoming spendable.
 ///
 /// Assumes the wallet stops entering rounds on request, which is the behaviour
@@ -149,6 +171,20 @@ mod tests {
             outstanding_presignatures: 1,
             round_settlement_blocks: 36,
         }
+    }
+
+    #[test]
+    fn the_analysis_reads_the_delay_from_the_crate_that_defines_it() {
+        // Cross-crate drift is the version of this a single-crate grep cannot
+        // find: `ghost-lock` owns the escape leaf, `wraith-protocol` reasons
+        // about it, and nothing connected them.
+        let cfg = ExitConfig::for_hot_lane(5_000, 1, 36);
+        assert_eq!(cfg.exit_delay_blocks, ghost_lock::HOT_EXIT_BLOCKS);
+        assert_eq!(
+            realistic().exit_delay_blocks,
+            ghost_lock::HOT_EXIT_BLOCKS,
+            "the fixture has drifted from the leaf it claims to model"
+        );
     }
 
     #[test]

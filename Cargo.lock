@@ -3384,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-lock"
-version = "1.11.34"
+version = "1.11.35"
 dependencies = [
  "bitcoin",
  "rand 0.8.6",
@@ -10709,6 +10709,7 @@ version = "1.11.35"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
+ "ghost-lock",
  "hex",
  "parking_lot",
  "rand 0.8.6",

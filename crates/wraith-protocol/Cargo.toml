@@ -50,6 +50,11 @@ zeroize = { workspace = true }
 # builds re-enable zmq through their direct ghost-common dependency (Cargo unifies
 # features per build graph), so the node is unaffected.
 
+# The Lock policies this crate reasons about. `exit_availability` analyses the
+# hot lane's escape leaf, so it must read the delay from the crate that defines
+# it rather than restate the number.
+ghost-lock = { path = "../ghost-lock" }
+
 # Concurrency and timing
 parking_lot = { workspace = true }
 getrandom = { workspace = true }
