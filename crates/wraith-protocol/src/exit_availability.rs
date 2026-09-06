@@ -159,6 +159,124 @@ pub fn max_safe_presignatures(cfg: &ExitConfig, tolerated_delay_blocks: u32) -> 
     tolerated_delay_blocks.saturating_sub(cfg.exit_delay_blocks) / cfg.round_settlement_blocks
 }
 
+/// Where a hot-lane coin is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    /// Normal operation: the coin remixes and the owner pre-signs rounds.
+    Active,
+    /// The owner has asked to leave. **No new pre-signatures are issued.**
+    Exiting {
+        /// Height at which the request was made.
+        requested_at: u32,
+    },
+}
+
+/// Enforces the two behaviours the exit guarantee depends on.
+///
+/// [`assess`] reports whether an exit is *possible*. This is the thing that
+/// makes it so, and both halves are behaviour a wallet must implement rather
+/// than properties of the script:
+///
+/// 1. **Stop entering rounds on request.** A coin that keeps remixing keeps
+///    resetting its own `older(EXIT_DELAY)` clock, so the leaf never matures.
+/// 2. **Bound outstanding pre-signatures.** Stopping achieves nothing if the
+///    quorum still holds signatures it can spend with — each one is another
+///    round it can complete after the owner asked to leave.
+///
+/// The second is enforced here rather than merely computed, because a wallet
+/// that pre-signs generously is more convenient at every individual moment and
+/// only worse in aggregate. That is the shape of decision that needs a refusal
+/// rather than a guideline.
+#[derive(Debug, Clone)]
+pub struct ExitController {
+    state: LaneState,
+    outstanding: u32,
+    cfg: ExitConfig,
+    tolerated_delay_blocks: u32,
+    refused_presignatures: u64,
+}
+
+impl ExitController {
+    /// New controller for an active lane.
+    pub fn new(cfg: ExitConfig, tolerated_delay_blocks: u32) -> Self {
+        Self {
+            state: LaneState::Active,
+            outstanding: cfg.outstanding_presignatures,
+            cfg,
+            tolerated_delay_blocks,
+            refused_presignatures: 0,
+        }
+    }
+
+    /// Current state.
+    pub fn state(&self) -> LaneState {
+        self.state
+    }
+
+    /// Pre-signatures the quorum could still spend with.
+    pub fn outstanding(&self) -> u32 {
+        self.outstanding
+    }
+
+    /// How many pre-signature requests were refused.
+    ///
+    /// Rising steadily means the wallet is trying to pre-sign further ahead than
+    /// the exit guarantee permits, which is a bug in the wallet rather than a
+    /// user problem.
+    pub fn refused(&self) -> u64 {
+        self.refused_presignatures
+    }
+
+    /// May the owner pre-sign another round right now?
+    pub fn may_presign(&self) -> bool {
+        if matches!(self.state, LaneState::Exiting { .. }) {
+            return false;
+        }
+        let mut probe = self.cfg;
+        probe.outstanding_presignatures = self.outstanding;
+        self.outstanding < max_safe_presignatures(&probe, self.tolerated_delay_blocks)
+    }
+
+    /// Record a pre-signature, or refuse it.
+    pub fn presign(&mut self) -> bool {
+        if !self.may_presign() {
+            self.refused_presignatures += 1;
+            return false;
+        }
+        self.outstanding += 1;
+        true
+    }
+
+    /// A round settled, freeing one pre-signature.
+    pub fn on_round_settled(&mut self) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+    }
+
+    /// The owner asks to leave. Idempotent — the first request is what counts.
+    pub fn request_exit(&mut self, height: u32) {
+        if matches!(self.state, LaneState::Active) {
+            self.state = LaneState::Exiting {
+                requested_at: height,
+            };
+        }
+    }
+
+    /// Height at which the unilateral exit becomes spendable, once known.
+    ///
+    /// `None` while pre-signatures are outstanding: the quorum can still
+    /// complete a round and restart the clock, so no honest answer exists yet.
+    /// Reporting an optimistic height would be worse than reporting none.
+    pub fn exit_available_at(&self) -> Option<u32> {
+        let LaneState::Exiting { requested_at } = self.state else {
+            return None;
+        };
+        if self.outstanding > 0 {
+            return None;
+        }
+        Some(requested_at.saturating_add(self.cfg.exit_delay_blocks))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +289,84 @@ mod tests {
             outstanding_presignatures: 1,
             round_settlement_blocks: 36,
         }
+    }
+
+    fn controller() -> ExitController {
+        let mut cfg = realistic();
+        cfg.remix_interval_blocks = 5_000;
+        cfg.outstanding_presignatures = 0;
+        ExitController::new(cfg, 2_000)
+    }
+
+    #[test]
+    fn requesting_an_exit_stops_new_presignatures() {
+        // The whole mechanism. Without this the coin keeps remixing and its own
+        // escape leaf never matures.
+        let mut c = controller();
+        assert!(c.presign());
+        c.request_exit(900_000);
+        assert!(!c.may_presign());
+        assert!(
+            !c.presign(),
+            "a wallet must not pre-sign after an exit request"
+        );
+        assert_eq!(c.refused(), 1);
+    }
+
+    #[test]
+    fn the_presignature_bound_is_enforced_not_merely_reported() {
+        // Pre-signing further ahead is more convenient at every single moment
+        // and only worse in aggregate, so it needs a refusal rather than advice.
+        let mut c = controller();
+        let mut granted = 0;
+        for _ in 0..200 {
+            if c.presign() {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 27, "the computed bound must be the enforced bound");
+        assert!(c.refused() > 0);
+        assert_eq!(c.outstanding(), 27);
+    }
+
+    #[test]
+    fn no_exit_height_is_offered_while_signatures_are_outstanding() {
+        // The quorum can still complete a round and restart the clock, so no
+        // honest answer exists. An optimistic height would be worse than none.
+        let mut c = controller();
+        c.presign();
+        c.presign();
+        c.request_exit(900_000);
+        assert_eq!(c.exit_available_at(), None);
+
+        c.on_round_settled();
+        assert_eq!(c.exit_available_at(), None, "one still outstanding");
+
+        c.on_round_settled();
+        assert_eq!(
+            c.exit_available_at(),
+            Some(900_000 + ghost_lock::HOT_EXIT_BLOCKS),
+            "now the clock can actually run"
+        );
+    }
+
+    #[test]
+    fn requesting_twice_does_not_restart_the_clock() {
+        let mut c = controller();
+        c.request_exit(900_000);
+        c.request_exit(950_000);
+        assert_eq!(
+            c.exit_available_at(),
+            Some(900_000 + ghost_lock::HOT_EXIT_BLOCKS)
+        );
+    }
+
+    #[test]
+    fn settling_below_zero_does_not_wrap() {
+        let mut c = controller();
+        c.on_round_settled();
+        c.on_round_settled();
+        assert_eq!(c.outstanding(), 0);
     }
 
     #[test]
