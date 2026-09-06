@@ -14,6 +14,7 @@ pub mod lock_recovery;
 pub mod mainnet_guard;
 pub mod psbt;
 pub mod signer;
+pub mod signing_ledger_file;
 pub mod user_entropy;
 pub mod wraith;
 pub mod wraith_signer;

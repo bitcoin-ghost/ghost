@@ -172,7 +172,13 @@ async fn five_wallets_complete_a_full_mix_round() {
                     Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
                 }
             };
-            client.execute_mix(req, signer, prove).await
+            // Each wallet keeps its own ledger, as each would in production.
+            // Volatile is right here: the test is one process and one round, and
+            // the durable store has its own tests.
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            client.execute_mix(req, signer, prove, &mut ledger).await
         });
         handles.push(handle);
     }
@@ -760,4 +766,39 @@ fn a_signature_under_the_wrong_sighash_is_refused_by_its_length() {
         check_witness_sighash(&empty, 0),
         Err(WraithClientError::UnsafeSighash { len: 0, .. })
     ));
+}
+
+/// The same coin cannot be signed into two different rounds.
+///
+/// `SigningLedger` existed with no caller anywhere, so the rule was written down
+/// and not enforced. That matters more than it sounds: a coin signed into two
+/// rounds double-spends itself, one round dies at broadcast, and every other
+/// participant in it loses their round — and their coin's freedom, once the
+/// no-sign sweep puts it in cooldown — through no fault of their own.
+#[test]
+fn a_coin_committed_to_one_round_is_refused_for_another() {
+    use wraith_protocol::signing_ledger::{Decision, LedgerError, OutPointKey, SigningLedger};
+    use wraith_wallet_core::signing_ledger_file::FileSignatureStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("signed.json");
+    let coin = OutPointKey::new([0xAB; 32], 1);
+
+    let mut ledger = SigningLedger::new(FileSignatureStore::open(&path).unwrap());
+    assert_eq!(ledger.authorise(coin, [0x11; 32]), Ok(Decision::Sign));
+
+    // A second, different round wants the same coin.
+    assert_eq!(
+        ledger.authorise(coin, [0x22; 32]),
+        Err(LedgerError::Conflict {
+            existing_txid: [0x11; 32]
+        })
+    );
+    assert_eq!(ledger.refusals(), 1, "the refusal must be countable");
+
+    // And it still refuses after a restart, which is the case a volatile store
+    // would silently get wrong.
+    drop(ledger);
+    let mut reopened = SigningLedger::new(FileSignatureStore::open(&path).unwrap());
+    assert!(reopened.authorise(coin, [0x22; 32]).is_err());
 }

@@ -62,6 +62,17 @@ pub enum WraithClientError {
     Coordinator { status: u16, detail: String },
     #[error("response body did not match expected shape: {0}")]
     Shape(String),
+    /// This coin is already committed to a different round.
+    ///
+    /// Signing it again would double-spend it: one of the two rounds dies at
+    /// broadcast, and every other participant in that round loses it through no
+    /// fault of their own — and has their coin put in cooldown for it.
+    #[error("this coin is already committed to round {existing}; signing it into another would double-spend it and kill a round for everyone else in it")]
+    CoinAlreadyCommitted {
+        /// The round it is already committed to.
+        existing: String,
+    },
+
     /// A signature was produced under a sighash that does not commit to what
     /// was inspected, so the inspection would have been void.
     #[error("input {input_index} was signed with a {len}-byte signature; BIP-341 SIGHASH_DEFAULT is 64 bytes, and anything longer carries a sighash flag that lets the round be edited after inspection")]
@@ -477,21 +488,56 @@ impl WraithSessionClient {
     /// remote signer service) or when the caller wants to inspect
     /// `prepared.unsigned_tx` before signing — e.g. the
     /// daemon-integrated CLI.
-    pub async fn execute_mix<S, P, PFut>(
+    pub async fn execute_mix<S, P, PFut, L>(
         &self,
         request: MixRequest,
         mut signer: S,
         prove_ownership: P,
+        ledger: &mut wraith_protocol::signing_ledger::SigningLedger<L>,
     ) -> Result<MixOutcome, WraithClientError>
     where
         S: WitnessSigner,
         P: FnMut(&str) -> PFut,
         PFut: std::future::Future<Output = Result<String, WraithClientError>>,
+        L: wraith_protocol::signing_ledger::SignatureStore,
     {
         let prepared = self.prepare_mix(request, prove_ownership).await?;
         // Inspect before signing. A signature is the only irreversible step in
         // this protocol, so it is the one that has to be earned.
         prepared.inspect()?;
+
+        // Commit the coin to THIS round before signing it.
+        //
+        // Recorded first, deliberately: a crash between signing and recording is
+        // the window the rule exists to close, and an unrecorded signature is
+        // the one that gets replayed into a second round after a restart. The
+        // record is durable before this returns.
+        //
+        // A required parameter rather than an optional field, because the
+        // failure mode throughout this codebase has been correct checks that
+        // nothing calls. This one cannot be forgotten — there is no way to sign
+        // without supplying a ledger.
+        {
+            use bitcoin::hashes::Hash as _;
+            let mine = prepared.unsigned_tx.input[prepared.input_index].previous_output;
+            let coin = wraith_protocol::signing_ledger::OutPointKey::new(
+                mine.txid.to_byte_array(),
+                mine.vout,
+            );
+            let round_txid = prepared.unsigned_tx.compute_txid();
+            ledger
+                .authorise(coin, round_txid.to_byte_array())
+                .map_err(|e| match e {
+                    wraith_protocol::signing_ledger::LedgerError::Conflict { existing_txid } => {
+                        let mut disp = existing_txid;
+                        disp.reverse();
+                        WraithClientError::CoinAlreadyCommitted {
+                            existing: hex::encode(disp),
+                        }
+                    }
+                })?;
+        }
+
         let witness = signer
             .sign(
                 &prepared.unsigned_tx,
