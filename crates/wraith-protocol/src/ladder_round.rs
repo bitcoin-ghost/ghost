@@ -484,7 +484,8 @@ pub fn plan_participation(
     coins: &[Coin],
     amount_sats: u64,
     fee_share_sats: u64,
-    addresses: &[String],
+    recipient_addresses: &[String],
+    change_addresses: &[String],
 ) -> Result<LadderParticipant, PlanError> {
     let values: Vec<u64> = coins.iter().map(|c| c.value_sats).collect();
     let plan = ladder
@@ -502,18 +503,26 @@ pub fn plan_participation(
     // only the prefix consumed. A caller with a derivation bug that repeats an
     // address past the ones needed today will repeat it inside the window
     // tomorrow, and a shortage is a far less serious complaint to return.
+    // Reuse is checked FIRST, and across BOTH lists rather than only the prefix
+    // consumed. Checking across both also catches the worst case: a change
+    // address that is also a recipient address.
     let mut seen = std::collections::HashSet::new();
-    for a in addresses {
+    for a in recipient_addresses.iter().chain(change_addresses.iter()) {
         if !seen.insert(a) {
             return Err(PlanError::AddressReused { address: a.clone() });
         }
     }
 
-    let needed = plan.recipient.len() + plan.change.len();
-    if addresses.len() < needed {
+    if recipient_addresses.len() < plan.recipient.len() {
         return Err(PlanError::NotEnoughAddresses {
-            needed,
-            got: addresses.len(),
+            needed: plan.recipient.len(),
+            got: recipient_addresses.len(),
+        });
+    }
+    if change_addresses.len() < plan.change.len() {
+        return Err(PlanError::NotEnoughAddresses {
+            needed: plan.change.len(),
+            got: change_addresses.len(),
         });
     }
 
@@ -532,11 +541,12 @@ pub fn plan_participation(
         });
     }
 
+    // Pooled here, and only here: the result must not say which leg is which.
     let outputs = plan
         .recipient
         .iter()
-        .chain(plan.change.iter())
-        .zip(addresses)
+        .zip(recipient_addresses)
+        .chain(plan.change.iter().zip(change_addresses))
         .map(|(v, a)| LadderOutput {
             address: a.clone(),
             value_sats: *v,
@@ -846,15 +856,23 @@ mod tests {
             .collect()
     }
 
+    /// Addresses belonging to the PAYEE.
     fn fresh(n: usize) -> Vec<String> {
         (0..n).map(|i| addr(100u8.wrapping_add(i as u8))).collect()
+    }
+
+    /// Addresses belonging to US — where change must land, and where a payment
+    /// must never land.
+    fn to_self(n: usize) -> Vec<String> {
+        (0..n).map(|i| addr(180u8.wrapping_add(i as u8))).collect()
     }
 
     #[test]
     fn a_payment_plans_into_a_valid_contribution() {
         let l = Ladder::standard();
         let held = coins(&[200_000, 50_000]);
-        let p = plan_participation(&l, &held, 137_000, 2_000, &fresh(12)).expect("plans");
+        let p =
+            plan_participation(&l, &held, 137_000, 2_000, &fresh(6), &to_self(6)).expect("plans");
 
         // Every value on both sides is a rung.
         for i in &p.inputs {
@@ -871,6 +889,69 @@ mod tests {
         assert!(out >= 137_000);
     }
 
+    /// The test the old API passed while being unusable.
+    ///
+    /// The previous signature took one flat address list, so recipient legs and
+    /// change legs were drawn from the same pool in order. Values and sums were
+    /// asserted and were correct — but nothing checked *whose* addresses the
+    /// payment landed on, and there was no way for a caller to express the
+    /// distinction at all.
+    #[test]
+    fn the_payment_goes_to_the_payee_and_the_change_comes_back() {
+        let l = Ladder::standard();
+        let held = coins(&[200_000]);
+        let payee = fresh(6);
+        let mine = to_self(6);
+        let p = plan_participation(&l, &held, 137_000, 2_000, &payee, &mine).expect("plans");
+
+        let paid: u64 = p
+            .outputs
+            .iter()
+            .filter(|o| payee.contains(&o.address))
+            .map(|o| o.value_sats)
+            .sum();
+        let returned: u64 = p
+            .outputs
+            .iter()
+            .filter(|o| mine.contains(&o.address))
+            .map(|o| o.value_sats)
+            .sum();
+
+        assert_eq!(paid, 137_000, "the payee must receive exactly the payment");
+        assert!(
+            returned > 0,
+            "change must come back to us, not to the payee"
+        );
+        assert_eq!(
+            paid + returned,
+            p.outputs.iter().map(|o| o.value_sats).sum::<u64>(),
+            "every output belongs to one side or the other"
+        );
+    }
+
+    #[test]
+    fn a_change_address_that_is_also_a_payee_address_is_refused() {
+        // The worst case the cross-list reuse check exists for: change routed
+        // to an address the payee also controls.
+        let l = Ladder::standard();
+        let held = coins(&[200_000]);
+        let shared = addr(77);
+        let mut payee = fresh(5);
+        payee.push(shared.clone());
+        let mine = vec![
+            shared.clone(),
+            addr(78),
+            addr(79),
+            addr(80),
+            addr(81),
+            addr(82),
+        ];
+        assert_eq!(
+            plan_participation(&l, &held, 137_000, 2_000, &payee, &mine),
+            Err(PlanError::AddressReused { address: shared })
+        );
+    }
+
     #[test]
     fn a_reused_address_is_refused_before_it_reaches_the_chain() {
         let l = Ladder::standard();
@@ -882,7 +963,7 @@ mod tests {
         addrs.push(dupe.clone());
         addrs.push(dupe.clone());
         assert_eq!(
-            plan_participation(&l, &held, 137_000, 2_000, &addrs),
+            plan_participation(&l, &held, 137_000, 2_000, &addrs, &to_self(6)),
             Err(PlanError::AddressReused { address: dupe })
         );
     }
@@ -892,7 +973,7 @@ mod tests {
         let l = Ladder::standard();
         let held = coins(&[200_000]);
         assert!(matches!(
-            plan_participation(&l, &held, 137_000, 2_000, &fresh(2)),
+            plan_participation(&l, &held, 137_000, 2_000, &fresh(1), &to_self(1)),
             Err(PlanError::NotEnoughAddresses { .. })
         ));
     }
@@ -902,7 +983,7 @@ mod tests {
         let l = Ladder::standard();
         let held = coins(&[10_000]);
         assert!(matches!(
-            plan_participation(&l, &held, 137_000, 2_000, &fresh(12)),
+            plan_participation(&l, &held, 137_000, 2_000, &fresh(6), &to_self(6)),
             Err(PlanError::Insufficient { .. })
         ));
     }
@@ -918,7 +999,7 @@ mod tests {
         // Ask for an amount the single coin cannot cover, so planning fails
         // cleanly rather than reaching the mapping loop at all.
         assert!(matches!(
-            plan_participation(&l, &held, 500_000, 2_000, &fresh(12)),
+            plan_participation(&l, &held, 500_000, 2_000, &fresh(6), &to_self(6)),
             Err(PlanError::Insufficient { .. })
         ));
         // And the mapping loop itself returns rather than unwinds.
@@ -930,7 +1011,8 @@ mod tests {
         let l = Ladder::standard();
         // Two coins of equal value: the mapping must consume distinct outpoints.
         let held = coins(&[100_000, 100_000, 50_000]);
-        let p = plan_participation(&l, &held, 137_000, 2_000, &fresh(12)).expect("plans");
+        let p =
+            plan_participation(&l, &held, 137_000, 2_000, &fresh(6), &to_self(6)).expect("plans");
         let mut seen = std::collections::HashSet::new();
         for i in &p.inputs {
             assert!(
@@ -957,7 +1039,8 @@ mod tests {
                 .map(|j| addr(i.wrapping_mul(20).wrapping_add(j + 40)))
                 .collect();
             b.add_participant(
-                plan_participation(&l, &held, 150_000, 2_000, &addrs).expect("plans"),
+                plan_participation(&l, &held, 150_000, 2_000, &addrs[..6], &addrs[6..])
+                    .expect("plans"),
             );
         }
         absorb_surplus(&mut b);
