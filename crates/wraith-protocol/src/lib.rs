@@ -81,6 +81,7 @@ pub mod assignment;
 pub mod attestation;
 pub mod beacon;
 pub mod client_session;
+pub mod clustering;
 pub mod composition;
 pub mod consolidation;
 pub mod epoch;

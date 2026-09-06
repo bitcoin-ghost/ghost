@@ -109,6 +109,14 @@ mutate "pre-sign approves everything" pre_sign.rs \
 '    let mut refusals = Vec::new();
     if true { return refusals; }' pre_sign
 
+mutate "clustering ignores shared funding tx" clustering.rs \
+'        match by_txid.get(&c.outpoint.txid) {' \
+'        match None::<&usize> {' clustering
+
+mutate "clustering groups every unknown coin" clustering.rs \
+'        if !c.script_pubkey.is_empty() {' \
+'        if true {' clustering
+
 mutate "assignment ignores the modulus check" assignment.rs \
 '    if claimed_open_rounds != derived_rounds {' \
 '    if false {' assignment
