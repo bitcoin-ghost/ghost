@@ -1262,3 +1262,62 @@ code {
   background: var(--accent);
   transform: scale(1.25);
 }
+
+/* ── Anonymity set panel ────────────────────────────────────────────────── */
+/* The headline is the entity count. Seats sit beside it in a quieter weight,
+   because the gap between them is the signal and hiding either one hides it. */
+
+.anon-card { border-left: 3px solid var(--rule-strong); }
+.anon-card.anon-pass { border-left-color: var(--pass); }
+.anon-card.anon-warn { border-left-color: var(--warn); }
+.anon-card.anon-fail { border-left-color: var(--fail); }
+
+.anon-headline {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.anon-headline .eyebrow { flex-basis: 100%; }
+.anon-figure {
+  font-size: 2.25rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.anon-pass .anon-figure { color: var(--pass); }
+.anon-warn .anon-figure { color: var(--warn); }
+.anon-fail .anon-figure { color: var(--fail); }
+.anon-of { font-size: 0.875rem; }
+
+.anon-breakdown {
+  margin: 0 0 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+.anon-breakdown .kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+.anon-breakdown dt { margin: 0; }
+.anon-breakdown dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.anon-alert {
+  margin: 0 0 0.75rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: 4px;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.anon-warn .anon-alert { background: var(--warn-weak); }
+.anon-fail .anon-alert { background: var(--fail-weak); }
+
+.anon-proof {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--dim);
+}
+.anon-proof.anon-unchecked { color: var(--warn); }
