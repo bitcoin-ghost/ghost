@@ -2428,8 +2428,11 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
         .iter()
         .map(|i| {
             (
-                (i.input.txid.trim().to_ascii_lowercase(), i.input.vout),
-                i.input.value_sats,
+                (
+                    i.inputs[0].txid.trim().to_ascii_lowercase(),
+                    i.inputs[0].vout,
+                ),
+                i.inputs[0].value_sats,
             )
         })
         .collect();
@@ -2601,11 +2604,11 @@ fn find_input_index(state: &CoordinatorState, session_id: &str, ghost_id: &str) 
         .iter()
         .find(|i| i.ghost_id == ghost_id)
         .expect("mine");
-    let target_txid = bitcoin::Txid::from_str(&mine.input.txid).unwrap();
+    let target_txid = bitcoin::Txid::from_str(&mine.inputs[0].txid).unwrap();
     tx.input
         .iter()
         .position(|t| {
-            t.previous_output.txid == target_txid && t.previous_output.vout == mine.input.vout
+            t.previous_output.txid == target_txid && t.previous_output.vout == mine.inputs[0].vout
         })
         .expect("input present") as u32
 }

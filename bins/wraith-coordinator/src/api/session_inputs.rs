@@ -83,9 +83,13 @@ use crate::inputs::{AcceptedInputs, TxInputRef};
 use crate::state::CoordinatorState;
 use crate::utxo_source::parse_outpoint;
 
-#[derive(Debug, Deserialize)]
-pub struct Request {
-    pub ghost_id: String,
+/// One coin, with the proof that the submitter controls it.
+///
+/// The proof is per-rung and not per-request: each rung is a different UTXO
+/// with a different key, so one signature cannot speak for the others.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RungSubmission {
+    #[serde(flatten)]
     pub input: TxInputRef,
     /// BIP-322 simple signature over `ownership_challenge(session_id,
     /// txid, vout)`, base64-encoded exactly as the BIP specifies —
@@ -93,6 +97,69 @@ pub struct Request {
     /// (#699). Without it, anyone could register anyone's coin.
     #[serde(default)]
     pub ownership_proof: Option<String>,
+}
+
+/// A participant's whole contribution, in one request.
+///
+/// # Why all rungs in one call
+///
+/// A ladder participant brings several coins. Submitting them one per request
+/// would make the request *count* a per-participant signal — an observer of the
+/// coordinator's connection metadata could read off how many rungs each wallet
+/// brought, which narrows the amount they are paying. Inputs are identity-bearing
+/// anyway (`ghost_id` is right there, and ownership must be proved), so batching
+/// discloses nothing new to the coordinator and removes that side channel.
+///
+/// **Outputs are the opposite and must not be batched.** `/outputs` carries no
+/// `ghost_id`: it is authorised by a blind signature precisely so the
+/// coordinator cannot link an output to the participant who registered the
+/// input. Sending a participant's outputs together would re-link them to each
+/// other and undo that.
+#[derive(Debug, Deserialize)]
+pub struct Request {
+    pub ghost_id: String,
+    /// Every rung the participant is registering. Order is not significant.
+    ///
+    /// Accepted alongside the older single-`input` shape so existing tier-round
+    /// clients keep working; exactly one of the two must be present.
+    #[serde(default)]
+    pub inputs: Option<Vec<RungSubmission>>,
+    /// Legacy single-input form.
+    #[serde(default)]
+    pub input: Option<TxInputRef>,
+    /// Legacy proof, paired with the legacy `input`.
+    #[serde(default)]
+    pub ownership_proof: Option<String>,
+}
+
+impl Request {
+    /// Normalise either accepted shape into the list the handler works on.
+    ///
+    /// Refuses both-at-once rather than picking one: a client sending both is
+    /// confused about which it is using, and silently honouring one would
+    /// register coins the caller may not have meant to commit.
+    fn rungs(&self) -> Result<Vec<RungSubmission>, (&'static str, String)> {
+        match (&self.inputs, &self.input) {
+            (Some(_), Some(_)) => Err((
+                "ambiguous_submission",
+                "send either 'inputs' or the legacy 'input', not both".into(),
+            )),
+            (Some(list), None) => {
+                if list.is_empty() {
+                    return Err((
+                        "no_inputs",
+                        "'inputs' is empty; a participant must register at least one coin".into(),
+                    ));
+                }
+                Ok(list.clone())
+            }
+            (None, Some(one)) => Ok(vec![RungSubmission {
+                input: one.clone(),
+                ownership_proof: self.ownership_proof.clone(),
+            }]),
+            (None, None) => Err(("no_inputs", "one of 'inputs' or 'input' is required".into())),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -177,154 +244,198 @@ pub async fn post(
         );
     }
 
-    // 5. Check the input against the chain.
+    // 5-7. Validate every rung, all-or-nothing.
     //
-    //    Everything in `req.input` is wallet-asserted. Until this
-    //    existed the coordinator believed all of it, so the round
-    //    arithmetic was computed from a number the participant chose and
-    //    the input might have been spent, or never have existed. One
-    //    `gettxout` settles existence, value, scriptPubKey and
-    //    unspent-ness together (#699).
-    let outpoint = match parse_outpoint(&req.input.txid, req.input.vout) {
-        Ok(o) => o,
-        Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_outpoint", detail),
+    //    A partial accept would leave a participant registered with some of
+    //    their coins and short of the amount, which fails later at assembly
+    //    with nothing pointing at the rung that was refused.
+    let rungs = match req.rungs() {
+        Ok(r) => r,
+        Err((code, detail)) => return error(StatusCode::BAD_REQUEST, code, detail),
     };
 
-    //    A coin that killed a round is in cooldown. Checked before the
-    //    chain lookup so a banned outpoint costs the coordinator no RPC
-    //    round trip, and stated with its expiry so an honest wallet whose
-    //    last round died knows exactly when it can use the coin again.
-    if let Some(until) = state.bans.banned_until(&outpoint, now) {
-        return error(
-            StatusCode::FORBIDDEN,
-            "outpoint_banned",
-            format!(
-                "{outpoint} disrupted a round and is in cooldown for another {} seconds",
-                until.saturating_sub(now)
-            ),
-        );
-    }
-
-    let chain_utxo = match utxo_source.get_utxo(&outpoint) {
-        Ok(Some(u)) => u,
-        // Absent or spent. Deliberately one error for both: saying
-        // which would answer a question about the chain that the
-        // submitter did not ask.
-        Ok(None) => {
+    // A rung repeated inside one submission would build a transaction with
+    // duplicate inputs — the same round-killer as two participants sharing an
+    // outpoint, arriving by a shorter route.
+    for (i, a) in rungs.iter().enumerate() {
+        if rungs
+            .iter()
+            .skip(i + 1)
+            .any(|b| b.input.same_outpoint(&a.input))
+        {
             return error(
                 StatusCode::BAD_REQUEST,
-                "utxo_not_found",
-                format!("{outpoint} is not an unspent output"),
+                "duplicate_rung",
+                format!(
+                    "{}:{} appears twice in this submission",
+                    a.input.txid, a.input.vout
+                ),
             );
         }
-        Err(e) => {
-            warn!(%outpoint, error = %e, "utxo lookup failed");
+    }
+
+    let mut validated: Vec<TxInputRef> = Vec::with_capacity(rungs.len());
+    let mut total_sats: u64 = 0;
+
+    for rung in &rungs {
+        let outpoint = match parse_outpoint(&rung.input.txid, rung.input.vout) {
+            Ok(o) => o,
+            Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_outpoint", detail),
+        };
+
+        //    A coin that killed a round is in cooldown. Checked before the
+        //    chain lookup so a banned outpoint costs the coordinator no RPC
+        //    round trip, and stated with its expiry so an honest wallet whose
+        //    last round died knows exactly when it can use the coin again.
+        if let Some(until) = state.bans.banned_until(&outpoint, now) {
             return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "utxo_source_unreachable",
-                e.to_string(),
+                StatusCode::FORBIDDEN,
+                "outpoint_banned",
+                format!(
+                    "{outpoint} disrupted a round and is in cooldown for another {} seconds",
+                    until.saturating_sub(now)
+                ),
             );
         }
-    };
 
-    // An unconfirmed input can still be replaced out from under the
-    // round by its own parent, which would invalidate the whole
-    // transaction after everyone has signed.
-    if chain_utxo.confirmations == 0 {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "input_unconfirmed",
-            format!("{outpoint} is unconfirmed; a round input must be confirmed"),
-        );
-    }
-    if chain_utxo.coinbase && chain_utxo.confirmations < COINBASE_MATURITY {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "immature_coinbase",
-            format!(
-                "{outpoint} is a coinbase output with {} of {} confirmations",
-                chain_utxo.confirmations, COINBASE_MATURITY
-            ),
-        );
-    }
+        //    Everything in the submission is wallet-asserted. One `gettxout`
+        //    settles existence, value, scriptPubKey and unspent-ness together
+        //    (#699).
+        let chain_utxo = match utxo_source.get_utxo(&outpoint) {
+            Ok(Some(u)) => u,
+            // Absent or spent. Deliberately one error for both: saying
+            // which would answer a question about the chain that the
+            // submitter did not ask.
+            Ok(None) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "utxo_not_found",
+                    format!("{outpoint} is not an unspent output"),
+                );
+            }
+            Err(e) => {
+                warn!(%outpoint, error = %e, "utxo lookup failed");
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "utxo_source_unreachable",
+                    e.to_string(),
+                );
+            }
+        };
 
-    // The chain is authoritative. A mismatch is refused rather than
-    // silently corrected, so a wallet working from a stale view learns
-    // that it is stale instead of having its arithmetic quietly changed.
-    if chain_utxo.value_sats != req.input.value_sats {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "value_mismatch",
-            format!(
-                "{outpoint} is worth {} sats on-chain; submission claims {}",
-                chain_utxo.value_sats, req.input.value_sats
-            ),
-        );
-    }
-    let claimed_spk = req.input.scriptpubkey_hex.trim();
-    if !claimed_spk.eq_ignore_ascii_case(&chain_utxo.script_pubkey.to_hex_string()) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "scriptpubkey_mismatch",
-            format!(
-                "{outpoint} has scriptPubKey {}; submission claims {claimed_spk}",
-                chain_utxo.script_pubkey.to_hex_string()
-            ),
-        );
-    }
-
-    // 6. Prove the submitter controls the coin.
-    //
-    //    Everything above establishes what the coin *is*; none of it
-    //    establishes whose it is. Without this, registering someone
-    //    else's outpoint is free — which kills their round, and once
-    //    outpoint banning lands would get their coin banned on their
-    //    behalf (#699).
-    //
-    //    Verified against the scriptPubKey the *chain* reports, never
-    //    the one the submission claims; that ordering is the whole
-    //    point, since a proof against a script the submitter chose
-    //    proves only that they can sign for a script they made up.
-    let proof = match req.ownership_proof.as_deref().map(str::trim) {
-        Some(p) if !p.is_empty() => p,
-        _ => {
+        // An unconfirmed input can still be replaced out from under the
+        // round by its own parent, which would invalidate the whole
+        // transaction after everyone has signed.
+        if chain_utxo.confirmations == 0 {
             return error(
                 StatusCode::BAD_REQUEST,
-                "missing_ownership_proof",
-                "ownership_proof is required: a BIP-322 signature over the \
-                 session's ownership challenge, made with the input's key"
-                    .into(),
+                "input_unconfirmed",
+                format!("{outpoint} is unconfirmed; a round input must be confirmed"),
             );
         }
-    };
-    let address = match Address::from_script(&chain_utxo.script_pubkey, state.network) {
-        Ok(a) => a,
-        Err(e) => {
+        if chain_utxo.coinbase && chain_utxo.confirmations < COINBASE_MATURITY {
             return error(
                 StatusCode::BAD_REQUEST,
-                "unsupported_input_script",
-                format!("{outpoint} has a scriptPubKey with no address form: {e}"),
+                "immature_coinbase",
+                format!(
+                    "{outpoint} is a coinbase output with {} of {} confirmations",
+                    chain_utxo.confirmations, COINBASE_MATURITY
+                ),
             );
         }
-    };
-    let witness = match decode_bip322_witness(proof) {
-        Ok(w) => w,
-        Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_ownership_proof", detail),
-    };
-    let challenge = ownership_challenge(&session_id, &req.input.txid, req.input.vout);
-    if let Err(e) = bip322::verify_simple(&address, challenge.as_bytes(), witness) {
-        // Deliberately terse to the caller. The failure detail is a
-        // description of someone else's key material as often as it is
-        // of a wallet bug, and the operator can read the log.
-        debug!(%outpoint, error = %e, "ownership proof rejected");
-        return error(
-            StatusCode::FORBIDDEN,
-            "ownership_proof_failed",
-            format!("ownership proof does not verify against {outpoint}'s scriptPubKey"),
-        );
+
+        // The chain is authoritative. A mismatch is refused rather than
+        // silently corrected, so a wallet working from a stale view learns
+        // that it is stale instead of having its arithmetic quietly changed.
+        if chain_utxo.value_sats != rung.input.value_sats {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "value_mismatch",
+                format!(
+                    "{outpoint} is worth {} sats on-chain; submission claims {}",
+                    chain_utxo.value_sats, rung.input.value_sats
+                ),
+            );
+        }
+        let claimed_spk = rung.input.scriptpubkey_hex.trim();
+        if !claimed_spk.eq_ignore_ascii_case(&chain_utxo.script_pubkey.to_hex_string()) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "scriptpubkey_mismatch",
+                format!(
+                    "{outpoint} has scriptPubKey {}; submission claims {claimed_spk}",
+                    chain_utxo.script_pubkey.to_hex_string()
+                ),
+            );
+        }
+
+        //    Everything above establishes what the coin *is*; none of it
+        //    establishes whose it is. Without this, registering someone
+        //    else's outpoint is free (#699).
+        //
+        //    Verified against the scriptPubKey the *chain* reports, never
+        //    the one the submission claims; that ordering is the whole
+        //    point, since a proof against a script the submitter chose
+        //    proves only that they can sign for a script they made up.
+        //
+        //    Per rung: each is a different UTXO under a different key, so one
+        //    signature cannot stand for the rest.
+        let proof = match rung.ownership_proof.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "missing_ownership_proof",
+                    format!(
+                        "ownership_proof is required for {outpoint}: a BIP-322 signature \
+                         over the session's ownership challenge, made with that input's key"
+                    ),
+                );
+            }
+        };
+        let address = match Address::from_script(&chain_utxo.script_pubkey, state.network) {
+            Ok(a) => a,
+            Err(e) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_input_script",
+                    format!("{outpoint} has a scriptPubKey with no address form: {e}"),
+                );
+            }
+        };
+        let witness = match decode_bip322_witness(proof) {
+            Ok(w) => w,
+            Err(detail) => return error(StatusCode::BAD_REQUEST, "bad_ownership_proof", detail),
+        };
+        let challenge = ownership_challenge(&session_id, &rung.input.txid, rung.input.vout);
+        if let Err(e) = bip322::verify_simple(&address, challenge.as_bytes(), witness) {
+            // Deliberately terse to the caller. The failure detail is a
+            // description of someone else's key material as often as it is
+            // of a wallet bug, and the operator can read the log.
+            debug!(%outpoint, error = %e, "ownership proof rejected");
+            return error(
+                StatusCode::FORBIDDEN,
+                "ownership_proof_failed",
+                format!("ownership proof does not verify against {outpoint}'s scriptPubKey"),
+            );
+        }
+
+        total_sats = match total_sats.checked_add(chain_utxo.value_sats) {
+            Some(t) => t,
+            // Not reachable with real coins, but the alternative to checking is
+            // a wrap that turns an absurd submission into a passing total.
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "value_overflow",
+                    "submitted input values overflow u64".into(),
+                );
+            }
+        };
+        validated.push(rung.input.clone());
     }
 
-    // 7. The input must be worth exactly what a round seat costs.
+    //    The total must be exact.
     //
     //    Not "at least". A round has no change output, because a change
     //    output is linkable: it pays back to an address the participant
@@ -335,25 +446,23 @@ pub async fn post(
     //    donating it to miners would take a participant's money without
     //    telling them.
     //
-    //    A wallet whose coin is not already exact makes a preparatory split
-    //    first. That transaction is visible and marks them as preparing to
-    //    mix, which is a stated cost — and a smaller one than carrying the
-    //    link into the round, because it does not reveal which output of
-    //    the round is theirs.
+    //    Checked on the SUM rather than per rung, which is what lets a
+    //    participant bring a ladder: several coins that together come to the
+    //    seat price, instead of one coin that already is it.
     let required = match required_participant_input(&session, &state) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
 
-    if chain_utxo.value_sats != required {
+    if total_sats != required {
         return error(
             StatusCode::BAD_REQUEST,
             "input_not_exact",
             format!(
-                "input is {} sats; a round seat costs exactly {} sats \
-                 (denomination + fee shares). Split the coin first: rounds have no \
+                "submitted inputs total {total_sats} sats across {} rung(s); a round seat \
+                 costs exactly {required} sats (denomination + fee shares). Rounds have no \
                  change output, because a change output would identify you.",
-                chain_utxo.value_sats, required
+                validated.len()
             ),
         );
     }
@@ -362,7 +471,7 @@ pub async fn post(
     //    already submitted, the entry is replaced (wallet retry path).
     let accepted = AcceptedInputs {
         ghost_id: req.ghost_id.clone(),
-        input: req.input.clone(),
+        inputs: validated,
         accepted_at: now,
     };
     let (submitted_count, enrolled_count) = {
@@ -378,16 +487,17 @@ pub async fn post(
         //
         // Checked under the same lock as the insert, or two concurrent
         // submissions could each find the outpoint free.
-        if entry
-            .iter()
-            .any(|a| a.ghost_id != req.ghost_id && a.input.same_outpoint(&req.input))
-        {
+        if let Some(clash) = accepted.inputs.iter().find(|rung| {
+            entry
+                .iter()
+                .any(|a| a.ghost_id != req.ghost_id && a.holds_outpoint(rung))
+        }) {
             return error(
                 StatusCode::CONFLICT,
                 "duplicate_outpoint",
                 format!(
                     "{}:{} is already registered on session '{session_id}'",
-                    req.input.txid, req.input.vout
+                    clash.txid, clash.vout
                 ),
             );
         }
@@ -502,4 +612,106 @@ fn error(status: StatusCode, code: &'static str, detail: String) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod request_shape_tests {
+    use super::*;
+
+    fn rung(txid: &str, vout: u32, proof: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "txid": txid,
+            "vout": vout,
+            "value_sats": 100_000u64,
+            "scriptpubkey_hex": "0014000102030405060708090a0b0c0d0e0f1011121314",
+        });
+        if let Some(p) = proof {
+            v["ownership_proof"] = serde_json::Value::String(p.to_string());
+        }
+        v
+    }
+
+    fn parse(v: serde_json::Value) -> Request {
+        serde_json::from_value(v).expect("request should deserialise")
+    }
+
+    #[test]
+    fn a_ladder_submission_carries_every_rung() {
+        let req = parse(serde_json::json!({
+            "ghost_id": "g1",
+            "inputs": [rung("aa", 0, Some("p0")), rung("bb", 1, Some("p1"))],
+        }));
+        let rungs = req.rungs().expect("should normalise");
+        assert_eq!(rungs.len(), 2);
+        assert_eq!(rungs[0].input.txid, "aa");
+        assert_eq!(rungs[1].input.vout, 1);
+        // The proof is per rung, because each is a different key.
+        assert_eq!(rungs[0].ownership_proof.as_deref(), Some("p0"));
+        assert_eq!(rungs[1].ownership_proof.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn the_legacy_single_input_shape_still_works() {
+        // Tier-round clients predate the ladder and must keep working.
+        let mut v = rung("cc", 3, None);
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("ownership_proof");
+        let req = parse(serde_json::json!({
+            "ghost_id": "g1",
+            "input": v,
+            "ownership_proof": "legacy-proof",
+        }));
+        let rungs = req.rungs().expect("should normalise");
+        assert_eq!(rungs.len(), 1);
+        assert_eq!(rungs[0].input.txid, "cc");
+        // The top-level proof pairs with the top-level input.
+        assert_eq!(rungs[0].ownership_proof.as_deref(), Some("legacy-proof"));
+    }
+
+    #[test]
+    fn sending_both_shapes_is_refused_rather_than_resolved() {
+        // Honouring one silently would register coins the caller may not have
+        // meant to commit, and they cannot tell which was used.
+        let req = parse(serde_json::json!({
+            "ghost_id": "g1",
+            "inputs": [rung("aa", 0, Some("p0"))],
+            "input": rung("bb", 1, None),
+        }));
+        let (code, _) = req.rungs().expect_err("both shapes must be refused");
+        assert_eq!(code, "ambiguous_submission");
+    }
+
+    #[test]
+    fn an_empty_rung_list_is_refused() {
+        // Storing a participant with no coins passes the enrolment count and
+        // fails at assembly, pointing at nothing.
+        let req = parse(serde_json::json!({ "ghost_id": "g1", "inputs": [] }));
+        let (code, _) = req.rungs().expect_err("empty must be refused");
+        assert_eq!(code, "no_inputs");
+    }
+
+    #[test]
+    fn a_submission_with_neither_shape_is_refused() {
+        let req = parse(serde_json::json!({ "ghost_id": "g1" }));
+        let (code, _) = req.rungs().expect_err("neither shape must be refused");
+        assert_eq!(code, "no_inputs");
+    }
+
+    #[test]
+    fn the_total_is_saturating_not_wrapping() {
+        use crate::inputs::AcceptedInputs;
+        let big = TxInputRef {
+            txid: "aa".into(),
+            vout: 0,
+            value_sats: u64::MAX,
+            scriptpubkey_hex: "00".into(),
+        };
+        let a = AcceptedInputs {
+            ghost_id: "g1".into(),
+            inputs: vec![big.clone(), big],
+            accepted_at: 0,
+        };
+        // Wrapping here would turn an absurd total into a small passing one.
+        assert_eq!(a.total_value_sats(), u64::MAX);
+    }
 }

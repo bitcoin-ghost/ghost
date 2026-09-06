@@ -170,10 +170,9 @@ pub async fn get(
 
     let mut by_outpoint: HashMap<(String, u32), &TxInputRef> = HashMap::new();
     for inp in &inputs_snapshot {
-        by_outpoint.insert(
-            (inp.input.txid.trim().to_ascii_lowercase(), inp.input.vout),
-            &inp.input,
-        );
+        for rung in &inp.inputs {
+            by_outpoint.insert((rung.txid.trim().to_ascii_lowercase(), rung.vout), rung);
+        }
     }
 
     let mut prevouts = Vec::with_capacity(assembled.round.tx.input.len());

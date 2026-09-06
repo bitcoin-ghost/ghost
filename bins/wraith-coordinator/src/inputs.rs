@@ -23,12 +23,39 @@ use serde::{Deserialize, Serialize};
 pub struct AcceptedInputs {
     /// Wallet's per-round identity (matches `LiteSessionParticipant.ghost_id`).
     pub ghost_id: String,
-    /// The participant's single input UTXO.
-    pub input: TxInputRef,
+    /// The participant's input UTXOs — one per rung.
+    ///
+    /// This was a single `input: TxInputRef`, which made a ladder round
+    /// unrepresentable: a participant paying 137,000 sats brings a 100k, a 20k,
+    /// a 10k, a 5k and two 1k rungs, not one coin. The store also *replaced* a
+    /// participant's entry on resubmission, so a second rung silently erased
+    /// the first rather than adding to it.
+    ///
+    /// Never empty — the handler rejects an empty submission rather than
+    /// storing a participant with no coins, which would pass the enrolment
+    /// count and fail at assembly.
+    pub inputs: Vec<TxInputRef>,
     /// Unix-seconds the submission was accepted by the coordinator.
     /// Used for diagnostic / audit logging; the round-tx itself has no
     /// per-input timestamp.
     pub accepted_at: u64,
+}
+
+impl AcceptedInputs {
+    /// Total value the participant brought, in satoshis.
+    ///
+    /// Saturating: a submission summing past `u64` is refused upstream, and
+    /// wrapping here would turn that refusal into an accepted zero.
+    pub fn total_value_sats(&self) -> u64 {
+        self.inputs
+            .iter()
+            .fold(0u64, |acc, i| acc.saturating_add(i.value_sats))
+    }
+
+    /// Whether this participant registered `other` as one of its rungs.
+    pub fn holds_outpoint(&self, other: &TxInputRef) -> bool {
+        self.inputs.iter().any(|i| i.same_outpoint(other))
+    }
 }
 
 /// Wire-format input reference — what the wallet sends and what the

@@ -224,13 +224,19 @@ pub async fn post(
                 );
             }
         };
-        if claimed.previous_output.txid.to_string() != mine.input.txid
-            || claimed.previous_output.vout != mine.input.vout
-        {
+        // A ladder participant signs one index per rung, so this asks whether
+        // the claimed index is *one of* theirs rather than *the* one. Matching
+        // only the first would reject every rung after it, stalling the round
+        // on an honest wallet.
+        let claimed_txid = claimed.previous_output.txid.to_string();
+        let is_mine = mine.inputs.iter().any(|i| {
+            i.txid.eq_ignore_ascii_case(&claimed_txid) && i.vout == claimed.previous_output.vout
+        });
+        if !is_mine {
             return error(
                 StatusCode::BAD_REQUEST,
                 "input_index_mismatch",
-                "input_index does not point at this ghost_id's UTXO".into(),
+                "input_index does not point at one of this ghost_id's UTXOs".into(),
             );
         }
     }

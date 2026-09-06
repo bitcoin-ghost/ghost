@@ -113,11 +113,29 @@ pub fn assemble_round(ctx: RoundContext<'_>) -> Result<AssembledRound, AssembleE
     };
 
     for (i, (input, output)) in inputs.iter().zip(outputs.iter()).enumerate() {
-        let txid = Txid::from_str(input.input.txid.trim()).map_err(|e| AssembleError::BadTxid {
+        // `LiteRoundBuilder` pairs one input with one output per participant,
+        // and that pairing is the linkage a ladder round exists to break. A
+        // multi-rung participant cannot be expressed here at all, so refuse it
+        // rather than build a transaction from `inputs[0]` and silently drop
+        // the rest of somebody's money.
+        //
+        // Ladder assembly is `LadderRoundBuilder` in `wraith-protocol`, wired
+        // in a later increment. Until then `/inputs` will accept a ladder
+        // submission and this is where it stops.
+        let single = match input.inputs.as_slice() {
+            [only] => only,
+            other => {
+                return Err(AssembleError::LadderRoundNotAssemblable {
+                    participant_id: i as u32,
+                    rungs: other.len(),
+                })
+            }
+        };
+        let txid = Txid::from_str(single.txid.trim()).map_err(|e| AssembleError::BadTxid {
             participant_id: i as u32,
             detail: e.to_string(),
         })?;
-        let scriptpubkey_bytes = hex::decode(input.input.scriptpubkey_hex.trim()).map_err(|e| {
+        let scriptpubkey_bytes = hex::decode(single.scriptpubkey_hex.trim()).map_err(|e| {
             AssembleError::BadScriptPubkey {
                 participant_id: i as u32,
                 detail: format!("not valid hex: {e}"),
@@ -127,8 +145,8 @@ pub fn assemble_round(ctx: RoundContext<'_>) -> Result<AssembledRound, AssembleE
 
         let participant = LiteParticipantInput {
             txid,
-            vout: input.input.vout,
-            amount_sats: input.input.value_sats,
+            vout: single.vout,
+            amount_sats: single.value_sats,
             script_pubkey,
             mixed_output_address: output.address.clone(),
             participant_id: i as u32,
@@ -167,6 +185,12 @@ pub enum AssembleError {
     CountMismatch { inputs: usize, outputs: usize },
     #[error("no participants — empty round")]
     NoParticipants,
+    /// A participant brought a number of rungs other than one.
+    ///
+    /// Zero is a store invariant violation; anything above one is a ladder
+    /// round, which this builder cannot express — see the call site.
+    #[error("participant {participant_id} brought {rungs} rungs; the lite builder pairs one input with one output and cannot assemble a ladder round")]
+    LadderRoundNotAssemblable { participant_id: u32, rungs: usize },
     #[error("Mix round requires a coordinator_fee_address")]
     FeeAddressNotConfigured,
     #[error("participant {participant_id} bad txid: {detail}")]
@@ -191,6 +215,7 @@ impl AssembleError {
             Self::BadTxid { .. } => "bad_txid",
             Self::BadScriptPubkey { .. } => "bad_scriptpubkey",
             Self::AddParticipant { .. } => "add_participant_failed",
+            Self::LadderRoundNotAssemblable { .. } => "ladder_round_not_assemblable",
             Self::Build(_) => "build_failed",
         }
     }
