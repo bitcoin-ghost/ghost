@@ -79,6 +79,7 @@ pub mod admission;
 pub mod attestation;
 pub mod consolidation;
 pub mod epoch;
+pub mod exit_availability;
 pub mod ladder;
 pub mod ladder_round;
 pub mod liquidity;
