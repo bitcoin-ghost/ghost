@@ -265,7 +265,6 @@ ghost-policy = { workspace = true }
 ghost-consensus = { workspace = true, features = ["test-utils", "zk-consensus"] }
 ghost-pool = { workspace = true }
 ghost-keys = { workspace = true }
-ghost-locks = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }
 ghost-gsp-proto = { workspace = true }

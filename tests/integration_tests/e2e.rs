@@ -113,186 +113,6 @@ mod ghost_keys {
 // Ghost Locks E2E Tests
 // ============================================================================
 
-mod ghost_locks_tests {
-    use ::ghost_locks::{Denomination, GhostLock, TimelockTier};
-    use bitcoin::secp256k1::{Secp256k1, SecretKey};
-
-    #[test]
-    fn test_lock_denominations() {
-        // Test all denominations have increasing values
-        assert!(Denomination::Micro.sats() < Denomination::Tiny.sats());
-        assert!(Denomination::Tiny.sats() < Denomination::Small.sats());
-        assert!(Denomination::Small.sats() < Denomination::Medium.sats());
-        assert!(Denomination::Medium.sats() < Denomination::Large.sats());
-    }
-
-    #[test]
-    fn test_denomination_values() {
-        // Test specific values
-        assert_eq!(Denomination::Micro.sats(), 10_000);
-        assert_eq!(Denomination::Tiny.sats(), 100_000);
-    }
-
-    #[test]
-    fn test_denomination_from_sats() {
-        // from_sats should return exact denomination
-        let denom = Denomination::from_sats(10_000).unwrap();
-        assert_eq!(denom.sats(), 10_000);
-
-        // closest_for_amount should return appropriate denomination
-        let closest = Denomination::closest_for_amount(15_000).unwrap();
-        assert_eq!(closest, Denomination::Micro); // Closest to 10,000
-    }
-
-    #[test]
-    fn test_timelock_tiers() {
-        // Test all tiers (Short=6mo, Standard=1yr, Long=2yr)
-        assert!(TimelockTier::Short.blocks() < TimelockTier::Standard.blocks());
-        assert!(TimelockTier::Standard.blocks() < TimelockTier::Long.blocks());
-    }
-
-    #[test]
-    fn test_timelock_display() {
-        assert!(!TimelockTier::Standard.to_string().is_empty());
-        assert!(!TimelockTier::Short.to_string().is_empty());
-    }
-
-    #[test]
-    fn test_lock_creation() {
-        let secp = Secp256k1::new();
-
-        // Create test keys (deterministic for testing)
-        let lock_secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let recovery_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
-        let denomination = Denomination::Tiny; // 100,000 sats
-        let creation_height = 800_000;
-
-        let lock = GhostLock::new(
-            &secp,
-            &lock_secret,
-            &recovery_secret,
-            denomination,
-            TimelockTier::Standard,
-            creation_height,
-        );
-
-        assert!(lock.is_ok());
-        let lock = lock.unwrap();
-
-        // Lock should have correct properties
-        assert_eq!(lock.sats(), 100_000);
-        assert_eq!(lock.denomination(), Denomination::Tiny);
-        assert_eq!(lock.creation_height(), creation_height);
-    }
-
-    #[test]
-    fn test_lock_multiple_denominations() {
-        let secp = Secp256k1::new();
-        let lock_secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let recovery_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
-
-        for denom in [
-            Denomination::Micro,
-            Denomination::Tiny,
-            Denomination::Small,
-            Denomination::Medium,
-        ] {
-            let lock = GhostLock::new(
-                &secp,
-                &lock_secret,
-                &recovery_secret,
-                denom,
-                TimelockTier::Standard,
-                800_000,
-            );
-            assert!(lock.is_ok());
-            assert_eq!(lock.unwrap().sats(), denom.sats());
-        }
-    }
-
-    #[test]
-    fn test_lock_different_timelocks() {
-        let secp = Secp256k1::new();
-        let lock_secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let recovery_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
-
-        // Test all available timelock tiers
-        for tier in [
-            TimelockTier::Short,
-            TimelockTier::Standard,
-            TimelockTier::Long,
-        ] {
-            let lock = GhostLock::new(
-                &secp,
-                &lock_secret,
-                &recovery_secret,
-                Denomination::Tiny,
-                tier,
-                800_000,
-            );
-            assert!(lock.is_ok());
-            assert_eq!(lock.unwrap().timelock_tier(), tier);
-        }
-    }
-
-    #[test]
-    fn test_lock_recovery_height() {
-        let secp = Secp256k1::new();
-        let lock_secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let recovery_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
-        let creation_height = 800_000;
-
-        let lock = GhostLock::new(
-            &secp,
-            &lock_secret,
-            &recovery_secret,
-            Denomination::Tiny,
-            TimelockTier::Standard,
-            creation_height,
-        )
-        .unwrap();
-
-        // Recovery height should be after creation
-        assert!(lock.recovery_height() > creation_height);
-
-        // Check blocks until recovery
-        assert!(lock.blocks_until_recovery(creation_height) > 0);
-        assert!(!lock.is_recovery_available(creation_height));
-    }
-
-    #[test]
-    fn test_lock_id_uniqueness() {
-        let secp = Secp256k1::new();
-        let lock_secret1 = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let lock_secret2 = SecretKey::from_slice(&[3u8; 32]).unwrap();
-        let recovery_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
-
-        let lock1 = GhostLock::new(
-            &secp,
-            &lock_secret1,
-            &recovery_secret,
-            Denomination::Tiny,
-            TimelockTier::Standard,
-            800_000,
-        )
-        .unwrap();
-
-        let lock2 = GhostLock::new(
-            &secp,
-            &lock_secret2,
-            &recovery_secret,
-            Denomination::Tiny,
-            TimelockTier::Standard,
-            800_000,
-        )
-        .unwrap();
-
-        // Different keys should produce different lock IDs
-        assert_ne!(lock1.lock_id(), lock2.lock_id());
-        assert_ne!(lock1.lock_id_hex(), lock2.lock_id_hex());
-    }
-}
-
 // ============================================================================
 // GSP Protocol E2E Tests
 // ============================================================================
@@ -546,8 +366,6 @@ mod consensus {
 // ============================================================================
 
 mod full_stack {
-    use bitcoin::secp256k1::Secp256k1;
-
     /// Test that all major crates compile together
     #[test]
     fn test_crate_imports() {
@@ -555,50 +373,12 @@ mod full_stack {
         use ::ghost_common::VoteType;
         use ::ghost_gsp_proto::ClientMessage;
         use ::ghost_keys::GhostKeys;
-        use ::ghost_locks::TimelockTier;
 
         // If this compiles, all crates are compatible
         let _ = BudsTier::T0;
         let _ = VoteType::PayoutApproval;
         let _ = ClientMessage::GetBalance { max_k: None };
         let _ = GhostKeys::generate();
-        let _ = TimelockTier::Standard;
-    }
-
-    /// Test complete lock creation flow
-    #[test]
-    fn test_lock_creation_flow() {
-        use ::ghost_keys::GhostKeys;
-        use ::ghost_locks::{Denomination, GhostLock, TimelockTier};
-
-        // 1. Generate keys
-        let keys = GhostKeys::generate();
-
-        // 2. Determine denomination for amount
-        let amount = 100_000; // 0.001 BTC (Tiny denomination)
-        let denomination = Denomination::from_sats(amount).unwrap();
-        assert_eq!(denomination.sats(), amount);
-
-        // 3. Create lock using derived secrets
-        let secp = Secp256k1::new();
-        let lock_secret = keys.derive_lock_secret(0).unwrap();
-        let recovery_secret = keys.derive_recovery_secret(0).unwrap();
-
-        let lock = GhostLock::new(
-            &secp,
-            &lock_secret,
-            &recovery_secret,
-            denomination,
-            TimelockTier::Standard,
-            800_000,
-        )
-        .unwrap();
-
-        // 4. Lock should have correct value
-        assert_eq!(lock.sats(), amount);
-
-        // 5. Lock should have unique ID
-        assert_eq!(lock.lock_id_hex().len(), 64); // 32 bytes = 64 hex chars
     }
 
     /// Test GSP authentication flow
@@ -662,35 +442,5 @@ mod full_stack {
         let (scan_secret, spend_secret) = keys.export_secrets();
         assert_eq!(scan_secret.len(), 32);
         assert_eq!(spend_secret.len(), 32);
-    }
-
-    /// Test GhostLock with GhostKeys integration
-    #[test]
-    fn test_ghost_keys_to_lock_integration() {
-        use ::ghost_keys::GhostKeys;
-        use ::ghost_locks::{Denomination, GhostLock, TimelockTier};
-
-        let secp = Secp256k1::new();
-        let keys = GhostKeys::generate();
-
-        // Derive lock and recovery secrets from GhostKeys
-        let lock_secret = keys.derive_lock_secret(0).unwrap();
-        let recovery_secret = keys.derive_recovery_secret(0).unwrap();
-
-        // Create lock
-        let lock = GhostLock::new(
-            &secp,
-            &lock_secret,
-            &recovery_secret,
-            Denomination::Small, // 0.01 BTC
-            TimelockTier::Standard,
-            850_000,
-        )
-        .unwrap();
-
-        // Verify lock properties
-        assert_eq!(lock.sats(), 1_000_000);
-        assert_eq!(lock.timelock_tier(), TimelockTier::Standard);
-        assert!(!lock.is_recovery_available(850_000));
     }
 }

@@ -368,61 +368,10 @@ async fn gsp_auth() -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
-#[tauri::command]
-async fn locks_list() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksList).await?;
-    to_value(&resp)
-}
 
-#[tauri::command]
-async fn locks_prepare(capacity_sats: u64) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksPrepare { capacity_sats }).await?;
-    to_value(&resp)
-}
 
-#[tauri::command]
-async fn locks_confirm(lock_id: String, funding_txid: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksConfirm {
-        lock_id,
-        funding_txid,
-    })
-    .await?;
-    to_value(&resp)
-}
 
-#[tauri::command]
-async fn locks_jump(
-    lock_id: String,
-    target_address: String,
-    priority: String,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksJump {
-        lock_id,
-        target_address,
-        priority,
-    })
-    .await?;
-    to_value(&resp)
-}
 
-/// Unilateral exit. Builds + signs + broadcasts a recovery spend
-/// using the wallet's own recovery secret, after confirming the
-/// timelock has matured. Talks straight to the configured ghostd —
-/// no GSP, no operator cooperation.
-#[tauri::command]
-async fn locks_recover(
-    lock_id: String,
-    destination_address: String,
-    fee_sats: u64,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksRecover {
-        lock_id,
-        destination_address,
-        fee_sats,
-    })
-    .await?;
-    to_value(&resp)
-}
 
 #[tauri::command]
 async fn light_send(
@@ -970,11 +919,6 @@ pub fn run() {
             gsp_register_scan_key,
             gsp_session_status,
             gsp_auth,
-            locks_list,
-            locks_prepare,
-            locks_confirm,
-            locks_jump,
-            locks_recover,
             psbt_inspect,
             psbt_sign,
             psbt_create,

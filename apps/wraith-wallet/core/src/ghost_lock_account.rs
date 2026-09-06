@@ -6,11 +6,15 @@
 //!
 //! # Not `ghost-locks`
 //!
-//! `wraith-wallet-core` also depends on `ghost-locks` (plural), which is Ghost
-//! Pay's P2WSH lock and is what `LockEntry` and the wallet's Locks screen render
-//! today. This is the replacement, and the two coexist until Phase 0 demolition.
-//! Nothing here touches the old model, deliberately — attaching the new design
-//! to the one being demolished would make the demolition harder.
+//! `ghost-locks` (plural) is Ghost Pay's P2WSH lock. It used to back `LockEntry`
+//! and the wallet's Locks screen; Phase 0 demolition removed that, and the wallet
+//! no longer depends on the crate at all. The crate itself stays in the workspace
+//! because `bins/ghost-pay` — a shipped fleet binary — still builds on it.
+//!
+//! The demolition was safe to do because nobody ever created one of the old
+//! locks: the `ghost_locks` table held zero rows on every fleet node, checked
+//! against a control query that saw 22,562 shares in the same database. There
+//! was nothing to migrate and nothing to strand.
 //!
 //! # The lanes are not interchangeable, and the wallet must not pretend they are
 //!

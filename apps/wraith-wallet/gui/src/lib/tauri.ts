@@ -901,138 +901,18 @@ export async function gspSessionStatus(): Promise<GspSessionStatus> {
 // runtime — previously `state`/`created_at`/`recovery_height` (none of which exist
 // on the wire) left the State pill blank and the Confirm/Recover buttons (gated on
 // `state`) permanently unreachable.
-export interface LockEntry {
-  lock_id: string;
-  status: string;
-  capacity_sats: number;
-  balance_sats: number;
-  denomination: string;
-  timelock_tier: string;
-  funding_address: string;
-  funding_txid?: string;
-  funding_vout?: number;
-  /// Block height the lock was created at.
-  creation_height: number;
-  /// Absolute block height the timelock matures at — after this the wallet's
-  /// unilateral recovery branch is spendable (creation_height + recovery_blocks).
-  recovery_height: number;
-}
 
-export interface LocksListResponse {
-  locks: LockEntry[];
-}
 
-/// Wire-format lock entry — matches `wraith_wallet_ipc::LockEntry`
-/// exactly. Field names differ from the frontend's `LockEntry`
-/// (`status` vs `state`), so `locksList` adapts. Reading the wire
-/// shape straight through left `state` undefined, which silently
-/// suppressed every per-row action (Confirm / Recover / Rotate),
-/// since those gate on `state`.
-interface WireLockEntry {
-  lock_id: string;
-  status: string;
-  capacity_sats: number;
-  balance_sats: number;
-  denomination: string;
-  timelock_tier: string;
-  funding_address: string;
-  funding_txid: string | null;
-  funding_vout: number | null;
-  creation_height: number;
-  recovery_height: number;
-}
 
-interface WireLocksListResponse {
-  locks: WireLockEntry[];
-  total_locked_sats: number;
-}
 
-export async function locksList(): Promise<LocksListResponse> {
-  const resp = await invoke("locks_list");
-  const raw = unwrap<WireLocksListResponse>(resp).payload;
-  const locks: LockEntry[] = (raw.locks ?? []).map((w) => ({
-    lock_id: w.lock_id,
-    capacity_sats: w.capacity_sats,
-    balance_sats: w.balance_sats,
-    denomination: w.denomination,
-    timelock_tier: w.timelock_tier,
-    status: w.status,
-    funding_address: w.funding_address,
-    funding_txid: w.funding_txid ?? undefined,
-    funding_vout: w.funding_vout ?? undefined,
-    creation_height: w.creation_height,
-    recovery_height: w.recovery_height,
-  }));
-  return { locks };
-}
 
-export type LockJumpPriority = "normal" | "high" | "urgent";
 
-export interface LocksJumpedResult {
-  lock_id: string;
-  /// Jump (key-rotation) transaction id, when the operator broadcast
-  /// it. `null` while the rotation is queued.
-  jump_txid: string | null;
-}
 
-/// Rotate a lock's custody key ("jump"): the operator re-derives the
-/// cooperative key to `target_address`, severing any prior key
-/// exposure while keeping the funds inside the lock. `priority`
-/// trades fee for queue position.
-export async function locksJump(
-  lock_id: string,
-  target_address: string,
-  priority: LockJumpPriority = "normal",
-): Promise<LocksJumpedResult> {
-  const resp = await invoke("locks_jump", {
-    lockId: lock_id,
-    targetAddress: target_address,
-    priority,
-  });
-  return unwrap<LocksJumpedResult>(resp).payload;
-}
 
-export interface LocksPreparedResponse {
-  lock_id: string;
-  funding_address: string;
-  required_sats: number;
-}
 
-export async function locksPrepare(
-  capacity_sats: number,
-): Promise<LocksPreparedResponse> {
-  const resp = await invoke("locks_prepare", { capacitySats: capacity_sats });
-  return unwrap<LocksPreparedResponse>(resp).payload;
-}
 
-export async function locksConfirm(
-  lock_id: string,
-  funding_txid: string,
-): Promise<unknown> {
-  const resp = await invoke("locks_confirm", { lockId: lock_id, fundingTxid: funding_txid });
-  return unwrap(resp).payload;
-}
 
-export interface LocksRecoveredResult {
-  lock_id: string;
-  broadcast_txid: string;
-  destination: string;
-  recovered_sats: number;
-  fee_sats: number;
-}
 
-export async function locksRecover(
-  lock_id: string,
-  destination_address: string,
-  fee_sats: number,
-): Promise<LocksRecoveredResult> {
-  const resp = await invoke("locks_recover", {
-    lockId: lock_id,
-    destinationAddress: destination_address,
-    feeSats: fee_sats,
-  });
-  return unwrap<LocksRecoveredResult>(resp).payload;
-}
 
 // ----- PSBT --------------------------------------------------------------
 

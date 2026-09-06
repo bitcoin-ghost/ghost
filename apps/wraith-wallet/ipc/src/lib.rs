@@ -260,44 +260,6 @@ pub enum Request {
     /// the socket. The initial reply on the request's own id is an
     /// acknowledgement (`Response::Watching`).
     WatchPayments,
-    /// List the active wallet's Ghost Locks via the persistent GSP session.
-    LocksList,
-    /// Ask GSP to prepare a new ghost lock for the active wallet.
-    /// Server returns a funding address and required-sats; client funds it externally.
-    LocksPrepare {
-        capacity_sats: u64,
-    },
-    /// Confirm that a previously-prepared lock has been funded on-chain.
-    LocksConfirm {
-        lock_id: String,
-        funding_txid: String,
-    },
-    /// Initiate a jump (key rotation) for an existing lock.
-    /// Priority is one of: "normal" (default), "high", "urgent".
-    LocksJump {
-        lock_id: String,
-        target_address: String,
-        priority: String,
-    },
-    /// **Unilateral exit** — spend a Ghost Lock via the timelock
-    /// recovery branch, with no operator cooperation. Daemon talks
-    /// directly to the user-configured bitcoind, builds + signs +
-    /// broadcasts the spend tx using the wallet's own
-    /// recovery_secret. Works even if ghost-pay and ghost-gsp are
-    /// permanently down. The maturation precondition (current
-    /// height >= creation_height + recovery_blocks) is enforced
-    /// before signing — bitcoin would reject the spend anyway, but
-    /// surfacing it here gives a friendly error instead of a
-    /// cryptic mempool rejection.
-    LocksRecover {
-        lock_id: String,
-        /// Wallet-controlled L1 destination for the recovered funds.
-        destination_address: String,
-        /// Mining fee in sats. Subtracted from the lock's value.
-        /// Caller responsible for picking a sane number; daemon
-        /// refuses fee >= prev_value_sats.
-        fee_sats: u64,
-    },
     /// Prepare + sign + submit an L2 payment.
     /// Mode is `ghostpay` (the instant L2 ledger transfer); it is the
     /// only accepted value and the default. The legacy `wraith` and
@@ -734,13 +696,6 @@ pub enum Response {
     Watching,
     /// Unsolicited push: a new BIP-352 detection. Daemon sends with `id=0`.
     PaymentDetected(DetectedPaymentEntry),
-    LocksList(LocksListResponse),
-    LocksPrepared(LocksPreparedResponse),
-    LocksConfirmed(LocksConfirmedResponse),
-    LocksJumped(LocksJumpedResponse),
-    /// Successful response to [`Request::LocksRecover`]. The
-    /// recovery tx has been built, signed, and accepted by bitcoind.
-    LocksRecovered(LocksRecoveredResponse),
     LightSent(LightSentResponse),
     WalletCreate(WalletCreateResponse),
     /// Reply to `Request::WalletImport`. We don't echo the mnemonic back —
@@ -1244,67 +1199,6 @@ pub struct DetectedPaymentEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightDetectedResponse {
     pub detections: Vec<DetectedPaymentEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LockEntry {
-    pub lock_id: String,
-    pub status: String,
-    pub capacity_sats: u64,
-    pub balance_sats: u64,
-    pub denomination: String,
-    pub timelock_tier: String,
-    pub funding_address: String,
-    pub funding_txid: Option<String>,
-    pub funding_vout: Option<u32>,
-    pub creation_height: u32,
-    /// Absolute block height at which the lock's timelock matures and
-    /// the wallet's unilateral recovery branch becomes spendable
-    /// (`creation_height + recovery_blocks` per the lock's
-    /// `timelock_tier`). Sourced from the operator-reported
-    /// `recovery_height` on the GSP lock record.
-    pub recovery_height: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksListResponse {
-    pub locks: Vec<LockEntry>,
-    pub total_locked_sats: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksPreparedResponse {
-    pub lock_id: String,
-    pub funding_address: String,
-    pub required_sats: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksConfirmedResponse {
-    pub lock_id: String,
-    pub txid: String,
-    pub block_height: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksJumpedResponse {
-    pub lock_id: String,
-    /// Jump transaction id, if the server broadcast it.
-    pub jump_txid: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksRecoveredResponse {
-    pub lock_id: String,
-    /// Txid bitcoind accepted into the mempool. Once it confirms,
-    /// the lock's funds are back in the wallet's L1 control.
-    pub broadcast_txid: String,
-    /// Where the recovered funds went.
-    pub destination_address: String,
-    /// How much went to the destination (lock value minus fee).
-    pub recovered_sats: u64,
-    /// Mining fee paid.
-    pub fee_sats: u64,
 }
 
 /// One binary entry in a release manifest. Mirrors the JSON shape produced
@@ -1833,10 +1727,6 @@ mod tests {
                 shroud_max_ms: None,
                 mode: "onchain".into(),
                 memo: Some("test".into()),
-            },
-            Request::LocksList,
-            Request::LocksPrepare {
-                capacity_sats: 1_000_000,
             },
             Request::DaemonEnv,
             Request::SetNodeEndpoints {

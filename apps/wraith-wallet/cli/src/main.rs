@@ -54,11 +54,6 @@ enum Command {
         #[command(subcommand)]
         sub: LightCommand,
     },
-    /// Ghost Locks (custody primitive) commands.
-    Locks {
-        #[command(subcommand)]
-        sub: LocksCommand,
-    },
     /// Release / update commands.
     Update {
         #[command(subcommand)]
@@ -322,91 +317,6 @@ enum UpdateCommand {
 }
 
 #[derive(Subcommand)]
-enum LocksCommand {
-    /// List all Ghost Locks for the active wallet.
-    List,
-    /// Ask GSP to prepare a new ghost lock — returns a funding address.
-    Prepare {
-        /// Capacity of the lock in satoshis.
-        capacity_sats: u64,
-    },
-    /// Confirm that a prepared lock has been funded on-chain.
-    Confirm {
-        lock_id: String,
-        funding_txid: String,
-    },
-    /// Initiate a jump (key rotation) for an existing lock.
-    Jump {
-        lock_id: String,
-        /// Target address for the new lock.
-        target_address: String,
-        /// Priority: normal (default), high, or urgent.
-        #[arg(long, default_value = "normal")]
-        priority: String,
-    },
-    /// Prepare a lock AND fund it through a Wraith CoinJoin in one
-    /// shot. The mix's denom output is the lock's funding output, so
-    /// chain analysts see a CoinJoin — they cannot tell which output
-    /// became which user's L2 entry. This is the private-entry path
-    /// that distinguishes Ghost Locks from typical L2 funding (where
-    /// the channel-open tx is a chain-analysis goldmine).
-    ///
-    /// CLI chains three IPC calls under the hood:
-    ///   1. LocksPrepare(capacity_sats)               → funding_address
-    ///   2. WraithMixOneShot(mix_output=funding_addr) → broadcast_txid
-    ///   3. LocksConfirm(lock_id, broadcast_txid)     → block_height
-    ///
-    PrepareViaWraith {
-        /// Lock capacity in satoshis. Must match a Wraith Lite tier
-        /// denomination (100k_sats / 1m_sats / 10m_sats / 100m_sats).
-        #[arg(long)]
-        capacity_sats: u64,
-        /// HTTP URL of the wraith-coordinator endpoint.
-        #[arg(long)]
-        coordinator: String,
-        /// Wraith Lite tier id matching `capacity_sats`.
-        #[arg(long)]
-        tier: String,
-        /// Wallet's per-round identity for the wraith coordinator.
-        #[arg(long)]
-        ghost_id: String,
-        /// Optional SOCKS5 proxy for the /outputs anonymous step
-        /// (e.g. `socks5h://127.0.0.1:9050` for Tor).
-        #[arg(long)]
-        socks5_proxy: Option<String>,
-        /// UTXO outpoint feeding the mix as `txid:vout`.
-        #[arg(long)]
-        utxo: String,
-        /// UTXO value in satoshis.
-        #[arg(long)]
-        utxo_value: u64,
-        /// UTXO scriptPubKey, hex.
-        #[arg(long)]
-        utxo_scriptpubkey: String,
-        /// Optional BIP86 derivation index of the wallet key that
-        /// owns the input UTXO. None → daemon scans 0..1024.
-        #[arg(long)]
-        bip86_index: Option<u32>,
-    },
-    /// Unilateral exit — spend a Ghost Lock via the timelock recovery
-    /// branch to a wallet-controlled L1 destination, without any
-    /// operator cooperation. Daemon talks straight to bitcoind. Only
-    /// works once the lock's CSV timelock has matured (current height
-    /// >= creation_height + recovery_blocks).
-    Recover {
-        /// Lock to recover.
-        #[arg(long)]
-        lock_id: String,
-        /// L1 destination address for the recovered funds.
-        #[arg(long, value_name = "ADDR")]
-        to: String,
-        /// Mining fee in sats. Subtracted from the lock value.
-        #[arg(long, default_value_t = 1000)]
-        fee_sats: u64,
-    },
-}
-
-#[derive(Subcommand)]
 enum WalletCommand {
     /// Create a fresh wallet under the given name (generates a new BIP39 mnemonic).
     Create {
@@ -509,8 +419,7 @@ mod client {
     }
 
     use crate::{
-        ChainCommand, Command, GspCommand, LightCommand, LocksCommand, MixCommand, UpdateCommand,
-        WalletCommand,
+        ChainCommand, Command, GspCommand, LightCommand, MixCommand, UpdateCommand, WalletCommand,
     };
 
     pub async fn run(command: Command, json: bool, no_spawn: bool) -> std::process::ExitCode {
@@ -544,44 +453,6 @@ mod client {
         // terminal-friendly view.
         if matches!(&command, Command::Status) {
             return run_status(json).await;
-        }
-
-        // Multi-call entry-via-wraith flow: chains LocksPrepare →
-        // WraithMixOneShot → LocksConfirm under the hood, so the
-        // user sees one command.
-        if let Command::Locks {
-            sub: LocksCommand::PrepareViaWraith { .. },
-        } = &command
-        {
-            if let Command::Locks {
-                sub:
-                    LocksCommand::PrepareViaWraith {
-                        capacity_sats,
-                        coordinator,
-                        tier,
-                        ghost_id,
-                        socks5_proxy,
-                        utxo,
-                        utxo_value,
-                        utxo_scriptpubkey,
-                        bip86_index,
-                    },
-            } = command
-            {
-                return run_prepare_via_wraith(
-                    json,
-                    capacity_sats,
-                    coordinator,
-                    tier,
-                    ghost_id,
-                    socks5_proxy,
-                    utxo,
-                    utxo_value,
-                    utxo_scriptpubkey,
-                    bip86_index,
-                )
-                .await;
-            }
         }
 
         let request = match command {
@@ -627,41 +498,6 @@ mod client {
                     memo,
                     shroud_max_ms: if immediate { Some(0) } else { shroud_max_ms },
                 },
-            },
-            Command::Locks { sub } => match sub {
-                LocksCommand::List => Request::LocksList,
-                LocksCommand::Prepare { capacity_sats } => Request::LocksPrepare { capacity_sats },
-                LocksCommand::Confirm {
-                    lock_id,
-                    funding_txid,
-                } => Request::LocksConfirm {
-                    lock_id,
-                    funding_txid,
-                },
-                LocksCommand::Jump {
-                    lock_id,
-                    target_address,
-                    priority,
-                } => Request::LocksJump {
-                    lock_id,
-                    target_address,
-                    priority,
-                },
-                LocksCommand::Recover {
-                    lock_id,
-                    to,
-                    fee_sats,
-                } => Request::LocksRecover {
-                    lock_id,
-                    destination_address: to,
-                    fee_sats,
-                },
-                // Multi-call flow — handled before this match in
-                // run() proper. The arm exists only so the match
-                // is exhaustive.
-                LocksCommand::PrepareViaWraith { .. } => {
-                    unreachable!("PrepareViaWraith handled by run_prepare_via_wraith")
-                }
             },
             Command::Update { sub } => match sub {
                 UpdateCommand::Check { manifest_url } => Request::CheckForUpdate { manifest_url },
@@ -764,6 +600,7 @@ mod client {
                         }
                     };
                     Request::WraithMixPrepare {
+                        min_entities: None,
                         coordinator_url: coordinator,
                         coordinator_peers,
                         socks5_proxy,
@@ -813,6 +650,7 @@ mod client {
                         }
                     };
                     Request::WraithMixOneShot {
+                        min_entities: None,
                         coordinator_url: coordinator,
                         coordinator_peers,
                         socks5_proxy,
@@ -1098,70 +936,6 @@ mod client {
                 }
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::LocksPrepared(r)) => {
-                println!("lock prepared");
-                println!("  lock_id:         {}", r.lock_id);
-                println!("  funding address: {}", r.funding_address);
-                println!("  required:        {} sats", r.required_sats);
-                println!();
-                println!(
-                    "Send {} sats to the address above, then run:",
-                    r.required_sats
-                );
-                println!("  wraith locks confirm {} <funding_txid>", r.lock_id);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksConfirmed(r)) => {
-                println!("lock confirmed");
-                println!("  lock_id:      {}", r.lock_id);
-                println!("  funding txid: {}", r.txid);
-                println!("  block height: {}", r.block_height);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksJumped(r)) => {
-                println!("jump initiated");
-                println!("  lock_id:   {}", r.lock_id);
-                match r.jump_txid {
-                    Some(tx) => println!("  jump txid: {tx}"),
-                    None => println!("  jump txid: (queued — not yet broadcast)"),
-                }
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksRecovered(r)) => {
-                println!("✓ unilateral exit broadcast — funds back on L1");
-                println!("  lock_id:        {}", r.lock_id);
-                println!("  broadcast_txid: {}", r.broadcast_txid);
-                println!("  destination:    {}", r.destination_address);
-                println!("  recovered_sats: {}", r.recovered_sats);
-                println!("  fee_sats:       {}", r.fee_sats);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksList(r)) => {
-                if r.locks.is_empty() {
-                    println!("(no locks)");
-                } else {
-                    for l in &r.locks {
-                        println!(
-                            "{}  {}  {} / {} sats  ({})",
-                            &l.lock_id[..16.min(l.lock_id.len())],
-                            l.status,
-                            l.balance_sats,
-                            l.capacity_sats,
-                            l.denomination,
-                        );
-                        println!("  funding: {}", l.funding_address);
-                        if let (Some(txid), Some(vout)) = (&l.funding_txid, l.funding_vout) {
-                            println!("  outpoint: {txid}:{vout}");
-                        }
-                    }
-                    println!(
-                        "\n{} locks  total: {} sats",
-                        r.locks.len(),
-                        r.total_locked_sats
-                    );
-                }
-                std::process::ExitCode::SUCCESS
-            }
             Ok(Response::LightBalance(b)) => {
                 match b.confirmed_sats {
                     None => println!("(balance not yet known — session still authenticating?)"),
@@ -1179,6 +953,77 @@ mod client {
                     }
                 }
                 std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockLanes(r)) => {
+                println!(
+                    "ghost lock: {} sats settled, {} pending (block {})",
+                    r.total_sats, r.total_pending_sats, r.chain_height
+                );
+                if r.custodial_sats > 0 {
+                    println!(
+                        "  {} sats in Investments — the quorum can move these without you",
+                        r.custodial_sats
+                    );
+                }
+                for l in &r.lanes {
+                    let mut flags = String::new();
+                    if l.quorum_can_spend_alone {
+                        flags.push_str("  [custodial]");
+                    }
+                    if !l.round_eligible {
+                        flags.push_str("  [not private]");
+                    }
+                    println!("  {:<12} {} sats{}", l.label, l.balance_sats, flags);
+                    if l.pending_sats > 0 {
+                        println!("               +{} pending", l.pending_sats);
+                    }
+                    println!("               {}", l.address);
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSaved(r)) => {
+                println!(
+                    "{} {}",
+                    if r.created { "saved" } else { "updated" },
+                    r.lock.label.as_deref().unwrap_or(&r.lock.lock_id)
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockList(r)) => {
+                if r.locks.is_empty() {
+                    println!("(no Ghost Locks)");
+                }
+                for l in &r.locks {
+                    println!(
+                        "{}  {}",
+                        l.lock_id,
+                        l.label.as_deref().unwrap_or("(unnamed)")
+                    );
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockForgotten(r)) => {
+                // Says what it did NOT do: forgetting a definition leaves the
+                // funds exactly where they were.
+                if r.existed {
+                    println!("forgot {} — funds untouched", r.lock_id);
+                } else {
+                    println!("no such lock: {}", r.lock_id);
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::WraithMixRefused(r)) => {
+                println!(
+                    "refused: {} distinct entities across {} seats (floor {})",
+                    r.report.entities, r.report.seats, r.min_entities
+                );
+                for reason in &r.reasons {
+                    println!("  {reason}");
+                }
+                if !r.lowering_the_floor_would_help {
+                    println!("  the coordinator claimed more than its coins support");
+                }
+                std::process::ExitCode::FAILURE
             }
             Ok(Response::NodeEndpointsSet(r)) => {
                 println!("node endpoints updated (preset: {})", r.preset);
@@ -1761,146 +1606,6 @@ mod client {
         Ok(envelope.payload)
     }
 
-    /// `wraith locks prepare-via-wraith` flow. Three IPC calls under
-    /// the hood:
-    ///   1. LocksPrepare(capacity_sats)               → funding_address + lock_id
-    ///   2. WraithMixOneShot(mix_output=funding_addr) → broadcast_txid
-    ///   3. LocksConfirm(lock_id, broadcast_txid)     → block_height
-    ///
-    /// Stops at the first error and surfaces it to the user. The
-    /// printed step-by-step trail makes it obvious which phase
-    /// broke if the operator/coordinator misbehaves mid-flight.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_prepare_via_wraith(
-        json: bool,
-        capacity_sats: u64,
-        coordinator: String,
-        tier: String,
-        ghost_id: String,
-        socks5_proxy: Option<String>,
-        utxo: String,
-        utxo_value: u64,
-        utxo_scriptpubkey: String,
-        bip86_index: Option<u32>,
-    ) -> std::process::ExitCode {
-        let (txid, vout) = match parse_outpoint(&utxo) {
-            Ok(v) => v,
-            Err(e) => {
-                return io_err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
-            }
-        };
-
-        // Phase 1: prepare the lock.
-        if !json {
-            println!("[1/3] preparing lock ({capacity_sats} sats)");
-        }
-        let prep = match call(Request::LocksPrepare { capacity_sats }).await {
-            Ok(Response::LocksPrepared(p)) => p,
-            Ok(Response::Error(e)) => {
-                return error_out(json, format!("LocksPrepare: {}", e.message))
-            }
-            Ok(other) => {
-                return error_out(json, format!("LocksPrepare: unexpected response {other:?}"))
-            }
-            Err(e) => return error_out(json, format!("LocksPrepare: {e}")),
-        };
-        if !json {
-            println!("      lock_id:         {}", prep.lock_id);
-            println!("      funding_address: {}", prep.funding_address);
-        }
-
-        // Phase 2: run the wraith mix with the lock's funding address
-        // as the mix output. The CoinJoin's denom output IS the
-        // lock's funding output — the on-chain footprint is
-        // indistinguishable from any other Wraith mix.
-        if !json {
-            println!("[2/3] running wraith mix → {}", prep.funding_address);
-        }
-        let mix = match call(Request::WraithMixOneShot {
-            coordinator_url: coordinator,
-            coordinator_peers: Vec::new(),
-            socks5_proxy,
-            tier_id: tier,
-            ghost_id,
-            utxo_txid: txid,
-            utxo_vout: vout,
-            utxo_value_sats: utxo_value,
-            utxo_scriptpubkey_hex: utxo_scriptpubkey,
-            mix_output_address: prep.funding_address.clone(),
-            bip86_index,
-            bip86_scan_max: None,
-        })
-        .await
-        {
-            Ok(Response::WraithMixCompleted(m)) => m,
-            Ok(Response::Error(e)) => {
-                return error_out(json, format!("WraithMixOneShot: {}", e.message))
-            }
-            Ok(other) => {
-                return error_out(
-                    json,
-                    format!("WraithMixOneShot: unexpected response {other:?}"),
-                )
-            }
-            Err(e) => return error_out(json, format!("WraithMixOneShot: {e}")),
-        };
-        if !json {
-            println!("      session_id:     {}", mix.session_id);
-            println!("      broadcast_txid: {}", mix.broadcast_txid);
-        }
-
-        // Phase 3: confirm the lock against the broadcast txid.
-        if !json {
-            println!("[3/3] confirming lock funding");
-        }
-        let conf = match call(Request::LocksConfirm {
-            lock_id: prep.lock_id.clone(),
-            funding_txid: mix.broadcast_txid.clone(),
-        })
-        .await
-        {
-            Ok(Response::LocksConfirmed(c)) => c,
-            Ok(Response::Error(e)) => {
-                return error_out(json, format!("LocksConfirm: {}", e.message))
-            }
-            Ok(other) => {
-                return error_out(json, format!("LocksConfirm: unexpected response {other:?}"))
-            }
-            Err(e) => return error_out(json, format!("LocksConfirm: {e}")),
-        };
-
-        if json {
-            let body = serde_json::json!({
-                "lock_id": prep.lock_id,
-                "funding_address": prep.funding_address,
-                "broadcast_txid": mix.broadcast_txid,
-                "block_height": conf.block_height,
-                "session_id": mix.session_id,
-            });
-            println!("{body}");
-        } else {
-            println!();
-            println!("✓ lock funded via Wraith CoinJoin");
-            println!("  lock_id:        {}", prep.lock_id);
-            println!("  broadcast_txid: {}", mix.broadcast_txid);
-            println!("  block_height:   {}", conf.block_height);
-            println!();
-            println!("the chain shows a CoinJoin tx — chain analysts cannot tell");
-            println!("which output became this lock. that's the privacy property.");
-        }
-        std::process::ExitCode::SUCCESS
-    }
-
-    fn error_out(json: bool, msg: String) -> std::process::ExitCode {
-        if json {
-            let body = serde_json::json!({ "error": { "message": msg } });
-            println!("{body}");
-        } else {
-            eprintln!("wraith: {msg}");
-        }
-        std::process::ExitCode::FAILURE
-    }
-
     /// Multi-call status summary. Issues a few cheap requests in sequence and
     /// renders one line per facet. With --json, dumps the consolidated map
     /// instead so it's machine-readable.
@@ -1910,7 +1615,6 @@ mod client {
         let wallets = call(Request::WalletList).await;
         let session = call(Request::GspSessionStatus).await;
         let balance = call(Request::LightBalance).await;
-        let locks = call(Request::LocksList).await;
 
         if json {
             let body = serde_json::json!({
@@ -1919,7 +1623,6 @@ mod client {
                 "wallets": result_value(&wallets),
                 "session": result_value(&session),
                 "balance": result_value(&balance),
-                "locks":   result_value(&locks),
             });
             println!("{body}");
             return std::process::ExitCode::SUCCESS;
@@ -1975,18 +1678,6 @@ mod client {
             Ok(Response::Error(_)) | Err(_) => {
                 println!("balance:  (no session — `wraith gsp auth`)");
             }
-            _ => {}
-        }
-        // locks row
-        match &locks {
-            Ok(Response::LocksList(l)) => {
-                println!(
-                    "locks:    {} ({} sat capacity)",
-                    l.locks.len(),
-                    l.total_locked_sats
-                );
-            }
-            Ok(Response::Error(_)) | Err(_) => println!("locks:    (no session)"),
             _ => {}
         }
         // session row

@@ -12,7 +12,6 @@ pub mod ghostd;
 pub mod gsp;
 pub mod keystore;
 pub mod light;
-pub mod lock_recovery;
 pub mod mainnet_guard;
 pub mod psbt;
 pub mod signer;
