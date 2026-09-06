@@ -3526,3 +3526,90 @@ fn the_derivation_places_a_participant_somewhere_it_did_not_choose() {
         "placement must spread across the open rounds, got {seen:?}"
     );
 }
+
+#[tokio::test]
+async fn status_says_when_placement_is_not_actually_running() {
+    // A silently disabled defence reads as protection. With no epoch source the
+    // fallback must be distinguishable from a healthy single-round epoch.
+    let (router, _state, _b) = deterministic_router(1_000_000);
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "alice" }),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(create.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sid = json["session"]["session_id"].as_str().unwrap().to_string();
+
+    let r = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(r.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let p = &json["placement"];
+    assert_eq!(p["derived"], false, "no epoch source means not derived");
+    assert_eq!(p["fallback_reason"], "no_epoch_source_configured");
+    assert_eq!(p["open_rounds"], 1);
+}
+
+#[tokio::test]
+async fn status_reports_placement_as_running_when_it_is() {
+    // The other half: a configured beacon must read as derived, or the field
+    // would be a constant warning nobody acts on.
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(MockClock::new(1_000_000)),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            None,
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source()))
+        .with_epoch_source(Arc::new(FixedEpoch { volume: 200 })),
+    );
+    let router = build_router(state.clone());
+
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "alice" }),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(create.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sid = json["session"]["session_id"].as_str().unwrap().to_string();
+
+    let r = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(r.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let p = &json["placement"];
+    assert_eq!(p["derived"], true);
+    assert!(p["fallback_reason"].is_null());
+    assert!(
+        p["open_rounds"].as_u64().unwrap() > 1,
+        "200 payments should open several rounds: {p}"
+    );
+}
