@@ -27,6 +27,10 @@ use thiserror::Error;
 /// Something went wrong building or describing a Lock.
 #[derive(Debug, Error)]
 pub enum LockError {
+    /// A compartment rule was violated — see [`crate::compartment`].
+    #[error("{0}")]
+    Policy(String),
+
     /// A relative timelock exceeded the BIP-68 16-bit ceiling.
     #[error("relative timelock {blocks} exceeds the BIP-68 ceiling of {max} blocks; use an absolute CLTV height instead")]
     TimelockTooLong {

@@ -30,9 +30,9 @@
 //!
 //! | Lane | Key path | The quorum |
 //! |---|---|---|
-//! | [`VaultPolicy`] | `musig(owner, backup)` | has no part in it |
-//! | [`HotPolicy`] | `musig(owner, quorum)` | can only complete what was pre-signed |
-//! | [`LiquidityPolicy`] | `quorum` | can spend alone — this lane is custody |
+//! | [`SavingsPolicy`] | `musig(owner, backup)` | has no part in it |
+//! | [`SpendingPolicy`] | `musig(owner, quorum)` | can only complete what was pre-signed |
+//! | [`InvestmentsPolicy`] | `quorum` | can spend alone — this lane is custody |
 //!
 //! # Why the key path matters
 //!
@@ -52,13 +52,15 @@
 
 #![deny(missing_docs)]
 
+pub mod compartment;
 pub mod constants;
 pub mod error;
 pub mod lane;
 
+pub use compartment::{Compartment, CompartmentError};
 pub use constants::*;
 pub use error::LockError;
-pub use lane::{HotPolicy, Lane, LiquidityPolicy, VaultPolicy};
+pub use lane::{CashPolicy, InvestmentsPolicy, Lane, SavingsPolicy, SpendingPolicy};
 
 #[cfg(test)]
 mod tests {
@@ -72,8 +74,8 @@ mod tests {
         sk.x_only_public_key(&secp).0
     }
 
-    fn vault() -> VaultPolicy {
-        VaultPolicy {
+    fn vault() -> SavingsPolicy {
+        SavingsPolicy {
             aggregate: key(1),
             owner: key(2),
             backup: key(3),
@@ -97,15 +99,44 @@ mod tests {
     }
 
     #[test]
-    fn hot_and_liquidity_have_exactly_one_leaf() {
+    fn cash_has_no_script_path_at_all() {
+        // The only lane with no leaves. A script path would be a way to move
+        // the coin that is not the owner's key, and Cash has nothing to
+        // delegate and nothing to escape from.
         let secp = Secp256k1::verification_only();
-        let hot = HotPolicy {
+        let cash = CashPolicy { owner: key(2) }
+            .build(&secp, Network::Regtest)
+            .expect("builds");
+        assert_eq!(cash.spend_info.script_map().len(), 0);
+        assert!(cash.spend_info.merkle_root().is_none());
+    }
+
+    #[test]
+    fn cash_is_not_the_same_address_as_the_private_lanes() {
+        // Compartmenting is worthless if the compartments share an address.
+        let secp = Secp256k1::verification_only();
+        let cash = CashPolicy { owner: key(2) }
+            .build(&secp, Network::Regtest)
+            .expect("builds");
+        let spending = SpendingPolicy {
             aggregate: key(1),
             owner: key(2),
         }
         .build(&secp, Network::Regtest)
         .expect("builds");
-        let liq = LiquidityPolicy {
+        assert_ne!(cash.address, spending.address);
+    }
+
+    #[test]
+    fn hot_and_liquidity_have_exactly_one_leaf() {
+        let secp = Secp256k1::verification_only();
+        let hot = SpendingPolicy {
+            aggregate: key(1),
+            owner: key(2),
+        }
+        .build(&secp, Network::Regtest)
+        .expect("builds");
+        let liq = InvestmentsPolicy {
             quorum: key(5),
             owner: key(2),
         }
@@ -164,7 +195,7 @@ mod tests {
     fn lanes_of_one_lock_are_distinct_addresses() {
         let secp = Secp256k1::verification_only();
         let v = vault().build(&secp, 900_000, Network::Regtest).unwrap();
-        let h = HotPolicy {
+        let h = SpendingPolicy {
             aggregate: key(1),
             owner: key(2),
         }

@@ -29,7 +29,7 @@
 //! deliberate and load-bearing: a key-path spend is a single 64-byte Schnorr
 //! signature over a bare 32-byte output key, indistinguishable from any
 //! ordinary single-signature wallet. A script-path spend reveals its leaf, and
-//! on the hot lane that would mark every round input as Wraith.
+//! on the spending lane that would mark every round input as Wraith.
 //!
 //! ```text
 //! VAULT      key path  musig(owner, backup)   quorum has NO part
@@ -130,7 +130,7 @@ impl Lane {
 
 /// The savings lane. The quorum has no part in it at all.
 #[derive(Debug, Clone, Copy)]
-pub struct VaultPolicy {
+pub struct SavingsPolicy {
     /// MuSig2 aggregate of the owner and backup keys — the normal spend.
     pub aggregate: XOnlyPublicKey,
     /// Owner key, for the ~14 month recovery leaf.
@@ -143,8 +143,8 @@ pub struct VaultPolicy {
     pub inherit_height: u32,
 }
 
-impl VaultPolicy {
-    /// Build the vault lane, anchored at `anchor_height` (the current tip when
+impl SavingsPolicy {
+    /// Build the savings lane, anchored at `anchor_height` (the current tip when
     /// the Lock is created or rolled over).
     pub fn build<C: Verification>(
         &self,
@@ -183,15 +183,15 @@ impl VaultPolicy {
 /// pre-signed — it cannot redirect, and it cannot spend alone. That is what
 /// makes this delegation and not custody.
 #[derive(Debug, Clone, Copy)]
-pub struct HotPolicy {
+pub struct SpendingPolicy {
     /// MuSig2 aggregate of the owner and the coin's quorum.
     pub aggregate: XOnlyPublicKey,
     /// Owner key, for the escape leaf if the quorum goes dark.
     pub owner: XOnlyPublicKey,
 }
 
-impl HotPolicy {
-    /// Build the hot lane.
+impl SpendingPolicy {
+    /// Build the spending lane.
     pub fn build<C: Verification>(
         &self,
         secp: &Secp256k1<C>,
@@ -200,7 +200,10 @@ impl HotPolicy {
         Lane::assemble(
             secp,
             self.aggregate,
-            vec![(0, relative_timelock_leaf(HOT_EXIT_BLOCKS, &self.owner)?)],
+            vec![(
+                0,
+                relative_timelock_leaf(SPENDING_EXIT_BLOCKS, &self.owner)?,
+            )],
             network,
         )
     }
@@ -209,18 +212,18 @@ impl HotPolicy {
 /// The earning lane. **This lane is custody** — the quorum spends alone.
 ///
 /// The recall leaf bounds how long a silent quorum can hold the funds. Total
-/// deposits across all liquidity lanes must not exceed aggregate bond, or the
+/// deposits across all investments lanes must not exceed aggregate bond, or the
 /// guarantee behind them is theatre.
 #[derive(Debug, Clone, Copy)]
-pub struct LiquidityPolicy {
+pub struct InvestmentsPolicy {
     /// Quorum key — spends alone, via the key path.
     pub quorum: XOnlyPublicKey,
     /// Owner key, for the recall leaf.
     pub owner: XOnlyPublicKey,
 }
 
-impl LiquidityPolicy {
-    /// Build the liquidity lane.
+impl InvestmentsPolicy {
+    /// Build the investments lane.
     pub fn build<C: Verification>(
         &self,
         secp: &Secp256k1<C>,
@@ -231,9 +234,51 @@ impl LiquidityPolicy {
             self.quorum,
             vec![(
                 0,
-                relative_timelock_leaf(LIQUIDITY_RECALL_BLOCKS, &self.owner)?,
+                relative_timelock_leaf(INVESTMENTS_RECALL_BLOCKS, &self.owner)?,
             )],
             network,
         )
+    }
+}
+
+/// The **Cash** lane: small, public, everyday spending. Owner key only.
+///
+/// # Why a deliberately non-private lane exists
+///
+/// The ladder floor is 1,000 sats and a round costs fees and latency, so mixing
+/// a coffee costs more than the coffee. Refusing to serve that case does not
+/// remove it — the user fetches a second wallet and funds it **from here**,
+/// which creates exactly the link the Lock exists to avoid, somewhere nobody
+/// can see it. Better to serve it, and compartment it properly.
+///
+/// # No quorum, no timelock
+///
+/// The quorum's job is to co-sign spends that need protecting. Cash holds small
+/// amounts that are already public once spent, so a co-signer would add
+/// ceremony and a liveness dependency to buy nothing. There is no escape leaf
+/// for the same reason: there is nothing to escape from.
+///
+/// This is the only lane with no script path at all — a bare key-path output,
+/// indistinguishable from any ordinary single-sig wallet.
+///
+/// # Safety rests on the compartment, not on this type
+///
+/// See [`crate::compartment`]. A Cash coin must never enter a round, and round
+/// outputs must never be topped up into Cash UTXOs. Without those two rules
+/// this lane re-links the coins the other three lanes protected.
+#[derive(Debug, Clone, Copy)]
+pub struct CashPolicy {
+    /// Owner key. Spends alone, by the key path.
+    pub owner: XOnlyPublicKey,
+}
+
+impl CashPolicy {
+    /// Build the cash lane: key-path only, no leaves.
+    pub fn build<C: Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        network: Network,
+    ) -> Result<Lane, LockError> {
+        Lane::assemble(secp, self.owner, vec![], network)
     }
 }

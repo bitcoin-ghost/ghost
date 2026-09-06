@@ -89,7 +89,7 @@ pub enum ExitRisk {
 impl ExitConfig {
     /// A config anchored to the real hot-lane escape leaf.
     ///
-    /// `exit_delay_blocks` is read from [`ghost_lock::HOT_EXIT_BLOCKS`] rather
+    /// `exit_delay_blocks` is read from [`ghost_lock::SPENDING_EXIT_BLOCKS`] rather
     /// than restated. The two crates do not otherwise know about each other, so
     /// a change to the leaf would silently leave this analysis reasoning about
     /// a delay that no longer exists — drift a grep inside either crate cannot
@@ -100,7 +100,7 @@ impl ExitConfig {
         round_settlement_blocks: u32,
     ) -> Self {
         Self {
-            exit_delay_blocks: ghost_lock::HOT_EXIT_BLOCKS,
+            exit_delay_blocks: ghost_lock::SPENDING_EXIT_BLOCKS,
             remix_interval_blocks,
             outstanding_presignatures,
             round_settlement_blocks,
@@ -345,7 +345,7 @@ mod tests {
         c.on_round_settled();
         assert_eq!(
             c.exit_available_at(),
-            Some(900_000 + ghost_lock::HOT_EXIT_BLOCKS),
+            Some(900_000 + ghost_lock::SPENDING_EXIT_BLOCKS),
             "now the clock can actually run"
         );
     }
@@ -357,7 +357,7 @@ mod tests {
         c.request_exit(950_000);
         assert_eq!(
             c.exit_available_at(),
-            Some(900_000 + ghost_lock::HOT_EXIT_BLOCKS)
+            Some(900_000 + ghost_lock::SPENDING_EXIT_BLOCKS)
         );
     }
 
@@ -375,10 +375,10 @@ mod tests {
         // find: `ghost-lock` owns the escape leaf, `wraith-protocol` reasons
         // about it, and nothing connected them.
         let cfg = ExitConfig::for_hot_lane(5_000, 1, 36);
-        assert_eq!(cfg.exit_delay_blocks, ghost_lock::HOT_EXIT_BLOCKS);
+        assert_eq!(cfg.exit_delay_blocks, ghost_lock::SPENDING_EXIT_BLOCKS);
         assert_eq!(
             realistic().exit_delay_blocks,
-            ghost_lock::HOT_EXIT_BLOCKS,
+            ghost_lock::SPENDING_EXIT_BLOCKS,
             "the fixture has drifted from the leaf it claims to model"
         );
     }

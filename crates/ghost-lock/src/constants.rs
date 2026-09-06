@@ -52,17 +52,17 @@ pub const BACKUP_RECOVERY_BLOCKS: u32 = CSV_MAX_BLOCKS;
 /// staggered race into a coin flip.
 pub const MIN_RECOVERY_GAP_BLOCKS: u32 = 4_320;
 
-/// Owner-alone escape from the hot lane, in blocks (~7 days).
+/// Owner-alone escape from the spending lane, in blocks (~7 days).
 ///
-/// The hot lane delegates co-signing to a quorum. This leaf is what makes that
+/// The spending lane delegates co-signing to a quorum. This leaf is what makes that
 /// delegation rather than custody: if the quorum goes dark, the owner sweeps.
-pub const HOT_EXIT_BLOCKS: u32 = 1_008;
+pub const SPENDING_EXIT_BLOCKS: u32 = 1_008;
 
-/// Owner-alone recall from the liquidity lane, in blocks (~14 days).
+/// Owner-alone recall from the investments lane, in blocks (~14 days).
 ///
-/// The liquidity lane **is** custody — the quorum spends alone. This leaf bounds
+/// The investments lane **is** custody — the quorum spends alone. This leaf bounds
 /// how long a silent quorum can hold the funds.
-pub const LIQUIDITY_RECALL_BLOCKS: u32 = 2_016;
+pub const INVESTMENTS_RECALL_BLOCKS: u32 = 2_016;
 
 // ---------------------------------------------------------------------------
 // Invariants, enforced at COMPILE TIME.
@@ -88,5 +88,5 @@ const _: () = assert!(
 );
 
 const _: () = assert!(OWNER_RECOVERY_BLOCKS <= CSV_MAX_BLOCKS);
-const _: () = assert!(HOT_EXIT_BLOCKS <= CSV_MAX_BLOCKS);
-const _: () = assert!(LIQUIDITY_RECALL_BLOCKS <= CSV_MAX_BLOCKS);
+const _: () = assert!(SPENDING_EXIT_BLOCKS <= CSV_MAX_BLOCKS);
+const _: () = assert!(INVESTMENTS_RECALL_BLOCKS <= CSV_MAX_BLOCKS);
