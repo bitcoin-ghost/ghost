@@ -13,6 +13,7 @@ use stratum_apps::stratum_core::{
     common_messages_sv2::*,
     extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
     mining_sv2::*,
+    extensions_sv2::PROVISIONAL_CHANNEL_IDENTITY,
     parsers_sv2::{AnyMessage, Extensions, ExtensionsNegotiation, Mining},
 };
 use tracing::info;
@@ -123,12 +124,23 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
         )
         .await;
 
-    // Extract and verify user_identity from OpenExtendedMiningChannel
+    // The CHANNEL carries the provisional sentinel, not the miner's identity — and that is the
+    // point of `open_channel_on_subscribe`, which every production node runs.
+    //
+    // A serialising SV1 client waits for the subscribe response before it authorises, so the
+    // channel has to open at subscribe, before any user_identity is known. It therefore opens
+    // under `PROVISIONAL_CHANNEL_IDENTITY` and the real payout identity travels PER SHARE in the
+    // worker TLV, asserted below — which is what this test is actually named for.
+    //
+    // ⚠ Asserting the miner's username here instead would pass only with the flag OFF, i.e. only
+    // in the configuration where the miner is handed a placeholder extranonce and every share it
+    // submits is invalid. A green assertion bought at the cost of the test never reaching a
+    // single share.
     let open_channel_msg = pool_translator_sniffer.next_message_from_downstream();
     match open_channel_msg {
         Some((_, AnyMessage::Mining(Mining::OpenExtendedMiningChannel(msg)))) => {
             let user_identity = msg.user_identity.as_utf8_or_hex();
-            assert_eq!(user_identity, MINER_USERNAME.to_string());
+            assert_eq!(user_identity, PROVISIONAL_CHANNEL_IDENTITY.to_string());
         }
         _ => panic!(
             "received unexpected message: {:?}",
@@ -186,17 +198,24 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
                     tlv.r#type.field_type, TLV_FIELD_TYPE_USER_IDENTITY,
                     "TLV field_type should be user_identity"
                 );
+                // The TLV carries the FULL `<address>.<worker>` identity, not just the worker
+                // half. Under `open_channel_on_subscribe` the channel opens on the provisional
+                // sentinel, so the payout address has nowhere else to travel — it rides per
+                // share, here. Derived from the constant rather than hard-coded, so changing the
+                // fixture username cannot leave a stale byte count behind.
                 let payload_len = tlv.value.len();
-                assert!(
-                    payload_len == 9,
-                    "user_identity TLV payload should be 9 bytes"
+                assert_eq!(
+                    payload_len,
+                    MINER_USERNAME.len(),
+                    "user_identity TLV payload should be the full identity ({} bytes)",
+                    MINER_USERNAME.len()
                 );
                 // Try to convert value to string for logging
                 if let Ok(user_identity_str) = std::str::from_utf8(&tlv.value) {
                     // Verify user_identity format (should be "SRI-miner")
                     assert_eq!(
-                        user_identity_str, "SRI-miner",
-                        "user_identity should be 'SRI-miner', got: {}",
+                        user_identity_str, MINER_USERNAME,
+                        "user_identity TLV should carry the full identity, got: {}",
                         user_identity_str
                     );
                 } else {
