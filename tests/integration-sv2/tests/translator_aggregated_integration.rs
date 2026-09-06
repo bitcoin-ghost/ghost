@@ -12,33 +12,26 @@
 
 // This file contains integration tests for the `TranslatorSv2` module.
 use integration_tests_sv2::{
-    interceptor::{IgnoreMessage, MessageDirection, ReplaceMessage},
+    interceptor::{IgnoreMessage, MessageDirection},
     mock_roles::{MockUpstream, WithSetup},
-    sv1_sniffer::SV1MessageFilter,
     template_provider::DifficultyLevel,
     utils::get_available_address,
     *,
 };
 use stratum_apps::stratum_core::mining_sv2::*;
-use tokio::net::{TcpListener, TcpStream};
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::time::Duration;
 use stratum_apps::stratum_core::{
     binary_sv2::{Seq0255, Sv2Option},
     common_messages_sv2::{
-        Protocol, SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
-        MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        Protocol, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
+        MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
     },
     mining_sv2::{
-        CloseChannel, OpenMiningChannelError, MESSAGE_TYPE_CLOSE_CHANNEL,
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        CloseChannel, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     },
     parsers_sv2::{self, AnyMessage, CommonMessages},
-    sv1_api,
     template_distribution_sv2::MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
 

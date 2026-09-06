@@ -17,7 +17,7 @@ use std::{
 use stratum_apps::stratum_core::{
     binary_sv2::{Seq0255, Sv2Option},
     common_messages_sv2::{
-        Protocol, SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
+        SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
         MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
     },
     mining_sv2::{
