@@ -340,12 +340,47 @@ phase_soak() {
     info "canaries healthy"
 }
 
+# ⚠ Production is TWO passes, not one loop, and the reason is `PRODUCTION_ONLY_BINARIES`.
+#
+# ghost-pay and ghost-gsp run on production nodes only — no canary carries the service — so
+# `deploy-node.sh` makes the FIRST production node deployed act as their canary and soak alone
+# for SOAK_MINUTES. A node cannot vouch for itself, so it is excluded from its own soak pool.
+#
+# A single loop therefore refuses partway through the SECOND node, which is exactly what
+# happened rolling v1.11.37: vm1 took all five, vm2 took the mining stack and was then refused
+# on ghost-pay with "has not soaked 60m on a canary" — leaving vm3 and vm4 still on the old
+# mining stack while production sat split across two versions.
+#
+# So: mining stack to every production node FIRST (the split is the state worth shortening),
+# then the production-only pair, retrying past the soak refusal rather than treating it as
+# fatal. The soak itself is still enforced by deploy-node.sh; this only avoids hammering it.
 phase_production() {
     step "production roll"
     require_sha; assert_sha_still_current "$(release_sha)"
-    $DRY_RUN && { info "[dry-run] would roll $FLEET_BINARIES $PRODUCTION_ONLY to $PRODUCTION_NODES"; return 0; }
+    $DRY_RUN && { info "[dry-run] would roll $FLEET_BINARIES to $PRODUCTION_NODES, then \
+$PRODUCTION_ONLY (first node soaks alone)"; return 0; }
+
+    info "pass 1: mining stack to every production node"
     for n in $PRODUCTION_NODES; do
-        roll_node "$n" "" "$FLEET_BINARIES $PRODUCTION_ONLY" || die "production roll stopped at $n"
+        roll_node "$n" "" "$FLEET_BINARIES" || die "production roll stopped at $n"
+    done
+
+    info "pass 2: production-only binaries ($PRODUCTION_ONLY)"
+    local n b rc attempt
+    for n in $PRODUCTION_NODES; do
+        for b in $PRODUCTION_ONLY; do
+            for attempt in $(seq 1 24); do
+                (cd "$WORKTREE" && ./scripts/deploy-node.sh "$n" "$b")
+                rc=$?
+                [ $rc -eq 0 ] && break
+                # exit 1 is a PRECONDITION (the soak is not satisfied yet) — wait and retry.
+                # Any other code is a real deploy or smoke failure and must stop the roll.
+                [ $rc -ne 1 ] && die "$n/$b failed (exit $rc)"
+                info "$n/$b: soak not yet satisfied, waiting 5m (attempt $attempt)"
+                sleep 300
+            done
+            [ $rc -eq 0 ] || die "$n/$b never satisfied its soak"
+        done
     done
     info "production done"
 }
