@@ -87,6 +87,7 @@ pub mod seat_price;
 pub mod service;
 pub mod signing_ledger;
 pub mod sortition;
+pub mod standing_order;
 pub use epoch::{
     canonical_roster, derive_beacon, epoch_for_height, shard_key_for_tier_epoch,
     snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
