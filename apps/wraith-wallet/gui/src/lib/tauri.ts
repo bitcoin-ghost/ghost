@@ -797,8 +797,6 @@ export interface GhostLockLanesArgs {
   backup_pubkey: string;
   heir_pubkey: string;
   quorum_pubkey: string;
-  owner_backup_aggregate: string;
-  owner_quorum_aggregate: string;
   inherit_height: number;
   anchor_height: number;
   bip86_index?: number;
@@ -806,9 +804,9 @@ export interface GhostLockLanesArgs {
 
 /// Derive a Ghost Lock's four lanes and read their balances.
 ///
-/// The aggregates are supplied rather than derived: both are products of a
-/// MuSig2 ceremony with the backup device and the quorum. This reports on a Lock
-/// that already exists — creating one needs that ceremony, which is not built.
+/// The MuSig2 aggregates are derived by the daemon from these three keys.
+/// BIP-327 key aggregation is deterministic, so no ceremony is needed to build a
+/// Lock; interaction is required only to sign a key-path spend.
 export async function ghostLockLanes(
   args: GhostLockLanesArgs,
 ): Promise<GhostLockLanes> {
@@ -816,8 +814,6 @@ export async function ghostLockLanes(
     backupPubkey: args.backup_pubkey,
     heirPubkey: args.heir_pubkey,
     quorumPubkey: args.quorum_pubkey,
-    ownerBackupAggregate: args.owner_backup_aggregate,
-    ownerQuorumAggregate: args.owner_quorum_aggregate,
     inheritHeight: args.inherit_height,
     anchorHeight: args.anchor_height,
     bip86Index: args.bip86_index,

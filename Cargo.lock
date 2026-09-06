@@ -10833,6 +10833,7 @@ dependencies = [
  "bitcoin",
  "ghost-gsp-proto",
  "ghost-keys",
+ "ghost-lock",
  "hex",
  "interprocess",
  "rand 0.8.6",

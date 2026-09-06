@@ -149,15 +149,20 @@ pub enum Request {
     /// field to skip the daemon-side scan.
     /// Derive a Ghost Lock's four lanes and report their balances.
     ///
-    /// # The aggregate keys are supplied, not derived
+    /// # The aggregates are derived, not supplied
     ///
     /// Savings spends by a MuSig2 aggregate of owner and backup; Spending by an
-    /// aggregate of owner and quorum. Those are products of an interactive
-    /// ceremony with the other party — the wallet cannot compute either alone,
-    /// and MuSig2 is not in this workspace at all.
+    /// aggregate of owner and quorum. Both are computed here from the individual
+    /// public keys: BIP-327 key aggregation is deterministic, so no ceremony and
+    /// no other party being online is required.
     ///
-    /// So this request reports on a Lock whose keys already exist. Creating one
-    /// needs the ceremony, which is a separate piece of work and not yet built.
+    /// Interaction is needed only to **sign** a key-path spend — nonce exchange
+    /// and partial signatures — which is a separate piece of work.
+    ///
+    /// Deriving rather than accepting them also removes a class of error: a
+    /// pasted aggregate that does not match its parts would build a Lock whose
+    /// key path nobody can satisfy, and nothing would notice until a spend
+    /// failed.
     GhostLockLanes {
         /// Backup device's x-only key, hex.
         backup_pubkey: String,
@@ -165,10 +170,6 @@ pub enum Request {
         heir_pubkey: String,
         /// Wraith quorum's x-only key, hex.
         quorum_pubkey: String,
-        /// MuSig2 aggregate of owner and backup, hex.
-        owner_backup_aggregate: String,
-        /// MuSig2 aggregate of owner and quorum, hex.
-        owner_quorum_aggregate: String,
         /// Absolute height the inheritance leaf matures at.
         inherit_height: u32,
         /// Height the Lock is anchored at — normally the current tip.

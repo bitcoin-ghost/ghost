@@ -536,17 +536,13 @@ async fn wraith_mix_run(
 
 /// Derive a Ghost Lock's four lanes and report their balances.
 ///
-/// The two aggregate keys are supplied rather than derived: they are products of
-/// a MuSig2 ceremony with the backup device and the quorum, and MuSig2 is not in
-/// this workspace. This reports on a Lock that already exists.
+/// The MuSig2 aggregates are derived by the daemon from the individual keys —
+/// BIP-327 aggregation is deterministic, so no ceremony is involved.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 async fn ghost_lock_lanes(
     backup_pubkey: String,
     heir_pubkey: String,
     quorum_pubkey: String,
-    owner_backup_aggregate: String,
-    owner_quorum_aggregate: String,
     inherit_height: u32,
     anchor_height: u32,
     bip86_index: Option<u32>,
@@ -555,8 +551,6 @@ async fn ghost_lock_lanes(
         backup_pubkey,
         heir_pubkey,
         quorum_pubkey,
-        owner_backup_aggregate,
-        owner_quorum_aggregate,
         inherit_height,
         anchor_height,
         bip86_index,

@@ -2739,8 +2739,6 @@ mod server {
                 backup_pubkey,
                 heir_pubkey,
                 quorum_pubkey,
-                owner_backup_aggregate,
-                owner_quorum_aggregate,
                 inherit_height,
                 anchor_height,
                 bip86_index,
@@ -2783,19 +2781,26 @@ mod server {
 
                 let built = (|| {
                     let owner = owner_res.clone()?;
+                    let backup = xonly("backup_pubkey", &backup_pubkey)?;
+                    let quorum = xonly("quorum_pubkey", &quorum_pubkey)?;
+
+                    // Derived here rather than accepted from the caller. BIP-327
+                    // aggregation is deterministic, so both sides reach the same
+                    // answer independently — and a pasted aggregate that did not
+                    // match its parts would build a Lock whose key path nobody
+                    // can satisfy, with nothing noticing until a spend failed.
+                    let owner_backup_aggregate = ghost_lock::aggregate(&[owner, backup])
+                        .map_err(|e| format!("owner+backup aggregate: {e}"))?;
+                    let owner_quorum_aggregate = ghost_lock::aggregate(&[owner, quorum])
+                        .map_err(|e| format!("owner+quorum aggregate: {e}"))?;
+
                     let keys = LockKeys {
                         owner,
-                        backup: xonly("backup_pubkey", &backup_pubkey)?,
+                        backup,
                         heir: xonly("heir_pubkey", &heir_pubkey)?,
-                        owner_backup_aggregate: xonly(
-                            "owner_backup_aggregate",
-                            &owner_backup_aggregate,
-                        )?,
-                        owner_quorum_aggregate: xonly(
-                            "owner_quorum_aggregate",
-                            &owner_quorum_aggregate,
-                        )?,
-                        quorum: xonly("quorum_pubkey", &quorum_pubkey)?,
+                        owner_backup_aggregate,
+                        owner_quorum_aggregate,
+                        quorum,
                     };
                     let secp = Secp256k1::verification_only();
                     GhostLockAccount::build(&secp, &keys, network, anchor_height, inherit_height)
