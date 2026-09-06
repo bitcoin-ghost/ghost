@@ -89,6 +89,7 @@ pub mod mailbox;
 pub mod pre_sign;
 pub mod privacy;
 pub mod privacy_level;
+pub mod residency;
 pub mod seat_price;
 pub mod service;
 pub mod signature_scope;
