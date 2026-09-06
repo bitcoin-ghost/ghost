@@ -11,6 +11,7 @@ import {
   type LocksRecoveredResult,
   type LocksJumpedResult,
 } from "../lib/tauri";
+import { GhostLockPanel } from "../components/GhostLockPanel";
 import { HelpTip } from "../components/HelpTip";
 import { HELP_TOPICS } from "../lib/help";
 
@@ -211,9 +212,13 @@ export function Locks() {
       </div>
       {err && <div className="card error-card">{err}</div>}
 
+      <GhostLockPanel />
+
       <div className="card">
         <div className="card-header">
-          <h2>{locks.length === 0 ? "No locks yet" : "Your locks"}</h2>
+          <h2>
+            {locks.length === 0 ? "No Ghost Pay locks yet" : "Ghost Pay locks"}
+          </h2>
           {!showPrepare && (
             <button
               className="primary"

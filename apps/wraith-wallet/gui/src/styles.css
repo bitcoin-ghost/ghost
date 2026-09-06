@@ -1355,3 +1355,10 @@ code {
 .lane-pending { font-size: 0.8125rem; }
 .lane-addr { font-size: 0.75rem; overflow-wrap: anywhere; margin-top: 0.25rem; }
 .lock-height { margin: 0.75rem 0 0; font-size: 0.8125rem; }
+
+/* Ghost Lock key entry. Public keys only — nothing secret is typed here. */
+.ghost-lock-panel { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; }
+.lock-key-form { display: flex; flex-direction: column; gap: 0.75rem; margin: 0.75rem 0; }
+.lock-key-field { display: flex; flex-direction: column; gap: 0.25rem; }
+.lock-key-field input { width: 100%; font-size: 0.8125rem; }
+.lock-key-hint { font-size: 0.75rem; }
