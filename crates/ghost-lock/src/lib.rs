@@ -20,6 +20,22 @@
 //| FILE: lib.rs                                                                                                         |
 //|======================================================================================================================|
 
+//! # Not to be confused with `ghost-locks`
+//!
+//! There is a separate crate called **`ghost-locks`** (plural). It is Ghost
+//! Pay's P2WSH quantum-safe lock, and it is the thing this crate exists to
+//! replace — it is still wired into `wraith-wallet-core` and stays until Phase 0
+//! demolition, which is blocked on v1 shipping.
+//!
+//! | Crate | What it is | Script type |
+//! |---|---|---|
+//! | `ghost-lock` (this one) | The new four-lane Lock | Taproot |
+//! | `ghost-locks` | Ghost Pay's lock, being replaced | P2WSH |
+//!
+//! The names differ by one character and the wrong import compiles, so check
+//! which one you meant. `Locks.tsx` in the wallet GUI renders `ghost-locks`
+//! entries, not these lanes.
+//!
 //! Ghost Lock — Taproot custody policies for Bitcoin Ghost.
 //!
 //! A Lock is a **policy, not a coin**. Many UTXOs sit under one Lock, and the
