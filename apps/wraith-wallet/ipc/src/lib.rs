@@ -163,6 +163,31 @@ pub enum Request {
     /// pasted aggregate that does not match its parts would build a Lock whose
     /// key path nobody can satisfy, and nothing would notice until a spend
     /// failed.
+    /// Remember a Ghost Lock's definition.
+    ///
+    /// `lock_id` is derived from the fields, so saving the same Lock twice
+    /// updates one record rather than making a second. Only public keys and two
+    /// heights are stored — the owner's key stays in the keystore.
+    GhostLockSave {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        backup_pubkey: String,
+        heir_pubkey: String,
+        quorum_pubkey: String,
+        anchor_height: u32,
+        inherit_height: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bip86_index: Option<u32>,
+    },
+    /// Every remembered Lock.
+    GhostLockList,
+    /// Forget a Lock's definition.
+    ///
+    /// Removes the record, not the Lock. The lanes stay spendable by anyone
+    /// holding the keys.
+    GhostLockForget {
+        lock_id: String,
+    },
     GhostLockLanes {
         /// Backup device's x-only key, hex.
         backup_pubkey: String,
@@ -693,6 +718,9 @@ pub enum Response {
     LightUtxos(LightUtxosResponse),
     LightL1Utxos(LightL1UtxosResponse),
     GhostLockLanes(GhostLockLanesResponse),
+    GhostLockSaved(GhostLockSavedResponse),
+    GhostLockList(GhostLockListResponse),
+    GhostLockForgotten(GhostLockForgottenResponse),
     LightHistory(LightHistoryResponse),
     LightDetected(LightDetectedResponse),
     DaemonEnv(DaemonEnvResponse),
@@ -1668,6 +1696,39 @@ pub struct WraithMixRefusedResponse {
     /// coordinator stated a figure the chain does not support, and there is no
     /// floor at which that becomes acceptable.
     pub lowering_the_floor_would_help: bool,
+}
+
+/// A remembered Lock definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockRecord {
+    pub lock_id: String,
+    pub label: Option<String>,
+    pub backup_pubkey: String,
+    pub heir_pubkey: String,
+    pub quorum_pubkey: String,
+    pub anchor_height: u32,
+    pub inherit_height: u32,
+    pub bip86_index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockSavedResponse {
+    pub lock: GhostLockRecord,
+    /// False when this updated an existing record — the same keys are the same
+    /// Lock, so re-entering them is a rename rather than a second Lock.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockListResponse {
+    pub locks: Vec<GhostLockRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockForgottenResponse {
+    pub lock_id: String,
+    /// False when there was nothing to forget.
+    pub existed: bool,
 }
 
 /// One lane of a Ghost Lock, as shown.

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod chain;
 pub mod descriptor;
 pub mod ghost_lock_account;
+pub mod ghost_lock_store;
 pub mod ghostd;
 pub mod gsp;
 pub mod keystore;

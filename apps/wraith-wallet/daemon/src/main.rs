@@ -62,8 +62,9 @@ mod server {
     use wraith_wallet_ipc::{
         AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
-        ErrorResponse, GhostLockLane, GhostLockLanesResponse, GlyphClaimResult, GlyphInfo,
-        GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
+        ErrorResponse, GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse,
+        GhostLockListResponse, GhostLockRecord, GhostLockSavedResponse, GlyphClaimResult,
+        GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
         LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
         LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse, LightSentResponse,
         LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse, LocksJumpedResponse,
@@ -192,6 +193,36 @@ mod server {
             min_entities,
             lowering_the_floor_would_help: !over_claimed,
         })
+    }
+
+    /// Open the store of Ghost Lock definitions.
+    ///
+    /// Beside `node.json`, and beside the signing ledger — which is a different
+    /// kind of file despite the neighbourhood. Losing *this* one costs
+    /// convenience; the lanes rebuild from the same three keys and the keystore.
+    /// Losing the ledger re-permits a double-sign.
+    fn ghost_lock_store_for(
+        state: &Arc<DaemonState>,
+    ) -> std::io::Result<wraith_wallet_core::ghost_lock_store::GhostLockStore> {
+        let path = state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("ghost-locks.json");
+        wraith_wallet_core::ghost_lock_store::GhostLockStore::open(path)
+    }
+
+    fn lock_record(l: &wraith_wallet_core::ghost_lock_store::StoredLock) -> GhostLockRecord {
+        GhostLockRecord {
+            lock_id: l.lock_id.clone(),
+            label: l.label.clone(),
+            backup_pubkey: l.backup_pubkey.clone(),
+            heir_pubkey: l.heir_pubkey.clone(),
+            quorum_pubkey: l.quorum_pubkey.clone(),
+            anchor_height: l.anchor_height,
+            inherit_height: l.inherit_height,
+            bip86_index: l.bip86_index,
+        }
     }
 
     /// Open the durable once-per-coin ledger.
@@ -2735,6 +2766,65 @@ mod server {
                     },
                 }
             }
+            Request::GhostLockSave {
+                label,
+                backup_pubkey,
+                heir_pubkey,
+                quorum_pubkey,
+                anchor_height,
+                inherit_height,
+                bip86_index,
+            } => {
+                use wraith_wallet_core::ghost_lock_store::StoredLock;
+                let lock = StoredLock::new(
+                    label,
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index.unwrap_or(0),
+                );
+                match ghost_lock_store_for(state) {
+                    Err(e) => Response::Error(ErrorResponse {
+                        message: format!("lock store: {e}"),
+                    }),
+                    Ok(mut store) => {
+                        let created = store.get(&lock.lock_id).is_none();
+                        match store.put(lock.clone()) {
+                            Err(e) => Response::Error(ErrorResponse {
+                                message: format!("save lock: {e}"),
+                            }),
+                            Ok(()) => Response::GhostLockSaved(GhostLockSavedResponse {
+                                lock: lock_record(&lock),
+                                created,
+                            }),
+                        }
+                    }
+                }
+            }
+            Request::GhostLockList => match ghost_lock_store_for(state) {
+                Err(e) => Response::Error(ErrorResponse {
+                    message: format!("lock store: {e}"),
+                }),
+                Ok(store) => Response::GhostLockList(GhostLockListResponse {
+                    locks: store.list().iter().map(lock_record).collect(),
+                }),
+            },
+            Request::GhostLockForget { lock_id } => match ghost_lock_store_for(state) {
+                Err(e) => Response::Error(ErrorResponse {
+                    message: format!("lock store: {e}"),
+                }),
+                Ok(mut store) => match store.remove(&lock_id) {
+                    Err(e) => Response::Error(ErrorResponse {
+                        message: format!("forget lock: {e}"),
+                    }),
+                    Ok(existed) => Response::GhostLockForgotten(GhostLockForgottenResponse {
+                        lock_id,
+                        existed,
+                    }),
+                },
+            },
             Request::GhostLockLanes {
                 backup_pubkey,
                 heir_pubkey,
