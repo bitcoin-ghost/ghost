@@ -77,6 +77,7 @@ pub mod remix;
 
 pub mod admission;
 pub mod anonymity_set;
+pub mod assignment;
 pub mod attestation;
 pub mod beacon;
 pub mod client_session;

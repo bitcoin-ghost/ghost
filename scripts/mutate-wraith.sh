@@ -109,6 +109,18 @@ mutate "pre-sign approves everything" pre_sign.rs \
 '    let mut refusals = Vec::new();
     if true { return refusals; }' pre_sign
 
+mutate "assignment ignores the modulus check" assignment.rs \
+'    if claimed_open_rounds != derived_rounds {' \
+'    if false {' assignment
+
+mutate "assignment ignores the coin set" assignment.rs \
+'    buf.extend_from_slice(&coins_digest(coins));' \
+'    buf.extend_from_slice(&[0u8; 32]);' assignment
+
+mutate "low volume still splits rounds" assignment.rs \
+'    if committed_volume < SPLIT_FLOOR_PAYMENTS {' \
+'    if false {' assignment
+
 # --- composition + entity counting: the structural Sybil rules -------------
 # Each of these is a rule the round is sold on. A rule nothing detects the
 # absence of is not enforced, it is merely written down.
