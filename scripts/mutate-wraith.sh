@@ -58,6 +58,14 @@ PY
     return 1
   fi
 
+  # Cargo fingerprints on mtime with one-second granularity, and a
+  # mutate/test/restore cycle completes well inside that. Without this the test
+  # runs against the PREVIOUS build and reports "survived" for a mutation that
+  # was applied and would have been caught — which is how this harness spent
+  # several runs producing different answers to the same question.
+  touch "$file"
+  sleep 1
+
   local rc
   timeout 300 cargo test -j2 -p wraith-protocol --lib "$filter" >/dev/null 2>&1
   rc=$?
@@ -133,6 +141,8 @@ mutate "ladder accepts non-rungs" ladder_round.rs \
 # misclassifying and every result above is suspect.
 cp crates/wraith-protocol/src/mailbox.rs "$BAK/mailbox.rs.bak"
 printf '\n// harness control\n' >> crates/wraith-protocol/src/mailbox.rs
+touch crates/wraith-protocol/src/mailbox.rs
+sleep 1
 timeout 300 cargo test -j2 -p wraith-protocol --lib mailbox >/dev/null 2>&1
 control_rc=$?
 cp "$BAK/mailbox.rs.bak" crates/wraith-protocol/src/mailbox.rs
