@@ -60,20 +60,20 @@ mod server {
     use wraith_wallet_core::light;
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
-        ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse, DaemonEnvResponse,
-        DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope, ErrorResponse,
-        GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
-        HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
-        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
-        LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse,
-        LocksJumpedResponse, LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse,
-        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
-        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
-        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
-        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
-        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
+        AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
+        DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
+        ErrorResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
+        GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
+        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
+        LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockEntry,
+        LocksConfirmedResponse, LocksJumpedResponse, LocksListResponse, LocksPreparedResponse,
+        LocksRecoveredResponse, NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse,
+        PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse,
+        ReleaseManifest, Request, Response, SignerInfoIpc, WalletAuthInfoResponse,
+        WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry,
+        WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
         WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
-        WraithMixPreparedResponse,
+        WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
     /// Bundled public preset — the Bitcoin Ghost fleet, reachable without
@@ -155,6 +155,45 @@ mod server {
     /// client / proxy config without rebuilding it). Caller is
     /// expected to submit promptly — the coordinator's no-sign
     /// deadline is ticking.
+    /// Turn a refusal into something the wallet can render.
+    ///
+    /// A refusal shown as a sentence gives the user nothing to decide with. The
+    /// figures are what they need: how many entities were actually there, what
+    /// was discounted, and whether the coordinator's claim was the problem.
+    fn refusal_response(
+        session_id: String,
+        min_entities: usize,
+        e: &wraith_wallet_core::wraith::WraithClientError,
+    ) -> Option<WraithMixRefusedResponse> {
+        use wraith_protocol::pre_sign::RefuseToSign;
+        use wraith_wallet_core::wraith::WraithClientError;
+
+        let WraithClientError::RefusedRound { reasons, report } = e else {
+            return None;
+        };
+
+        // An over-claim is not a size problem. The coordinator stated a figure
+        // the chain does not support, and no floor makes that acceptable — so
+        // the wallet must not offer to lower one.
+        let over_claimed = reasons
+            .iter()
+            .any(|r| matches!(r, RefuseToSign::SetOverClaimed { .. }));
+
+        Some(WraithMixRefusedResponse {
+            session_id,
+            report: AnonymitySetReport {
+                seats: report.seats,
+                entities: report.entities,
+                discounted: report.discounted(),
+                unverified: report.unverified,
+                payers: report.payers,
+            },
+            reasons: reasons.iter().map(ToString::to_string).collect(),
+            min_entities,
+            lowering_the_floor_would_help: !over_claimed,
+        })
+    }
+
     /// Open the durable once-per-coin ledger.
     ///
     /// Lives beside `node.json` in the wallet's data directory. Opened per
@@ -4090,9 +4129,16 @@ mod server {
                                 message: format!("signing ledger unavailable: {e}"),
                             }),
                             Ok(mut ledger) => match prepared.inspect(&mut ledger) {
-                                Err(e) => Response::Error(ErrorResponse {
-                                    message: format!("refused the round: {e}"),
-                                }),
+                                Err(e) => match refusal_response(
+                                    prepared.session_id.clone(),
+                                    wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                                    &e,
+                                ) {
+                                    Some(r) => Response::WraithMixRefused(r),
+                                    None => Response::Error(ErrorResponse {
+                                        message: format!("refused the round: {e}"),
+                                    }),
+                                },
                                 Ok(inspected) => {
                                     let p = inspected.prepared();
                                     let resp = WraithMixPreparedResponse {
@@ -4382,12 +4428,17 @@ mod server {
                 let inspected = match prepared.inspect(&mut ledger) {
                     Ok(i) => i,
                     Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
+                        let resp = match refusal_response(
+                            prepared.session_id.clone(),
+                            wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
+                            &e,
+                        ) {
+                            Some(r) => Response::WraithMixRefused(r),
+                            None => Response::Error(ErrorResponse {
                                 message: format!("refused the round: {e}"),
                             }),
-                        );
+                        };
+                        return Envelope::new(id, resp);
                     }
                 };
 

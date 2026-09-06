@@ -735,6 +735,13 @@ pub enum Response {
     /// Reply to [`Request::WraithMixSubmit`]. Carries the broadcast
     /// txid and the index of the wallet's mixed output.
     WraithMixCompleted(WraithMixCompletedResponse),
+    /// The wallet inspected the round and refused to sign it.
+    ///
+    /// Structured rather than an error string, because the wallet has to *show*
+    /// what it found: the entity count, what was discounted, and whether the
+    /// coordinator over-claimed. A refusal rendered as a sentence gives the user
+    /// nothing to decide with.
+    WraithMixRefused(WraithMixRefusedResponse),
     PsbtInspected(PsbtInspectResponse),
     PsbtSigned(PsbtSignResponse),
     PsbtCreated(PsbtCreateResponse),
@@ -1580,6 +1587,43 @@ pub struct WalletXpubResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub message: String,
+}
+
+/// The wallet's own count of a round, as shown to the user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnonymitySetReport {
+    /// Seats in the round — what a naive mixer would call the set.
+    pub seats: usize,
+    /// Distinct entities. **This is the anonymity set.**
+    pub entities: usize,
+    /// Seats that collapsed into another entity.
+    pub discounted: usize,
+    /// Entities distinct only because no linkage was found.
+    pub unverified: usize,
+    /// Real payers among the entities.
+    pub payers: usize,
+}
+
+/// Why a round was refused, and what the wallet counted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WraithMixRefusedResponse {
+    pub session_id: String,
+    /// Counted by the wallet from the chain, never taken from the coordinator.
+    pub report: AnonymitySetReport,
+    /// Every reason, not just the first — a user deciding between retrying and
+    /// walking away needs the whole picture.
+    pub reasons: Vec<String>,
+    /// The floor that was applied.
+    pub min_entities: usize,
+    /// Whether lowering the floor could make this round acceptable.
+    ///
+    /// True for a thin round: it is honest, just small, and accepting a smaller
+    /// set is a decision the user is entitled to make.
+    ///
+    /// **False for an over-claim.** That is not a size problem — the
+    /// coordinator stated a figure the chain does not support, and there is no
+    /// floor at which that becomes acceptable.
+    pub lowering_the_floor_would_help: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
