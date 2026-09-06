@@ -112,6 +112,7 @@ ghost-pool = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 # Ghost Pay L2 crates
 ghost-keys = { path = "crates/ghost-keys" }
+ghost-lock = { path = "crates/ghost-lock" }
 ghost-locks = { path = "crates/ghost-locks" }
 wraith-protocol = { path = "crates/wraith-protocol" }
 wraith-coordinator = { path = "bins/wraith-coordinator" }

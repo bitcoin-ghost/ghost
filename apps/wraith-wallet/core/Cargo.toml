@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 wraith-protocol = { workspace = true }
+ghost-lock = { workspace = true }
 ghost-locks = { workspace = true }
 aes-gcm = { workspace = true }
 # Local override to pull in reqwest's SOCKS5 feature for the

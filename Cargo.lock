@@ -10755,6 +10755,7 @@ dependencies = [
  "futures-util",
  "ghost-gsp-proto",
  "ghost-keys",
+ "ghost-lock",
  "ghost-locks",
  "hex",
  "rand 0.8.6",
