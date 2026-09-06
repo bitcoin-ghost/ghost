@@ -61,7 +61,9 @@ use bitcoin::{
 
 use crate::ladder::Ladder;
 use crate::single_round::shuffle_with_chacha;
-use crate::tier::{TX_OVERHEAD_VBYTES, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT};
+use crate::tier::{
+    MIN_ROUND_PARTICIPANTS, TX_OVERHEAD_VBYTES, VBYTES_PER_INPUT, VBYTES_PER_OUTPUT,
+};
 
 /// A coin a participant contributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +144,15 @@ pub enum LadderRoundError {
         floor: usize,
     },
 
+    /// The configured floor is below the point where a round means anything.
+    #[error("a floor of {configured} is below the protocol minimum of {minimum} — a round that small provides no privacy to price")]
+    FloorBelowProtocolMinimum {
+        /// What the caller asked for.
+        configured: usize,
+        /// [`MIN_ROUND_PARTICIPANTS`].
+        minimum: usize,
+    },
+
     /// An address failed to parse or belongs to another network.
     #[error("address {address}: {detail}")]
     BadAddress {
@@ -216,6 +227,15 @@ impl LadderRoundBuilder {
 
     /// Build the unsigned round transaction.
     pub fn build(&self, entropy: &[u8; 32]) -> Result<LadderRound, LadderRoundError> {
+        // The configured floor is a policy choice, but it has a bottom. Checked
+        // at build rather than construction so a misconfiguration cannot sit
+        // dormant until the first round.
+        if self.floor < MIN_ROUND_PARTICIPANTS {
+            return Err(LadderRoundError::FloorBelowProtocolMinimum {
+                configured: self.floor,
+                minimum: MIN_ROUND_PARTICIPANTS,
+            });
+        }
         if self.participants.len() < self.floor {
             return Err(LadderRoundError::BelowFloor {
                 got: self.participants.len(),
@@ -714,6 +734,38 @@ mod tests {
             b.build(&[0x11; 32]),
             Err(LadderRoundError::Underfunded { .. })
         ));
+    }
+
+    /// The floor is a launch lever with a bottom, and a cost argument will
+    /// happily reason past it — a smaller round genuinely is cheaper for a lone
+    /// payer, which is exactly why the bottom has to be in code.
+    #[test]
+    fn a_floor_below_the_protocol_minimum_is_refused() {
+        let mut b = LadderRoundBuilder::new("s", Ladder::standard(), Network::Signet, 5, 2);
+        for i in 0..5u8 {
+            b.add_participant(LadderParticipant {
+                inputs: vec![coin(i + 1, 100_000)],
+                outputs: vec![],
+            });
+        }
+        assert!(matches!(
+            b.build(&[0x11; 32]),
+            Err(LadderRoundError::FloorBelowProtocolMinimum {
+                configured: 2,
+                minimum: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn the_builder_agrees_with_the_tier_minimum() {
+        // One number, not three. The design note said 10, `tier` said 5, and
+        // the builder took whatever it was handed.
+        assert_eq!(
+            MIN_ROUND_PARTICIPANTS,
+            crate::tier::LiteTier::Denom100kSats.min_participants(),
+            "the ladder and tier paths must not disagree on what a round needs"
+        );
     }
 
     #[test]

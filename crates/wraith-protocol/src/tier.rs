@@ -41,6 +41,19 @@ pub const VBYTES_PER_OUTPUT: usize = 43;
 /// arithmetic existed before it was; see `privacy_level::VBYTES_PER_SEAT`.
 pub const TX_OVERHEAD_VBYTES: usize = 11;
 
+/// The smallest round that provides any privacy at all.
+///
+/// Below this a round is theatre rather than a weak version of itself: with two
+/// participants an output is a coin flip, with three it is barely better. Five
+/// is Whirlpool's number, well tested for fill rate against anonymity set, and
+/// it is already what every `LiteTier` returns from `min_participants`.
+///
+/// **A round's configured floor is a policy choice above this line, never below
+/// it.** The floor is a genuine launch lever — a smaller round costs a lone
+/// payer far less — but the lever has a bottom, and cost analysis alone will
+/// happily argue past it.
+pub const MIN_ROUND_PARTICIPANTS: usize = 5;
+
 /// Maximum transaction size budget in vbytes — 10% margin under Bitcoin's
 /// 100KB standardness limit.
 #[allow(dead_code)]
