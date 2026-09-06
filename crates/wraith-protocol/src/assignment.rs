@@ -75,16 +75,27 @@ use crate::signing_ledger::OutPointKey;
 /// Domain tag. Versioned.
 pub const ASSIGNMENT_TAG: &str = "wraith/assignment/v1";
 
+/// Recent payments per open round, above the floor.
+pub const PAYMENTS_PER_ROUND: u64 = 20;
+
 /// Below this many recent payments an epoch runs a single round.
 ///
 /// Splitting divides participants, and smaller rounds are weaker rounds: at low
 /// volume one round of twenty beats four rounds of five. So the concentration
 /// defence is **off** below the floor, which is correct rather than a
 /// compromise — it would cost more anonymity than it protects.
-pub const SPLIT_FLOOR_PAYMENTS: u64 = 40;
-
-/// Recent payments per open round, above the floor.
-pub const PAYMENTS_PER_ROUND: u64 = 20;
+///
+/// # Why this is three rounds' worth and not two
+///
+/// It was 40, which is exactly where `volume / PAYMENTS_PER_ROUND` reaches 2 —
+/// so the guard never changed an answer and the constant was decoration. A
+/// mutation deleting it survived the whole suite, which is what surfaced it.
+///
+/// The margin is the point: volume fluctuates, and splitting the instant the
+/// average supports two rounds means an ordinary dip leaves two half-empty ones.
+/// Requiring three rounds' worth before splitting at all means a dip still
+/// leaves rounds worth being in.
+pub const SPLIT_FLOOR_PAYMENTS: u64 = PAYMENTS_PER_ROUND * 3;
 
 /// Hard ceiling on concurrent rounds per tier.
 pub const MAX_OPEN_ROUNDS: u64 = 8;
@@ -272,7 +283,33 @@ mod tests {
         // beats four of five. Off below the floor is correct, not a compromise.
         assert_eq!(open_rounds_for(0), 1);
         assert_eq!(open_rounds_for(SPLIT_FLOOR_PAYMENTS - 1), 1);
-        assert_eq!(open_rounds_for(SPLIT_FLOOR_PAYMENTS), 2);
+        assert_eq!(
+            open_rounds_for(SPLIT_FLOOR_PAYMENTS),
+            SPLIT_FLOOR_PAYMENTS / PAYMENTS_PER_ROUND
+        );
+    }
+
+    #[test]
+    fn the_floor_actually_changes_an_answer() {
+        // The floor was 40 while `volume / 20` already gave 1 below it, so the
+        // guard never changed anything and the constant was decoration. A
+        // mutation deleting it survived the entire suite.
+        //
+        // This asserts on a volume where the two rules disagree, so removing
+        // the floor fails here.
+        let v = SPLIT_FLOOR_PAYMENTS - 1;
+        assert!(
+            v / PAYMENTS_PER_ROUND > 1,
+            "fixture is pointless unless the unguarded rule would split here"
+        );
+        assert_eq!(open_rounds_for(v), 1, "the floor must hold it at one round");
+    }
+
+    #[test]
+    fn the_floor_leaves_room_for_a_dip() {
+        // Splitting the instant the average supports two rounds means an
+        // ordinary fluctuation leaves two half-empty ones.
+        assert!(SPLIT_FLOOR_PAYMENTS >= PAYMENTS_PER_ROUND * 3);
     }
 
     #[test]
