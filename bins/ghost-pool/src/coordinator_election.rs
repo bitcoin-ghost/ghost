@@ -36,6 +36,7 @@ use ghost_common::types::NodeCapabilities;
 use ghost_consensus::mesh::MeshNetwork;
 
 use wraith_protocol::epoch::canonical_roster;
+use wraith_protocol::roster_snapshot::roster_commitment;
 use wraith_protocol::service::{CoordinatorView, EndpointMap};
 use wraith_protocol::sortition::CoordinatorNodeId;
 
@@ -155,6 +156,15 @@ struct Cached {
     /// Height of the block whose hash the beacon is derived from, so the
     /// beacon itself can be re-derived straight from the chain.
     anchor_height: u64,
+    /// Commitment to `(epoch, anchor_height, roster)`, published so two nodes
+    /// can be compared and a split *seen* rather than inferred later from
+    /// sessions that went to two owners.
+    ///
+    /// The anchor height identifies the epoch's frozen chain input. It is
+    /// deliberately **not** a claim that the roster was read at that height —
+    /// the roster comes from live mesh state, which is the defect this value
+    /// exposes rather than repairs.
+    roster_commitment: [u8; 32],
 }
 
 /// Live coordinator-election service for ghost-pool.
@@ -229,8 +239,25 @@ impl CoordinatorElection {
     /// capability AND (b) advertised a non-empty endpoint in a recent health
     /// ping (so a wallet can actually dial it). Self is included iff it opted in
     /// and has its own advertised endpoint. The roster is canonicalised (dedup +
-    /// sort) so every node derives the byte-identical set + map from the same
-    /// mesh membership.
+    /// sort), so a node's own collection order cannot change the result.
+    ///
+    /// # This does NOT make nodes agree
+    ///
+    /// It used to claim every node derives "the byte-identical set + map from
+    /// the same mesh membership". Mesh membership is not shared state.
+    /// `get_connected_peers` filters on `p.state == Connected` — *this node's*
+    /// connection state — and on `p.last_seen >= now - 300` against *this
+    /// node's* clock. A peer connected to us and not to a sibling is in our
+    /// roster alone; a peer whose last ping landed around 300 seconds ago is in
+    /// whichever nodes' rosters their clocks happen to place it in.
+    ///
+    /// So divergence here is the normal case, not a boundary edge case, and
+    /// canonicalisation cannot fix it: it makes one node's answer
+    /// order-independent, not two nodes' answers equal.
+    ///
+    /// `Cached::roster_commitment` therefore exists so the disagreement is
+    /// *visible* across the fleet. See `roster_snapshot` for why this must be
+    /// resolved before `wraith_election_enabled` is ever turned on.
     /// Returns the canonical roster, the endpoint map, and the summed recent
     /// session `demand` across the eligible set (incl. self) — the frozen input
     /// to [`seats_for_demand`].
@@ -304,12 +331,15 @@ impl CoordinatorElection {
         let (roster, endpoints, demand) = self.roster_with_endpoints();
         let seats = seats_for_demand(demand, roster.len());
         let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, seats);
+        let anchor_height = anchor_height_for_epoch(epoch);
+        let commitment = roster_commitment(epoch, anchor_height, &roster);
         *self.cached.write() = Some(Cached {
             epoch,
             view,
             beacon,
             roster,
-            anchor_height: anchor_height_for_epoch(epoch),
+            anchor_height,
+            roster_commitment: commitment,
         });
         epoch
     }
@@ -326,7 +356,7 @@ impl CoordinatorElection {
     }
 
     /// A JSON snapshot of the cached election for the read-only HTTP endpoint:
-    /// `{enabled, epoch, seats, my_seat, elected: [hex ids], coordinators:
+    /// `{enabled, roster_commitment, epoch, seats, my_seat, elected: [hex ids],
     /// [{node_id, seat, endpoint}]}`. The `coordinators` array is what a wallet
     /// reads to dial the seat that owns its session; `elected` is kept as the
     /// flat hex list for existing consumers. Pre-serialised so
@@ -347,6 +377,7 @@ impl CoordinatorElection {
                 "anchor_height": serde_json::Value::Null,
                 "roster": [],
                 "roster_size": 0,
+                "roster_commitment": serde_json::Value::Null,
                 "degraded": true,
             });
         };
@@ -366,6 +397,10 @@ impl CoordinatorElection {
             .collect();
         serde_json::json!({
             "enabled": true,
+            // Compare this across nodes: equal means they drew from the same
+            // roster, unequal means the coordinator layer has split. It is the
+            // only field here that a single node cannot self-check.
+            "roster_commitment": hex::encode(c.roster_commitment),
             "epoch": c.view.epoch(),
             "seats": c.view.seats(),
             "my_seat": c.view.my_seat(&self.self_id),
