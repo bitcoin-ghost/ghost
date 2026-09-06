@@ -100,6 +100,19 @@ pub const SPLIT_FLOOR_PAYMENTS: u64 = PAYMENTS_PER_ROUND * 3;
 /// Hard ceiling on concurrent rounds per tier.
 pub const MAX_OPEN_ROUNDS: u64 = 8;
 
+// Enforced at COMPILE TIME, not in a test.
+//
+// Splitting the instant the average supports two rounds leaves an ordinary dip
+// with two half-empty ones, so the floor must carry a margin. This was a runtime
+// `assert!` over two constants, which clippy correctly called a constant
+// assertion: it can only fail long after the edit that broke it, in a test run
+// somebody might not do. A build failure lands on whoever made the change.
+const _: () = assert!(
+    SPLIT_FLOOR_PAYMENTS >= PAYMENTS_PER_ROUND * 3,
+    "the split floor must leave room for a volume dip; below three rounds' \
+     worth, an ordinary fluctuation halves every round"
+);
+
 /// Why an assignment was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AssignmentError {
@@ -303,13 +316,6 @@ mod tests {
             "fixture is pointless unless the unguarded rule would split here"
         );
         assert_eq!(open_rounds_for(v), 1, "the floor must hold it at one round");
-    }
-
-    #[test]
-    fn the_floor_leaves_room_for_a_dip() {
-        // Splitting the instant the average supports two rounds means an
-        // ordinary fluctuation leaves two half-empty ones.
-        assert!(SPLIT_FLOOR_PAYMENTS >= PAYMENTS_PER_ROUND * 3);
     }
 
     #[test]
