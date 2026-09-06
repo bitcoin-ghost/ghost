@@ -144,6 +144,11 @@ impl EpochCoordinators {
     /// wanting the same denomination in the same epoch converge on the same
     /// seat, which is a larger anonymity set rather than load spreading.
     ///
+    /// Takes no epoch: it is always `self.epoch`. It used to be a parameter,
+    /// which let a caller pair one epoch's election with another epoch's shard
+    /// key and silently get a different seat — the same class of mistake as the
+    /// one below, and reachable by a plain typo.
+    ///
     /// This replaced a `coordinator_for_session(session_id)` that documented
     /// itself as the value "a wallet and every node agree" on, while the
     /// wallet actually sharded by `(tier, epoch)` and nothing called the
@@ -151,11 +156,11 @@ impl EpochCoordinators {
     /// dead and inviting: whoever wired up its `owns_session` companion would
     /// have had wallets dialling one seat while another believed it owned the
     /// work.
-    pub fn coordinator_for_tier(&self, tier_id: &str, epoch: u64) -> Option<&ElectedCoordinator> {
+    pub fn coordinator_for_tier(&self, tier_id: &str) -> Option<&ElectedCoordinator> {
         if self.coordinators.is_empty() {
             return None;
         }
-        let key = shard_key_for_tier_epoch(tier_id, epoch);
+        let key = shard_key_for_tier_epoch(tier_id, self.epoch);
         let seat = shard_for(&key, self.coordinators.len());
         // seats are exactly 0..len in seat order, so index directly.
         self.coordinators.get(seat as usize)
@@ -266,13 +271,13 @@ mod tests {
         let ec = EpochCoordinators::elect(3, &beacon(2), &q, 5);
         for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
             let c = ec
-                .coordinator_for_tier(tier, 3)
+                .coordinator_for_tier(tier)
                 .expect("a coordinator owns every tier");
             assert!(ec.is_coordinator(&c.node_id));
             // Stable: every wallet asking for this tier in this epoch lands
             // on the same seat, which is the point — a larger anonymity set,
             // not load spreading.
-            assert_eq!(ec.coordinator_for_tier(tier, 3).unwrap().node_id, c.node_id);
+            assert_eq!(ec.coordinator_for_tier(tier).unwrap().node_id, c.node_id);
         }
     }
 
@@ -281,10 +286,13 @@ mod tests {
     #[test]
     fn a_tier_moves_between_seats_across_epochs() {
         let q = qualified(15);
-        let ec = EpochCoordinators::elect(3, &beacon(2), &q, 5);
         let mut hit = std::collections::HashSet::new();
+        // Re-elect each epoch, as a node does. This used to hold one election
+        // and vary only the epoch argument, which exercised a pairing that
+        // cannot occur now the argument is gone.
         for epoch in 0u64..200 {
-            hit.insert(ec.coordinator_for_tier("100k_sats", epoch).unwrap().seat);
+            let ec = EpochCoordinators::elect(epoch, &beacon(2), &q, 5);
+            hit.insert(ec.coordinator_for_tier("100k_sats").unwrap().seat);
         }
         assert_eq!(hit.len(), 5, "every seat serves the tier in some epoch");
     }
@@ -340,6 +348,6 @@ mod tests {
     fn empty_roster_seats_nobody() {
         let ec = EpochCoordinators::elect(1, &beacon(1), &[], 4);
         assert_eq!(ec.seats(), 0);
-        assert!(ec.coordinator_for_tier("100k_sats", 1).is_none());
+        assert!(ec.coordinator_for_tier("100k_sats").is_none());
     }
 }

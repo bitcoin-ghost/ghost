@@ -81,6 +81,7 @@ pub mod beacon;
 pub mod client_session;
 pub mod consolidation;
 pub mod epoch;
+pub mod epoch_handover;
 pub mod exit_availability;
 pub mod ladder;
 pub mod ladder_round;
