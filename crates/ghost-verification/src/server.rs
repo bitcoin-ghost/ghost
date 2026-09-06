@@ -3019,7 +3019,18 @@ impl VerificationState {
     /// Get health response
     pub async fn get_health(&self) -> HealthResponse {
         let core = self.get_core_health.as_ref().map(|probe| probe());
+        // #537 counters. `None` when no database is wired (the verification server can run
+        // without one), which serialises as absent rather than as a misleading zero.
+        let db_connection = self.database.as_ref().map(|_| {
+            let (calls, micros, slow) = ghost_storage::Database::connection_stats();
+            crate::challenge::DbConnectionStats {
+                calls,
+                total_ms_held: micros / 1_000,
+                slow_calls: slow,
+            }
+        });
         HealthResponse {
+            db_connection,
             mesh_validation: self.get_mesh_validation.as_ref().map(|p| p()),
             convergence_channels: self.get_convergence_channels.as_ref().map(|p| p()),
             // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it

@@ -500,6 +500,21 @@ impl GhostPayResponse {
     }
 }
 
+/// `Database::with_connection` usage counters surfaced on `/health` (#537).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct DbConnectionStats {
+    /// Total `with_connection` calls since process start.
+    pub calls: u64,
+    /// Total milliseconds the calling thread spent acquiring AND holding the connection.
+    ///
+    /// Acquisition is included deliberately: waiting for the mutex blocks the thread exactly as
+    /// much as holding it, and under contention the wait is the larger half. Counting only the
+    /// closure would report the system healthiest precisely when it is worst.
+    pub total_ms_held: u64,
+    /// Calls that took 250ms or longer.
+    pub slow_calls: u64,
+}
+
 /// Health check response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -535,6 +550,19 @@ pub struct HealthResponse {
     pub capabilities: CapabilityStatus,
     /// Uptime (seconds)
     pub uptime_secs: u64,
+    /// Cumulative `Database::with_connection` usage: `(calls, total_ms_held, slow_calls)` (#537).
+    ///
+    /// Exposed because the counters are otherwise unreadable in production, and an unreadable
+    /// counter answers "is the database blocking the runtime?" with a confident silence.
+    ///
+    /// How to read it: `total_ms_held` against `uptime_secs * 1000 * worker_threads` is the
+    /// fraction of the runtime spent inside the single connection mutex. Approaching 1 means
+    /// the reactor is saturated on database work, which is the mechanism #537 describes and the
+    /// stalls in #535 look like. `slow_calls` counts individual calls past 250ms — the point
+    /// above which a call is either an unusually heavy query or, more often, time spent waiting
+    /// behind another caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_connection: Option<DbConnectionStats>,
     /// Mesh message-validation counters, or `null` if not wired.
     ///
     /// #591: these were incremented on every rejected message and read by nobody, so an oversized
@@ -1206,6 +1234,7 @@ mod tests {
     #[test]
     fn test_signed_response_creation() {
         let health = HealthResponse {
+            db_connection: None,
             mesh_validation: None,
             convergence_channels: None,
             healthy: true,
@@ -1241,6 +1270,7 @@ mod tests {
     #[test]
     fn test_signed_response_timestamp_validation() {
         let health = HealthResponse {
+            db_connection: None,
             mesh_validation: None,
             convergence_channels: None,
             healthy: true,
