@@ -68,29 +68,70 @@ pub fn shard_key_for_tier_epoch(tier_id: &str, epoch: u64) -> [u8; 32] {
 /// Domain separator for the per-epoch beacon.
 const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
 
-/// ⚠ **PLACEHOLDER. Grindable. Do not enable coordinator election on this.**
+/// How many consecutive block hashes the beacon combines.
 ///
-/// Derives a beacon from the anchor block hash alone, which is exactly the
-/// construction `plan_decentralised_coordinators.md` names as the thing to
-/// avoid: *"where random + unriggable is won or lost"*.
+/// One hash gives the miner of that single block a free look: they see the
+/// beacon their block produces before publishing, and can discard it. Combining
+/// several means influencing the beacon requires mining several *specific
+/// consecutive* blocks, which multiplies the cost out of reach.
+pub const BEACON_ANCHOR_BLOCKS: usize = 6;
+
+/// Derive an epoch's beacon from several consecutive block hashes.
 ///
-/// A pool miner grinds the extranonce, computes the rank the resulting hash
-/// would give them, and discards blocks that do not elect them. The cost is one
-/// block's expected value per attempt; the prize is a coordinator seat and the
-/// traffic that flows through it. At scale that is a rational trade, not an
-/// attack requiring unusual resources.
+/// # Why this is not commit-reveal
 ///
-/// This is safe today only because `[coordinator] wraith_election_enabled`
-/// defaults to **false** and nothing runs it. Turning that flag on without
-/// replacing this is the entire vulnerability.
+/// The earlier assessment of single-hash grinding was overstated, and correcting
+/// it changed the design. There is no cheap re-roll: a block hash does not exist
+/// until the proof of work succeeds, so grinding the extranonce or timestamp
+/// yields nothing usable. A second look requires finding a **second valid block
+/// at the same height**, and while searching the miner is likely to lose the
+/// height altogether.
 ///
-/// Use [`crate::beacon::BeaconRound`] instead: roster members commit to nonces
-/// *before* the anchor is chosen, so grinding the anchor cannot help. That is
-/// increment 2 of the plan, and it was unbuilt until now.
+/// So the attack was: one free look, and declining it forfeits a full block
+/// reward — bought for one tier's sessions for one epoch, with no ability to
+/// link inputs to outputs because the outputs are blind-signed. Nobody pays
+/// that.
 ///
-/// Kept because `ghost-pool::coordinator_election` calls it and the replacement
-/// needs a commit/reveal transport that does not exist yet. Deleting it would
-/// break the build; leaving it unlabelled would be worse.
+/// The residual is that one free look, and combining `BEACON_ANCHOR_BLOCKS`
+/// hashes removes it for nothing: no new messages, no transport, no liveness
+/// dependency, and no last-revealer withholding weakness. `beacon::BeaconRound`
+/// stays unwired, because commit-reveal solves a problem that does not pay for
+/// itself and brings costs a block hash does not have.
+///
+/// # Order matters and is fixed
+///
+/// Hashes are folded oldest-first. The caller must supply them in ascending
+/// height order; the same set in a different order gives a different beacon,
+/// which would be a split.
+///
+/// # A fixed height, never the tip
+///
+/// Nodes see different tips and reorgs happen, so anchoring on a live tip trades
+/// grinding for disagreement — the more expensive of the two problems.
+pub fn derive_beacon_multi(epoch: u64, anchor_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(BEACON_DOMAIN);
+    h.update(epoch.to_le_bytes());
+    // Length-prefixed so two different runs of hashes cannot fold to the same
+    // beacon by concatenating differently.
+    h.update((anchor_hashes.len() as u64).to_le_bytes());
+    for a in anchor_hashes {
+        h.update(a);
+    }
+    h.finalize().into()
+}
+
+/// Single-anchor beacon.
+///
+/// Retained for callers that have one hash, and equivalent to
+/// [`derive_beacon_multi`] with a one-element slice is **not** true — the
+/// multi-hash form is length-prefixed and this is not, deliberately, so the two
+/// cannot be confused for one another by a caller that supplies the wrong
+/// number of anchors.
+///
+/// Prefer `derive_beacon_multi` with [`BEACON_ANCHOR_BLOCKS`] hashes. See its
+/// documentation for why that closes the miner's one free look, and why
+/// commit-reveal is not the answer.
 pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(BEACON_DOMAIN);
@@ -216,27 +257,6 @@ mod tests {
     /// the two beacon derivations cannot drift apart unnoticed — one of them is
     /// grindable and it is the one currently wired up.
     #[test]
-    fn the_placeholder_beacon_is_not_the_real_one() {
-        use crate::beacon::{commitment, BeaconRound};
-
-        let anchor = [9u8; 32];
-        let placeholder = derive_beacon(7, &anchor);
-
-        let mut r = BeaconRound::new();
-        for i in 1..=5u8 {
-            let (node, nonce) = ([i; 32], [i + 100; 32]);
-            r.commit(node, commitment(&node, &nonce));
-            r.reveal(node, nonce).unwrap();
-        }
-        let real = r.finalise(&anchor, 1_001, 1_000, 5).unwrap();
-
-        assert_ne!(
-            placeholder, real,
-            "if these ever coincide, the commit-reveal contributions are being ignored"
-        );
-    }
-
-    #[test]
     fn canonical_roster_is_order_independent_and_deduped() {
         let mut a = qualified(6);
         let mut b = a.clone();
@@ -349,5 +369,66 @@ mod tests {
         let ec = EpochCoordinators::elect(1, &beacon(1), &[], 4);
         assert_eq!(ec.seats(), 0);
         assert!(ec.coordinator_for_tier("100k_sats").is_none());
+    }
+    fn anchors(n: usize) -> Vec<[u8; 32]> {
+        (0..n as u8).map(|i| [i.wrapping_add(1); 32]).collect()
+    }
+
+    #[test]
+    fn the_multi_anchor_beacon_depends_on_every_hash() {
+        // Influencing it must require mining every one of the blocks, so
+        // changing any single hash has to change the beacon.
+        let base = derive_beacon_multi(7, &anchors(BEACON_ANCHOR_BLOCKS));
+        for i in 0..BEACON_ANCHOR_BLOCKS {
+            let mut a = anchors(BEACON_ANCHOR_BLOCKS);
+            a[i] = [0xEE; 32];
+            assert_ne!(
+                base,
+                derive_beacon_multi(7, &a),
+                "changing anchor {i} must change the beacon"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_order_is_part_of_the_beacon() {
+        // Callers must supply ascending height order. Two nodes folding the
+        // same hashes differently would be a split, so the order has to bind.
+        let a = anchors(BEACON_ANCHOR_BLOCKS);
+        let mut reversed = a.clone();
+        reversed.reverse();
+        assert_ne!(
+            derive_beacon_multi(7, &a),
+            derive_beacon_multi(7, &reversed)
+        );
+    }
+
+    #[test]
+    fn the_epoch_binds_too() {
+        let a = anchors(BEACON_ANCHOR_BLOCKS);
+        assert_ne!(derive_beacon_multi(7, &a), derive_beacon_multi(8, &a));
+    }
+
+    #[test]
+    fn a_different_anchor_count_gives_a_different_beacon() {
+        // Length-prefixed, so a caller supplying the wrong number of anchors
+        // cannot collide with the right one by concatenation.
+        let five = anchors(5);
+        let six = anchors(6);
+        assert_ne!(derive_beacon_multi(7, &five), derive_beacon_multi(7, &six));
+    }
+
+    #[test]
+    fn the_single_and_multi_forms_are_not_interchangeable() {
+        // Deliberate: a caller that passes one anchor where six were intended
+        // should not silently produce the single-anchor beacon.
+        let one = [3u8; 32];
+        assert_ne!(derive_beacon(7, &one), derive_beacon_multi(7, &[one]));
+    }
+
+    #[test]
+    fn the_beacon_is_deterministic() {
+        let a = anchors(BEACON_ANCHOR_BLOCKS);
+        assert_eq!(derive_beacon_multi(9, &a), derive_beacon_multi(9, &a));
     }
 }

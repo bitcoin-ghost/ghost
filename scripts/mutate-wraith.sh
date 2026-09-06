@@ -125,6 +125,22 @@ mutate "clustering groups every unknown coin" clustering.rs \
 '        if !c.script_pubkey.is_empty() {' \
 '        if true {' clustering
 
+mutate "the beacon ignores all but the first anchor" epoch.rs \
+'    for a in anchor_hashes {' \
+'    for a in anchor_hashes.iter().take(1) {' epoch
+
+mutate "every tier gets the same ordering" sortition.rs \
+'    h.update(tier_id.as_bytes());' \
+'    h.update(b"");' sortition
+
+mutate "eligibility ignores maturity" eligibility.rs \
+'    if known < policy.maturity_secs {' \
+'    if false {' eligibility
+
+mutate "eligibility ignores archive mode" eligibility.rs \
+'    if policy.require_archive && !facts.archive {' \
+'    if false {' eligibility
+
 mutate "assignment ignores the modulus check" assignment.rs \
 '    if claimed_open_rounds != derived_rounds {' \
 '    if false {' assignment

@@ -57,12 +57,79 @@ pub struct ElectedCoordinator {
 /// The sortition rank of a single node for a given beacon+epoch:
 /// `SHA256(DOMAIN_RANK ‖ beacon ‖ epoch_le ‖ node_id)`. Lower ranks win.
 pub fn rank_of(beacon: &[u8; 32], epoch: u64, node_id: &CoordinatorNodeId) -> [u8; 32] {
+    rank_of_for_tier(beacon, epoch, "", node_id)
+}
+
+/// The sortition rank of a node **for one tier**:
+/// `SHA256(DOMAIN_RANK ‖ beacon ‖ epoch_le ‖ tier_len ‖ tier ‖ node_id)`.
+/// Lower ranks win.
+///
+/// # Why the tier is in the hash
+///
+/// Callers walk the ordering from the top until a coordinator accepts, which
+/// concentrates traffic on whoever is first. Concentration is good for
+/// anonymity — a larger set — but it makes being first worth a great deal, and
+/// a single ordering would make one node first for *every* denomination at once.
+///
+/// Mixing the tier in gives each denomination an independent ordering, so
+/// winning one buys one. It keeps walk-until-filled intact and spreads the prize
+/// without reintroducing a seat count to disagree about.
+///
+/// The tier is length-prefixed so `"1m" ‖ "sats"` cannot collide with
+/// `"1msats" ‖ ""`.
+pub fn rank_of_for_tier(
+    beacon: &[u8; 32],
+    epoch: u64,
+    tier_id: &str,
+    node_id: &CoordinatorNodeId,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(DOMAIN_RANK);
     h.update(beacon);
     h.update(epoch.to_le_bytes());
+    h.update((tier_id.len() as u64).to_le_bytes());
+    h.update(tier_id.as_bytes());
     h.update(node_id);
     h.finalize().into()
+}
+
+/// The full preference order of coordinators for one tier, best first.
+///
+/// # Why an ordering rather than a seat count
+///
+/// `coordinator_for_tier` used to compute a seat count from mesh-summed demand
+/// and then `shard_for(key) mod seats`. Two nodes disagreeing on that count sent
+/// the same tier to *different* nodes even when their elected sets were
+/// identical — the ranking never differed, only the modulus did.
+///
+/// There is no count here to disagree about. A caller walks this list and takes
+/// the first coordinator that is reachable and not full, so demand fills the
+/// list organically and an unreachable node costs one step rather than a split.
+///
+/// Returns every eligible node, not a truncated set: the tail is the failover
+/// path, and truncating it would reintroduce a length to disagree about.
+pub fn coordinator_order_for_tier(
+    beacon: &[u8; 32],
+    epoch: u64,
+    tier_id: &str,
+    roster: &[CoordinatorNodeId],
+) -> Vec<ElectedCoordinator> {
+    let mut seen = HashSet::with_capacity(roster.len());
+    let mut ranked: Vec<([u8; 32], CoordinatorNodeId)> = roster
+        .iter()
+        .filter(|id| seen.insert(**id))
+        .map(|id| (rank_of_for_tier(beacon, epoch, tier_id, id), *id))
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(seat, (rank, node_id))| ElectedCoordinator {
+            node_id,
+            rank,
+            seat: seat as u32,
+        })
+        .collect()
 }
 
 /// Elect `n` coordinators from `roster` for `epoch` under `beacon`.
@@ -318,5 +385,69 @@ mod tests {
             !verify_election(&beacon(99), e, &r, n, &valid),
             "beacon-bound"
         );
+    }
+    #[test]
+    fn each_tier_gets_its_own_ordering() {
+        // Walking from the top concentrates traffic on whoever is first. One
+        // ordering would make a single node first for every denomination at
+        // once; per-tier orderings mean winning one buys one.
+        let roster: Vec<CoordinatorNodeId> = (1..=12u8).map(|i| [i; 32]).collect();
+        let b = [5u8; 32];
+        let a_first = coordinator_order_for_tier(&b, 3, "100k_sats", &roster)[0].node_id;
+        let b_first = coordinator_order_for_tier(&b, 3, "1m_sats", &roster)[0].node_id;
+        let c_first = coordinator_order_for_tier(&b, 3, "10k_sats", &roster)[0].node_id;
+        assert!(
+            !(a_first == b_first && b_first == c_first),
+            "one node must not lead every tier"
+        );
+    }
+
+    #[test]
+    fn the_ordering_carries_every_node_so_the_tail_is_the_failover() {
+        // Truncating would reintroduce a length for two nodes to disagree
+        // about, which is the bug this replaced.
+        let roster: Vec<CoordinatorNodeId> = (1..=9u8).map(|i| [i; 32]).collect();
+        let order = coordinator_order_for_tier(&[1u8; 32], 4, "100k_sats", &roster);
+        assert_eq!(order.len(), roster.len());
+        let seats: Vec<u32> = order.iter().map(|c| c.seat).collect();
+        assert_eq!(seats, (0..roster.len() as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn two_nodes_with_the_same_roster_walk_the_same_order() {
+        // The agreement property, and it needs no count to be agreed.
+        let roster: Vec<CoordinatorNodeId> = (1..=8u8).map(|i| [i; 32]).collect();
+        let mut shuffled = roster.clone();
+        shuffled.reverse();
+        let a = coordinator_order_for_tier(&[9u8; 32], 2, "1m_sats", &roster);
+        let b = coordinator_order_for_tier(&[9u8; 32], 2, "1m_sats", &shuffled);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_duplicated_node_takes_one_place_in_the_order() {
+        let dup = vec![[1u8; 32], [2u8; 32], [1u8; 32], [3u8; 32]];
+        let order = coordinator_order_for_tier(&[7u8; 32], 1, "100k_sats", &dup);
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn the_tier_is_length_prefixed_so_names_cannot_collide() {
+        // "1m" + "sats" must not hash the same as "1msats" + "".
+        let n = [4u8; 32];
+        let b = [2u8; 32];
+        assert_ne!(
+            rank_of_for_tier(&b, 1, "1m", &n),
+            rank_of_for_tier(&b, 1, "1msats", &n)
+        );
+    }
+
+    #[test]
+    fn the_untiered_rank_is_the_empty_tier() {
+        // `rank_of` is kept for callers with no tier in hand, and must stay
+        // consistent with the tiered form rather than being a second scheme.
+        let n = [6u8; 32];
+        let b = [3u8; 32];
+        assert_eq!(rank_of(&b, 5, &n), rank_of_for_tier(&b, 5, "", &n));
     }
 }
