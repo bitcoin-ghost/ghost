@@ -17,6 +17,16 @@ use stratum_apps::stratum_core::{
 };
 use tracing::info;
 
+/// The SV1 username the miner authorises with, and therefore the `user_identity` that must reach
+/// the pool. Declared once and asserted against, so the two cannot drift apart again.
+///
+/// ⚠ It must be `<bitcoin_address>.<worker_name>`. #479 made a bare username a REJECTED
+/// authorize — "shares from this username could not be attributed and would earn nothing" — so a
+/// fixture using a bare name never opens a channel at all, and the test then fails much later as
+/// a timeout waiting for `OpenExtendedMiningChannel`, which reads like a protocol fault rather
+/// than a bad fixture. The address is the harness's own signet coinbase address.
+const MINER_USERNAME: &str = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8.SRI-miner";
+
 /// Tests that the translator successfully negotiates extension 0x0002 with the pool
 /// and sends user_identity TLV in SubmitSharesExtended messages.
 #[tokio::test]
@@ -51,7 +61,7 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     // Start SV1 miner (minerd) connected to translator with username "SRI-miner"
     let (_minerd_process, _minerd_addr) = start_minerd(
         tproxy_addr,
-        Some("SRI-miner".to_string()),
+        Some(MINER_USERNAME.to_string()),
         Some("password".to_string()),
         false,
     )
@@ -118,7 +128,7 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     match open_channel_msg {
         Some((_, AnyMessage::Mining(Mining::OpenExtendedMiningChannel(msg)))) => {
             let user_identity = msg.user_identity.as_utf8_or_hex();
-            assert_eq!(user_identity, "user_identity.miner1".to_string());
+            assert_eq!(user_identity, MINER_USERNAME.to_string());
         }
         _ => panic!(
             "received unexpected message: {:?}",
