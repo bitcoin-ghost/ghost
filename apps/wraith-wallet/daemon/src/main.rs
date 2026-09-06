@@ -2749,7 +2749,7 @@ mod server {
                 use bitcoin::XOnlyPublicKey;
                 use std::str::FromStr;
                 use wraith_wallet_core::ghost_lock_account::{
-                    balances, GhostLockAccount, LaneKind, LockKeys,
+                    balances, GhostLockAccount, LockKeys,
                 };
 
                 fn xonly(label: &str, hexstr: &str) -> Result<XOnlyPublicKey, String> {
@@ -2815,9 +2815,10 @@ mod server {
                     .map(|l| l.lane.address.to_string())
                     .collect();
 
-                // One confirmation. A Lock balance is what is settled; counting
-                // unconfirmed funds would show money that can still vanish.
-                let scan = match state.chain().await.scan_utxos(&addresses, 1).await {
+                // Scanned at ZERO confirmations, then split. One round trip
+                // gives both figures, and the split happens here rather than
+                // being two scans that could disagree with each other.
+                let scan = match state.chain().await.scan_utxos(&addresses, 0).await {
                     Ok(s) => s,
                     Err(e) => {
                         return Envelope::new(
@@ -2830,7 +2831,8 @@ mod server {
                 };
 
                 // Attribute each UTXO to its lane by address.
-                let mut per_lane: Vec<(LaneKind, u64)> = Vec::new();
+                let mut per_lane: Vec<wraith_wallet_core::ghost_lock_account::LaneCoin> =
+                    Vec::new();
                 for u in &scan.utxos {
                     // A UTXO the scanner could not attribute to an address is
                     // skipped rather than guessed at. Guessing would put
@@ -2844,7 +2846,11 @@ mod server {
                         .iter()
                         .find(|l| l.lane.address.to_string() == addr)
                     {
-                        per_lane.push((b.kind, u.amount_sats));
+                        per_lane.push(wraith_wallet_core::ghost_lock_account::LaneCoin {
+                            kind: b.kind,
+                            sats: u.amount_sats,
+                            confirmations: u.confirmations,
+                        });
                     }
                 }
 
@@ -2858,11 +2864,13 @@ mod server {
                             label: l.label.clone(),
                             address: l.address.clone(),
                             balance_sats: l.balance_sats,
+                            pending_sats: l.pending_sats,
                             quorum_can_spend_alone: l.quorum_can_spend_alone,
                             round_eligible: l.round_eligible,
                         })
                         .collect(),
                     total_sats: b.total_sats,
+                    total_pending_sats: b.total_pending_sats,
                     custodial_sats: b.custodial_sats,
                     chain_height: scan.chain_height,
                 })

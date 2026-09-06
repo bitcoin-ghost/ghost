@@ -1675,7 +1675,11 @@ pub struct GhostLockLane {
     pub kind: String,
     pub label: String,
     pub address: String,
+    /// Confirmed — what has settled.
     pub balance_sats: u64,
+    /// Unconfirmed, reported separately. Never added to `balance_sats`: money
+    /// that can still vanish must not read as settled.
+    pub pending_sats: u64,
     /// **True only for Investments.** The quorum can move this lane's funds
     /// without the owner. Carried per lane so every client shows the same
     /// warning rather than inferring it from the lane's name.
@@ -1688,8 +1692,10 @@ pub struct GhostLockLane {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GhostLockLanesResponse {
     pub lanes: Vec<GhostLockLane>,
-    /// The whole Lock — what a person means by "how much have I got".
+    /// The whole Lock, confirmed — what a person means by "how much have I got".
     pub total_sats: u64,
+    /// Unconfirmed across every lane. Beside the total, never inside it.
+    pub total_pending_sats: u64,
     /// Of that, how much the quorum could move without the owner. Reported
     /// beside the total rather than folded into it.
     pub custodial_sats: u64,

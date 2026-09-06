@@ -184,7 +184,15 @@ pub struct LaneBalance {
     pub kind: LaneKind,
     pub label: String,
     pub address: String,
+    /// Confirmed. What has settled and can be relied on.
     pub balance_sats: u64,
+    /// Unconfirmed, and reported **separately rather than added**.
+    ///
+    /// A user who has just funded a lane needs to see it arriving, or the
+    /// wallet looks broken for a block. But folding it into the balance would
+    /// show money that can still vanish as though it were settled, which is the
+    /// more expensive mistake of the two.
+    pub pending_sats: u64,
     /// True only for Investments. Carried per lane rather than left for the UI
     /// to infer, so every client shows the same warning.
     pub quorum_can_spend_alone: bool,
@@ -196,8 +204,10 @@ pub struct LaneBalance {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LockBalances {
     pub lanes: Vec<LaneBalance>,
-    /// The whole Lock. What a person means by "how much have I got".
+    /// The whole Lock, confirmed. What a person means by "how much have I got".
     pub total_sats: u64,
+    /// Unconfirmed across every lane. Beside the total, never inside it.
+    pub total_pending_sats: u64,
     /// Of the total, how much the quorum could move without the owner.
     ///
     /// Reported alongside the total rather than folded into it: a single figure
@@ -206,30 +216,51 @@ pub struct LockBalances {
     pub custodial_sats: u64,
 }
 
-/// Sum a Lock's lanes.
+/// One scanned coin, already attributed to a lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneCoin {
+    pub kind: LaneKind,
+    pub sats: u64,
+    /// Zero means it is still in the mempool.
+    pub confirmations: u32,
+}
+
+/// Sum a Lock's lanes, keeping confirmed and pending apart.
 ///
 /// Saturating, because a total shown to a person must never wrap into a small
 /// number. Where arithmetic actually moves coins the checked form is used
 /// instead.
-pub fn balances(account: &GhostLockAccount, per_lane_sats: &[(LaneKind, u64)]) -> LockBalances {
+///
+/// The custodial figure counts **confirmed** funds only: it answers "how much
+/// of my settled money can somebody else move", and unconfirmed coins are not
+/// yet anybody's to move.
+pub fn balances(account: &GhostLockAccount, coins: &[LaneCoin]) -> LockBalances {
     let mut lanes = Vec::with_capacity(account.lanes.len());
     let mut total: u64 = 0;
+    let mut pending_total: u64 = 0;
     let mut custodial: u64 = 0;
 
     for built in &account.lanes {
-        let sats = per_lane_sats
-            .iter()
-            .filter(|(k, _)| *k == built.kind)
-            .fold(0u64, |acc, (_, v)| acc.saturating_add(*v));
-        total = total.saturating_add(sats);
+        let mut settled: u64 = 0;
+        let mut pending: u64 = 0;
+        for c in coins.iter().filter(|c| c.kind == built.kind) {
+            if c.confirmations == 0 {
+                pending = pending.saturating_add(c.sats);
+            } else {
+                settled = settled.saturating_add(c.sats);
+            }
+        }
+        total = total.saturating_add(settled);
+        pending_total = pending_total.saturating_add(pending);
         if built.kind.quorum_can_spend_alone() {
-            custodial = custodial.saturating_add(sats);
+            custodial = custodial.saturating_add(settled);
         }
         lanes.push(LaneBalance {
             kind: built.kind,
             label: built.kind.label().to_string(),
             address: built.lane.address.to_string(),
-            balance_sats: sats,
+            balance_sats: settled,
+            pending_sats: pending,
             quorum_can_spend_alone: built.kind.quorum_can_spend_alone(),
             round_eligible: built.kind.round_eligible(),
         });
@@ -238,6 +269,7 @@ pub fn balances(account: &GhostLockAccount, per_lane_sats: &[(LaneKind, u64)]) -
     LockBalances {
         lanes,
         total_sats: total,
+        total_pending_sats: pending_total,
         custodial_sats: custodial,
     }
 }
@@ -261,6 +293,22 @@ mod tests {
             owner_backup_aggregate: key(4),
             owner_quorum_aggregate: key(5),
             quorum: key(6),
+        }
+    }
+
+    fn settled(kind: LaneKind, sats: u64) -> LaneCoin {
+        LaneCoin {
+            kind,
+            sats,
+            confirmations: 1,
+        }
+    }
+
+    fn pending(kind: LaneKind, sats: u64) -> LaneCoin {
+        LaneCoin {
+            kind,
+            sats,
+            confirmations: 0,
         }
     }
 
@@ -309,10 +357,10 @@ mod tests {
         let b = balances(
             &a,
             &[
-                (LaneKind::Savings, 1_000_000),
-                (LaneKind::Spending, 200_000),
-                (LaneKind::Cash, 50_000),
-                (LaneKind::Investments, 40_000),
+                settled(LaneKind::Savings, 1_000_000),
+                settled(LaneKind::Spending, 200_000),
+                settled(LaneKind::Cash, 50_000),
+                settled(LaneKind::Investments, 40_000),
             ],
         );
         assert_eq!(b.total_sats, 1_290_000);
@@ -327,8 +375,8 @@ mod tests {
         let b = balances(
             &a,
             &[
-                (LaneKind::Savings, 1_000_000),
-                (LaneKind::Investments, 40_000),
+                settled(LaneKind::Savings, 1_000_000),
+                settled(LaneKind::Investments, 40_000),
             ],
         );
         assert_eq!(b.total_sats, 1_040_000);
@@ -340,7 +388,7 @@ mod tests {
         // An empty lane must not vanish: it has an address funds can arrive at,
         // and a person needs to see it exists.
         let a = account();
-        let b = balances(&a, &[(LaneKind::Spending, 5)]);
+        let b = balances(&a, &[settled(LaneKind::Spending, 5)]);
         assert_eq!(b.lanes.len(), 4);
         assert_eq!(b.total_sats, 5);
         for l in &b.lanes {
@@ -354,9 +402,9 @@ mod tests {
         let b = balances(
             &a,
             &[
-                (LaneKind::Cash, 1_000),
-                (LaneKind::Cash, 2_000),
-                (LaneKind::Cash, 3_000),
+                settled(LaneKind::Cash, 1_000),
+                settled(LaneKind::Cash, 2_000),
+                settled(LaneKind::Cash, 3_000),
             ],
         );
         assert_eq!(b.total_sats, 6_000);
@@ -369,11 +417,51 @@ mod tests {
         let b = balances(
             &a,
             &[
-                (LaneKind::Savings, u64::MAX),
-                (LaneKind::Spending, u64::MAX),
+                settled(LaneKind::Savings, u64::MAX),
+                settled(LaneKind::Spending, u64::MAX),
             ],
         );
         assert_eq!(b.total_sats, u64::MAX);
+    }
+
+    #[test]
+    fn pending_is_reported_beside_settled_never_added_to_it() {
+        // A user who has just funded a lane must see it arriving, or the wallet
+        // looks broken for a block. Folding it in would show money that can
+        // still vanish as though it had settled — the more expensive mistake.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Savings, 1_000_000),
+                pending(LaneKind::Savings, 250_000),
+            ],
+        );
+        assert_eq!(b.total_sats, 1_000_000, "settled must exclude pending");
+        assert_eq!(b.total_pending_sats, 250_000);
+        let sav = b
+            .lanes
+            .iter()
+            .find(|l| l.kind == LaneKind::Savings)
+            .unwrap();
+        assert_eq!(sav.balance_sats, 1_000_000);
+        assert_eq!(sav.pending_sats, 250_000);
+    }
+
+    #[test]
+    fn the_custodial_figure_counts_settled_funds_only() {
+        // It answers "how much of my settled money can somebody else move".
+        // Unconfirmed coins are not yet anybody's to move.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Investments, 40_000),
+                pending(LaneKind::Investments, 999_000),
+            ],
+        );
+        assert_eq!(b.custodial_sats, 40_000);
+        assert_eq!(b.total_pending_sats, 999_000);
     }
 
     #[test]
