@@ -66,17 +66,32 @@ PY
   touch "$file"
   sleep 1
 
-  local rc
-  timeout 300 cargo test -j2 -p wraith-protocol --lib "$filter" >/dev/null 2>&1
+  # Run the WHOLE suite, not a filter, and run it twice.
+  #
+  # Cargo's fingerprint is mtime-based and a mutate/test/restore cycle races it
+  # even with a touch and a sleep: an early version of this harness gave three
+  # different answers to the same question across consecutive runs. Filtering
+  # made it worse by shortening the cycle.
+  #
+  # Two agreeing runs is the bar. A guard that cannot give a stable answer must
+  # say so rather than pick one — reporting a confident wrong result is the
+  # failure this whole script exists to catch, one level up.
+  local rc rc2
+  timeout 300 cargo test -j2 -p wraith-protocol --lib >/dev/null 2>&1
   rc=$?
+  timeout 300 cargo test -j2 -p wraith-protocol --lib >/dev/null 2>&1
+  rc2=$?
   cp "$BAK/${rel//\//__}.bak" "$file"
   checked=$((checked + 1))
 
-  if [ "$rc" -eq 0 ]; then
-    printf '  %-38s *** SURVIVED *** (rc=%s)\n' "$name" "$rc"
+  if [ "$rc" -ne "$rc2" ]; then
+    printf '  %-38s INDETERMINATE (%s then %s)\n' "$name" "$rc" "$rc2"
+    survivors=$((survivors + 1))
+  elif [ "$rc" -eq 0 ]; then
+    printf '  %-38s *** SURVIVED ***\n' "$name"
     survivors=$((survivors + 1))
   else
-    printf '  %-38s caught (rc=%s)\n' "$name" "$rc"
+    printf '  %-38s caught\n' "$name"
   fi
 }
 
@@ -143,7 +158,7 @@ cp crates/wraith-protocol/src/mailbox.rs "$BAK/mailbox.rs.bak"
 printf '\n// harness control\n' >> crates/wraith-protocol/src/mailbox.rs
 touch crates/wraith-protocol/src/mailbox.rs
 sleep 1
-timeout 300 cargo test -j2 -p wraith-protocol --lib mailbox >/dev/null 2>&1
+timeout 300 cargo test -j2 -p wraith-protocol --lib >/dev/null 2>&1
 control_rc=$?
 cp "$BAK/mailbox.rs.bak" crates/wraith-protocol/src/mailbox.rs
 echo "  control rc=$control_rc"
