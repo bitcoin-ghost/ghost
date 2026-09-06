@@ -534,6 +534,37 @@ async fn wraith_mix_run(
     to_value(&resp)
 }
 
+/// Derive a Ghost Lock's four lanes and report their balances.
+///
+/// The two aggregate keys are supplied rather than derived: they are products of
+/// a MuSig2 ceremony with the backup device and the quorum, and MuSig2 is not in
+/// this workspace. This reports on a Lock that already exists.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn ghost_lock_lanes(
+    backup_pubkey: String,
+    heir_pubkey: String,
+    quorum_pubkey: String,
+    owner_backup_aggregate: String,
+    owner_quorum_aggregate: String,
+    inherit_height: u32,
+    anchor_height: u32,
+    bip86_index: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockLanes {
+        backup_pubkey,
+        heir_pubkey,
+        quorum_pubkey,
+        owner_backup_aggregate,
+        owner_quorum_aggregate,
+        inherit_height,
+        anchor_height,
+        bip86_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
 fn to_value(resp: &Response) -> Result<serde_json::Value, String> {
     serde_json::to_value(resp).map_err(|e| e.to_string())
 }
@@ -895,6 +926,7 @@ pub fn run() {
             wraith_coordinator_discover,
             wraith_resolve_coordinator,
             wraith_mix_run,
+            ghost_lock_lanes,
             wallet_ghost_id,
             wallet_glyph,
             wallet_glyph_claim,

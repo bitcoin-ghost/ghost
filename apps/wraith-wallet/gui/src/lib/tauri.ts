@@ -767,6 +767,64 @@ export async function wraithMixRun(
   return { kind: "completed", value: payload as unknown as WraithMixCompleted };
 }
 
+// ----- Ghost Lock lanes ---------------------------------------------------
+
+/// One lane of a Ghost Lock.
+export interface GhostLockLane {
+  kind: string;
+  label: string;
+  address: string;
+  /// Confirmed — what has settled.
+  balance_sats: number;
+  /// Unconfirmed. Shown beside the settled figure, never added to it.
+  pending_sats: number;
+  /// True only for Investments: the quorum can move these funds without you.
+  quorum_can_spend_alone: boolean;
+  /// False for Cash — those coins are already public, so a round gains nothing.
+  round_eligible: boolean;
+}
+
+export interface GhostLockLanes {
+  lanes: GhostLockLane[];
+  total_sats: number;
+  total_pending_sats: number;
+  /// Of the settled total, how much the quorum could move without you.
+  custodial_sats: number;
+  chain_height: number;
+}
+
+export interface GhostLockLanesArgs {
+  backup_pubkey: string;
+  heir_pubkey: string;
+  quorum_pubkey: string;
+  owner_backup_aggregate: string;
+  owner_quorum_aggregate: string;
+  inherit_height: number;
+  anchor_height: number;
+  bip86_index?: number;
+}
+
+/// Derive a Ghost Lock's four lanes and read their balances.
+///
+/// The aggregates are supplied rather than derived: both are products of a
+/// MuSig2 ceremony with the backup device and the quorum. This reports on a Lock
+/// that already exists — creating one needs that ceremony, which is not built.
+export async function ghostLockLanes(
+  args: GhostLockLanesArgs,
+): Promise<GhostLockLanes> {
+  const resp = await invoke("ghost_lock_lanes", {
+    backupPubkey: args.backup_pubkey,
+    heirPubkey: args.heir_pubkey,
+    quorumPubkey: args.quorum_pubkey,
+    ownerBackupAggregate: args.owner_backup_aggregate,
+    ownerQuorumAggregate: args.owner_quorum_aggregate,
+    inheritHeight: args.inherit_height,
+    anchorHeight: args.anchor_height,
+    bip86Index: args.bip86_index,
+  });
+  return unwrap<GhostLockLanes>(resp).payload;
+}
+
 // ----- GSP ---------------------------------------------------------------
 
 export async function gspAuth(): Promise<unknown> {

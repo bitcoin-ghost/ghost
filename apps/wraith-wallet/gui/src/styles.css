@@ -1326,3 +1326,32 @@ code {
 .mix-refusal { display: flex; flex-direction: column; gap: 0.75rem; }
 .mix-reasons { margin: 0 0 0.75rem; padding-left: 1.25rem; font-size: 0.875rem; line-height: 1.6; }
 .mix-reasons li { margin-bottom: 0.25rem; }
+
+/* ── Ghost Lock lanes ───────────────────────────────────────────────────── */
+/* The total leads because it answers the question. Pending and custodial sit
+   beside it rather than inside it — both would mislead if folded in. */
+
+.lock-total { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.5rem 0.75rem; margin-bottom: 0.75rem; }
+.lock-total .eyebrow { flex-basis: 100%; }
+.lock-total-figure { font-size: 2rem; line-height: 1; font-variant-numeric: tabular-nums; }
+.lock-total-pending { font-size: 0.875rem; }
+
+.lock-custodial-note {
+  margin: 0 0 1rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: 4px;
+  background: var(--warn-weak);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.lane-list { display: flex; flex-direction: column; gap: 0.75rem; }
+.lane-row { padding: 0.625rem 0.75rem; border: 1px solid var(--rule); border-radius: 4px; }
+.lane-row.lane-custodial { border-color: var(--warn); }
+.lane-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem; }
+.lane-name { font-weight: 600; }
+.lane-figures { display: flex; align-items: baseline; gap: 0.75rem; }
+.lane-settled { font-size: 1.125rem; font-variant-numeric: tabular-nums; }
+.lane-pending { font-size: 0.8125rem; }
+.lane-addr { font-size: 0.75rem; overflow-wrap: anywhere; margin-top: 0.25rem; }
+.lock-height { margin: 0.75rem 0 0; font-size: 0.8125rem; }
