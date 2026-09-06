@@ -81,6 +81,7 @@ pub mod epoch;
 pub mod ladder;
 pub mod ladder_round;
 pub mod liquidity;
+pub mod mailbox;
 pub mod privacy;
 pub mod privacy_level;
 pub mod seat_price;
