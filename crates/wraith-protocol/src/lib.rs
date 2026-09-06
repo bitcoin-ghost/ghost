@@ -77,6 +77,7 @@ pub mod remix;
 
 pub mod admission;
 pub mod attestation;
+pub mod beacon;
 pub mod consolidation;
 pub mod epoch;
 pub mod exit_availability;
