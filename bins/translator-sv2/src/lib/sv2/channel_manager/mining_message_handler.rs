@@ -502,10 +502,22 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 } else {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
-                    error!(
-                        "Channel not found: {}, ignoring NewExtendedMiningJob message",
-                        m_static.channel_id
-                    );
+                    let n = self
+                        .unknown_channel_messages
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    // Channel churn, not a fault — see `unknown_channel_messages`.
+                    debug!(
+                            "channel {} not found, ignoring NewExtendedMiningJob (total unknown-channel messages: {})",
+                            m_static.channel_id, n
+                        );
+                    if n.is_multiple_of(500) {
+                        info!(
+                                "{} upstream messages for channels this translator does not hold — \
+                                 routine during downstream churn; a rising RATE is the signal, not the count",
+                                n
+                            );
+                    }
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 }
             // we're not in aggregated mode
@@ -545,10 +557,22 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 let Some(mut channel) = self.extended_channels.get_mut(&m_static.channel_id) else {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
-                    error!(
-                        "Channel not found: {}, ignoring NewExtendedMiningJob message",
-                        m_static.channel_id
-                    );
+                    let n = self
+                        .unknown_channel_messages
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    // Channel churn, not a fault — see `unknown_channel_messages`.
+                    debug!(
+                            "channel {} not found, ignoring NewExtendedMiningJob (total unknown-channel messages: {})",
+                            m_static.channel_id, n
+                        );
+                    if n.is_multiple_of(500) {
+                        info!(
+                                "{} upstream messages for channels this translator does not hold — \
+                                 routine during downstream churn; a rising RATE is the signal, not the count",
+                                n
+                            );
+                    }
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 };
 
@@ -652,10 +676,22 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     } else {
                         // we got a nonsense channel id, we should log an error and ignore
                         // the message
-                        warn!(
-                            "Channel not found: {}, ignoring SetNewPrevHash message",
-                            m_static.channel_id
-                        );
+                        let n = self
+                            .unknown_channel_messages
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        // Channel churn, not a fault — see `unknown_channel_messages`.
+                        debug!(
+                                "channel {} not found, ignoring SetNewPrevHash (total unknown-channel messages: {})",
+                                m_static.channel_id, n
+                            );
+                        if n.is_multiple_of(500) {
+                            info!(
+                                    "{} upstream messages for channels this translator does not hold — \
+                                     routine during downstream churn; a rising RATE is the signal, not the count",
+                                    n
+                                );
+                        }
                         return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                     }
                 // we are not in aggregated mode.. was the message sent to a group channel?
@@ -706,10 +742,22 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     else {
                         // we got a nonsense channel id, we should log an error and ignore the
                         // message
-                        warn!(
-                            "Channel not found: {}, ignoring SetNewPrevHash message",
-                            m_static.channel_id
-                        );
+                        let n = self
+                            .unknown_channel_messages
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        // Channel churn, not a fault — see `unknown_channel_messages`.
+                        debug!(
+                                "channel {} not found, ignoring SetNewPrevHash (total unknown-channel messages: {})",
+                                m_static.channel_id, n
+                            );
+                        if n.is_multiple_of(500) {
+                            info!(
+                                    "{} upstream messages for channels this translator does not hold — \
+                                     routine during downstream churn; a rising RATE is the signal, not the count",
+                                    n
+                                );
+                        }
                         return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                     };
 
@@ -847,10 +895,22 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 } else {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
-                    warn!(
-                        "Channel not found: {}, ignoring SetTarget message",
-                        m_static.channel_id
-                    );
+                    let n = self
+                        .unknown_channel_messages
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    // Channel churn, not a fault — see `unknown_channel_messages`.
+                    debug!(
+                            "channel {} not found, ignoring SetTarget (total unknown-channel messages: {})",
+                            m_static.channel_id, n
+                        );
+                    if n.is_multiple_of(500) {
+                        info!(
+                                "{} upstream messages for channels this translator does not hold — \
+                                 routine during downstream churn; a rising RATE is the signal, not the count",
+                                n
+                            );
+                    }
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 }
 
@@ -880,10 +940,22 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 let Some(mut channel) = self.extended_channels.get_mut(&m.channel_id) else {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
-                    warn!(
-                        "Channel not found: {}, ignoring SetTarget message",
-                        m_static.channel_id
-                    );
+                    let n = self
+                        .unknown_channel_messages
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    // Channel churn, not a fault — see `unknown_channel_messages`.
+                    debug!(
+                            "channel {} not found, ignoring SetTarget (total unknown-channel messages: {})",
+                            m_static.channel_id, n
+                        );
+                    if n.is_multiple_of(500) {
+                        info!(
+                                "{} upstream messages for channels this translator does not hold — \
+                                 routine during downstream churn; a rising RATE is the signal, not the count",
+                                n
+                            );
+                    }
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 };
 
