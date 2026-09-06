@@ -151,8 +151,15 @@ async fn five_wallets_complete_a_full_mix_round() {
                 mix_output_address: participant_address(i as u8 + 10).to_string(),
             };
             let signer = |_tx: &bitcoin::Transaction, _idx: usize, _amt: u64| {
+                // 64 bytes, the length a real BIP-341 SIGHASH_DEFAULT signature
+                // has. The bytes are not a valid signature — this test drives
+                // the protocol flow, and `five_wallets_sign_real_taproot_...`
+                // covers real signing — but the LENGTH has to be realistic,
+                // because `check_witness_sighash` reads it to detect a sighash
+                // type that would void the pre-sign inspection. A four-byte
+                // placeholder was never something that could reach a chain.
                 let mut w = Witness::new();
-                w.push([0xde, 0xad, 0xbe, 0xef]);
+                w.push([0xdeu8; 64]);
                 Ok::<Witness, WraithClientError>(w)
             };
             let prove = move |challenge: &str| {
@@ -358,7 +365,7 @@ async fn prepare_then_submit_works_via_split_api() {
             // Schnorr / ECDSA sign).
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             let mut w = Witness::new();
-            w.push([0xab, 0xcd, 0xef]);
+            w.push([0xabu8; 64]);
 
             // Phase 2: submit.
             client.submit_witness(&prepared, w).await
@@ -717,4 +724,40 @@ fn a_prepared_round_below_the_floor_is_refused_before_signing() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// A signature made under the wrong sighash voids the inspection, and is caught
+/// by its length rather than by trusting the signer.
+///
+/// `client_session::Verified::authorise` performs this check and was never
+/// called from anywhere — `inspect` returns the report and drops the `Verified`.
+/// The wallet's own signer happens to use SIGHASH_DEFAULT, so it would have
+/// passed; that is luck, not a check, and it would not hold for a hardware
+/// wallet or a remote signer that chose differently.
+#[test]
+fn a_signature_under_the_wrong_sighash_is_refused_by_its_length() {
+    use bitcoin::Witness;
+    use wraith_wallet_core::wraith::{check_witness_sighash, WraithClientError};
+
+    // 64 bytes: SIGHASH_DEFAULT, commits to every input and output.
+    let good = Witness::from_slice(&[vec![0u8; 64]]);
+    assert!(check_witness_sighash(&good, 0).is_ok());
+
+    // 65 bytes: some other type, with its flag appended. The extra byte is the
+    // whole tell — it means the round can be edited after inspection.
+    let flagged = Witness::from_slice(&[vec![0u8; 65]]);
+    assert!(matches!(
+        check_witness_sighash(&flagged, 3),
+        Err(WraithClientError::UnsafeSighash {
+            input_index: 3,
+            len: 65
+        })
+    ));
+
+    // Nothing at all cannot have committed to anything.
+    let empty = Witness::new();
+    assert!(matches!(
+        check_witness_sighash(&empty, 0),
+        Err(WraithClientError::UnsafeSighash { len: 0, .. })
+    ));
 }

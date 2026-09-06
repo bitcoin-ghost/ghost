@@ -62,6 +62,16 @@ pub enum WraithClientError {
     Coordinator { status: u16, detail: String },
     #[error("response body did not match expected shape: {0}")]
     Shape(String),
+    /// A signature was produced under a sighash that does not commit to what
+    /// was inspected, so the inspection would have been void.
+    #[error("input {input_index} was signed with a {len}-byte signature; BIP-341 SIGHASH_DEFAULT is 64 bytes, and anything longer carries a sighash flag that lets the round be edited after inspection")]
+    UnsafeSighash {
+        /// Which input.
+        input_index: usize,
+        /// Signature length produced.
+        len: usize,
+    },
+
     /// The round failed inspection, so nothing was signed.
     ///
     /// Carries every reason rather than the first: a wallet deciding between
@@ -131,6 +141,37 @@ pub struct MixRequest {
 /// will assemble, not a sensible privacy default — one in five is barely
 /// privacy. Unmeasured; revise against real volume.
 pub const DEFAULT_MIN_ENTITIES: usize = 10;
+
+/// Reject a witness whose signature was made under a sighash that does not
+/// commit to the whole round.
+///
+/// A BIP-341 key-path signature is 64 bytes under `SIGHASH_DEFAULT`. Every other
+/// type appends its flag byte, making 65. So the length answers the question
+/// without trusting the signer to report honestly — which matters precisely for
+/// the signers most likely to differ: hardware wallets and remote signing
+/// services.
+///
+/// An empty witness is refused too. A signature that is not there cannot have
+/// committed to anything.
+pub fn check_witness_sighash(
+    witness: &Witness,
+    input_index: usize,
+) -> Result<(), WraithClientError> {
+    let sig = witness
+        .iter()
+        .next()
+        .ok_or(WraithClientError::UnsafeSighash {
+            input_index,
+            len: 0,
+        })?;
+    if sig.len() != 64 {
+        return Err(WraithClientError::UnsafeSighash {
+            input_index,
+            len: sig.len(),
+        });
+    }
+    Ok(())
+}
 
 /// The result of a successful mix.
 #[derive(Debug, Clone)]
@@ -464,6 +505,20 @@ impl WraithSessionClient {
                     detail: other.to_string(),
                 },
             })?;
+
+        // Inspection is only worth anything if the signature commits to what was
+        // inspected. `signature_scope` says which sighash types void it —
+        // ANYONECANPAY lets inputs be swapped in afterwards, SINGLE/NONE lets
+        // outputs be — and this is where that is enforced for an arbitrary
+        // signer.
+        //
+        // Checked by LENGTH rather than by asking the signer what it used. A
+        // BIP-341 signature is 64 bytes under SIGHASH_DEFAULT and 65 under
+        // every other type, because the flag is appended. So the transaction
+        // itself reports the answer, and a hardware wallet or remote signer
+        // that quietly chose something else cannot misreport it.
+        check_witness_sighash(&witness, prepared.input_index)?;
+
         self.submit_witness(&prepared, witness).await
     }
 
