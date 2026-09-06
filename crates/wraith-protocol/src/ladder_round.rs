@@ -85,7 +85,7 @@ pub struct LadderOutput {
 }
 
 /// One participant's contribution to the round.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LadderParticipant {
     /// Rungs contributed.
     pub inputs: Vec<LadderInput>,
@@ -378,6 +378,140 @@ impl AddressExt for Address {
     }
 }
 
+/// A coin the wallet holds, ready to spend into a round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coin {
+    /// Previous txid.
+    pub txid: Txid,
+    /// Previous vout.
+    pub vout: u32,
+    /// Value. Must be a ladder rung.
+    pub value_sats: u64,
+}
+
+/// Why a participation could not be planned.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlanError {
+    /// Holdings do not cover the payment plus the fee share.
+    #[error("holdings total {available}, need {target}")]
+    Insufficient {
+        /// Sum of the coins offered.
+        available: u64,
+        /// Payment plus fee share.
+        target: u64,
+    },
+
+    /// The amount is not expressible on this ladder.
+    #[error("amount {amount} is not a ladder amount; quantise it first")]
+    InexpressibleAmount {
+        /// The requested amount.
+        amount: u64,
+    },
+
+    /// Not enough fresh addresses were supplied for the outputs required.
+    #[error("{needed} outputs need {needed} fresh addresses, got {got}")]
+    NotEnoughAddresses {
+        /// Addresses required.
+        needed: usize,
+        /// Addresses supplied.
+        got: usize,
+    },
+
+    /// An address was supplied twice.
+    ///
+    /// Reuse links outputs to each other and, over time, to their owner. It is
+    /// refused here rather than left to a probe, because by the time a probe
+    /// sees it the transaction is on chain.
+    #[error("address {address} supplied more than once — every output needs a fresh one")]
+    AddressReused {
+        /// The repeated address.
+        address: String,
+    },
+}
+
+/// Turn "I want to pay this much" into a round contribution.
+///
+/// This is the join between [`Ladder::plan`], which works in values, and
+/// [`LadderParticipant`], which needs coins and addresses.
+///
+/// # Fresh addresses are mandatory, and checked
+///
+/// One address per output, all distinct. The caller supplies them because only
+/// the wallet can derive them, but the requirement is enforced here — a reused
+/// address links outputs to each other and eventually to their owner, and by
+/// the time an on-chain probe notices, the transaction has confirmed.
+///
+/// Recipient legs and change legs are deliberately not distinguished in the
+/// result. An observer cannot tell them apart, and neither should anything
+/// downstream of this function.
+pub fn plan_participation(
+    ladder: &Ladder,
+    coins: &[Coin],
+    amount_sats: u64,
+    fee_share_sats: u64,
+    addresses: &[String],
+) -> Result<LadderParticipant, PlanError> {
+    let values: Vec<u64> = coins.iter().map(|c| c.value_sats).collect();
+    let plan = ladder
+        .plan(&values, amount_sats, fee_share_sats)
+        .map_err(|e| match e {
+            crate::ladder::LadderError::Insufficient { available, target } => {
+                PlanError::Insufficient { available, target }
+            }
+            _ => PlanError::InexpressibleAmount {
+                amount: amount_sats,
+            },
+        })?;
+
+    // Reuse is checked FIRST, and across every address supplied rather than
+    // only the prefix consumed. A caller with a derivation bug that repeats an
+    // address past the ones needed today will repeat it inside the window
+    // tomorrow, and a shortage is a far less serious complaint to return.
+    let mut seen = std::collections::HashSet::new();
+    for a in addresses {
+        if !seen.insert(a) {
+            return Err(PlanError::AddressReused { address: a.clone() });
+        }
+    }
+
+    let needed = plan.recipient.len() + plan.change.len();
+    if addresses.len() < needed {
+        return Err(PlanError::NotEnoughAddresses {
+            needed,
+            got: addresses.len(),
+        });
+    }
+
+    // Map chosen values back to specific coins, consuming each at most once.
+    let mut pool: Vec<&Coin> = coins.iter().collect();
+    let mut inputs = Vec::with_capacity(plan.inputs.len());
+    for v in &plan.inputs {
+        let pos = pool
+            .iter()
+            .position(|c| c.value_sats == *v)
+            .expect("plan only selects values present in the pool");
+        let c = pool.remove(pos);
+        inputs.push(LadderInput {
+            txid: c.txid,
+            vout: c.vout,
+            value_sats: c.value_sats,
+        });
+    }
+
+    let outputs = plan
+        .recipient
+        .iter()
+        .chain(plan.change.iter())
+        .zip(addresses)
+        .map(|(v, a)| LadderOutput {
+            address: a.clone(),
+            value_sats: *v,
+        })
+        .collect();
+
+    Ok(LadderParticipant { inputs, outputs })
+}
+
 /// A built ladder round.
 #[derive(Debug, Clone)]
 pub struct LadderRound {
@@ -632,6 +766,122 @@ mod tests {
         let round = b.build(&[0x11; 32]).unwrap();
         // No shape supplied: there is no single denomination, which is the point.
         assert!(probe_round(&round.tx, None).is_empty());
+    }
+
+    fn coins(values: &[u64]) -> Vec<Coin> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Coin {
+                txid: Txid::from_byte_array([i as u8 + 1; 32]),
+                vout: i as u32,
+                value_sats: *v,
+            })
+            .collect()
+    }
+
+    fn fresh(n: usize) -> Vec<String> {
+        (0..n).map(|i| addr(100u8.wrapping_add(i as u8))).collect()
+    }
+
+    #[test]
+    fn a_payment_plans_into_a_valid_contribution() {
+        let l = Ladder::standard();
+        let held = coins(&[200_000, 50_000]);
+        let p = plan_participation(&l, &held, 137_000, 2_000, &fresh(12)).expect("plans");
+
+        // Every value on both sides is a rung.
+        for i in &p.inputs {
+            assert!(l.rungs().contains(&i.value_sats));
+        }
+        for o in &p.outputs {
+            assert!(l.rungs().contains(&o.value_sats));
+        }
+        // Inputs cover the payment plus the fee share.
+        let spent: u64 = p.inputs.iter().map(|i| i.value_sats).sum();
+        assert!(spent >= 139_000);
+        // Recipient legs and change legs are indistinguishable in the result.
+        let out: u64 = p.outputs.iter().map(|o| o.value_sats).sum();
+        assert!(out >= 137_000);
+    }
+
+    #[test]
+    fn a_reused_address_is_refused_before_it_reaches_the_chain() {
+        let l = Ladder::standard();
+        let held = coins(&[200_000]);
+        // Plenty of addresses, but one repeated — the shortage check must not
+        // mask the more serious complaint.
+        let dupe = addr(7);
+        let mut addrs = fresh(12);
+        addrs.push(dupe.clone());
+        addrs.push(dupe.clone());
+        assert_eq!(
+            plan_participation(&l, &held, 137_000, 2_000, &addrs),
+            Err(PlanError::AddressReused { address: dupe })
+        );
+    }
+
+    #[test]
+    fn too_few_addresses_is_refused_rather_than_silently_reusing() {
+        let l = Ladder::standard();
+        let held = coins(&[200_000]);
+        assert!(matches!(
+            plan_participation(&l, &held, 137_000, 2_000, &fresh(2)),
+            Err(PlanError::NotEnoughAddresses { .. })
+        ));
+    }
+
+    #[test]
+    fn insufficient_holdings_are_refused() {
+        let l = Ladder::standard();
+        let held = coins(&[10_000]);
+        assert!(matches!(
+            plan_participation(&l, &held, 137_000, 2_000, &fresh(12)),
+            Err(PlanError::Insufficient { .. })
+        ));
+    }
+
+    #[test]
+    fn a_coin_is_never_spent_twice() {
+        let l = Ladder::standard();
+        // Two coins of equal value: the mapping must consume distinct outpoints.
+        let held = coins(&[100_000, 100_000, 50_000]);
+        let p = plan_participation(&l, &held, 137_000, 2_000, &fresh(12)).expect("plans");
+        let mut seen = std::collections::HashSet::new();
+        for i in &p.inputs {
+            assert!(
+                seen.insert((i.txid, i.vout)),
+                "outpoint {}:{} spent twice",
+                i.txid,
+                i.vout
+            );
+        }
+    }
+
+    #[test]
+    fn a_planned_contribution_builds_into_a_round() {
+        // End to end: plan five participants, assemble, and probe.
+        let l = Ladder::standard();
+        let mut b = LadderRoundBuilder::new("s-e2e", l.clone(), Network::Signet, 5, 5);
+        for i in 0..5u8 {
+            let held = vec![Coin {
+                txid: Txid::from_byte_array([i + 1; 32]),
+                vout: 0,
+                value_sats: 200_000,
+            }];
+            let addrs: Vec<String> = (0..12)
+                .map(|j| addr(i.wrapping_mul(20).wrapping_add(j + 40)))
+                .collect();
+            b.add_participant(
+                plan_participation(&l, &held, 150_000, 2_000, &addrs).expect("plans"),
+            );
+        }
+        absorb_surplus(&mut b);
+        let round = b.build(&[0x33; 32]).expect("balances");
+        assert!(crate::privacy::probe_round(&round.tx, None).is_empty());
+        for o in &round.tx.output {
+            assert!(l.rungs().contains(&o.value.to_sat()));
+        }
     }
 
     #[test]
