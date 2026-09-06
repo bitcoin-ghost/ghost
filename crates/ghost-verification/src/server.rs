@@ -1274,13 +1274,26 @@ impl GhostdReaperApply {
     }
 }
 
-/// Memo store behind [`VerificationState::records_cache`]: window name -> (computed at, answer).
+/// Memo store behind [`VerificationState::records_cache`]: window name ->
+/// (computed at, answer, how long the query took).
+///
+/// The measured cost is stored alongside the answer because the TTL is derived from it — see
+/// `adaptive_records_ttl`. Without it the memo would have to assume a cost, and the assumption
+/// has already gone stale once (the hard-coded TTLs were sized for a 20s query that no longer
+/// exists).
 ///
 /// Factored out because clippy rightly refuses the inline form — three nested generics deep is
 /// unreadable at a field declaration.
 pub type RecordsCache = Arc<
     parking_lot::RwLock<
-        std::collections::HashMap<String, (Instant, Option<ghost_storage::models::BestShare>)>,
+        std::collections::HashMap<
+            String,
+            (
+                Instant,
+                Option<ghost_storage::models::BestShare>,
+                std::time::Duration,
+            ),
+        >,
     >,
 >;
 
@@ -1389,8 +1402,11 @@ pub struct VerificationState {
     /// `proxy_read_timeout 10s`.
     ///
     /// The result barely moves between requests, so it is memoised rather than recomputed. The TTL
-    /// is per window (see `records_ttl`), because how fast the answer can change differs by three
-    /// orders of magnitude between `block` and `month`.
+    /// is the SHORTER of a per-window ceiling (see `records_ttl`, because how fast the answer can
+    /// change differs by three orders of magnitude between `block` and `month`) and a term
+    /// proportional to the query's own measured cost (see `adaptive_records_ttl`). The cost term
+    /// is what keeps the memo honest: the window is cheap or expensive depending on how much of
+    /// the frozen `shares_archive` still falls inside it, and that shrinks every day.
     ///
     /// `Option<BestShare>` is cached, not `Result`: a MISS is a legitimate answer worth caching
     /// (a quiet window genuinely has no record), whereas an error must not be, or one transient
