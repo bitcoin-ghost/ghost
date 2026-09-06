@@ -4085,7 +4085,7 @@ mod server {
                         // handed a transaction to sign. Checking later would
                         // mean the wallet had already produced a signature over
                         // a round it never verified.
-                        match signing_ledger_for(&state) {
+                        match signing_ledger_for(state) {
                             Err(e) => Response::Error(ErrorResponse {
                                 message: format!("signing ledger unavailable: {e}"),
                             }),
