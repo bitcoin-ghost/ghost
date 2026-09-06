@@ -713,6 +713,53 @@ impl Database {
     ///
     /// The caller must only pass an epoch it has actually summarised; see
     /// `ShardRuntime::expired_evidence`, which refuses to expire an epoch this node never folded.
+    /// Delete orphaned FOREIGN evidence older than `older_than_secs` (#834).
+    ///
+    /// An orphan is a share whose `round_id` has no row in `rounds`, so no epoch can be derived
+    /// for it. Round ids are per-node; `share_handler.rs` stores a gossiped `ShareProof` under the
+    /// ORIGINATING node's round id verbatim, and where that id does not exist locally the join
+    /// never resolves. Measured 2026-09-06: 43,431 on vm1, 36,850 on vm5.
+    ///
+    /// These are invisible to every other reaper — [`Self::shard_reap_evidence_through_epoch`] and
+    /// [`Self::shard_epoch_shares`] both inner-join `rounds`, and `delete_old_shares` keys on
+    /// `paid_in_proposal_hash`, which nothing writes any more. They were the last unbounded axis.
+    ///
+    /// ⛔ `received_by != own_node` is a HARD condition, not an optimisation. A foreign row was
+    /// never credited here — each node folds only its own column and the shard is the sum — so
+    /// dropping it takes nothing. An **own** orphan is the opposite: the fold joins `rounds` too,
+    /// so it could never have been folded, its work may never have reached `shard_counters`, and
+    /// deleting it would destroy a claim with no record anywhere. There are none today (measured:
+    /// 0 on both vm1 and vm5) and this must keep it that way if that ever changes.
+    ///
+    /// Keyed on TIMESTAMP rather than block height, which is the one place in this module that is
+    /// justified: an orphan has no derivable epoch, which is the definition of being one. §12's
+    /// requirement that boundaries be chain-derivable protects evidence a peer may audit — and an
+    /// orphan can never be audited, because the epoch it would be served for cannot be computed by
+    /// either side. The window is deliberately generous (a day, against a six-hour evidence
+    /// window) because a wall-clock key deserves more margin than a height-keyed one.
+    pub fn shard_reap_orphaned_foreign_evidence(
+        &self,
+        own_node: &str,
+        older_than_secs: i64,
+    ) -> GhostResult<usize> {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - older_than_secs.max(3600);
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM shares
+                 WHERE received_by <> ?1
+                   AND timestamp < ?2
+                   AND NOT EXISTS (SELECT 1 FROM rounds r WHERE r.round_id = shares.round_id)",
+                params![own_node, cutoff],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     pub fn shard_reap_evidence_through_epoch(
         &self,
         expired_epoch: u64,
@@ -13056,6 +13103,13 @@ mod tests {
     }
 
     /// Which share hashes an epoch query returned, as their leading bytes.
+    fn chrono_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
     fn count_all_shares(db: &Database) -> i64 {
         db.with_connection(|conn| {
             conn.query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
@@ -13153,6 +13207,59 @@ mod tests {
             1,
             "epoch 101 is inside the retention window and must survive"
         );
+    }
+
+    /// Orphaned FOREIGN rows past the window go; everything else stays (#834).
+    #[test]
+    fn reaping_orphans_takes_only_foreign_rows_with_no_round() {
+        let db = Database::in_memory().unwrap();
+        let ours = "aabbccdd00112233";
+        let theirs = "ffeeddcc99887766";
+        let old = 1_000_000i64; // far past any window
+        let now = chrono_now();
+
+        db.create_round(&shard_round(1, 600)).unwrap(); // exists
+                                                        // rounds 900/901 deliberately NOT created — shares on them are orphans.
+
+        for (record, blob) in [
+            shard_share(900, 0x01, Some(12), theirs, true, old), // foreign orphan, old  -> GO
+            shard_share(901, 0x02, Some(12), theirs, true, now), // foreign orphan, new  -> STAY
+            shard_share(900, 0x03, Some(12), ours, true, old),   // OWN orphan, old      -> STAY
+            shard_share(1, 0x04, Some(12), theirs, true, old),   // foreign, HAS a round -> STAY
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+        assert_eq!(count_all_shares(&db), 4);
+
+        let reaped = db
+            .shard_reap_orphaned_foreign_evidence(ours, 86_400)
+            .unwrap();
+        assert_eq!(reaped, 1, "only the old FOREIGN orphan");
+        assert_eq!(count_all_shares(&db), 3);
+    }
+
+    /// ⛔ An OWN orphan must never be deleted, however old.
+    ///
+    /// The fold joins `rounds` as well, so an own orphan could never have been folded — its work
+    /// may never have reached `shard_counters`, and deleting it destroys the claim with no record
+    /// anywhere. There are none on the fleet today; this keeps it that way if that changes.
+    #[test]
+    fn reaping_orphans_never_touches_this_nodes_own_rows() {
+        let db = Database::in_memory().unwrap();
+        let ours = "aabbccdd00112233";
+
+        for (record, blob) in [
+            shard_share(900, 0x11, Some(12), ours, true, 1),
+            shard_share(901, 0x12, Some(12), ours, true, 2),
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+
+        let reaped = db
+            .shard_reap_orphaned_foreign_evidence(ours, 3_600)
+            .unwrap();
+        assert_eq!(reaped, 0, "own orphans are never reaped, however old");
+        assert_eq!(count_all_shares(&db), 2);
     }
 
     /// ⛔ Rows BELOW the expired epoch must survive — they may never have been summarised.

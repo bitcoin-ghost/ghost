@@ -67,6 +67,19 @@ pub const EPOCH_BLOCKS: NonZeroU64 = NonZeroU64::new(6).expect("6 is not zero");
 /// requester could reasonably ask for is still held. Pinned by test below.
 pub const RETENTION_EPOCHS: u64 = 6;
 
+/// How long an ORPHANED foreign share is kept before it is reaped (#834).
+///
+/// An orphan has no `rounds` row, so no epoch can be derived for it — which is precisely why it
+/// escapes every other reaper, and why this one is keyed on the share's timestamp instead of on
+/// block height. That is the single place a wall-clock key is defensible here: §12 requires
+/// audit boundaries be chain-derivable so both sides compute the same one, and an orphan can
+/// never be audited by anyone, because the epoch it would be served for does not resolve.
+///
+/// A day, against a six-hour evidence window. Deliberately generous: a wall-clock key deserves
+/// more margin than a height-keyed one, and these rows carry no claim, so over-retaining costs
+/// only disk while under-retaining would be the first mistake of its kind in this module.
+pub const ORPHAN_EVIDENCE_MAX_AGE_SECS: i64 = 86_400;
+
 /// How long after publication a summary is still actively being sampled: one epoch for it to
 /// propagate and be sampled, one more for the follow-up requests a subset response forces.
 ///
