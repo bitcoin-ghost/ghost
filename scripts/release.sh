@@ -33,7 +33,8 @@
 #   scripts/release.sh --status
 #
 #   <version>   e.g. 1.11.38 (no leading v)
-#   --from      resume at a phase: bump|pr|gates|build|canary|soak|production|tag
+#   --from      resume at a phase:
+#               bump|pr|gates|build|canary|soak|production|node|tag
 #               A release takes 2h+, mostly soak. Resuming must not redo the roll.
 #   --dry-run   print what each phase would do; touch nothing
 #
@@ -89,6 +90,17 @@ VERSION=""
 FROM="bump"
 
 die()  { echo "REFUSED: $*" >&2; exit 1; }
+# Never let a phase run with an empty SHA: `cat` of a missing file yields "" and every
+# downstream git command then silently means something else.
+#
+# ⚠ This is deliberately TWO functions. `die` inside a command substitution calls `exit` in the
+# SUBSHELL, so `sha=$(would_die)` carries on with an empty string and the guard reads as passing.
+# The refusal has to happen in the caller's own shell, before the substitution.
+require_sha() {
+    [ -s "$SHA_FILE" ] || die "no release SHA recorded for $TAG ($SHA_FILE). \
+Run the 'pr' phase first, or write the merged SHA there by hand."
+}
+release_sha() { cat "$SHA_FILE"; }
 info() { echo "  $*"; }
 step() { echo; echo "=== $* ==="; }
 run()  { if $DRY_RUN; then echo "  [dry-run] $*"; else eval "$@"; fi; }
@@ -238,7 +250,7 @@ wait_for_ci_and_merge() {
 
 phase_gates() {
     step "gates on the merged SHA"
-    local sha; sha="$(cat "$SHA_FILE")"
+    require_sha; local sha; sha="$(release_sha)"
     assert_sha_still_current "$sha"
     $DRY_RUN && { info "[dry-run] would run record-tests.sh in $WORKTREE"; return 0; }
     [ -d "$WORKTREE" ] || git worktree add -q --detach "$WORKTREE" "$sha" || die "worktree failed"
@@ -294,7 +306,7 @@ roll_node() {
 
 phase_canary() {
     step "canary roll"
-    assert_sha_still_current "$(cat "$SHA_FILE")"
+    require_sha; assert_sha_still_current "$(release_sha)"
     $DRY_RUN && { info "[dry-run] would roll $FLEET_BINARIES to $CANARY_NODES"; return 0; }
     for n in $CANARY_NODES; do
         roll_node "$n" "--canary" "$FLEET_BINARIES" || die "canary roll stopped at $n"
@@ -330,7 +342,7 @@ phase_soak() {
 
 phase_production() {
     step "production roll"
-    assert_sha_still_current "$(cat "$SHA_FILE")"
+    require_sha; assert_sha_still_current "$(release_sha)"
     $DRY_RUN && { info "[dry-run] would roll $FLEET_BINARIES $PRODUCTION_ONLY to $PRODUCTION_NODES"; return 0; }
     for n in $PRODUCTION_NODES; do
         roll_node "$n" "" "$FLEET_BINARIES $PRODUCTION_ONLY" || die "production roll stopped at $n"
@@ -338,11 +350,97 @@ phase_production() {
     info "production done"
 }
 
+# ---------------------------------------------------------------- ghostd
+#
+# ghostd is the sixth shipped binary and the only one that is not Cargo-built. It does NOT need
+# a manual version bump — `ghost-core/CMakeLists.txt` reads the workspace `Cargo.toml` and sets
+# CLIENT_VERSION from it, so the number tracks a release automatically. What does not happen
+# automatically is the BUILD: ghostd sat at 1.11.34 across the whole fleet while the Rust
+# binaries moved to 1.11.37, purely because nothing rebuilt it.
+#
+# ⚠ The version is read at CMAKE CONFIGURE time, not build time. `cmake --build` alone after a
+# bump produces a binary still stamped with the old version, which is worse than not building —
+# it looks current everywhere except in what it actually reports.
+phase_node() {
+    step "ghostd $VERSION"
+    $DRY_RUN && { info "[dry-run] would reconfigure, build and roll ghostd"; return 0; }
+
+    local core="$WORKTREE/ghost-core"
+    [ -d "$core" ] || { info "no ghost-core in the worktree; skipping ghostd"; return 0; }
+
+    # ⛔ -j2 max. WSL2 OOM-kills cc1plus above that, and a killed build leaves 0-byte artefacts
+    # that look like output.
+    (cd "$core" && cmake -B build >/dev/null 2>&1 && \
+        cmake --build build -j"${NODE_BUILD_JOBS:-2}" --target ghostd >/tmp/ghostd_build.log 2>&1) \
+        || { tail -20 /tmp/ghostd_build.log >&2; die "ghostd build failed"; }
+
+    local bin="$core/build/bin/ghostd" got
+    [ -x "$bin" ] || die "ghostd build reported success but $bin does not exist"
+    got="$("$bin" --version 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    [ "$got" = "v$VERSION" ] || die "ghostd self-reports '$got', expected 'v$VERSION' — \
+CMake was not reconfigured, so it read the old workspace version"
+    info "ghostd $got built"
+
+    # Canaries first, then production with vm1 LAST: it is the genesis node.
+    for n in ghost-vm8 ghost-vm7 ghost-vm6 ghost-vm5 ghost-vm4 ghost-vm3 ghost-vm2 ghost-vm1; do
+        roll_ghostd "$n" "$bin" || die "ghostd roll stopped at $n"
+    done
+    info "ghostd rolled to the fleet"
+}
+
+# Atomic mv + `systemctl restart`, never stop/cp/start. Both halves are load-bearing:
+#
+#   * `cp` over a running ghostd rewrites the SAME inode the live process has mmap'd as its
+#     executable, risking corruption of the running node. `mv` gives the new file a fresh inode
+#     and leaves the running process's now-unlinked one intact until restart.
+#   * separate `stop` then `start` race: on vm3 `systemctl stop ghostd` returned non-zero with
+#     "Job for ghostd.service canceled." and the deploy aborted with the backup taken and the
+#     binary unswapped. `restart` is one transaction and cannot be cancelled by a competing job.
+roll_ghostd() {
+    local node="$1" bin="$2" want got
+    want="$(sha256sum "$bin" | cut -d" " -f1)"
+    echo "  ---- $node ----"
+
+    scp -q -o ConnectTimeout=10 "$bin" "$node:/tmp/ghostd-new" || return 1
+    got=$(ssh -o ConnectTimeout=10 "$node" "sha256sum /tmp/ghostd-new | cut -d' ' -f1" 2>/dev/null)
+    [ "$want" = "$got" ] || { echo "    checksum mismatch after transfer" >&2; return 1; }
+
+    ssh -o ConnectTimeout=10 "$node" "
+        set -e
+        S=\$(command -v sudo >/dev/null && echo sudo || echo)
+        \$S cp -p /opt/ghost/bin/ghostd /opt/ghost/bin/ghostd.bak.\$(date +%Y%m%d-%H%M%S)
+        \$S cp /tmp/ghostd-new /opt/ghost/bin/.ghostd.staged
+        \$S chmod 755 /opt/ghost/bin/.ghostd.staged
+        \$S mv /opt/ghost/bin/.ghostd.staged /opt/ghost/bin/ghostd
+        \$S rm -f /tmp/ghostd-new
+        \$S systemctl restart ghostd
+    " || return 1
+
+    # Verify it is SERVING, not merely started. A ghostd restart drops its RPC, so ghost-pool
+    # may restart itself and read `activating` for a few seconds — that is normal, and is why
+    # this waits on the RPC answering rather than on unit state.
+    local i
+    for i in $(seq 1 60); do
+        if ssh -o ConnectTimeout=10 "$node" \
+             "/opt/ghost/bin/ghost-cli getblockchaininfo >/dev/null 2>&1" 2>/dev/null; then
+            local v blocks
+            v=$(ssh -o ConnectTimeout=10 "$node" "/opt/ghost/bin/ghostd --version 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1" 2>/dev/null)
+            blocks=$(ssh -o ConnectTimeout=10 "$node" "/opt/ghost/bin/ghost-cli getblockcount 2>/dev/null" 2>/dev/null)
+            info "$node ghostd $v serving, height $blocks"
+            [ "$v" = "v$VERSION" ] || { echo "    node reports $v after swap" >&2; return 1; }
+            return 0
+        fi
+        sleep 5
+    done
+    echo "    ghostd RPC did not answer within 300s" >&2
+    return 1
+}
+
 # The step that was simply forgotten for v1.11.35, which is why the newest published release
 # described a binary the network had already moved past. It is a phase now, not a good intention.
 phase_tag() {
     step "tag and publish $TAG"
-    local sha; sha="$(cat "$SHA_FILE")"
+    require_sha; local sha; sha="$(release_sha)"
     $DRY_RUN && { info "[dry-run] would tag $TAG at ${sha:0:9} and publish"; return 0; }
 
     if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
@@ -365,7 +463,7 @@ phase_tag() {
 }
 
 # ---------------------------------------------------------------- driver
-PHASES="bump pr gates build canary soak production tag"
+PHASES="bump pr gates build canary soak production node tag"
 echo "$PHASES" | tr ' ' '\n' | grep -qx "$FROM" || die "unknown phase '$FROM' (want one of: $PHASES)"
 
 started=false
