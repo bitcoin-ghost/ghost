@@ -109,6 +109,10 @@ mutate "pre-sign approves everything" pre_sign.rs \
 '    let mut refusals = Vec::new();
     if true { return refusals; }' pre_sign
 
+mutate "misaligned prevouts are analysed anyway" client_session.rs \
+'        if prevout_scripts.len() != tx.input.len() {' \
+'        if false {' client_session
+
 mutate "over-claiming is never refused" anonymity_set.rs \
 '    if claimed.entities > independent.entities {' \
 '    if false {' anonymity_set

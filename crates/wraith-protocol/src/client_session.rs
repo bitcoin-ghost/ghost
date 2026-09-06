@@ -48,6 +48,7 @@
 //! second client re-derives them, and the second client is the one written by
 //! someone who has not read this file.
 
+use bitcoin::hashes::Hash;
 use bitcoin::sighash::TapSighashType;
 use bitcoin::{Transaction, Txid};
 
@@ -80,7 +81,53 @@ impl Joined {
         &self.expectation
     }
 
-    /// Verify a round transaction. The only way to reach a signable state.
+    /// Verify a coordinator's whole `/round-tx` response.
+    ///
+    /// This is the path a wallet should use. [`Self::verify`] leaves the
+    /// anonymity analysis to the caller, and a caller that forgets it gets
+    /// `SetUnverified` — correct, but only after the round trip. This does the
+    /// recount itself, from the transaction and the prevouts the response
+    /// already carries, so the check cannot be skipped by omission.
+    ///
+    /// `prevout_scripts` must be in `tx.input` order, as the endpoint serves
+    /// them.
+    pub fn verify_response(
+        mut self,
+        tx: &Transaction,
+        prevout_scripts: &[Vec<u8>],
+        claimed: Option<crate::anonymity_set::SetReport>,
+    ) -> Result<Verified, Vec<RefuseToSign>> {
+        // A response whose prevouts do not line up with its inputs cannot be
+        // analysed, and guessing the alignment would produce a confident wrong
+        // answer. Refuse instead — this is also the shape a coordinator would
+        // serve if it were trying to make the recount come out differently.
+        if prevout_scripts.len() != tx.input.len() {
+            return Err(vec![RefuseToSign::SetUnverified {
+                seats: tx.input.len(),
+            }]);
+        }
+
+        let coins: Vec<crate::clustering::CoinFacts> = tx
+            .input
+            .iter()
+            .zip(prevout_scripts.iter())
+            .map(|(txin, script)| crate::clustering::CoinFacts {
+                outpoint: crate::signing_ledger::OutPointKey {
+                    txid: txin.previous_output.txid.to_byte_array(),
+                    vout: txin.previous_output.vout,
+                },
+                script_pubkey: script.clone(),
+            })
+            .collect();
+
+        self.expectation.set_report = Some(crate::anonymity_set::recount_from_inputs(&coins));
+        self.expectation.claimed_set = claimed;
+        self.verify(tx)
+    }
+
+    /// Verify a round transaction against an expectation the caller has already
+    /// completed. Prefer [`Self::verify_response`], which fills in the
+    /// anonymity analysis rather than trusting the caller to have done it.
     ///
     /// Returns every reason to refuse rather than the first, so a client can
     /// decide between retrying and walking away.
@@ -293,5 +340,100 @@ mod tests {
             v.authorise(&b, TapSighashType::Default),
             Err(AuthoriseError::NotTheVerifiedTransaction { .. })
         ));
+    }
+    /// Scripts for a round whose inputs are all independent.
+    fn independent_scripts(tx: &Transaction) -> Vec<Vec<u8>> {
+        (0..tx.input.len()).map(|i| vec![i as u8, 0xab]).collect()
+    }
+
+    #[test]
+    fn verify_response_does_the_recount_itself() {
+        // `verify` leaves the analysis to the caller, and a caller who forgets
+        // gets `SetUnverified` only after the round trip. This path cannot be
+        // skipped by omission.
+        let tx = honest_round();
+        let mut want = expectation();
+        want.set_report = None; // deliberately not supplied
+        want.min_set = 3;
+        let scripts = independent_scripts(&tx);
+        let joined = Joined::new(want);
+        let verified = joined
+            .verify_response(&tx, &scripts, None)
+            .expect("independent inputs should verify");
+        assert_eq!(verified.approved_txid(), tx.compute_txid());
+        assert!(verified.expectation().set_report.is_some());
+    }
+
+    #[test]
+    fn verify_response_refuses_an_over_claim_from_the_wire() {
+        // The whole point of serving a figure: it can be contradicted.
+        let tx = honest_round();
+        let mut want = expectation();
+        want.set_report = None;
+        want.min_set = 1;
+        let scripts = independent_scripts(&tx);
+        let claimed = crate::anonymity_set::SetReport {
+            seats: tx.input.len(),
+            entities: 500,
+            unverified: 0,
+            payers: 500,
+            discounts: Vec::new(),
+        };
+        let refusals = Joined::new(want)
+            .verify_response(&tx, &scripts, Some(claimed))
+            .expect_err("a 500-entity claim must not stand");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, RefuseToSign::SetOverClaimed { claimed: 500, .. })),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn a_round_of_siblings_fails_the_floor_through_the_wire_path() {
+        // Every input from one funding transaction is one entity, however many
+        // seats it fills. The recount has to see that without being told.
+        let mut tx = honest_round();
+        let common = tx.input[0].previous_output.txid;
+        for (i, txin) in tx.input.iter_mut().enumerate() {
+            txin.previous_output.txid = common;
+            txin.previous_output.vout = i as u32;
+        }
+        let mut want = expectation();
+        want.set_report = None;
+        want.min_set = 5;
+        let scripts = independent_scripts(&tx);
+        let refusals = Joined::new(want)
+            .verify_response(&tx, &scripts, None)
+            .expect_err("one entity cannot clear a floor of five");
+        assert!(
+            refusals.iter().any(|r| matches!(
+                r,
+                RefuseToSign::SetTooSmall {
+                    got: 1,
+                    floor: 5,
+                    ..
+                }
+            )),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_prevouts_are_refused_rather_than_guessed() {
+        // Guessing the alignment produces a confident wrong answer, and this is
+        // also the shape a coordinator would serve to bend the recount.
+        let tx = honest_round();
+        let short = vec![vec![1u8]; tx.input.len().saturating_sub(1)];
+        let refusals = Joined::new(expectation())
+            .verify_response(&tx, &short, None)
+            .expect_err("misaligned prevouts must refuse");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, RefuseToSign::SetUnverified { .. })),
+            "{refusals:?}"
+        );
     }
 }
