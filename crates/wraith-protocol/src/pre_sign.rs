@@ -90,6 +90,21 @@ pub enum RefuseToSign {
         seats: usize,
     },
 
+    /// The coordinator claimed a bigger set than the round's own coins support.
+    ///
+    /// Distinct from [`Self::SetTooSmall`], which is an honest round that is
+    /// merely too thin. This is a round whose *stated* figure is not derivable
+    /// from the chain — the participant recounted and got a smaller answer.
+    #[error(
+        "coordinator claims {claimed} entities but the round's inputs support at most {counted}"
+    )]
+    SetOverClaimed {
+        /// The coordinator's figure.
+        claimed: usize,
+        /// What the participant counted.
+        counted: usize,
+    },
+
     /// The anonymity set was not analysed, so it cannot be relied on.
     ///
     /// Signing into an unmeasured set means trusting the coordinator's word for
@@ -146,6 +161,16 @@ pub struct Expectation {
     /// Built by [`crate::anonymity_set::assess`] from public chain data, so the
     /// coordinator is not in the trust path for it.
     pub set_report: Option<crate::anonymity_set::SetReport>,
+    /// What the coordinator *claimed*, if it said anything.
+    ///
+    /// Checked against `set_report` rather than used in its place. A served
+    /// figure is worth having only because it can be contradicted: without the
+    /// comparison it is a number the user is asked to take on faith, which is
+    /// the thing the recount exists to remove.
+    ///
+    /// `None` simply skips the comparison — a coordinator that claims nothing
+    /// has not over-claimed.
+    pub claimed_set: Option<crate::anonymity_set::SetReport>,
 }
 
 /// Verify a round before signing it. Returns every reason to refuse, not the
@@ -169,6 +194,16 @@ pub fn check_before_signing(tx: &Transaction, want: &Expectation) -> Vec<RefuseT
         None => refusals.push(RefuseToSign::SetUnverified {
             seats: tx.input.len(),
         }),
+    }
+
+    // A served figure earns its place only by being contradictable.
+    if let (Some(claimed), Some(independent)) = (&want.claimed_set, &want.set_report) {
+        if let Err(e) = crate::anonymity_set::verify_claim(claimed, independent) {
+            refusals.push(RefuseToSign::SetOverClaimed {
+                claimed: e.claimed,
+                counted: e.counted,
+            });
+        }
     }
 
     let (txid, vout) = want.my_input;
@@ -276,6 +311,7 @@ mod tests {
             max_fee_sats: 10_000,
             min_set: 5,
             set_report: Some(report_of(5, 5)),
+            claimed_set: None,
         }
     }
 
@@ -288,6 +324,42 @@ mod tests {
             payers: entities,
             discounts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_coordinator_claiming_more_than_the_coins_support_is_refused() {
+        // Distinct from a thin round. This one is not merely small — its stated
+        // figure is not derivable from the chain at all.
+        let mut want = expectation();
+        want.set_report = Some(report_of(5, 20));
+        want.claimed_set = Some(report_of(20, 20));
+        let r = check_before_signing(&honest_round(), &want);
+        assert!(
+            r.iter().any(|x| matches!(
+                x,
+                RefuseToSign::SetOverClaimed {
+                    claimed: 20,
+                    counted: 5
+                }
+            )),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_claiming_fewer_is_not_punished_for_it() {
+        // It can see liquidity-provider identities the participant cannot, and
+        // merging those correctly lowers the figure. Refusing that would punish
+        // the honest behaviour.
+        let mut want = expectation();
+        want.set_report = Some(report_of(9, 9));
+        want.claimed_set = Some(report_of(6, 9));
+        let r = check_before_signing(&honest_round(), &want);
+        assert!(
+            !r.iter()
+                .any(|x| matches!(x, RefuseToSign::SetOverClaimed { .. })),
+            "{r:?}"
+        );
     }
 
     #[test]

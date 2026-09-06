@@ -109,6 +109,10 @@ mutate "pre-sign approves everything" pre_sign.rs \
 '    let mut refusals = Vec::new();
     if true { return refusals; }' pre_sign
 
+mutate "over-claiming is never refused" anonymity_set.rs \
+'    if claimed.entities > independent.entities {' \
+'    if false {' anonymity_set
+
 mutate "clustering ignores shared funding tx" clustering.rs \
 '        match by_txid.get(&c.outpoint.txid) {' \
 '        match None::<&usize> {' clustering

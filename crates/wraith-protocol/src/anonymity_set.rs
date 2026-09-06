@@ -268,6 +268,75 @@ pub fn assess(seats: &[Seat]) -> SetReport {
     }
 }
 
+/// The coordinator claimed a larger set than the chain supports.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("coordinator claims an anonymity set of {claimed}, but only {counted} distinct entities are visible in the round's own inputs")]
+pub struct OverClaimed {
+    /// What the coordinator said.
+    pub claimed: usize,
+    /// What the participant counted for itself.
+    pub counted: usize,
+}
+
+/// Recount a round's entities from its inputs alone, as a participant can.
+///
+/// Takes `(outpoint, scriptPubKey)` per input — both available from the round
+/// transaction and its prevouts, so this needs nothing the coordinator has to
+/// be believed about.
+///
+/// Roles are unknown to a participant, so every seat is counted as a payer.
+/// That means the result is an **upper bound**: the coordinator additionally
+/// merges seats belonging to one liquidity provider, which can only make its
+/// honest figure smaller than this one.
+pub fn recount_from_inputs(coins: &[crate::clustering::CoinFacts]) -> SetReport {
+    let clusters = crate::clustering::cluster_coins(coins);
+    let seats: Vec<Seat> = coins
+        .iter()
+        .zip(clusters.iter())
+        .map(|(c, cluster)| Seat {
+            candidate: SeatCandidate {
+                coin: c.outpoint,
+                confirmed_height: 0,
+                cluster: *cluster,
+            },
+            role: Role::Payer,
+        })
+        .collect();
+    assess(&seats)
+}
+
+/// Check a coordinator's claim against an independent recount.
+///
+/// # The asymmetry is the whole design
+///
+/// Only **over**-claiming is a refusal. A coordinator reporting *fewer* entities
+/// than the participant counts is being conservative — it can see liquidity
+/// provider identities the participant cannot, and merging those correctly
+/// lowers the figure. Refusing that would punish the honest behaviour.
+///
+/// Claiming *more* than the round's own inputs support cannot be conservatism.
+/// The participant's count is an upper bound, so exceeding it means the claim is
+/// not derivable from the chain at all.
+///
+/// # What this catches, and what it does not
+///
+/// It catches gross over-claiming — fifty asserted where the coins show three —
+/// which is the failure that matters, because it is the one a user acts on.
+///
+/// It cannot verify the coordinator's liquidity-provider merging, because the
+/// participant cannot see which seats belong to which provider. A coordinator
+/// under-reporting to hide something would pass. That is the weaker direction
+/// and it is not the direction that misleads a user into signing.
+pub fn verify_claim(claimed: &SetReport, independent: &SetReport) -> Result<(), OverClaimed> {
+    if claimed.entities > independent.entities {
+        return Err(OverClaimed {
+            claimed: claimed.entities,
+            counted: independent.entities,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +354,95 @@ mod tests {
             },
             role,
         }
+    }
+
+    fn facts(txid: u8, vout: u32, script: &[u8]) -> crate::clustering::CoinFacts {
+        crate::clustering::CoinFacts {
+            outpoint: OutPointKey {
+                txid: [txid; 32],
+                vout,
+            },
+            script_pubkey: script.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_participant_recounts_the_round_from_its_own_inputs() {
+        // Everything here comes from the round transaction and its prevouts, so
+        // the coordinator does not have to be believed about any of it.
+        let coins = vec![
+            facts(1, 0, &[1]),
+            facts(2, 0, &[2]),
+            facts(3, 0, &[3]),
+            facts(9, 0, &[9]),
+            facts(9, 1, &[10]), // sibling of the previous one
+        ];
+        let r = recount_from_inputs(&coins);
+        assert_eq!(r.seats, 5);
+        assert_eq!(r.entities, 4, "the two siblings are one entity");
+    }
+
+    #[test]
+    fn claiming_more_than_the_coins_support_is_refused() {
+        // The failure that matters: a number the user acts on that the chain
+        // does not support.
+        let coins: Vec<crate::clustering::CoinFacts> =
+            (0..20u32).map(|v| facts(7, v, &[v as u8])).collect();
+        let independent = recount_from_inputs(&coins);
+        assert_eq!(independent.entities, 1, "all twenty share a funding tx");
+
+        let claimed = SetReport {
+            seats: 20,
+            entities: 20,
+            unverified: 0,
+            payers: 20,
+            discounts: Vec::new(),
+        };
+        assert_eq!(
+            verify_claim(&claimed, &independent),
+            Err(OverClaimed {
+                claimed: 20,
+                counted: 1
+            })
+        );
+    }
+
+    #[test]
+    fn claiming_fewer_is_accepted_because_it_is_conservatism() {
+        // The coordinator sees liquidity-provider identities a participant
+        // cannot, and merging those correctly lowers the figure. Refusing that
+        // would punish the honest behaviour.
+        let coins = vec![facts(1, 0, &[1]), facts(2, 0, &[2]), facts(3, 0, &[3])];
+        let independent = recount_from_inputs(&coins);
+        assert_eq!(independent.entities, 3);
+
+        let claimed = SetReport {
+            seats: 3,
+            entities: 2,
+            unverified: 0,
+            payers: 1,
+            discounts: Vec::new(),
+        };
+        assert!(verify_claim(&claimed, &independent).is_ok());
+    }
+
+    #[test]
+    fn an_exact_match_is_accepted() {
+        let coins = vec![facts(1, 0, &[1]), facts(2, 0, &[2])];
+        let independent = recount_from_inputs(&coins);
+        let claimed = independent.clone();
+        assert!(verify_claim(&claimed, &independent).is_ok());
+    }
+
+    #[test]
+    fn the_over_claim_error_carries_both_numbers() {
+        // A user shown only "refused" cannot tell a bug from a lie.
+        let msg = OverClaimed {
+            claimed: 50,
+            counted: 3,
+        }
+        .to_string();
+        assert!(msg.contains("50") && msg.contains('3'), "{msg}");
     }
 
     #[test]
