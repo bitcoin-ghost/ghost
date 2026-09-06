@@ -65,10 +65,10 @@ PY
   checked=$((checked + 1))
 
   if [ "$rc" -eq 0 ]; then
-    printf '  %-38s *** SURVIVED ***\n' "$name"
+    printf '  %-38s *** SURVIVED *** (rc=%s)\n' "$name" "$rc"
     survivors=$((survivors + 1))
   else
-    printf '  %-38s caught\n' "$name"
+    printf '  %-38s caught (rc=%s)\n' "$name" "$rc"
   fi
 }
 
@@ -136,6 +136,7 @@ printf '\n// harness control\n' >> crates/wraith-protocol/src/mailbox.rs
 timeout 300 cargo test -j2 -p wraith-protocol --lib mailbox >/dev/null 2>&1
 control_rc=$?
 cp "$BAK/mailbox.rs.bak" crates/wraith-protocol/src/mailbox.rs
+echo "  control rc=$control_rc"
 if [ "$control_rc" -ne 0 ]; then
   echo
   echo "CONTROL FAILED: a no-op mutation was reported as caught — results above are not trustworthy"
