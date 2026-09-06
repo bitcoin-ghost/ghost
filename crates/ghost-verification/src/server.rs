@@ -1151,6 +1151,14 @@ pub struct PoolPeerInfo {
     /// miner that fails over between nodes.
     #[serde(default)]
     pub deduped_miner_count: u32,
+    /// Whether this peer's own Ghost Core was reachable at its last health ping (#778).
+    ///
+    /// `None` = the peer has never reported it (older build, or not yet pinged). The translator
+    /// must treat that as "keep routing here", NOT as unhealthy: assuming the worst on absence
+    /// would divert every miner away from every peer the moment a rolling deploy put one node
+    /// ahead of the rest.
+    #[serde(default)]
+    pub core_healthy: Option<bool>,
     /// The peer's SV1 hobby listener, or `None` if it does not advertise one. The translator
     /// treats absence as "serves the default 3333", which is what every node did before the farm
     /// tier existed (#495).

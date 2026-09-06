@@ -3222,6 +3222,22 @@ async fn main() -> Result<()> {
     let l2_cache_for_ping = Arc::clone(&l2_height_cache);
     mesh_inner.set_l2_height_provider(Arc::new(move || l2_cache_for_ping.get()));
 
+    // Gossip whether our own Ghost Core is reachable, so peers can route around us when it is
+    // not (#778). Same probe and same staleness bound the `/health` endpoint uses — two missed
+    // template refreshes, floored at 120s — so the two can never disagree about this node.
+    //
+    // Before this, the mesh had no way to express it: a node whose `ghostd` was dead kept
+    // gossiping normally (vm8 reported `peer_count: 7` for 2h15m on 2026-08-24 through 260
+    // ghostd crash-loops), so peers kept sending it miners while it could serve none.
+    {
+        let rpc_for_ping = Arc::clone(&rpc);
+        let stale_after = (config.pool.template_refresh_ms() / 1000)
+            .saturating_mul(2)
+            .max(120);
+        mesh_inner
+            .set_core_healthy_provider(Arc::new(move || rpc_for_ping.core_liveness(stale_after).0));
+    }
+
     // Poll the local ghost-pay service (:8800) for the L2 tip and cache it, so
     // both this node's gossiped L2 height and the cache stay warm. Only runs
     // when ghost-pay is enabled; on failure the last good value is retained.
@@ -7604,6 +7620,10 @@ async fn main() -> Result<()> {
                 last_seen: p.last_seen,
                 max_capacity: p.max_capacity,
                 deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
+                // Passed through verbatim INCLUDING None (#778): the translator has to be able
+                // to tell "never reported" from "reported unhealthy", or a rolling deploy in
+                // which one node leads the others black-holes routing.
+                core_healthy: p.core_healthy,
                 // Gossiped SV1 tier listeners (#495). Passed through verbatim, including None:
                 // the translator must be able to tell "no farm tier" from "farm tier on 4444",
                 // and only absence keeps a peer out of farm routing.

@@ -153,6 +153,14 @@ struct PeerInfo {
     /// flood them with traffic on stale assumptions.
     #[serde(default)]
     max_capacity: u32,
+    /// Whether that peer's own Ghost Core was reachable at its last health ping (#778).
+    ///
+    /// `None` = never reported, and that is NOT the same as unhealthy. A peer running a build
+    /// from before the field omits it, so treating absence as bad would empty the candidate list
+    /// during any rolling deploy and send every miner nowhere. Only an explicit `Some(false)`
+    /// takes a peer out of routing.
+    #[serde(default)]
+    core_healthy: Option<bool>,
     /// The peer's SV1 hobby listener. `None` on a peer that predates tier advertisement;
     /// such a peer is assumed to serve hobby on the default port, which is what every node
     /// did before the farm tier existed.
@@ -351,6 +359,15 @@ impl LoadBalancer {
                     // Farm this excludes every peer that has not advertised a farm port,
                     // including all peers running a build from before tier advertisement.
                     && p.port_for(tier).is_some()
+                    // A peer whose own Ghost Core is down cannot serve a miner, however idle it
+                    // looks (#778). Its utilisation is actively MISLEADING here: as it sheds
+                    // miners its util falls, so utilisation-only routing rates it more
+                    // attractive the worse it gets — the same inversion this file already
+                    // documents for the local node.
+                    //
+                    // `!= Some(false)` and not `== Some(true)`: absence means "never reported",
+                    // and excluding on absence would empty the candidate list mid-deploy.
+                    && p.core_healthy != Some(false)
             })
             .collect();
         if candidates.is_empty() {
@@ -413,7 +430,17 @@ impl LoadBalancer {
             .peers
             .iter()
             .filter(|p| {
-                p.public_mining && !p.public_address.is_empty() && p.port_for(tier).is_some()
+                p.public_mining
+                    && !p.public_address.is_empty()
+                    && p.port_for(tier).is_some()
+                    // #778: a peer whose own Core is down cannot serve a miner, and this path
+                    // picks by LOWEST miner_count — which is precisely what a dying node
+                    // produces as it sheds. Without this it is not merely eligible, it is the
+                    // preferred target.
+                    //
+                    // `!= Some(false)`: `None` means never reported, and excluding on absence
+                    // would empty the list mid rolling-deploy.
+                    && p.core_healthy != Some(false)
             })
             .min_by_key(|p| p.miner_count)?;
 
@@ -631,6 +658,7 @@ mod tests {
                     public_mining: true,
                     last_seen: 0,
                     max_capacity: cap,
+                    core_healthy: None,
                     hobby_port: None,
                     farm_port: None,
                 })
@@ -646,9 +674,80 @@ mod tests {
             public_mining: true,
             last_seen: 0,
             max_capacity: 100,
+            core_healthy: None,
             hobby_port: hobby,
             farm_port: farm,
         }
+    }
+
+    /// Build a peer with an explicit Core-health reading, otherwise idle and roomy so that
+    /// utilisation alone would always prefer it.
+    fn peer_with_health(addr: &str, miners: u32, core_healthy: Option<bool>) -> PeerInfo {
+        PeerInfo {
+            public_address: addr.into(),
+            miner_count: miners,
+            public_mining: true,
+            last_seen: 0,
+            max_capacity: 100,
+            core_healthy,
+            hobby_port: Some(3333),
+            farm_port: None,
+        }
+    }
+
+    /// A peer whose Ghost Core is DOWN must not be picked, however idle it looks (#778).
+    ///
+    /// The dead peer here is the most attractive candidate by the rule this path uses: it picks
+    /// `min_by_key(miner_count)`, and the dead peer has 0 miners against the healthy peer's 50.
+    /// That is not contrived — it is the steady state of the bug. A node whose Core dies sheds
+    /// its miners, so its count falls, so a lowest-count rule prefers it more the worse it gets.
+    /// vm8 sat like that for 2h15m on 2026-08-24 through 260 ghostd crash-loops, gossiping
+    /// normally the whole time, because mesh liveness says nothing about Core.
+    #[test]
+    fn a_peer_with_a_dead_core_is_not_chosen_even_when_it_is_the_idlest() {
+        let lb = LoadBalancer::new(cfg());
+        let cache = Cache {
+            this_node: ThisNode {
+                miner_count: 90,
+                max_capacity: 100,
+                core_healthy: true,
+            },
+            peers: vec![
+                peer_with_health("10.0.0.9:8080", 0, Some(false)),
+                peer_with_health("10.0.0.8:8080", 50, Some(true)),
+            ],
+            updated_at: Instant::now(),
+        };
+        let chosen = lb.fallback_pick_by_count(90, &cache, Tier::Hobby);
+        assert_eq!(
+            chosen,
+            Some("10.0.0.8:3333".parse().unwrap()),
+            "must route to the healthy peer, not the idle-but-dead one"
+        );
+    }
+
+    /// A peer that has NEVER reported its Core health stays eligible (#778).
+    ///
+    /// `None` means "running a build from before the field", not "unhealthy". Excluding on
+    /// absence would empty the candidate list the moment one node in a rolling deploy ran ahead
+    /// of the others, turning a health feature into a routing outage.
+    #[test]
+    fn a_peer_that_never_reported_health_is_still_eligible() {
+        let lb = LoadBalancer::new(cfg());
+        let cache = Cache {
+            this_node: ThisNode {
+                miner_count: 90,
+                max_capacity: 100,
+                core_healthy: true,
+            },
+            peers: vec![peer_with_health("10.0.0.7:8080", 0, None)],
+            updated_at: Instant::now(),
+        };
+        assert_eq!(
+            lb.fallback_pick_by_count(90, &cache, Tier::Hobby),
+            Some("10.0.0.7:3333".parse().unwrap()),
+            "absence of a health report must not exclude a peer"
+        );
     }
 
     /// A peer too old to advertise ports is still a valid HOBBY target — that is where every
