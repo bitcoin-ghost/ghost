@@ -282,6 +282,11 @@ jobs:
   #   sv2_mining_device                  passes locally in 11s, hung >15min on a CI runner. It
   #                                      measures real CPU hashrate against a wall clock, which
   #                                      is the least reproducible thing a shared runner can do.
+  #   jd_integration                     11/0 locally, 10/1 on a CI runner — the
+  #                                      `jds_wont_exit_upon_receiving_unexpected_txids...` case
+  #                                      timed out waiting for ProvideMissingTransactions. Second
+  #                                      time local green has failed to hold on a runner, so it
+  #                                      does not gate until it is proven green THERE.
   #   translator_integration             7 passed / 2 failed — real progress from "never
   #                                      finished", but not green yet.
   #   translator_aggregated_integration  all 4 pass INDIVIDUALLY; hang when run together, so
@@ -330,7 +335,6 @@ jobs:
         run: |
           for t in pool_solo_mining \
                    pool_integration \
-                   jd_integration \
                    jd_provide_missing_transaction \
                    jd_tproxy_integration \
                    jd_aggregated_tproxy_integration \

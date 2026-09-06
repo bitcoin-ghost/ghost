@@ -11,9 +11,9 @@ use integration_tests_sv2::{interceptor::MessageDirection, template_provider::Di
 use stratum_apps::stratum_core::{
     binary_sv2::Seq064K,
     common_messages_sv2::*,
+    extensions_sv2::PROVISIONAL_CHANNEL_IDENTITY,
     extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
     mining_sv2::*,
-    extensions_sv2::PROVISIONAL_CHANNEL_IDENTITY,
     parsers_sv2::{AnyMessage, Extensions, ExtensionsNegotiation, Mining},
 };
 use tracing::info;
