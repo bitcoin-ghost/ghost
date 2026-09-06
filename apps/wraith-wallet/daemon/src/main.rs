@@ -155,8 +155,34 @@ mod server {
     /// client / proxy config without rebuilding it). Caller is
     /// expected to submit promptly — the coordinator's no-sign
     /// deadline is ticking.
+    /// Open the durable once-per-coin ledger.
+    ///
+    /// Lives beside `node.json` in the wallet's data directory. Opened per
+    /// operation rather than held: the file is small, the write is the
+    /// expensive part either way, and a fresh read means a second process
+    /// touching the same wallet cannot be missed.
+    fn signing_ledger_for(
+        state: &Arc<DaemonState>,
+    ) -> std::io::Result<
+        wraith_protocol::signing_ledger::SigningLedger<
+            wraith_wallet_core::signing_ledger_file::FileSignatureStore,
+        >,
+    > {
+        let path = state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("wraith-signed-coins.json");
+        Ok(wraith_protocol::signing_ledger::SigningLedger::new(
+            wraith_wallet_core::signing_ledger_file::FileSignatureStore::open(path)?,
+        ))
+    }
+
     struct StoredWraithMix {
-        prepared: wraith_wallet_core::wraith::PreparedMix,
+        /// The **inspected** round. Not a `PreparedMix`: `submit_witness` will
+        /// not accept anything else, so a round cannot reach the wire without
+        /// having been checked and its coin committed.
+        inspected: wraith_wallet_core::wraith::InspectedMix,
         client: Arc<wraith_wallet_core::wraith::WraithSessionClient>,
     }
 
@@ -4027,6 +4053,7 @@ mod server {
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
                     mix_output_address,
+                    min_entities: wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
                 };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
@@ -4054,20 +4081,39 @@ mod server {
                 };
                 match client.prepare_mix(req, prove_ownership).await {
                     Ok(prepared) => {
-                        let resp = WraithMixPreparedResponse {
-                            session_id: prepared.session_id.clone(),
-                            unsigned_tx_hex: bitcoin::consensus::encode::serialize_hex(
-                                &prepared.unsigned_tx,
-                            ),
-                            input_index: prepared.input_index as u32,
-                            prev_amount_sats: prepared.prev_amount_sats,
-                            mixed_output_tx_index: prepared.mixed_output_tx_index as u32,
-                        };
-                        state.wraith_mixes.write().await.insert(
-                            prepared.session_id.clone(),
-                            StoredWraithMix { prepared, client },
-                        );
-                        Response::WraithMixPrepared(resp)
+                        // Inspect here, at prepare time — before the caller is
+                        // handed a transaction to sign. Checking later would
+                        // mean the wallet had already produced a signature over
+                        // a round it never verified.
+                        match signing_ledger_for(&state) {
+                            Err(e) => Response::Error(ErrorResponse {
+                                message: format!("signing ledger unavailable: {e}"),
+                            }),
+                            Ok(mut ledger) => match prepared.inspect(&mut ledger) {
+                                Err(e) => Response::Error(ErrorResponse {
+                                    message: format!("refused the round: {e}"),
+                                }),
+                                Ok(inspected) => {
+                                    let p = inspected.prepared();
+                                    let resp = WraithMixPreparedResponse {
+                                        session_id: p.session_id.clone(),
+                                        unsigned_tx_hex: bitcoin::consensus::encode::serialize_hex(
+                                            &p.unsigned_tx,
+                                        ),
+                                        input_index: p.input_index as u32,
+                                        prev_amount_sats: p.prev_amount_sats,
+                                        mixed_output_tx_index: p.mixed_output_tx_index as u32,
+                                    };
+                                    let sid = p.session_id.clone();
+                                    state
+                                        .wraith_mixes
+                                        .write()
+                                        .await
+                                        .insert(sid, StoredWraithMix { inspected, client });
+                                    Response::WraithMixPrepared(resp)
+                                }
+                            },
+                        }
                     }
                     Err(e) => Response::Error(ErrorResponse {
                         message: format!("wraith prepare: {e}"),
@@ -4126,7 +4172,7 @@ mod server {
                     };
                 match stored
                     .client
-                    .submit_witness(&stored.prepared, witness)
+                    .submit_witness(&stored.inspected, witness)
                     .await
                 {
                     Ok(outcome) => Response::WraithMixCompleted(WraithMixCompletedResponse {
@@ -4280,6 +4326,7 @@ mod server {
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
                     mix_output_address,
+                    min_entities: wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
                 };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
@@ -4316,6 +4363,34 @@ mod server {
                         );
                     }
                 };
+
+                // Inspect BEFORE signing. This path is the one-shot mix, and it
+                // previously went from `/round-tx` straight to the keystore —
+                // no check that the wallet's own input and output were in the
+                // round, no anonymity floor, and no commitment of the coin.
+                let mut ledger = match signing_ledger_for(state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("signing ledger unavailable: {e}"),
+                            }),
+                        );
+                    }
+                };
+                let inspected = match prepared.inspect(&mut ledger) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("refused the round: {e}"),
+                            }),
+                        );
+                    }
+                };
+
                 // Sign with the active wallet's keystore. `with_active_wallet`
                 // is async and re-locks the keystore RwLock on each call;
                 // we hold the lock just for the (sync) sighash + Schnorr step.
@@ -4350,7 +4425,7 @@ mod server {
                         return Envelope::new(id, Response::Error(ErrorResponse { message }));
                     }
                 };
-                match client.submit_witness(&prepared, witness).await {
+                match client.submit_witness(&inspected, witness).await {
                     Ok(outcome) => Response::WraithMixCompleted(WraithMixCompletedResponse {
                         session_id: outcome.session_id,
                         broadcast_txid: outcome.broadcast_txid.to_string(),

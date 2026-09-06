@@ -269,6 +269,36 @@ pub struct PreparedMix {
     pub expected_output_script: bitcoin::ScriptBuf,
 }
 
+/// Proof that a round was inspected and its coin committed, before signing.
+///
+/// # Why this is a type rather than a call somewhere
+///
+/// The checks kept existing and not running. `pre_sign` was written and nothing
+/// called it; `Verified::authorise` likewise; `SigningLedger` likewise. Each
+/// time the fix was to add a call at the one place that seemed to matter, and
+/// each time a second path — the split `prepare_mix` / `submit_witness` API the
+/// daemon actually uses — went round it.
+///
+/// So this is not a call to remember. `submit_witness` will not accept anything
+/// else, and only [`PreparedMix::inspect`] mints one. Forgetting is a
+/// compile error.
+/// Owned rather than borrowing, because the split API spans two IPC calls: the
+/// daemon prepares a round in one request and submits the witness in another,
+/// so the proof has to be storable between them.
+#[derive(Debug, Clone)]
+pub struct InspectedMix {
+    prepared: PreparedMix,
+    /// What this wallet counted for itself, kept so a caller can show it.
+    pub report: wraith_protocol::anonymity_set::SetReport,
+}
+
+impl InspectedMix {
+    /// The round that was inspected.
+    pub fn prepared(&self) -> &PreparedMix {
+        &self.prepared
+    }
+}
+
 impl PreparedMix {
     /// Inspect the round before signing it.
     ///
@@ -281,7 +311,13 @@ impl PreparedMix {
     /// The recount is done here from the transaction and its prevouts rather
     /// than taken from the coordinator, because a coordinator can lie about the
     /// set but not about the chain.
-    pub fn inspect(&self) -> Result<wraith_protocol::anonymity_set::SetReport, WraithClientError> {
+    pub fn inspect<L>(
+        &self,
+        ledger: &mut wraith_protocol::signing_ledger::SigningLedger<L>,
+    ) -> Result<InspectedMix, WraithClientError>
+    where
+        L: wraith_protocol::signing_ledger::SignatureStore,
+    {
         use wraith_protocol::client_session::Joined;
         use wraith_protocol::pre_sign::Expectation;
 
@@ -329,10 +365,40 @@ impl PreparedMix {
                 .collect::<Vec<_>>(),
         );
 
-        match Joined::new(want).verify_response(&self.unsigned_tx, &scripts, None) {
-            Ok(_) => Ok(report),
-            Err(reasons) => Err(WraithClientError::RefusedRound { reasons, report }),
+        if let Err(reasons) = Joined::new(want).verify_response(&self.unsigned_tx, &scripts, None) {
+            return Err(WraithClientError::RefusedRound { reasons, report });
         }
+
+        // Commit the coin to THIS round, before any signature exists.
+        //
+        // Recorded first, deliberately: a crash between signing and recording is
+        // the window the once-per-coin rule closes, and an unrecorded signature
+        // is the one replayed into a second round after a restart.
+        {
+            use bitcoin::hashes::Hash as _;
+            let mine = self.unsigned_tx.input[self.input_index].previous_output;
+            let coin = wraith_protocol::signing_ledger::OutPointKey::new(
+                mine.txid.to_byte_array(),
+                mine.vout,
+            );
+            let round_txid = self.unsigned_tx.compute_txid();
+            ledger
+                .authorise(coin, round_txid.to_byte_array())
+                .map_err(|e| match e {
+                    wraith_protocol::signing_ledger::LedgerError::Conflict { existing_txid } => {
+                        let mut disp = existing_txid;
+                        disp.reverse();
+                        WraithClientError::CoinAlreadyCommitted {
+                            existing: hex::encode(disp),
+                        }
+                    }
+                })?;
+        }
+
+        Ok(InspectedMix {
+            prepared: self.clone(),
+            report,
+        })
     }
 }
 
@@ -503,41 +569,9 @@ impl WraithSessionClient {
     {
         let prepared = self.prepare_mix(request, prove_ownership).await?;
         // Inspect before signing. A signature is the only irreversible step in
-        // this protocol, so it is the one that has to be earned.
-        prepared.inspect()?;
-
-        // Commit the coin to THIS round before signing it.
-        //
-        // Recorded first, deliberately: a crash between signing and recording is
-        // the window the rule exists to close, and an unrecorded signature is
-        // the one that gets replayed into a second round after a restart. The
-        // record is durable before this returns.
-        //
-        // A required parameter rather than an optional field, because the
-        // failure mode throughout this codebase has been correct checks that
-        // nothing calls. This one cannot be forgotten — there is no way to sign
-        // without supplying a ledger.
-        {
-            use bitcoin::hashes::Hash as _;
-            let mine = prepared.unsigned_tx.input[prepared.input_index].previous_output;
-            let coin = wraith_protocol::signing_ledger::OutPointKey::new(
-                mine.txid.to_byte_array(),
-                mine.vout,
-            );
-            let round_txid = prepared.unsigned_tx.compute_txid();
-            ledger
-                .authorise(coin, round_txid.to_byte_array())
-                .map_err(|e| match e {
-                    wraith_protocol::signing_ledger::LedgerError::Conflict { existing_txid } => {
-                        let mut disp = existing_txid;
-                        disp.reverse();
-                        WraithClientError::CoinAlreadyCommitted {
-                            existing: hex::encode(disp),
-                        }
-                    }
-                })?;
-        }
-
+        // this protocol, so it is the one that has to be earned. The token this
+        // returns is what `submit_witness` requires, so neither path can skip it.
+        let inspected = prepared.inspect(ledger)?;
         let witness = signer
             .sign(
                 &prepared.unsigned_tx,
@@ -551,21 +585,7 @@ impl WraithSessionClient {
                     detail: other.to_string(),
                 },
             })?;
-
-        // Inspection is only worth anything if the signature commits to what was
-        // inspected. `signature_scope` says which sighash types void it —
-        // ANYONECANPAY lets inputs be swapped in afterwards, SINGLE/NONE lets
-        // outputs be — and this is where that is enforced for an arbitrary
-        // signer.
-        //
-        // Checked by LENGTH rather than by asking the signer what it used. A
-        // BIP-341 signature is 64 bytes under SIGHASH_DEFAULT and 65 under
-        // every other type, because the flag is appended. So the transaction
-        // itself reports the answer, and a hardware wallet or remote signer
-        // that quietly chose something else cannot misreport it.
-        check_witness_sighash(&witness, prepared.input_index)?;
-
-        self.submit_witness(&prepared, witness).await
+        self.submit_witness(&inspected, witness).await
     }
 
     /// Drive the protocol from /find_or_create through /round-tx.
@@ -769,9 +789,17 @@ impl WraithSessionClient {
     /// Complete before returning. Returns the broadcast txid.
     pub async fn submit_witness(
         &self,
-        prepared: &PreparedMix,
+        inspected: &InspectedMix,
         witness: Witness,
     ) -> Result<MixOutcome, WraithClientError> {
+        let prepared = inspected.prepared();
+
+        // Inspection is only worth something if the signature commits to what
+        // was inspected. Checked here rather than in `execute_mix` alone,
+        // because the split API goes straight to this method and previously
+        // skipped it entirely.
+        check_witness_sighash(&witness, prepared.input_index)?;
+
         let witness_hex = bitcoin::consensus::encode::serialize_hex(&witness);
         let session_id = &prepared.session_id;
 

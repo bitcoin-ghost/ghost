@@ -374,7 +374,13 @@ async fn prepare_then_submit_works_via_split_api() {
             w.push([0xabu8; 64]);
 
             // Phase 2: submit.
-            client.submit_witness(&prepared, w).await
+            // The split API now requires proof of inspection, exactly as the
+            // daemon's two-phase flow does.
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            let inspected = prepared.inspect(&mut ledger).expect("round inspects");
+            client.submit_witness(&inspected, w).await
         }));
     }
 
@@ -533,7 +539,11 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                 DEFAULT_SCAN_INDEX_MAX.min(16),
             )
             .expect("real signer ok");
-            client.submit_witness(&prepared, witness).await
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            let inspected = prepared.inspect(&mut ledger).expect("round inspects");
+            client.submit_witness(&inspected, witness).await
         });
         handles.push(handle);
     }
@@ -713,7 +723,10 @@ fn a_prepared_round_below_the_floor_is_refused_before_signing() {
         expected_output_script: spk,
     };
 
-    match prepared.inspect() {
+    let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+        wraith_protocol::signing_ledger::VolatileStore::default(),
+    );
+    match prepared.inspect(&mut ledger) {
         Err(WraithClientError::RefusedRound { reasons, report }) => {
             assert_eq!(
                 report.entities, 1,
