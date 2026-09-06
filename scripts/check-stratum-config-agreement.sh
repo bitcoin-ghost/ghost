@@ -112,7 +112,12 @@ def values(path):
             if in_farm:
                 if key in FARM_SHARED:
                     farm.setdefault(key, val)
-            elif key in SHARED:
+            else:
+                # EVERY key, not just the allowlisted ones. Filtering here is what made the
+                # comparison below unable to catch anything new: a key absent from SHARED never
+                # entered the map, so comparing the maps compared only what someone had
+                # remembered to list. That has now failed twice (#480 extensions, #617
+                # open_channel_on_subscribe). Collect everything and let the comparison decide.
                 out.setdefault(key, val)
     return out, farm
 
@@ -189,19 +194,52 @@ else:
             f"will fail and the translator will fall through to another upstream"
         )
 
+# SHARED is a REQUIRED-PRESENT list, not the comparison set.
+#
+# It used to be both, and that is a design that fails the same way twice. A curated list only
+# compares what someone remembered to add:
+#
+#   * #480 — `supported_extensions` / `required_extensions` diverged silently because they were
+#     not listed. The installer set `required_extensions = [0x0002]` and the reference said `[]`,
+#     so which attribution path a node took depended on which file provisioned it.
+#   * #617 — `open_channel_on_subscribe` was added to both files long after this list was
+#     written, and was never added to it. Both copies happened to agree on `false` while the
+#     entire fleet ran `true`, so a freshly provisioned node would have been given the pre-#783
+#     behaviour that makes every share from a serialising client invalid.
+#
+# So: compare every key present in BOTH files automatically. A key added tomorrow is compared
+# tomorrow, with nobody needing to remember this script exists.
+# Keys that legitimately differ. An EXPLICIT exception list, which is the opposite of the
+# allowlist it replaces: an unknown key is now compared and must be justified to be skipped,
+# rather than ignored until someone remembers to add it. Fail-closed, not fail-open.
+NOT_COMPARED = {
+    # Per-node identity: the installer substitutes a shell variable, the reference carries a
+    # placeholder literal. They cannot agree and should not.
+    "authority_pubkey": "per-node, installer substitutes ${SV2_AUTH_PUB}",
+    "user_identity": "per-node, installer substitutes ${PAYOUT_ADDRESS}",
+    # ⚠ Ambiguous key name, not a real divergence. `port` appears in several TOML sections and
+    # this parser is section-blind outside [farm_tier], so it compares whichever `port` it saw
+    # first in each file — 8333 (P2P) against 34256 (SV2). The farm-tier port IS compared,
+    # section-aware, by the FARM_SHARED block above.
+    "port": "ambiguous across TOML sections; farm port is compared separately",
+}
+
+for k in sorted(set(a) & set(b)):
+    if k in NOT_COMPARED:
+        continue
+    if a[k] != b[k]:
+        problems.append(f"{k}: {INSTALLER} = {a[k]!r} but {REFERENCE} = {b[k]!r}")
+
+# SHARED now asserts PRESENCE. A key that vanishes from one file is not "in agreement" — it is
+# unchecked, and silently counting that as passing is how a gate reports a clean run while
+# testing nothing. The original version of this script could not match a key containing a digit,
+# so `downstream_extranonce2_size` was skipped entirely and it still printed "8 shared keys
+# agree".
 for k in SHARED:
     va, vb = a.get(k), b.get(k)
-    # A key we cannot find in both files is not "in agreement" — it is unchecked, and
-    # silently counting it as passing is how a gate ends up reporting a clean run while
-    # testing nothing. The original version of this script could not match a key
-    # containing a digit, so `downstream_extranonce2_size` was skipped entirely and it
-    # still printed "8 shared keys agree".
     if va is None or vb is None:
         missing = INSTALLER if va is None else REFERENCE
         problems.append(f"{k}: not found in {missing} — cannot verify agreement")
-        continue
-    if va != vb:
-        problems.append(f"{k}: {INSTALLER} = {va!r} but {REFERENCE} = {vb!r}")
 
 for k, check in INVARIANTS.items():
     for path, vals in ((INSTALLER, a), (REFERENCE, b)):
@@ -290,7 +328,7 @@ if problems:
           file=sys.stderr)
     sys.exit(1)
 
-checked = [k for k in SHARED if k in a and k in b]
-print(f"check-stratum-config-agreement: {len(checked)}/{len(SHARED)} shared keys compared "
+checked = [k for k in sorted(set(a) & set(b)) if k not in NOT_COMPARED]
+print(f"check-stratum-config-agreement: {len(checked)} shared keys compared "
       f"and in agreement, invariants hold")
 PY

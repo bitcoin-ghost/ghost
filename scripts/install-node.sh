@@ -956,7 +956,16 @@ aggregate_channels = false
 # response instead of a placeholder that makes every share they build invalid.
 # ROLLOUT GATE, default false: pool_sv2 must understand a provisional channel identity on
 # every node before this is turned on anywhere.
-open_channel_on_subscribe = false
+# ⚠ The rollout gate is SATISFIED and this is now ON. `pool_sv2` understands a provisional
+# channel identity on every node (fleet-wide since #783/#784/#785, all eight verified), so the
+# ordering hazard above is spent.
+#
+# It must stay `true` here or a freshly provisioned node gets the pre-#783 behaviour: a
+# serialising client (a proxy, or a rented-hashrate marketplace like Braiins) is answered with
+# an 8-byte placeholder extranonce while the real prefix is 12, builds a 4-byte-short coinbase,
+# and has EVERY share rejected. `mining.set_extranonce` cannot rescue it — that is an optional
+# extension those clients never negotiate.
+open_channel_on_subscribe = true
 
 # Protocol extensions — negotiate the Ghost per-miner TLV extension (0x0002).
 supported_extensions = []
