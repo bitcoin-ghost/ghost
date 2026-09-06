@@ -109,6 +109,34 @@ mutate "pre-sign approves everything" pre_sign.rs \
 '    let mut refusals = Vec::new();
     if true { return refusals; }' pre_sign
 
+# --- composition + entity counting: the structural Sybil rules -------------
+# Each of these is a rule the round is sold on. A rule nothing detects the
+# absence of is not enforced, it is merely written down.
+
+mutate "LP allowance is unlimited" composition.rs \
+'            if held >= policy.max_inputs_per_lp {' \
+'            if false {' composition
+
+mutate "mixing slots never run out" composition.rs \
+'            if taken >= policy.max_mixing_slots {' \
+'            if false {' composition
+
+mutate "a thin round can be padded" composition.rs \
+'            if (payers as f64) < policy.min_payer_fraction * total as f64 {' \
+'            if false {' composition
+
+mutate "entity count is just the seat count" anonymity_set.rs \
+'    let entities = roots.len();' \
+'    let entities = seats.len();' anonymity_set
+
+mutate "unverified distinctness is not declared" anonymity_set.rs \
+'        if !has_evidence {' \
+'        if false {' anonymity_set
+
+mutate "an unanalysed set signs anyway" pre_sign.rs \
+'        None => refusals.push(RefuseToSign::SetUnverified {' \
+'        None => drop(RefuseToSign::SetUnverified {' pre_sign
+
 mutate "consolidation sees no risk" consolidation.rs \
 '    let mut risks = Vec::new();' \
 '    let mut risks = Vec::new();

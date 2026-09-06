@@ -80,6 +80,7 @@ pub mod anonymity_set;
 pub mod attestation;
 pub mod beacon;
 pub mod client_session;
+pub mod composition;
 pub mod consolidation;
 pub mod epoch;
 pub mod epoch_handover;
