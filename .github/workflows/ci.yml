@@ -255,8 +255,10 @@ jobs:
       # per-target budget and nothing else building:
       #
       #   PASS, real assertions   pool_solo_mining (8 tests, 198s), template_provider_integration
-      #                           (3, 11s), sniffer_integration (2, 9s), sv2_mining_device (1, 11s),
+      #                           (3, 11s), sniffer_integration (2, 9s),
       #                           mining_device_fast_hasher_equivalence (1, 0.01s)
+      #   PASSED LOCALLY, HANGS   sv2_mining_device (1, 11s locally; hung >15min on CI) — a
+      #     ON CI                 single local run is not evidence of stability
       #   PASS, but VACUOUS       bitcoin_core_ipc_integration (3/3 `#[ignore]`d),
       #                           jds_block_propagation (1/1) — these report green having executed
       #                           nothing, so they are NOT listed below; a green that cannot fail
@@ -278,16 +280,32 @@ jobs:
       #
       # ⚠ `--test-threads=1`. These bind real ports and spawn real processes; running them
       # concurrently is how the port-reservation work in #408/#612 got exercised the hard way.
+      #
+      # ⛔ `sv2_mining_device` is NOT in this list, and the reason matters more than the omission.
+      # It was in the first version of this step, on the strength of a single green local run
+      # (10.7s). On CI it reached "Measured CPU hashrate", logged `Reader task exited`, and then
+      # hung until the 15-minute step timeout — taking the whole job with it, including the
+      # target after it that never got to run.
+      #
+      # One green run is not evidence of stability, and that is precisely the mistake #617 warns
+      # against: promote a flaky target to blocking and the job stops being trusted. It measures
+      # real CPU hashrate against a wall-clock window, which is the least reproducible thing a
+      # shared runner can be asked to do. It stays compile-only until someone makes it
+      # deterministic.
+      #
+      # ⚠ Per-target `timeout` as well as the step timeout. Without it one hung target consumes
+      # the entire budget and every target after it is reported as "not run" rather than as
+      # anything a reader can act on — which is exactly how the failure above presented.
       - name: Run the green SV2 integration targets
         timeout-minutes: 15
         run: |
           for t in pool_solo_mining \
                    template_provider_integration \
                    sniffer_integration \
-                   sv2_mining_device \
                    mining_device_fast_hasher_equivalence; do
             echo "::group::$t"
-            cargo test -p integration_tests_sv2 --test "$t" -- --test-threads=1
+            timeout 420 cargo test -p integration_tests_sv2 --test "$t" -- --test-threads=1 \
+              || { echo "::endgroup::"; echo "::error::$t failed or exceeded 420s"; exit 1; }
             echo "::endgroup::"
           done
 
