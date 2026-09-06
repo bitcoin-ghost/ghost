@@ -147,6 +147,36 @@ pub enum Request {
     /// each matching UTXO tagged with the BIP86 index that produced
     /// its address — drop straight into Wraith mix's `bip86_index`
     /// field to skip the daemon-side scan.
+    /// Derive a Ghost Lock's four lanes and report their balances.
+    ///
+    /// # The aggregate keys are supplied, not derived
+    ///
+    /// Savings spends by a MuSig2 aggregate of owner and backup; Spending by an
+    /// aggregate of owner and quorum. Those are products of an interactive
+    /// ceremony with the other party — the wallet cannot compute either alone,
+    /// and MuSig2 is not in this workspace at all.
+    ///
+    /// So this request reports on a Lock whose keys already exist. Creating one
+    /// needs the ceremony, which is a separate piece of work and not yet built.
+    GhostLockLanes {
+        /// Backup device's x-only key, hex.
+        backup_pubkey: String,
+        /// Heir's x-only key, hex.
+        heir_pubkey: String,
+        /// Wraith quorum's x-only key, hex.
+        quorum_pubkey: String,
+        /// MuSig2 aggregate of owner and backup, hex.
+        owner_backup_aggregate: String,
+        /// MuSig2 aggregate of owner and quorum, hex.
+        owner_quorum_aggregate: String,
+        /// Absolute height the inheritance leaf matures at.
+        inherit_height: u32,
+        /// Height the Lock is anchored at — normally the current tip.
+        anchor_height: u32,
+        /// BIP86 index for the owner key. Defaults to 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bip86_index: Option<u32>,
+    },
     LightL1Utxos {
         /// Highest BIP86 index to derive. Daemon scans 0..this.
         /// Capped server-side at 1024 (ghost-pay's scantxoutset
@@ -661,6 +691,7 @@ pub enum Response {
     LightBalance(LightBalanceResponse),
     LightUtxos(LightUtxosResponse),
     LightL1Utxos(LightL1UtxosResponse),
+    GhostLockLanes(GhostLockLanesResponse),
     LightHistory(LightHistoryResponse),
     LightDetected(LightDetectedResponse),
     DaemonEnv(DaemonEnvResponse),
@@ -1636,6 +1667,34 @@ pub struct WraithMixRefusedResponse {
     /// coordinator stated a figure the chain does not support, and there is no
     /// floor at which that becomes acceptable.
     pub lowering_the_floor_would_help: bool,
+}
+
+/// One lane of a Ghost Lock, as shown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockLane {
+    pub kind: String,
+    pub label: String,
+    pub address: String,
+    pub balance_sats: u64,
+    /// **True only for Investments.** The quorum can move this lane's funds
+    /// without the owner. Carried per lane so every client shows the same
+    /// warning rather than inferring it from the lane's name.
+    pub quorum_can_spend_alone: bool,
+    /// Whether these coins may enter a Wraith round. False for Cash.
+    pub round_eligible: bool,
+}
+
+/// A Ghost Lock's four lanes and its totals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockLanesResponse {
+    pub lanes: Vec<GhostLockLane>,
+    /// The whole Lock — what a person means by "how much have I got".
+    pub total_sats: u64,
+    /// Of that, how much the quorum could move without the owner. Reported
+    /// beside the total rather than folded into it.
+    pub custodial_sats: u64,
+    /// Chain height the balances were read at.
+    pub chain_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

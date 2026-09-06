@@ -62,17 +62,17 @@ mod server {
     use wraith_wallet_ipc::{
         AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
-        ErrorResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
-        GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
-        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
-        LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockEntry,
-        LocksConfirmedResponse, LocksJumpedResponse, LocksListResponse, LocksPreparedResponse,
-        LocksRecoveredResponse, NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse,
-        PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse,
-        ReleaseManifest, Request, Response, SignerInfoIpc, WalletAuthInfoResponse,
-        WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry,
-        WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
-        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        ErrorResponse, GhostLockLane, GhostLockLanesResponse, GlyphClaimResult, GlyphInfo,
+        GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
+        LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
+        LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse, LightSentResponse,
+        LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse, LocksJumpedResponse,
+        LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse, NodeEndpointsResponse,
+        PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse,
+        PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
+        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
+        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -2734,6 +2734,138 @@ mod server {
                         }),
                     },
                 }
+            }
+            Request::GhostLockLanes {
+                backup_pubkey,
+                heir_pubkey,
+                quorum_pubkey,
+                owner_backup_aggregate,
+                owner_quorum_aggregate,
+                inherit_height,
+                anchor_height,
+                bip86_index,
+            } => {
+                use bitcoin::secp256k1::Secp256k1;
+                use bitcoin::XOnlyPublicKey;
+                use std::str::FromStr;
+                use wraith_wallet_core::ghost_lock_account::{
+                    balances, GhostLockAccount, LaneKind, LockKeys,
+                };
+
+                fn xonly(label: &str, hexstr: &str) -> Result<XOnlyPublicKey, String> {
+                    XOnlyPublicKey::from_str(hexstr.trim())
+                        .map_err(|e| format!("{label} is not an x-only public key: {e}"))
+                }
+
+                // The owner key comes from the active keystore. Everything else
+                // is supplied: the two aggregates are products of a MuSig2
+                // ceremony with the backup device and the quorum, which the
+                // wallet cannot perform alone and which is not built yet.
+                let idx = bip86_index.unwrap_or(0);
+                let network = state.network;
+                let owner_res = with_active_wallet(state, move |_, ks| {
+                    let path = format!(
+                        "m/86'/{}'/0'/0/{idx}",
+                        wraith_wallet_core::light::GHOST_COIN_TYPE
+                    );
+                    let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
+                    let secp = Secp256k1::new();
+                    let sk =
+                        bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
+                            .map_err(|e| format!("owner key: {e}"))?;
+                    Ok::<XOnlyPublicKey, String>(
+                        bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk)
+                            .x_only_public_key()
+                            .0,
+                    )
+                })
+                .await;
+
+                let built = (|| {
+                    let owner = owner_res.clone()?;
+                    let keys = LockKeys {
+                        owner,
+                        backup: xonly("backup_pubkey", &backup_pubkey)?,
+                        heir: xonly("heir_pubkey", &heir_pubkey)?,
+                        owner_backup_aggregate: xonly(
+                            "owner_backup_aggregate",
+                            &owner_backup_aggregate,
+                        )?,
+                        owner_quorum_aggregate: xonly(
+                            "owner_quorum_aggregate",
+                            &owner_quorum_aggregate,
+                        )?,
+                        quorum: xonly("quorum_pubkey", &quorum_pubkey)?,
+                    };
+                    let secp = Secp256k1::verification_only();
+                    GhostLockAccount::build(&secp, &keys, network, anchor_height, inherit_height)
+                        .map_err(|e| format!("lock: {e}"))
+                })();
+
+                let account = match built {
+                    Ok(a) => a,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let addresses: Vec<String> = account
+                    .lanes
+                    .iter()
+                    .map(|l| l.lane.address.to_string())
+                    .collect();
+
+                // One confirmation. A Lock balance is what is settled; counting
+                // unconfirmed funds would show money that can still vanish.
+                let scan = match state.chain().await.scan_utxos(&addresses, 1).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("scan: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // Attribute each UTXO to its lane by address.
+                let mut per_lane: Vec<(LaneKind, u64)> = Vec::new();
+                for u in &scan.utxos {
+                    // A UTXO the scanner could not attribute to an address is
+                    // skipped rather than guessed at. Guessing would put
+                    // somebody's coins in the wrong compartment, and the
+                    // compartments are the point.
+                    let Some(addr) = u.address.as_deref() else {
+                        continue;
+                    };
+                    if let Some(b) = account
+                        .lanes
+                        .iter()
+                        .find(|l| l.lane.address.to_string() == addr)
+                    {
+                        per_lane.push((b.kind, u.amount_sats));
+                    }
+                }
+
+                let b = balances(&account, &per_lane);
+                Response::GhostLockLanes(GhostLockLanesResponse {
+                    lanes: b
+                        .lanes
+                        .iter()
+                        .map(|l| GhostLockLane {
+                            kind: format!("{:?}", l.kind).to_lowercase(),
+                            label: l.label.clone(),
+                            address: l.address.clone(),
+                            balance_sats: l.balance_sats,
+                            quorum_can_spend_alone: l.quorum_can_spend_alone,
+                            round_eligible: l.round_eligible,
+                        })
+                        .collect(),
+                    total_sats: b.total_sats,
+                    custodial_sats: b.custodial_sats,
+                    chain_height: scan.chain_height,
+                })
             }
             Request::LightL1Utxos {
                 scan_max_index,
