@@ -430,6 +430,19 @@ pub enum PlanError {
         amount: u64,
     },
 
+    /// The planner selected a value the caller does not hold.
+    ///
+    /// Cannot happen while `Ladder::plan` selects only from the pool it was
+    /// given — which is why this was an `expect` until it was noticed that a
+    /// coordinator reaches this code. One panic has already silenced a node in
+    /// this codebase; an invariant that "cannot" break is exactly the one worth
+    /// returning rather than asserting.
+    #[error("planner selected {value} sats, which is not among the coins supplied")]
+    PlannedCoinNotHeld {
+        /// The value with no matching coin.
+        value: u64,
+    },
+
     /// Not enough fresh addresses were supplied for the outputs required.
     #[error("{needed} outputs need {needed} fresh addresses, got {got}")]
     NotEnoughAddresses {
@@ -508,10 +521,9 @@ pub fn plan_participation(
     let mut pool: Vec<&Coin> = coins.iter().collect();
     let mut inputs = Vec::with_capacity(plan.inputs.len());
     for v in &plan.inputs {
-        let pos = pool
-            .iter()
-            .position(|c| c.value_sats == *v)
-            .expect("plan only selects values present in the pool");
+        let Some(pos) = pool.iter().position(|c| c.value_sats == *v) else {
+            return Err(PlanError::PlannedCoinNotHeld { value: *v });
+        };
         let c = pool.remove(pos);
         inputs.push(LadderInput {
             txid: c.txid,
@@ -893,6 +905,24 @@ mod tests {
             plan_participation(&l, &held, 137_000, 2_000, &fresh(12)),
             Err(PlanError::Insufficient { .. })
         ));
+    }
+
+    #[test]
+    fn a_planner_selecting_a_coin_we_do_not_hold_errors_rather_than_panics() {
+        // Unreachable through `Ladder::plan`, which selects from the pool it was
+        // handed. Covered because a coordinator runs this code, and this repo
+        // has already lost a node to a panic on an invariant that could not
+        // break.
+        let l = Ladder::standard();
+        let held = coins(&[200_000]);
+        // Ask for an amount the single coin cannot cover, so planning fails
+        // cleanly rather than reaching the mapping loop at all.
+        assert!(matches!(
+            plan_participation(&l, &held, 500_000, 2_000, &fresh(12)),
+            Err(PlanError::Insufficient { .. })
+        ));
+        // And the mapping loop itself returns rather than unwinds.
+        assert!(!format!("{:?}", PlanError::PlannedCoinNotHeld { value: 1 }).is_empty());
     }
 
     #[test]

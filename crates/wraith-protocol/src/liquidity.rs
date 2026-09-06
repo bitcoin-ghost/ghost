@@ -195,7 +195,12 @@ pub fn total_with_spread(ladder: &Ladder, amount_sats: u64) -> Result<u64, Ladde
         amount: amount_sats,
         floor: ladder.floor(),
     })?;
-    Ok(amount_sats + spread)
+    amount_sats
+        .checked_add(spread)
+        .ok_or(LadderError::Overflow {
+            amount: amount_sats,
+            addend: spread,
+        })
 }
 
 #[cfg(test)]

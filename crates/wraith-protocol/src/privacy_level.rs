@@ -148,13 +148,19 @@ impl Quote {
 /// `commission_sats` is what each padding provider earns — small enough that it
 /// is 5–15% of the bill, so providers can be paid generously without the payer
 /// noticing much. Vbytes dominate.
+/// Saturating rather than checked, deliberately: a quote is a price shown to
+/// someone, not a spend. A saturated figure is absurd on its face and gets
+/// rejected; a wrapped one looks like a bargain. Where the arithmetic actually
+/// moves coins — `Ladder::plan` — it is checked and returns an error instead.
 pub fn quote(level: PrivacyLevel, fee_rate_sats_per_vb: u64, commission_sats: u64) -> Quote {
     let r = level.providers_per_payer();
-    let network_fee_sats = (PAYER_VBYTES + VBYTES_PER_SEAT * r) * fee_rate_sats_per_vb;
-    let commission_sats = commission_sats * r;
+    let network_fee_sats = PAYER_VBYTES
+        .saturating_add(VBYTES_PER_SEAT.saturating_mul(r))
+        .saturating_mul(fee_rate_sats_per_vb);
+    let commission_sats = commission_sats.saturating_mul(r);
     Quote {
         level,
-        total_sats: network_fee_sats + commission_sats,
+        total_sats: network_fee_sats.saturating_add(commission_sats),
         network_fee_sats,
         commission_sats,
         nominal_set: r + 1,

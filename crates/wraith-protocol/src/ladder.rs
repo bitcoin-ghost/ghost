@@ -78,6 +78,21 @@ pub enum LadderError {
         above: u64,
     },
 
+    /// A satoshi total overflowed.
+    ///
+    /// Only reachable with absurd input, and it is checked because the failure
+    /// is silent: in release, `u64::MAX - 500 + 2_000` is 1,499. A wrapped
+    /// total looks like a perfectly reasonable amount and would fund a round
+    /// with almost nothing. *Money math is integer sats* is a design law, and
+    /// unchecked addition is how it gets broken quietly.
+    #[error("satoshi total overflowed adding {amount} and {addend}")]
+    Overflow {
+        /// First operand.
+        amount: u64,
+        /// Second operand.
+        addend: u64,
+    },
+
     /// The available rungs do not cover the target.
     #[error("holdings total {available} sats, need {target}")]
     Insufficient {
@@ -303,7 +318,10 @@ impl Ladder {
         amount: u64,
         fee: u64,
     ) -> Result<PaymentPlan, LadderError> {
-        let target = amount + fee;
+        let target = amount.checked_add(fee).ok_or(LadderError::Overflow {
+            amount,
+            addend: fee,
+        })?;
         let inputs = self.select_inputs(available, target)?;
         let spent: u64 = inputs.iter().sum();
         let recipient = self.decompose(amount)?;
@@ -508,6 +526,21 @@ mod tests {
         assert_eq!(plan.recipient, vec![100_000, 20_000, 10_000, 5_000, 2_000]);
         assert_eq!(plan.change, vec![50_000, 10_000, 1_000]);
         assert!(plan.change.iter().all(|r| l.rungs().contains(r)));
+    }
+
+    #[test]
+    fn an_overflowing_total_is_refused_not_wrapped() {
+        // The failure this guards is silent, not loud: in release the wrapped
+        // total is small and plausible, so the round would fund itself with
+        // almost nothing rather than erroring.
+        let l = Ladder::standard();
+        assert_eq!(
+            l.plan(&[100_000], u64::MAX - 500, 2_000),
+            Err(LadderError::Overflow {
+                amount: u64::MAX - 500,
+                addend: 2_000
+            })
+        );
     }
 
     #[test]
