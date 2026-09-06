@@ -387,6 +387,38 @@ mod tests {
         );
     }
     #[test]
+    fn tiers_of_the_same_length_still_get_different_orderings() {
+        // Every other tier fixture here has a distinct name length, so the
+        // length prefix alone separated them and a mutation blanking the tier
+        // BYTES survived the whole suite. These two are both nine characters,
+        // so only the content can tell them apart.
+        let roster: Vec<CoordinatorNodeId> = (1..=12u8).map(|i| [i; 32]).collect();
+        let b = [5u8; 32];
+        assert_eq!(
+            "100k_sats".len(),
+            "500k_sats".len(),
+            "fixture must be same-length"
+        );
+        let a = coordinator_order_for_tier(&b, 3, "100k_sats", &roster);
+        let c = coordinator_order_for_tier(&b, 3, "500k_sats", &roster);
+        assert_ne!(
+            a.iter().map(|x| x.node_id).collect::<Vec<_>>(),
+            c.iter().map(|x| x.node_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_tier_content_binds_not_just_its_length() {
+        let n = [4u8; 32];
+        let b = [2u8; 32];
+        assert_ne!(
+            rank_of_for_tier(&b, 1, "aaaa", &n),
+            rank_of_for_tier(&b, 1, "bbbb", &n),
+            "same length, different content — the bytes must bind"
+        );
+    }
+
+    #[test]
     fn each_tier_gets_its_own_ordering() {
         // Walking from the top concentrates traffic on whoever is first. One
         // ordering would make a single node first for every denomination at
