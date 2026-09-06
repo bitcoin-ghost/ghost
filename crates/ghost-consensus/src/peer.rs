@@ -346,7 +346,7 @@ impl PeerManager {
         }
     }
 
-    /// Update live metrics from a health ping (miner count + capabilities).
+    /// Update live metrics from a health ping (miner count + capabilities + Core health).
     pub fn update_health_metrics(
         &self,
         node_id: &NodeId,
@@ -354,9 +354,17 @@ impl PeerManager {
         capabilities: ghost_common::types::NodeCapabilities,
         coordinator_endpoint: Option<String>,
         coordinator_sessions: u32,
+        core_healthy: Option<bool>,
     ) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.miner_count = miner_count;
+            // Only overwrite on an explicit report. A ping from a node that predates the field
+            // carries `None`, and taking that at face value would erase a known-bad reading and
+            // put an unhealthy peer straight back into routing — the same trap as the
+            // capabilities guard below, which exists because #518 flapped on exactly this.
+            if core_healthy.is_some() {
+                peer.core_healthy = core_healthy;
+            }
             // Do not let a ping that claims NOTHING erase what a peer has already told us.
             //
             // `NodeCapabilities` is a struct of plain bools, so "not reported" and "reported all
@@ -580,6 +588,13 @@ pub struct Peer {
     pub messages_sent: u64,
     /// Number of miners connected to this peer (from health pings)
     pub miner_count: u32,
+    /// Whether this peer's own Ghost Core was reachable at its last health ping (#778).
+    ///
+    /// `None` means the peer has never reported it — either it predates the field or it has not
+    /// pinged since connecting. Deliberately NOT folded into `capabilities`: that struct feeds
+    /// `total_shares()` and the capability proofs of #605, and node health is a live gauge, not
+    /// an earned capability.
+    pub core_healthy: Option<bool>,
     /// Truncated SHA-256 hashes of miner_ids active on this peer in the
     /// last ~5 min, from the most recent health ping. Used for mesh-wide
     /// deduplicated active-miner counting.
@@ -642,6 +657,10 @@ impl Peer {
             first_seen: now,
             last_seen: now,
             state: PeerState::Connecting,
+            // Never reported yet. NOT `Some(true)`: a peer that has not pinged has told us
+            // nothing, and conflating that with a positive report is how a stale optimistic
+            // reading survives a restart.
+            core_healthy: None,
             is_elder: false,
             elder_order: None,
             capabilities: NodeCapabilities::default(),
@@ -1041,7 +1060,7 @@ mod tests {
         // A health ping populates the gossip metrics.
         let hashes = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
         mgr.update_active_miner_hashes(&pid, hashes.clone(), 4.5);
-        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default(), None, 0);
+        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default(), None, 0, None);
         mgr.update_max_capacity(&pid, 64);
         let records = vec![WindowBestRecord {
             window: "day".to_string(),
@@ -1098,11 +1117,11 @@ mod tests {
             reaper: true,
             ..Default::default()
         };
-        mgr.update_health_metrics(&pid, 5, caps, None, 0);
+        mgr.update_health_metrics(&pid, 5, caps, None, 0, None);
         assert!(mgr.get_peer(&pid).unwrap().capabilities.public_mining);
 
         // The flap: a ping carrying nothing.
-        mgr.update_health_metrics(&pid, 6, NodeCapabilities::default(), None, 0);
+        mgr.update_health_metrics(&pid, 6, NodeCapabilities::default(), None, 0, None);
         let got = mgr.get_peer(&pid).unwrap();
         assert!(
             got.capabilities.public_mining,
@@ -1128,7 +1147,7 @@ mod tests {
             reaper: true,
             ..Default::default()
         };
-        mgr.update_health_metrics(&pid, 1, caps, None, 0);
+        mgr.update_health_metrics(&pid, 1, caps, None, 0, None);
 
         // Operator turns public mining off but the node still runs the reaper: a real claim,
         // not an empty one, so it must be believed.
@@ -1136,7 +1155,7 @@ mod tests {
             reaper: true,
             ..Default::default()
         };
-        mgr.update_health_metrics(&pid, 1, narrowed, None, 0);
+        mgr.update_health_metrics(&pid, 1, narrowed, None, 0, None);
 
         let got = mgr.get_peer(&pid).unwrap();
         assert!(
