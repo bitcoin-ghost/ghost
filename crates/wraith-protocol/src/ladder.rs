@@ -140,8 +140,10 @@ impl Ladder {
 
     /// The 1-2-5 series from 1,000 sats to 1 BTC.
     ///
-    /// The floor matches `LITE_SERVICE_FEE_FLOOR_SATS` and sits comfortably above
-    /// the P2TR dust limit.
+    /// The floor matches `LITE_SERVICE_FEE_FLOOR_SATS` and sits above the P2TR
+    /// dust limit — asserted by `the_floor_clears_the_dust_limit` rather than
+    /// merely claimed here. A floor below dust would make every rung an
+    /// unspendable output, which is a far worse failure than an expensive one.
     pub fn standard() -> Self {
         let mut rungs = Vec::new();
         let mut decade = 1_000u64;
@@ -396,7 +398,10 @@ pub fn compare_shapes(ladder: &Ladder, amounts: &[u64]) -> BTreeMap<&'static str
     let mean = counts.iter().sum::<usize>() as f64 / counts.len().max(1) as f64;
     m.insert("distinct_values", ladder.rungs().len() as f64);
     m.insert("mean_outputs", mean);
-    m.insert("mean_output_vbytes", mean * 43.0);
+    m.insert(
+        "mean_output_vbytes",
+        mean * crate::tier::VBYTES_PER_OUTPUT as f64,
+    );
     m
 }
 
@@ -419,6 +424,31 @@ mod tests {
             }
         }
         best[n]
+    }
+
+    /// The docs used to claim this and nothing checked it.
+    ///
+    /// Below the dust limit every rung becomes an output no node will relay —
+    /// the ladder would mint unspendable money. Computed from rust-bitcoin
+    /// rather than restating 330, which is the mistake this sweep keeps finding.
+    #[test]
+    fn the_floor_clears_the_dust_limit() {
+        // A bare P2TR scriptPubKey: OP_1 <32-byte x-only key>.
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&[0xABu8; 32]);
+        let p2tr = bitcoin::ScriptBuf::from_bytes(spk);
+        let dust = p2tr.minimal_non_dust().to_sat();
+
+        let floor = Ladder::standard().floor();
+        assert!(
+            floor > dust,
+            "ladder floor {floor} is at or below the P2TR dust limit {dust} — every rung would be unspendable"
+        );
+        // And with headroom, so a future floor reduction does not land on it.
+        assert!(
+            floor >= dust * 2,
+            "floor {floor} leaves no margin over dust {dust}"
+        );
     }
 
     #[test]
