@@ -76,6 +76,7 @@ pub use ownership::{ownership_challenge, OWNERSHIP_CHALLENGE_TAG};
 pub mod remix;
 
 pub mod admission;
+pub mod anonymity_set;
 pub mod attestation;
 pub mod beacon;
 pub mod client_session;

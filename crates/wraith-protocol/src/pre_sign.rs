@@ -78,12 +78,30 @@ pub enum RefuseToSign {
     },
 
     /// Too few participants for the round to be worth joining.
-    #[error("{got} inputs is below the floor of {floor} — the set is not worth signing")]
+    #[error("{got} distinct entities across {seats} seats is below the floor of {floor} — the set is not worth signing")]
     SetTooSmall {
-        /// Inputs present.
+        /// Distinct **entities** present, not seats.
         got: usize,
         /// Minimum acceptable.
         floor: usize,
+        /// Seats in the round, so the gap between the two is visible. A round
+        /// with many seats and few entities is padded, and the pair of numbers
+        /// is what shows it.
+        seats: usize,
+    },
+
+    /// The anonymity set was not analysed, so it cannot be relied on.
+    ///
+    /// Signing into an unmeasured set means trusting the coordinator's word for
+    /// the one number the round is being bought for, and a malicious
+    /// coordinator's easiest lie is a large one. Counting inputs is not a
+    /// substitute: seats are what a padded round has plenty of.
+    #[error(
+        "anonymity set was not analysed; refusing to sign on an unverified set of {seats} seats"
+    )]
+    SetUnverified {
+        /// Seats in the round.
+        seats: usize,
     },
 
     /// The round carries an on-chain marker.
@@ -116,8 +134,18 @@ pub struct Expectation {
     pub total_input_sats: u64,
     /// Fee ceiling the participant accepted.
     pub max_fee_sats: u64,
-    /// Minimum anonymity set worth signing into.
+    /// Minimum anonymity set worth signing into, in **entities**.
     pub min_set: usize,
+    /// The participant's own analysis of the round's composition.
+    ///
+    /// `None` is not "skip the check" — it produces
+    /// [`RefuseToSign::SetUnverified`]. The fallback is loud rather than
+    /// silent, because a quiet fallback to counting seats is how the padded
+    /// round gets signed.
+    ///
+    /// Built by [`crate::anonymity_set::assess`] from public chain data, so the
+    /// coordinator is not in the trust path for it.
+    pub set_report: Option<crate::anonymity_set::SetReport>,
 }
 
 /// Verify a round before signing it. Returns every reason to refuse, not the
@@ -125,11 +153,22 @@ pub struct Expectation {
 pub fn check_before_signing(tx: &Transaction, want: &Expectation) -> Vec<RefuseToSign> {
     let mut refusals = Vec::new();
 
-    if tx.input.len() < want.min_set {
-        refusals.push(RefuseToSign::SetTooSmall {
-            got: tx.input.len(),
-            floor: want.min_set,
-        });
+    // Judged on entities. This counted `tx.input.len()` — seats — which passes
+    // exactly the padded round the floor exists to catch: fifty inputs from two
+    // parties cleared a floor of five.
+    match &want.set_report {
+        Some(report) => {
+            if !report.meets(want.min_set) {
+                refusals.push(RefuseToSign::SetTooSmall {
+                    got: report.entities,
+                    floor: want.min_set,
+                    seats: tx.input.len(),
+                });
+            }
+        }
+        None => refusals.push(RefuseToSign::SetUnverified {
+            seats: tx.input.len(),
+        }),
     }
 
     let (txid, vout) = want.my_input;
@@ -236,7 +275,67 @@ mod tests {
             total_input_sats: 505_000,
             max_fee_sats: 10_000,
             min_set: 5,
+            set_report: Some(report_of(5, 5)),
         }
+    }
+
+    /// A report with `entities` distinct parties across `seats` seats.
+    fn report_of(entities: usize, seats: usize) -> crate::anonymity_set::SetReport {
+        crate::anonymity_set::SetReport {
+            seats,
+            entities,
+            unverified: 0,
+            payers: entities,
+            discounts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_padded_round_is_refused_however_many_seats_it_has() {
+        // The bug this replaced: the floor counted inputs, so fifty seats held
+        // by two parties cleared a floor of five.
+        let mut want = expectation();
+        want.set_report = Some(report_of(2, 50));
+        let refusals = check_before_signing(&honest_round(), &want);
+        assert!(
+            refusals.iter().any(|r| matches!(
+                r,
+                RefuseToSign::SetTooSmall {
+                    got: 2,
+                    floor: 5,
+                    ..
+                }
+            )),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn an_unanalysed_set_is_refused_rather_than_assumed_fine() {
+        // A quiet fallback to counting seats is how the padded round gets
+        // signed, so the absence of analysis must be loud.
+        let mut want = expectation();
+        want.set_report = None;
+        let refusals = check_before_signing(&honest_round(), &want);
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, RefuseToSign::SetUnverified { .. })),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_shows_entities_against_seats() {
+        // The gap between the two is what tells a user the round was padded,
+        // so both have to be in the message.
+        let e = RefuseToSign::SetTooSmall {
+            got: 2,
+            floor: 5,
+            seats: 50,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains('2') && msg.contains("50"), "{msg}");
     }
 
     #[test]
@@ -296,10 +395,29 @@ mod tests {
 
     #[test]
     fn a_thin_round_is_refused() {
+        let mut want = expectation();
+        want.set_report = Some(report_of(2, 2));
+        let r = check_before_signing(&honest_round(), &want);
+        assert!(r.contains(&RefuseToSign::SetTooSmall {
+            got: 2,
+            floor: 5,
+            seats: 5
+        }));
+    }
+
+    #[test]
+    fn the_transactions_input_count_is_no_longer_the_set() {
+        // Truncating the transaction does not trip the floor, because seats are
+        // not the set. This is the whole change: the number that matters comes
+        // from the participant's own analysis, not from counting inputs.
         let mut tx = honest_round();
         tx.input.truncate(2);
         let r = check_before_signing(&tx, &expectation());
-        assert!(r.contains(&RefuseToSign::SetTooSmall { got: 2, floor: 5 }));
+        assert!(
+            !r.iter()
+                .any(|x| matches!(x, RefuseToSign::SetTooSmall { .. })),
+            "seat count must not drive the set floor: {r:?}"
+        );
     }
 
     #[test]
@@ -338,7 +456,11 @@ mod tests {
         let mut tx = honest_round();
         tx.input.truncate(1);
         tx.output.retain(|o| o.script_pubkey != spk(11));
-        let r = check_before_signing(&tx, &expectation());
+        let mut want = expectation();
+        // The set has to be made thin explicitly now; truncating the inputs no
+        // longer does it, which is the point of the change.
+        want.set_report = Some(report_of(1, 1));
+        let r = check_before_signing(&tx, &want);
         assert!(r.len() >= 3, "expected several refusals, got {r:?}");
     }
 }

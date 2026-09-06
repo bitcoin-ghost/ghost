@@ -203,6 +203,13 @@ mod tests {
             my_output_sats: 100_000,
             total_input_sats: 505_000,
             max_fee_sats: 10_000,
+            set_report: Some(crate::anonymity_set::SetReport {
+                seats: 5,
+                entities: 5,
+                unverified: 0,
+                payers: 5,
+                discounts: Vec::new(),
+            }),
             min_set: 5,
         }
     }
