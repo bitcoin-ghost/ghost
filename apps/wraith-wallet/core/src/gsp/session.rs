@@ -372,7 +372,7 @@ pub fn spawn_session_with_bech32(
 ///
 /// Returns the `(stream, response)` pair `tokio_tungstenite::connect_async`
 /// would have returned.
-async fn ws_connect(
+pub(crate) async fn ws_connect(
     ws_url: &str,
     proxy: Option<&str>,
 ) -> Result<

@@ -18,7 +18,7 @@ use ghost_gsp_proto::{
     ClientMessage, RegisterRequest, RegisterResponse, ServerMessage, SessionRequest,
     SessionResponse, SessionToken, WalletId, WalletProof,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GspError {
@@ -51,6 +51,12 @@ pub struct GspClient {
     /// e.g. `ws://host:port/ws/v1` → `http://host:port`.
     http_bases: Vec<String>,
     http: reqwest::Client,
+    /// SOCKS5 proxy for WebSocket connections, if configured.
+    ///
+    /// Held separately from `http`: a `reqwest::Proxy` lives inside that
+    /// client and cannot be read back out, so a WebSocket opened alongside it
+    /// would have gone direct — which is how the ping below used to leak.
+    ws_proxy: Option<String>,
 }
 
 impl GspClient {
@@ -62,13 +68,22 @@ impl GspClient {
         Self::with_urls_and_proxy(ws_urls, None).expect("default reqwest client always builds")
     }
 
-    /// Same as `with_urls` but routes REST traffic (register, session) through
-    /// the given SOCKS5 proxy (e.g. `socks5h://127.0.0.1:9050` for Tor).
+    /// Same as `with_urls` but routes traffic through the given SOCKS5 proxy
+    /// (e.g. `socks5h://127.0.0.1:9050` for Tor).
     ///
-    /// **Note:** the persistent WebSocket session does **not** currently honour
-    /// this proxy — `tokio-tungstenite` needs a separate custom connector for
-    /// SOCKS5. Use Tor for REST today, treat WS as direct. Full WS-over-Tor
-    /// support is a follow-up.
+    /// REST and every WebSocket this client opens honour it: `tokio-tungstenite`
+    /// has no proxy support of its own, so `session::ws_connect` does
+    /// the SOCKS5 handshake and hands it the resulting socket.
+    ///
+    /// **`wss://` over a proxy is refused, not silently downgraded.** The TLS
+    /// layer on top of a SOCKS5 socket is not wired yet, so a Tor user on a TLS
+    /// endpoint gets an error rather than a direct connection — the right
+    /// failure direction, but it does mean Tor plus `wss` is unavailable. Use
+    /// `ws://` to an onion service.
+    ///
+    /// ⚠ This doc once said the persistent session ignored the proxy. It had
+    /// not been true for some time, and it was believed because it was written
+    /// down. Prefer reading `ws_connect`.
     pub fn with_urls_and_proxy(
         ws_urls: Vec<String>,
         proxy_url: Option<&str>,
@@ -92,6 +107,7 @@ impl GspClient {
             ws_urls: urls,
             http_bases,
             http,
+            ws_proxy: proxy_url.map(|p| p.to_string()),
         })
     }
 
@@ -132,13 +148,17 @@ impl GspClient {
         // when the host is unroutable, which blocks doctor for far longer
         // than is useful. 5 s comfortably covers any real LAN / internet
         // handshake.
-        let (mut ws, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), connect_async(ws_url))
-                .await
-                .map_err(|_| {
-                    GspError::Transport(format!("connect to {ws_url}: timed out after 5s"))
-                })?
-                .map_err(|e| GspError::Transport(e.to_string()))?;
+        // Through the proxy when one is configured. This used to call
+        // `connect_async` directly, so a Tor user's health check dialled the
+        // GSP from their own address — a short connection, but one that runs
+        // on a timer and reveals exactly what the proxy is there to hide.
+        let (mut ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::gsp::session::ws_connect(ws_url, self.ws_proxy.as_deref()),
+        )
+        .await
+        .map_err(|_| GspError::Transport(format!("connect to {ws_url}: timed out after 5s")))?
+        .map_err(GspError::Transport)?;
 
         let sent_ts = now_unix_ms();
         let request = ClientMessage::Ping {
@@ -364,6 +384,56 @@ mod tests {
         assert_eq!(
             derive_http_base("ws://localhost:9000"),
             "http://localhost:9000"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    /// The proxy must be kept, not just handed to `reqwest`.
+    ///
+    /// This is the shape of the bug it replaces: the proxy went into the HTTP
+    /// client and nowhere else, and a `reqwest::Proxy` cannot be read back out
+    /// — so every WebSocket opened alongside it went direct with nothing in
+    /// the type system to say so.
+    #[test]
+    fn a_proxied_client_keeps_the_proxy_for_websockets() {
+        let c = GspClient::with_urls_and_proxy(
+            vec!["ws://127.0.0.1:8900/ws/v1".into()],
+            Some("socks5h://127.0.0.1:9050"),
+        )
+        .expect("builds");
+        assert_eq!(
+            c.ws_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:9050"),
+            "a WebSocket opened by this client must be able to find the proxy"
+        );
+    }
+
+    #[test]
+    fn an_unproxied_client_has_no_proxy() {
+        let c = GspClient::with_urls(vec!["ws://127.0.0.1:8900/ws/v1".into()]);
+        assert!(c.ws_proxy.is_none());
+    }
+
+    /// `wss` through a proxy is refused rather than silently going direct.
+    ///
+    /// The wrong failure here would be a downgrade: a Tor user on a TLS
+    /// endpoint quietly connecting from their own address. An error is the
+    /// safe direction even though it means the combination is unavailable.
+    #[tokio::test]
+    async fn wss_through_a_proxy_is_refused_not_downgraded() {
+        let err = super::session::ws_connect(
+            "wss://example.invalid:443/ws/v1",
+            Some("socks5h://127.0.0.1:9050"),
+        )
+        .await
+        .expect_err("wss over a proxy is not supported");
+        assert!(
+            err.contains("wss-over-tor not yet supported"),
+            "it must say why, not just fail: {err}"
         );
     }
 }
