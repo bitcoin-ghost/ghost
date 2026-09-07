@@ -62,16 +62,17 @@ mod server {
         AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
         ErrorResponse, GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse,
-        GhostLockListResponse, GhostLockRecord, GhostLockSavedResponse, GlyphClaimResult,
-        GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
-        LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
-        LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse, LightSentResponse,
-        LightUtxoEntry, LightUtxosResponse, NodeEndpointsResponse, PsbtBroadcastResponse,
-        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
-        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
-        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
-        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
-        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        GhostLockListResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
+        GhostLockSavedResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
+        GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
+        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
+        LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse,
+        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
+        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
+        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
+        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
+        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
+        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -2367,6 +2368,83 @@ mod server {
         }
     }
 
+    /// Derive a Lock's four lanes from the supplied keys plus the active
+    /// wallet's owner key.
+    ///
+    /// One definition, deliberately. `GhostLockLanes` and
+    /// `GhostLockRoundDestination` must not be able to derive different
+    /// addresses for the same Lock — a round paying into an address the
+    /// balance view does not watch would look exactly like a lost deposit.
+    async fn build_lock_account(
+        state: &Arc<DaemonState>,
+        backup_pubkey: &str,
+        heir_pubkey: &str,
+        quorum_pubkey: &str,
+        inherit_height: u32,
+        anchor_height: u32,
+        bip86_index: Option<u32>,
+    ) -> Result<wraith_wallet_core::ghost_lock_account::GhostLockAccount, String> {
+        use bitcoin::secp256k1::Secp256k1;
+        use bitcoin::XOnlyPublicKey;
+        use std::str::FromStr;
+        use wraith_wallet_core::ghost_lock_account::{GhostLockAccount, LockKeys};
+
+        fn xonly(label: &str, hexstr: &str) -> Result<XOnlyPublicKey, String> {
+            XOnlyPublicKey::from_str(hexstr.trim())
+                .map_err(|e| format!("{label} is not an x-only public key: {e}"))
+        }
+
+        // The owner key comes from the active keystore; the backup, heir and
+        // quorum keys are supplied. The two MuSig2 aggregates are DERIVED
+        // below, not supplied — BIP-327 key aggregation is a deterministic
+        // function of the public keys, so no ceremony and no other party
+        // online is needed to CREATE a Lock. Interaction is only required to
+        // SIGN a key-path spend.
+        let idx = bip86_index.unwrap_or(0);
+        let network = state.network;
+        let owner = with_active_wallet(state, move |_, ks| {
+            let path = format!(
+                "m/86'/{}'/0'/0/{idx}",
+                wraith_wallet_core::light::GHOST_COIN_TYPE
+            );
+            let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
+            let secp = Secp256k1::new();
+            let sk = bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
+                .map_err(|e| format!("owner key: {e}"))?;
+            Ok::<XOnlyPublicKey, String>(
+                bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk)
+                    .x_only_public_key()
+                    .0,
+            )
+        })
+        .await?;
+
+        let backup = xonly("backup_pubkey", backup_pubkey)?;
+        let quorum = xonly("quorum_pubkey", quorum_pubkey)?;
+
+        // Derived here rather than accepted from the caller. BIP-327
+        // aggregation is deterministic, so both sides reach the same answer
+        // independently — and a pasted aggregate that did not match its parts
+        // would build a Lock whose key path nobody can satisfy, with nothing
+        // noticing until a spend failed.
+        let owner_backup_aggregate = ghost_lock::aggregate(&[owner, backup])
+            .map_err(|e| format!("owner+backup aggregate: {e}"))?;
+        let owner_quorum_aggregate = ghost_lock::aggregate(&[owner, quorum])
+            .map_err(|e| format!("owner+quorum aggregate: {e}"))?;
+
+        let keys = LockKeys {
+            owner,
+            backup,
+            heir: xonly("heir_pubkey", heir_pubkey)?,
+            owner_backup_aggregate,
+            owner_quorum_aggregate,
+            quorum,
+        };
+        let secp = Secp256k1::verification_only();
+        GhostLockAccount::build(&secp, &keys, network, anchor_height, inherit_height)
+            .map_err(|e| format!("lock: {e}"))
+    }
+
     async fn dispatch(line: &str, state: &Arc<DaemonState>) -> Envelope<Response> {
         let parsed: Result<Envelope<Request>, _> = serde_json::from_str(line);
         let (id, request) = match parsed {
@@ -2611,6 +2689,97 @@ mod server {
                     }
                 }
             }
+            Request::GhostLockRoundDestination { lock_id, lane } => {
+                use wraith_wallet_core::ghost_lock_account::LaneKind;
+
+                // Name the lane, never accept an address. The whole point of
+                // private entry is that the round's output IS the lane, so if
+                // a caller could hand in an arbitrary address then "fund my
+                // Savings privately" and "pay this stranger" would be the same
+                // request with the same audit trail.
+                let kind = match lane.trim().to_ascii_lowercase().as_str() {
+                    "savings" => LaneKind::Savings,
+                    "spending" => LaneKind::Spending,
+                    "cash" => LaneKind::Cash,
+                    "investments" => LaneKind::Investments,
+                    other => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!(
+                                "unknown lane '{other}' (try savings, spending, cash, investments)"
+                            ),
+                            }),
+                        )
+                    }
+                };
+
+                // Refused here rather than in the CLI. A rule enforced only in
+                // the client is enforced only for clients that ask nicely.
+                if let Err(e) = ghost_lock::check_round_destination(kind.compartment()) {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("{} lane: {e}", kind.label()),
+                        }),
+                    );
+                }
+
+                let record = match ghost_lock_store_for(state) {
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("lock store: {e}"),
+                            }),
+                        )
+                    }
+                    Ok(store) => match store.get(&lock_id) {
+                        Some(l) => l.clone(),
+                        None => {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!(
+                                        "no remembered Lock '{lock_id}' — `wraith lock list` shows the ones this wallet knows"
+                                    ),
+                                }),
+                            )
+                        }
+                    },
+                };
+
+                let account = match build_lock_account(
+                    state,
+                    &record.backup_pubkey,
+                    &record.heir_pubkey,
+                    &record.quorum_pubkey,
+                    record.inherit_height,
+                    record.anchor_height,
+                    Some(record.bip86_index),
+                )
+                .await
+                {
+                    Ok(a) => a,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                match account.lanes.iter().find(|l| l.kind == kind) {
+                    Some(built) => {
+                        Response::GhostLockRoundDestination(GhostLockRoundDestinationResponse {
+                            lock_id: record.lock_id.clone(),
+                            lane: lane.trim().to_ascii_lowercase(),
+                            label: kind.label().to_string(),
+                            address: built.lane.address.to_string(),
+                        })
+                    }
+                    None => Response::Error(ErrorResponse {
+                        message: format!("Lock has no {} lane", kind.label()),
+                    }),
+                }
+            }
             Request::GhostLockList => match ghost_lock_store_for(state) {
                 Err(e) => Response::Error(ErrorResponse {
                     message: format!("lock store: {e}"),
@@ -2641,73 +2810,19 @@ mod server {
                 anchor_height,
                 bip86_index,
             } => {
-                use bitcoin::secp256k1::Secp256k1;
-                use bitcoin::XOnlyPublicKey;
-                use std::str::FromStr;
-                use wraith_wallet_core::ghost_lock_account::{
-                    balances, GhostLockAccount, LockKeys,
-                };
+                use wraith_wallet_core::ghost_lock_account::balances;
 
-                fn xonly(label: &str, hexstr: &str) -> Result<XOnlyPublicKey, String> {
-                    XOnlyPublicKey::from_str(hexstr.trim())
-                        .map_err(|e| format!("{label} is not an x-only public key: {e}"))
-                }
-
-                // The owner key comes from the active keystore; the backup,
-                // heir and quorum keys are supplied. The two MuSig2 aggregates
-                // are DERIVED below, not supplied — BIP-327 key aggregation is a
-                // deterministic function of the public keys, so no ceremony and
-                // no other party online is needed to CREATE a Lock. Interaction
-                // is only required to SIGN a key-path spend.
-                let idx = bip86_index.unwrap_or(0);
-                let network = state.network;
-                let owner_res = with_active_wallet(state, move |_, ks| {
-                    let path = format!(
-                        "m/86'/{}'/0'/0/{idx}",
-                        wraith_wallet_core::light::GHOST_COIN_TYPE
-                    );
-                    let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
-                    let secp = Secp256k1::new();
-                    let sk =
-                        bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
-                            .map_err(|e| format!("owner key: {e}"))?;
-                    Ok::<XOnlyPublicKey, String>(
-                        bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk)
-                            .x_only_public_key()
-                            .0,
-                    )
-                })
-                .await;
-
-                let built = (|| {
-                    let owner = owner_res.clone()?;
-                    let backup = xonly("backup_pubkey", &backup_pubkey)?;
-                    let quorum = xonly("quorum_pubkey", &quorum_pubkey)?;
-
-                    // Derived here rather than accepted from the caller. BIP-327
-                    // aggregation is deterministic, so both sides reach the same
-                    // answer independently — and a pasted aggregate that did not
-                    // match its parts would build a Lock whose key path nobody
-                    // can satisfy, with nothing noticing until a spend failed.
-                    let owner_backup_aggregate = ghost_lock::aggregate(&[owner, backup])
-                        .map_err(|e| format!("owner+backup aggregate: {e}"))?;
-                    let owner_quorum_aggregate = ghost_lock::aggregate(&[owner, quorum])
-                        .map_err(|e| format!("owner+quorum aggregate: {e}"))?;
-
-                    let keys = LockKeys {
-                        owner,
-                        backup,
-                        heir: xonly("heir_pubkey", &heir_pubkey)?,
-                        owner_backup_aggregate,
-                        owner_quorum_aggregate,
-                        quorum,
-                    };
-                    let secp = Secp256k1::verification_only();
-                    GhostLockAccount::build(&secp, &keys, network, anchor_height, inherit_height)
-                        .map_err(|e| format!("lock: {e}"))
-                })();
-
-                let account = match built {
+                let account = match build_lock_account(
+                    state,
+                    &backup_pubkey,
+                    &heir_pubkey,
+                    &quorum_pubkey,
+                    inherit_height,
+                    anchor_height,
+                    bip86_index,
+                )
+                .await
+                {
                     Ok(a) => a,
                     Err(message) => {
                         return Envelope::new(id, Response::Error(ErrorResponse { message }))
@@ -4471,6 +4586,88 @@ mod server {
                 ghostd_user: None,
                 ghostd_pass: None,
             })
+        }
+
+        /// Private entry must refuse the Cash lane, and refuse it at the gate
+        /// — before the Lock is even looked up.
+        ///
+        /// Tested through `dispatch` rather than a helper because the point of
+        /// putting the rule in the daemon is that it holds for anything that
+        /// speaks the wire, not just for the CLI that asks nicely.
+        #[tokio::test]
+        async fn a_round_may_not_be_pointed_at_the_cash_lane() {
+            let state = test_state();
+            let line = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockRoundDestination {
+                    lock_id: "no-such-lock".into(),
+                    lane: "cash".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&line, &state).await;
+            let Response::Error(e) = resp.payload else {
+                panic!("Cash must be refused, never resolved to an address");
+            };
+            assert!(
+                e.message.contains("Cash"),
+                "the refusal must name the lane: {}",
+                e.message
+            );
+            // The lock_id is deliberately nonsense. If the error is about the
+            // Lock not being found, the compartment rule ran too late — a real
+            // lock_id would then have sailed past it.
+            assert!(
+                !e.message.contains("no remembered Lock"),
+                "Cash must be refused BEFORE the Lock lookup; got: {}",
+                e.message
+            );
+        }
+
+        /// The three private lanes get past the compartment gate. They stop at
+        /// the Lock lookup instead, which is what proves the gate let them
+        /// through rather than the request failing for some earlier reason.
+        #[tokio::test]
+        async fn the_private_lanes_get_past_the_compartment_gate() {
+            let state = test_state();
+            for lane in ["savings", "spending", "investments"] {
+                let line = serde_json::to_string(&Envelope::new(
+                    1,
+                    Request::GhostLockRoundDestination {
+                        lock_id: "no-such-lock".into(),
+                        lane: lane.into(),
+                    },
+                ))
+                .unwrap();
+                let resp = super::dispatch(&line, &state).await;
+                let Response::Error(e) = resp.payload else {
+                    panic!("{lane}: a nonexistent Lock cannot resolve to an address");
+                };
+                assert!(
+                    !e.message.contains("cannot pay out into Cash"),
+                    "{lane} is a private lane and must not hit the Cash rule: {}",
+                    e.message
+                );
+            }
+        }
+
+        /// An unknown lane name is refused, not silently coerced to a default.
+        #[tokio::test]
+        async fn an_unknown_lane_is_refused() {
+            let state = test_state();
+            let line = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockRoundDestination {
+                    lock_id: "no-such-lock".into(),
+                    lane: "chequing".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&line, &state).await;
+            let Response::Error(e) = resp.payload else {
+                panic!("an unknown lane must not resolve to an address");
+            };
+            assert!(e.message.contains("unknown lane"), "got: {}", e.message);
         }
 
         #[tokio::test]

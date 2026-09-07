@@ -68,6 +68,9 @@ pub enum CompartmentError {
     /// A Cash coin was offered to a round.
     #[error("a Cash coin cannot enter a round: it is already public, so it gains nothing and re-links whatever it is mixed with")]
     CashIntoRound,
+    /// A round was asked to pay out into Cash.
+    #[error("a round cannot pay out into Cash: the lane is public by design, so the unlinkability the round just bought is discarded the moment the coin lands")]
+    CashAsRoundDestination,
     /// A spend mixed compartments.
     #[error("this spend combines {private} private and {cash} Cash inputs; spending them together proves they share an owner and undoes the round")]
     MixedSpend {
@@ -92,7 +95,24 @@ pub fn check_round_eligible(c: Compartment) -> Result<(), CompartmentError> {
     }
 }
 
-/// Rule 2 — may these coins be spent in one transaction?
+/// Rule 2 — may a round pay OUT to this compartment?
+///
+/// Deliberately separate from [`check_round_eligible`], which is about a coin
+/// being registered as a round INPUT. The two look alike and are not: rule 1
+/// refuses Cash because mixing an already-public coin re-links the strangers it
+/// is mixed with, which is other people's problem. This rule refuses Cash
+/// because the round's whole product — an output nobody can link to its source
+/// — is thrown away by a lane that is public on purpose, which is only the
+/// owner's problem. Collapsing them into one predicate would make the next
+/// change to either silently apply to both.
+pub fn check_round_destination(c: Compartment) -> Result<(), CompartmentError> {
+    match c {
+        Compartment::Private => Ok(()),
+        Compartment::Cash => Err(CompartmentError::CashAsRoundDestination),
+    }
+}
+
+/// Rule 3 — may these coins be spent in one transaction?
 ///
 /// Takes the whole input set rather than a pair, because the violation is a
 /// property of the transaction: two calls that each pass can still build a
@@ -118,6 +138,27 @@ mod tests {
             Err(CompartmentError::CashIntoRound)
         );
         assert!(check_round_eligible(Private).is_ok());
+    }
+
+    #[test]
+    fn a_round_may_not_pay_out_into_cash() {
+        assert_eq!(
+            check_round_destination(Cash),
+            Err(CompartmentError::CashAsRoundDestination)
+        );
+        assert!(check_round_destination(Private).is_ok());
+    }
+
+    /// The two round rules are separate rules that happen to agree today. This
+    /// pins the distinction: they must not be refactored into one predicate,
+    /// because they refuse Cash for different reasons and carry different
+    /// errors.
+    #[test]
+    fn the_two_round_rules_are_not_the_same_rule() {
+        assert_ne!(
+            check_round_eligible(Cash).unwrap_err(),
+            check_round_destination(Cash).unwrap_err(),
+        );
     }
 
     #[test]

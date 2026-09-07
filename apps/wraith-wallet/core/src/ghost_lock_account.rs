@@ -77,14 +77,38 @@ impl LaneKind {
         matches!(self, LaneKind::Investments)
     }
 
-    /// Whether coins here can enter a Wraith round.
+    /// Which compartment this lane's coins belong to.
+    ///
+    /// The single place the lane-to-compartment mapping lives. Everything that
+    /// needs a compartment rule goes through here rather than re-matching on
+    /// `LaneKind`, so adding a lane cannot leave one rule behind.
+    pub fn compartment(self) -> ghost_lock::Compartment {
+        match self {
+            LaneKind::Cash => ghost_lock::Compartment::Cash,
+            LaneKind::Savings | LaneKind::Spending | LaneKind::Investments => {
+                ghost_lock::Compartment::Private
+            }
+        }
+    }
+
+    /// Whether coins here can enter a Wraith round as an INPUT.
     ///
     /// False for Cash: it is already public, so mixing it gains nothing and
-    /// re-links whatever it is mixed with. Enforced in
-    /// `ghost_lock::compartment`; repeated here so a caller building a UI does
-    /// not have to reach for the rule.
+    /// re-links whatever it is mixed with. Derived from
+    /// `ghost_lock::check_round_eligible` rather than restated, so the rule has
+    /// one definition and a UI reading this flag cannot drift from the
+    /// enforcement.
     pub fn round_eligible(self) -> bool {
-        !matches!(self, LaneKind::Cash)
+        ghost_lock::check_round_eligible(self.compartment()).is_ok()
+    }
+
+    /// Whether a Wraith round may pay OUT to this lane — i.e. whether the lane
+    /// can be funded privately.
+    ///
+    /// A different rule from [`Self::round_eligible`], refusing Cash for a
+    /// different reason. See `ghost_lock::check_round_destination`.
+    pub fn round_destination_eligible(self) -> bool {
+        ghost_lock::check_round_destination(self.compartment()).is_ok()
     }
 }
 
@@ -350,6 +374,45 @@ mod tests {
     fn cash_is_the_only_lane_barred_from_rounds() {
         for k in LaneKind::ALL {
             assert_eq!(k.round_eligible(), k != LaneKind::Cash, "{k:?}");
+        }
+    }
+
+    /// Private entry: a round may pay into the three private lanes and must
+    /// not pay into Cash. Distinct from `round_eligible`, which is about a
+    /// coin leaving a lane INTO a round.
+    #[test]
+    fn a_round_may_fund_every_lane_except_cash() {
+        for k in LaneKind::ALL {
+            assert_eq!(
+                k.round_destination_eligible(),
+                k != LaneKind::Cash,
+                "{k:?} destination eligibility"
+            );
+        }
+    }
+
+    /// The two rules agree today and are still two rules. If someone collapses
+    /// them, this keeps the reason visible: they refuse Cash for different
+    /// reasons and would diverge the moment either changes.
+    #[test]
+    fn the_input_rule_and_the_destination_rule_are_separate() {
+        let cash = LaneKind::Cash.compartment();
+        assert_ne!(
+            ghost_lock::check_round_eligible(cash).unwrap_err(),
+            ghost_lock::check_round_destination(cash).unwrap_err(),
+        );
+    }
+
+    /// Every lane maps to exactly one compartment, and only Cash is public.
+    #[test]
+    fn only_cash_is_the_public_compartment() {
+        for k in LaneKind::ALL {
+            let expected = if k == LaneKind::Cash {
+                ghost_lock::Compartment::Cash
+            } else {
+                ghost_lock::Compartment::Private
+            };
+            assert_eq!(k.compartment(), expected, "{k:?}");
         }
     }
 

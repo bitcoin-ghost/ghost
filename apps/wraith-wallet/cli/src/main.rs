@@ -215,6 +215,50 @@ enum MixCommand {
         #[arg(long)]
         bip86_scan_max: Option<u32>,
     },
+    /// Fund one lane of a remembered Lock through a round — private entry.
+    ///
+    /// The round's output IS the lane, so on-chain the deposit looks like any
+    /// other round output rather than a transfer from a wallet you are known
+    /// to control. Funding a lane directly works and is simpler; it just
+    /// publishes the link between your existing coins and the Lock.
+    ///
+    /// You name the lane, not an address: the daemon derives it from the
+    /// remembered Lock, so a typo cannot send a round's proceeds to a
+    /// stranger. Cash is refused — it is public by design, so a round would
+    /// buy unlinkability the lane discards on arrival.
+    FundLock {
+        /// `lock_id` from `wraith mix lock-list`, or the GUI's Locks screen.
+        #[arg(long)]
+        lock_id: String,
+        /// Lane to fund: savings, spending or investments.
+        #[arg(long)]
+        lane: String,
+        #[arg(long)]
+        coordinator: String,
+        /// Optional fallback coordinator URLs. Repeatable.
+        #[arg(long = "coordinator-peer")]
+        coordinator_peers: Vec<String>,
+        #[arg(long)]
+        socks5_proxy: Option<String>,
+        #[arg(long)]
+        tier: String,
+        #[arg(long)]
+        ghost_id: String,
+        #[arg(long)]
+        utxo: String,
+        #[arg(long)]
+        utxo_value: u64,
+        #[arg(long)]
+        utxo_scriptpubkey: String,
+        #[arg(long)]
+        bip86_index: Option<u32>,
+        #[arg(long)]
+        bip86_scan_max: Option<u32>,
+        /// Smallest anonymity set, in distinct entities, worth signing into.
+        /// Stating a floor is a decision; dismissing a dialog is a reflex.
+        #[arg(long)]
+        min_entities: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -449,6 +493,53 @@ mod client {
             return run_watch(json).await;
         }
 
+        // Multi-call: private entry chains the lane lookup and the round so
+        // the user issues one command. The lookup must come first — the round
+        // needs the lane's address as its output, and the daemon refuses a
+        // lane a round must not pay into before any coin is committed.
+        if let Command::Mix {
+            sub: MixCommand::FundLock { .. },
+        } = &command
+        {
+            if let Command::Mix {
+                sub:
+                    MixCommand::FundLock {
+                        lock_id,
+                        lane,
+                        coordinator,
+                        coordinator_peers,
+                        socks5_proxy,
+                        tier,
+                        ghost_id,
+                        utxo,
+                        utxo_value,
+                        utxo_scriptpubkey,
+                        bip86_index,
+                        bip86_scan_max,
+                        min_entities,
+                    },
+            } = command
+            {
+                return run_fund_lock(
+                    json,
+                    lock_id,
+                    lane,
+                    coordinator,
+                    coordinator_peers,
+                    socks5_proxy,
+                    tier,
+                    ghost_id,
+                    utxo,
+                    utxo_value,
+                    utxo_scriptpubkey,
+                    bip86_index,
+                    bip86_scan_max,
+                    min_entities,
+                )
+                .await;
+            }
+        }
+
         // Multi-call summary: aggregate several IPC round-trips into one
         // terminal-friendly view.
         if matches!(&command, Command::Status) {
@@ -665,6 +756,8 @@ mod client {
                         bip86_scan_max,
                     }
                 }
+                // Intercepted above: private entry is two calls, not one.
+                MixCommand::FundLock { .. } => unreachable!("FundLock handled above"),
             },
             // Handled in main() before we reach the runtime; the arm exists
             // here only so the match is exhaustive.
@@ -860,6 +953,15 @@ mod client {
                     }
                     println!("\ntotal: {} sats ({} utxos)", u.total_sats, u.utxos.len());
                 }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockRoundDestination(d)) => {
+                println!("lock:    {}", d.lock_id);
+                println!("lane:    {} ({})", d.label, d.lane);
+                println!("address: {}", d.address);
+                println!("\nfund it with `wraith mix fund-lock`, which runs a round whose");
+                println!("output is this address. Paying it directly also works, and");
+                println!("publishes the link between those coins and the Lock.");
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::LightDetected(d)) => {
@@ -1604,6 +1706,116 @@ mod client {
         let envelope: Envelope<Response> =
             serde_json::from_str(&response_line).map_err(|e| format!("malformed response: {e}"))?;
         Ok(envelope.payload)
+    }
+
+    /// Private entry: fund one lane of a remembered Lock through a round.
+    ///
+    /// Two calls, in this order for a reason. `GhostLockRoundDestination`
+    /// resolves the lane to an address AND applies the compartment rule, so a
+    /// lane a round must not pay into is refused before a coin is registered
+    /// anywhere. Only then is the round run, with that address as its output.
+    ///
+    /// The address is never taken from the user. The whole property being
+    /// bought here is that the round's output belongs to the Lock; letting a
+    /// caller supply the destination would make "fund my Savings privately"
+    /// and "send my coins to this address" the same command.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_fund_lock(
+        json: bool,
+        lock_id: String,
+        lane: String,
+        coordinator: String,
+        coordinator_peers: Vec<String>,
+        socks5_proxy: Option<String>,
+        tier: String,
+        ghost_id: String,
+        utxo: String,
+        utxo_value: u64,
+        utxo_scriptpubkey: String,
+        bip86_index: Option<u32>,
+        bip86_scan_max: Option<u32>,
+        min_entities: Option<usize>,
+    ) -> std::process::ExitCode {
+        let (txid, vout) = match parse_outpoint(&utxo) {
+            Ok(v) => v,
+            Err(e) => return io_err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+        };
+
+        if !json {
+            println!("[1/2] resolving {lane} lane of {lock_id}");
+        }
+        let dest = match call(Request::GhostLockRoundDestination {
+            lock_id: lock_id.clone(),
+            lane: lane.clone(),
+        })
+        .await
+        {
+            Ok(Response::GhostLockRoundDestination(d)) => d,
+            Ok(Response::Error(e)) => return fund_lock_err(json, e.message),
+            Ok(other) => return fund_lock_err(json, format!("unexpected response {other:?}")),
+            Err(e) => return fund_lock_err(json, e),
+        };
+        if !json {
+            println!("      {} → {}", dest.label, dest.address);
+        }
+
+        if !json {
+            println!("[2/2] running round; its output funds the lane");
+        }
+        let mixed = match call(Request::WraithMixOneShot {
+            coordinator_url: coordinator,
+            coordinator_peers,
+            socks5_proxy,
+            tier_id: tier,
+            ghost_id,
+            utxo_txid: txid,
+            utxo_vout: vout,
+            utxo_value_sats: utxo_value,
+            utxo_scriptpubkey_hex: utxo_scriptpubkey,
+            mix_output_address: dest.address.clone(),
+            bip86_index,
+            bip86_scan_max,
+            min_entities,
+        })
+        .await
+        {
+            Ok(Response::WraithMixCompleted(m)) => m,
+            Ok(Response::Error(e)) => return fund_lock_err(json, e.message),
+            Ok(other) => return fund_lock_err(json, format!("unexpected response {other:?}")),
+            Err(e) => return fund_lock_err(json, e),
+        };
+
+        if json {
+            let body = serde_json::json!({
+                "lock_id": dest.lock_id,
+                "lane": dest.lane,
+                "address": dest.address,
+                "session_id": mixed.session_id,
+                "broadcast_txid": mixed.broadcast_txid,
+                "mixed_output_tx_index": mixed.mixed_output_tx_index,
+            });
+            println!("{body}");
+        } else {
+            println!("      txid:   {}", mixed.broadcast_txid);
+            println!("      vout:   {}", mixed.mixed_output_tx_index);
+            println!(
+                "done. {} of {} is funded; the deposit is a round output, not a transfer.",
+                dest.label, dest.lock_id
+            );
+            println!("      it will show as pending until the round transaction confirms.");
+        }
+        std::process::ExitCode::SUCCESS
+    }
+
+    /// Failure path for `run_fund_lock`, matching the CLI's `--json` contract.
+    fn fund_lock_err(json: bool, msg: String) -> std::process::ExitCode {
+        if json {
+            let body = serde_json::json!({ "error": { "message": msg } });
+            println!("{body}");
+        } else {
+            eprintln!("wraith: {msg}");
+        }
+        std::process::ExitCode::FAILURE
     }
 
     /// Multi-call status summary. Issues a few cheap requests in sequence and

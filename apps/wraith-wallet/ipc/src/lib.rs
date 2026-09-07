@@ -203,6 +203,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bip86_index: Option<u32>,
     },
+    /// Resolve the address a Wraith round should pay into to fund one lane of
+    /// a remembered Lock — private entry.
+    ///
+    /// The lane is named, not the address, and the daemon derives it. A caller
+    /// cannot pass an address of its own choosing here, so "fund this lane
+    /// privately" cannot silently become "pay this stranger", and the
+    /// compartment rule is applied somewhere a CLI cannot skip it.
+    GhostLockRoundDestination {
+        /// `lock_id` from [`Request::GhostLockList`].
+        lock_id: String,
+        /// Lane to fund: `savings`, `spending`, `cash` or `investments`.
+        /// `cash` is refused — see `ghost_lock::check_round_destination`.
+        lane: String,
+    },
     LightL1Utxos {
         /// Highest BIP86 index to derive. Daemon scans 0..this.
         /// Capped server-side at 1024 (ghost-pay's scantxoutset
@@ -680,6 +694,7 @@ pub enum Response {
     LightUtxos(LightUtxosResponse),
     LightL1Utxos(LightL1UtxosResponse),
     GhostLockLanes(GhostLockLanesResponse),
+    GhostLockRoundDestination(GhostLockRoundDestinationResponse),
     GhostLockSaved(GhostLockSavedResponse),
     GhostLockList(GhostLockListResponse),
     GhostLockForgotten(GhostLockForgottenResponse),
@@ -1644,6 +1659,20 @@ pub struct GhostLockLane {
     pub round_eligible: bool,
 }
 
+/// Where a round should pay to fund one lane privately.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockRoundDestinationResponse {
+    pub lock_id: String,
+    /// The lane, echoed back so a caller cannot mistake which one it asked for.
+    pub lane: String,
+    /// Human label for that lane.
+    pub label: String,
+    /// The address a round must pay into. This is the lane itself — funding it
+    /// is the round's output, so the deposit has the on-chain footprint of any
+    /// other round output rather than a transfer from a known wallet.
+    pub address: String,
+}
+
 /// A Ghost Lock's four lanes and its totals.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GhostLockLanesResponse {
@@ -1727,6 +1756,10 @@ mod tests {
                 shroud_max_ms: None,
                 mode: "onchain".into(),
                 memo: Some("test".into()),
+            },
+            Request::GhostLockRoundDestination {
+                lock_id: "abc123".into(),
+                lane: "savings".into(),
             },
             Request::DaemonEnv,
             Request::SetNodeEndpoints {
