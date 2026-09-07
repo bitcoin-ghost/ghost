@@ -66,4 +66,5 @@ subtle.workspace = true
 dev-mode = []  # Enables unsafe testing utilities - NEVER use in production
 
 [dev-dependencies]
+tempfile = "3.10"
 rand = "0.8"

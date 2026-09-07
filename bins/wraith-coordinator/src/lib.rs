@@ -26,7 +26,7 @@ pub mod tick;
 pub mod utxo_source;
 pub mod witnesses;
 
-pub use state::CoordinatorState;
+pub use state::{CoordinatorState, LockCosignState};
 
 /// Construct the Axum router for a given coordinator state. Pure
 /// function so tests can build it deterministically.

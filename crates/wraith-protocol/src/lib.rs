@@ -102,7 +102,9 @@ pub mod seat_price;
 pub mod service;
 pub mod signature_scope;
 pub mod signing_ledger;
+pub mod signing_ledger_file;
 pub mod sortition;
+pub mod spend_log_file;
 pub mod standing_order;
 pub use epoch::{
     canonical_roster, derive_beacon, epoch_for_height, shard_key_for_tier_epoch,

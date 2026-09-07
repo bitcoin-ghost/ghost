@@ -29,7 +29,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use wraith_protocol::signing_ledger::{OutPointKey, SignatureStore};
+use crate::signing_ledger::{OutPointKey, SignatureStore};
 
 /// File-backed [`SignatureStore`]. Safe for production use.
 #[derive(Debug)]
@@ -164,7 +164,7 @@ impl SignatureStore for FileSignatureStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wraith_protocol::signing_ledger::{Decision, LedgerError, SigningLedger};
+    use crate::signing_ledger::{Decision, LedgerError, SigningLedger};
 
     fn coin(b: u8) -> OutPointKey {
         OutPointKey::new([b; 32], 0)

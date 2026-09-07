@@ -30,6 +30,42 @@ use crate::witnesses::AcceptedWitness;
 /// without holding the outer registry mutex.
 pub type SharedSigner = Arc<Mutex<CoordinatorSigner>>;
 
+impl LockCosignState {
+    /// Open the ledgers under `dir` and assemble the co-signing state.
+    ///
+    /// Both stores are opened here rather than lazily: a coordinator that
+    /// cannot write its ledgers must fail at startup, where an operator sees
+    /// it, rather than on the first spend, where it looks like a refusal.
+    pub fn open(
+        dir: &std::path::Path,
+        seed_phrase: zeroize::Zeroizing<String>,
+        seed_passphrase: zeroize::Zeroizing<String>,
+        policy: wraith_protocol::lock_cosign::CosignPolicy,
+        role: wraith_protocol::lock_cosign::Role,
+    ) -> std::io::Result<Self> {
+        // Retain at least the window the policy enforces; a shorter retention
+        // would prune history the window still needs and quietly raise the
+        // limit.
+        let retain = policy.window.map(|w| w.window_secs).unwrap_or(86_400);
+        Ok(Self {
+            seed_phrase,
+            seed_passphrase,
+            policy,
+            role,
+            coins: Mutex::new(wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger_file::FileSignatureStore::open(
+                    dir.join("lock-cosigned-coins.json"),
+                )?,
+            )),
+            spends: Mutex::new(wraith_protocol::spend_log_file::FileSpendLog::open(
+                dir.join("lock-cosign-spends.json"),
+                retain,
+            )?),
+            pending: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
 /// Everything the quorum needs to co-sign Ghost Locks.
 ///
 /// Held together because the three pieces are only safe as a set: the seed
@@ -48,14 +84,20 @@ pub struct LockCosignState {
     pub policy: wraith_protocol::lock_cosign::CosignPolicy,
     /// Whether this coordinator co-signs at all right now.
     pub role: wraith_protocol::lock_cosign::Role,
-    /// Once-per-coin ledger. Durable.
+    /// Once-per-coin ledger, on disk.
+    ///
+    /// Durable because a forgotten commitment is a second signature over the
+    /// same coin, which is a valid double-sign proof against this quorum.
     pub coins: Mutex<
         wraith_protocol::signing_ledger::SigningLedger<
-            wraith_protocol::signing_ledger::VolatileStore,
+            wraith_protocol::signing_ledger_file::FileSignatureStore,
         >,
     >,
-    /// Rolling spend window. Durable.
-    pub spends: Mutex<wraith_protocol::lock_cosign::VolatileSpendLog>,
+    /// Rolling spend window, on disk.
+    ///
+    /// Durable because a window that resets on restart is bypassed by crashing
+    /// the service, which is cheaper than stealing the key it bounds.
+    pub spends: Mutex<wraith_protocol::spend_log_file::FileSpendLog>,
     /// Co-signings waiting on their second round, keyed by session.
     ///
     /// In memory: a restart drops the secret nonce, which is the safe
