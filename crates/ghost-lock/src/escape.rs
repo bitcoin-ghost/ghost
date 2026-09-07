@@ -110,6 +110,119 @@ fn control_block(lane: &Lane, leaf: &ScriptBuf) -> Result<ControlBlock, LockErro
         })
 }
 
+/// Claims that are not the owner's.
+///
+/// Kept apart from [`OwnerEscape`] because the wallet cannot produce either of
+/// them: they are signed by the backup device and the heir. Listing them beside
+/// the owner's routes would offer spends the holder of the owner key cannot
+/// make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtherClaim {
+    /// Savings, by the backup device, after ~15 months.
+    ///
+    /// A relative timelock, so it signs through [`sign_escape`] like the
+    /// owner's routes — only the key differs.
+    BackupRecovery,
+    /// Savings, by the heir, at an absolute height.
+    ///
+    /// The only **absolute** leaf in the design. Inheritance is 18-24 months
+    /// out and [`crate::constants::CSV_MAX_BLOCKS`] tops out near fifteen, so
+    /// a relative lock cannot express it. That is why it needs
+    /// [`sign_inheritance`] rather than [`sign_escape`].
+    Inheritance {
+        /// The height the leaf matures at, as the Lock recorded it.
+        height: u32,
+    },
+}
+
+impl OtherClaim {
+    /// What to call it to a person.
+    pub fn label(self) -> &'static str {
+        match self {
+            OtherClaim::BackupRecovery => "Savings backup recovery",
+            OtherClaim::Inheritance { .. } => "Savings inheritance",
+        }
+    }
+
+    /// The leaf script, built the way the lane built it.
+    pub fn leaf(self, key: &bitcoin::XOnlyPublicKey) -> Result<ScriptBuf, LockError> {
+        match self {
+            OtherClaim::BackupRecovery => {
+                crate::lane::relative_timelock_leaf(crate::constants::BACKUP_RECOVERY_BLOCKS, key)
+            }
+            OtherClaim::Inheritance { height } => {
+                Ok(crate::lane::absolute_timelock_leaf(height, key))
+            }
+        }
+    }
+}
+
+/// Sign the inheritance leaf: an **absolute** timelock, spent by the heir.
+///
+/// # Two conditions, and the second is the one people miss
+///
+/// `OP_CHECKLOCKTIMEVERIFY` compares against the transaction's `nLockTime`, so
+/// that must be at or past the leaf's height. It is also **only enforced when
+/// the input's `nSequence` is not final**: with `0xFFFFFFFF` the consensus
+/// rules ignore `nLockTime` entirely, and the script fails.
+///
+/// So a transaction can look correct — right height, right key — and be
+/// unspendable because one sequence number is at its maximum. Both are checked
+/// here rather than left to be discovered from a rejection.
+pub fn sign_inheritance(
+    lane: &Lane,
+    leaf: &ScriptBuf,
+    height: u32,
+    key: &SecretKey,
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[TxOut],
+) -> Result<Witness, LockError> {
+    if input_index >= tx.input.len() {
+        return Err(LockError::Policy(format!(
+            "input {input_index} does not exist: the transaction has {}",
+            tx.input.len()
+        )));
+    }
+    if prevouts.len() != tx.input.len() {
+        return Err(LockError::Policy(format!(
+            "{} prevouts for {} inputs: a Taproot sighash commits to every input, so \
+             this would sign a different transaction than the one presented",
+            prevouts.len(),
+            tx.input.len()
+        )));
+    }
+
+    let locktime = tx.lock_time.to_consensus_u32();
+    if locktime < height {
+        return Err(LockError::Policy(format!(
+            "the transaction's nLockTime is {locktime} but this leaf matures at {height}; \
+             a node would reject the spend, and signing it would only make a dead \
+             transaction look finished"
+        )));
+    }
+    // Heights and timestamps share one field; CLTV requires both sides to be
+    // the same kind, and a leaf built from a block height must not be paired
+    // with a time-based locktime.
+    if !tx.lock_time.is_block_height() {
+        return Err(LockError::Policy(
+            "this leaf locks to a block height, but the transaction's nLockTime is a \
+             timestamp; CLTV refuses to compare the two"
+                .into(),
+        ));
+    }
+    if tx.input[input_index].sequence == Sequence::MAX {
+        return Err(LockError::Policy(format!(
+            "input {input_index} has nSequence 0xffffffff, which disables nLockTime \
+             entirely — the script would fail even though the height is right. Use \
+             {} or any value below the maximum.",
+            Sequence::ENABLE_LOCKTIME_NO_RBF.0
+        )));
+    }
+
+    sign_leaf(lane, leaf, key, tx, input_index, prevouts)
+}
+
 /// Sign one input's escape leaf and return the finished witness.
 ///
 /// `prevouts` must cover **every** input: a Taproot sighash commits to all of
@@ -155,6 +268,21 @@ pub fn sign_escape(
         )));
     }
 
+    sign_leaf(lane, leaf, key, tx, input_index, prevouts)
+}
+
+/// The signing common to every leaf: control block, sighash, witness.
+///
+/// Shared so the relative and absolute paths cannot drift into producing
+/// differently-shaped witnesses for the same tree.
+fn sign_leaf(
+    lane: &Lane,
+    leaf: &ScriptBuf,
+    key: &SecretKey,
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[TxOut],
+) -> Result<Witness, LockError> {
     let cb = control_block(lane, leaf)?;
     let leaf_hash = TapLeafHash::from_script(leaf, LeafVersion::TapScript);
 
@@ -409,6 +537,139 @@ mod tests {
         let err = sign_escape(&lane, &leaf, SPENDING_EXIT_BLOCKS, &owner, &tx, 0, &[])
             .expect_err("must refuse");
         assert!(format!("{err}").contains("commits to every input"), "{err}");
+    }
+
+    fn savings_lane(owner: &SecretKey, backup: &SecretKey, heir: &SecretKey, at: u32) -> Lane {
+        crate::lane::SavingsPolicy {
+            aggregate: crate::key_agg::aggregate(&[xonly(owner), xonly(backup)]).unwrap(),
+            owner: xonly(owner),
+            backup: xonly(backup),
+            heir: xonly(heir),
+            inherit_height: at,
+        }
+        .build(&Secp256k1::new(), 900_000, Network::Regtest)
+        .unwrap()
+    }
+
+    fn spend_at(lane: &Lane, locktime: LockTime, seq: Sequence) -> (Transaction, Vec<TxOut>) {
+        let prevout = TxOut {
+            value: Amount::from_sat(80_000),
+            script_pubkey: lane.address.script_pubkey(),
+        };
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: locktime,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_str(
+                        "0000000000000000000000000000000000000000000000000000000000000005",
+                    )
+                    .unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: seq,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(79_000),
+                script_pubkey: lane.address.script_pubkey(),
+            }],
+        };
+        (tx, vec![prevout])
+    }
+
+    /// **The heir can claim.** Until this existed, nobody could.
+    #[test]
+    fn the_heir_can_claim_after_the_height() {
+        let (owner, backup, heir) = (sk(31), sk(32), sk(33));
+        let at = 1_000_000;
+        let lane = savings_lane(&owner, &backup, &heir, at);
+        let leaf = OtherClaim::Inheritance { height: at }
+            .leaf(&xonly(&heir))
+            .unwrap();
+        let (tx, prevouts) = spend_at(
+            &lane,
+            LockTime::from_height(at).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        let w = sign_inheritance(&lane, &leaf, at, &heir, &tx, 0, &prevouts).unwrap();
+        assert_eq!(w.len(), 3, "signature, script, control block");
+    }
+
+    /// The backup device's leaf is relative, so it signs like the owner's.
+    #[test]
+    fn the_backup_device_can_recover_savings() {
+        let (owner, backup, heir) = (sk(34), sk(35), sk(36));
+        let lane = savings_lane(&owner, &backup, &heir, 1_000_000);
+        let leaf = OtherClaim::BackupRecovery.leaf(&xonly(&backup)).unwrap();
+        let blocks = crate::constants::BACKUP_RECOVERY_BLOCKS;
+        let (tx, prevouts) = spend_at(&lane, LockTime::ZERO, escape_sequence(blocks).unwrap());
+
+        let w = sign_escape(&lane, &leaf, blocks, &backup, &tx, 0, &prevouts).unwrap();
+        assert_eq!(w.len(), 3);
+    }
+
+    /// **The trap: a final nSequence disables nLockTime entirely.**
+    ///
+    /// Right height, right key, and the script still fails — because consensus
+    /// ignores nLockTime when every input is final. Caught here rather than at
+    /// broadcast.
+    #[test]
+    fn a_final_sequence_disables_the_locktime_and_is_refused() {
+        let (owner, backup, heir) = (sk(37), sk(38), sk(39));
+        let at = 1_000_000;
+        let lane = savings_lane(&owner, &backup, &heir, at);
+        let leaf = OtherClaim::Inheritance { height: at }
+            .leaf(&xonly(&heir))
+            .unwrap();
+        let (tx, prevouts) = spend_at(&lane, LockTime::from_height(at).unwrap(), Sequence::MAX);
+
+        let err = sign_inheritance(&lane, &leaf, at, &heir, &tx, 0, &prevouts)
+            .expect_err("a final sequence must be refused");
+        assert!(format!("{err}").contains("disables nLockTime"), "{err}");
+    }
+
+    /// Too early is refused rather than signed.
+    #[test]
+    fn a_locktime_before_the_height_is_refused() {
+        let (owner, backup, heir) = (sk(41), sk(42), sk(43));
+        let at = 1_000_000;
+        let lane = savings_lane(&owner, &backup, &heir, at);
+        let leaf = OtherClaim::Inheritance { height: at }
+            .leaf(&xonly(&heir))
+            .unwrap();
+        let (tx, prevouts) = spend_at(
+            &lane,
+            LockTime::from_height(at - 1).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        let err =
+            sign_inheritance(&lane, &leaf, at, &heir, &tx, 0, &prevouts).expect_err("too early");
+        assert!(format!("{err}").contains("matures at"), "{err}");
+    }
+
+    /// A timestamp locktime cannot satisfy a height-locked leaf.
+    #[test]
+    fn a_timestamp_locktime_is_refused_for_a_height_leaf() {
+        let (owner, backup, heir) = (sk(44), sk(45), sk(46));
+        let at = 1_000_000;
+        let lane = savings_lane(&owner, &backup, &heir, at);
+        let leaf = OtherClaim::Inheritance { height: at }
+            .leaf(&xonly(&heir))
+            .unwrap();
+        // Well past the height numerically, but a different unit entirely.
+        let (tx, prevouts) = spend_at(
+            &lane,
+            LockTime::from_time(1_700_000_000).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        let err = sign_inheritance(&lane, &leaf, at, &heir, &tx, 0, &prevouts)
+            .expect_err("units must match");
+        assert!(format!("{err}").contains("timestamp"), "{err}");
     }
 
     /// BIP-68 block-based encoding, and the ceiling is enforced.
