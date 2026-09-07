@@ -57,6 +57,24 @@ enum Command {
         #[arg(long, default_value = "bitcoin")]
         network: String,
     },
+    /// Print the quorum's public key for one Lock.
+    ///
+    /// A quorum derives a different key per Lock, from the Lock's own id, so
+    /// there is no list to keep. This is what an operator puts in a Lock's
+    /// `quorum_pubkey` when building it — derived from the seed rather than
+    /// typed, so the key in the Lock is provably the one the coordinator will
+    /// sign with.
+    QuorumPubkey {
+        /// File holding the coordinator's BIP39 quorum seed.
+        #[arg(long)]
+        seed: PathBuf,
+        /// File holding the BIP39 passphrase, if any.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// The Lock this key is for.
+        #[arg(long)]
+        lock_id: String,
+    },
     /// Claim a Savings lane by a leaf that is yours — heir or backup device.
     ///
     /// One signature, no ceremony, no counterparty: the leaf is a plain
@@ -189,6 +207,25 @@ fn run() -> Result<(), String> {
             print_summary(&summary);
             println!("\nsighash: {}", hex::encode(message));
             println!("(reviewed only — nothing was signed)");
+            Ok(())
+        }
+        Command::QuorumPubkey {
+            seed,
+            passphrase_file,
+            lock_id,
+        } => {
+            let phrase = read_secret_file(&seed, "seed phrase")?;
+            let pass = match &passphrase_file {
+                Some(p) => read_secret_file(p, "passphrase")?,
+                None => String::new(),
+            };
+            let pk = ghost_lock::backup_key::quorum_public_key(&phrase, &pass, &lock_id)
+                .map_err(|e| e.to_string())?;
+            println!("{}", hex::encode(pk.serialize()));
+            eprintln!(
+                "derived at {} — put this in the Lock's quorum_pubkey",
+                ghost_lock::backup_key::quorum_derivation_path(&lock_id)
+            );
             Ok(())
         }
         Command::Claim {
