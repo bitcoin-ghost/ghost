@@ -26,37 +26,6 @@ use ghost_gsp_proto::{
 };
 use ghost_keys::{GhostKeys, PaymentDetector};
 
-#[derive(Debug, Clone)]
-pub struct LockPreparedResult {
-    pub lock_id: String,
-    pub funding_address: String,
-    pub required_sats: u64,
-    /// Operator-derived lock public key (cooperative-path key).
-    pub lock_pubkey: String,
-    /// Echo of the wallet-supplied recovery_pubkey. Caller MUST verify
-    /// it equals the value sent — substitution by the operator would
-    /// silently break unilateral exit.
-    pub recovery_pubkey: String,
-    /// Echo of the wallet's recovery derivation index.
-    pub recovery_index: u32,
-    /// CSV blocks the recovery branch waits before becoming spendable.
-    pub recovery_blocks: u32,
-    /// Block height the lock was created at.
-    pub creation_height: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct LockConfirmedResult {
-    pub lock_id: String,
-    pub txid: String,
-    pub block_height: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct JumpRequestedResult {
-    pub lock_id: String,
-    pub jump_txid: Option<String>,
-}
 use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
@@ -161,16 +130,6 @@ impl SessionHandle {
         rx.await.map_err(|_| "reply dropped".to_string())?
     }
 
-    /// Issue `GetGhostLocks` and await the matching `GhostLocks` reply.
-    pub async fn get_ghost_locks(&self) -> Result<GhostLocksResult, String> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::GetGhostLocks { reply: tx })
-            .await
-            .map_err(|_| "session task closed".to_string())?;
-        rx.await.map_err(|_| "reply dropped".to_string())?
-    }
-
     /// Issue `PreparePayment` and await the matching `PaymentPrepared` reply.
     pub async fn prepare_payment(
         &self,
@@ -240,53 +199,6 @@ impl SessionHandle {
         rx.await.map_err(|_| "reply dropped".to_string())?
     }
 
-    /// Issue `PrepareGhostLock` and await the matching `LockPrepared` reply.
-    ///
-    /// `recovery_pubkey_hex` is the user-derived recovery pubkey
-    /// (33-byte SEC1 compressed) that will go into the lock script's
-    /// recovery branch. The wallet keeps the matching secret locally so
-    /// the timelock recovery path is genuinely unilateral.
-    pub async fn prepare_ghost_lock(
-        &self,
-        owner_pubkey_hex: String,
-        capacity_sats: u64,
-        recovery_pubkey_hex: String,
-        recovery_index: u32,
-    ) -> Result<LockPreparedResult, String> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::PrepareGhostLock {
-                owner_pubkey: owner_pubkey_hex,
-                capacity_sats,
-                recovery_pubkey: recovery_pubkey_hex,
-                recovery_index,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| "session task closed".to_string())?;
-        rx.await.map_err(|_| "reply dropped".to_string())?
-    }
-
-    /// Issue `ConfirmGhostLockFunding` and await the matching `LockConfirmed` reply.
-    pub async fn confirm_ghost_lock_funding(
-        &self,
-        lock_id: String,
-        funding_txid: String,
-        proof: WalletProof,
-    ) -> Result<LockConfirmedResult, String> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::ConfirmGhostLockFunding {
-                lock_id,
-                funding_txid,
-                proof,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| "session task closed".to_string())?;
-        rx.await.map_err(|_| "reply dropped".to_string())?
-    }
-
     /// Issue `RegisterScanKey` and await the matching `ScanKeyRegistered` reply.
     pub async fn register_scan_key(
         &self,
@@ -297,28 +209,6 @@ impl SessionHandle {
         self.cmd_tx
             .send(SessionCommand::RegisterScanKey {
                 scan_pubkey: scan_pubkey_hex,
-                proof,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| "session task closed".to_string())?;
-        rx.await.map_err(|_| "reply dropped".to_string())?
-    }
-
-    /// Issue `RequestJump` and await the matching `JumpRequested` reply.
-    pub async fn request_jump(
-        &self,
-        lock_id: String,
-        priority: String,
-        target_address: String,
-        proof: WalletProof,
-    ) -> Result<JumpRequestedResult, String> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::RequestJump {
-                lock_id,
-                priority,
-                target_address,
                 proof,
                 reply: tx,
             })
@@ -342,12 +232,8 @@ impl Drop for SessionHandle {
 enum PendingReply {
     Utxos(oneshot::Sender<Result<UtxosResult, String>>),
     Transactions(oneshot::Sender<Result<TransactionsResult, String>>),
-    GhostLocks(oneshot::Sender<Result<GhostLocksResult, String>>),
     PaymentPrepared(oneshot::Sender<Result<PreparedPayment, String>>),
     PaymentSubmitted(oneshot::Sender<Result<SubmittedPaymentResult, String>>),
-    LockPrepared(oneshot::Sender<Result<LockPreparedResult, String>>),
-    LockConfirmed(oneshot::Sender<Result<LockConfirmedResult, String>>),
-    JumpRequested(oneshot::Sender<Result<JumpRequestedResult, String>>),
     ScanKeyRegistered(oneshot::Sender<Result<(), String>>),
     PaymentSent(oneshot::Sender<Result<SentL2PaymentResult, String>>),
 }
@@ -363,9 +249,6 @@ pub enum SessionCommand {
         offset: u32,
         reply: oneshot::Sender<Result<TransactionsResult, String>>,
     },
-    GetGhostLocks {
-        reply: oneshot::Sender<Result<GhostLocksResult, String>>,
-    },
     PreparePayment {
         recipient: String,
         amount_sats: u64,
@@ -379,26 +262,6 @@ pub enum SessionCommand {
         signature: String,
         public_key: String,
         reply: oneshot::Sender<Result<SubmittedPaymentResult, String>>,
-    },
-    PrepareGhostLock {
-        owner_pubkey: String,
-        capacity_sats: u64,
-        recovery_pubkey: String,
-        recovery_index: u32,
-        reply: oneshot::Sender<Result<LockPreparedResult, String>>,
-    },
-    ConfirmGhostLockFunding {
-        lock_id: String,
-        funding_txid: String,
-        proof: WalletProof,
-        reply: oneshot::Sender<Result<LockConfirmedResult, String>>,
-    },
-    RequestJump {
-        lock_id: String,
-        priority: String,
-        target_address: String,
-        proof: WalletProof,
-        reply: oneshot::Sender<Result<JumpRequestedResult, String>>,
     },
     RegisterScanKey {
         scan_pubkey: String,
@@ -438,12 +301,6 @@ pub struct UtxosResult {
 pub struct TransactionsResult {
     pub transactions: Vec<TransactionInfo>,
     pub total_count: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct GhostLocksResult {
-    pub locks: Vec<ghost_gsp_proto::GhostLockInfo>,
-    pub total_locked_sats: u64,
 }
 
 /// Spawn a long-lived authenticated session task. Returns a handle.
@@ -724,22 +581,10 @@ async fn run(
                 PendingReply::Transactions(tx) => {
                     let _ = tx.send(Err("session disconnected".into()));
                 }
-                PendingReply::GhostLocks(tx) => {
-                    let _ = tx.send(Err("session disconnected".into()));
-                }
                 PendingReply::PaymentPrepared(tx) => {
                     let _ = tx.send(Err("session disconnected".into()));
                 }
                 PendingReply::PaymentSubmitted(tx) => {
-                    let _ = tx.send(Err("session disconnected".into()));
-                }
-                PendingReply::LockPrepared(tx) => {
-                    let _ = tx.send(Err("session disconnected".into()));
-                }
-                PendingReply::LockConfirmed(tx) => {
-                    let _ = tx.send(Err("session disconnected".into()));
-                }
-                PendingReply::JumpRequested(tx) => {
                     let _ = tx.send(Err("session disconnected".into()));
                 }
                 PendingReply::ScanKeyRegistered(tx) => {
@@ -835,16 +680,6 @@ async fn run_main_loop(
                         }
                         pending.push_back(PendingReply::Transactions(reply));
                     }
-                    SessionCommand::GetGhostLocks { reply } => {
-                        let msg = ClientMessage::GetGhostLocks;
-                        if let Err(e) = send_client(ws, &msg).await {
-                            let _ = reply.send(Err(format!("send GetGhostLocks: {e}")));
-                            return MainLoopOutcome::Disconnect(format!(
-                                "send GetGhostLocks: {e}"
-                            ));
-                        }
-                        pending.push_back(PendingReply::GhostLocks(reply));
-                    }
                     SessionCommand::PreparePayment {
                         recipient,
                         amount_sats,
@@ -887,67 +722,6 @@ async fn run_main_loop(
                             ));
                         }
                         pending.push_back(PendingReply::PaymentSubmitted(reply));
-                    }
-                    SessionCommand::PrepareGhostLock {
-                        owner_pubkey,
-                        capacity_sats,
-                        recovery_pubkey,
-                        recovery_index,
-                        reply,
-                    } => {
-                        let msg = ClientMessage::PrepareGhostLock {
-                            owner_pubkey,
-                            capacity_sats,
-                            recovery_pubkey,
-                            recovery_index,
-                        };
-                        if let Err(e) = send_client(ws, &msg).await {
-                            let _ = reply.send(Err(format!("send PrepareGhostLock: {e}")));
-                            return MainLoopOutcome::Disconnect(format!(
-                                "send PrepareGhostLock: {e}"
-                            ));
-                        }
-                        pending.push_back(PendingReply::LockPrepared(reply));
-                    }
-                    SessionCommand::ConfirmGhostLockFunding {
-                        lock_id,
-                        funding_txid,
-                        proof,
-                        reply,
-                    } => {
-                        let msg = ClientMessage::ConfirmGhostLockFunding {
-                            lock_id,
-                            funding_txid,
-                            proof,
-                        };
-                        if let Err(e) = send_client(ws, &msg).await {
-                            let _ = reply.send(Err(format!("send ConfirmGhostLockFunding: {e}")));
-                            return MainLoopOutcome::Disconnect(format!(
-                                "send ConfirmGhostLockFunding: {e}"
-                            ));
-                        }
-                        pending.push_back(PendingReply::LockConfirmed(reply));
-                    }
-                    SessionCommand::RequestJump {
-                        lock_id,
-                        priority,
-                        target_address,
-                        proof,
-                        reply,
-                    } => {
-                        let msg = ClientMessage::RequestJump {
-                            lock_id,
-                            priority,
-                            target_address,
-                            proof,
-                        };
-                        if let Err(e) = send_client(ws, &msg).await {
-                            let _ = reply.send(Err(format!("send RequestJump: {e}")));
-                            return MainLoopOutcome::Disconnect(format!(
-                                "send RequestJump: {e}"
-                            ));
-                        }
-                        pending.push_back(PendingReply::JumpRequested(reply));
                     }
                     SessionCommand::RegisterScanKey {
                         scan_pubkey,
@@ -1075,26 +849,6 @@ async fn handle_message(
             tracing::debug!("gsp session: unmatched Transactions message");
         }
 
-        // Response to GetGhostLocks.
-        ServerMessage::GhostLocks {
-            locks,
-            total_locked_sats,
-        } => {
-            if let Some(idx) = pending
-                .iter()
-                .position(|p| matches!(p, PendingReply::GhostLocks(_)))
-            {
-                if let Some(PendingReply::GhostLocks(tx)) = pending.remove(idx) {
-                    let _ = tx.send(Ok(GhostLocksResult {
-                        locks,
-                        total_locked_sats,
-                    }));
-                    return;
-                }
-            }
-            tracing::debug!("gsp session: unmatched GhostLocks message");
-        }
-
         // Response to PreparePayment.
         ServerMessage::PaymentPrepared {
             success,
@@ -1179,114 +933,6 @@ async fn handle_message(
             tracing::debug!("gsp session: unmatched PaymentSent message");
         }
 
-        // Response to PrepareGhostLock.
-        ServerMessage::LockPrepared {
-            success,
-            lock_id,
-            funding_address,
-            required_sats,
-            lock_pubkey,
-            recovery_pubkey,
-            recovery_index,
-            recovery_blocks,
-            creation_height,
-            error,
-        } => {
-            if let Some(idx) = pending
-                .iter()
-                .position(|p| matches!(p, PendingReply::LockPrepared(_)))
-            {
-                if let Some(PendingReply::LockPrepared(tx)) = pending.remove(idx) {
-                    let result = if success {
-                        match (
-                            lock_id,
-                            funding_address,
-                            required_sats,
-                            lock_pubkey,
-                            recovery_pubkey,
-                            recovery_index,
-                            recovery_blocks,
-                            creation_height,
-                        ) {
-                            (
-                                Some(id),
-                                Some(addr),
-                                Some(sats),
-                                Some(lpk),
-                                Some(rpk),
-                                Some(ridx),
-                                Some(rblocks),
-                                Some(height),
-                            ) => Ok(LockPreparedResult {
-                                lock_id: id,
-                                funding_address: addr,
-                                required_sats: sats,
-                                lock_pubkey: lpk,
-                                recovery_pubkey: rpk,
-                                recovery_index: ridx,
-                                recovery_blocks: rblocks,
-                                creation_height: height,
-                            }),
-                            _ => Err("server reported success but missing lock-script fields \
-                                 — refusing to consider lock prepared"
-                                .into()),
-                        }
-                    } else {
-                        Err(error.unwrap_or_else(|| "LockPrepared failed".into()))
-                    };
-                    let _ = tx.send(result);
-                    return;
-                }
-            }
-            tracing::debug!("gsp session: unmatched LockPrepared message");
-        }
-
-        // Response to ConfirmGhostLockFunding.
-        ServerMessage::LockConfirmed {
-            lock_id,
-            txid,
-            block_height,
-        } => {
-            if let Some(idx) = pending
-                .iter()
-                .position(|p| matches!(p, PendingReply::LockConfirmed(_)))
-            {
-                if let Some(PendingReply::LockConfirmed(tx)) = pending.remove(idx) {
-                    let _ = tx.send(Ok(LockConfirmedResult {
-                        lock_id,
-                        txid,
-                        block_height,
-                    }));
-                    return;
-                }
-            }
-            tracing::debug!("gsp session: unmatched LockConfirmed message");
-        }
-
-        // Response to RequestJump.
-        ServerMessage::JumpRequested {
-            success,
-            lock_id,
-            jump_txid,
-            error,
-        } => {
-            if let Some(idx) = pending
-                .iter()
-                .position(|p| matches!(p, PendingReply::JumpRequested(_)))
-            {
-                if let Some(PendingReply::JumpRequested(tx)) = pending.remove(idx) {
-                    let result = if success {
-                        Ok(JumpRequestedResult { lock_id, jump_txid })
-                    } else {
-                        Err(error.unwrap_or_else(|| "JumpRequested failed".into()))
-                    };
-                    let _ = tx.send(result);
-                    return;
-                }
-            }
-            tracing::debug!("gsp session: unmatched JumpRequested message");
-        }
-
         // Response to RegisterScanKey.
         ServerMessage::ScanKeyRegistered { success, error } => {
             if let Some(idx) = pending
@@ -1322,22 +968,10 @@ async fn handle_message(
                     PendingReply::Transactions(tx) => {
                         let _ = tx.send(Err(err));
                     }
-                    PendingReply::GhostLocks(tx) => {
-                        let _ = tx.send(Err(err));
-                    }
                     PendingReply::PaymentPrepared(tx) => {
                         let _ = tx.send(Err(err));
                     }
                     PendingReply::PaymentSubmitted(tx) => {
-                        let _ = tx.send(Err(err));
-                    }
-                    PendingReply::LockPrepared(tx) => {
-                        let _ = tx.send(Err(err));
-                    }
-                    PendingReply::LockConfirmed(tx) => {
-                        let _ = tx.send(Err(err));
-                    }
-                    PendingReply::JumpRequested(tx) => {
                         let _ = tx.send(Err(err));
                     }
                     PendingReply::ScanKeyRegistered(tx) => {
