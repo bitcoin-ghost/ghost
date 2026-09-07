@@ -91,6 +91,7 @@ pub mod exit_availability;
 pub mod ladder;
 pub mod ladder_round;
 pub mod liquidity;
+pub mod lock_cosign;
 pub mod mailbox;
 pub mod pre_sign;
 pub mod privacy;

@@ -54,6 +54,7 @@ zeroize = { workspace = true }
 # hot lane's escape leaf, so it must read the delay from the crate that defines
 # it rather than restate the number.
 ghost-lock = { path = "../ghost-lock" }
+base64 = { workspace = true }
 
 # Concurrency and timing
 parking_lot = { workspace = true }

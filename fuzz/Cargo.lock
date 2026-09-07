@@ -5495,6 +5495,7 @@ dependencies = [
 name = "wraith-protocol"
 version = "1.11.38"
 dependencies = [
+ "base64 0.22.1",
  "bitcoin",
  "getrandom 0.2.17",
  "ghost-lock",
