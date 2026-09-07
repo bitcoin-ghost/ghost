@@ -1,4 +1,9 @@
-//! Optional user-supplied entropy, mixed into a new wallet seed.
+//! Optional user-supplied entropy, mixed into a new wallet or device seed.
+//!
+//! Moved out of `wraith-wallet-core` unchanged so the offline signer can use it
+//! without linking the wallet. The domain tags below are byte-identical to the
+//! ones it had there: changing them would change every seed this has ever
+//! derived, which is why they are versioned rather than edited.
 //!
 //! ## Why this exists
 //!

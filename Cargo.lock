@@ -3282,6 +3282,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-entropy"
+version = "1.11.38"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "ghost-glyph"
 version = "1.11.38"
 dependencies = [
@@ -3389,6 +3398,7 @@ dependencies = [
  "bip32",
  "bip39",
  "bitcoin",
+ "ghost-entropy",
  "hex",
  "musig2",
  "rand 0.8.6",
@@ -3407,6 +3417,7 @@ dependencies = [
  "base64 0.22.1",
  "bitcoin",
  "clap",
+ "ghost-entropy",
  "ghost-lock",
  "hex",
  "serde",
@@ -10820,6 +10831,7 @@ dependencies = [
  "bip39",
  "bitcoin",
  "futures-util",
+ "ghost-entropy",
  "ghost-gsp-proto",
  "ghost-keys",
  "ghost-lock",

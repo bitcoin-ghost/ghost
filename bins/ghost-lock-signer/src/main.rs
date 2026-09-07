@@ -57,6 +57,35 @@ enum Command {
         #[arg(long, default_value = "bitcoin")]
         network: String,
     },
+    /// Create this device's seed phrase.
+    ///
+    /// Entropy comes from the OS CSPRNG. Dice or coin flips, if you supply
+    /// them, are **mixed in and never substituted**, so they can only ever make
+    /// the result stronger — supplying none, or supplying predictable rolls,
+    /// leaves the seed exactly as strong as the OS bytes alone.
+    ///
+    /// The reason to bother: with one source, nothing can notice it silently
+    /// degrading. Coldcard firmware once generated seeds through a PRNG rather
+    /// than its hardware TRNG, dropping to about 40 bits with a normal-looking
+    /// output distribution, and roughly 1,816 BTC was swept years later. Dice
+    /// give a floor that does not depend on any implementation being right.
+    Generate {
+        /// File of die rolls: digits 1-6, whitespace ignored.
+        #[arg(long)]
+        dice_file: Option<PathBuf>,
+        /// File of coin flips: H/T or 1/0, whitespace ignored.
+        #[arg(long)]
+        coins_file: Option<PathBuf>,
+        /// Also write the phrase here, mode 0600.
+        ///
+        /// Optional. Writing a seed to disk is itself a risk; the phrase is
+        /// printed either way so it can be written down.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Derivation index to report the public key for.
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+    },
     /// Print the public key this device signs with.
     ///
     /// This is what gets registered as the Lock's `backup_pubkey`. Derived
@@ -134,6 +163,12 @@ fn run() -> Result<(), String> {
             println!("(reviewed only — nothing was signed)");
             Ok(())
         }
+        Command::Generate {
+            dice_file,
+            coins_file,
+            out,
+            index,
+        } => generate(dice_file, coins_file, out, index),
         Command::Pubkey {
             seed,
             passphrase_file,
@@ -299,6 +334,105 @@ fn sign(
         serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
     );
     println!("--- end ---");
+    Ok(())
+}
+
+/// Create a seed phrase, optionally mixing in rolls the operator produced.
+fn generate(
+    dice_file: Option<PathBuf>,
+    coins_file: Option<PathBuf>,
+    out: Option<PathBuf>,
+    index: u32,
+) -> Result<(), String> {
+    let mut user = ghost_entropy::UserEntropy::new();
+
+    if let Some(path) = &dice_file {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        for (i, c) in raw.chars().filter(|c| !c.is_whitespace()).enumerate() {
+            let face = c
+                .to_digit(10)
+                .ok_or_else(|| format!("die roll {} is '{c}', not a digit", i + 1))?;
+            user.push_die(face as u8)
+                .map_err(|e| format!("die roll {}: {e}", i + 1))?;
+        }
+    }
+    if let Some(path) = &coins_file {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        for (i, c) in raw.chars().filter(|c| !c.is_whitespace()).enumerate() {
+            match c {
+                'h' | 'H' | '1' => user.push_coin(true),
+                't' | 'T' | '0' => user.push_coin(false),
+                other => return Err(format!("coin flip {} is '{other}'; use H/T or 1/0", i + 1)),
+            }
+        }
+    }
+
+    // `digest` enforces the minimum contribution. That floor is not about
+    // safety — mixing means any amount is safe — it is about not letting
+    // somebody believe six rolls bought them something.
+    let user_digest = if user.is_empty() {
+        println!("Entropy: OS CSPRNG only.");
+        println!(
+            "  You can mix in dice or coin flips with --dice-file / --coins-file.\n  \
+             They can only make the seed stronger, never weaker."
+        );
+        None
+    } else {
+        let d = user.digest().map_err(|e| e.to_string())?;
+        println!(
+            "Entropy: OS CSPRNG mixed with {} die rolls and {} coin flips ({:.0} bits of yours).",
+            user.die_rolls(),
+            user.coin_flips(),
+            user.bits()
+        );
+        println!("  Mixed, never substituted — the OS bytes are still there in full.");
+        Some(d)
+    };
+
+    let phrase =
+        ghost_lock::backup_key::new_phrase(user_digest.as_ref()).map_err(|e| e.to_string())?;
+    let pk = ghost_lock::backup_key::public_key(&phrase, "", index).map_err(|e| e.to_string())?;
+
+    println!("\n--- write these words down. They are the only way back. ---");
+    for (i, word) in phrase.split_whitespace().enumerate() {
+        println!("{:>3}. {word}", i + 1);
+    }
+    println!("--- end ---");
+
+    println!(
+        "\npublic key at {}:",
+        ghost_lock::backup_key::derivation_path(index)
+    );
+    println!("{}", hex::encode(pk.serialize()));
+    println!("Register that as the Lock's backup_pubkey.");
+
+    if let Some(path) = &out {
+        write_secret_file(path, &phrase)?;
+        println!("\nAlso written to {} (mode 0600).", path.display());
+        println!("A seed on disk is a seed a backup can copy. The words above are the record.");
+    }
+    Ok(())
+}
+
+/// Write a secret to a new file, owner-readable only.
+fn write_secret_file(path: &PathBuf, body: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Before the contents, so the window where it is world-readable does
+        // not contain a seed.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot secure {}: {e}", path.display()))?;
+    }
+    f.write_all(body.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    f.write_all(b"\n").ok();
+    f.sync_all().ok();
     Ok(())
 }
 

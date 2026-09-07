@@ -410,3 +410,120 @@ fn review_signs_nothing() {
     assert!(text.contains("240000 sats"), "must show the amount: {text}");
     assert!(text.contains("reviewed only"), "{text}");
 }
+
+/// `generate` produces a usable phrase and the key to register with it.
+#[test]
+fn generate_produces_a_phrase_that_derives_its_reported_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("seed.txt");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args(["generate", "--out", out.to_str().unwrap(), "--index", "0"])
+        .output()
+        .expect("runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let phrase = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(phrase.split_whitespace().count(), 24);
+
+    // The key it told you to register must be the key that phrase derives.
+    let derived = ghost_lock::backup_key::public_key(&phrase, "", 0).unwrap();
+    assert!(
+        text.contains(&hex::encode(derived.serialize())),
+        "the reported key must be the one the phrase derives"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a seed file must not be world-readable");
+    }
+}
+
+/// Dice are mixed in, and the same dice do not give the same seed.
+///
+/// If user entropy replaced the OS bytes rather than being mixed with them,
+/// these two runs would collide — and anyone with predictable rolls would have
+/// a predictable seed. That is the failure this asserts against.
+#[test]
+fn the_same_dice_twice_give_different_seeds() {
+    let dir = tempfile::tempdir().unwrap();
+    // 50 rolls: the minimum contribution the module accepts.
+    let rolls = "1234561234561234561234561234561234561234561234561234"
+        .chars()
+        .take(50)
+        .collect::<String>();
+    let dice = dir.path().join("dice.txt");
+    std::fs::write(&dice, &rolls).unwrap();
+
+    let run = |name: &str| {
+        let out = dir.path().join(name);
+        let o = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+            .args([
+                "generate",
+                "--dice-file",
+                dice.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("runs");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        (
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            std::fs::read_to_string(&out).unwrap(),
+        )
+    };
+
+    let (text, first) = run("a.txt");
+    let (_, second) = run("b.txt");
+
+    assert!(
+        text.contains("Mixed, never substituted"),
+        "the output must say what it did with the rolls: {text}"
+    );
+    assert_ne!(
+        first, second,
+        "identical dice must still give different seeds — otherwise the rolls \
+         replaced the OS entropy instead of being mixed with it"
+    );
+}
+
+/// Too few rolls is refused, rather than quietly accepted as if it helped.
+#[test]
+fn a_token_number_of_rolls_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let dice = dir.path().join("dice.txt");
+    std::fs::write(&dice, "123456").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args(["generate", "--dice-file", dice.to_str().unwrap()])
+        .output()
+        .expect("runs");
+    assert!(
+        !output.status.success(),
+        "six rolls must not pass as a contribution"
+    );
+}
+
+/// A non-die character is named, not silently skipped.
+#[test]
+fn a_bad_die_face_is_reported_with_its_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let dice = dir.path().join("dice.txt");
+    std::fs::write(&dice, "1234569").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args(["generate", "--dice-file", dice.to_str().unwrap()])
+        .output()
+        .expect("runs");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("die roll 7"), "must say which roll: {err}");
+}

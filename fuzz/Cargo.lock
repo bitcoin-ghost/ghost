@@ -1836,6 +1836,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-entropy"
+version = "1.11.38"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "ghost-fuzz"
 version = "0.1.0"
 dependencies = [
@@ -1883,6 +1892,7 @@ dependencies = [
  "bip32",
  "bip39",
  "bitcoin",
+ "ghost-entropy",
  "hex",
  "musig2",
  "rand 0.8.5",

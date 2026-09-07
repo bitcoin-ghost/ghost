@@ -16,6 +16,8 @@ pub mod mainnet_guard;
 pub mod psbt;
 pub mod signer;
 pub mod signing_ledger_file;
-pub mod user_entropy;
+/// Re-exported: the implementation moved to `ghost-entropy` so the offline
+/// signer can share it. Unchanged, tags included.
+pub use ghost_entropy as user_entropy;
 pub mod wraith;
 pub mod wraith_signer;

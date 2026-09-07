@@ -12,6 +12,7 @@ description = "Offline co-signer for a Ghost Lock's key path"
 # client, or an async runtime, because it needs none of them: it reads JSON on
 # stdin and writes JSON on stdout.
 [dependencies]
+ghost-entropy = { workspace = true }
 ghost-lock = { workspace = true }
 bitcoin = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

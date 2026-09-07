@@ -19,7 +19,7 @@
 
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::XOnlyPublicKey;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::LockError;
 
@@ -34,6 +34,55 @@ pub const LOCK_COIN_TYPE: u32 = 531;
 /// BIP-86 (`m/86'/…`), because these are Taproot keys.
 pub fn derivation_path(index: u32) -> String {
     format!("m/86'/{LOCK_COIN_TYPE}'/0'/0/{index}")
+}
+
+/// Generate a new seed phrase for a co-signing device.
+///
+/// # The entropy rule, and why it is not "use the OS RNG"
+///
+/// It is that, plus a floor. Every secret starts from the OS CSPRNG, and
+/// optional user entropy is **mixed in, never substituted**:
+///
+/// ```text
+/// seed = SHA256( tag ‖ os_bytes ‖ user_digest )
+/// ```
+///
+/// The mixing is one-directional, which is the whole point. Supplying no
+/// rolls, or entirely predictable ones, leaves the seed exactly as strong as
+/// the OS bytes alone — an attacker still has to break those. Supplying good
+/// rolls means they must break the OS source *and* guess the rolls. There is
+/// no input a user can provide that makes the result weaker.
+///
+/// A "dice only" mode is deliberately not offered: it would make the seed
+/// depend on somebody rolling honestly and well, with no safety net if they
+/// did not.
+///
+/// # Why a floor is worth having at all
+///
+/// With a single source there is nothing to notice a silent degradation.
+/// Coldcard firmware from March 2021 generated seeds through MicroPython's
+/// Yasmarang PRNG rather than the hardware TRNG; effective entropy fell to
+/// about 40 bits on Mk3. The output distribution looked fine — only the seed
+/// *space* was small — and nothing in the device could tell. In July 2026 an
+/// attacker enumerated it and swept roughly 1,816 BTC. Dice give a floor that
+/// does not depend on any implementation being correct.
+///
+/// See [`ghost_entropy`] for collecting rolls and for what one is worth.
+pub fn new_phrase(user_digest: Option<&[u8; 32]>) -> Result<Zeroizing<String>, LockError> {
+    use rand::RngCore;
+
+    let mut os_bytes = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut os_bytes[..])
+        .map_err(|e| LockError::Policy(format!("no secure randomness for a seed: {e}")))?;
+
+    let mut entropy = Zeroizing::new(ghost_entropy::mix_seed_entropy(&os_bytes, user_digest));
+
+    let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy[..])
+        .map_err(|e| LockError::Policy(format!("could not build a seed phrase: {e}")))?;
+    let phrase = Zeroizing::new(mnemonic.to_string());
+    entropy.zeroize();
+    Ok(phrase)
 }
 
 /// Derive the secret key for `index` from a BIP39 phrase.
@@ -83,6 +132,42 @@ mod tests {
     /// A well-known test vector phrase. Never use it for anything.
     const PHRASE: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn a_generated_phrase_is_24_words_and_usable() {
+        let phrase = new_phrase(None).expect("generates");
+        assert_eq!(
+            phrase.split_whitespace().count(),
+            24,
+            "256 bits of entropy is a 24-word phrase"
+        );
+        // It must round-trip through the derivation it exists for.
+        public_key(&phrase, "", 0).expect("the generated phrase must derive a key");
+    }
+
+    #[test]
+    fn two_generated_phrases_differ() {
+        let a = new_phrase(None).unwrap();
+        let b = new_phrase(None).unwrap();
+        assert_ne!(*a, *b, "seeds must not repeat");
+    }
+
+    /// **Mixed, never substituted.**
+    ///
+    /// The same user digest twice must still give different seeds, because the
+    /// OS bytes are re-drawn. If user entropy replaced the OS source rather
+    /// than being mixed with it, these would collide — and a user with
+    /// predictable rolls would have a predictable seed.
+    #[test]
+    fn the_same_dice_do_not_produce_the_same_seed() {
+        let digest = [7u8; 32];
+        let a = new_phrase(Some(&digest)).unwrap();
+        let b = new_phrase(Some(&digest)).unwrap();
+        assert_ne!(
+            *a, *b,
+            "user entropy must be mixed with fresh OS bytes, not substituted for them"
+        );
+    }
 
     #[test]
     fn derivation_is_deterministic() {
