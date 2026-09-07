@@ -95,7 +95,12 @@ impl<'a> Sniffer<'a> {
     ///
     /// Idempotent — aborting an already-finished task is a no-op — so a test may call it on a
     /// sniffer whose peer has already gone.
-    pub fn shutdown(&self) {
+    ///
+    /// `async` with nothing to await, so that `shutdown_all!` can take it: that macro expands to
+    /// `tokio::join!` over each handle's `shutdown()`, which requires futures. A sync method here
+    /// would compile everywhere except the one place a test actually wants to use it, and the
+    /// point of this is to be uniform with `PoolSv2`/`TranslatorSv2`/the JD roles.
+    pub async fn shutdown(&self) {
         if let Ok(mut handles) = self.tasks.lock() {
             for h in handles.drain(..) {
                 h.abort();
