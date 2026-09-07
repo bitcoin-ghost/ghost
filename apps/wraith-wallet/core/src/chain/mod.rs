@@ -7,7 +7,9 @@ mod ghost_pay;
 
 use async_trait::async_trait;
 
+pub mod ghostd_chain;
 pub use ghost_pay::{GhostPayClient, ScanUtxosResponse, ScannedL1Utxo};
+pub use ghostd_chain::GhostdChainClient;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainStatus {
