@@ -518,6 +518,22 @@ async fn ghost_lock_forget(lock_id: String) -> Result<serde_json::Value, String>
     to_value(&resp)
 }
 
+/// Where a round should pay to fund one lane privately.
+///
+/// Asks the daemon rather than reusing the address the lanes view already
+/// holds. The daemon applies the compartment rule — Cash is refused, because
+/// a round would buy unlinkability a public-by-design lane discards on arrival
+/// — and a rule enforced only in the client is enforced only for clients that
+/// ask nicely.
+#[tauri::command]
+async fn ghost_lock_round_destination(
+    lock_id: String,
+    lane: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockRoundDestination { lock_id, lane }).await?;
+    to_value(&resp)
+}
+
 /// The MuSig2 aggregates are derived by the daemon from the individual keys —
 /// BIP-327 aggregation is deterministic, so no ceremony is involved.
 #[tauri::command]
@@ -906,6 +922,7 @@ pub fn run() {
             ghost_lock_save,
             ghost_lock_list,
             ghost_lock_forget,
+            ghost_lock_round_destination,
             wallet_ghost_id,
             wallet_glyph,
             wallet_glyph_claim,

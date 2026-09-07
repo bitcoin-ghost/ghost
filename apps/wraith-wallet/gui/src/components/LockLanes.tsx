@@ -11,6 +11,12 @@
  * - **Custodial.** Investments is the one lane where the quorum can move funds
  *   without you. Hiding that inside a single balance would let a reader assume
  *   all four lanes carry the same risk, and they do not.
+ *
+ * Each lane also says how to put money into it, because the two routes are not
+ * equivalent and the difference is invisible from the address alone: paying a
+ * lane directly publishes the link between those coins and the Lock forever,
+ * while funding it as a round's output does not. Cash says why it cannot be
+ * funded privately rather than silently omitting the option.
  */
 
 import type { GhostLockLane, GhostLockLanes } from "../lib/tauri";
@@ -44,6 +50,22 @@ function LaneRow({ lane }: { lane: GhostLockLane }) {
         )}
       </div>
       <div className="mono muted lane-addr">{lane.address}</div>
+      <p className="muted lane-funding">
+        {lane.round_eligible ? (
+          <>
+            Paying this address directly works, and publishes the link between
+            those coins and this Lock. <code>wraith lock fund</code> runs a
+            round whose output <em>is</em> this address, so the deposit looks
+            like any other round output.
+          </>
+        ) : (
+          <>
+            Public by design, so a round cannot fund it — the unlinkability
+            would be discarded the moment the coin landed. Pay this address
+            directly.
+          </>
+        )}
+      </p>
     </div>
   );
 }

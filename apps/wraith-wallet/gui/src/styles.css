@@ -1354,6 +1354,13 @@ code {
 .lane-settled { font-size: 1.125rem; font-variant-numeric: tabular-nums; }
 .lane-pending { font-size: 0.8125rem; }
 .lane-addr { font-size: 0.75rem; overflow-wrap: anywhere; margin-top: 0.25rem; }
+.lane-funding { font-size: 0.72rem; line-height: 1.45; margin: 0.35rem 0 0; }
+.lane-funding code {
+  font-size: 0.95em;
+  padding: 0.05rem 0.25rem;
+  border-radius: 3px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+}
 .lock-height { margin: 0.75rem 0 0; font-size: 0.8125rem; }
 
 /* Ghost Lock key entry. Public keys only — nothing secret is typed here. */

@@ -870,6 +870,35 @@ export async function ghostLockLanes(
   return unwrap<GhostLockLanes>(resp).payload;
 }
 
+/// Where a round should pay to fund one lane privately.
+export interface GhostLockRoundDestination {
+  lock_id: string;
+  /// The lane, echoed back so a caller cannot mistake which one it asked for.
+  lane: string;
+  label: string;
+  /// The address a round must pay into — the lane itself.
+  address: string;
+}
+
+/// Ask where a round should pay to fund one lane — private entry.
+///
+/// Two ways to put money in a lane, and they are not equivalent:
+///
+/// - **Directly.** Simple, works today, and publishes the link between coins
+///   you are known to control and this Lock, permanently.
+/// - **Through a round.** The round's output IS the lane, so on-chain the
+///   deposit looks like any other round output and nothing ties it to you.
+///
+/// Cash is refused by the daemon: it is public by design, so a round would buy
+/// unlinkability the lane discards the moment the coin lands.
+export async function ghostLockRoundDestination(
+  lockId: string,
+  lane: string,
+): Promise<GhostLockRoundDestination> {
+  const resp = await invoke("ghost_lock_round_destination", { lockId, lane });
+  return unwrap<GhostLockRoundDestination>(resp).payload;
+}
+
 // ----- GSP ---------------------------------------------------------------
 
 export async function gspAuth(): Promise<unknown> {
