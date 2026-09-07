@@ -10,11 +10,24 @@
  * What remains is the replacement: the four-lane Ghost Lock.
  */
 
+import { useEffect, useState } from "react";
 import { GhostLockPanel } from "../components/GhostLockPanel";
+import { EscapePanel } from "../components/EscapePanel";
+import { ghostLockList, type GhostLockRecord } from "../lib/tauri";
 import { HelpTip } from "../components/HelpTip";
 import { HELP_TOPICS } from "../lib/help";
 
 export function Locks() {
+  // Loaded here rather than inside the panel: the escape flow is the one a
+  // person reaches for when something has gone wrong, and it should not open
+  // with an empty dropdown and a button to press.
+  const [locks, setLocks] = useState<GhostLockRecord[]>([]);
+  useEffect(() => {
+    ghostLockList()
+      .then(setLocks)
+      .catch(() => setLocks([]));
+  }, []);
+
   return (
     <div className="screen">
       <div className="page-head">
@@ -37,6 +50,8 @@ export function Locks() {
       </div>
 
       <GhostLockPanel />
+
+      <EscapePanel locks={locks} />
     </div>
   );
 }

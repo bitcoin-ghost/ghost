@@ -518,6 +518,34 @@ async fn ghost_lock_forget(lock_id: String) -> Result<serde_json::Value, String>
     to_value(&resp)
 }
 
+/// What leaving alone needs, and whether the coins are old enough.
+#[tauri::command]
+async fn ghost_lock_escape_plan(
+    lock_id: String,
+    lane: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockEscapePlan { lock_id, lane }).await?;
+    to_value(&resp)
+}
+
+/// Sign a lane's escape leaf with the owner's key.
+#[tauri::command]
+async fn ghost_lock_escape_sign(
+    lock_id: String,
+    lane: String,
+    psbt: String,
+    input_index: u32,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockEscapeSign {
+        lock_id,
+        lane,
+        psbt,
+        input_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
 /// Round 1 of an air-gapped key-path spend.
 #[tauri::command]
 async fn ghost_lock_sign_begin(
@@ -969,6 +997,8 @@ pub fn run() {
             ghost_lock_list,
             ghost_lock_forget,
             ghost_lock_round_destination,
+            ghost_lock_escape_plan,
+            ghost_lock_escape_sign,
             ghost_lock_sign_begin,
             ghost_lock_sign_nonce,
             ghost_lock_sign_complete,

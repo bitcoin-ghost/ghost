@@ -1428,3 +1428,35 @@ code {
 }
 .device-lock-pick { display: flex; gap: 0.5rem; align-items: center; }
 .device-lock-pick select { flex: 1 1 auto; }
+
+/* --- Leaving alone ---------------------------------------------------- */
+.escape-panel h2 { margin-top: 0; }
+.escape-plan { margin-top: 1rem; }
+.escape-plan h3 { margin-bottom: 0.5rem; }
+.escape-plan h4 {
+  margin: 0.9rem 0 0.3rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+.escape-facts { display: grid; gap: 0.35rem; margin-bottom: 0.6rem; }
+.escape-facts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.82rem;
+}
+.escape-addr { overflow-wrap: anywhere; text-align: right; }
+.escape-coins { list-style: none; padding: 0; margin: 0; font-size: 0.82rem; }
+.escape-coins li { padding: 0.2rem 0; }
+.escape-tx {
+  max-height: 8rem;
+  overflow: auto;
+  font-size: 0.7rem;
+  padding: 0.6rem;
+  border-radius: 4px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.1));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

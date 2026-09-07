@@ -899,6 +899,63 @@ export async function ghostLockRoundDestination(
   return unwrap<GhostLockRoundDestination>(resp).payload;
 }
 
+/// A coin in a lane, and whether its escape has matured.
+export interface EscapeCoin {
+  txid: string;
+  vout: number;
+  sats: number;
+  confirmations: number;
+  /// Blocks still to wait. Zero means spendable now.
+  blocks_remaining: number;
+}
+
+/// What an escape spend needs.
+export interface GhostLockEscapePlan {
+  lock_id: string;
+  lane: string;
+  escape: string;
+  delay_blocks: number;
+  /// Every spending input must carry this nSequence. A different value is
+  /// rejected by the network as non-final.
+  required_sequence: number;
+  lane_address: string;
+  coins: EscapeCoin[];
+}
+
+export interface GhostLockEscapeSigned {
+  lock_id: string;
+  lane: string;
+  escape: string;
+  psbt: string;
+  /// The finished transaction, ready to broadcast.
+  tx_hex: string;
+}
+
+/// Ask what leaving alone needs, before building the transaction.
+export async function ghostLockEscapePlan(
+  lockId: string,
+  lane: string,
+): Promise<GhostLockEscapePlan> {
+  const resp = await invoke("ghost_lock_escape_plan", { lockId, lane });
+  return unwrap<GhostLockEscapePlan>(resp).payload;
+}
+
+/// Sign a lane's escape leaf. No quorum, no device, no ceremony.
+export async function ghostLockEscapeSign(args: {
+  lockId: string;
+  lane: string;
+  psbt: string;
+  inputIndex: number;
+}): Promise<GhostLockEscapeSigned> {
+  const resp = await invoke("ghost_lock_escape_sign", {
+    lockId: args.lockId,
+    lane: args.lane,
+    psbt: args.psbt,
+    inputIndex: args.inputIndex,
+  });
+  return unwrap<GhostLockEscapeSigned>(resp).payload;
+}
+
 /// One output of a spend, as a person reads it.
 export interface LockSpendOutput {
   address: string | null;
