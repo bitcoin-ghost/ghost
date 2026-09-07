@@ -124,6 +124,31 @@ mod tests {
         assert!(lane.address.script_pubkey().is_p2tr());
     }
 
+    /// Cash is an ordinary BIP86 output, so the wallet's existing signing
+    /// handles it and no Lock-specific path is needed.
+    ///
+    /// `CashPolicy` builds a lane with the owner as internal key and no
+    /// leaves, which is exactly what BIP86 specifies: tweak the internal key
+    /// with an empty merkle root. If this ever diverged, Cash would look like
+    /// a normal address and refuse to spend like one.
+    #[test]
+    fn cash_is_an_ordinary_bip86_output() {
+        use bitcoin::key::TapTweak;
+        let secp = Secp256k1::new();
+        let owner = key(2);
+        let cash = CashPolicy { owner }
+            .build(&secp, Network::Regtest)
+            .expect("builds");
+
+        let (bip86, _) = owner.tap_tweak(&secp, None);
+        assert_eq!(
+            cash.spend_info.output_key(),
+            bip86,
+            "the Cash lane must be the plain BIP86 output for the owner key"
+        );
+        assert!(cash.spend_info.merkle_root().is_none());
+    }
+
     #[test]
     fn cash_has_no_script_path_at_all() {
         // The only lane with no leaves. A script path would be a way to move
