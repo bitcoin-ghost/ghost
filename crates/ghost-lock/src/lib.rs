@@ -73,6 +73,7 @@ pub mod backup_key;
 pub mod compartment;
 pub mod constants;
 pub mod error;
+pub mod escape;
 pub mod key_agg;
 pub mod lane;
 pub mod nonce_ledger_file;
