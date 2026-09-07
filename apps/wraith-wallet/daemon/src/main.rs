@@ -534,7 +534,27 @@ mod server {
         }
         /// Build a fresh ghost-pay chain client for `urls`, reusing the daemon's
         /// tor proxy + internal-auth secret.
+        /// Build the chain backend.
+        ///
+        /// **The owner's own node wins when it is configured.** Ghost Pay is
+        /// being removed — Ghost Wallet is self-custody on ordinary Bitcoin
+        /// infrastructure — so a wallet that can reach a node should never be
+        /// asking an operator where its money is. Ghost Pay remains only as
+        /// the fallback for a wallet with no node yet, and goes with the rest
+        /// of L2.
         fn build_chain(&self, urls: Vec<String>) -> Result<Arc<dyn ChainClient>, String> {
+            if let Some(rpc) = self.build_ghostd_rpc() {
+                tracing::info!("chain backend: the wallet's own node");
+                return Ok(Arc::new(wraith_wallet_core::chain::GhostdChainClient::new(
+                    rpc,
+                    self.network.to_string(),
+                )));
+            }
+            tracing::warn!(
+                "chain backend: ghost-pay — no ghostd configured, so balances and \
+                 broadcasts go through an operator. Set GHOSTD_URL; this fallback goes \
+                 with the rest of L2."
+            );
             let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
                 urls,
                 self.tor_proxy.as_deref(),
@@ -546,6 +566,31 @@ mod server {
                 }
             }
             Ok(Arc::new(c))
+        }
+
+        /// An RPC connection to the owner's node, if one is configured.
+        ///
+        /// Shared with the election-beacon check rather than built twice: two
+        /// constructions of the same connection drift, and the one that drifts
+        /// is always the one nobody is looking at.
+        fn build_ghostd_rpc(&self) -> Option<wraith_wallet_core::ghostd::GhostdRpc> {
+            use wraith_wallet_core::ghostd::GhostdRpc;
+            let url = self.ghostd_url.as_deref()?;
+            match (
+                self.ghostd_cookie_path.as_ref(),
+                self.ghostd_user.as_deref(),
+                self.ghostd_pass.as_deref(),
+            ) {
+                (Some(cookie), _, _) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ghostd cookie unreadable; falling back");
+                        None
+                    }
+                },
+                (None, Some(u), Some(p)) => Some(GhostdRpc::new(url, u, p)),
+                _ => None,
+            }
         }
 
         /// Apply a node selection at runtime: rebuild the ghost-pay + GSP
