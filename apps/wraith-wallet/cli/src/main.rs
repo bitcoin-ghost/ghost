@@ -68,6 +68,15 @@ enum Command {
         #[command(subcommand)]
         sub: MixCommand,
     },
+    /// Ghost Lock: one account, four compartments.
+    ///
+    /// Savings needs your backup device; Spending co-signs with the Wraith
+    /// quorum; Cash is yours alone and deliberately not private; Investments
+    /// is the one lane the quorum can move without you.
+    Lock {
+        #[command(subcommand)]
+        sub: LockCommand,
+    },
     /// Print a shell-completion script to stdout. Pipe into your shell's
     /// completion location, e.g.:
     ///   wraith completions bash > /etc/bash_completion.d/wraith
@@ -215,19 +224,83 @@ enum MixCommand {
         #[arg(long)]
         bip86_scan_max: Option<u32>,
     },
-    /// Fund one lane of a remembered Lock through a round — private entry.
+}
+
+#[derive(Subcommand)]
+enum LockCommand {
+    /// Every Lock this wallet remembers.
+    List,
+    /// Remember a Lock's definition.
+    ///
+    /// Stores the keys it is built from, not the coins. The lanes are derived
+    /// from these every time, so forgetting a Lock never moves money.
+    Save {
+        /// Optional name, so a list of ids is a list of things.
+        #[arg(long)]
+        label: Option<String>,
+        /// Backup device's x-only key, hex.
+        #[arg(long)]
+        backup_pubkey: String,
+        /// Heir's x-only key, hex.
+        #[arg(long)]
+        heir_pubkey: String,
+        /// Wraith quorum's x-only key, hex.
+        #[arg(long)]
+        quorum_pubkey: String,
+        /// Height the Lock is anchored at — normally the current tip.
+        #[arg(long)]
+        anchor_height: u32,
+        /// Absolute height the inheritance leaf matures at.
+        #[arg(long)]
+        inherit_height: u32,
+        /// BIP86 index for the owner key. Defaults to 0.
+        #[arg(long)]
+        bip86_index: Option<u32>,
+    },
+    /// Forget a Lock's definition. The funds stay exactly where they are.
+    Forget {
+        #[arg(long)]
+        lock_id: String,
+    },
+    /// Show a Lock's four lanes, their addresses and balances.
+    Lanes {
+        #[arg(long)]
+        backup_pubkey: String,
+        #[arg(long)]
+        heir_pubkey: String,
+        #[arg(long)]
+        quorum_pubkey: String,
+        #[arg(long)]
+        anchor_height: u32,
+        #[arg(long)]
+        inherit_height: u32,
+        #[arg(long)]
+        bip86_index: Option<u32>,
+    },
+    /// Where a round should pay to fund one lane privately.
+    ///
+    /// Prints the address without running anything, for when you want to
+    /// drive the round yourself. `lock fund` does both in one step.
+    Destination {
+        #[arg(long)]
+        lock_id: String,
+        /// savings, spending or investments. Cash is refused.
+        #[arg(long)]
+        lane: String,
+    },
+    /// Fund one lane through a round — private entry.
     ///
     /// The round's output IS the lane, so on-chain the deposit looks like any
     /// other round output rather than a transfer from a wallet you are known
-    /// to control. Funding a lane directly works and is simpler; it just
-    /// publishes the link between your existing coins and the Lock.
+    /// to control. Funding a lane directly works too; it just publishes the
+    /// link between those coins and the Lock.
     ///
-    /// You name the lane, not an address: the daemon derives it from the
+    /// You name the lane, never an address: the daemon derives it from the
     /// remembered Lock, so a typo cannot send a round's proceeds to a
     /// stranger. Cash is refused — it is public by design, so a round would
     /// buy unlinkability the lane discards on arrival.
-    FundLock {
-        /// `lock_id` from `wraith mix lock-list`, or the GUI's Locks screen.
+    Fund {
+        /// `lock_id` from `wraith lock list`.
         #[arg(long)]
         lock_id: String,
         /// Lane to fund: savings, spending or investments.
@@ -463,7 +536,8 @@ mod client {
     }
 
     use crate::{
-        ChainCommand, Command, GspCommand, LightCommand, MixCommand, UpdateCommand, WalletCommand,
+        ChainCommand, Command, GspCommand, LightCommand, LockCommand, MixCommand, UpdateCommand,
+        WalletCommand,
     };
 
     pub async fn run(command: Command, json: bool, no_spawn: bool) -> std::process::ExitCode {
@@ -497,13 +571,13 @@ mod client {
         // the user issues one command. The lookup must come first — the round
         // needs the lane's address as its output, and the daemon refuses a
         // lane a round must not pay into before any coin is committed.
-        if let Command::Mix {
-            sub: MixCommand::FundLock { .. },
+        if let Command::Lock {
+            sub: LockCommand::Fund { .. },
         } = &command
         {
-            if let Command::Mix {
+            if let Command::Lock {
                 sub:
-                    MixCommand::FundLock {
+                    LockCommand::Fund {
                         lock_id,
                         lane,
                         coordinator,
@@ -654,6 +728,47 @@ mod client {
                     from_path: from,
                 },
             },
+            Command::Lock { sub } => match sub {
+                LockCommand::List => Request::GhostLockList,
+                LockCommand::Save {
+                    label,
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                } => Request::GhostLockSave {
+                    label,
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                },
+                LockCommand::Forget { lock_id } => Request::GhostLockForget { lock_id },
+                LockCommand::Lanes {
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                } => Request::GhostLockLanes {
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                },
+                LockCommand::Destination { lock_id, lane } => {
+                    Request::GhostLockRoundDestination { lock_id, lane }
+                }
+                // Intercepted above: private entry is two calls, not one.
+                LockCommand::Fund { .. } => unreachable!("lock fund handled above"),
+            },
             Command::Mix { sub } => match sub {
                 MixCommand::PrepareCoin {
                     coordinator,
@@ -756,8 +871,6 @@ mod client {
                         bip86_scan_max,
                     }
                 }
-                // Intercepted above: private entry is two calls, not one.
-                MixCommand::FundLock { .. } => unreachable!("FundLock handled above"),
             },
             // Handled in main() before we reach the runtime; the arm exists
             // here only so the match is exhaustive.
@@ -959,7 +1072,7 @@ mod client {
                 println!("lock:    {}", d.lock_id);
                 println!("lane:    {} ({})", d.label, d.lane);
                 println!("address: {}", d.address);
-                println!("\nfund it with `wraith mix fund-lock`, which runs a round whose");
+                println!("\nfund it with `wraith lock fund`, which runs a round whose");
                 println!("output is this address. Paying it directly also works, and");
                 println!("publishes the link between those coins and the Lock.");
                 std::process::ExitCode::SUCCESS
@@ -2007,6 +2120,119 @@ mod client {
                     return std::process::ExitCode::FAILURE;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own validity check: duplicate flags, bad names, conflicting
+    /// shorts. Cheap, and it fails at test time rather than on first run.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every Lock subcommand parses.
+    ///
+    /// This exists because the CLI shipped with four `GhostLock*` response
+    /// renderers and no commands that could produce them — the wallet could
+    /// format a lock list it had no way to ask for, and a help string pointed
+    /// at a `lock-list` command that did not exist. Nothing caught it because
+    /// nothing parsed the tree. This does.
+    #[test]
+    fn every_lock_subcommand_parses() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["wraith", "lock", "list"],
+            vec!["wraith", "lock", "forget", "--lock-id", "abc"],
+            vec![
+                "wraith",
+                "lock",
+                "destination",
+                "--lock-id",
+                "abc",
+                "--lane",
+                "savings",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "save",
+                "--backup-pubkey",
+                "aa",
+                "--heir-pubkey",
+                "bb",
+                "--quorum-pubkey",
+                "cc",
+                "--anchor-height",
+                "1",
+                "--inherit-height",
+                "2",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "lanes",
+                "--backup-pubkey",
+                "aa",
+                "--heir-pubkey",
+                "bb",
+                "--quorum-pubkey",
+                "cc",
+                "--anchor-height",
+                "1",
+                "--inherit-height",
+                "2",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "fund",
+                "--lock-id",
+                "abc",
+                "--lane",
+                "savings",
+                "--coordinator",
+                "http://127.0.0.1:9100",
+                "--tier",
+                "1m_sats",
+                "--ghost-id",
+                "g",
+                "--utxo",
+                "aa:0",
+                "--utxo-value",
+                "1000000",
+                "--utxo-scriptpubkey",
+                "5120aa",
+            ],
+        ];
+        for argv in cases {
+            let joined = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
+        }
+    }
+
+    /// The lane names the CLI documents are the ones the daemon accepts.
+    ///
+    /// Kept as a literal list rather than derived, because the daemon parses
+    /// these from a string: if someone renames a lane on one side only, this
+    /// is the thing that notices.
+    #[test]
+    fn the_documented_lanes_are_the_daemon_s_lanes() {
+        for lane in ["savings", "spending", "investments", "cash"] {
+            let argv = vec![
+                "wraith",
+                "lock",
+                "destination",
+                "--lock-id",
+                "a",
+                "--lane",
+                lane,
+            ];
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("lane `{lane}`: {e}"));
         }
     }
 }
