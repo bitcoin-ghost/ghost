@@ -2653,10 +2653,12 @@ mod server {
                         .map_err(|e| format!("{label} is not an x-only public key: {e}"))
                 }
 
-                // The owner key comes from the active keystore. Everything else
-                // is supplied: the two aggregates are products of a MuSig2
-                // ceremony with the backup device and the quorum, which the
-                // wallet cannot perform alone and which is not built yet.
+                // The owner key comes from the active keystore; the backup,
+                // heir and quorum keys are supplied. The two MuSig2 aggregates
+                // are DERIVED below, not supplied — BIP-327 key aggregation is a
+                // deterministic function of the public keys, so no ceremony and
+                // no other party online is needed to CREATE a Lock. Interaction
+                // is only required to SIGN a key-path spend.
                 let idx = bip86_index.unwrap_or(0);
                 let network = state.network;
                 let owner_res = with_active_wallet(state, move |_, ks| {
