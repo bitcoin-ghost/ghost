@@ -3393,7 +3393,22 @@ dependencies = [
  "secp256k1 0.29.1",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ghost-lock-signer"
+version = "1.11.38"
+dependencies = [
+ "base64 0.22.1",
+ "bitcoin",
+ "clap",
+ "ghost-lock",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

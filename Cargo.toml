@@ -36,6 +36,7 @@ members = [
     # Ghost Pay L2
     "crates/ghost-keys",
     "crates/ghost-lock",
+    "bins/ghost-lock-signer",
     "crates/ghost-locks",
     "crates/wraith-protocol",
     "crates/ghost-reconciliation",

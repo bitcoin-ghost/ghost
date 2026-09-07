@@ -238,13 +238,13 @@ mod server {
     /// and sharing a file would make one's corruption the other's outage.
     fn ghost_lock_nonce_ledger_for(
         state: &Arc<DaemonState>,
-    ) -> std::io::Result<wraith_wallet_core::nonce_ledger_file::FileNonceLedger> {
+    ) -> std::io::Result<ghost_lock::nonce_ledger_file::FileNonceLedger> {
         let path = state
             .node_config_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("ghost-lock-nonces.json");
-        wraith_wallet_core::nonce_ledger_file::FileNonceLedger::open(path)
+        ghost_lock::nonce_ledger_file::FileNonceLedger::open(path)
     }
 
     fn signing_ledger_for(

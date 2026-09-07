@@ -74,6 +74,7 @@ pub mod constants;
 pub mod error;
 pub mod key_agg;
 pub mod lane;
+pub mod nonce_ledger_file;
 pub mod signing;
 
 pub use compartment::{

@@ -13,7 +13,6 @@ pub mod gsp;
 pub mod keystore;
 pub mod light;
 pub mod mainnet_guard;
-pub mod nonce_ledger_file;
 pub mod psbt;
 pub mod signer;
 pub mod signing_ledger_file;

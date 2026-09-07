@@ -3,7 +3,7 @@
 //! # Why this is not optional
 //!
 //! A MuSig2 secret nonce used for two signatures publishes the signer's key.
-//! `ghost_lock::signing` stops that twice inside one process — the message is
+//! [`crate::signing`] stops that twice inside one process — the message is
 //! bound at nonce creation, and signing consumes the session — but neither
 //! survives the daemon dying between rounds. This does.
 //!
@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ghost_lock::signing::{NonceId, NonceLedger};
+use crate::signing::{NonceId, NonceLedger};
 
 /// File-backed [`NonceLedger`]. Safe for production use.
 #[derive(Debug)]
@@ -131,10 +131,10 @@ impl NonceLedger for FileNonceLedger {
     /// A failed write is an error, not a warning. Returning `Ok` on an
     /// unpersisted burn would hand out a signature the ledger has no record of
     /// — which is the reuse case, one restart later.
-    fn spend(&mut self, id: &NonceId) -> Result<(), ghost_lock::LockError> {
+    fn spend(&mut self, id: &NonceId) -> Result<(), crate::LockError> {
         let key = *id.as_bytes();
         if self.spent.contains(&key) {
-            return Err(ghost_lock::LockError::Policy(format!(
+            return Err(crate::LockError::Policy(format!(
                 "nonce {} has already produced a signature — signing with it again \
                  publishes this key",
                 hex::encode(key)
@@ -146,7 +146,7 @@ impl NonceLedger for FileNonceLedger {
             // read as burned, or a later restart would disagree with this
             // process about what is safe.
             self.spent.remove(&key);
-            return Err(ghost_lock::LockError::Policy(format!(
+            return Err(crate::LockError::Policy(format!(
                 "could not record the nonce burn at {} ({e}); refusing to sign, \
                  because an unrecorded signature is one a restart would let happen \
                  twice",
