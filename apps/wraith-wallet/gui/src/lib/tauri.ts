@@ -899,6 +899,86 @@ export async function ghostLockRoundDestination(
   return unwrap<GhostLockRoundDestination>(resp).payload;
 }
 
+/// One output of a spend, as a person reads it.
+export interface LockSpendOutput {
+  address: string | null;
+  sats: number;
+}
+
+/// What a spend does. Derived by the daemon from the same transaction it
+/// derives the sighash from, so the figures shown and the thing signed cannot
+/// diverge.
+export interface LockSpendSummary {
+  input_index: number;
+  input_sats: number;
+  input_address: string | null;
+  outputs: LockSpendOutput[];
+  fee_sats: number;
+  input_count: number;
+}
+
+export interface GhostLockSignBegun {
+  session: string;
+  summary: LockSpendSummary;
+  /// JSON to carry to the offline device. Contains the whole PSBT, so the
+  /// device recomputes the sighash rather than being told it.
+  device_request: string;
+  our_nonce: string;
+}
+
+export interface GhostLockSignNonced {
+  session: string;
+  device_request: string;
+}
+
+export interface GhostLockSigned {
+  session: string;
+  signature: string;
+  psbt: string;
+}
+
+/// Round 1: review the spend and commit this wallet's nonce.
+export async function ghostLockSignBegin(args: {
+  lockId: string;
+  lane: string;
+  psbt: string;
+  inputIndex: number;
+}): Promise<GhostLockSignBegun> {
+  const resp = await invoke("ghost_lock_sign_begin", {
+    lockId: args.lockId,
+    lane: args.lane,
+    psbt: args.psbt,
+    inputIndex: args.inputIndex,
+  });
+  return unwrap<GhostLockSignBegun>(resp).payload;
+}
+
+/// Round 1 reply. The daemon signs its own share here, burning its nonce
+/// durably first — so no secret nonce is held while you carry the second
+/// payload to the device.
+export async function ghostLockSignNonce(
+  session: string,
+  deviceNonce: string,
+): Promise<GhostLockSignNonced> {
+  const resp = await invoke("ghost_lock_sign_nonce", {
+    session,
+    deviceNonce,
+  });
+  return unwrap<GhostLockSignNonced>(resp).payload;
+}
+
+/// Round 2 reply. Completes the spend.
+export async function ghostLockSignComplete(
+  session: string,
+  devicePartial: string,
+): Promise<GhostLockSigned> {
+  const resp = await invoke("ghost_lock_sign_complete", {
+    session,
+    devicePartial,
+  });
+  return unwrap<GhostLockSigned>(resp).payload;
+}
+
 // ----- GSP ---------------------------------------------------------------
 
 export async function gspAuth(): Promise<unknown> {

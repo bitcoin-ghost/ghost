@@ -518,6 +518,52 @@ async fn ghost_lock_forget(lock_id: String) -> Result<serde_json::Value, String>
     to_value(&resp)
 }
 
+/// Round 1 of an air-gapped key-path spend.
+#[tauri::command]
+async fn ghost_lock_sign_begin(
+    lock_id: String,
+    lane: String,
+    psbt: String,
+    input_index: u32,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSignBegin {
+        lock_id,
+        lane,
+        psbt,
+        input_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Round 1 reply from the device. The daemon signs its own share here.
+#[tauri::command]
+async fn ghost_lock_sign_nonce(
+    session: String,
+    device_nonce: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSignNonce {
+        session,
+        device_nonce,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Round 2 reply from the device. Completes the spend.
+#[tauri::command]
+async fn ghost_lock_sign_complete(
+    session: String,
+    device_partial: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSignComplete {
+        session,
+        device_partial,
+    })
+    .await?;
+    to_value(&resp)
+}
+
 /// Where a round should pay to fund one lane privately.
 ///
 /// Asks the daemon rather than reusing the address the lanes view already
@@ -923,6 +969,9 @@ pub fn run() {
             ghost_lock_list,
             ghost_lock_forget,
             ghost_lock_round_destination,
+            ghost_lock_sign_begin,
+            ghost_lock_sign_nonce,
+            ghost_lock_sign_complete,
             wallet_ghost_id,
             wallet_glyph,
             wallet_glyph_claim,

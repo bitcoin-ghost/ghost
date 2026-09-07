@@ -20,6 +20,7 @@ import { Glyph } from "./screens/Glyph";
 import { Merchant } from "./screens/Merchant";
 import { Reports } from "./screens/Reports";
 import { Locks } from "./screens/Locks";
+import { Device } from "./screens/Device";
 import { History } from "./screens/History";
 import { Network } from "./screens/Network";
 import { Settings } from "./screens/Settings";
@@ -32,6 +33,7 @@ import { FirstRunTour } from "./components/FirstRunTour";
 import { CATEGORY_HELP } from "./lib/help";
 
 type Screen =
+  | "device"
   | "wallet"
   | "receive"
   | "send"
@@ -60,6 +62,7 @@ const NAV_GROUPS: Array<{
       { id: "wallet", label: "Wallet" },
       { id: "history", label: "History" },
       { id: "locks", label: "Locks" },
+      { id: "device", label: "Offline device" },
     ],
   },
   {
@@ -279,6 +282,8 @@ export default function App() {
         return <Reports activeWallet={walletState.active} />;
       case "locks":
         return <Locks />;
+      case "device":
+        return <Device />;
       case "history":
         return <History paymentTick={paymentTick} />;
       case "network":
