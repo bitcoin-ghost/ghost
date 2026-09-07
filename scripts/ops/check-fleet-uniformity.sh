@@ -43,6 +43,17 @@ MIN_EXTRANONCE2_SIZE=7
 # Fields collected per node. Keep the remote side to one ssh round trip per node.
 COLLECT='
   SUDO=$(command -v sudo >/dev/null && echo sudo || echo)
+  # The ghostd peer limit. Not a translator setting, but exactly the kind of per-node value
+  # that drifts silently: the 2026-07-27 raise from 50 to 125 went to production only, and
+  # vm5-vm8 sat at 50 -- pinned at 39/39 inbound, refusing peers -- for six weeks before anyone
+  # measured it (#572). A node at its inbound ceiling gets dropped from public listings by
+  # crawlers, which is the #497/#498 failure. It is invisible per node (the #499 settings page
+  # shows only the node you are looking at, and nobody opens eight dashboards) and obvious the
+  # moment nodes are compared.
+  #
+  # NB: no apostrophes anywhere in this block. COLLECT is a single-quoted shell string, so one
+  # stray quote in a COMMENT terminates it and the whole script fails to parse.
+  printf "maxconn=%s\n"       "$(grep -hE "^maxconnections" /etc/bitcoin/bitcoin.conf 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs)"
   printf "gp_sha=%s\n"        "$(sha256sum /opt/ghost/bin/ghost-pool 2>/dev/null | cut -c1-12)"
   printf "poolsv2_sha=%s\n"   "$(sha256sum /opt/ghost/bin/pool_sv2 2>/dev/null | cut -c1-12)"
   printf "trans_sha=%s\n"     "$(sha256sum /opt/ghost/bin/translator_sv2 2>/dev/null | cut -c1-12)"

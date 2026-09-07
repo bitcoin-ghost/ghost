@@ -1,8 +1,25 @@
+//! The AGGREGATED half of the tproxy JD integration, split out of
+//! `jd_tproxy_integration.rs`.
+//!
+//! ⛔ It has to live in its own file, and the reason is structural rather than stylistic.
+//! `TPROXY_MODE` and `VARDIFF_ENABLED` are process-global `OnceLock`s set from the translator's
+//! config on `start()`. Re-setting them to the SAME value is a no-op, but re-setting to a
+//! DIFFERENT one is fatal on purpose — a single global cannot represent two translators that
+//! disagree, and the alternative is the second silently running under the first one's mode.
+//!
+//! `--test-threads=1` does NOT help: it serialises tests without giving them separate processes.
+//! Each `tests/*.rs` is its own binary, so a file boundary is a process boundary — which is the
+//! only thing that actually separates them.
+//!
+//! Keeping the aggregated and non-aggregated cases in one file meant whichever ran second died
+//! with "TPROXY_MODE re-initialised with a different value", so the target could never report
+//! better than 1 passed / 1 failed (#617).
+
 use integration_tests_sv2::{interceptor::MessageDirection, template_provider::DifficultyLevel, *};
 use stratum_apps::stratum_core::{common_messages_sv2::*, mining_sv2::*};
 
 #[tokio::test]
-async fn jd_non_aggregated_tproxy_integration() {
+async fn jd_aggregated_tproxy_integration() {
     start_tracing();
     let (tp, _tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let (pool, pool_addr, jds_addr, _) =
@@ -25,7 +42,7 @@ async fn jd_non_aggregated_tproxy_integration() {
         start_sniffer("1", jdc_addr, false, vec![], None);
     let (translator, tproxy_addr, _) = start_sv2_translator(
         &[tproxy_jdc_sniffer_addr],
-        false,
+        true,
         vec![],
         vec![],
         None,
@@ -37,8 +54,7 @@ async fn jd_non_aggregated_tproxy_integration() {
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
 
-    // assert that two OpenExtendedMiningChannel messages are present in the queue
-    // because two minerd processes are started
+    // assert that only one OpenExtendedMiningChannel message is present in the queue
     {
         tproxy_jdc_sniffer
             .wait_for_message_type_and_clean_queue(
@@ -46,12 +62,16 @@ async fn jd_non_aggregated_tproxy_integration() {
                 MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
             )
             .await;
-        tproxy_jdc_sniffer
-            .wait_for_message_type_and_clean_queue(
-                MessageDirection::ToUpstream,
-                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
-            )
-            .await;
+        assert!(
+            tproxy_jdc_sniffer
+                .assert_message_not_present(
+                    MessageDirection::ToUpstream,
+                    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                    std::time::Duration::from_secs(2),
+                )
+                .await,
+            "Expected only one OpenExtendedMiningChannel but found another one."
+        );
     }
 
     jdc_pool_sniffer

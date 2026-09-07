@@ -508,6 +508,21 @@ pub struct HealthPing {
     /// Proves computational work was done to create this identity
     #[serde(default)]
     pub pow_proof: Option<(u64, u32)>,
+    /// Whether the SENDER's own Ghost Core was reachable when this ping was built (#778).
+    ///
+    /// ⚠ `Option`, not `bool`, and the distinction is the whole point. Mesh liveness is
+    /// independent of Core: vm8 gossiped `peer_count: 7` for 2h15m on 2026-08-24 while its
+    /// `ghostd` crash-looped 260 times, so a peer being *reachable* says nothing about whether
+    /// it can serve a miner. But a plain bool makes "did not report" and "reported false"
+    /// identical on the wire, which is exactly the ambiguity that made capability flags flap in
+    /// #518 — peers blinked out of the public list because an all-default ping was taken at face
+    /// value.
+    ///
+    /// So: `None` = the sender predates this field; `Some(false)` = it says its Core is down.
+    /// Consumers must treat those differently, or a rolling deploy black-holes routing the
+    /// moment one node out-runs the others.
+    #[serde(default)]
+    pub core_healthy: Option<bool>,
     /// Truncated SHA-256 hashes of miner_ids active in the last N seconds on
     /// the sender. Used by peers to compute a deduplicated mesh-wide active
     /// miner count without leaking miner_ids in cleartext.
@@ -1438,6 +1453,7 @@ mod tests {
             miner_count: 2,
             timestamp: 1,
             pow_proof: None,
+            core_healthy: None,
             active_miner_id_hashes: vec![[1u8; 16], [2u8; 16]],
             local_hashrate_th: 4.0,
             max_capacity: 0,

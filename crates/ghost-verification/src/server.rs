@@ -1151,6 +1151,14 @@ pub struct PoolPeerInfo {
     /// miner that fails over between nodes.
     #[serde(default)]
     pub deduped_miner_count: u32,
+    /// Whether this peer's own Ghost Core was reachable at its last health ping (#778).
+    ///
+    /// `None` = the peer has never reported it (older build, or not yet pinged). The translator
+    /// must treat that as "keep routing here", NOT as unhealthy: assuming the worst on absence
+    /// would divert every miner away from every peer the moment a rolling deploy put one node
+    /// ahead of the rest.
+    #[serde(default)]
+    pub core_healthy: Option<bool>,
     /// The peer's SV1 hobby listener, or `None` if it does not advertise one. The translator
     /// treats absence as "serves the default 3333", which is what every node did before the farm
     /// tier existed (#495).
@@ -1274,13 +1282,26 @@ impl GhostdReaperApply {
     }
 }
 
-/// Memo store behind [`VerificationState::records_cache`]: window name -> (computed at, answer).
+/// Memo store behind [`VerificationState::records_cache`]: window name ->
+/// (computed at, answer, how long the query took).
+///
+/// The measured cost is stored alongside the answer because the TTL is derived from it — see
+/// `adaptive_records_ttl`. Without it the memo would have to assume a cost, and the assumption
+/// has already gone stale once (the hard-coded TTLs were sized for a 20s query that no longer
+/// exists).
 ///
 /// Factored out because clippy rightly refuses the inline form — three nested generics deep is
 /// unreadable at a field declaration.
 pub type RecordsCache = Arc<
     parking_lot::RwLock<
-        std::collections::HashMap<String, (Instant, Option<ghost_storage::models::BestShare>)>,
+        std::collections::HashMap<
+            String,
+            (
+                Instant,
+                Option<ghost_storage::models::BestShare>,
+                std::time::Duration,
+            ),
+        >,
     >,
 >;
 
@@ -1389,8 +1410,11 @@ pub struct VerificationState {
     /// `proxy_read_timeout 10s`.
     ///
     /// The result barely moves between requests, so it is memoised rather than recomputed. The TTL
-    /// is per window (see `records_ttl`), because how fast the answer can change differs by three
-    /// orders of magnitude between `block` and `month`.
+    /// is the SHORTER of a per-window ceiling (see `records_ttl`, because how fast the answer can
+    /// change differs by three orders of magnitude between `block` and `month`) and a term
+    /// proportional to the query's own measured cost (see `adaptive_records_ttl`). The cost term
+    /// is what keeps the memo honest: the window is cheap or expensive depending on how much of
+    /// the frozen `shares_archive` still falls inside it, and that shrinks every day.
     ///
     /// `Option<BestShare>` is cached, not `Result`: a MISS is a legitimate answer worth caching
     /// (a quiet window genuinely has no record), whereas an error must not be, or one transient
@@ -2995,7 +3019,18 @@ impl VerificationState {
     /// Get health response
     pub async fn get_health(&self) -> HealthResponse {
         let core = self.get_core_health.as_ref().map(|probe| probe());
+        // #537 counters. `None` when no database is wired (the verification server can run
+        // without one), which serialises as absent rather than as a misleading zero.
+        let db_connection = self.database.as_ref().map(|_| {
+            let (calls, micros, slow) = ghost_storage::Database::connection_stats();
+            crate::challenge::DbConnectionStats {
+                calls,
+                total_ms_held: micros / 1_000,
+                slow_calls: slow,
+            }
+        });
         HealthResponse {
+            db_connection,
             mesh_validation: self.get_mesh_validation.as_ref().map(|p| p()),
             convergence_channels: self.get_convergence_channels.as_ref().map(|p| p()),
             // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it

@@ -52,7 +52,7 @@ use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::share_shard::{
     discharged_micro_work, epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS,
-    RETENTION_EPOCHS,
+    ORPHAN_EVIDENCE_MAX_AGE_SECS, RETENTION_EPOCHS,
 };
 use ghost_common::types::ShareProof;
 use ghost_common::work_fold::{canonical_sort, creditable_difficulty};
@@ -143,6 +143,9 @@ pub struct FoldReport {
     /// a counter that only speaks when non-zero cannot be told apart from one that stopped
     /// running, which is the trap #822 was raised for.
     pub swept_expired: usize,
+    /// Orphaned FOREIGN rows reaped (#834) — peers' shares whose `round_id` this node has no
+    /// round for, so no epoch is derivable and no height-keyed reaper can see them.
+    pub orphans_reaped: usize,
 }
 
 /// One epoch's fold outcome.
@@ -1705,12 +1708,26 @@ impl ShardRuntime {
         // has not applied still shares `shares` with the legacy ledger, and deleting there would
         // take money the old path would have paid.
         let mut swept = 0usize;
+        let mut orphans_reaped = 0usize;
         if self.owns_evidence {
             if let Some(expired) = expired_epoch {
                 swept = self
                     .db
                     .shard_reap_evidence_through_epoch(expired, EPOCH_BLOCKS)?;
             }
+
+            // #834: orphaned FOREIGN evidence — a peer's share whose `round_id` has no row in
+            // this node's `rounds`, so no epoch can be derived and every height-keyed reaper
+            // (including the sweep above) inner-joins straight past it. 43,431 rows on vm1 and
+            // 36,850 on vm5, and the last unbounded axis after #830/#831/#833.
+            //
+            // Own rows are excluded inside the query and that is a safety condition, not a
+            // filter: an own orphan could never have been folded either, so its work may never
+            // have reached a counter. Measured 0 on the fleet; the guard keeps it so.
+            orphans_reaped = self.db.shard_reap_orphaned_foreign_evidence(
+                &self.received_by,
+                ORPHAN_EVIDENCE_MAX_AGE_SECS,
+            )?;
         }
 
         // Only after the transaction has committed does the in-memory table move — a failed
@@ -1730,6 +1747,7 @@ impl ShardRuntime {
             expired_epoch,
             evidence_dropped,
             swept_expired: swept,
+            orphans_reaped,
         };
         info!(
             epoch,
@@ -1737,6 +1755,7 @@ impl ShardRuntime {
             addresses = report.addresses,
             evidence_dropped,
             swept_expired = report.swept_expired,
+            orphans_reaped = report.orphans_reaped,
             "share shard: epoch folded"
         );
         Ok(FoldOutcome::Folded(report))

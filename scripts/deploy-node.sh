@@ -931,6 +931,53 @@ if [ "$BINARY" = "ghost-pool" ]; then
     info "config gate: parses with the incoming binary, no dead keys, mining_mode set"
 fi
 
+# ------------------------------------------------------- ops script convergence (#759)
+#
+# Deploy swaps binaries and, above, checks config. Nothing has ever converged the OPS SCRIPTS,
+# so they froze at whatever each node was INSTALLED with. `install-node.sh` embeds a copy of the
+# watchdog (CI keeps the two in step via check-inlined-copies.sh), which means a node built today
+# is current and a node built in March never changes again.
+#
+# Measured 2026-09-06: `ghost-restart-watch.sh` was stale on ALL EIGHT nodes — 157 lines against
+# the repo's 252. The missing 95 were the liveness check added in #814: the one that detects a
+# unit which is `active`, has NEVER restarted, and is serving nothing. That is exactly the vm2
+# translator deadlock of #812 — held no listener for ~45 minutes while `systemctl is-active` said
+# `active` and NRestarts stayed 0. So the fleet was running a watchdog blind to the specific
+# failure it had been extended to catch, and `check-fleet-uniformity.sh` reported it for weeks
+# with no one to act on it, because no tool owned the fix.
+#
+# Converge rather than refuse. A stale watchdog is not a reason to abandon a binary roll, and
+# refusing here would just block deploys on something the deploy itself can fix. The install is
+# idempotent and independent of the binary.
+#
+# ⚠ Deliberately BEFORE the swap: the watchdog is what notices a node that comes back wrong, so
+# it should be current before the risky step, not after it.
+WATCHDOG_SRC="$REPO_ROOT/scripts/ghost-restart-watch.sh"
+if [ -r "$WATCHDOG_SRC" ]; then
+    want_sha="$(sha256sum "$WATCHDOG_SRC" | cut -d" " -f1)"
+    have_sha="$(timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" \
+        "sha256sum /opt/ghost/bin/ghost-restart-watch.sh 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)"
+    if [ "$want_sha" != "$have_sha" ]; then
+        info "ops: watchdog is stale (node ${have_sha:0:8}, repo ${want_sha:0:8}) — converging"
+        if "$REPO_ROOT/scripts/ops/install-restart-watch.sh" "$NODE" >/dev/null 2>&1; then
+            # Verify the outcome, never the command's own report: re-read the hash off the node.
+            got="$(timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" \
+                "sha256sum /opt/ghost/bin/ghost-restart-watch.sh 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)"
+            if [ "$got" = "$want_sha" ]; then
+                info "ops: watchdog converged"
+            else
+                echo "  WARN: watchdog install reported success but the node still has ${got:0:8}" >&2
+            fi
+        else
+            # Not fatal: this does not affect whether the incoming binary is good.
+            echo "  WARN: could not converge the watchdog on $NODE — deploy continues" >&2
+            echo "        fix with: scripts/ops/install-restart-watch.sh $NODE" >&2
+        fi
+    else
+        info "ops: watchdog current"
+    fi
+fi
+
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
 timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
 set -e

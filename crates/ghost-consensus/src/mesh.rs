@@ -310,6 +310,14 @@ pub struct MeshNetwork {
     /// virtual-block height, gossiped in health pings. `None` when ghost-pay
     /// isn't running / the tip is unknown; absent provider → `None` in the ping.
     l2_height_fn: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
+    /// Application-provided callback reporting whether this node's own Ghost Core is reachable,
+    /// gossiped in health pings so peers can route around a node whose `ghostd` is down (#778).
+    ///
+    /// Absent provider → `None` in the ping, which peers read as "not reported" rather than
+    /// "unhealthy". Mesh liveness is independent of Core — vm8 gossiped normally for 2h15m while
+    /// its ghostd crash-looped 260 times — so without this the mesh simply cannot express the
+    /// difference.
+    core_healthy_fn: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Hardware-derived effective capacity advertised in health pings.
     /// `0` means we haven't computed it yet (mesh started before capacity
     /// init); peers treat it as unknown and skip utilisation routing for us.
@@ -1495,6 +1503,7 @@ impl MeshNetwork {
             l1_height_fn: None,
             uptime_percent_fn: None,
             l2_height_fn: None,
+            core_healthy_fn: None,
             max_capacity: AtomicU32::new(0),
             coordinator_sessions: AtomicU32::new(0),
         })
@@ -1619,6 +1628,16 @@ impl MeshNetwork {
     /// the L2 tip isn't known yet.
     pub fn set_l2_height_provider(&mut self, f: Arc<dyn Fn() -> Option<u64> + Send + Sync>) {
         self.l2_height_fn = Some(f);
+    }
+
+    /// Set the provider reporting whether this node's own Ghost Core is reachable (#778).
+    ///
+    /// Wired from ghost-pool, which owns the RPC liveness probe. If it is never set, every ping
+    /// carries `None` and peers keep routing to this node as before — the safe direction, since
+    /// assuming the worst would divert traffic away from a perfectly healthy node whose only
+    /// fault is running an older binary.
+    pub fn set_core_healthy_provider(&mut self, f: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.core_healthy_fn = Some(f);
     }
 
     /// Collect the best (rarest) record per window across the mesh: every
@@ -3570,6 +3589,7 @@ impl MeshNetwork {
                     .unwrap_or(self.peers.peer_count() as u32),
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
                 pow_proof,
+                core_healthy: self.core_healthy_fn.as_ref().map(|f| f()),
                 active_miner_id_hashes,
                 local_hashrate_th,
                 max_capacity: self.max_capacity.load(Ordering::Relaxed),

@@ -340,6 +340,25 @@ pub fn apply_pending_restore(db_path: &Path) -> GhostResult<bool> {
     Ok(true)
 }
 
+/// How long a single `with_connection` call may take before it is worth a line in the log.
+///
+/// 250ms is chosen against measurement, not taste: individual statements on this fleet time at
+/// 0.03s (vm1) to 0.21s (vm6), so anything past 250ms is either an unusually heavy query or --
+/// far more often -- time spent WAITING for the mutex behind a caller that already holds it.
+/// Either way it is the interesting case, and at normal rates it logs nothing.
+const SLOW_DB_CALL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Cumulative `with_connection` statistics (#537), read via [`Database::connection_stats`].
+///
+/// The point is to make an invisible problem countable. #537 could establish that the mechanism
+/// was real but not that it caused any particular stall, because proving that "needs
+/// tokio-console or the runtime's blocking-task detection during a slow window" -- a tool nobody
+/// runs in production. Total time held is the number that settles it: compare it against wall
+/// clock times worker count and the answer stops being a matter of opinion.
+static DB_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DB_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DB_SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Database {
     /// Open a database at the given path
     ///
@@ -515,7 +534,7 @@ impl Database {
         // Set user_version on the encrypted database so migrations don't re-run
         {
             let enc_conn = Connection::open(&encrypted_path)
-                .map_err(|e| GhostError::Database(e.to_string()))?;
+                .map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))?;
             enc_conn
                 .pragma_update(None, "key", format!("x'{}'", key_hex))
                 .map_err(|e| GhostError::Database(format!("SQLCipher PRAGMA key: {}", e)))?;
@@ -654,13 +673,51 @@ impl Database {
         Ok(())
     }
 
+    /// `(calls, total_micros_held, slow_calls)` since process start (#537).
+    ///
+    /// `total_micros_held` counts lock acquisition AND the closure, because both are time the
+    /// calling thread is unavailable to the runtime -- which is the quantity that matters. If it
+    /// approaches `wall_clock x worker_threads`, the runtime is saturated on database work, and
+    /// no amount of reasoning about individual query times will explain the stalls.
+    pub fn connection_stats() -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            DB_CALLS.load(Relaxed),
+            DB_MICROS.load(Relaxed),
+            DB_SLOW_CALLS.load(Relaxed),
+        )
+    }
+
     /// Execute a function with the database connection
+    ///
+    /// ⚠ This BLOCKS the calling thread. `write_conn` is a `parking_lot::Mutex`, which does not
+    /// yield, so calling this from an async context parks the tokio worker it runs on rather
+    /// than returning it to the runtime (#537). Prefer `spawn_blocking` at the call site in
+    /// async code.
     pub fn with_connection<F, T>(&self, f: F) -> GhostResult<T>
     where
         F: FnOnce(&Connection) -> GhostResult<T>,
     {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Timed from BEFORE the lock: waiting for it is exactly as blocking as holding it, and
+        // under contention the wait is the larger half. Timing only the closure would report the
+        // system healthiest precisely when it is worst.
+        let started = std::time::Instant::now();
         let conn = self.inner.write_conn.lock();
-        f(&conn)
+        let out = f(&conn);
+        drop(conn);
+        let elapsed = started.elapsed();
+        DB_CALLS.fetch_add(1, Relaxed);
+        DB_MICROS.fetch_add(elapsed.as_micros() as u64, Relaxed);
+        if elapsed >= SLOW_DB_CALL {
+            DB_SLOW_CALLS.fetch_add(1, Relaxed);
+            tracing::warn!(
+                held_ms = elapsed.as_millis(),
+                "database connection held past the slow threshold -- on a 2-CPU node this parks \
+                 a tokio worker for the duration (#537)"
+            );
+        }
+        out
     }
 
     /// Execute a function with the database connection, with retry logic for transient errors
@@ -1618,6 +1675,50 @@ impl DatabaseStats {
 
 #[cfg(test)]
 mod tests {
+    /// The #537 counters must actually count. A metric that never moves is worse than none: it
+    /// answers "is the database blocking the runtime?" with a confident zero.
+    ///
+    /// Deltas, not absolutes — these are process-global statics and the test binary shares them
+    /// with every other test in this module, so asserting `calls == 1` would pass or fail on
+    /// ordering rather than on behaviour.
+    #[test]
+    fn connection_stats_move_when_the_connection_is_used() {
+        let db = super::Database::in_memory().expect("in-memory database");
+        let (calls_before, micros_before, _) = super::Database::connection_stats();
+
+        db.with_connection(|conn| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS t537 (x INTEGER)")
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("with_connection");
+
+        let (calls_after, micros_after, _) = super::Database::connection_stats();
+        assert!(
+            calls_after > calls_before,
+            "call counter did not move: {calls_before} -> {calls_after}"
+        );
+        assert!(
+            micros_after >= micros_before,
+            "held-time counter went backwards: {micros_before} -> {micros_after}"
+        );
+    }
+
+    /// The slow threshold must sit above the measured normal case and below the pathological one.
+    ///
+    /// Individual statements time at 0.03s (vm1) to 0.21s (vm6). A threshold at or under that
+    /// logs on every ordinary query and the warning becomes noise nobody reads; far above it and
+    /// a multi-second stall passes unremarked.
+    #[test]
+    fn the_slow_call_threshold_brackets_the_measured_range() {
+        assert!(
+            super::SLOW_DB_CALL > std::time::Duration::from_millis(213),
+            "threshold must sit above the slowest measured normal query (vm6, 0.213s)"
+        );
+        assert!(
+            super::SLOW_DB_CALL <= std::time::Duration::from_secs(1),
+            "a threshold above 1s would not fire on the multi-second stalls this exists to catch"
+        );
+    }
 
     /// ⛔ The retention floor is TWO seven-day windows, not one.
     ///

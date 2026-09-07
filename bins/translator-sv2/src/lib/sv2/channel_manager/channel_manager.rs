@@ -53,6 +53,19 @@ const AGGREGATED_MODE_TRANSLATOR_SEARCH_SPACE_BYTES: usize = 4;
 /// connections while maintaining proper isolation and state management.
 #[derive(Debug, Clone)]
 pub struct ChannelManager {
+    /// Upstream messages that named a channel this manager does not hold (#823).
+    ///
+    /// Counted rather than logged per occurrence. A `NewExtendedMiningJob`, `SetNewPrevHash` or
+    /// `SetTarget` can legitimately arrive for a channel that has just closed: the fleet sees
+    /// ~11,500 downstream disconnects per node per day, and upstream does not learn of a close
+    /// until its own bookkeeping catches up, so a message already in flight names a channel that
+    /// is gone by the time it lands. That is channel churn, not a fault.
+    ///
+    /// It was logged at ERROR per message. On vm1 that produced a steady stream that read as a
+    /// live problem and was investigated twice (#823). The count still surfaces — every 500, at
+    /// INFO — so a genuine change in rate is visible while routine churn is not mistaken for
+    /// breakage.
+    pub unknown_channel_messages: Arc<std::sync::atomic::AtomicU64>,
     pub channel_state: ChannelState,
     /// Extensions that the translator supports (will request if required by server)
     pub supported_extensions: Vec<u16>,
@@ -130,6 +143,7 @@ impl ChannelManager {
         );
 
         Self {
+            unknown_channel_messages: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             channel_state,
             supported_extensions,
             required_extensions,

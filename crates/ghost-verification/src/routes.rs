@@ -3152,13 +3152,16 @@ async fn api_miner_history_handler(
 ///
 /// The miner ID is returned in redacted form to preserve privacy while
 /// still giving enough of a handle to recognise one's own worker.
-/// How long a `pool/records` answer stays fresh, by window.
+/// CEILING on how long a `pool/records` answer may be served, by window.
 ///
-/// Deliberately not one number. `block` is a 600s window that turns over constantly and is cheap
-/// to compute (6ms), so caching it hard would show users a stale record for no gain. `month` is a
-/// 30-day window whose record changes maybe once a week and costs 7-20s, so it is the opposite
-/// trade. Anything not recognised gets the shortest TTL — an unknown window is not a licence to
-/// serve stale data.
+/// Deliberately not one number. `block` is a 600s window that turns over constantly, so caching
+/// it hard would show users a stale record for no gain. `month` is a 30-day window whose record
+/// changes maybe once a week, so it is the opposite trade. Anything not recognised gets the
+/// shortest TTL — an unknown window is not a licence to serve stale data.
+///
+/// This is only the ceiling. The TTL actually used is the shorter of this and the cost-derived
+/// term from [`adaptive_records_ttl`], so a window that has become cheap is served fresh even
+/// though its ceiling stayed generous.
 fn records_ttl(window: &str) -> std::time::Duration {
     use std::time::Duration;
     match window {
@@ -3167,6 +3170,37 @@ fn records_ttl(window: &str) -> std::time::Duration {
         "day" => Duration::from_secs(60),
         _ => Duration::from_secs(15),
     }
+}
+
+/// How long to serve a memoised `pool/records` answer, given what the query actually cost.
+///
+/// The old TTLs were fixed numbers chosen when `window=month` measured 7-20s. That number was a
+/// property of the DATA, not the query: the month window's cost is dominated by how many rows of
+/// the frozen `shares_archive` still fall inside it, and the archive stopped being written at the
+/// v56 cutover. Measured on ghost-vm6 2026-09-06 — archive newest row 18.7 days old, 550,321
+/// archive rows still inside the 30-day window against 55,760 live ones, and the month query
+/// answering in ~0.6s rather than the ~20s the constants were sized for. As the frozen archive
+/// ages past the 30-day boundary that term goes to zero on its own and the window converges on
+/// the live-shares-only cost (95ms, measured). A hard-coded 300s would then be five minutes of
+/// staleness bought for nothing — which is #687.
+///
+/// So spend a fixed FRACTION of the node's time on the query instead of a fixed interval:
+/// recomputing every `COST_MULTIPLE` times its own duration caps the duty cycle at
+/// `1 / COST_MULTIPLE` no matter what the query costs. At 60 that is under 2%. The answer then
+/// gets fresher automatically as the data gets cheaper, and — the direction that actually
+/// matters — a node whose query REGRESSES backs off by itself instead of melting, which is the
+/// protection the fixed ceiling was really providing.
+///
+/// Clamped at both ends: never thrash a genuinely cheap window, never exceed the window ceiling.
+fn adaptive_records_ttl(window: &str, measured: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    /// Recompute after this many multiples of the query's own cost — a duty-cycle cap of 1/60.
+    const COST_MULTIPLE: u32 = 60;
+    /// Never recompute more often than this, however cheap the query looks.
+    const MIN_TTL: Duration = Duration::from_secs(5);
+
+    let cost_derived = measured.saturating_mul(COST_MULTIPLE).max(MIN_TTL);
+    cost_derived.min(records_ttl(window))
 }
 
 async fn api_pool_records_handler(
@@ -3241,11 +3275,14 @@ async fn api_pool_records_handler(
     // out, so a slightly stale answer is a slightly conservative one, never a wrong kind of
     // thing — and the client already tolerates that, because it caches records itself and
     // enforces window monotonicity.
-    let ttl = records_ttl(&window_name);
     let cache_hit = {
         let cache = state.records_cache.read();
         match cache.get(&window_name) {
-            Some((at, v)) if at.elapsed() < ttl => Some(v.clone()),
+            // The TTL is derived from what the query cost LAST time, so it is read from the
+            // entry rather than computed from the window alone.
+            Some((at, v, cost)) if at.elapsed() < adaptive_records_ttl(&window_name, *cost) => {
+                Some(v.clone())
+            }
             _ => None,
         }
     };
@@ -3254,6 +3291,7 @@ async fn api_pool_records_handler(
         Some(v) => v,
         None => {
             let db_best = db.clone();
+            let started = std::time::Instant::now();
             let fresh =
                 match tokio::task::spawn_blocking(move || db_best.get_best_share_since(since_ts))
                     .await
@@ -3272,11 +3310,21 @@ async fn api_pool_records_handler(
                         }));
                     }
                 };
+            // Measured AFTER the error arm returns, so a fast failure can never be recorded as
+            // a cheap success and drive the TTL down.
+            let measured = started.elapsed();
+            let ttl = adaptive_records_ttl(&window_name, measured);
+            tracing::debug!(
+                window = %window_name,
+                cost_ms = measured.as_millis(),
+                ttl_s = ttl.as_secs(),
+                "pool records: recomputed"
+            );
             // Only a successful read is cached — an error returns above without poisoning the
             // memo, or one transient failure would be served for the whole TTL.
             state.records_cache.write().insert(
                 window_name.clone(),
-                (std::time::Instant::now(), fresh.clone()),
+                (std::time::Instant::now(), fresh.clone(), measured),
             );
             fresh
         }
@@ -12393,6 +12441,87 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cheap query must be served fresh, not held for the window ceiling.
+    ///
+    /// This is #687 stated as a test. The month ceiling is 300s and was chosen when the query
+    /// measured ~20s; the same query now measures ~0.6s and converges on 95ms as the frozen
+    /// `shares_archive` ages out of the 30-day window. Holding a 95ms answer for five minutes is
+    /// staleness bought for nothing.
+    #[test]
+    fn a_cheap_query_is_not_cached_for_the_window_ceiling() {
+        let cheap = adaptive_records_ttl("month", std::time::Duration::from_millis(95));
+        assert!(
+            cheap < records_ttl("month"),
+            "a 95ms query must not be held for the 300s month ceiling — got {cheap:?}"
+        );
+        // 95ms * 60 = 5.7s, above the 5s floor, so the cost term is what is binding here.
+        assert!(
+            cheap < std::time::Duration::from_secs(10),
+            "a 95ms query should be recomputed within seconds — got {cheap:?}"
+        );
+
+        // Today's measured cost lands in between: fresher than the ceiling, not thrashing.
+        let today = adaptive_records_ttl("month", std::time::Duration::from_millis(600));
+        assert!(
+            today > std::time::Duration::from_secs(15) && today < records_ttl("month"),
+            "a 0.6s query should be held tens of seconds, not five minutes — got {today:?}"
+        );
+    }
+
+    /// An EXPENSIVE query must back off, and never past its window ceiling.
+    ///
+    /// This is the direction that protects the node. The duty cycle is what is being held
+    /// constant, so the guarantee is a ratio, not a number: however slow the query gets, the time
+    /// spent recomputing it stays a small fraction of the time spent serving it.
+    #[test]
+    fn an_expensive_query_backs_off_but_never_past_the_ceiling() {
+        let slow = adaptive_records_ttl("month", std::time::Duration::from_secs(20));
+        assert_eq!(
+            slow,
+            records_ttl("month"),
+            "a 20s query must be clamped to the window ceiling, not cached for 20 minutes"
+        );
+
+        // Ordering must hold across the whole cost range: slower query, never-shorter TTL.
+        let mut prev = std::time::Duration::ZERO;
+        for ms in [1u64, 10, 95, 600, 5_000, 60_000] {
+            let ttl = adaptive_records_ttl("month", std::time::Duration::from_millis(ms));
+            assert!(
+                ttl >= prev,
+                "TTL must not shrink as the query gets slower ({ms}ms)"
+            );
+            assert!(
+                ttl <= records_ttl("month"),
+                "TTL must never exceed the window ceiling ({ms}ms)"
+            );
+            prev = ttl;
+        }
+    }
+
+    /// A cheap window must not be recomputed on literally every request.
+    ///
+    /// `block` costs ~6ms; without the floor the cost term would be 0.36s, so a page polling
+    /// four windows would drive the query continuously for no freshness a user could perceive.
+    #[test]
+    fn a_trivially_cheap_query_still_gets_a_floor() {
+        let ttl = adaptive_records_ttl("block", std::time::Duration::from_millis(6));
+        assert!(
+            ttl >= std::time::Duration::from_secs(5),
+            "even a 6ms query needs a floor, or the memo stops being a memo — got {ttl:?}"
+        );
+    }
+
+    /// The ceiling still applies to an unrecognised window.
+    #[test]
+    fn an_unknown_window_is_capped_even_when_the_query_is_slow() {
+        let ttl = adaptive_records_ttl("decade", std::time::Duration::from_secs(30));
+        assert_eq!(
+            ttl,
+            records_ttl("decade"),
+            "an unknown window must not inherit a long TTL from a slow query"
+        );
+    }
 
     /// The records TTL must be ordered by how fast each window can actually change, and an
     /// unrecognised window must get the SHORTEST one.

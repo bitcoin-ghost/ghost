@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-ghost-tests"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_core_sv2"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin-capnp-types",
@@ -3177,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-accounting"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "ed25519-dalek",
@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-buds"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -3201,11 +3201,11 @@ dependencies = [
 
 [[package]]
 name = "ghost-build-info"
-version = "1.11.35"
+version = "1.11.38"
 
 [[package]]
 name = "ghost-cli"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "anyhow",
  "clap",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-common"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-consensus"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3283,7 +3283,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-glyph"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "axum 0.7.9",
  "bitcoin",
@@ -3327,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp-bin"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp-proto"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-keys"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bech32",
  "chacha20poly1305",
@@ -3394,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-locks"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-miner-proxy"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "anyhow",
  "clap",
@@ -3451,7 +3451,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-pay"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3496,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-policy"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-pool"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -3561,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reaper"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reconciliation"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -3589,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-setup"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "clap",
  "dirs 5.0.1",
@@ -3598,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-stats"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-storage"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-tap-core"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3673,7 +3673,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-tap-desktop"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "dirs 6.0.0",
  "getrandom 0.2.17",
@@ -3699,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-tap-integration"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "ghost-gsp-proto",
  "ghost-tap-core",
@@ -3712,7 +3712,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-verification"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
@@ -4708,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "jd_client_sv2"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin_core_sv2",
@@ -4724,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "jd_server_sv2"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-channel 1.9.0",
  "async-trait",
@@ -6291,7 +6291,7 @@ dependencies = [
 
 [[package]]
 name = "pool_sv2"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin_core_sv2",
@@ -8103,7 +8103,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-channel 1.9.0",
  "axum 0.8.9",
@@ -9366,7 +9366,7 @@ dependencies = [
 
 [[package]]
 name = "translator_sv2"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-channel 1.9.0",
  "clap",
@@ -10717,7 +10717,7 @@ checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 
 [[package]]
 name = "wraith-coordinator"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -10750,7 +10750,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-protocol"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
@@ -10770,7 +10770,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-cli"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "clap",
  "clap_complete",
@@ -10786,7 +10786,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-core"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -10824,7 +10824,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-daemon"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -10851,7 +10851,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-gui"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "interprocess",
  "serde",
@@ -10866,7 +10866,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-ipc"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "interprocess",
  "libc",
