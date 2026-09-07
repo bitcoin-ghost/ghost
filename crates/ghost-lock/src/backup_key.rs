@@ -36,6 +36,57 @@ pub fn derivation_path(index: u32) -> String {
     format!("m/86'/{LOCK_COIN_TYPE}'/0'/0/{index}")
 }
 
+/// Derivation account for quorum keys, kept apart from an owner's `0'`.
+///
+/// A quorum's seed and an owner's seed are different secrets held by different
+/// people; separating the accounts means a path collision cannot make one
+/// derive the other's key even if a seed were ever shared by mistake.
+pub const QUORUM_ACCOUNT: u32 = 1;
+
+/// The path a quorum derives its key for one Lock at.
+///
+/// # One key per Lock, not one key for all of them
+///
+/// Deterministic derivation makes per-Lock keys free, and the alternative is
+/// costly: a single quorum key appears in every Lock it guards, so anyone who
+/// sees two addresses can tell they answer to the same quorum. Per-Lock keys
+/// leave nothing to correlate.
+///
+/// The index comes from the Lock's own id, so both sides reach it without
+/// storing a mapping — the quorum does not need a database to know which key
+/// belongs to which Lock, and losing one could not orphan a Lock.
+///
+/// Two levels of 31 bits, because BIP32 indices are 31 bits unhardened and one
+/// level would leave a collision rate worth thinking about. At 62 bits it is
+/// not.
+pub fn quorum_derivation_path(lock_id: &str) -> String {
+    use bitcoin::hashes::{sha256, Hash as _};
+    let h = sha256::Hash::hash(lock_id.trim().as_bytes()).to_byte_array();
+    let hi = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) & 0x7fff_ffff;
+    let lo = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) & 0x7fff_ffff;
+    format!("m/86'/{LOCK_COIN_TYPE}'/{QUORUM_ACCOUNT}'/{hi}/{lo}")
+}
+
+/// The quorum's secret key for one Lock.
+pub fn quorum_secret_key(
+    phrase: &str,
+    passphrase: &str,
+    lock_id: &str,
+) -> Result<SecretKey, LockError> {
+    derive_at(phrase, passphrase, &quorum_derivation_path(lock_id))
+}
+
+/// The quorum's public key for one Lock — what goes in the Lock.
+pub fn quorum_public_key(
+    phrase: &str,
+    passphrase: &str,
+    lock_id: &str,
+) -> Result<XOnlyPublicKey, LockError> {
+    Ok(quorum_secret_key(phrase, passphrase, lock_id)?
+        .x_only_public_key(&Secp256k1::new())
+        .0)
+}
+
 /// Generate a new seed phrase for a co-signing device.
 ///
 /// # The entropy rule, and why it is not "use the OS RNG"
@@ -95,6 +146,11 @@ pub fn new_phrase(user_digest: Option<&[u8; 32]>) -> Result<Zeroizing<String>, L
 /// The seed is zeroized on the way out. The returned `SecretKey` is the
 /// caller's to look after.
 pub fn secret_key(phrase: &str, passphrase: &str, index: u32) -> Result<SecretKey, LockError> {
+    derive_at(phrase, passphrase, &derivation_path(index))
+}
+
+/// Derive a key at an explicit BIP32 path.
+fn derive_at(phrase: &str, passphrase: &str, path: &str) -> Result<SecretKey, LockError> {
     let mnemonic = bip39::Mnemonic::parse_in(bip39::Language::English, phrase.trim())
         .map_err(|e| LockError::Policy(format!("seed phrase is not valid BIP39: {e}")))?;
     let seed = Zeroizing::new(mnemonic.to_seed(passphrase));
@@ -103,7 +159,7 @@ pub fn secret_key(phrase: &str, passphrase: &str, index: u32) -> Result<SecretKe
         .map_err(|e| LockError::Policy(format!("seed is not a valid master key: {e}")))?;
 
     use std::str::FromStr;
-    let path = bip32::DerivationPath::from_str(&derivation_path(index))
+    let path = bip32::DerivationPath::from_str(path)
         .map_err(|e| LockError::Policy(format!("derivation path: {e}")))?;
     for child in path.into_iter() {
         xprv = xprv
@@ -167,6 +223,47 @@ mod tests {
             *a, *b,
             "user entropy must be mixed with fresh OS bytes, not substituted for them"
         );
+    }
+
+    /// A quorum reaches the same key from the Lock id alone, with no mapping
+    /// stored anywhere.
+    #[test]
+    fn a_quorum_key_is_determined_by_the_lock_id() {
+        let a = quorum_public_key(PHRASE, "", "lock-abc").unwrap();
+        let b = quorum_public_key(PHRASE, "", "lock-abc").unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// **Per Lock, not per quorum.** One key across every Lock would let
+    /// anyone holding two addresses tell they answer to the same quorum.
+    #[test]
+    fn different_locks_get_different_quorum_keys() {
+        let a = quorum_public_key(PHRASE, "", "lock-abc").unwrap();
+        let b = quorum_public_key(PHRASE, "", "lock-def").unwrap();
+        assert_ne!(a, b, "two Locks must not share a quorum key");
+    }
+
+    /// The quorum account is separate from an owner's, so the same seed could
+    /// never derive one party's key at the other's path.
+    #[test]
+    fn quorum_keys_do_not_collide_with_owner_keys() {
+        let owner = public_key(PHRASE, "", 0).unwrap();
+        let quorum = quorum_public_key(PHRASE, "", "lock-abc").unwrap();
+        assert_ne!(owner, quorum);
+        assert!(quorum_derivation_path("lock-abc").contains("/1'/"));
+        assert!(derivation_path(0).contains("/0'/"));
+    }
+
+    /// Indices must stay inside BIP32's unhardened range.
+    #[test]
+    fn the_quorum_path_indices_are_in_range() {
+        for id in ["a", "lock-1", "zzzz", &"f".repeat(64)] {
+            let path = quorum_derivation_path(id);
+            for seg in path.split('/').skip(4) {
+                let n: u64 = seg.parse().expect("a plain index");
+                assert!(n < 0x8000_0000, "index {n} is hardened territory");
+            }
+        }
     }
 
     #[test]

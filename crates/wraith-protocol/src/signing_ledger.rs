@@ -168,6 +168,17 @@ impl<S: SignatureStore> SigningLedger<S> {
         }
     }
 
+    /// Whether `coin` is already committed to exactly `spending_txid`.
+    ///
+    /// Read-only: it commits nothing. Callers need this to tell a retry from a
+    /// new spend *before* deciding anything, because some rules apply to new
+    /// spends and must not fire again on a retry — a spending limit that
+    /// charges the same transaction twice turns a network hiccup into a
+    /// lockout.
+    pub fn is_committed_to(&self, coin: &OutPointKey, spending_txid: &[u8; 32]) -> bool {
+        self.store.signed_txid(coin).as_ref() == Some(spending_txid)
+    }
+
     /// How many equivocation attempts this ledger has refused.
     ///
     /// *A check whose failure produces no observable output is not a check.*

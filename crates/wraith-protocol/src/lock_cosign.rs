@@ -39,6 +39,15 @@ use ghost_lock::signing::{NonceLedger, SigningSession};
 
 use crate::signing_ledger::{Decision, LedgerError, OutPointKey, SignatureStore, SigningLedger};
 
+/// A rolling total the quorum will not co-sign past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VelocityLimit {
+    /// Most the quorum will co-sign within one window.
+    pub max_sats: u64,
+    /// How long the window is, in seconds.
+    pub window_secs: u64,
+}
+
 /// What the quorum will and will not co-sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CosignPolicy {
@@ -49,6 +58,74 @@ pub struct CosignPolicy {
     /// availability over that protection — but it is a choice, not a default
     /// somebody should arrive at by omission.
     pub max_spend_sats: Option<u64>,
+    /// Rolling total across a window.
+    ///
+    /// **A ceiling alone does not bound a theft.** Somebody holding the
+    /// owner's key simply spends the ceiling ten times; the ceiling costs them
+    /// ten transactions and ten fees and stops nothing. The window is what
+    /// turns a speed bump into a wall, and a ceiling configured without one
+    /// invites trusting protection that is not there.
+    pub window: Option<VelocityLimit>,
+}
+
+/// What the quorum has already co-signed, and when.
+///
+/// # This must survive a restart
+///
+/// A window kept only in memory is bypassed by crashing the service: the total
+/// resets and the next window starts empty. That is a cheaper attack than
+/// stealing the key it is supposed to bound, so an implementation that forgets
+/// is worse than no limit at all — it reports a protection it does not have.
+pub trait SpendLog {
+    /// Total co-signed at or after `since_secs`.
+    fn total_since(&self, since_secs: u64) -> u64;
+    /// Record a co-signature. Must be durable before it returns.
+    fn record(&mut self, at_secs: u64, sats: u64) -> Result<(), String>;
+}
+
+/// An in-memory [`SpendLog`], for tests.
+///
+/// Named to be uncomfortable to type in production, because forgetting is the
+/// exact failure the trait's contract is about.
+#[derive(Debug, Default)]
+pub struct VolatileSpendLog {
+    entries: Vec<(u64, u64)>,
+}
+
+impl SpendLog for VolatileSpendLog {
+    fn total_since(&self, since_secs: u64) -> u64 {
+        self.entries
+            .iter()
+            .filter(|(at, _)| *at >= since_secs)
+            .map(|(_, sats)| *sats)
+            .sum()
+    }
+    fn record(&mut self, at_secs: u64, sats: u64) -> Result<(), String> {
+        self.entries.push((at_secs, sats));
+        Ok(())
+    }
+}
+
+/// Whether this coordinator may co-sign Locks right now.
+///
+/// # Only one may
+///
+/// Every coordinator holding the quorum seed can derive the same key, which is
+/// what makes failover work. But each keeps its own once-per-coin ledger, so
+/// two of them serving at once can be asked to co-sign two *different* spends
+/// of one coin — and both would agree, producing a valid double-sign proof
+/// against the quorum. That is the fraud the design promises cannot happen,
+/// reintroduced by redundancy.
+///
+/// So Lock co-signing is the Active coordinator's job alone. A Standby holding
+/// the same seed must refuse, and refuse structurally rather than by
+/// convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Serving. May co-sign.
+    Active,
+    /// Ready to take over, and must not co-sign until it has.
+    Standby,
 }
 
 /// Why the quorum said no.
@@ -68,6 +145,29 @@ pub enum CosignRefusal {
     /// This coin is already committed to a different transaction.
     #[error("{0}")]
     WouldEquivocate(#[from] LedgerError),
+    /// The window's total would be exceeded.
+    #[error(
+        "this spend would take the last {window_secs}s to {would_total} sats and the \
+         quorum's limit is {limit_sats}; it will not co-sign. Wait for the window to \
+         clear, or use the Spending exit leaf."
+    )]
+    AboveWindow {
+        /// What the total would become.
+        would_total: u64,
+        /// The configured limit.
+        limit_sats: u64,
+        /// The window's length.
+        window_secs: u64,
+    },
+    /// This coordinator is not the one that co-signs.
+    #[error(
+        "this coordinator is on standby and does not co-sign Locks; only the active one \
+         does, because two ledgers can be asked to sign two different spends of one coin"
+    )]
+    NotActive,
+    /// The spend log could not be written, so the window is unknown.
+    #[error("the spend log is unavailable ({0}); refusing rather than co-signing past a limit it cannot see")]
+    LogUnavailable(String),
     /// The request could not be read, so nothing about it is known.
     #[error("this request cannot be co-signed: {0}")]
     Unreadable(String),
@@ -129,15 +229,24 @@ impl CosignSession {
 /// into the Lock's address, unlike the ephemeral per-round keys the blind
 /// signer uses.
 #[allow(clippy::too_many_arguments)]
-pub fn begin_cosign<S: SignatureStore>(
+pub fn begin_cosign<S: SignatureStore, L: SpendLog>(
     request: &SigningRequest,
     network: bitcoin::Network,
     policy: CosignPolicy,
+    role: Role,
     coins: &mut SigningLedger<S>,
+    spends: &mut L,
+    now_secs: u64,
     quorum_key: &bitcoin::secp256k1::SecretKey,
     keys: &[XOnlyPublicKey],
     merkle_root: Option<bitcoin::TapNodeHash>,
 ) -> Result<CosignSession, CosignRefusal> {
+    // Before anything else. A standby that got as far as reading the request
+    // is a standby that could get as far as signing it.
+    if role != Role::Active {
+        return Err(CosignRefusal::NotActive);
+    }
+
     // Read the transaction first: every rule below is about what it does, and
     // a request that cannot be read is one the quorum knows nothing about.
     let (summary, message) =
@@ -154,14 +263,48 @@ pub fn begin_cosign<S: SignatureStore>(
         }
     }
 
+    let coin = coin_key(request).map_err(CosignRefusal::Unreadable)?;
+    let txid = spending_txid(request).map_err(CosignRefusal::Unreadable)?;
+
+    // Is this the same transaction we already committed to? Asked before any
+    // rule is applied, and answered without committing anything.
+    //
+    // A retry must skip the window entirely. Checking it first and committing
+    // after looked right and was not: the window already holds this spend, so
+    // the check counts it twice and refuses the retry. Committing first
+    // instead would lock the coin to a transaction that was never signed.
+    // Neither order works without knowing, so the ledger is asked.
+    let is_retry = coins.is_committed_to(&coin, &txid);
+
+    // The window is checked before the coin is committed, so a refused spend
+    // leaves nothing behind.
+    if let (false, Some(limit)) = (is_retry, policy.window) {
+        let since = now_secs.saturating_sub(limit.window_secs);
+        let would_total = spends.total_since(since).saturating_add(summary.input_sats);
+        if would_total > limit.max_sats {
+            return Err(CosignRefusal::AboveWindow {
+                would_total,
+                limit_sats: limit.max_sats,
+                window_secs: limit.window_secs,
+            });
+        }
+    }
+
     // Commit the coin before signing. The ledger is idempotent, so a retry of
     // the same spend is allowed through; a *different* spend of the same coin
     // is refused, which is the equivocation guarantee.
-    let coin = coin_key(request).map_err(CosignRefusal::Unreadable)?;
-    let txid = spending_txid(request).map_err(CosignRefusal::Unreadable)?;
-    match coins.authorise(coin, txid) {
-        Ok(Decision::Sign) | Ok(Decision::AlreadyCommitted) => {}
+    let decision = match coins.authorise(coin, txid) {
+        Ok(d) => d,
         Err(e) => return Err(CosignRefusal::WouldEquivocate(e)),
+    };
+
+    // Count the spend only when it is new. A retry of one transaction is one
+    // spend, and charging the window twice for it would refuse honest retries
+    // — turning a network hiccup into a lockout.
+    if decision == Decision::Sign && policy.window.is_some() {
+        spends
+            .record(now_secs, summary.input_sats)
+            .map_err(CosignRefusal::LogUnavailable)?;
     }
 
     let (session, commitment) = SigningSession::begin(keys, quorum_key, merkle_root, &message)
@@ -301,7 +444,10 @@ mod tests {
             &req,
             Network::Regtest,
             CosignPolicy::default(),
+            Role::Active,
             &mut coins,
+            &mut VolatileSpendLog::default(),
+            0,
             &quorum,
             &keys,
             root,
@@ -341,8 +487,12 @@ mod tests {
             Network::Regtest,
             CosignPolicy {
                 max_spend_sats: Some(100_000),
+                ..Default::default()
             },
+            Role::Active,
             &mut coins,
+            &mut VolatileSpendLog::default(),
+            0,
             &quorum,
             &keys,
             root,
@@ -369,13 +519,17 @@ mod tests {
         let mut coins = SigningLedger::new(VolatileStore::default());
         let policy = CosignPolicy {
             max_spend_sats: Some(100_000),
+            ..Default::default()
         };
 
         assert!(begin_cosign(
             &req,
             Network::Regtest,
             policy,
+            Role::Active,
             &mut coins,
+            &mut VolatileSpendLog::default(),
+            0,
             &quorum,
             &keys,
             root
@@ -389,8 +543,12 @@ mod tests {
             Network::Regtest,
             CosignPolicy {
                 max_spend_sats: Some(1_000_000),
+                ..Default::default()
             },
+            Role::Active,
             &mut coins,
+            &mut VolatileSpendLog::default(),
+            0,
             &quorum,
             &keys,
             root,
@@ -414,7 +572,10 @@ mod tests {
             &first,
             Network::Regtest,
             CosignPolicy::default(),
+            Role::Active,
             &mut coins,
+            &mut VolatileSpendLog::default(),
+            0,
             &quorum,
             &keys,
             root,
@@ -427,7 +588,10 @@ mod tests {
             &second,
             Network::Regtest,
             CosignPolicy::default(),
+            Role::Active,
             &mut coins,
+            &mut VolatileSpendLog::default(),
+            0,
             &quorum,
             &keys,
             root,
@@ -435,6 +599,181 @@ mod tests {
         .expect_err("a second spend of one coin must be refused");
         assert!(format!("{err}").contains("equivocate"), "{err}");
         assert_eq!(coins.refusals(), 1, "the attempt must be counted");
+    }
+
+    fn active(
+        req: &SigningRequest,
+        policy: CosignPolicy,
+        coins: &mut SigningLedger<VolatileStore>,
+        spends: &mut VolatileSpendLog,
+        now: u64,
+        quorum: &SecretKey,
+    ) -> Result<CosignSession, CosignRefusal> {
+        let keys = ghost_lock::airgap::keys(req).unwrap();
+        let root = ghost_lock::airgap::merkle_root(req).unwrap();
+        begin_cosign(
+            req,
+            Network::Regtest,
+            policy,
+            Role::Active,
+            coins,
+            spends,
+            now,
+            quorum,
+            &keys,
+            root,
+        )
+    }
+
+    /// **A ceiling alone does not bound a theft.**
+    ///
+    /// Ten spends of the ceiling drain what one spend of ten times it could
+    /// not. The window is what turns the speed bump into a wall, and this is
+    /// the test that would fail if the window were only decorative.
+    #[test]
+    fn repeated_spends_under_the_ceiling_hit_the_window() {
+        let (_, _, quorum, _) = fixture(100_000, 0);
+        let policy = CosignPolicy {
+            max_spend_sats: Some(100_000),
+            window: Some(VelocityLimit {
+                max_sats: 250_000,
+                window_secs: 86_400,
+            }),
+        };
+        let mut coins = SigningLedger::new(VolatileStore::default());
+        let mut spends = VolatileSpendLog::default();
+
+        // Each is under the ceiling; each is a different coin.
+        for vout in 0..2u32 {
+            let (_, _, _, req) = fixture(100_000, vout);
+            active(&req, policy, &mut coins, &mut spends, 0, &quorum)
+                .unwrap_or_else(|e| panic!("spend {vout} should pass: {e}"));
+        }
+
+        let (_, _, _, third) = fixture(100_000, 2);
+        let err = active(&third, policy, &mut coins, &mut spends, 0, &quorum)
+            .expect_err("the third spend crosses the window");
+        let msg = format!("{err}");
+        assert!(msg.contains("300000"), "{msg}");
+        assert!(
+            msg.contains("exit leaf"),
+            "a refusal must leave the owner a way out: {msg}"
+        );
+    }
+
+    /// The window rolls: once it has passed, spending resumes.
+    #[test]
+    fn the_window_clears_with_time() {
+        let (_, _, quorum, _) = fixture(100_000, 0);
+        let policy = CosignPolicy {
+            max_spend_sats: None,
+            window: Some(VelocityLimit {
+                max_sats: 150_000,
+                window_secs: 3_600,
+            }),
+        };
+        let mut coins = SigningLedger::new(VolatileStore::default());
+        let mut spends = VolatileSpendLog::default();
+
+        let (_, _, _, a) = fixture(100_000, 0);
+        active(&a, policy, &mut coins, &mut spends, 1_000, &quorum).expect("first");
+
+        let (_, _, _, b) = fixture(100_000, 1);
+        assert!(
+            active(&b, policy, &mut coins, &mut spends, 1_500, &quorum).is_err(),
+            "still inside the window"
+        );
+        assert!(
+            active(&b, policy, &mut coins, &mut spends, 10_000, &quorum).is_ok(),
+            "the window has rolled past the first spend"
+        );
+    }
+
+    /// A retry must not be charged to the window twice.
+    ///
+    /// Otherwise a network hiccup turns into a lockout: the caller retries one
+    /// spend and the quorum counts it as two.
+    #[test]
+    fn a_retry_is_charged_once() {
+        let (_, _, quorum, req) = fixture(100_000, 0);
+        let policy = CosignPolicy {
+            max_spend_sats: None,
+            window: Some(VelocityLimit {
+                max_sats: 150_000,
+                window_secs: 86_400,
+            }),
+        };
+        let mut coins = SigningLedger::new(VolatileStore::default());
+        let mut spends = VolatileSpendLog::default();
+
+        for attempt in 0..3 {
+            active(&req, policy, &mut coins, &mut spends, 0, &quorum)
+                .unwrap_or_else(|e| panic!("retry {attempt} must be allowed: {e}"));
+        }
+        assert_eq!(
+            spends.total_since(0),
+            100_000,
+            "one transaction is one spend, however many times it is asked for"
+        );
+    }
+
+    /// A refused spend leaves the window untouched.
+    #[test]
+    fn a_refusal_does_not_consume_the_window() {
+        let (_, _, quorum, req) = fixture(500_000, 0);
+        let mut coins = SigningLedger::new(VolatileStore::default());
+        let mut spends = VolatileSpendLog::default();
+
+        assert!(active(
+            &req,
+            CosignPolicy {
+                max_spend_sats: Some(100_000),
+                window: Some(VelocityLimit {
+                    max_sats: 10_000_000,
+                    window_secs: 86_400
+                }),
+            },
+            &mut coins,
+            &mut spends,
+            0,
+            &quorum
+        )
+        .is_err());
+        assert_eq!(spends.total_since(0), 0, "a refusal spends nothing");
+    }
+
+    /// **Only the active coordinator co-signs.**
+    ///
+    /// Two coordinators with the same seed and separate ledgers can be asked
+    /// to sign two different spends of one coin, and both would agree — a
+    /// double-sign proof against the quorum, reintroduced by redundancy.
+    #[test]
+    fn a_standby_refuses_before_it_reads_anything() {
+        let (_, _, quorum, req) = fixture(100_000, 0);
+        let keys = ghost_lock::airgap::keys(&req).unwrap();
+        let root = ghost_lock::airgap::merkle_root(&req).unwrap();
+        let mut coins = SigningLedger::new(VolatileStore::default());
+        let mut spends = VolatileSpendLog::default();
+
+        let err = begin_cosign(
+            &req,
+            Network::Regtest,
+            CosignPolicy::default(),
+            Role::Standby,
+            &mut coins,
+            &mut spends,
+            0,
+            &quorum,
+            &keys,
+            root,
+        )
+        .expect_err("a standby must not co-sign");
+        assert!(format!("{err}").contains("standby"), "{err}");
+        assert_eq!(
+            spends.total_since(0),
+            0,
+            "a standby must not touch the window either"
+        );
     }
 
     /// Retrying the identical spend is a retry, not an attack.
@@ -450,7 +789,10 @@ mod tests {
                 &req,
                 Network::Regtest,
                 CosignPolicy::default(),
+                Role::Active,
                 &mut coins,
+                &mut VolatileSpendLog::default(),
+                0,
                 &quorum,
                 &keys,
                 root,
