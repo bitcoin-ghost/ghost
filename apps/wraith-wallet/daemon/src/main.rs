@@ -63,16 +63,17 @@ mod server {
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
         ErrorResponse, GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse,
         GhostLockListResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
-        GhostLockSavedResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
+        GhostLockSavedResponse, GhostLockSignBegunResponse, GhostLockSignNoncedResponse,
+        GhostLockSignedResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
         GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
         LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
         LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse,
-        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
-        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
-        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
-        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
-        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
-        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        LockSpendOutput, LockSpendSummary, NodeEndpointsResponse, PsbtBroadcastResponse,
+        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
+        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
+        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
+        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -230,6 +231,22 @@ mod server {
     /// operation rather than held: the file is small, the write is the
     /// expensive part either way, and a fresh read means a second process
     /// touching the same wallet cannot be missed.
+    /// The wallet's own MuSig2 nonce ledger.
+    ///
+    /// Separate file from the round signing ledger: they answer different
+    /// questions (has this coin been signed for / has this nonce been used)
+    /// and sharing a file would make one's corruption the other's outage.
+    fn ghost_lock_nonce_ledger_for(
+        state: &Arc<DaemonState>,
+    ) -> std::io::Result<wraith_wallet_core::nonce_ledger_file::FileNonceLedger> {
+        let path = state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("ghost-lock-nonces.json");
+        wraith_wallet_core::nonce_ledger_file::FileNonceLedger::open(path)
+    }
+
     fn signing_ledger_for(
         state: &Arc<DaemonState>,
     ) -> std::io::Result<
@@ -245,6 +262,27 @@ mod server {
         Ok(wraith_protocol::signing_ledger::SigningLedger::new(
             wraith_wallet_core::signing_ledger_file::FileSignatureStore::open(path)?,
         ))
+    }
+
+    /// One air-gapped Lock signing, between rounds.
+    ///
+    /// The `session` is `Some` only between round 1 and round 2. The owner's
+    /// partial signature is produced as soon as both nonces are known, so no
+    /// secret nonce is held while somebody carries the second payload to the
+    /// device.
+    struct PendingLockSign {
+        keys: Vec<bitcoin::XOnlyPublicKey>,
+        merkle_root: Option<bitcoin::TapNodeHash>,
+        message: [u8; 32],
+        psbt: String,
+        input_index: u32,
+        our_nonce: [u8; 66],
+        /// Consumed at round 2.
+        session: Option<ghost_lock::signing::SigningSession>,
+        /// Set at round 2, with every party's nonce in the order they were
+        /// aggregated.
+        nonces: Vec<[u8; 66]>,
+        our_partial: Option<[u8; 32]>,
     }
 
     struct StoredWraithMix {
@@ -328,6 +366,13 @@ mod server {
         /// `WraithSessionClient` that produced it (so submit reuses
         /// the same HTTP client / proxy config).
         wraith_mixes: RwLock<HashMap<String, StoredWraithMix>>,
+        /// Air-gapped Lock signings waiting on the backup device.
+        ///
+        /// In memory by design. A daemon restart loses the secret nonce, which
+        /// is the safe direction: nothing can be reused, and the spend is
+        /// retryable because the nonce ledger keys on the nonce rather than the
+        /// message.
+        lock_signings: RwLock<HashMap<String, PendingLockSign>>,
         /// Optional bitcoind RPC URL. Used to pin the election beacon to
         /// the chain; None disables that check.
         ghostd_url: Option<String>,
@@ -894,6 +939,7 @@ mod server {
             update_manifest_url,
             http,
             wraith_mixes: RwLock::new(HashMap::new()),
+            lock_signings: RwLock::new(HashMap::new()),
             ghostd_url,
             ghostd_cookie_path,
             ghostd_user,
@@ -2445,6 +2491,169 @@ mod server {
             .map_err(|e| format!("lock: {e}"))
     }
 
+    fn unhex32(label: &str, s: &str) -> Result<[u8; 32], String> {
+        let raw = hex::decode(s.trim()).map_err(|e| format!("{label} is not hex: {e}"))?;
+        raw.try_into()
+            .map_err(|_| format!("{label} must be 32 bytes"))
+    }
+
+    fn unhex66(label: &str, s: &str) -> Result<[u8; 66], String> {
+        let raw = hex::decode(s.trim()).map_err(|e| format!("{label} is not hex: {e}"))?;
+        raw.try_into()
+            .map_err(|_| format!("{label} must be 66 bytes"))
+    }
+
+    fn lock_spend_summary(s: &ghost_lock::airgap::SpendSummary) -> LockSpendSummary {
+        LockSpendSummary {
+            input_index: s.input_index,
+            input_sats: s.input_sats,
+            input_address: s.input_address.clone(),
+            outputs: s
+                .outputs
+                .iter()
+                .map(|o| LockSpendOutput {
+                    address: o.address.clone(),
+                    sats: o.sats,
+                })
+                .collect(),
+            fee_sats: s.fee_sats,
+            input_count: s.input_count,
+        }
+    }
+
+    /// Load a remembered Lock, derive its lanes, and resolve the named lane.
+    ///
+    /// Shares `build_lock_account` with the balance view and the round
+    /// destination, so all three derive one Lock's addresses identically.
+    async fn lock_lane_for(
+        state: &Arc<DaemonState>,
+        lock_id: &str,
+        lane: &str,
+    ) -> Result<
+        (
+            wraith_wallet_core::ghost_lock_account::GhostLockAccount,
+            wraith_wallet_core::ghost_lock_account::LaneKind,
+            wraith_wallet_core::ghost_lock_store::StoredLock,
+        ),
+        String,
+    > {
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+        let kind = match lane.trim().to_ascii_lowercase().as_str() {
+            "savings" => LaneKind::Savings,
+            "spending" => LaneKind::Spending,
+            "cash" => LaneKind::Cash,
+            "investments" => LaneKind::Investments,
+            other => {
+                return Err(format!(
+                    "unknown lane '{other}' (try savings, spending, cash, investments)"
+                ))
+            }
+        };
+        let record = {
+            let store = ghost_lock_store_for(state).map_err(|e| format!("lock store: {e}"))?;
+            store
+                .get(lock_id)
+                .cloned()
+                .ok_or_else(|| format!("no remembered Lock '{lock_id}'"))?
+        };
+        let account = build_lock_account(
+            state,
+            &record.backup_pubkey,
+            &record.heir_pubkey,
+            &record.quorum_pubkey,
+            record.inherit_height,
+            record.anchor_height,
+            Some(record.bip86_index),
+        )
+        .await?;
+        Ok((account, kind, record))
+    }
+
+    /// Which keys spend a lane by its key path.
+    ///
+    /// Not one answer for the whole Lock: each lane's Taproot internal key is a
+    /// different thing, and signing under the wrong pair produces a signature
+    /// that fails against the address with nothing to say why.
+    ///
+    ///   * **Savings** — MuSig2 of owner + backup. The air-gapped case.
+    ///   * **Spending** — MuSig2 of owner + quorum. Networked.
+    ///   * **Cash** — the owner's key alone. Ordinary single-sig; a MuSig2
+    ///     ceremony here would be two rounds of theatre.
+    ///   * **Investments** — the quorum's key alone. The owner cannot spend it
+    ///     by the key path at all; the owner's route out is the recall leaf.
+    fn lane_cosigners(
+        kind: wraith_wallet_core::ghost_lock_account::LaneKind,
+        owner: bitcoin::XOnlyPublicKey,
+        record: &wraith_wallet_core::ghost_lock_store::StoredLock,
+    ) -> Result<Vec<bitcoin::XOnlyPublicKey>, String> {
+        use std::str::FromStr;
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+        let parse = |label: &str, hexstr: &str| {
+            bitcoin::XOnlyPublicKey::from_str(hexstr.trim())
+                .map_err(|e| format!("{label} is not an x-only public key: {e}"))
+        };
+        match kind {
+            LaneKind::Savings => Ok(vec![owner, parse("backup_pubkey", &record.backup_pubkey)?]),
+            LaneKind::Spending => Ok(vec![owner, parse("quorum_pubkey", &record.quorum_pubkey)?]),
+            LaneKind::Cash => Err(
+                "Cash spends with your key alone — sign it as an ordinary single-sig input, \
+                 not through a MuSig2 ceremony"
+                    .into(),
+            ),
+            LaneKind::Investments => Err(
+                "Investments spends by the quorum's key alone, so there is no key path for \
+                 you to co-sign; your route out is the recall leaf after its delay"
+                    .into(),
+            ),
+        }
+    }
+
+    /// The owner's signing key for a Lock, from the active keystore.
+    async fn lock_owner_seckey(
+        state: &Arc<DaemonState>,
+        bip86_index: u32,
+    ) -> Result<bitcoin::secp256k1::SecretKey, String> {
+        with_active_wallet(state, move |_, ks| {
+            let path = format!(
+                "m/86'/{}'/0'/0/{bip86_index}",
+                wraith_wallet_core::light::GHOST_COIN_TYPE
+            );
+            let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
+            bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
+                .map_err(|e| format!("owner key: {e}"))
+        })
+        .await
+    }
+
+    /// Attach a finished key-path signature to the PSBT input.
+    ///
+    /// A key-path spend's witness is the signature and nothing else, so this is
+    /// the whole of finalisation for that input.
+    fn attach_key_path_signature(
+        psbt_b64: &str,
+        input_index: u32,
+        sig: &bitcoin::secp256k1::schnorr::Signature,
+    ) -> Result<String, String> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(psbt_b64.trim())
+            .map_err(|e| format!("psbt is not base64: {e}"))?;
+        let mut psbt = bitcoin::psbt::Psbt::deserialize(&raw).map_err(|e| format!("psbt: {e}"))?;
+        let idx = input_index as usize;
+        let input = psbt
+            .inputs
+            .get_mut(idx)
+            .ok_or_else(|| format!("input {idx} does not exist"))?;
+        input.tap_key_sig = Some(bitcoin::taproot::Signature {
+            signature: *sig,
+            sighash_type: bitcoin::TapSighashType::Default,
+        });
+        let mut witness = bitcoin::Witness::new();
+        witness.push(sig.serialize());
+        input.final_script_witness = Some(witness);
+        Ok(base64::engine::general_purpose::STANDARD.encode(psbt.serialize()))
+    }
+
     async fn dispatch(line: &str, state: &Arc<DaemonState>) -> Envelope<Response> {
         let parsed: Result<Envelope<Request>, _> = serde_json::from_str(line);
         let (id, request) = match parsed {
@@ -2689,6 +2898,284 @@ mod server {
                     }
                 }
             }
+            Request::GhostLockSignBegin {
+                lock_id,
+                lane,
+                psbt,
+                input_index,
+            } => {
+                let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("Lock has no {} lane", kind.label()),
+                        }),
+                    );
+                };
+
+                let root = built.lane.spend_info.merkle_root();
+
+                let owner_sk = match lock_owner_seckey(state, record.bip86_index).await {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let owner_xonly = owner_sk
+                    .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0;
+                let keys = match lane_cosigners(kind, owner_xonly, &record) {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let request = ghost_lock::airgap::SigningRequest {
+                    psbt: psbt.clone(),
+                    input_index,
+                    keys: keys.iter().map(|k| hex::encode(k.serialize())).collect(),
+                    merkle_root: root.map(|r| {
+                        use bitcoin::hashes::Hash as _;
+                        hex::encode(r.to_byte_array())
+                    }),
+                };
+
+                let (summary, message) = match ghost_lock::airgap::review(&request, state.network) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("review: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // The input must be the lane's. Without this the daemon would
+                // happily sign an input belonging to somebody else's script,
+                // on the say-so of whoever supplied the PSBT.
+                let expected = built.lane.address.to_string();
+                if summary.input_address.as_deref() != Some(expected.as_str()) {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "input {input_index} is not the {} lane: it pays to {},                                  the lane is {expected}",
+                                kind.label(),
+                                summary.input_address.as_deref().unwrap_or("an unrenderable script")
+                            ),
+                        }),
+                    );
+                }
+
+                let (session, commitment) = match ghost_lock::signing::SigningSession::begin(
+                    &keys, &owner_sk, root, &message,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("round 1: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let session_hex = hex::encode(commitment.session.as_bytes());
+                let our_nonce = commitment.public_nonce;
+                state.lock_signings.write().await.insert(
+                    session_hex.clone(),
+                    PendingLockSign {
+                        keys,
+                        merkle_root: root,
+                        message,
+                        psbt,
+                        input_index,
+                        our_nonce,
+                        session: Some(session),
+                        nonces: Vec::new(),
+                        our_partial: None,
+                    },
+                );
+
+                Response::GhostLockSignBegun(GhostLockSignBegunResponse {
+                    session: session_hex,
+                    summary: lock_spend_summary(&summary),
+                    device_request: match serde_json::to_string_pretty(&request) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!("device request: {e}"),
+                                }),
+                            )
+                        }
+                    },
+                    our_nonce: hex::encode(our_nonce),
+                })
+            }
+
+            Request::GhostLockSignNonce {
+                session,
+                device_nonce,
+            } => {
+                let device = match unhex66("device_nonce", &device_nonce) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let mut guard = state.lock_signings.write().await;
+                let Some(pending) = guard.get_mut(&session) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "no signing session '{session}' — a daemon restart drops \
+                                 these, which is safe: start again with `lock sign begin`"
+                            ),
+                        }),
+                    );
+                };
+                let Some(sess) = pending.session.take() else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: "this session already has its nonce round; the next step \
+                                      is `lock sign complete`"
+                                .into(),
+                        }),
+                    );
+                };
+
+                // Nonce order must match what every party aggregates. Sorted,
+                // so both sides reach the same aggregate without agreeing who
+                // goes first — the same reason the keys are sorted.
+                let mut nonces = vec![pending.our_nonce, device];
+                nonces.sort_unstable();
+
+                // Sign now, while both nonces are known. After this the daemon
+                // holds no secret nonce, so none is sitting in memory while the
+                // second payload is carried to the device.
+                let mut ledger = match ghost_lock_nonce_ledger_for(state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("nonce ledger unavailable: {e}"),
+                            }),
+                        )
+                    }
+                };
+                let partial = match sess.sign(&mut ledger, &nonces) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("round 2: {e}"),
+                            }),
+                        )
+                    }
+                };
+                pending.nonces = nonces.clone();
+                pending.our_partial = Some(partial);
+
+                let req = ghost_lock::airgap::PartialRequest {
+                    session: session.clone(),
+                    public_nonces: nonces.iter().map(hex::encode).collect(),
+                };
+                Response::GhostLockSignNonced(GhostLockSignNoncedResponse {
+                    session,
+                    device_request: match serde_json::to_string_pretty(&req) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!("device request: {e}"),
+                                }),
+                            )
+                        }
+                    },
+                })
+            }
+
+            Request::GhostLockSignComplete {
+                session,
+                device_partial,
+            } => {
+                let device = match unhex32("device_partial", &device_partial) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let mut guard = state.lock_signings.write().await;
+                let Some(pending) = guard.get(&session) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("no signing session '{session}'"),
+                        }),
+                    );
+                };
+                let Some(ours) = pending.our_partial else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: "this session has not completed its nonce round yet".into(),
+                        }),
+                    );
+                };
+
+                let sig = match ghost_lock::signing::combine(
+                    &pending.keys,
+                    pending.merkle_root,
+                    &pending.nonces,
+                    &[ours, device],
+                    &pending.message,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("combine: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let psbt_out =
+                    match attach_key_path_signature(&pending.psbt, pending.input_index, &sig) {
+                        Ok(p) => p,
+                        Err(message) => {
+                            return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                        }
+                    };
+                let out = Response::GhostLockSigned(GhostLockSignedResponse {
+                    session: session.clone(),
+                    signature: hex::encode(sig.serialize()),
+                    psbt: psbt_out,
+                });
+                guard.remove(&session);
+                out
+            }
+
             Request::GhostLockRoundDestination { lock_id, lane } => {
                 use wraith_wallet_core::ghost_lock_account::LaneKind;
 
@@ -4581,11 +5068,70 @@ mod server {
                 update_manifest_url: None,
                 http: reqwest::Client::new(),
                 wraith_mixes: RwLock::new(HashMap::new()),
+                lock_signings: RwLock::new(HashMap::new()),
                 ghostd_url: None,
                 ghostd_cookie_path: None,
                 ghostd_user: None,
                 ghostd_pass: None,
             })
+        }
+
+        /// Each lane's key path has different co-signers, and two lanes have
+        /// no owner-signable key path at all.
+        ///
+        /// Getting this wrong does not fail loudly: signing under the wrong
+        /// pair produces a well-formed signature that simply does not verify
+        /// against the address, discovered at broadcast.
+        #[test]
+        fn each_lane_names_its_own_cosigners() {
+            use std::str::FromStr;
+            use wraith_wallet_core::ghost_lock_account::LaneKind;
+
+            let k = |b: u8| {
+                let sk = bitcoin::secp256k1::SecretKey::from_slice(&[b; 32]).unwrap();
+                sk.x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0
+            };
+            let owner = k(1);
+            let backup = k(2);
+            let quorum = k(3);
+            let record = wraith_wallet_core::ghost_lock_store::StoredLock {
+                lock_id: "l".into(),
+                label: None,
+                backup_pubkey: hex::encode(backup.serialize()),
+                heir_pubkey: hex::encode(k(4).serialize()),
+                quorum_pubkey: hex::encode(quorum.serialize()),
+                anchor_height: 1,
+                inherit_height: 2,
+                bip86_index: 0,
+            };
+
+            // Savings co-signs with the backup device.
+            let savings = super::lane_cosigners(LaneKind::Savings, owner, &record).unwrap();
+            assert_eq!(savings, vec![owner, backup]);
+
+            // Spending co-signs with the quorum — a DIFFERENT pair.
+            let spending = super::lane_cosigners(LaneKind::Spending, owner, &record).unwrap();
+            assert_eq!(spending, vec![owner, quorum]);
+            assert_ne!(
+                savings, spending,
+                "the two co-signed lanes must not share a key set"
+            );
+
+            // Cash is single-sig; a ceremony here would be theatre.
+            let err = super::lane_cosigners(LaneKind::Cash, owner, &record)
+                .expect_err("Cash has no MuSig2 key path");
+            assert!(err.contains("your key alone"), "{err}");
+
+            // Investments is the quorum's alone — the owner cannot co-sign it.
+            let err = super::lane_cosigners(LaneKind::Investments, owner, &record)
+                .expect_err("Investments has no owner key path");
+            assert!(
+                err.contains("recall leaf"),
+                "the refusal must name the way out: {err}"
+            );
+
+            let _ = bitcoin::XOnlyPublicKey::from_str(&record.backup_pubkey).unwrap();
         }
 
         /// Private entry must refuse the Cash lane, and refuse it at the gate

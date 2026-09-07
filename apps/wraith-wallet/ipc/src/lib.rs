@@ -203,6 +203,41 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bip86_index: Option<u32>,
     },
+    /// Round 1 of an air-gapped key-path spend: review the spend and commit a
+    /// nonce.
+    ///
+    /// Returns what to carry to the backup device. The daemon holds its own
+    /// secret nonce until [`Request::GhostLockSignNonce`], and never longer:
+    /// the owner's partial signature is produced the moment both nonces are
+    /// known, so no secret nonce is held while somebody walks to the device a
+    /// second time.
+    GhostLockSignBegin {
+        /// `lock_id` from [`Request::GhostLockList`].
+        lock_id: String,
+        /// Lane being spent: `savings`, `spending` or `investments`.
+        lane: String,
+        /// The unsigned spend, base64 PSBT.
+        psbt: String,
+        /// Which input belongs to the lane.
+        input_index: u32,
+    },
+    /// Round 1 reply from the device: its public nonce.
+    ///
+    /// The daemon signs its own partial here, burning its nonce durably first.
+    GhostLockSignNonce {
+        /// Session from [`Response::GhostLockSignBegun`].
+        session: String,
+        /// The device's public nonce, hex.
+        device_nonce: String,
+    },
+    /// Round 2 reply from the device: its partial signature. Completes the
+    /// spend.
+    GhostLockSignComplete {
+        /// Session from [`Response::GhostLockSignBegun`].
+        session: String,
+        /// The device's partial signature, hex.
+        device_partial: String,
+    },
     /// Resolve the address a Wraith round should pay into to fund one lane of
     /// a remembered Lock — private entry.
     ///
@@ -695,6 +730,9 @@ pub enum Response {
     LightL1Utxos(LightL1UtxosResponse),
     GhostLockLanes(GhostLockLanesResponse),
     GhostLockRoundDestination(GhostLockRoundDestinationResponse),
+    GhostLockSignBegun(GhostLockSignBegunResponse),
+    GhostLockSignNonced(GhostLockSignNoncedResponse),
+    GhostLockSigned(GhostLockSignedResponse),
     GhostLockSaved(GhostLockSavedResponse),
     GhostLockList(GhostLockListResponse),
     GhostLockForgotten(GhostLockForgottenResponse),
@@ -1657,6 +1695,68 @@ pub struct GhostLockLane {
     pub quorum_can_spend_alone: bool,
     /// Whether these coins may enter a Wraith round. False for Cash.
     pub round_eligible: bool,
+}
+
+/// One output of a spend, as a person reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockSpendOutput {
+    /// Address, or `None` for a script with no address form — shown as such
+    /// rather than omitted, because an unrenderable output is the one worth
+    /// noticing.
+    pub address: Option<String>,
+    /// Value of this output.
+    pub sats: u64,
+}
+
+/// What the spend does, for the owner to check before anything is signed.
+///
+/// The daemon derives this from the same transaction it derives the sighash
+/// from, so the figures shown and the thing signed cannot diverge.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockSpendSummary {
+    pub input_index: u32,
+    pub input_sats: u64,
+    /// The lane being spent from.
+    pub input_address: Option<String>,
+    pub outputs: Vec<LockSpendOutput>,
+    pub fee_sats: u64,
+    /// Total inputs in the transaction. More than one means this spend
+    /// combines coins.
+    pub input_count: usize,
+}
+
+/// Round 1 result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockSignBegunResponse {
+    /// Identifies this attempt. Pass it back on the next two calls.
+    pub session: String,
+    /// What the spend does. Check it before carrying anything anywhere.
+    pub summary: LockSpendSummary,
+    /// Carry this to the backup device: a JSON `SigningRequest`. It contains
+    /// the whole PSBT, so the device recomputes the sighash rather than being
+    /// told it.
+    pub device_request: String,
+    /// This wallet's own public nonce, hex.
+    pub our_nonce: String,
+}
+
+/// Round 1 acknowledged; round 2 payload ready.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockSignNoncedResponse {
+    pub session: String,
+    /// Carry this to the device: a JSON `PartialRequest`.
+    pub device_request: String,
+}
+
+/// The finished signature.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockSignedResponse {
+    pub session: String,
+    /// The aggregated Schnorr signature, hex. Verified during aggregation, so
+    /// a value here is one that checks out against the lane's output key.
+    pub signature: String,
+    /// The PSBT with the key-path signature attached, base64.
+    pub psbt: String,
 }
 
 /// Where a round should pay to fund one lane privately.

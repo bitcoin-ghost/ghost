@@ -288,6 +288,17 @@ enum LockCommand {
         #[arg(long)]
         lane: String,
     },
+    /// Air-gapped key-path signing, in three steps.
+    ///
+    /// MuSig2 needs two rounds, so a spend is: begin (carry a request to the
+    /// device), nonce (carry the device's reply back, then a second request
+    /// out), complete (carry the device's signature back). The device never
+    /// receives a bare hash — it gets the whole transaction and derives the
+    /// hash itself, so what it shows you and what it signs cannot differ.
+    Sign {
+        #[command(subcommand)]
+        sub: LockSignCommand,
+    },
     /// Fund one lane through a round — private entry.
     ///
     /// The round's output IS the lane, so on-chain the deposit looks like any
@@ -331,6 +342,48 @@ enum LockCommand {
         /// Stating a floor is a decision; dismissing a dialog is a reflex.
         #[arg(long)]
         min_entities: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LockSignCommand {
+    /// Round 1. Review the spend and commit this wallet's nonce.
+    ///
+    /// Prints what the spend does — check it — and the JSON to carry to the
+    /// backup device.
+    Begin {
+        #[arg(long)]
+        lock_id: String,
+        /// savings or spending. Cash signs as ordinary single-sig;
+        /// Investments has no owner key path.
+        #[arg(long)]
+        lane: String,
+        /// The unsigned spend, base64 PSBT.
+        #[arg(long)]
+        psbt: String,
+        /// Which input belongs to the lane.
+        #[arg(long)]
+        input_index: u32,
+    },
+    /// Round 1 reply. Hand back the device's public nonce.
+    ///
+    /// This wallet signs its own share here, so its nonce is burned durably
+    /// before the second payload goes out — no secret nonce is held while you
+    /// walk to the device again.
+    Nonce {
+        #[arg(long)]
+        session: String,
+        /// The device's public nonce, hex.
+        #[arg(long)]
+        device_nonce: String,
+    },
+    /// Round 2 reply. Hand back the device's partial signature.
+    Complete {
+        #[arg(long)]
+        session: String,
+        /// The device's partial signature, hex.
+        #[arg(long)]
+        device_partial: String,
     },
 }
 
@@ -536,8 +589,8 @@ mod client {
     }
 
     use crate::{
-        ChainCommand, Command, GspCommand, LightCommand, LockCommand, MixCommand, UpdateCommand,
-        WalletCommand,
+        ChainCommand, Command, GspCommand, LightCommand, LockCommand, LockSignCommand, MixCommand,
+        UpdateCommand, WalletCommand,
     };
 
     pub async fn run(command: Command, json: bool, no_spawn: bool) -> std::process::ExitCode {
@@ -766,6 +819,33 @@ mod client {
                 LockCommand::Destination { lock_id, lane } => {
                     Request::GhostLockRoundDestination { lock_id, lane }
                 }
+                LockCommand::Sign { sub } => match sub {
+                    LockSignCommand::Begin {
+                        lock_id,
+                        lane,
+                        psbt,
+                        input_index,
+                    } => Request::GhostLockSignBegin {
+                        lock_id,
+                        lane,
+                        psbt,
+                        input_index,
+                    },
+                    LockSignCommand::Nonce {
+                        session,
+                        device_nonce,
+                    } => Request::GhostLockSignNonce {
+                        session,
+                        device_nonce,
+                    },
+                    LockSignCommand::Complete {
+                        session,
+                        device_partial,
+                    } => Request::GhostLockSignComplete {
+                        session,
+                        device_partial,
+                    },
+                },
                 // Intercepted above: private entry is two calls, not one.
                 LockCommand::Fund { .. } => unreachable!("lock fund handled above"),
             },
@@ -1066,6 +1146,57 @@ mod client {
                     }
                     println!("\ntotal: {} sats ({} utxos)", u.total_sats, u.utxos.len());
                 }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSignBegun(r)) => {
+                let s = &r.summary;
+                println!("CHECK THIS BEFORE YOU CARRY ANYTHING ANYWHERE");
+                println!(
+                    "  spending  {} sats from {}",
+                    s.input_sats,
+                    s.input_address
+                        .as_deref()
+                        .unwrap_or("(unrenderable script)")
+                );
+                if s.input_count > 1 {
+                    println!(
+                        "  ⚠ this transaction has {} inputs; you are signing input {}",
+                        s.input_count, s.input_index
+                    );
+                }
+                for o in &s.outputs {
+                    println!(
+                        "  paying    {} sats to {}",
+                        o.sats,
+                        o.address.as_deref().unwrap_or("(unrenderable script)")
+                    );
+                }
+                println!("  fee       {} sats", s.fee_sats);
+                println!("\nsession: {}", r.session);
+                println!("our nonce: {}", r.our_nonce);
+                println!("\n--- carry this to the backup device ---");
+                println!("{}", r.device_request);
+                println!(
+                    "--- then: wraith lock sign nonce --session {} --device-nonce <hex>",
+                    r.session
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSignNonced(r)) => {
+                println!("this wallet has signed its share; its nonce is burned.");
+                println!("\n--- carry this to the backup device ---");
+                println!("{}", r.device_request);
+                println!(
+                    "--- then: wraith lock sign complete --session {} --device-partial <hex>",
+                    r.session
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSigned(r)) => {
+                println!("signed. the signature verifies against the lane's output key.");
+                println!("signature: {}", r.signature);
+                println!("\nsigned psbt:");
+                println!("{}", r.psbt);
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::GhostLockRoundDestination(d)) => {
@@ -2207,6 +2338,51 @@ mod cli_tests {
                 "1000000",
                 "--utxo-scriptpubkey",
                 "5120aa",
+            ],
+        ];
+        for argv in cases {
+            let joined = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
+        }
+    }
+
+    /// The three signing steps parse, so the flow cannot ship half-wired.
+    #[test]
+    fn every_sign_step_parses() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec![
+                "wraith",
+                "lock",
+                "sign",
+                "begin",
+                "--lock-id",
+                "a",
+                "--lane",
+                "savings",
+                "--psbt",
+                "cHNidP8=",
+                "--input-index",
+                "0",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "sign",
+                "nonce",
+                "--session",
+                "aa",
+                "--device-nonce",
+                "bb",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "sign",
+                "complete",
+                "--session",
+                "aa",
+                "--device-partial",
+                "bb",
             ],
         ];
         for argv in cases {

@@ -10832,6 +10832,7 @@ version = "1.11.38"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "base64 0.22.1",
  "bitcoin",
  "ghost-gsp-proto",
  "ghost-keys",
