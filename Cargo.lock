@@ -3386,6 +3386,7 @@ name = "ghost-lock"
 version = "1.11.38"
 dependencies = [
  "bitcoin",
+ "hex",
  "musig2",
  "rand 0.8.6",
  "secp256k1 0.29.1",

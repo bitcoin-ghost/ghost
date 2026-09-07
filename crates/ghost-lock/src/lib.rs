@@ -73,6 +73,7 @@ pub mod constants;
 pub mod error;
 pub mod key_agg;
 pub mod lane;
+pub mod signing;
 
 pub use compartment::{
     check_round_destination, check_round_eligible, check_spend_together, Compartment,

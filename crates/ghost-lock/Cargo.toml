@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 bitcoin = { workspace = true }
 musig2 = { version = "0.4", default-features = false, features = ["secp256k1"] }
+rand = { workspace = true }
+hex = { workspace = true }
 secp256k1 = { workspace = true }
 thiserror = { workspace = true }
 
