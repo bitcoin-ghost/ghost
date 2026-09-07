@@ -10760,6 +10760,7 @@ dependencies = [
  "chrono",
  "clap",
  "getrandom 0.2.17",
+ "ghost-lock",
  "ghost-storage",
  "hex",
  "hmac",
@@ -10779,6 +10780,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "wraith-protocol",
+ "zeroize",
 ]
 
 [[package]]

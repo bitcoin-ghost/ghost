@@ -3613,3 +3613,90 @@ async fn status_reports_placement_as_running_when_it_is() {
         "200 payments should open several rounds: {p}"
     );
 }
+
+// --- Ghost Lock co-signing ------------------------------------------------
+
+/// A coordinator with no quorum seed says it does not do this, rather than
+/// refusing the spend.
+///
+/// The distinction matters to whoever is holding a transaction that will not
+/// go through: 501 sends them to a different coordinator, 403 sends them to
+/// rewrite their spend. Only one of those helps.
+#[tokio::test]
+async fn cosign_is_not_implemented_without_a_quorum_seed() {
+    let body = serde_json::json!({
+        "lock_id": "lock-abc",
+        "request": {
+            "psbt": "cHNidP8BAAA=",
+            "input_index": 0,
+            "keys": [],
+        }
+    });
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/lock/cosign/nonce")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let raw = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(json["error"], "lock_cosign_not_configured");
+    assert!(
+        json["detail"].as_str().unwrap().contains("quorum seed"),
+        "the reply must say what is missing: {json}"
+    );
+}
+
+/// Round 2 for a session nobody started is a 404, and says why it is safe.
+#[tokio::test]
+async fn cosign_partial_for_an_unknown_session_is_not_found() {
+    let body = serde_json::json!({
+        "session": "ff".repeat(32),
+        "public_nonces": [],
+    });
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/lock/cosign/partial")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Unconfigured takes precedence: this coordinator does not co-sign at all.
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// The routes exist and reject a malformed body rather than 404ing.
+///
+/// A missing route and a bad request look the same to a client that only
+/// checks for failure, and the two call for opposite fixes.
+#[tokio::test]
+async fn the_cosign_routes_are_mounted() {
+    for uri in ["/api/v1/lock/cosign/nonce", "/api/v1/lock/cosign/partial"] {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{ not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{uri} must be mounted"
+        );
+    }
+}

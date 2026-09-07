@@ -30,6 +30,39 @@ use crate::witnesses::AcceptedWitness;
 /// without holding the outer registry mutex.
 pub type SharedSigner = Arc<Mutex<CoordinatorSigner>>;
 
+/// Everything the quorum needs to co-sign Ghost Locks.
+///
+/// Held together because the three pieces are only safe as a set: the seed
+/// without the ledgers would equivocate, and the ledgers without the role
+/// would let a standby serve alongside the active coordinator and equivocate
+/// anyway.
+pub struct LockCosignState {
+    /// BIP39 phrase this coordinator derives per-Lock quorum keys from.
+    ///
+    /// Shared across the coordinator set so any of them can take over; which
+    /// one actually serves is decided by `role`, not by who holds the seed.
+    pub seed_phrase: zeroize::Zeroizing<String>,
+    /// BIP39 passphrase, empty if unused.
+    pub seed_passphrase: zeroize::Zeroizing<String>,
+    /// What this coordinator will co-sign.
+    pub policy: wraith_protocol::lock_cosign::CosignPolicy,
+    /// Whether this coordinator co-signs at all right now.
+    pub role: wraith_protocol::lock_cosign::Role,
+    /// Once-per-coin ledger. Durable.
+    pub coins: Mutex<
+        wraith_protocol::signing_ledger::SigningLedger<
+            wraith_protocol::signing_ledger::VolatileStore,
+        >,
+    >,
+    /// Rolling spend window. Durable.
+    pub spends: Mutex<wraith_protocol::lock_cosign::VolatileSpendLog>,
+    /// Co-signings waiting on their second round, keyed by session.
+    ///
+    /// In memory: a restart drops the secret nonce, which is the safe
+    /// direction, and the owner retries with a fresh one.
+    pub pending: Mutex<HashMap<String, wraith_protocol::lock_cosign::CosignSession>>,
+}
+
 /// Process-global state shared across HTTP handlers.
 /// Everything a round's placement derivation needs for the current epoch.
 ///
@@ -146,6 +179,11 @@ pub struct CoordinatorState {
     /// When `None`, the route accepts unsigned requests — operators
     /// must firewall the `/api/v1/internal/` prefix.
     pub gossip_peer_secret: Option<String>,
+    /// Ghost Lock co-signing, or `None` if this coordinator does not offer it.
+    ///
+    /// Absent by default: a coordinator with no quorum seed configured should
+    /// refuse Lock co-signing rather than derive keys from nothing.
+    pub lock_cosign: Option<LockCosignState>,
     /// Unix-seconds the binary started. `/health` reports uptime.
     pub started_at: u64,
     /// Override for the per-session fill window in seconds. Defaults
@@ -184,6 +222,9 @@ impl CoordinatorState {
     ) -> Self {
         let started_at = clock.unix_secs();
         Self {
+            // Off unless a quorum seed is configured: a coordinator with no seed
+            // must refuse Lock co-signing, not derive keys from nothing.
+            lock_cosign: None,
             network,
             sessions: LiteSessionRegistry::new(),
             remix: RemixQueue::new(),

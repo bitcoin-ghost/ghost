@@ -69,6 +69,14 @@ pub fn build_router(state: Arc<CoordinatorState>) -> Router {
             "/api/v1/session/:session_id/witness",
             axum::routing::post(api::session_witness::post),
         )
+        .route(
+            "/api/v1/lock/cosign/nonce",
+            axum::routing::post(api::lock_cosign::post_nonce),
+        )
+        .route(
+            "/api/v1/lock/cosign/partial",
+            axum::routing::post(api::lock_cosign::post_partial),
+        )
         // Internal coordinator-to-coordinator state replication.
         // Operator firewalls this prefix to the pool's address range
         // until the auth header lands; v1 trusts peers on a private

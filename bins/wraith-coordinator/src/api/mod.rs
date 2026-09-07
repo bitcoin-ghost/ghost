@@ -6,6 +6,7 @@ pub mod discover;
 pub mod find_or_create;
 pub mod gossip;
 pub mod health;
+pub mod lock_cosign;
 pub mod round_tx;
 pub mod session_inputs;
 pub mod session_outputs;

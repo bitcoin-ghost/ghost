@@ -38,6 +38,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace crates
+ghost-lock = { workspace = true }
+zeroize = { workspace = true }
 wraith-protocol = { workspace = true }
 
 # Bitcoin (just needed for Network enum + re-exports)
