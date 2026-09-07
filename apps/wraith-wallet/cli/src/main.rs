@@ -288,6 +288,29 @@ enum LockCommand {
         #[arg(long)]
         lane: String,
     },
+    /// Spend the Spending lane with the quorum.
+    ///
+    /// One command: the wallet does both MuSig2 rounds against the coordinator
+    /// itself, because the counterparty is a service and nobody has to carry
+    /// anything.
+    ///
+    /// The quorum may refuse — a ceiling, a spending window, or a coin it has
+    /// already signed for. That is what makes it a second factor rather than a
+    /// rubber stamp, and the refusal says which rule applied.
+    QuorumSign {
+        #[arg(long)]
+        lock_id: String,
+        /// Only `spending` is co-signed by the quorum.
+        #[arg(long, default_value = "spending")]
+        lane: String,
+        #[arg(long)]
+        psbt: String,
+        #[arg(long)]
+        input_index: u32,
+        /// Base URL of the coordinator to ask.
+        #[arg(long)]
+        coordinator: String,
+    },
     /// What leaving alone needs, and whether the coins are old enough.
     ///
     /// Ask before building the transaction: the input's `nSequence` is fixed by
@@ -845,6 +868,19 @@ mod client {
                 LockCommand::Destination { lock_id, lane } => {
                     Request::GhostLockRoundDestination { lock_id, lane }
                 }
+                LockCommand::QuorumSign {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                    coordinator,
+                } => Request::GhostLockQuorumSign {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                    coordinator_url: coordinator,
+                },
                 LockCommand::EscapePlan { lock_id, lane } => {
                     Request::GhostLockEscapePlan { lock_id, lane }
                 }
@@ -1185,6 +1221,23 @@ mod client {
                         println!("              spk={}", x.scriptpubkey_hex);
                     }
                     println!("\ntotal: {} sats ({} utxos)", u.total_sats, u.utxos.len());
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockQuorumSigned(r)) => {
+                println!("the quorum co-signed {}", r.lock_id);
+                println!(
+                    "  it read the spend as {} sats out, {} sats fee",
+                    r.quorum_saw_input_sats, r.quorum_saw_fee_sats
+                );
+                println!("  compare that with what you meant before broadcasting.");
+                println!("\nsignature: {}", r.signature);
+                if r.tx_hex.is_empty() {
+                    println!("\nsigned, but the transaction still needs other inputs;");
+                    println!("pass this psbt on:\n{}", r.psbt);
+                } else {
+                    println!("\ntransaction (hex) — broadcast this:");
+                    println!("{}", r.tx_hex);
                 }
                 std::process::ExitCode::SUCCESS
             }
@@ -2427,6 +2480,25 @@ mod cli_tests {
             let joined = argv.join(" ");
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
         }
+    }
+
+    /// The quorum-sign command parses.
+    #[test]
+    fn the_quorum_sign_command_parses() {
+        let argv = vec![
+            "wraith",
+            "lock",
+            "quorum-sign",
+            "--lock-id",
+            "a",
+            "--psbt",
+            "cHNidP8=",
+            "--input-index",
+            "0",
+            "--coordinator",
+            "http://127.0.0.1:9100",
+        ];
+        Cli::try_parse_from(&argv).expect("must parse");
     }
 
     /// The escape subcommands parse.

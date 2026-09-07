@@ -63,18 +63,18 @@ mod server {
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
         ErrorResponse, EscapeCoin, GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse,
         GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
-        GhostLockRecord, GhostLockRoundDestinationResponse, GhostLockSavedResponse,
-        GhostLockSignBegunResponse, GhostLockSignNoncedResponse, GhostLockSignedResponse,
-        GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
-        HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
-        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
-        LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockSpendOutput, LockSpendSummary,
-        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
-        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
-        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
-        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
-        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
-        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        GhostLockQuorumSignedResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
+        GhostLockSavedResponse, GhostLockSignBegunResponse, GhostLockSignNoncedResponse,
+        GhostLockSignedResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
+        GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
+        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
+        LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse,
+        LockSpendOutput, LockSpendSummary, NodeEndpointsResponse, PsbtBroadcastResponse,
+        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
+        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
+        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
+        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -2971,6 +2971,165 @@ mod server {
                     }
                 }
             }
+            Request::GhostLockQuorumSign {
+                lock_id,
+                lane,
+                psbt,
+                input_index,
+                coordinator_url,
+            } => {
+                use wraith_wallet_core::ghost_lock_account::LaneKind;
+                let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                if kind != LaneKind::Spending {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "the quorum only co-signs Spending; {} is signed another way",
+                                kind.label()
+                            ),
+                        }),
+                    );
+                }
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: "Lock has no Spending lane".into(),
+                        }),
+                    );
+                };
+                let root = built.lane.spend_info.merkle_root();
+
+                let owner_sk = match lock_owner_seckey(state, record.bip86_index).await {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let owner_xonly = owner_sk
+                    .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0;
+                let keys = match lane_cosigners(kind, owner_xonly, &record) {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let request = ghost_lock::airgap::SigningRequest {
+                    psbt: psbt.clone(),
+                    input_index,
+                    keys: keys.iter().map(|k| hex::encode(k.serialize())).collect(),
+                    merkle_root: root.map(|r| {
+                        use bitcoin::hashes::Hash as _;
+                        hex::encode(r.to_byte_array())
+                    }),
+                };
+
+                let (summary, message) = match ghost_lock::airgap::review(&request, state.network) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("review: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // The input must be the lane's, checked here rather than trusted
+                // from whoever supplied the PSBT.
+                let expected = built.lane.address.to_string();
+                if summary.input_address.as_deref() != Some(expected.as_str()) {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "input {input_index} is not the Spending lane: it pays to {}, \
+                                 the lane is {expected}",
+                                summary
+                                    .input_address
+                                    .as_deref()
+                                    .unwrap_or("an unrenderable script")
+                            ),
+                        }),
+                    );
+                }
+
+                let mut ledger = match ghost_lock_nonce_ledger_for(state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("nonce ledger unavailable: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let (sig, view) = match wraith_wallet_core::lock_cosign_client::cosign_with_quorum(
+                    &state.http,
+                    &coordinator_url,
+                    &lock_id,
+                    &request,
+                    &owner_sk,
+                    &keys,
+                    root,
+                    &message,
+                    &mut ledger,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("{e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let psbt_out = match attach_key_path_signature(&psbt, input_index, &sig) {
+                    Ok(p) => p,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                // The finished transaction, when every input is signed. A
+                // multi-input spend may still be waiting on somebody else, so
+                // an empty string here means "signed, not yet complete" rather
+                // than a failure — the PSBT above is the thing to pass on.
+                let tx_hex = {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(psbt_out.trim())
+                        .ok()
+                        .and_then(|raw| bitcoin::psbt::Psbt::deserialize(&raw).ok())
+                        .and_then(|p| p.extract_tx().ok())
+                        .map(|tx| bitcoin::consensus::encode::serialize_hex(&tx))
+                        .unwrap_or_default()
+                };
+
+                Response::GhostLockQuorumSigned(GhostLockQuorumSignedResponse {
+                    lock_id,
+                    signature: hex::encode(sig.serialize()),
+                    psbt: psbt_out,
+                    tx_hex,
+                    quorum_saw_input_sats: view.input_sats,
+                    quorum_saw_fee_sats: view.fee_sats,
+                })
+            }
+
             Request::GhostLockEscapePlan { lock_id, lane } => {
                 let (account, kind, _record, escape) =
                     match lock_escape_for(state, &lock_id, &lane).await {

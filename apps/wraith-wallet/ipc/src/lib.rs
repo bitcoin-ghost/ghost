@@ -203,6 +203,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bip86_index: Option<u32>,
     },
+    /// Spend a Spending lane with the quorum, over HTTP.
+    ///
+    /// One call, not three: both MuSig2 rounds happen here because the
+    /// counterparty is a service rather than a person carrying payloads.
+    GhostLockQuorumSign {
+        lock_id: String,
+        /// Must be `spending` — the only lane the quorum co-signs.
+        lane: String,
+        /// The spend, base64 PSBT.
+        psbt: String,
+        input_index: u32,
+        /// Base URL of the coordinator to ask.
+        coordinator_url: String,
+    },
     /// What an escape spend needs, and whether the coins are old enough yet.
     ///
     /// Asked before building the transaction, because the input's `nSequence`
@@ -754,6 +768,7 @@ pub enum Response {
     LightL1Utxos(LightL1UtxosResponse),
     GhostLockLanes(GhostLockLanesResponse),
     GhostLockRoundDestination(GhostLockRoundDestinationResponse),
+    GhostLockQuorumSigned(GhostLockQuorumSignedResponse),
     GhostLockEscapePlan(GhostLockEscapePlanResponse),
     GhostLockEscapeSigned(GhostLockEscapeSignedResponse),
     GhostLockSignBegun(GhostLockSignBegunResponse),
@@ -1749,6 +1764,23 @@ pub struct LockSpendSummary {
     /// Total inputs in the transaction. More than one means this spend
     /// combines coins.
     pub input_count: usize,
+}
+
+/// A Spending spend the quorum co-signed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockQuorumSignedResponse {
+    pub lock_id: String,
+    /// The aggregated signature, hex. Verified during aggregation.
+    pub signature: String,
+    /// The PSBT with the key-path signature attached, base64.
+    pub psbt: String,
+    /// The finished transaction, hex.
+    pub tx_hex: String,
+    /// What the quorum understood it was signing. Compare it with what you
+    /// meant: the two are derived from the same PSBT, so a mismatch means one
+    /// side read a different transaction.
+    pub quorum_saw_input_sats: u64,
+    pub quorum_saw_fee_sats: u64,
 }
 
 /// One coin sitting in a lane, and whether its escape has matured.
