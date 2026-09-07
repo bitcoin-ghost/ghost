@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-lock"
-version = "1.11.35"
+version = "1.11.38"
 dependencies = [
  "bitcoin",
  "musig2",
