@@ -288,6 +288,32 @@ enum LockCommand {
         #[arg(long)]
         lane: String,
     },
+    /// What leaving alone needs, and whether the coins are old enough.
+    ///
+    /// Ask before building the transaction: the input's `nSequence` is fixed by
+    /// the leaf's delay, and a wrong one is rejected as non-final.
+    EscapePlan {
+        #[arg(long)]
+        lock_id: String,
+        /// savings, spending or investments.
+        #[arg(long)]
+        lane: String,
+    },
+    /// Sign a lane's escape leaf — leaving alone, after the delay.
+    ///
+    /// No quorum, no backup device, no ceremony. This is the path that stops a
+    /// silent quorum from being the end of the money.
+    Escape {
+        #[arg(long)]
+        lock_id: String,
+        #[arg(long)]
+        lane: String,
+        /// The spend, base64 PSBT, with the nSequence `escape-plan` reported.
+        #[arg(long)]
+        psbt: String,
+        #[arg(long)]
+        input_index: u32,
+    },
     /// Air-gapped key-path signing, in three steps.
     ///
     /// MuSig2 needs two rounds, so a spend is: begin (carry a request to the
@@ -819,6 +845,20 @@ mod client {
                 LockCommand::Destination { lock_id, lane } => {
                     Request::GhostLockRoundDestination { lock_id, lane }
                 }
+                LockCommand::EscapePlan { lock_id, lane } => {
+                    Request::GhostLockEscapePlan { lock_id, lane }
+                }
+                LockCommand::Escape {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                } => Request::GhostLockEscapeSign {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                },
                 LockCommand::Sign { sub } => match sub {
                     LockSignCommand::Begin {
                         lock_id,
@@ -1146,6 +1186,49 @@ mod client {
                     }
                     println!("\ntotal: {} sats ({} utxos)", u.total_sats, u.utxos.len());
                 }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockEscapePlan(r)) => {
+                println!("{} — {} lane of {}", r.escape, r.lane, r.lock_id);
+                println!("  wait:     {} blocks", r.delay_blocks);
+                println!(
+                    "  nSequence every input must carry: {}",
+                    r.required_sequence
+                );
+                println!("  lane:     {}", r.lane_address);
+                if r.coins.is_empty() {
+                    println!("\n(no coins in this lane)");
+                } else {
+                    println!("\ncoins:");
+                    for c in &r.coins {
+                        if c.blocks_remaining == 0 {
+                            println!(
+                                "  {}:{}  {} sats  ready now ({} confirmations)",
+                                c.txid, c.vout, c.sats, c.confirmations
+                            );
+                        } else {
+                            println!(
+                                "  {}:{}  {} sats  {} more blocks (~{:.1} days)",
+                                c.txid,
+                                c.vout,
+                                c.sats,
+                                c.blocks_remaining,
+                                f64::from(c.blocks_remaining) / 144.0
+                            );
+                        }
+                    }
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockEscapeSigned(r)) => {
+                println!(
+                    "{} signed for the {} lane of {}",
+                    r.escape, r.lane, r.lock_id
+                );
+                println!("\ntransaction (hex) — broadcast this:");
+                println!("{}", r.tx_hex);
+                println!("\npsbt:");
+                println!("{}", r.psbt);
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::GhostLockSignBegun(r)) => {
@@ -2338,6 +2421,39 @@ mod cli_tests {
                 "1000000",
                 "--utxo-scriptpubkey",
                 "5120aa",
+            ],
+        ];
+        for argv in cases {
+            let joined = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
+        }
+    }
+
+    /// The escape subcommands parse.
+    #[test]
+    fn the_escape_commands_parse() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec![
+                "wraith",
+                "lock",
+                "escape-plan",
+                "--lock-id",
+                "a",
+                "--lane",
+                "spending",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "escape",
+                "--lock-id",
+                "a",
+                "--lane",
+                "investments",
+                "--psbt",
+                "cHNidP8=",
+                "--input-index",
+                "0",
             ],
         ];
         for argv in cases {

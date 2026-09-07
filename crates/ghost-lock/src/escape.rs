@@ -38,6 +38,51 @@ use bitcoin::{
 use crate::error::LockError;
 use crate::lane::Lane;
 
+/// The escape leaf the **owner** can spend, per lane.
+///
+/// Only the owner's routes are here. Savings' backup-recovery leaf belongs to
+/// the backup device and its inheritance leaf to the heir; a wallet holding
+/// the owner key cannot spend either, and offering them would be offering a
+/// spend that cannot be produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerEscape {
+    /// Savings, after ~14 months of silence.
+    SavingsRecovery,
+    /// Spending, after ~7 days without the quorum.
+    SpendingExit,
+    /// Investments, recalled after ~14 days.
+    InvestmentsRecall,
+}
+
+impl OwnerEscape {
+    /// How long the wait is, in blocks.
+    pub fn blocks(self) -> u32 {
+        match self {
+            OwnerEscape::SavingsRecovery => crate::constants::OWNER_RECOVERY_BLOCKS,
+            OwnerEscape::SpendingExit => crate::constants::SPENDING_EXIT_BLOCKS,
+            OwnerEscape::InvestmentsRecall => crate::constants::INVESTMENTS_RECALL_BLOCKS,
+        }
+    }
+
+    /// What to call it to a person.
+    pub fn label(self) -> &'static str {
+        match self {
+            OwnerEscape::SavingsRecovery => "Savings recovery",
+            OwnerEscape::SpendingExit => "Spending exit",
+            OwnerEscape::InvestmentsRecall => "Investments recall",
+        }
+    }
+
+    /// The leaf script, built the same way the lane built it.
+    ///
+    /// Derived rather than reconstructed by callers: a leaf that differs from
+    /// the one in the tree by a single byte has no control block, and the only
+    /// symptom is a spend that cannot be assembled.
+    pub fn leaf(self, owner: &bitcoin::XOnlyPublicKey) -> Result<ScriptBuf, LockError> {
+        crate::lane::relative_timelock_leaf(self.blocks(), owner)
+    }
+}
+
 /// The `nSequence` an input must carry to satisfy a `blocks`-deep relative
 /// timelock.
 ///
@@ -214,6 +259,52 @@ mod tests {
             }],
         };
         (tx, vec![prevout])
+    }
+
+    /// The leaf this helper builds must be the one in the lane's tree.
+    ///
+    /// If it were not, there would be no control block and the escape would be
+    /// unassemblable — the failure the helper exists to prevent.
+    #[test]
+    fn the_owner_escape_leaf_is_the_one_in_the_tree() {
+        let owner = sk(81);
+        let lane = spending_lane(&owner);
+        let leaf = OwnerEscape::SpendingExit.leaf(&xonly(&owner)).unwrap();
+        assert!(
+            lane.spend_info
+                .control_block(&(leaf, LeafVersion::TapScript))
+                .is_some(),
+            "the derived leaf must be in the lane's tree"
+        );
+
+        let inv_owner = sk(82);
+        let inv = InvestmentsPolicy {
+            quorum: xonly(&sk(97)),
+            owner: xonly(&inv_owner),
+        }
+        .build(&Secp256k1::new(), Network::Regtest)
+        .unwrap();
+        let leaf = OwnerEscape::InvestmentsRecall
+            .leaf(&xonly(&inv_owner))
+            .unwrap();
+        assert!(inv
+            .spend_info
+            .control_block(&(leaf, LeafVersion::TapScript))
+            .is_some());
+    }
+
+    /// The delays are the constants, not numbers typed twice.
+    #[test]
+    fn each_escape_reports_its_own_delay() {
+        assert_eq!(OwnerEscape::SpendingExit.blocks(), SPENDING_EXIT_BLOCKS);
+        assert_eq!(
+            OwnerEscape::InvestmentsRecall.blocks(),
+            INVESTMENTS_RECALL_BLOCKS
+        );
+        assert_eq!(
+            OwnerEscape::SavingsRecovery.blocks(),
+            crate::constants::OWNER_RECOVERY_BLOCKS
+        );
     }
 
     /// **The guarantee: the owner leaves alone.**

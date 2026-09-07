@@ -61,19 +61,20 @@ mod server {
     use wraith_wallet_ipc::{
         AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
-        ErrorResponse, GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse,
-        GhostLockListResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
-        GhostLockSavedResponse, GhostLockSignBegunResponse, GhostLockSignNoncedResponse,
-        GhostLockSignedResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
-        GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
-        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
-        LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse,
-        LockSpendOutput, LockSpendSummary, NodeEndpointsResponse, PsbtBroadcastResponse,
-        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
-        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
-        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
-        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
-        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        ErrorResponse, EscapeCoin, GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse,
+        GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
+        GhostLockRecord, GhostLockRoundDestinationResponse, GhostLockSavedResponse,
+        GhostLockSignBegunResponse, GhostLockSignNoncedResponse, GhostLockSignedResponse,
+        GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
+        HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
+        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
+        LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockSpendOutput, LockSpendSummary,
+        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
+        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
+        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
+        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
+        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
+        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -2537,18 +2538,7 @@ mod server {
         ),
         String,
     > {
-        use wraith_wallet_core::ghost_lock_account::LaneKind;
-        let kind = match lane.trim().to_ascii_lowercase().as_str() {
-            "savings" => LaneKind::Savings,
-            "spending" => LaneKind::Spending,
-            "cash" => LaneKind::Cash,
-            "investments" => LaneKind::Investments,
-            other => {
-                return Err(format!(
-                    "unknown lane '{other}' (try savings, spending, cash, investments)"
-                ))
-            }
-        };
+        let kind = parse_lane(lane)?;
         let record = {
             let store = ghost_lock_store_for(state).map_err(|e| format!("lock store: {e}"))?;
             store
@@ -2567,6 +2557,89 @@ mod server {
         )
         .await?;
         Ok((account, kind, record))
+    }
+
+    /// One lane-name parser, so every caller accepts the same words.
+    fn parse_lane(lane: &str) -> Result<wraith_wallet_core::ghost_lock_account::LaneKind, String> {
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+        match lane.trim().to_ascii_lowercase().as_str() {
+            "savings" => Ok(LaneKind::Savings),
+            "spending" => Ok(LaneKind::Spending),
+            "cash" => Ok(LaneKind::Cash),
+            "investments" => Ok(LaneKind::Investments),
+            other => Err(format!(
+                "unknown lane '{other}' (try savings, spending, cash, investments)"
+            )),
+        }
+    }
+
+    /// Resolve a lane and the escape its owner can take.
+    ///
+    /// Refuses the lanes with no owner escape by name. Cash has no leaves at
+    /// all — it is the owner's key on the key path, so there is nothing to
+    /// escape from.
+    async fn lock_escape_for(
+        state: &Arc<DaemonState>,
+        lock_id: &str,
+        lane: &str,
+    ) -> Result<
+        (
+            wraith_wallet_core::ghost_lock_account::GhostLockAccount,
+            wraith_wallet_core::ghost_lock_account::LaneKind,
+            wraith_wallet_core::ghost_lock_store::StoredLock,
+            ghost_lock::escape::OwnerEscape,
+        ),
+        String,
+    > {
+        use ghost_lock::escape::OwnerEscape;
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+
+        // Resolve the lane BEFORE loading the Lock. Both orders are correct;
+        // only this one is useful. Asking about Cash with an unknown lock_id
+        // should say Cash has no escape, not that the Lock is missing — the
+        // second answer sends someone looking for the wrong problem.
+        let kind = parse_lane(lane)?;
+        let escape = match kind {
+            LaneKind::Savings => OwnerEscape::SavingsRecovery,
+            LaneKind::Spending => OwnerEscape::SpendingExit,
+            LaneKind::Investments => OwnerEscape::InvestmentsRecall,
+            LaneKind::Cash => {
+                return Err(
+                    "Cash has no escape leaf: it already spends with your key alone, so \
+                     there is nothing to wait for"
+                        .into(),
+                )
+            }
+        };
+        let (account, kind, record) = lock_lane_for(state, lock_id, lane).await?;
+        Ok((account, kind, record, escape))
+    }
+
+    /// Decode a base64 PSBT and pull out every prevout.
+    ///
+    /// Every one, because a Taproot sighash commits to all of them. A missing
+    /// prevout is refused rather than defaulted: the signature would be over a
+    /// transaction different from the one presented.
+    fn decode_psbt_with_prevouts(
+        psbt_b64: &str,
+    ) -> Result<(bitcoin::psbt::Psbt, Vec<bitcoin::TxOut>), String> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(psbt_b64.trim())
+            .map_err(|e| format!("psbt is not base64: {e}"))?;
+        let psbt = bitcoin::psbt::Psbt::deserialize(&raw).map_err(|e| format!("psbt: {e}"))?;
+        let mut prevouts = Vec::with_capacity(psbt.inputs.len());
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
+                format!(
+                    "input {i} has no witness_utxo, so its value and script are unknown — \
+                     the Taproot sighash commits to every input, so this cannot be signed \
+                     correctly"
+                )
+            })?;
+            prevouts.push(utxo.clone());
+        }
+        Ok((psbt, prevouts))
     }
 
     /// Which keys spend a lane by its key path.
@@ -2898,6 +2971,197 @@ mod server {
                     }
                 }
             }
+            Request::GhostLockEscapePlan { lock_id, lane } => {
+                let (account, kind, _record, escape) =
+                    match lock_escape_for(state, &lock_id, &lane).await {
+                        Ok(v) => v,
+                        Err(message) => {
+                            return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                        }
+                    };
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("Lock has no {} lane", kind.label()),
+                        }),
+                    );
+                };
+                let address = built.lane.address.to_string();
+
+                let seq = match ghost_lock::escape::escape_sequence(escape.blocks()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("sequence: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // Scanned at zero confirmations so an immature coin is listed
+                // with the wait still to go, rather than being invisible until
+                // it is already spendable.
+                let scan = match state
+                    .chain()
+                    .await
+                    .scan_utxos(std::slice::from_ref(&address), 0)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("scan: {e}"),
+                            }),
+                        )
+                    }
+                };
+                let coins: Vec<EscapeCoin> = scan
+                    .utxos
+                    .iter()
+                    .map(|u| EscapeCoin {
+                        txid: u.txid.clone(),
+                        vout: u.vout,
+                        sats: u.amount_sats,
+                        confirmations: u.confirmations,
+                        blocks_remaining: escape.blocks().saturating_sub(u.confirmations),
+                    })
+                    .collect();
+
+                Response::GhostLockEscapePlan(GhostLockEscapePlanResponse {
+                    lock_id,
+                    lane: kind.label().to_ascii_lowercase(),
+                    escape: escape.label().to_string(),
+                    delay_blocks: escape.blocks(),
+                    required_sequence: seq.0,
+                    lane_address: address,
+                    coins,
+                })
+            }
+
+            Request::GhostLockEscapeSign {
+                lock_id,
+                lane,
+                psbt,
+                input_index,
+            } => {
+                let (account, kind, record, escape) =
+                    match lock_escape_for(state, &lock_id, &lane).await {
+                        Ok(v) => v,
+                        Err(message) => {
+                            return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                        }
+                    };
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("Lock has no {} lane", kind.label()),
+                        }),
+                    );
+                };
+
+                let owner_sk = match lock_owner_seckey(state, record.bip86_index).await {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let owner_xonly = owner_sk
+                    .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0;
+                let leaf = match escape.leaf(&owner_xonly) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("leaf: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let (mut parsed, prevouts) = match decode_psbt_with_prevouts(&psbt) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                // The input must be this lane's. Otherwise the daemon would
+                // sign whatever input it was pointed at, on the say-so of
+                // whoever supplied the PSBT.
+                let idx = input_index as usize;
+                let Some(prev) = prevouts.get(idx) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("input {idx} does not exist"),
+                        }),
+                    );
+                };
+                if prev.script_pubkey != built.lane.address.script_pubkey() {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "input {idx} is not the {} lane — it pays to a different script",
+                                kind.label()
+                            ),
+                        }),
+                    );
+                }
+
+                let witness = match ghost_lock::escape::sign_escape(
+                    &built.lane,
+                    &leaf,
+                    escape.blocks(),
+                    &owner_sk,
+                    &parsed.unsigned_tx,
+                    idx,
+                    &prevouts,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("{e}"),
+                            }),
+                        )
+                    }
+                };
+
+                parsed.inputs[idx].final_script_witness = Some(witness);
+                let tx_hex = match parsed.clone().extract_tx() {
+                    Ok(tx) => bitcoin::consensus::encode::serialize_hex(&tx),
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!(
+                                    "the spend is signed but not complete ({e}); every input \
+                                     needs its own witness before this can be broadcast"
+                                ),
+                            }),
+                        )
+                    }
+                };
+                use base64::Engine as _;
+                Response::GhostLockEscapeSigned(GhostLockEscapeSignedResponse {
+                    lock_id,
+                    lane: kind.label().to_ascii_lowercase(),
+                    escape: escape.label().to_string(),
+                    psbt: base64::engine::general_purpose::STANDARD.encode(parsed.serialize()),
+                    tx_hex,
+                })
+            }
+
             Request::GhostLockSignBegin {
                 lock_id,
                 lane,
@@ -5074,6 +5338,41 @@ mod server {
                 ghostd_user: None,
                 ghostd_pass: None,
             })
+        }
+
+        /// Cash is refused an escape, and told why rather than just "no".
+        ///
+        /// Every other lane has a leaf that lets the owner leave alone. Cash
+        /// does not need one — it already spends with the owner's key on the
+        /// key path — and a caller who asks should learn that rather than
+        /// conclude the lane is stuck.
+        #[tokio::test]
+        async fn cash_has_no_escape_and_says_so() {
+            let state = test_state();
+            let line = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockEscapePlan {
+                    lock_id: "no-such-lock".into(),
+                    lane: "cash".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&line, &state).await;
+            let Response::Error(e) = resp.payload else {
+                panic!("Cash must not resolve to an escape plan");
+            };
+            assert!(
+                e.message.contains("nothing to wait for"),
+                "the refusal must explain, not just decline: {}",
+                e.message
+            );
+            // The lock_id is nonsense on purpose: if the error were about the
+            // Lock, the lane check would be running too late to be useful.
+            assert!(
+                !e.message.contains("no remembered Lock"),
+                "Cash must be refused before the Lock lookup: {}",
+                e.message
+            );
         }
 
         /// Each lane's key path has different co-signers, and two lanes have

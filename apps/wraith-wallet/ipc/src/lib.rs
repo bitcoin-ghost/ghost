@@ -203,6 +203,30 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bip86_index: Option<u32>,
     },
+    /// What an escape spend needs, and whether the coins are old enough yet.
+    ///
+    /// Asked before building the transaction, because the input's `nSequence`
+    /// is dictated by the leaf's delay and a wrong one is rejected as
+    /// non-final. The wallet knows the number; the caller should not have to.
+    GhostLockEscapePlan {
+        /// `lock_id` from [`Request::GhostLockList`].
+        lock_id: String,
+        /// `savings`, `spending` or `investments`. Cash has no leaves.
+        lane: String,
+    },
+    /// Sign a lane's escape leaf with the owner's key — leaving alone.
+    ///
+    /// Needs no quorum, no backup device and no ceremony: a key, a delay and a
+    /// transaction. This is the path that stops a silent quorum from being the
+    /// end of the money.
+    GhostLockEscapeSign {
+        lock_id: String,
+        lane: String,
+        /// The spend, base64 PSBT. Its input must carry the `nSequence`
+        /// [`Request::GhostLockEscapePlan`] reported.
+        psbt: String,
+        input_index: u32,
+    },
     /// Round 1 of an air-gapped key-path spend: review the spend and commit a
     /// nonce.
     ///
@@ -730,6 +754,8 @@ pub enum Response {
     LightL1Utxos(LightL1UtxosResponse),
     GhostLockLanes(GhostLockLanesResponse),
     GhostLockRoundDestination(GhostLockRoundDestinationResponse),
+    GhostLockEscapePlan(GhostLockEscapePlanResponse),
+    GhostLockEscapeSigned(GhostLockEscapeSignedResponse),
     GhostLockSignBegun(GhostLockSignBegunResponse),
     GhostLockSignNonced(GhostLockSignNoncedResponse),
     GhostLockSigned(GhostLockSignedResponse),
@@ -1723,6 +1749,47 @@ pub struct LockSpendSummary {
     /// Total inputs in the transaction. More than one means this spend
     /// combines coins.
     pub input_count: usize,
+}
+
+/// One coin sitting in a lane, and whether its escape has matured.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EscapeCoin {
+    pub txid: String,
+    pub vout: u32,
+    pub sats: u64,
+    pub confirmations: u32,
+    /// Blocks still to wait. Zero means it can be spent now.
+    pub blocks_remaining: u32,
+}
+
+/// What an escape spend needs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockEscapePlanResponse {
+    pub lock_id: String,
+    pub lane: String,
+    /// Which escape this is, in words.
+    pub escape: String,
+    /// The wait, in blocks.
+    pub delay_blocks: u32,
+    /// The `nSequence` every spending input must carry. A different value is
+    /// rejected by the network as non-final.
+    pub required_sequence: u32,
+    /// The lane's address — where the coins are.
+    pub lane_address: String,
+    /// Coins in the lane, with how much longer each must wait.
+    pub coins: Vec<EscapeCoin>,
+}
+
+/// A signed escape spend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockEscapeSignedResponse {
+    pub lock_id: String,
+    pub lane: String,
+    pub escape: String,
+    /// The PSBT with the script-path witness attached, base64.
+    pub psbt: String,
+    /// The finished transaction, hex — ready to broadcast.
+    pub tx_hex: String,
 }
 
 /// Round 1 result.
