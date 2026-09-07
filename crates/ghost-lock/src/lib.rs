@@ -68,6 +68,7 @@
 
 #![deny(missing_docs)]
 
+pub mod airgap;
 pub mod compartment;
 pub mod constants;
 pub mod error;

@@ -47,8 +47,43 @@ use crate::error::LockError;
 /// Derived from the message rather than chosen, so two parties agree on it
 /// without negotiating, and so a caller cannot accidentally reuse an id across
 /// two different spends.
+///
+/// This is **not** what the nonce ledger keys on — see [`NonceId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId([u8; 32]);
+
+/// Identifies one secret nonce, by the public nonce it produced.
+///
+/// # Why the ledger keys on this and not the message
+///
+/// The rule that matters is **one partial signature per secret nonce**. It is
+/// not "one nonce per message": generating a fresh nonce and signing the same
+/// message again is safe, because the attack needs the *same* nonce used
+/// twice.
+///
+/// Keying on the message looked equivalent and is not. An air-gapped device
+/// that loses power between round 1 and round 2 has thrown its secret nonce
+/// away — nothing can be reused — but a message-keyed ledger would refuse the
+/// retry and leave that spend permanently unsignable. A device that cannot
+/// retry is a device people work around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NonceId([u8; 32]);
+
+impl NonceId {
+    /// The id of the secret nonce behind `public_nonce`.
+    ///
+    /// A public nonce determines its secret nonce, so this identifies the
+    /// secret without ever handling it.
+    pub fn for_public_nonce(public_nonce: &[u8; 66]) -> Self {
+        use bitcoin::hashes::{sha256, Hash as _};
+        NonceId(sha256::Hash::hash(public_nonce).to_byte_array())
+    }
+
+    /// Raw bytes, for a ledger key or a wire field.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 impl SessionId {
     /// The session a given sighash belongs to.
@@ -62,23 +97,26 @@ impl SessionId {
     }
 }
 
-/// Remembers which sessions have had a secret nonce issued.
+/// Remembers which secret nonces have already been spent on a signature.
 ///
 /// # The contract
 ///
-/// [`claim`](NonceLedger::claim) must return `Ok` **at most once** for a given
-/// [`SessionId`], and that fact must survive a crash between the claim and the
-/// signature. An implementation that keeps this in memory satisfies the letter
-/// of the trait and not its purpose: a daemon that restarts mid-round would
-/// re-issue a nonce for a session it had already signed, and the two partial
-/// signatures would publish the owner's key.
+/// [`spend`](NonceLedger::spend) must return `Ok` **at most once** for a given
+/// [`NonceId`], and that fact must survive a crash between the claim and the
+/// signature being handed out. An implementation that keeps this in memory
+/// satisfies the letter of the trait and not its purpose: a signer that
+/// restarts mid-round would sign a second time with a nonce it had already
+/// used, and the two partial signatures publish its key.
 ///
-/// Write before returning `Ok`, and fsync. This is the same shape as the
-/// once-per-coin rule the wallet enforces for rounds, and it fails the same
-/// way when it is treated as bookkeeping.
+/// Write before returning `Ok`, and fsync. Claiming *after* signing is the
+/// same bug with a smaller window: a crash in between loses the record while
+/// the signature is already out.
+///
+/// This is the same shape as the once-per-coin rule the wallet enforces for
+/// rounds, and it fails the same way when treated as bookkeeping.
 pub trait NonceLedger {
-    /// Reserve `id`. `Err` if it has been reserved before.
-    fn claim(&mut self, id: &SessionId) -> Result<(), LockError>;
+    /// Burn `id`. `Err` if it has been burned before.
+    fn spend(&mut self, id: &NonceId) -> Result<(), LockError>;
 }
 
 /// An in-memory [`NonceLedger`], for tests.
@@ -88,15 +126,15 @@ pub trait NonceLedger {
 /// lives, and silently catastrophic across the restart it cannot see.
 #[derive(Debug, Default)]
 pub struct VolatileNonceLedger {
-    claimed: std::collections::BTreeSet<SessionId>,
+    spent: std::collections::BTreeSet<NonceId>,
 }
 
 impl NonceLedger for VolatileNonceLedger {
-    fn claim(&mut self, id: &SessionId) -> Result<(), LockError> {
-        if !self.claimed.insert(*id) {
+    fn spend(&mut self, id: &NonceId) -> Result<(), LockError> {
+        if !self.spent.insert(*id) {
             return Err(LockError::Policy(format!(
-                "a secret nonce was already issued for session {} — issuing a second \
-                 one and signing with both publishes this key",
+                "nonce {} has already produced a signature — signing with it again \
+                 publishes this key",
                 hex::encode(id.as_bytes())
             )));
         }
@@ -214,16 +252,16 @@ impl SigningSession {
     ///
     /// `ledger` is consulted before any nonce exists, so a session that has
     /// been signed before fails without generating one.
-    pub fn begin<L: NonceLedger>(
-        ledger: &mut L,
+    /// Generating a nonce is free of consequence — it is *using* one twice that
+    /// publishes a key — so the ledger is not consulted here. It is consulted
+    /// in [`sign`](Self::sign), which is the operation that can do harm.
+    pub fn begin(
         keys: &[XOnlyPublicKey],
         own_seckey: &bitcoin::secp256k1::SecretKey,
         merkle_root: Option<TapNodeHash>,
         message: &[u8; 32],
     ) -> Result<(Self, NonceCommitment), LockError> {
         let session = SessionId::for_message(message);
-        ledger.claim(&session)?;
-
         let ctx = context(keys, merkle_root)?;
 
         // Match the scalar to the point the group actually contains.
@@ -277,13 +315,28 @@ impl SigningSession {
         self.session
     }
 
+    /// The id of this session's secret nonce, as the ledger keys it.
+    pub fn nonce_id(&self) -> NonceId {
+        NonceId::for_public_nonce(&self.secnonce.public_nonce().serialize())
+    }
+
     /// Round 2. Combine the other parties' nonces and produce this party's
     /// partial signature.
     ///
     /// Takes `self` by value. The secret nonce is moved out and dropped with
     /// the session, so there is no way to sign twice with it — that is a
     /// compile error, not a check.
-    pub fn sign(self, public_nonces: &[[u8; 66]]) -> Result<[u8; 32], LockError> {
+    pub fn sign<L: NonceLedger>(
+        self,
+        ledger: &mut L,
+        public_nonces: &[[u8; 66]],
+    ) -> Result<[u8; 32], LockError> {
+        // Burn the nonce BEFORE producing the signature. A crash in between
+        // then costs a wasted nonce, which is nothing; the other order costs
+        // the key, because the signature would already be out with no record
+        // that it happened.
+        ledger.spend(&self.nonce_id())?;
+
         if public_nonces.is_empty() {
             return Err(LockError::Policy(
                 "no public nonces: a MuSig2 signature needs every party's round-1 output".into(),
@@ -374,25 +427,63 @@ mod tests {
 
     /// The ledger's whole job, and the failure it exists to prevent.
     #[test]
-    fn a_session_can_only_claim_a_nonce_once() {
+    fn a_nonce_can_only_be_spent_once() {
         let mut ledger = VolatileNonceLedger::default();
-        let id = SessionId::for_message(&[7u8; 32]);
-        assert!(ledger.claim(&id).is_ok());
+        let id = NonceId::for_public_nonce(&[7u8; 66]);
+        assert!(ledger.spend(&id).is_ok());
         let err = ledger
-            .claim(&id)
-            .expect_err("a second nonce for one session publishes the key");
+            .spend(&id)
+            .expect_err("a nonce used twice publishes the key");
         assert!(
             format!("{err}").contains("publishes this key"),
             "the refusal must say why it matters: {err}"
         );
     }
 
-    /// A different message is a different session, so it claims cleanly.
+    /// Different nonces are independent.
     #[test]
-    fn a_different_message_is_a_different_session() {
+    fn different_nonces_are_independent() {
         let mut ledger = VolatileNonceLedger::default();
-        assert!(ledger.claim(&SessionId::for_message(&[1u8; 32])).is_ok());
-        assert!(ledger.claim(&SessionId::for_message(&[2u8; 32])).is_ok());
+        assert!(ledger.spend(&NonceId::for_public_nonce(&[1u8; 66])).is_ok());
+        assert!(ledger.spend(&NonceId::for_public_nonce(&[2u8; 66])).is_ok());
+    }
+
+    /// **The retry case, and the reason the ledger keys on the nonce.**
+    ///
+    /// An air-gapped device that loses power between round 1 and round 2 has
+    /// thrown its secret nonce away, so nothing can be reused and the spend
+    /// must be retryable. An earlier version keyed the ledger on the message
+    /// and refused exactly this, leaving the spend permanently unsignable —
+    /// safe, useless, and the kind of thing people route around.
+    #[test]
+    fn a_lost_round_one_can_be_retried_with_a_fresh_nonce() {
+        let owner = sk(41);
+        let backup = sk(42);
+        let keys = [xonly(&owner), xonly(&backup)];
+        let message = [0x99u8; 32];
+        let mut ledger = VolatileNonceLedger::default();
+
+        // Round 1, then the device forgets everything.
+        let (abandoned, _) =
+            SigningSession::begin(&keys, &owner, None, &message).expect("first attempt");
+        let abandoned_id = abandoned.nonce_id();
+        drop(abandoned);
+
+        // Same message, fresh nonce: must be allowed.
+        let (retry, commit) =
+            SigningSession::begin(&keys, &owner, None, &message).expect("retry must be allowed");
+        assert_ne!(
+            retry.nonce_id(),
+            abandoned_id,
+            "a retry must use a different nonce, or it is the reuse we are avoiding"
+        );
+
+        let (other, other_commit) =
+            SigningSession::begin(&keys, &backup, None, &message).expect("counterparty");
+        let nonces = [commit.public_nonce, other_commit.public_nonce];
+        let mut other_ledger = VolatileNonceLedger::default();
+        assert!(retry.sign(&mut ledger, &nonces).is_ok());
+        assert!(other.sign(&mut other_ledger, &nonces).is_ok());
     }
 
     /// **The test that proves the tweak.**
@@ -461,11 +552,9 @@ mod tests {
 
         // Round 1: nonces.
         let (owner_session, owner_commit) =
-            SigningSession::begin(&mut owner_ledger, &keys, &owner, root, &message)
-                .expect("owner round 1");
+            SigningSession::begin(&keys, &owner, root, &message).expect("owner round 1");
         let (backup_session, backup_commit) =
-            SigningSession::begin(&mut backup_ledger, &keys, &backup, root, &message)
-                .expect("backup round 1");
+            SigningSession::begin(&keys, &backup, root, &message).expect("backup round 1");
 
         assert_eq!(
             owner_commit.session, backup_commit.session,
@@ -475,8 +564,12 @@ mod tests {
         let nonces = [owner_commit.public_nonce, backup_commit.public_nonce];
 
         // Round 2: partial signatures.
-        let owner_partial = owner_session.sign(&nonces).expect("owner round 2");
-        let backup_partial = backup_session.sign(&nonces).expect("backup round 2");
+        let owner_partial = owner_session
+            .sign(&mut owner_ledger, &nonces)
+            .expect("owner round 2");
+        let backup_partial = backup_session
+            .sign(&mut backup_ledger, &nonces)
+            .expect("backup round 2");
 
         let sig = combine(
             &keys,
@@ -533,14 +626,14 @@ mod tests {
 
         let mut l1 = VolatileNonceLedger::default();
         let mut l2 = VolatileNonceLedger::default();
-        let (s1, c1) = SigningSession::begin(&mut l1, &keys, &even, None, &message)
-            .expect("even-Y party round 1");
-        let (s2, c2) = SigningSession::begin(&mut l2, &keys, &odd, None, &message)
-            .expect("odd-Y party round 1");
+        let (s1, c1) =
+            SigningSession::begin(&keys, &even, None, &message).expect("even-Y party round 1");
+        let (s2, c2) =
+            SigningSession::begin(&keys, &odd, None, &message).expect("odd-Y party round 1");
 
         let nonces = [c1.public_nonce, c2.public_nonce];
-        let p1 = s1.sign(&nonces).expect("even-Y party round 2");
-        let p2 = s2.sign(&nonces).expect("odd-Y party round 2");
+        let p1 = s1.sign(&mut l1, &nonces).expect("even-Y party round 2");
+        let p2 = s2.sign(&mut l2, &nonces).expect("odd-Y party round 2");
 
         let sig = combine(&keys, None, &nonces, &[p1, p2], &message).expect("combines");
         let out = output_key(&keys, None).expect("derives");
@@ -559,14 +652,12 @@ mod tests {
 
         let mut l1 = VolatileNonceLedger::default();
         let mut l2 = VolatileNonceLedger::default();
-        let (s1, c1) =
-            SigningSession::begin(&mut l1, &keys, &owner, None, &message).expect("round 1");
-        let (s2, c2) =
-            SigningSession::begin(&mut l2, &keys, &backup, None, &message).expect("round 1");
+        let (s1, c1) = SigningSession::begin(&keys, &owner, None, &message).expect("round 1");
+        let (s2, c2) = SigningSession::begin(&keys, &backup, None, &message).expect("round 1");
 
         let nonces = [c1.public_nonce, c2.public_nonce];
-        let p1 = s1.sign(&nonces).expect("round 2");
-        let p2 = s2.sign(&nonces).expect("round 2");
+        let p1 = s1.sign(&mut l1, &nonces).expect("round 2");
+        let p2 = s2.sign(&mut l2, &nonces).expect("round 2");
 
         // Aggregate against only one of the two nonces: the aggregate nonce no
         // longer matches what either party signed under.

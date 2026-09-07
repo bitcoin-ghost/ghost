@@ -1795,11 +1795,14 @@ dependencies = [
 name = "ghost-lock"
 version = "1.11.38"
 dependencies = [
+ "base64 0.22.1",
  "bitcoin",
  "hex",
  "musig2",
  "rand 0.8.5",
  "secp256k1 0.29.1",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
