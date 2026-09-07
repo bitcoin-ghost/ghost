@@ -45,8 +45,8 @@
 //! coordinator will happily sign a second transaction for a coin it already
 //! signed — which is not a degraded service, it is the exact fraud the whole
 //! design promises cannot happen, executed accidentally by an honest operator.
-//! A restart would mint a valid [`DoubleSignProof`] against a quorum that did
-//! nothing wrong.
+//! A restart would mint a valid [`crate::attestation::DoubleSignProof`] against
+//! a quorum that did nothing wrong.
 //!
 //! So [`SignatureStore`] is a trait with a durability contract, and
 //! [`VolatileStore`] is named to be uncomfortable to type in production.

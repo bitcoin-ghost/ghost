@@ -86,7 +86,7 @@ impl PrivacyLevel {
 /// **Derived, never restated.** `#698` was two components computing the same
 /// quantity independently and never matching — invisible because both only
 /// checked `>=`, so the larger won and the difference went to miners. Every
-/// vbyte figure in this crate comes from [`crate::tier`] or it is that bug
+/// vbyte figure in this crate comes from `crate::tier` or it is that bug
 /// again.
 pub const VBYTES_PER_SEAT: u64 =
     (crate::tier::VBYTES_PER_INPUT + crate::tier::VBYTES_PER_OUTPUT) as u64;
