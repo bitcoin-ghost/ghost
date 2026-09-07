@@ -1355,11 +1355,11 @@ mod server {
             txid: None,
             recipient,
             amount_sats: result.amount_sats,
-            // ghost-pay's L2 send doesn't currently expose a fee
-            // breakdown in its response. v1 reports 0; the
-            // operator-side fee accounting can surface later via
-            // a separate query if/when needed.
-            fee_sats: 0,
+            // `PaymentSent` carries no fee, so the wallet does not know what
+            // this cost. Reporting `0` claimed it was free, which is a
+            // stronger and possibly false statement — ghost-pay does account
+            // for L2 fees operator-side. `None` says what is true.
+            fee_sats: None,
             mode: mode_label,
             shroud_delay_ms,
         })

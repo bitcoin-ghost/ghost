@@ -1410,7 +1410,12 @@ mod client {
                 }
                 println!("  recipient:  {}", s.recipient);
                 println!("  amount:     {} sats", s.amount_sats);
-                println!("  fee:        {} sats", s.fee_sats);
+                match s.fee_sats {
+                    Some(f) => println!("  fee:        {f} sats"),
+                    // Not "0 sats": the wallet is not told, and printing a
+                    // number it did not receive would be inventing one.
+                    None => println!("  fee:        (not reported by the server)"),
+                }
                 println!("  mode:       {}", s.mode);
                 match s.shroud_delay_ms {
                     Some(ms) => println!("  shroud:     held {ms} ms before broadcast"),

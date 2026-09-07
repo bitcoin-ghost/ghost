@@ -1413,7 +1413,16 @@ pub struct LightSentResponse {
     pub txid: Option<String>,
     pub recipient: String,
     pub amount_sats: u64,
-    pub fee_sats: u64,
+    /// What the send cost, when that is known.
+    ///
+    /// `None` means **unknown**, not free. An L2 ledger transfer's fee is not
+    /// in `PaymentSent` — the server does not send one — so the wallet cannot
+    /// report a figure. It said `0` before, which is a different claim from
+    /// "unknown" and the wrong one: a reader takes it as "this was free".
+    ///
+    /// Surfacing a real number needs a field on the wire message and ghost-pay
+    /// filling it in; until then, saying so is the honest answer.
+    pub fee_sats: Option<u64>,
     pub mode: String,
     /// Actual milliseconds the wallet held the signed payment before
     /// submitting to ghost-pay (Phase 9 Shroud relay). `None` when shroud
@@ -2007,6 +2016,33 @@ mod tests {
         for raw in inputs {
             let result: Result<Envelope<Request>, _> = serde_json::from_str(raw);
             assert!(result.is_err(), "expected error for input: {raw:?}");
+        }
+    }
+
+    /// An unknown fee must survive the wire as unknown.
+    ///
+    /// The bug this replaces was a fabricated `0`, so the thing worth pinning
+    /// is that `None` stays `None` — a serialiser that defaulted it back to a
+    /// number would restore the lie without touching the code that fixed it.
+    #[test]
+    fn an_unreported_send_fee_stays_unknown_across_the_wire() {
+        let sent = LightSentResponse {
+            payment_id: "p1".into(),
+            txid: None,
+            recipient: "gh1qexample".into(),
+            amount_sats: 1_000,
+            fee_sats: None,
+            mode: "ghostpay".into(),
+            shroud_delay_ms: None,
+        };
+        let wire = serde_json::to_string(&Envelope::new(1, Response::LightSent(sent))).unwrap();
+        let back: Envelope<Response> = serde_json::from_str(&wire).unwrap();
+        match back.payload {
+            Response::LightSent(r) => assert!(
+                r.fee_sats.is_none(),
+                "an unknown fee must not come back as a number"
+            ),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
