@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 bitcoin = { workspace = true }
+bip39 = { workspace = true }
+bip32 = { workspace = true }
+zeroize = { workspace = true }
 musig2 = { version = "0.4", default-features = false, features = ["secp256k1"] }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

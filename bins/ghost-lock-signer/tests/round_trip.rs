@@ -21,6 +21,28 @@ fn sk(b: u8) -> SecretKey {
     SecretKey::from_slice(&[b; 32]).expect("valid scalar")
 }
 
+/// A BIP39 test vector. Never use it for anything real.
+const PHRASE: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+/// The key the device will actually derive — so the lane is built around the
+/// key the device holds, not a stand-in that happens to be nearby.
+fn device_key(index: u32) -> SecretKey {
+    ghost_lock::backup_key::secret_key(PHRASE, "", index).expect("derives")
+}
+
+/// Write a secret to a file the signer will accept.
+fn secret_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    p
+}
+
 fn xonly(s: &SecretKey) -> XOnlyPublicKey {
     Keypair::from_secret_key(&Secp256k1::new(), s)
         .x_only_public_key()
@@ -31,7 +53,7 @@ fn xonly(s: &SecretKey) -> XOnlyPublicKey {
 fn fixture() -> (ghost_lock::lane::Lane, SecretKey, SecretKey, SigningRequest) {
     let secp = Secp256k1::new();
     let owner = sk(61);
-    let backup = sk(62);
+    let backup = device_key(0);
     let aggregate = ghost_lock::key_agg::aggregate(&[xonly(&owner), xonly(&backup)]).unwrap();
     let lane = SavingsPolicy {
         aggregate,
@@ -112,19 +134,13 @@ fn read_block(reader: &mut impl BufRead) -> String {
 #[test]
 fn the_device_co_signs_a_spend() {
     let secp = Secp256k1::new();
-    let (lane, owner, backup, request) = fixture();
+    let (lane, owner, _backup, request) = fixture();
     let dir = tempfile::tempdir().unwrap();
 
     let req_path = dir.path().join("request.json");
     std::fs::write(&req_path, serde_json::to_string(&request).unwrap()).unwrap();
 
-    let key_path = dir.path().join("backup.key");
-    std::fs::write(&key_path, hex::encode(backup.secret_bytes())).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    let seed_path = secret_file(dir.path(), "seed.txt", PHRASE);
     let ledger_path = dir.path().join("nonces.json");
 
     // Host side: review the same request and take round 1.
@@ -139,8 +155,8 @@ fn the_device_co_signs_a_spend() {
             "sign",
             "--request",
             req_path.to_str().unwrap(),
-            "--key",
-            key_path.to_str().unwrap(),
+            "--seed",
+            seed_path.to_str().unwrap(),
             "--ledger",
             ledger_path.to_str().unwrap(),
             "--network",
@@ -217,17 +233,11 @@ fn the_device_co_signs_a_spend() {
 /// different one in round 2, which would make the device's screen meaningless.
 #[test]
 fn the_device_refuses_a_round_two_for_a_different_spend() {
-    let (_, _, backup, request) = fixture();
+    let (_, _, _backup, request) = fixture();
     let dir = tempfile::tempdir().unwrap();
     let req_path = dir.path().join("request.json");
     std::fs::write(&req_path, serde_json::to_string(&request).unwrap()).unwrap();
-    let key_path = dir.path().join("backup.key");
-    std::fs::write(&key_path, hex::encode(backup.secret_bytes())).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    let seed_path = secret_file(dir.path(), "seed.txt", PHRASE);
     let ledger_path = dir.path().join("nonces.json");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
@@ -235,8 +245,8 @@ fn the_device_refuses_a_round_two_for_a_different_spend() {
             "sign",
             "--request",
             req_path.to_str().unwrap(),
-            "--key",
-            key_path.to_str().unwrap(),
+            "--seed",
+            seed_path.to_str().unwrap(),
             "--ledger",
             ledger_path.to_str().unwrap(),
             "--network",
@@ -278,26 +288,26 @@ fn the_device_refuses_a_round_two_for_a_different_spend() {
     );
 }
 
-/// A world-readable key file is refused.
+/// A world-readable seed file is refused.
 #[cfg(unix)]
 #[test]
-fn the_device_refuses_a_key_others_can_read() {
+fn the_device_refuses_a_seed_others_can_read() {
     use std::os::unix::fs::PermissionsExt;
-    let (_, _, backup, request) = fixture();
+    let (_, _, _, request) = fixture();
     let dir = tempfile::tempdir().unwrap();
     let req_path = dir.path().join("request.json");
     std::fs::write(&req_path, serde_json::to_string(&request).unwrap()).unwrap();
-    let key_path = dir.path().join("backup.key");
-    std::fs::write(&key_path, hex::encode(backup.secret_bytes())).unwrap();
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let seed_path = dir.path().join("seed.txt");
+    std::fs::write(&seed_path, PHRASE).unwrap();
+    std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
         .args([
             "sign",
             "--request",
             req_path.to_str().unwrap(),
-            "--key",
-            key_path.to_str().unwrap(),
+            "--seed",
+            seed_path.to_str().unwrap(),
             "--ledger",
             dir.path().join("n.json").to_str().unwrap(),
             "--network",
@@ -309,6 +319,72 @@ fn the_device_refuses_a_key_others_can_read() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("readable by others"), "{err}");
+}
+
+/// The wrong derivation index is caught before anything is signed.
+///
+/// Otherwise the device would burn a nonce producing a share that belongs to
+/// no Lock, and the failure would surface as an aggregation error on the host
+/// with nothing pointing at the index.
+#[test]
+fn the_device_refuses_an_index_that_is_not_a_cosigner() {
+    let (_, _, _, request) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let req_path = dir.path().join("request.json");
+    std::fs::write(&req_path, serde_json::to_string(&request).unwrap()).unwrap();
+    let seed_path = secret_file(dir.path(), "seed.txt", PHRASE);
+    let ledger_path = dir.path().join("n.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args([
+            "sign",
+            "--request",
+            req_path.to_str().unwrap(),
+            "--seed",
+            seed_path.to_str().unwrap(),
+            "--ledger",
+            ledger_path.to_str().unwrap(),
+            "--network",
+            "regtest",
+            "--no-confirm",
+            // The lane was built around index 0.
+            "--index",
+            "9",
+        ])
+        .output()
+        .expect("runs");
+    assert!(!output.status.success(), "the wrong index must be refused");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("not one of the co-signers"), "{err}");
+    assert!(
+        !ledger_path.exists(),
+        "nothing may be burned when nothing was signed"
+    );
+}
+
+/// `pubkey` prints the key to register, and it is the key the device signs with.
+#[test]
+fn pubkey_prints_the_key_the_device_signs_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed_path = secret_file(dir.path(), "seed.txt", PHRASE);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args([
+            "pubkey",
+            "--seed",
+            seed_path.to_str().unwrap(),
+            "--index",
+            "0",
+        ])
+        .output()
+        .expect("runs");
+    assert!(output.status.success());
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(
+        printed,
+        hex::encode(xonly(&device_key(0)).serialize()),
+        "the printed key must be the one the device derives for signing"
+    );
 }
 
 /// `review` shows the spend and signs nothing.

@@ -57,6 +57,22 @@ enum Command {
         #[arg(long, default_value = "bitcoin")]
         network: String,
     },
+    /// Print the public key this device signs with.
+    ///
+    /// This is what gets registered as the Lock's `backup_pubkey`. Derived
+    /// from the phrase rather than typed, so the key in the Lock is provably
+    /// the key this device will sign with.
+    Pubkey {
+        /// File holding this device's BIP39 seed phrase.
+        #[arg(long)]
+        seed: PathBuf,
+        /// File holding the BIP39 passphrase, if any.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Derivation index.
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+    },
     /// Co-sign a spend. Two rounds, one interactive session.
     Sign {
         /// Signing request JSON, as a file path.
@@ -64,9 +80,23 @@ enum Command {
         /// A path rather than stdin, because stdin is needed for round 2.
         #[arg(long)]
         request: PathBuf,
-        /// File holding this device's key: 64 hex characters, nothing else.
+        /// File holding this device's BIP39 seed phrase, and nothing else.
+        ///
+        /// A file rather than an argument: a phrase on the command line ends
+        /// up in shell history and in the process list, where anything on the
+        /// machine can read it.
         #[arg(long)]
-        key: PathBuf,
+        seed: PathBuf,
+        /// File holding the BIP39 passphrase, if this device uses one.
+        ///
+        /// Optional, and empty by default. A passphrase produces a completely
+        /// different key, so a device configured with one must keep it —
+        /// losing it loses the funds exactly as losing the phrase would.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Derivation index. Must match the key registered in the Lock.
+        #[arg(long, default_value_t = 0)]
+        index: u32,
         /// Where to record spent nonces. Must be durable storage.
         #[arg(long)]
         ledger: PathBuf,
@@ -104,19 +134,51 @@ fn run() -> Result<(), String> {
             println!("(reviewed only — nothing was signed)");
             Ok(())
         }
+        Command::Pubkey {
+            seed,
+            passphrase_file,
+            index,
+        } => {
+            let phrase = read_secret_file(&seed, "seed phrase")?;
+            let pass = match &passphrase_file {
+                Some(p) => read_secret_file(p, "passphrase")?,
+                None => String::new(),
+            };
+            let pk = ghost_lock::backup_key::public_key(&phrase, &pass, index)
+                .map_err(|e| e.to_string())?;
+            println!("{}", hex::encode(pk.serialize()));
+            eprintln!(
+                "derived at {} — register this as the Lock's backup_pubkey",
+                ghost_lock::backup_key::derivation_path(index)
+            );
+            Ok(())
+        }
         Command::Sign {
             request,
-            key,
+            seed,
+            passphrase_file,
+            index,
             ledger,
             network,
             no_confirm,
-        } => sign(request, key, ledger, &network, no_confirm),
+        } => sign(
+            request,
+            seed,
+            passphrase_file,
+            index,
+            ledger,
+            &network,
+            no_confirm,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign(
     request_path: PathBuf,
-    key_path: PathBuf,
+    seed_path: PathBuf,
+    passphrase_path: Option<PathBuf>,
+    index: u32,
     ledger_path: PathBuf,
     network: &str,
     no_confirm: bool,
@@ -139,7 +201,31 @@ fn sign(
         confirm()?;
     }
 
-    let seckey = read_key(&key_path)?;
+    let phrase = read_secret_file(&seed_path, "seed phrase")?;
+    let pass = match &passphrase_path {
+        Some(p) => read_secret_file(p, "passphrase")?,
+        None => String::new(),
+    };
+    let seckey =
+        ghost_lock::backup_key::secret_key(&phrase, &pass, index).map_err(|e| e.to_string())?;
+
+    // The key this device holds must be one of the co-signers named in the
+    // request. If it is not, the request is for a Lock this device is not part
+    // of — signing would burn a nonce and produce a share nobody can use.
+    let ours = seckey
+        .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+        .0;
+    if !keys.contains(&ours) {
+        return Err(format!(
+            "this device's key is not one of the co-signers in this request.\n               this device (index {index}): {}\n               the request names:          {}\n             Either the index is wrong, or this request belongs to a different Lock.",
+            hex::encode(ours.serialize()),
+            keys.iter()
+                .map(|k| hex::encode(k.serialize()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     let mut ledger =
         FileNonceLedger::open(&ledger_path).map_err(|e| format!("nonce ledger: {e}"))?;
 
@@ -290,30 +376,31 @@ fn read_request(source: &str) -> Result<SigningRequest, String> {
     serde_json::from_str(&raw).map_err(|e| format!("request is not valid JSON: {e}"))
 }
 
-/// Read this device's key.
+/// Read a secret from a file, refusing one others can read.
 ///
-/// Refuses a group- or world-readable file. A signing key readable by another
-/// account on the machine is already disclosed, and continuing would put a
-/// signature behind a key somebody else may hold.
-fn read_key(path: &PathBuf) -> Result<bitcoin::secp256k1::SecretKey, String> {
+/// Mode is checked before the contents are touched. A seed phrase readable by
+/// another account on the machine is already disclosed, and continuing would
+/// put a signature behind a key somebody else can derive.
+fn read_secret_file(path: &PathBuf, what: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat key: {e}"))?;
-        let mode = meta.permissions().mode() & 0o077;
-        if mode != 0 {
+        let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat {what}: {e}"))?;
+        if meta.permissions().mode() & 0o077 != 0 {
             return Err(format!(
                 "{} is readable by others (mode {:o}); run `chmod 600` on it. \
-                 A key another account can read is a key you no longer control.",
+                 A {what} another account can read is one you no longer control.",
                 path.display(),
                 meta.permissions().mode() & 0o777
             ));
         }
     }
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read key: {e}"))?;
-    let bytes = hex::decode(raw.trim()).map_err(|e| format!("key is not hex: {e}"))?;
-    bitcoin::secp256k1::SecretKey::from_slice(&bytes)
-        .map_err(|e| format!("key is not a valid secp256k1 secret: {e}"))
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read {what}: {e}"))?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(trimmed)
 }
 
 fn parse_network(s: &str) -> Result<bitcoin::Network, String> {

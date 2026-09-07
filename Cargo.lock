@@ -3386,6 +3386,8 @@ name = "ghost-lock"
 version = "1.11.38"
 dependencies = [
  "base64 0.22.1",
+ "bip32",
+ "bip39",
  "bitcoin",
  "hex",
  "musig2",
@@ -3395,6 +3397,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
