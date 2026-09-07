@@ -57,6 +57,34 @@ enum Command {
         #[arg(long, default_value = "bitcoin")]
         network: String,
     },
+    /// Claim a Savings lane by a leaf that is yours — heir or backup device.
+    ///
+    /// One signature, no ceremony, no counterparty: the leaf is a plain
+    /// timelock over your key. What it needs is the delay to have passed, and
+    /// the transaction to say so correctly.
+    ///
+    /// You need the Lock's descriptor — four public keys and two heights —
+    /// and your own seed. Nothing secret from the owner.
+    Claim {
+        /// Claim JSON: the Lock descriptor plus the spend. `-` reads stdin.
+        #[arg(long)]
+        request: String,
+        /// File holding your BIP39 seed phrase.
+        #[arg(long)]
+        seed: PathBuf,
+        /// File holding the BIP39 passphrase, if any.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Derivation index your key sits at.
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        /// Network the addresses belong to.
+        #[arg(long, default_value = "bitcoin")]
+        network: String,
+        /// Skip the typed confirmation. For scripted testing.
+        #[arg(long)]
+        no_confirm: bool,
+    },
     /// Create this device's seed phrase.
     ///
     /// Entropy comes from the OS CSPRNG. Dice or coin flips, if you supply
@@ -163,6 +191,14 @@ fn run() -> Result<(), String> {
             println!("(reviewed only — nothing was signed)");
             Ok(())
         }
+        Command::Claim {
+            request,
+            seed,
+            passphrase_file,
+            index,
+            network,
+            no_confirm,
+        } => claim(request, seed, passphrase_file, index, &network, no_confirm),
         Command::Generate {
             dice_file,
             coins_file,
@@ -333,6 +369,160 @@ fn sign(
         "{}",
         serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
     );
+    println!("--- end ---");
+    Ok(())
+}
+
+/// What a claimant is handed: the Lock in public terms, plus the spend.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaimRequest {
+    /// The Lock, as four public keys and two heights.
+    descriptor: ghost_lock::descriptor::LockDescriptor,
+    /// The unsigned spend, base64 PSBT.
+    psbt: String,
+    /// Which input is the Savings lane.
+    input_index: u32,
+    /// `backup-recovery` or `inheritance`.
+    claim: String,
+}
+
+/// Sign a Savings leaf that belongs to the claimant.
+#[allow(clippy::too_many_arguments)]
+fn claim(
+    request: String,
+    seed_path: PathBuf,
+    passphrase_path: Option<PathBuf>,
+    index: u32,
+    network: &str,
+    no_confirm: bool,
+) -> Result<(), String> {
+    use ghost_lock::escape::OtherClaim;
+
+    let network = parse_network(network)?;
+    let raw = if request == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+            .map_err(|e| format!("stdin: {e}"))?;
+        s
+    } else {
+        std::fs::read_to_string(&request).map_err(|e| format!("cannot read {request}: {e}"))?
+    };
+    let req: ClaimRequest =
+        serde_json::from_str(&raw).map_err(|e| format!("claim request is not valid JSON: {e}"))?;
+
+    let kind = match req.claim.trim().to_ascii_lowercase().as_str() {
+        "backup-recovery" | "backup" => OtherClaim::BackupRecovery,
+        "inheritance" | "heir" => OtherClaim::Inheritance {
+            height: req.descriptor.inherit_height,
+        },
+        other => {
+            return Err(format!(
+                "unknown claim '{other}' (try backup-recovery or inheritance)"
+            ))
+        }
+    };
+
+    // Rebuild the lane from the descriptor. Derived, not accepted: an address
+    // handed over could be anyone's.
+    let lane = req
+        .descriptor
+        .savings_lane(network)
+        .map_err(|e| format!("this descriptor does not build a lane: {e}"))?;
+
+    let (summary, psbt, prevouts) =
+        ghost_lock::airgap::summarise(&req.psbt, req.input_index, network)
+            .map_err(|e| format!("this spend cannot be read: {e}"))?;
+
+    // The input must be the lane the descriptor describes.
+    let idx = req.input_index as usize;
+    let prev = prevouts
+        .get(idx)
+        .ok_or_else(|| format!("input {idx} does not exist"))?;
+    if prev.script_pubkey != lane.address.script_pubkey() {
+        return Err(format!(
+            "input {idx} is not this Lock's Savings lane.\n               the lane is: {}\n               the input pays: {}",
+            lane.address,
+            summary
+                .input_address
+                .as_deref()
+                .unwrap_or("an unrenderable script")
+        ));
+    }
+
+    println!("{} — {}", kind.label(), lane.address);
+    print_summary(&summary);
+    match kind {
+        OtherClaim::BackupRecovery => println!(
+            "\nThis leaf opens {} blocks after the coin was confirmed.",
+            ghost_lock::constants::BACKUP_RECOVERY_BLOCKS
+        ),
+        OtherClaim::Inheritance { height } => {
+            println!("\nThis leaf opens at block height {height}.")
+        }
+    }
+
+    if !no_confirm {
+        confirm()?;
+    }
+
+    let phrase = read_secret_file(&seed_path, "seed phrase")?;
+    let pass = match &passphrase_path {
+        Some(p) => read_secret_file(p, "passphrase")?,
+        None => String::new(),
+    };
+    let key =
+        ghost_lock::backup_key::secret_key(&phrase, &pass, index).map_err(|e| e.to_string())?;
+    let ours = key
+        .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+        .0;
+
+    // The key must be the one this claim belongs to. Otherwise the leaf is
+    // built around somebody else's key and has no control block, which reads
+    // as a confusing tree error rather than "wrong index".
+    let expected = match kind {
+        OtherClaim::BackupRecovery => req.descriptor.backup(),
+        OtherClaim::Inheritance { .. } => req.descriptor.heir(),
+    }
+    .map_err(|e| e.to_string())?;
+    if ours != expected {
+        return Err(format!(
+            "the key at index {index} is not the one this claim is for.\n               yours:    {}\n               expected: {}\n             Either the index is wrong, or this descriptor is for a different person.",
+            hex::encode(ours.serialize()),
+            hex::encode(expected.serialize())
+        ));
+    }
+
+    let leaf = kind.leaf(&ours).map_err(|e| e.to_string())?;
+    let witness = match kind {
+        OtherClaim::BackupRecovery => ghost_lock::escape::sign_escape(
+            &lane,
+            &leaf,
+            ghost_lock::constants::BACKUP_RECOVERY_BLOCKS,
+            &key,
+            &psbt.unsigned_tx,
+            idx,
+            &prevouts,
+        ),
+        OtherClaim::Inheritance { height } => ghost_lock::escape::sign_inheritance(
+            &lane,
+            &leaf,
+            height,
+            &key,
+            &psbt.unsigned_tx,
+            idx,
+            &prevouts,
+        ),
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut signed = psbt;
+    signed.inputs[idx].final_script_witness = Some(witness);
+    let tx = signed
+        .extract_tx()
+        .map_err(|e| format!("the claim is signed but the transaction is not complete ({e})"))?;
+
+    println!("\n--- broadcast this ---");
+    println!("{}", bitcoin::consensus::encode::serialize_hex(&tx));
     println!("--- end ---");
     Ok(())
 }

@@ -527,3 +527,185 @@ fn a_bad_die_face_is_reported_with_its_position() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("die roll 7"), "must say which roll: {err}");
 }
+
+/// **An heir claims, with nothing but a descriptor and their own seed.**
+///
+/// This is the promise inheritance makes. Before the claim path existed the
+/// leaf was in the tree and unspendable by anyone.
+#[test]
+fn an_heir_claims_savings_with_only_a_descriptor_and_a_seed() {
+    use bitcoin::absolute::LockTime;
+    let secp = Secp256k1::new();
+    let dir = tempfile::tempdir().unwrap();
+
+    // The heir's key comes from THEIR seed, at their index.
+    let heir = ghost_lock::backup_key::secret_key(PHRASE, "", 5).unwrap();
+    let owner = sk(11);
+    let backup = sk(12);
+    let inherit_at = 1_000_000u32;
+
+    let descriptor = ghost_lock::descriptor::LockDescriptor {
+        owner_pubkey: hex::encode(xonly(&owner).serialize()),
+        backup_pubkey: hex::encode(xonly(&backup).serialize()),
+        heir_pubkey: hex::encode(xonly(&heir).serialize()),
+        quorum_pubkey: hex::encode(xonly(&sk(13)).serialize()),
+        anchor_height: 900_000,
+        inherit_height: inherit_at,
+    };
+    let lane = descriptor.savings_lane(Network::Regtest).unwrap();
+
+    // A spend of the lane, correctly formed for a CLTV claim.
+    let prevout = TxOut {
+        value: Amount::from_sat(70_000),
+        script_pubkey: lane.address.script_pubkey(),
+    };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_height(inherit_at).unwrap(),
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_str(
+                    "0000000000000000000000000000000000000000000000000000000000000006",
+                )
+                .unwrap(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(69_000),
+            script_pubkey: lane.address.script_pubkey(),
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.inputs[0].witness_utxo = Some(prevout);
+
+    use base64::Engine as _;
+    let request = serde_json::json!({
+        "descriptor": descriptor,
+        "psbt": base64::engine::general_purpose::STANDARD.encode(psbt.serialize()),
+        "input_index": 0,
+        "claim": "inheritance",
+    });
+    let req_path = dir.path().join("claim.json");
+    std::fs::write(&req_path, serde_json::to_string(&request).unwrap()).unwrap();
+    let seed_path = secret_file(dir.path(), "seed.txt", PHRASE);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args([
+            "claim",
+            "--request",
+            req_path.to_str().unwrap(),
+            "--seed",
+            seed_path.to_str().unwrap(),
+            "--index",
+            "5",
+            "--network",
+            "regtest",
+            "--no-confirm",
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        output.status.success(),
+        "the heir must be able to claim: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Savings inheritance"), "{text}");
+    assert!(
+        text.contains(&format!("block height {inherit_at}")),
+        "the claimant must be told when the leaf opens: {text}"
+    );
+
+    // The transaction it produced must actually be a valid spend of the lane.
+    let hex_line = text
+        .lines()
+        .skip_while(|l| !l.starts_with("--- broadcast"))
+        .nth(1)
+        .expect("a transaction");
+    let raw = hex::decode(hex_line.trim()).expect("hex");
+    let signed: Transaction = bitcoin::consensus::encode::deserialize(&raw).expect("a transaction");
+    assert_eq!(
+        signed.input[0].witness.len(),
+        3,
+        "signature, script, control"
+    );
+    let _ = secp;
+}
+
+/// The wrong index is refused before anything is signed.
+#[test]
+fn a_claimant_at_the_wrong_index_is_refused() {
+    use bitcoin::absolute::LockTime;
+    let dir = tempfile::tempdir().unwrap();
+    let heir = ghost_lock::backup_key::secret_key(PHRASE, "", 5).unwrap();
+    let descriptor = ghost_lock::descriptor::LockDescriptor {
+        owner_pubkey: hex::encode(xonly(&sk(11)).serialize()),
+        backup_pubkey: hex::encode(xonly(&sk(12)).serialize()),
+        heir_pubkey: hex::encode(xonly(&heir).serialize()),
+        quorum_pubkey: hex::encode(xonly(&sk(13)).serialize()),
+        anchor_height: 900_000,
+        inherit_height: 1_000_000,
+    };
+    let lane = descriptor.savings_lane(Network::Regtest).unwrap();
+    let prevout = TxOut {
+        value: Amount::from_sat(70_000),
+        script_pubkey: lane.address.script_pubkey(),
+    };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_height(1_000_000).unwrap(),
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_str(
+                    "0000000000000000000000000000000000000000000000000000000000000007",
+                )
+                .unwrap(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(69_000),
+            script_pubkey: lane.address.script_pubkey(),
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.inputs[0].witness_utxo = Some(prevout);
+
+    use base64::Engine as _;
+    let request = serde_json::json!({
+        "descriptor": descriptor,
+        "psbt": base64::engine::general_purpose::STANDARD.encode(psbt.serialize()),
+        "input_index": 0,
+        "claim": "inheritance",
+    });
+    let req_path = dir.path().join("claim.json");
+    std::fs::write(&req_path, serde_json::to_string(&request).unwrap()).unwrap();
+    let seed_path = secret_file(dir.path(), "seed.txt", PHRASE);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghost-lock-signer"))
+        .args([
+            "claim",
+            "--request",
+            req_path.to_str().unwrap(),
+            "--seed",
+            seed_path.to_str().unwrap(),
+            // The descriptor names index 5.
+            "--index",
+            "0",
+            "--network",
+            "regtest",
+            "--no-confirm",
+        ])
+        .output()
+        .expect("runs");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("not the one this claim is for"), "{err}");
+}

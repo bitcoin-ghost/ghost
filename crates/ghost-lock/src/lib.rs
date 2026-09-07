@@ -72,6 +72,7 @@ pub mod airgap;
 pub mod backup_key;
 pub mod compartment;
 pub mod constants;
+pub mod descriptor;
 pub mod error;
 pub mod escape;
 pub mod key_agg;

@@ -16,7 +16,7 @@ ghost-entropy = { workspace = true }
 ghost-lock = { workspace = true }
 bitcoin = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 

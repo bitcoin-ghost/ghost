@@ -142,14 +142,36 @@ pub fn review(
     request: &SigningRequest,
     network: Network,
 ) -> Result<(SpendSummary, [u8; 32]), LockError> {
+    let (summary, psbt, prevouts) = summarise(&request.psbt, request.input_index, network)?;
+    let idx = request.input_index as usize;
+    let mut cache = SighashCache::new(&psbt.unsigned_tx);
+    let sighash = cache
+        .taproot_key_spend_signature_hash(idx, &Prevouts::All(&prevouts), TapSighashType::Default)
+        .map_err(|e| LockError::Policy(format!("sighash: {e}")))?;
+    Ok((summary, *sighash.as_ref()))
+}
+
+/// Decode a PSBT and describe what it does.
+///
+/// Shared by every path that shows a spend before signing it — the key-path
+/// ceremony and the script-path claims alike. One reader, so two callers cannot
+/// display the same transaction differently.
+///
+/// Returns the prevouts as well, because a Taproot sighash of either kind
+/// commits to all of them.
+pub fn summarise(
+    psbt_b64: &str,
+    input_index: u32,
+    network: Network,
+) -> Result<(SpendSummary, Psbt, Vec<bitcoin::TxOut>), LockError> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::STANDARD
-        .decode(request.psbt.trim())
+        .decode(psbt_b64.trim())
         .map_err(|e| LockError::Policy(format!("psbt is not base64: {e}")))?;
     let psbt = Psbt::deserialize(&raw)
         .map_err(|e| LockError::Policy(format!("psbt does not decode: {e}")))?;
 
-    let idx = request.input_index as usize;
+    let idx = input_index as usize;
     if idx >= psbt.inputs.len() {
         return Err(LockError::Policy(format!(
             "input {idx} does not exist: the transaction has {}",
@@ -188,7 +210,7 @@ pub fn review(
     })?;
 
     let summary = SpendSummary {
-        input_index: request.input_index,
+        input_index,
         input_sats: prevouts[idx].value.to_sat(),
         input_address: Address::from_script(&prevouts[idx].script_pubkey, network)
             .ok()
@@ -208,12 +230,7 @@ pub fn review(
         input_count: psbt.inputs.len(),
     };
 
-    let mut cache = SighashCache::new(&psbt.unsigned_tx);
-    let sighash = cache
-        .taproot_key_spend_signature_hash(idx, &Prevouts::All(&prevouts), TapSighashType::Default)
-        .map_err(|e| LockError::Policy(format!("sighash: {e}")))?;
-
-    Ok((summary, *sighash.as_ref()))
+    Ok((summary, psbt, prevouts))
 }
 
 /// The co-signer keys from a request.
