@@ -1852,12 +1852,10 @@ dependencies = [
  "chrono",
  "ghost-common",
  "ghost-consensus",
- "ghost-gsp-proto",
  "ghost-pool",
  "ghost-reconciliation",
  "ghost-zkp",
  "libfuzzer-sys",
- "serde",
  "serde_json",
 ]
 
@@ -1865,21 +1863,6 @@ dependencies = [
 name = "ghost-glyph"
 version = "1.11.38"
 dependencies = [
- "sha2 0.10.9",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "ghost-gsp-proto"
-version = "1.11.38"
-dependencies = [
- "bitcoin",
- "chrono",
- "getrandom 0.2.17",
- "ghost-common",
- "hex",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
 ]

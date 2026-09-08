@@ -1347,34 +1347,22 @@ mod gsp_type_sync_tests {
         }
     }
 
-    /// Verify the serde tag format matches expectations.
+    /// Pin ghost-tap's own wire format.
     ///
-    /// ghost-tap uses `#[serde(tag = "type", content = "payload")]` which
-    /// produces `{"type": "VariantName", "payload": {...}}`.
-    /// ghost-gsp-proto uses `#[serde(tag = "type", rename_all = "snake_case")]`
-    /// which produces `{"type": "variant_name", ...fields}`.
-    ///
-    /// This documents the known wire format divergence. The GSP WebSocket
-    /// adapter layer must handle the translation.
+    /// It uses `#[serde(tag = "type", content = "payload")]`, producing
+    /// `{"type": "VariantName", "payload": {...}}`. This used to sit beside an
+    /// assertion about ghost-gsp-proto's differing format, documenting a
+    /// divergence an adapter had to bridge; that server is gone, and with it
+    /// the other half of the comparison. What is left is worth keeping on its
+    /// own: a silent change to this tag shape breaks every reader.
     #[test]
     fn test_gsp_serde_format_documented() {
         let req = GspRequest::GetBalance;
         let json = serde_json::to_string(&req).unwrap();
-        // ghost-tap uses externally tagged with content
         assert!(
             json.contains("\"type\":\"GetBalance\""),
             "Expected PascalCase tag format, got: {}",
             json
-        );
-
-        // ghost-gsp-proto uses internally tagged with snake_case
-        // If we ever align these, both should produce the same format
-        let server_msg = ghost_gsp_proto::ClientMessage::GetBalance { max_k: None };
-        let server_json = serde_json::to_string(&server_msg).unwrap();
-        assert!(
-            server_json.contains("\"type\":\"get_balance\""),
-            "Expected snake_case tag format, got: {}",
-            server_json
         );
     }
 }

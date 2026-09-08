@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regtest end-to-end demo of a Wraith Lite CoinJoin.
 #
-# Boots ghostd + ghost-pay + ghost-gsp + wraith-coordinator +
+# Boots ghostd + wraith-coordinator +
 # wraithd, funds 5 BIP86 UTXOs on the same wallet, runs 5
 # parallel `wraith mix run` calls each enrolling a different
 # ghost_id, and asserts the assembled CoinJoin tx hits the chain
@@ -36,8 +36,6 @@ DATADIR="$(mktemp -d -t ghost-regtest-mix-demo.XXXXXX)"
 SAVED_LOGS_DIR="${SAVED_LOGS_DIR:-/tmp/wraith-mix-demo-logs}"
 mkdir -p "$SAVED_LOGS_DIR"
 
-GHOST_PAY_PID=""
-GSP_PID=""
 COORD_PID=""
 WRAITHD_PID=""
 GHOSTD_DIR=""
@@ -48,8 +46,6 @@ cleanup() {
     set +e
     [ -n "$WRAITHD_PID" ] && kill "$WRAITHD_PID" 2>/dev/null
     [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null
-    [ -n "$GSP_PID" ] && kill "$GSP_PID" 2>/dev/null
-    [ -n "$GHOST_PAY_PID" ] && kill "$GHOST_PAY_PID" 2>/dev/null
     if [ -n "$GHOSTD_DIR" ]; then
         $GHOST_CLI -regtest -datadir="$GHOSTD_DIR" \
             -rpcuser=demo -rpcpassword=demo stop 2>/dev/null || true
@@ -82,9 +78,6 @@ fi
 GHOSTD_DIR="$DATADIR/ghostd"
 GHOSTD_RPC_URL="http://127.0.0.1:${GHOSTD_PORT}/"
 mkdir -p "$GHOSTD_DIR"
-GHOST_PAY_DIR="$DATADIR/ghost-pay"
-GHOST_PAY_URL="http://127.0.0.1:8800"
-GSP_URL="ws://127.0.0.1:8900/ws/v1"
 COORD_URL="http://127.0.0.1:9100"
 WRAITH_SOCK="$DATADIR/wraithd.sock"
 
@@ -107,41 +100,6 @@ $BCLI loadwallet demo || true
 DEMO_ADDR=$($BCLI -rpcwallet=demo getnewaddress)
 $BCLI -rpcwallet=demo generatetoaddress 101 "$DEMO_ADDR" >/dev/null
 
-GHOST_PAY_API_SECRET="$(openssl rand -base64 32)"
-INTERNAL_SECRET="$(openssl rand -base64 32)"
-
-# ---- ghost-pay --------------------------------------------------------------
-step "starting ghost-pay"
-BITCOIN_RPC_USER=demo \
-BITCOIN_RPC_PASSWORD=demo \
-GHOST_PAY_API_SECRET="$GHOST_PAY_API_SECRET" \
-GHOST_PAY_INTERNAL_SECRET="$INTERNAL_SECRET" \
-"$BIN/ghost-pay" \
-    --network regtest \
-    --bitcoin-rpc "$GHOSTD_RPC_URL" \
-    --api-listen 127.0.0.1:8800 \
-    --data-dir "$GHOST_PAY_DIR" \
-    >"$DATADIR/ghost-pay.log" 2>&1 &
-GHOST_PAY_PID=$!
-
-# ---- ghost-gsp --------------------------------------------------------------
-step "starting ghost-gsp"
-GHOST_PAY_INTERNAL_SECRET="$INTERNAL_SECRET" \
-"$BIN/ghost-gsp" \
-    --network regtest \
-    --pay-node-url "$GHOST_PAY_URL" \
-    --listen 127.0.0.1:8900 \
-    --data-dir "$DATADIR/gsp" \
-    --insecure-http \
-    >"$DATADIR/gsp.log" 2>&1 &
-GSP_PID=$!
-sleep 4
-
-# Bootstrap operator keys.
-step "bootstrapping ghost-pay operator keys"
-curl -fsS -X POST -H "X-Internal-Auth: $INTERNAL_SECRET" \
-    -H "Content-Type: application/json" \
-    "$GHOST_PAY_URL/api/v1/keys/generate" -d '{}' >/dev/null
 
 # ---- wraithd ----------------------------------------------------------------
 # Started before the coordinator so we can derive addresses up-front
@@ -150,9 +108,9 @@ curl -fsS -X POST -H "X-Internal-Auth: $INTERNAL_SECRET" \
 step "starting wraithd"
 WRAITHD_SOCKET="$WRAITH_SOCK" \
 WRAITHD_NETWORK=regtest \
-WRAITHD_GHOST_PAY="$GHOST_PAY_URL" \
-WRAITHD_GSP="$GSP_URL" \
-WRAITHD_GHOST_PAY_INTERNAL_AUTH="$INTERNAL_SECRET" \
+WRAITHD_GHOSTD_URL="$GHOSTD_RPC_URL" \
+WRAITHD_GHOSTD_USER=demo \
+WRAITHD_GHOSTD_PASS=demo \
 WRAITHD_WALLETS_DIR="$DATADIR/wallets" \
 "$BIN/wraithd" \
     >"$DATADIR/wraithd.log" 2>&1 &

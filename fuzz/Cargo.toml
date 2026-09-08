@@ -38,9 +38,7 @@ ghost-pool = { path = "../bins/ghost-pool" }
 ghost-consensus = { path = "../crates/ghost-consensus" }
 ghost-common = { path = "../crates/ghost-common" }
 ghost-zkp = { path = "../crates/ghost-zkp" }
-ghost-gsp-proto = { path = "../crates/ghost-gsp-proto" }
 ghost-reconciliation = { path = "../crates/ghost-reconciliation" }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 
@@ -84,13 +82,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_gsp_messages"
-path = "fuzz_targets/fuzz_gsp_messages.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fuzz_checkpoint_voting"
 path = "fuzz_targets/fuzz_checkpoint_voting.rs"
 test = false
@@ -111,9 +102,3 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "fuzz_l2_requests"
-path = "fuzz_targets/fuzz_l2_requests.rs"
-test = false
-doc = false
-bench = false

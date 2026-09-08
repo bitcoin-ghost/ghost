@@ -20,13 +20,13 @@
 #     minutes were spent before the refusal landed.        -> `assert_sha_still_current`, checked
 #                                                             BEFORE each phase, not just at the end
 #
-#   * `cargo build -p ghost-gsp` exits 0 and builds the LIBRARY crate; the binary lives in
-#     `ghost-gsp-bin`. A "successful" build produced no binary and would have failed at deploy.
-#                                                          -> every build verifies the ARTEFACT
+#   * `cargo build -p ghost-gsp` exited 0 and built a LIBRARY crate, producing no binary at
+#     all; the "successful" build would have failed at deploy. That crate is gone, but the
+#     lesson is not.                                       -> every build verifies the ARTEFACT
 #
-#   * `--features ghost-pool/zk-production` is invalid when the selected packages do not include
-#     ghost-pool, and ghost-pay carries its OWN `zk-production`. Getting this wrong ships the
-#     random trusted setup.                                -> per-binary features in ONE table
+#   * `--features ghost-pool/zk-production` is invalid when the selected packages do not
+#     include ghost-pool. Getting this wrong ships the random trusted setup.
+#                                                          -> per-binary features in ONE table
 #
 # Usage:
 #   scripts/release.sh <version> [--from <phase>] [--dry-run]
@@ -47,33 +47,31 @@ cd "$REPO_ROOT" || exit 1
 
 # ---------------------------------------------------------------- the binary table
 #
-# ONE place that knows what ships and how it is built. Split by where it can be soaked:
-# the canaries carry the mining stack only, so ghost-pay and ghost-gsp have no canary and
-# `deploy-node.sh` soaks them on the first PRODUCTION node instead (PRODUCTION_ONLY_BINARIES).
+# ONE place that knows what ships and how it is built.
+#
+# `PRODUCTION_ONLY` held ghost-pay and ghost-gsp, which had no canary because the canaries
+# carry the mining stack only. Both are gone: the wallet talks to its owner's node now, and
+# the L2 they served went with them. The list stays because the soak-on-first-production-node
+# path in `deploy-node.sh` is still the right shape for anything future that cannot canary.
 #
 # `pool_sv2` leads `ghost-pool` because of the #742 webhook hazard: the SENDER of the share
 # signature must be current before the VERIFIER is. Wrong order is not "shares are delayed",
 # it is a 401 per batch and the batch is DISCARDED.
 FLEET_BINARIES="pool_sv2 ghost-pool translator_sv2"
-PRODUCTION_ONLY="ghost-pay ghost-gsp"
+PRODUCTION_ONLY=""
 
-# cargo package name, where it differs from the binary name. `ghost-gsp` is a LIBRARY crate;
-# building it succeeds and produces no binary at all.
+# cargo package name, where it differs from the binary name.
 pkg_for() {
-    case "$1" in
-        ghost-gsp) echo "ghost-gsp-bin" ;;
-        *)         echo "$1" ;;
-    esac
+    echo "$1"
 }
 
 # Cargo feature required for a mainnet build of this binary, if any.
-# ⛔ Without these ghost-pool refuses to start on mainnet, and ghost-pay silently ships the
-# random trusted setup (GHOST-08). A feature named for a package that is not in the selected
-# set is a hard cargo error, so these are grouped by build invocation, never concatenated.
+# ⛔ Without this ghost-pool refuses to start on mainnet. A feature named for a package that
+# is not in the selected set is a hard cargo error, so these are grouped by build invocation,
+# never concatenated.
 features_for() {
     case "$1" in
         ghost-pool|pool_sv2|translator_sv2) echo "ghost-pool/zk-production" ;;
-        ghost-pay)                          echo "ghost-pay/zk-production" ;;
         *)                                  echo "" ;;
     esac
 }
@@ -272,10 +270,6 @@ phase_build() {
     (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
         --features ghost-pool/zk-production -p ghost-pool -p pool_sv2 -p translator_sv2) \
         || die "mining-stack build failed"
-    (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
-        --features ghost-pay/zk-production -p ghost-pay) || die "ghost-pay build failed"
-    (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
-        -p "$(pkg_for ghost-gsp)") || die "ghost-gsp build failed"
 
     for b in $FLEET_BINARIES $PRODUCTION_ONLY; do assert_binary "$WORKTREE" "$b" "$VERSION"; done
 
@@ -342,9 +336,9 @@ phase_soak() {
 
 # ⚠ Production is TWO passes, not one loop, and the reason is `PRODUCTION_ONLY_BINARIES`.
 #
-# ghost-pay and ghost-gsp run on production nodes only — no canary carries the service — so
-# `deploy-node.sh` makes the FIRST production node deployed act as their canary and soak alone
-# for SOAK_MINUTES. A node cannot vouch for itself, so it is excluded from its own soak pool.
+# A production-only binary has no canary carrying it, so `deploy-node.sh` makes the FIRST
+# production node deployed act as its canary and soak alone for SOAK_MINUTES. A node cannot
+# vouch for itself, so it is excluded from its own soak pool.
 #
 # A single loop therefore refuses partway through the SECOND node, which is exactly what
 # happened rolling v1.11.37: vm1 took all five, vm2 took the mining stack and was then refused
@@ -352,8 +346,12 @@ phase_soak() {
 # mining stack while production sat split across two versions.
 #
 # So: mining stack to every production node FIRST (the split is the state worth shortening),
-# then the production-only pair, retrying past the soak refusal rather than treating it as
+# then anything production-only, retrying past the soak refusal rather than treating it as
 # fatal. The soak itself is still enforced by deploy-node.sh; this only avoids hammering it.
+#
+# `PRODUCTION_ONLY` is empty since ghost-pay and ghost-gsp were retired, so pass 2 is a no-op
+# today. It is kept because the shape is right and rebuilding it under a deadline is how the
+# v1.11.37 split happened in the first place.
 phase_production() {
     step "production roll"
     require_sha; assert_sha_still_current "$(release_sha)"
@@ -364,6 +362,12 @@ $PRODUCTION_ONLY (first node soaks alone)"; return 0; }
     for n in $PRODUCTION_NODES; do
         roll_node "$n" "" "$FLEET_BINARIES" || die "production roll stopped at $n"
     done
+
+    if [ -z "$PRODUCTION_ONLY" ]; then
+        info "pass 2: no production-only binaries — skipping"
+        info "production done"
+        return 0
+    fi
 
     info "pass 2: production-only binaries ($PRODUCTION_ONLY)"
     local n b rc attempt

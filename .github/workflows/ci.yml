@@ -16,7 +16,7 @@ env:
   # pure-Rust jobs below and built on their own; everything else gets full coverage.
   WORKSPACE_EXCLUDES: --workspace --exclude wraith-wallet-gui --exclude ghost-tap-desktop
   # System packages the Rust workspace needs: Cap'n Proto (bitcoin-core-sv2 build
-  # script) and SQLite (ghost-storage / ghost-pay).
+  # script) and SQLite (ghost-storage).
   LINUX_DEPS: libsqlite3-dev capnproto libcapnp-dev
   # What the Tauri desktop crates need on top: webkit2gtk is the webview, and `patchelf` is
   # used by the bundler. A superset of LINUX_DEPS so the one install script covers both.
@@ -185,8 +185,6 @@ jobs:
         run: .github/scripts/install-linux-deps.sh
       - name: Run integration tests
         run: |
-          # bond_e2e execs the real ghost-pay binary and asserts it exists.
-          cargo build -p ghost-pay
           cargo test $WORKSPACE_EXCLUDES --tests \
             --exclude ghost-mpc \
             --exclude mpc-xproc-harness \

@@ -25,7 +25,7 @@ GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # ghostd now ships INSIDE the signed release tarball (same SHA256SUMS + GPG chain
-# as ghost-pool/ghost-pay), so it can never drift from the release version and
+# as ghost-pool), so it can never drift from the release version and
 # needs no separate checksum pin — its integrity rides the tarball signature we
 # already verify below. GHOSTD_URL is an OPTIONAL, unverified escape hatch (empty
 # by default) for transition/testing only; leave it unset in production so ghostd
@@ -72,7 +72,6 @@ MINING_MODE="public_pool"
 POOL_NAME=""
 REAPER="true"
 ARCHIVE="false"
-GHOST_PAY="false"
 # Wraith mixing coordinator. Empty = "auto": ON when Ghost Pay is on, OFF
 # otherwise. --wraith / --no-wraith
 # pin it explicitly.
@@ -124,11 +123,8 @@ Options:
                                 one on the command line wins.
   --no-reaper                 Don't run the mempool reaper    (capability -2)
   --archive                   Full archive node (~720GB, capability +5)
-  --ghost-pay                 Enable the L2 payments service  (capability +4)
-  --wraith                    Run a Wraith mixing coordinator (implies --ghost-pay)
-  --no-wraith                 Never run a Wraith mixing coordinator
-                                (default: follows --ghost-pay — on when Ghost Pay
-                                 is on, off otherwise)
+  --wraith                    Run a Wraith mixing coordinator
+  --no-wraith                 Never run a Wraith mixing coordinator (default)
   --tor                       Route over Tor (hybrid): outbound peers via Tor +
                                 publish an onion, still reachable on clearnet 8333
   --tor-only                  Route over Tor ONLY: no clearnet (onlynet=onion),
@@ -173,7 +169,6 @@ while [[ $# -gt 0 ]]; do
     --no-public-mining) MINING_MODE="private_solo"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --ghost-pay)      GHOST_PAY="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --wraith)         WRAITH="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-wraith)      WRAITH="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor)            TOR="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -219,7 +214,7 @@ pool_name_valid() {
 WIZARD_RAN="false"
 
 # Yes/No prompt with a default. Echoes "true" or "false" so the caller can assign
-# it straight into REAPER / ARCHIVE / GHOST_PAY. The read prompt
+# it straight into REAPER / ARCHIVE. The read prompt
 # goes to stderr, so it stays visible inside $(...) capture; only the echoed
 # answer is captured. `|| true` keeps an EOF (Ctrl-D) from tripping `set -e`.
 prompt_yes_no() {
@@ -235,7 +230,7 @@ prompt_yes_no() {
 }
 
 # Interactive first-run wizard. Collects the SAME variables the flag interface
-# sets (PAYOUT_ADDRESS, SYNC_MODE, MINING_MODE, REAPER, ARCHIVE, GHOST_PAY,
+# sets (PAYOUT_ADDRESS, SYNC_MODE, MINING_MODE, REAPER, ARCHIVE,
 # NICKNAME); the rest of the installer is unchanged. Only ever runs with no
 # config flags, on a TTY, without --non-interactive.
 run_wizard() {
@@ -320,15 +315,11 @@ run_wizard() {
   echo "Capabilities (each affects your node's reward share):"
   REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions (+2 path)?" Y)"
   ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk (+5 shares)?" N)"
-  GHOST_PAY="$(prompt_yes_no "  Enable Ghost Pay — L2 instant-payments service (+4 shares)?" N)"
-
-  # Wraith mixing coordinator — only offered when Ghost Pay is on (it relies on
-  # Defaults Y so a Ghost Pay node mixes by default.
-  if [[ "$GHOST_PAY" == "true" ]]; then
-    WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator (requires Ghost Pay)?" Y)"
-  else
-    WRAITH="false"
-  fi
+  # Wraith mixing coordinator. It used to be gated behind Ghost Pay, which held
+  # the bond escrow it once needed; bonds are gone and so is Ghost Pay, so it
+  # now stands on its own. Off by default: running a coordinator is a
+  # commitment to be online, not a capability box to tick.
+  WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator?" N)"
 
   # Tor. Off by default. Hybrid keeps clearnet reachability AND adds an onion;
   # tor-only routes everything over Tor and drops clearnet.
@@ -366,7 +357,6 @@ run_wizard() {
     echo "  Miner password : (generated automatically — shown when install completes)"
   echo "  Reaper         : $REAPER"
   echo "  Archive node   : $ARCHIVE"
-  echo "  Ghost Pay      : $GHOST_PAY"
   echo "  Wraith mixing  : $WRAITH"
   echo "  Tor            : $([[ "$TOR" == "true" ]] && echo "$TOR_MODE" || echo "off")"
   echo "  Auto-update    : $AUTO_UPDATE"
@@ -415,15 +405,8 @@ fi
 
 # Resolve the
 # "auto" default — track Ghost Pay — and pull Ghost Pay in when Wraith was asked
-# for explicitly without it. We auto-enable Ghost Pay (rather than erroring) so a
-# non-interactive `--wraith` install can't half-provision a coordinator that has
-# nothing extra to talk to.
 if [[ -z "$WRAITH" ]]; then
-  WRAITH="$GHOST_PAY"
-fi
-if [[ "$WRAITH" == "true" && "$GHOST_PAY" != "true" ]]; then
-  log "Wraith mixing requires Ghost Pay — enabling Ghost Pay (capability +4) as well."
-  GHOST_PAY="true"
+  WRAITH="false"
 fi
 
 # ────────────────────────────── 1. packages ──────────────────────────────────
@@ -442,7 +425,7 @@ fi
 # ─────────────────────────── 2. user + layout ────────────────────────────────
 log "Creating ghost user and directories"
 id ghost >/dev/null 2>&1 || useradd -r -m -d /home/ghost -s /bin/bash ghost
-mkdir -p /opt/ghost/bin /etc/ghost /etc/bitcoin /var/lib/bitcoin /var/lib/ghost /home/ghost/.ghost/data /home/ghost/.ghost/ghost-pay
+mkdir -p /opt/ghost/bin /etc/ghost /etc/bitcoin /var/lib/bitcoin /var/lib/ghost /home/ghost/.ghost/data
 
 # Grant the operator read access to the service journals so that
 # `journalctl -u ghost-pool` works without sudo. When installed via `sudo bash`,
@@ -517,11 +500,6 @@ if [[ -n "$cli_bin" ]]; then
 else
   log "ghost-cli not found in ${POOL_TARBALL} (older release?) — skipping."
 fi
-# ghost-pay (L2) ships in the same signed tarball; install
-# it only when Ghost Pay is enabled.
-if [[ "$GHOST_PAY" == "true" ]]; then
-  install -m755 -o root -g root "$(find . -name ghost-pay -type f | head -1)" /opt/ghost/bin/ghost-pay
-fi
 # The miner-facing SV2 stratum stack ships in the SAME signed tarball. Without
 # these two binaries a node has ghost-pool's Template Distribution Protocol
 # running but nothing for miners to connect to, so it can join the mesh yet never
@@ -575,12 +553,6 @@ PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{pri
 PRIVATE_MINING_PASSWORD=""
 if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
   PRIVATE_MINING_PASSWORD="$(openssl rand -hex 16)"
-fi
-# Ghost Pay secrets. On mainnet ghost-pay refuses to start without both of
-# these (key-encryption password, API HMAC secret).
-if [[ "$GHOST_PAY" == "true" ]]; then
-  PAY_KEY_PASSWORD="$(openssl rand -hex 32)"
-  PAY_API_SECRET="$(openssl rand -hex 32)"
 fi
 
 # ───────────────────────── 5. ghostd config (sync) ───────────────────────────
@@ -751,11 +723,16 @@ treasury_address = "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k"
 min_payout_sats = 10000
 payout_interval_blocks = 100
 
+# ⚠ The section name is historical. Ghost Pay is retired and `enabled` is
+# hard-false; what still lives here is `wraith_enabled`, which is where
+# `NodeConfig::wraith_enabled()` reads the operator's mixing choice from.
+# Moving it to a section of its own is a config-schema change and therefore a
+# gated fleet roll, not an installer edit.
 [ghost_pay]
-enabled = ${GHOST_PAY}
+enabled = false
 virtual_block_secs = 10
 epoch_blocks = 100
-wraith_enabled = ${GHOST_PAY}
+wraith_enabled = ${WRAITH}
 
 # NOTE (#760): the keys removed from the blocks above and below were read by NOTHING. There is no
 # `#[serde(deny_unknown_fields)]` on NodeConfig, so they parsed, were discarded, and produced no
@@ -1144,13 +1121,6 @@ while true; do
   if [ "$IBD" = "false" ]; then
     echo "[ghost-pool-gate] ghostd synced — starting ghost-pool"
     systemctl start ghost-pool
-    # ghost-pay (when installed) also needs a live ghostd + ghost-pool, so the
-    # gate owns its first start too — mirrors ghost-pool, which is not enabled
-    # at boot.
-    if [ -f /etc/systemd/system/ghost-pay.service ]; then
-      echo "[ghost-pool-gate] starting ghost-pay"
-      systemctl start ghost-pay
-    fi
     exit 0
   fi
   sleep 30
@@ -1237,7 +1207,7 @@ Environment=ZK_GENESIS_PARAMS_HASH=${ZK_GENESIS_PARAMS_HASH}
 EOF
 
 # Journal access — the dashboard Logs console reads the OTHER node binaries'
-# logs (ghostd / ghost-pay / dashboard / SV2 stack) out of the systemd journal
+# logs (ghostd / dashboard / SV2 stack) out of the systemd journal
 # via journalctl, which requires membership of the `systemd-journal` group.
 # Written as a sibling drop-in (merged with the base unit like genesis-anchor.conf
 # above) so it can ship to existing nodes without rewriting the whole unit; the
@@ -1248,36 +1218,6 @@ cat > /etc/systemd/system/ghost-pool.service.d/journal-access.conf <<EOF
 [Service]
 SupplementaryGroups=systemd-journal
 EOF
-
-# ghost-pay L2 service on 8800. Only
-# MPC verification keys default
-# to the sibling of --data-dir (/home/ghost/.ghost/mpc_params), where ghost-pool
-# fetches them. The unit carries secrets, so it is locked to 0600.
-if [[ "$GHOST_PAY" == "true" ]]; then
-cat > /etc/systemd/system/ghost-pay.service <<EOF
-[Unit]
-Description=Ghost Pay L2 service
-After=network-online.target ghostd.service ghost-pool.service
-Wants=network-online.target
-[Service]
-Type=simple
-User=ghost
-Group=ghost
-WorkingDirectory=/var/lib/ghost
-ExecStart=/opt/ghost/bin/ghost-pay --api-listen 0.0.0.0:8800 --data-dir /home/ghost/.ghost/ghost-pay --bitcoin-rpc http://127.0.0.1:8332 --network mainnet --treasury-address bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k --node-payout-address ${PAYOUT_ADDRESS} --identity-key /home/ghost/.ghost/node.key
-Environment=RUST_LOG=info
-Environment=BITCOIN_RPC_USER=ghostrpc_mainnet
-Environment=BITCOIN_RPC_PASSWORD=${RPCPW}
-Environment=GHOST_PAY_PASSWORD=${PAY_KEY_PASSWORD}
-Environment=GHOST_PAY_API_SECRET=${PAY_API_SECRET}
-Restart=on-failure
-RestartSec=15
-LimitNOFILE=65536
-[Install]
-WantedBy=multi-user.target
-EOF
-chmod 600 /etc/systemd/system/ghost-pay.service
-fi
 
 # SV2 stratum stack units. sri-pool bridges ghost-pool's TDP to SV2 miners; the
 # translator fronts it for SV1 miners. sri-pool runs as root (it rewrites its own
@@ -1336,7 +1276,6 @@ ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications + MPC cont
 ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS (peers fetch MPC params + votes)
 # Ghost Pay L2 (peers issue Ghost Pay verification challenges here) — only
 # when enabled.
-[[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.

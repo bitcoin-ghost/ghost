@@ -6,19 +6,19 @@
 # regtest backend, asserting success at each step. The point is to be
 # able to prove the wallet works end-to-end WITHOUT the GUI — the CLI
 # (`wraith`) talks to the daemon (`wraithd`) over a Unix socket, and
-# the daemon talks to ghostd + ghost-pay + ghost-gsp, exactly as in
+# the daemon talks to ghostd, exactly as in
 # production. Nothing here is mocked.
 #
 # Flows exercised, in order:
 #   1.  create a BIP-39 wallet                  (wraith wallet create)
-#   2.  select + GSP auth                        (wraith wallet select / gsp auth)
+#   2.  select the active wallet                 (wraith wallet select)
 #   3.  derive a receive address                 (wraith light receive)
 #   4.  check the light balance                  (wraith light balance)
 #   5.  fund the receive address on regtest      (ghost-cli sendtoaddress)
 #   6.  scan L1 + see the funded UTXO             (wraith light l1-utxos)
 #   7.  Ghost Lock prepare + on-chain fund + confirm
 #                                                (wraith locks prepare / confirm)
-#   8.  L2 send (the wallet's `send` command)    (wraith light send)
+#   8.  on-chain payment                         (wraith light pay)
 #   9.  single-round Wraith mix → on-chain CoinJoin
 #                                                (wraith mix run, 5 enrolments)
 #
@@ -50,7 +50,7 @@
 #     (cargo build --workspace). Override the directory with
 #     $WRAITH_BIN_DIR if your binaries live elsewhere (e.g. a shared
 #     checkout's target/debug while running from a git worktree).
-#     If wraithd / ghost-pay / ghost-gsp / wraith-coordinator / wraith
+#     If wraithd / wraith-coordinator / wraith
 #     are missing this script tells you which and stops.
 #
 # Usage:
@@ -72,8 +72,6 @@ mkdir -p "$SAVED_LOGS_DIR"
 # (wraith-protocol tier.rs) — a round won't lock below this.
 N=5
 
-GHOST_PAY_PID=""
-GSP_PID=""
 COORD_PID=""
 WRAITHD_PID=""
 GHOSTD_UP=""
@@ -82,8 +80,6 @@ cleanup() {
     set +e
     [ -n "$WRAITHD_PID" ]   && kill "$WRAITHD_PID"   2>/dev/null
     [ -n "$COORD_PID" ]     && kill "$COORD_PID"     2>/dev/null
-    [ -n "$GSP_PID" ]       && kill "$GSP_PID"       2>/dev/null
-    [ -n "$GHOST_PAY_PID" ] && kill "$GHOST_PAY_PID" 2>/dev/null
     if [ -n "$GHOSTD_UP" ]; then
         $BCLI stop 2>/dev/null || true
     fi
@@ -100,7 +96,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "  PASS: $*"; }
 
 # ---- binary discovery -------------------------------------------------------
-for b in wraith wraithd ghost-pay ghost-gsp wraith-coordinator; do
+for b in wraith wraithd wraith-coordinator; do
     if [ ! -x "$BIN/$b" ]; then
         fail "missing $BIN/$b — run 'cargo build --workspace' (or set \$WRAITH_BIN_DIR)"
     fi
@@ -131,9 +127,6 @@ GHOSTD_PORT=18443
 GHOSTD_RPC_URL="http://127.0.0.1:${GHOSTD_PORT}/"
 mkdir -p "$GHOSTD_DIR"
 
-GHOST_PAY_DIR="$DATADIR/ghost-pay"
-GHOST_PAY_URL="http://127.0.0.1:8800"
-GSP_URL="ws://127.0.0.1:8900/ws/v1"
 COORD_URL="http://127.0.0.1:9100"
 WRAITH_SOCK="$DATADIR/wraithd.sock"
 
@@ -153,7 +146,7 @@ port_busy() {
 for p in "$GHOSTD_PORT" 18444 8800 8900 9100; do
     if port_busy "$p"; then
         fail "port $p is already in use — a stale stack or another regtest node is running. \
-Stop it (pkill -9 ghostd ghost-pay ghost-gsp wraithd; pkill -9 -f wraith-coordina) and retry."
+Stop it (pkill -9 ghostd wraithd; pkill -9 -f wraith-coordina) and retry."
     fi
 done
 
@@ -177,44 +170,6 @@ $BCLI -rpcwallet=demo generatetoaddress 101 "$DEMO_ADDR" >/dev/null
 echo "regtest funded — balance: $($BCLI -rpcwallet=demo getbalance) BTC"
 
 # ---- shared secrets ---------------------------------------------------------
-GHOST_PAY_API_SECRET="$(openssl rand -base64 32)"
-INTERNAL_SECRET="$(openssl rand -base64 32)"
-
-# ---- ghost-pay --------------------------------------------------------------
-step "starting ghost-pay"
-BITCOIN_RPC_USER=demo \
-BITCOIN_RPC_PASSWORD=demo \
-GHOST_PAY_API_SECRET="$GHOST_PAY_API_SECRET" \
-GHOST_PAY_INTERNAL_SECRET="$INTERNAL_SECRET" \
-"$BIN/ghost-pay" \
-    --network regtest \
-    --bitcoin-rpc "$GHOSTD_RPC_URL" \
-    --api-listen 127.0.0.1:8800 \
-    --data-dir "$GHOST_PAY_DIR" \
-    >"$DATADIR/ghost-pay.log" 2>&1 &
-GHOST_PAY_PID=$!
-
-# ---- ghost-gsp --------------------------------------------------------------
-step "starting ghost-gsp"
-GHOST_PAY_INTERNAL_SECRET="$INTERNAL_SECRET" \
-"$BIN/ghost-gsp" \
-    --network regtest \
-    --pay-node-url "$GHOST_PAY_URL" \
-    --listen 127.0.0.1:8900 \
-    --data-dir "$DATADIR/gsp" \
-    --insecure-http \
-    >"$DATADIR/gsp.log" 2>&1 &
-GSP_PID=$!
-sleep 4
-
-# ghost-pay needs operator keys before any /api/v1/locks/* route works
-# (state.keys is None until generated — returns 404 otherwise). In
-# production this is a one-time operator-install step.
-step "bootstrapping ghost-pay operator keys"
-curl -fsS -X POST -H "X-Internal-Auth: $INTERNAL_SECRET" \
-    -H "Content-Type: application/json" \
-    "$GHOST_PAY_URL/api/v1/keys/generate" -d '{}' >"$DATADIR/keys-init.json"
-echo "  ghost_id: $(jq -r '.ghost_id // empty' < "$DATADIR/keys-init.json" 2>/dev/null || echo '<missing>')"
 
 # ---- wraithd ----------------------------------------------------------------
 # Started before the coordinator so we can derive the fee-collection
@@ -224,9 +179,9 @@ echo "  ghost_id: $(jq -r '.ghost_id // empty' < "$DATADIR/keys-init.json" 2>/de
 step "starting wraithd"
 WRAITHD_SOCKET="$WRAITH_SOCK" \
 WRAITHD_NETWORK=regtest \
-WRAITHD_GHOST_PAY="$GHOST_PAY_URL" \
-WRAITHD_GSP="$GSP_URL" \
-WRAITHD_GHOST_PAY_INTERNAL_AUTH="$INTERNAL_SECRET" \
+WRAITHD_GHOSTD_URL="$GHOSTD_RPC_URL" \
+WRAITHD_GHOSTD_USER=demo \
+WRAITHD_GHOSTD_PASS=demo \
 WRAITHD_GHOSTD_URL="$GHOSTD_RPC_URL" \
 WRAITHD_GHOSTD_USER=demo \
 WRAITHD_GHOSTD_PASS=demo \
@@ -257,20 +212,21 @@ MNEMONIC_WORDS=$(echo "$CREATE_OUT" | awk 'NF==24{print NF; exit}')
 pass "wallet 'smoke' created with a 24-word BIP-39 mnemonic"
 
 # ============================================================================
-# FLOW 2: select (unlock-active) + GSP auth
+# FLOW 2: select (unlock-active)
 # ============================================================================
-step "FLOW 2 — select active wallet + GSP auth"
+step "FLOW 2 — select active wallet"
 WRAITH wallet select smoke >/dev/null
 STATUS_OUT=$(WRAITH wallet status)
 echo "$STATUS_OUT" | grep -q "active: smoke"   || fail "smoke is not the active wallet"
 echo "$STATUS_OUT" | grep -q "unlocked: yes"   || fail "smoke is not unlocked"
 pass "wallet 'smoke' is active + unlocked"
 
-AUTH_OUT=$(WRAITH gsp auth)
-echo "$AUTH_OUT" | grep -qiE 'session created' || fail "GSP auth did not create a session"
-STATIC_ID=$(echo "$AUTH_OUT" | grep -m1 'wallet_id:' | awk '{print $NF}')
-[ -n "$STATIC_ID" ] || fail "GSP auth returned no wallet_id"
-pass "GSP session created (static wallet_id $STATIC_ID)"
+# The wallet identity is derived locally now. It used to come back from the
+# GSP handshake, which meant this smoke test could not read it without an
+# operator being up.
+STATIC_ID=$(WRAITH --json wallet auth-info | jq -r '.WalletAuthInfo.wallet_id // .wallet_id')
+[ -n "$STATIC_ID" ] || fail "wallet auth-info returned no wallet_id"
+pass "wallet identity derived locally (wallet_id $STATIC_ID)"
 
 # ============================================================================
 # FLOW 3: derive a receive address
@@ -296,7 +252,7 @@ step "FLOW 4 — check light balance (pre-funding)"
 BAL_OUT=$(WRAITH light balance || true)
 echo "$BAL_OUT"
 # We only assert the command returns cleanly and reports a balance
-# surface; an exact figure depends on GSP scan timing. The post-funding
+# surface; an exact figure depends on scan timing. The post-funding
 # L1 scan in FLOW 6 is the authoritative balance assertion.
 pass "light balance query returned"
 
@@ -348,35 +304,32 @@ echo "$CONFIRM_OUT"
 echo "$CONFIRM_OUT" | grep -q "lock confirmed"            || fail "locks confirm did not succeed"
 echo "$CONFIRM_OUT" | grep -q "lock_id:      $LOCK_ID"    || fail "confirm echoed a different lock_id"
 echo "$CONFIRM_OUT" | grep -q "funding txid: $LOCK_TXID"  || fail "confirm echoed a different funding txid"
-# `locks list` is operator-side (GSP) registry state and is shown for
-# visibility only — it is not a hard gate (a freshly-confirmed lock may
-# lag in the GSP registry, and the demo scripts likewise don't assert
-# on it).
+# `locks list` is local store state, shown for visibility.
 echo "locks list (informational):"
 WRAITH locks list || true
 pass "Ghost Lock $LOCK_ID funded on-chain (tx $LOCK_TXID) and confirmed"
 
 # ============================================================================
-# FLOW 8: L2 send — the wallet's `light send` command
-#   Honest framing: this is an L2 ledger transfer, NOT an L1 broadcast
-#   (txid is null by design). We send to our own wallet's bech32
-#   ghost-id and assert the operator-side ledger recorded it.
+# FLOW 8: on-chain payment — the wallet's `light pay` command
+#   Builds, signs and broadcasts a real regtest transaction, then asserts
+#   the wallet recorded it in its own history with the fee it actually paid.
 # ============================================================================
-step "FLOW 8 — L2 send (wallet 'light send' command)"
-GHOST_ID=$(WRAITH --json wallet ghost-id | jq -r '.WalletGhostId.ghost_id // .ghost_id')
-[ -n "$GHOST_ID" ] || fail "could not read the wallet's bech32 ghost-id"
-SEND_JSON=$(WRAITH --json light send "$GHOST_ID" 5000 --immediate)
-echo "$SEND_JSON" | jq '.'
-PAYMENT_ID=$(echo "$SEND_JSON" | jq -r '.LightSent.payment_id // .payment_id // empty')
-[ -n "$PAYMENT_ID" ] || fail "light send returned no payment_id"
-# Confirm ghost-pay recorded the send under our static wallet_id.
-SENDER_TXS=$(curl -fsS -H "X-Internal-Auth: $INTERNAL_SECRET" \
-    "$GHOST_PAY_URL/api/v1/transactions?ghost_id=$STATIC_ID&limit=5")
-TOP_AMOUNT=$(echo "$SENDER_TXS" | jq -r '.transactions[0].amount_sats // empty')
-TOP_TYPE=$(echo   "$SENDER_TXS" | jq -r '.transactions[0].tx_type // empty')
-[ "$TOP_AMOUNT" = "-5000" ] && [ "$TOP_TYPE" = "send" ] \
-    || fail "operator ledger row unexpected — amount=$TOP_AMOUNT type=$TOP_TYPE"
-pass "L2 send recorded in ghost-pay ledger (payment_id $PAYMENT_ID, -5000 send)"
+step "FLOW 8 — on-chain payment (wallet 'light pay' command)"
+PAY_ADDR=$($BCLI -rpcwallet=demo getnewaddress)
+PAY_JSON=$(WRAITH --json light pay "$PAY_ADDR" 5000 --immediate)
+echo "$PAY_JSON" | jq '.'
+PAY_TXID=$(echo "$PAY_JSON" | jq -r '.L1Sent.txid // .txid // empty')
+[ -n "$PAY_TXID" ] || fail "light pay returned no txid"
+# The node must actually hold it — a txid the wallet invented would pass a
+# check that only asked the wallet.
+$BCLI getrawtransaction "$PAY_TXID" >/dev/null \
+    || fail "the node does not know tx $PAY_TXID"
+# And the wallet must have written it down. History is local now; if this is
+# empty the recording broke, not the send.
+HIST=$(WRAITH --json light history --limit 5)
+echo "$HIST" | jq -r '.LightHistory.transactions[0].txid // .transactions[0].txid' \
+    | grep -q "$PAY_TXID" || fail "the payment is missing from local history"
+pass "paid 5000 sats on-chain (tx $PAY_TXID) and recorded it locally"
 
 # ============================================================================
 # FLOW 9: single-round Wraith mix → on-chain CoinJoin
@@ -525,12 +478,12 @@ echo "================================================================"
 echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN"
 echo "================================================================"
 echo "  1. BIP-39 wallet create            ok"
-echo "  2. select + GSP auth               ok"
+echo "  2. select active wallet            ok"
 echo "  3. derive receive address          ok  ($RECV_ADDR)"
 echo "  4. light balance                   ok"
 echo "  5. regtest fund                    ok  ($FUND_TXID)"
 echo "  6. L1 scan sees own UTXO           ok  (1,000,000 sats)"
 echo "  7. Ghost Lock prepare/fund/confirm ok  ($LOCK_ID)"
-echo "  8. L2 send (light send)            ok  ($PAYMENT_ID)"
+echo "  8. on-chain payment (light pay)    ok  ($PAY_TXID)"
 echo "  9. single-round Wraith mix         ok  ($FIRST_TXID)"
 echo "================================================================"

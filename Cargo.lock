@@ -854,7 +854,6 @@ dependencies = [
  "ghost-buds",
  "ghost-common",
  "ghost-consensus",
- "ghost-gsp-proto",
  "ghost-keys",
  "ghost-policy",
  "ghost-pool",
@@ -3299,77 +3298,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-gsp"
-version = "1.11.38"
-dependencies = [
- "axum 0.7.9",
- "bitcoin",
- "chrono",
- "futures",
- "getrandom 0.2.17",
- "ghost-common",
- "ghost-consensus",
- "ghost-gsp-proto",
- "governor",
- "hex",
- "hyper-util",
- "jsonwebtoken",
- "parking_lot",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "subtle",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "tokio-test",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tower_governor",
- "tracing",
-]
-
-[[package]]
-name = "ghost-gsp-bin"
-version = "1.11.38"
-dependencies = [
- "anyhow",
- "bitcoin",
- "clap",
- "getrandom 0.2.17",
- "ghost-common",
- "ghost-gsp",
- "rustls",
- "serde",
- "tempfile",
- "tokio",
- "toml 0.8.2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ghost-gsp-proto"
-version = "1.11.38"
-dependencies = [
- "bitcoin",
- "chrono",
- "getrandom 0.2.17",
- "ghost-common",
- "hex",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "ghost-keys"
 version = "1.11.38"
 dependencies = [
@@ -3426,19 +3354,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-locks"
-version = "1.11.38"
-dependencies = [
- "bitcoin",
- "getrandom 0.2.17",
- "hex",
- "rand 0.8.6",
- "serde",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
 name = "ghost-miner-proxy"
 version = "1.11.38"
 dependencies = [
@@ -3480,51 +3395,6 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
-]
-
-[[package]]
-name = "ghost-pay"
-version = "1.11.38"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "axum 0.7.9",
- "bellperson",
- "bitcoin",
- "blstrs",
- "chrono",
- "clap",
- "getrandom 0.2.17",
- "ghost-common",
- "ghost-glyph",
- "ghost-keys",
- "ghost-locks",
- "ghost-mpc",
- "ghost-reconciliation",
- "ghost-storage",
- "ghost-zkp",
- "hex",
- "hmac",
- "http",
- "hyper-util",
- "parking_lot",
- "reqwest 0.12.28",
- "rusqlite",
- "rustls",
- "scrypt",
- "secp256k1 0.29.1",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tokio-rustls",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tower_governor",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wraith-coordinator",
 ]
 
 [[package]]
@@ -3734,7 +3604,6 @@ dependencies = [
 name = "ghost-tap-integration"
 version = "1.11.38"
 dependencies = [
- "ghost-gsp-proto",
  "ghost-tap-core",
  "reqwest 0.12.28",
  "secp256k1 0.29.1",
@@ -4865,21 +4734,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64 0.22.1",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
-]
-
-[[package]]
 name = "jwalk"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5409,16 +5263,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-bigint"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
-dependencies = [
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "num-conv"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5432,15 +5276,6 @@ checksum = "a652d9771a63711fd3c3deb670acfbe5c30a4072e664d7a3bf5a9e1056ac72c3"
 dependencies = [
  "arrayvec",
  "itoa",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]
@@ -7929,18 +7764,6 @@ name = "simd-adler32"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
-
-[[package]]
-name = "simple_asn1"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
-dependencies = [
- "num-bigint",
- "num-traits",
- "thiserror 2.0.18",
- "time",
-]
 
 [[package]]
 name = "siphasher"
