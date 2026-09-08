@@ -32,10 +32,27 @@ use parking_lot::RwLock;
 
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::types::NodeCapabilities;
 use ghost_consensus::mesh::MeshNetwork;
 
+use ghost_common::types::NodeCapabilities;
+use wraith_protocol::eligibility::{eligible_roster, EligibilityPolicy, NodeFacts};
+
+/// Verified-capability lookup, matching `CapabilityVerifierCallback` in
+/// `ghost-consensus` so the same provider serves both.
+pub type QualifiedCapsFn = Arc<dyn Fn(&CoordinatorNodeId) -> NodeCapabilities + Send + Sync>;
+
+/// Did this node pass the qualification gatekeeper at all?
+///
+/// Judged on the **verified** capability flags. `coordinator` is deliberately
+/// excluded: it is documented as opt-in that "needs no verification challenge",
+/// so counting it would let a self-declared flag masquerade as a challenge
+/// result — which is exactly the confusion this whole roster change exists to
+/// remove.
+fn passed_gatekeeper(caps: &NodeCapabilities) -> bool {
+    caps.archive_mode || caps.ghost_pay || caps.public_mining || caps.reaper || caps.elder_status
+}
 use wraith_protocol::epoch::canonical_roster;
+use wraith_protocol::roster_snapshot::roster_commitment;
 use wraith_protocol::service::{CoordinatorView, EndpointMap};
 use wraith_protocol::sortition::CoordinatorNodeId;
 
@@ -70,11 +87,18 @@ pub fn roster_is_degraded(roster_size: usize) -> bool {
 /// (Demand-driven sizing replaces this fixed target in a later increment.)
 pub const COORDINATOR_SEATS: usize = 5;
 
-/// Freshness window for an advertised coordinator endpoint: a peer must have
-/// pinged within this window to be electable, since a stale endpoint a wallet
-/// can't reach is worse than not seating it. ~5 min, matching the mesh
-/// active-miner freshness.
-const COORDINATOR_PEER_FRESHNESS_SECS: u64 = 300;
+// REMOVED: `COORDINATOR_PEER_FRESHNESS_SECS` (300s).
+//
+// It required a peer to have pinged within five minutes to be electable. The
+// reasoning was sound in isolation — a stale endpoint is worse than an unseated
+// one — but the window is evaluated against *this node's* clock and *this
+// node's* last-seen record, so it made eligibility a local observation.
+//
+// Two honest nodes then disagreed about any peer near the boundary, elected
+// different coordinators, and gave one session two owners. Liveness now lives
+// in `EligibilityPolicy::prune_after_secs`, measured in days, where nodes can
+// actually agree; an unreachable node costs one timeout as callers walk past
+// it, which is a latency cost rather than a correctness one.
 
 /// Demand-driven seat sizing. Recent mixing sessions per seat before another
 /// seat is added; minimum seats whenever any coordinator is eligible (so there
@@ -155,6 +179,15 @@ struct Cached {
     /// Height of the block whose hash the beacon is derived from, so the
     /// beacon itself can be re-derived straight from the chain.
     anchor_height: u64,
+    /// Commitment to `(epoch, anchor_height, roster)`, published so two nodes
+    /// can be compared and a split *seen* rather than inferred later from
+    /// sessions that went to two owners.
+    ///
+    /// The anchor height identifies the epoch's frozen chain input. It is
+    /// deliberately **not** a claim that the roster was read at that height —
+    /// the roster comes from live mesh state, which is the defect this value
+    /// exposes rather than repairs.
+    roster_commitment: [u8; 32],
 }
 
 /// Live coordinator-election service for ghost-pool.
@@ -178,6 +211,12 @@ pub struct CoordinatorElection {
     mesh: Arc<MeshNetwork>,
     /// Ghost Core RPC — source of the beacon anchor (block hash at a height).
     rpc: Arc<BitcoinRpc>,
+    /// Verified capabilities for a node, from `QualifiedCapabilityProvider`.
+    ///
+    /// Returns what a node has **proved** through challenges, not what it
+    /// claims in its health ping. The distinction is the point: archive mode is
+    /// the Sybil cost, and a claimed one costs nothing.
+    qualified_caps: QualifiedCapsFn,
     /// Cached current-epoch view.
     cached: RwLock<Option<Cached>>,
 }
@@ -191,8 +230,10 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
+        qualified_caps: QualifiedCapsFn,
     ) -> Self {
         Self {
+            qualified_caps,
             self_id: identity.node_id(),
             self_coordinator: capabilities.coordinator,
             self_endpoint,
@@ -211,6 +252,7 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
+        qualified_caps: QualifiedCapsFn,
     ) -> Option<Arc<Self>> {
         if !enabled {
             return None;
@@ -221,46 +263,104 @@ impl CoordinatorElection {
             self_endpoint,
             mesh,
             rpc,
+            qualified_caps,
         )))
     }
 
-    /// The opted-in, reachable coordinator roster for this epoch, plus the
-    /// endpoint map. A peer is eligible iff it (a) advertises the `coordinator`
-    /// capability AND (b) advertised a non-empty endpoint in a recent health
-    /// ping (so a wallet can actually dial it). Self is included iff it opted in
-    /// and has its own advertised endpoint. The roster is canonicalised (dedup +
-    /// sort) so every node derives the byte-identical set + map from the same
-    /// mesh membership.
+    /// The eligible coordinator roster for this epoch, plus the endpoint map.
+    ///
+    /// A peer is eligible iff it opted in, advertises a dialable endpoint, has
+    /// **verified** archive capability, passed the qualification gatekeeper, is
+    /// mature, and is not long-absent. Self is judged by the same verified
+    /// verdict as everyone else. The roster is canonicalised (dedup + sort), so
+    /// a node's own collection order cannot change the result.
+    ///
+    /// # Declared facts only
+    ///
+    /// This previously filtered `get_connected_peers(300)` — `p.state ==
+    /// Connected` (this node's socket) and `last_seen >= now - 300` (this
+    /// node's clock) — and claimed nodes derived a byte-identical set from it.
+    /// They could not: mesh membership is not shared state, so divergence was
+    /// the normal case rather than a boundary condition, and canonicalisation
+    /// could not fix it because sorting makes one node's answer
+    /// order-independent, not two nodes' answers equal.
+    ///
+    /// Eligibility is now `wraith_protocol::eligibility`, over facts a node
+    /// declared about itself or the network agreed on together: opted in, has
+    /// an endpoint, qualified, archive, mature, not long-absent. None of it
+    /// depends on whether *this* node holds a socket.
+    ///
+    /// `Cached::roster_commitment` stays regardless — it is how a split is
+    /// *seen*, and it is the only field in the status response one node cannot
+    /// self-check.
     /// Returns the canonical roster, the endpoint map, and the summed recent
     /// session `demand` across the eligible set (incl. self) — the frozen input
     /// to [`seats_for_demand`].
     fn roster_with_endpoints(&self) -> (Vec<CoordinatorNodeId>, EndpointMap, u64) {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let policy = EligibilityPolicy::default();
+
         let mut endpoints = EndpointMap::new();
-        let mut ids: Vec<CoordinatorNodeId> = Vec::new();
+        let mut facts: Vec<NodeFacts> = Vec::new();
         let mut demand: u64 = 0;
-        for p in self
-            .mesh
-            .peers()
-            .get_connected_peers(COORDINATOR_PEER_FRESHNESS_SECS)
-        {
-            if !p.capabilities.coordinator {
-                continue;
+
+        // `all_peers`, not `get_connected_peers`. Eligibility must not depend on
+        // whether THIS node currently holds a socket — that is what made two
+        // honest nodes disagree.
+        for p in self.mesh.peers().get_all_peers() {
+            let endpoint = p.coordinator_endpoint.clone();
+            // Verified, not claimed. `p.capabilities.archive_mode` is what the
+            // peer says about itself; this is what it proved under challenge,
+            // and a claimed archive flag costs an attacker nothing.
+            let verified = (self.qualified_caps)(&p.node_id);
+            let f = NodeFacts {
+                node_id: p.node_id,
+                // Opt-in stays declared: `coordinator` carries no challenge by
+                // design, and a node that has not asked to coordinate should
+                // not be conscripted.
+                opted_in: p.capabilities.coordinator,
+                archive: verified.archive_mode,
+                endpoint: endpoint.clone(),
+                first_seen_secs: p.first_seen,
+                last_seen_secs: p.last_seen,
+                qualified: passed_gatekeeper(&verified),
+            };
+            if let Some(ep) = endpoint {
+                if !ep.trim().is_empty() {
+                    endpoints.insert(p.node_id, ep);
+                }
             }
-            let sessions = p.coordinator_sessions;
-            if let Some(ep) = p.coordinator_endpoint.filter(|e| !e.is_empty()) {
-                endpoints.insert(p.node_id, ep);
-                ids.push(p.node_id);
-                demand = demand.saturating_add(sessions as u64);
-            }
+            demand = demand.saturating_add(p.coordinator_sessions as u64);
+            facts.push(f);
         }
+
         if self.self_coordinator {
-            if let Some(ep) = self.self_endpoint.as_deref().filter(|e| !e.is_empty()) {
+            if let Some(ep) = self
+                .self_endpoint
+                .as_deref()
+                .filter(|e| !e.trim().is_empty())
+            {
                 endpoints.insert(self.self_id, ep.to_string());
-                ids.push(self.self_id);
+                // Self is judged by the same verified verdict as everyone
+                // else. Trusting our own claim here would make this node the
+                // one peer that never has to prove anything.
+                let mine = (self.qualified_caps)(&self.self_id);
+                facts.push(NodeFacts {
+                    node_id: self.self_id,
+                    opted_in: true,
+                    archive: mine.archive_mode,
+                    endpoint: Some(ep.to_string()),
+                    first_seen_secs: 0,
+                    last_seen_secs: now,
+                    qualified: passed_gatekeeper(&mine),
+                });
                 demand = demand.saturating_add(self.mesh.coordinator_sessions() as u64);
             }
         }
-        (canonical_roster(&ids), endpoints, demand)
+
+        let roster = eligible_roster(&facts, policy, now);
+        endpoints.retain(|id, _| roster.contains(id));
+        (canonical_roster(&roster), endpoints, demand)
     }
 
     /// Fetch the beacon for `epoch` by anchoring on the epoch-start block hash
@@ -304,12 +404,15 @@ impl CoordinatorElection {
         let (roster, endpoints, demand) = self.roster_with_endpoints();
         let seats = seats_for_demand(demand, roster.len());
         let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, seats);
+        let anchor_height = anchor_height_for_epoch(epoch);
+        let commitment = roster_commitment(epoch, anchor_height, &roster);
         *self.cached.write() = Some(Cached {
             epoch,
             view,
             beacon,
             roster,
-            anchor_height: anchor_height_for_epoch(epoch),
+            anchor_height,
+            roster_commitment: commitment,
         });
         epoch
     }
@@ -326,7 +429,7 @@ impl CoordinatorElection {
     }
 
     /// A JSON snapshot of the cached election for the read-only HTTP endpoint:
-    /// `{enabled, epoch, seats, my_seat, elected: [hex ids], coordinators:
+    /// `{enabled, roster_commitment, epoch, seats, my_seat, elected: [hex ids],
     /// [{node_id, seat, endpoint}]}`. The `coordinators` array is what a wallet
     /// reads to dial the seat that owns its session; `elected` is kept as the
     /// flat hex list for existing consumers. Pre-serialised so
@@ -347,6 +450,7 @@ impl CoordinatorElection {
                 "anchor_height": serde_json::Value::Null,
                 "roster": [],
                 "roster_size": 0,
+                "roster_commitment": serde_json::Value::Null,
                 "degraded": true,
             });
         };
@@ -366,6 +470,10 @@ impl CoordinatorElection {
             .collect();
         serde_json::json!({
             "enabled": true,
+            // Compare this across nodes: equal means they drew from the same
+            // roster, unequal means the coordinator layer has split. It is the
+            // only field here that a single node cannot self-check.
+            "roster_commitment": hex::encode(c.roster_commitment),
             "epoch": c.view.epoch(),
             "seats": c.view.seats(),
             "my_seat": c.view.my_seat(&self.self_id),

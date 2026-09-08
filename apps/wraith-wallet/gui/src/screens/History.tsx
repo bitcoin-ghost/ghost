@@ -69,7 +69,10 @@ export function History({ paymentTick = 0 }: HistoryProps) {
   const pageEntries = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
   const fmtTime = (unix: number) => new Date(unix * 1000).toLocaleString();
-  const fmtAmount = (sats: number) => {
+  // A dash, not a zero: the wallet not knowing what moved and the wallet
+  // knowing nothing moved are different answers.
+  const fmtAmount = (sats: number | null) => {
+    if (sats === null || sats === undefined) return "—";
     const sign = sats > 0 ? "+" : "";
     return `${sign}${sats.toLocaleString()}`;
   };
@@ -165,9 +168,9 @@ export function History({ paymentTick = 0 }: HistoryProps) {
                     className="mono"
                     style={{
                       color:
-                        e.amount_sats > 0
+                        (e.amount_sats ?? 0) > 0
                           ? "var(--pass)"
-                          : e.amount_sats < 0
+                          : (e.amount_sats ?? 0) < 0
                             ? "var(--fail)"
                             : "var(--fg)",
                     }}
@@ -175,7 +178,7 @@ export function History({ paymentTick = 0 }: HistoryProps) {
                     {fmtAmount(e.amount_sats)}
                   </td>
                   <td className="muted">{e.memo ?? "—"}</td>
-                  <td>{e.confirmations ?? 0}</td>
+                  <td>{e.confirmations ?? "—"}</td>
                   <td>
                     <button
                       className="secondary"

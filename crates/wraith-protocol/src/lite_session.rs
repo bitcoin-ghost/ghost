@@ -77,9 +77,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::anonymity_set::Role;
+use crate::composition::{check_role_slot, CompositionPolicy};
 #[allow(unused_imports)] // LITE_FILL_WINDOW_SECS is used only in #[cfg(test)] code
 use crate::tier::{LiteTier, LITE_FILL_WINDOW_SECS};
 use crate::SessionType;
+
+/// Serde default for [`LiteSessionParticipant::role`].
+fn default_role() -> Role {
+    Role::Payer
+}
 
 /// Errors surfaced by the registry. All map cleanly to wallet-facing
 /// `Response::Error` envelopes — no panics on the coordinator hot path.
@@ -101,6 +108,9 @@ pub enum LiteSessionError {
     },
     #[error("participant '{0}' is already registered for session '{1}'")]
     AlreadyRegistered(String, String),
+    /// The round's composition rules refused the seat.
+    #[error("composition refused the seat: {0}")]
+    Composition(String),
 }
 
 /// Where a session is in its lifecycle. Participants may register only
@@ -154,6 +164,20 @@ impl LiteSessionState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiteSessionParticipant {
     pub ghost_id: String,
+    /// What this participant is doing in the round.
+    ///
+    /// Declared at join because `composition` needs it to enforce mixing
+    /// scarcity and the provider allowance before a seat is given away — after
+    /// the fact there is nothing to refuse.
+    ///
+    /// Partly self-declared, and known to be: blind signatures hide the
+    /// destination, so nothing on the wire tells a third-party payment from a
+    /// self-payment. Mixing slots are defended structurally (there are almost
+    /// none) and payment slots economically (each costs a fee).
+    ///
+    /// Defaults to `Payer` so a pre-role client still deserialises.
+    #[serde(default = "default_role")]
+    pub role: Role,
     /// Unix seconds of registration. Used for diagnostics and to detect
     /// extremely-late arrivals (e.g. a participant who somehow registered
     /// after the fill window — defensive logging).
@@ -171,6 +195,18 @@ pub struct LiteSession {
     pub created_at: u64,
     pub state: LiteSessionState,
     pub participants: Vec<LiteSessionParticipant>,
+    /// Which concurrent round of this tier the session is.
+    ///
+    /// A tier runs `assignment::open_rounds_for(volume)` rounds at once, and a
+    /// participant belongs in exactly one of them — derived from its own coins,
+    /// so neither it nor the coordinator picks. Sessions are matched on this as
+    /// well as tier, or every participant would land in whichever round happened
+    /// to be filling and the derivation would do nothing.
+    ///
+    /// `0` when the epoch runs a single round, which is also the fallback when
+    /// no beacon is available.
+    #[serde(default)]
+    pub round_index: u32,
 }
 
 impl LiteSession {
@@ -203,6 +239,9 @@ pub struct SessionDescriptor {
     pub slots_filled: u32,
     pub slots_total: u32,
     pub fill_window_expires_at: Option<u64>,
+    /// Which concurrent round of the tier this is. A wallet checks this against
+    /// its own derivation rather than accepting placement on trust.
+    pub round_index: u32,
 }
 
 impl SessionDescriptor {
@@ -220,6 +259,7 @@ impl SessionDescriptor {
             slots_filled: s.participants.len() as u32,
             slots_total: s.tier.max_participants() as u32,
             fill_window_expires_at,
+            round_index: s.round_index,
         }
     }
 }
@@ -629,6 +669,7 @@ impl LiteSessionRegistry {
         &self,
         tier: LiteTier,
         session_type: SessionType,
+        round_index: u32,
         now: u64,
         new_session: LiteSession,
     ) -> SessionDescriptor {
@@ -638,9 +679,13 @@ impl LiteSessionRegistry {
         let (descriptor, created) = {
             let mut guard = self.sessions.lock().expect("registry mutex");
             // Find first.
+            // Matched on `round_index` as well as tier. Without it every
+            // participant joins whichever round happens to be filling, and the
+            // derived assignment does nothing at all.
             if let Some(existing) = guard.values().find(|s| {
                 s.tier == tier
                     && s.session_type == session_type
+                    && s.round_index == round_index
                     && s.is_open_for_new_participants(now)
             }) {
                 return SessionDescriptor::from_session(existing);
@@ -671,6 +716,8 @@ impl LiteSessionRegistry {
         &self,
         session_id: &str,
         ghost_id: &str,
+        role: Role,
+        policy: CompositionPolicy,
         now: u64,
     ) -> Result<SessionDescriptor, LiteSessionError> {
         let (descriptor, event) = {
@@ -709,8 +756,16 @@ impl LiteSessionRegistry {
                     session_id.to_string(),
                 ));
             }
+            // Structural composition rules, before the seat is given away.
+            // Checked here rather than at `/inputs` because a rule enforced
+            // after the seat is taken has nothing left to refuse.
+            let seated: Vec<Role> = session.participants.iter().map(|p| p.role).collect();
+            check_role_slot(&seated, role, policy)
+                .map_err(|e| LiteSessionError::Composition(e.to_string()))?;
+
             let participant = LiteSessionParticipant {
                 ghost_id: ghost_id.to_string(),
+                role,
                 registered_at: now,
             };
             session.participants.push(participant.clone());
@@ -893,6 +948,7 @@ impl Default for LiteSessionRegistry {
 pub fn find_or_create_session(
     tier: LiteTier,
     session_type: SessionType,
+    round_index: u32,
     registry: &LiteSessionRegistry,
     clock: &dyn Clock,
     id_gen: &dyn SessionIdGenerator,
@@ -909,13 +965,14 @@ pub fn find_or_create_session(
         session_id: id_gen.next_id(),
         tier,
         session_type,
+        round_index,
         created_at: now,
         state: LiteSessionState::Filling {
             fill_window_expires_at: now + fill_window_secs,
         },
         participants: Vec::new(),
     };
-    registry.find_or_create_open(tier, session_type, now, prospective)
+    registry.find_or_create_open(tier, session_type, round_index, now, prospective)
 }
 
 #[cfg(test)]
@@ -940,6 +997,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -960,6 +1018,7 @@ mod tests {
         let d1 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -968,6 +1027,7 @@ mod tests {
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1004,6 +1064,7 @@ mod tests {
                 find_or_create_session(
                     LiteTier::Denom100kSats,
                     SessionType::Mix,
+                    0,
                     &r,
                     &*c,
                     &*g,
@@ -1034,6 +1095,7 @@ mod tests {
         let d_small = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1042,6 +1104,7 @@ mod tests {
         let d_big = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1062,6 +1125,7 @@ mod tests {
         let mix = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1070,6 +1134,7 @@ mod tests {
         let jump = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Jump,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1085,6 +1150,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1092,8 +1158,14 @@ mod tests {
         );
         // Fill it to the max (20 for 100k tier).
         for i in 0..20 {
-            reg.add_participant(&d.session_id, &format!("ghost-{i}"), 1_000_000)
-                .expect("add up to max");
+            reg.add_participant(
+                &d.session_id,
+                &format!("ghost-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
+            .expect("add up to max");
         }
         // Should be Locked now.
         let snap = reg.get(&d.session_id).unwrap();
@@ -1102,6 +1174,7 @@ mod tests {
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1117,6 +1190,7 @@ mod tests {
         let d1 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1127,6 +1201,7 @@ mod tests {
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1143,6 +1218,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1150,7 +1226,13 @@ mod tests {
         );
         assert_eq!(d.slots_filled, 0);
         let d2 = reg
-            .add_participant(&d.session_id, "alice", 1_000_000)
+            .add_participant(
+                &d.session_id,
+                "alice",
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
             .unwrap();
         assert_eq!(d2.slots_filled, 1);
     }
@@ -1161,15 +1243,28 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
         );
-        reg.add_participant(&d.session_id, "alice", 1_000_000)
-            .unwrap();
+        reg.add_participant(
+            &d.session_id,
+            "alice",
+            Role::Payer,
+            CompositionPolicy::default(),
+            1_000_000,
+        )
+        .unwrap();
         let err = reg
-            .add_participant(&d.session_id, "alice", 1_000_000)
+            .add_participant(
+                &d.session_id,
+                "alice",
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
             .expect_err("duplicate registration should fail");
         assert!(matches!(err, LiteSessionError::AlreadyRegistered(_, _)));
     }
@@ -1183,17 +1278,30 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
         );
         for i in 0..20 {
-            reg.add_participant(&d.session_id, &format!("g-{i}"), 1_000_000)
-                .unwrap();
+            reg.add_participant(
+                &d.session_id,
+                &format!("g-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
+            .unwrap();
         }
         let err = reg
-            .add_participant(&d.session_id, "late", 1_000_000)
+            .add_participant(
+                &d.session_id,
+                "late",
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
             .expect_err("locked round should reject new participants");
         match err {
             LiteSessionError::NotAcceptingParticipants(_, why) => {
@@ -1209,6 +1317,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1216,7 +1325,13 @@ mod tests {
         );
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let err = reg
-            .add_participant(&d.session_id, "tardy", clock.unix_secs())
+            .add_participant(
+                &d.session_id,
+                "tardy",
+                Role::Payer,
+                CompositionPolicy::default(),
+                clock.unix_secs(),
+            )
             .expect_err("expired fill window should reject");
         match err {
             LiteSessionError::NotAcceptingParticipants(_, why) => {
@@ -1232,6 +1347,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1239,8 +1355,14 @@ mod tests {
         );
         // 5 participants is exactly min — enough for quorum.
         for i in 0..5 {
-            reg.add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
-                .unwrap();
+            reg.add_participant(
+                &d.session_id,
+                &format!("g-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                clock.unix_secs(),
+            )
+            .unwrap();
         }
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let changed = reg.tick(clock.unix_secs());
@@ -1255,6 +1377,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1262,8 +1385,14 @@ mod tests {
         );
         // 4 < min participants of 5.
         for i in 0..4 {
-            reg.add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
-                .unwrap();
+            reg.add_participant(
+                &d.session_id,
+                &format!("g-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                clock.unix_secs(),
+            )
+            .unwrap();
         }
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         reg.tick(clock.unix_secs());
@@ -1282,6 +1411,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1303,6 +1433,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1310,8 +1441,14 @@ mod tests {
         );
         // Fill to max → Locked.
         for i in 0..20 {
-            reg.add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
-                .unwrap();
+            reg.add_participant(
+                &d.session_id,
+                &format!("g-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                clock.unix_secs(),
+            )
+            .unwrap();
         }
         // Locked → Signing → Broadcasting → Complete.
         let r = reg.transition_to_signing(&d.session_id).unwrap();
@@ -1328,6 +1465,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1351,6 +1489,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1371,6 +1510,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1440,6 +1580,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1462,13 +1603,20 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
         );
         active
-            .add_participant(&d.session_id, "alice", 1_000_000)
+            .add_participant(
+                &d.session_id,
+                "alice",
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
             .unwrap();
         let events = sink.events();
         assert_eq!(events.len(), 2);
@@ -1492,6 +1640,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1499,7 +1648,13 @@ mod tests {
         );
         for i in 0..LiteTier::Denom100kSats.max_participants() {
             active
-                .add_participant(&d.session_id, &format!("g-{i}"), 1_000_000)
+                .add_participant(
+                    &d.session_id,
+                    &format!("g-{i}"),
+                    Role::Payer,
+                    CompositionPolicy::default(),
+                    1_000_000,
+                )
                 .unwrap();
         }
         // Last ParticipantAdded should carry Locked.
@@ -1520,6 +1675,7 @@ mod tests {
         let d_quorum = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1527,12 +1683,19 @@ mod tests {
         );
         for i in 0..LiteTier::Denom100kSats.min_participants() {
             active
-                .add_participant(&d_quorum.session_id, &format!("g-{i}"), clock.unix_secs())
+                .add_participant(
+                    &d_quorum.session_id,
+                    &format!("g-{i}"),
+                    Role::Payer,
+                    CompositionPolicy::default(),
+                    clock.unix_secs(),
+                )
                 .unwrap();
         }
         let _d_empty = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1562,6 +1725,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1570,7 +1734,13 @@ mod tests {
         // Fill to max so we're Locked.
         for i in 0..LiteTier::Denom100kSats.max_participants() {
             active
-                .add_participant(&d.session_id, &format!("g-{i}"), clock.unix_secs())
+                .add_participant(
+                    &d.session_id,
+                    &format!("g-{i}"),
+                    Role::Payer,
+                    CompositionPolicy::default(),
+                    clock.unix_secs(),
+                )
                 .unwrap();
         }
         let baseline = sink.len();
@@ -1595,6 +1765,7 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1619,6 +1790,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1642,13 +1814,20 @@ mod tests {
         let d = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
         );
         active
-            .add_participant(&d.session_id, "alice", 1_000_000)
+            .add_participant(
+                &d.session_id,
+                "alice",
+                Role::Payer,
+                CompositionPolicy::default(),
+                1_000_000,
+            )
             .unwrap();
         for ev in sink.events() {
             standby.apply_event(ev).unwrap();
@@ -1671,6 +1850,7 @@ mod tests {
         let event = SessionGossipEvent::ParticipantAdded {
             session_id: "ghost-session".into(),
             participant: LiteSessionParticipant {
+                role: Role::Payer,
                 ghost_id: "alice".into(),
                 registered_at: 1_000_000,
             },
@@ -1705,6 +1885,7 @@ mod tests {
         let d_a = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1712,7 +1893,13 @@ mod tests {
         );
         for i in 0..5 {
             active
-                .add_participant(&d_a.session_id, &format!("alice-{i}"), clock.unix_secs())
+                .add_participant(
+                    &d_a.session_id,
+                    &format!("alice-{i}"),
+                    Role::Payer,
+                    CompositionPolicy::default(),
+                    clock.unix_secs(),
+                )
                 .unwrap();
         }
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
@@ -1724,6 +1911,7 @@ mod tests {
         let d_b = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &active,
             &clock,
             &gen,
@@ -1731,7 +1919,13 @@ mod tests {
         );
         for i in 0..3 {
             active
-                .add_participant(&d_b.session_id, &format!("bob-{i}"), clock.unix_secs())
+                .add_participant(
+                    &d_b.session_id,
+                    &format!("bob-{i}"),
+                    Role::Payer,
+                    CompositionPolicy::default(),
+                    clock.unix_secs(),
+                )
                 .unwrap();
         }
         active
@@ -1770,6 +1964,7 @@ mod tests {
         let _ = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &registry,
             &clock,
             &gen,
@@ -1784,6 +1979,7 @@ mod tests {
         // Wire format must be stable across coordinator pool versions —
         // pin every variant.
         let session = LiteSession {
+            round_index: 0,
             session_id: "test".into(),
             tier: LiteTier::Denom100kSats,
             session_type: SessionType::Mix,
@@ -1800,6 +1996,7 @@ mod tests {
             SessionGossipEvent::ParticipantAdded {
                 session_id: "test".into(),
                 participant: LiteSessionParticipant {
+                    role: Role::Payer,
                     ghost_id: "alice".into(),
                     registered_at: 1_000_000,
                 },
@@ -1825,6 +2022,7 @@ mod tests {
         let _open = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1833,6 +2031,7 @@ mod tests {
         let other_tier = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1840,14 +2039,21 @@ mod tests {
         );
         // Fill the second one to max so it locks.
         for i in 0..LiteTier::Denom1mSats.max_participants() {
-            reg.add_participant(&other_tier.session_id, &format!("g-{i}"), clock.unix_secs())
-                .unwrap();
+            reg.add_participant(
+                &other_tier.session_id,
+                &format!("g-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                clock.unix_secs(),
+            )
+            .unwrap();
         }
         // Asking for 1m_sats should NOT find the locked one — should
         // create a new session.
         let new_1m = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
+            0,
             &reg,
             &clock,
             &gen,
@@ -1856,5 +2062,105 @@ mod tests {
         assert_ne!(new_1m.session_id, other_tier.session_id);
         // Registry now has 3 sessions.
         assert_eq!(reg.len(), 3);
+    }
+    #[test]
+    fn the_registry_turns_away_a_mixer_once_the_slots_are_gone() {
+        // The rule has to fire through the session path. A correct module that
+        // nothing calls is not enforcement.
+        let (reg, clock, gen) = fixtures();
+        let policy = CompositionPolicy::default();
+        let d = find_or_create_session(
+            LiteTier::Denom100kSats,
+            SessionType::Mix,
+            0,
+            &reg,
+            &clock,
+            &gen,
+            LITE_FILL_WINDOW_SECS,
+        );
+        for i in 0..policy.max_mixing_slots {
+            reg.add_participant(
+                &d.session_id,
+                &format!("mixer-{i}"),
+                Role::Mixer,
+                policy,
+                clock.unix_secs(),
+            )
+            .expect("within the mixing allowance");
+        }
+        let err = reg
+            .add_participant(
+                &d.session_id,
+                "mixer-x",
+                Role::Mixer,
+                policy,
+                clock.unix_secs(),
+            )
+            .expect_err("mixing slots are exhausted");
+        assert!(
+            matches!(err, LiteSessionError::Composition(ref m) if m.contains("mixing slots")),
+            "{err:?}"
+        );
+        // A payer is still welcome — real traffic is never capped.
+        reg.add_participant(
+            &d.session_id,
+            "payer-1",
+            Role::Payer,
+            policy,
+            clock.unix_secs(),
+        )
+        .expect("payers are uncapped");
+    }
+
+    #[test]
+    fn the_registry_holds_a_provider_to_one_input() {
+        let (reg, clock, gen) = fixtures();
+        let policy = CompositionPolicy::default();
+        let d = find_or_create_session(
+            LiteTier::Denom100kSats,
+            SessionType::Mix,
+            0,
+            &reg,
+            &clock,
+            &gen,
+            LITE_FILL_WINDOW_SECS,
+        );
+        reg.add_participant(
+            &d.session_id,
+            "lp-7-a",
+            Role::LiquidityProvider(7),
+            policy,
+            clock.unix_secs(),
+        )
+        .expect("first seat");
+        let err = reg
+            .add_participant(
+                &d.session_id,
+                "lp-7-b",
+                Role::LiquidityProvider(7),
+                policy,
+                clock.unix_secs(),
+            )
+            .expect_err("one input per provider");
+        assert!(matches!(err, LiteSessionError::Composition(_)), "{err:?}");
+        // A different provider is fine — the cap is per provider, not per role.
+        reg.add_participant(
+            &d.session_id,
+            "lp-8",
+            Role::LiquidityProvider(8),
+            policy,
+            clock.unix_secs(),
+        )
+        .expect("a different provider");
+    }
+
+    #[test]
+    fn a_participant_without_a_declared_role_deserialises_as_a_payer() {
+        // Pre-role clients must not fail to parse; defaulting to Payer is the
+        // conservative choice because payers are the uncapped role, so an old
+        // client is never wrongly given a scarce mixing slot.
+        let p: LiteSessionParticipant =
+            serde_json::from_str(r#"{"ghost_id":"g1","registered_at":1}"#).expect("parses");
+        assert_eq!(p.role, Role::Payer);
     }
 }

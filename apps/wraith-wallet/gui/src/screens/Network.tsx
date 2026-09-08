@@ -4,12 +4,9 @@ import {
   daemonHealth,
   daemonEnv,
   daemonDoctor,
-  gspAuth,
-  gspSessionStatus,
   type ChainStatusResponse,
   type DaemonEnvResponse,
   type DoctorResponse,
-  type GspSessionStatus,
   type HealthResponse,
 } from "../lib/tauri";
 import { SyncIndicator } from "../components/SyncIndicator";
@@ -20,7 +17,6 @@ export function Network() {
   const [doctor, setDoctor] = useState<DoctorResponse | null>(null);
   const [doctorTs, setDoctorTs] = useState<number | null>(null);
   const [doctorErr, setDoctorErr] = useState<string | null>(null);
-  const [session, setSession] = useState<GspSessionStatus | null>(null);
   const [chain, setChain] = useState<ChainStatusResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -30,7 +26,6 @@ export function Network() {
     try {
       setHealth(await daemonHealth());
       setEnv(await daemonEnv());
-      setSession(await gspSessionStatus());
       try {
         setChain(await chainStatus());
       } catch {
@@ -67,33 +62,12 @@ export function Network() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const onAuth = async () => {
-    setBusy(true);
-    setErr(null);
-    try {
-      await gspAuth();
-      await refresh();
-    } catch (e) {
-      setErr((e as Error).message ?? String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const fmtUptime = (secs: number | undefined) => {
     if (!secs && secs !== 0) return "—";
     const m = Math.floor(secs / 60);
     const h = Math.floor(m / 60);
     if (h > 0) return `${h}h ${m % 60}m`;
     return `${m}m ${secs % 60}s`;
-  };
-
-  const fmtRemaining = (secs: number | null): string => {
-    if (secs == null) return "—";
-    if (secs <= 0) return "expired";
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    return h > 0 ? `${h}h ${m}m` : `${m}m ${secs % 60}s`;
   };
 
   // Top-level health rollup: green if doctor.all_pass, red if any
@@ -113,7 +87,7 @@ export function Network() {
           <span className="eyebrow">diagnostics</span>
           <h1>Network</h1>
           <p className="lead">
-            Connectivity health to the daemon, ghost-pay, ghost-gsp,
+            Connectivity health to the daemon, your node and the
             wraith-coordinator. Auto-runs on mount; refresh on demand.
           </p>
         </div>
@@ -243,77 +217,28 @@ export function Network() {
       </div>
 
       <div className="card">
-        <h2>Endpoints</h2>
+        <h2>Node</h2>
         <div className="kv">
-          <div className="k">ghost-pay</div>
+          <div className="k">RPC</div>
           <div className="v mono" style={{ fontSize: 12 }}>
-            {env?.ghost_pay_urls.join(", ") ?? "—"}
+            {env?.ghostd_url ?? "(none configured)"}
           </div>
-          <div className="k">GSP</div>
-          <div className="v mono" style={{ fontSize: 12 }}>
-            {env?.gsp_urls.join(", ") ?? "—"}
-          </div>
+          <div className="k">Auth</div>
+          <div className="v">{env?.ghostd_auth ?? "—"}</div>
+          {env?.ghostd_env_override && (
+            <>
+              <div className="k">Pinned</div>
+              <div className="v muted">
+                set by WRAITHD_GHOSTD_URL — change it there, not here
+              </div>
+            </>
+          )}
         </div>
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <h2>GSP session</h2>
-          <div className="row" style={{ gap: 8, alignItems: "center" }}>
-            {session && (
-              <span
-                className={`pill ${
-                  session.phase === "authenticated" ? "pass" : "mute"
-                }`}
-              >
-                {session.phase ?? "no session"}
-              </span>
-            )}
-            <button className="secondary" onClick={onAuth} disabled={busy}>
-              Re-auth
-            </button>
-          </div>
-        </div>
-        {!session?.have_token ? (
-          <div className="muted">
-            No GSP session — click Re-auth to register the active wallet.
-          </div>
-        ) : (
-          <div className="kv">
-            <div className="k">Wallet</div>
-            <div className="v">
-              {session.wallet_name ?? "—"}
-              {session.wallet_id && (
-                <span
-                  className="muted mono"
-                  style={{ marginLeft: 8, fontSize: 12 }}
-                >
-                  ({session.wallet_id})
-                </span>
-              )}
-            </div>
-            <div className="k">Connects</div>
-            <div className="v">
-              {session.connect_count ?? "—"}
-              {(session.connect_count ?? 0) > 1 && (
-                <span
-                  className="muted"
-                  style={{ marginLeft: 8, fontSize: 12 }}
-                >
-                  (reconnected {Number(session.connect_count) - 1}× since auth)
-                </span>
-              )}
-            </div>
-            <div className="k">Token expires</div>
-            <div className="v">{fmtRemaining(session.remaining_secs)}</div>
-            {session.last_error && (
-              <>
-                <div className="k">Last error</div>
-                <div className="v" style={{ color: "var(--fail)" }}>
-                  {session.last_error}
-                </div>
-              </>
-            )}
+        {!env?.ghostd_url && (
+          <div className="muted" style={{ marginTop: 8 }}>
+            The wallet reads and writes the chain through your own node. Until
+            one is set it will refuse those operations rather than ask somebody
+            else — set it in Settings.
           </div>
         )}
       </div>

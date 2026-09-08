@@ -213,6 +213,7 @@ async fn wallet_lifecycle_round_trip() {
         &socket,
         8,
         Request::WalletImport {
+            birth_height: None,
             name: "beta".into(),
             mnemonic: known.clone(),
             passphrase: pass.clone(),
@@ -229,6 +230,7 @@ async fn wallet_lifecycle_round_trip() {
         &socket,
         9,
         Request::WalletImport {
+            birth_height: None,
             name: "beta".into(),
             mnemonic: known,
             passphrase: pass.clone(),
@@ -526,56 +528,6 @@ async fn idle_lock_locks_wallets_after_threshold() {
             );
         }
         other => panic!("list: {other:?}"),
-    }
-
-    child.kill().await.ok();
-}
-
-/// WatchPayments before any gsp_auth must return a clean Error envelope on
-/// the same connection and not panic the daemon. Pinned because the streaming
-/// code path is structurally different from the request/response dispatch and
-/// regressions there are easy to miss.
-#[tokio::test]
-async fn watch_payments_without_session_errors_cleanly() {
-    let (mut child, socket, _tmp) = spawn_daemon().await;
-
-    // Open a connection, send WatchPayments. The daemon should send the
-    // Watching ack on the original id, then immediately send an Error envelope
-    // (id=0) saying "no active session", and close.
-    let stream = UnixStream::connect(&socket).await.expect("connect");
-    let (reader, mut writer) = stream.into_split();
-    let mut line =
-        serde_json::to_string(&Envelope::new(42, Request::WatchPayments)).expect("serialise");
-    line.push('\n');
-    writer.write_all(line.as_bytes()).await.expect("write");
-
-    let mut reader = BufReader::new(reader);
-
-    // First reply: the ack.
-    let mut ack_line = String::new();
-    reader.read_line(&mut ack_line).await.expect("read ack");
-    let ack: Envelope<Response> = serde_json::from_str(&ack_line).expect("decode ack");
-    assert_eq!(ack.id, 42);
-    assert!(
-        matches!(ack.payload, Response::Watching),
-        "expected Watching ack, got {:?}",
-        ack.payload
-    );
-
-    // Second reply: the no-session error pushed with id=0.
-    let mut err_line = String::new();
-    reader.read_line(&mut err_line).await.expect("read err");
-    let err: Envelope<Response> = serde_json::from_str(&err_line).expect("decode err");
-    assert_eq!(err.id, 0, "push must use id=0");
-    match err.payload {
-        Response::Error(e) => {
-            assert!(
-                e.message.to_lowercase().contains("session"),
-                "expected session-related error, got: {}",
-                e.message
-            );
-        }
-        other => panic!("expected Error push, got {other:?}"),
     }
 
     child.kill().await.ok();

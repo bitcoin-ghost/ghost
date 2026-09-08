@@ -139,6 +139,58 @@ struct Cli {
     #[arg(long, env = "WRAITH_COORDINATOR_PEERS", value_delimiter = ',')]
     peers: Vec<String>,
 
+    /// File holding the BIP39 seed this coordinator derives per-Lock quorum
+    /// keys from. Ghost Lock co-signing is off until this is set.
+    ///
+    /// The same seed on every coordinator in the pool, so any of them can take
+    /// over — which one actually co-signs is decided by `--lock-cosign-role`,
+    /// not by who holds the seed. A file rather than an env var: an env var is
+    /// readable from `/proc` and lands in process listings and crash dumps.
+    #[arg(long, env = "WRAITH_COORDINATOR_LOCK_SEED_FILE")]
+    lock_seed_file: Option<std::path::PathBuf>,
+
+    /// File holding the BIP39 passphrase for the quorum seed, if used.
+    #[arg(long, env = "WRAITH_COORDINATOR_LOCK_SEED_PASSPHRASE_FILE")]
+    lock_seed_passphrase_file: Option<std::path::PathBuf>,
+
+    /// Whether this coordinator co-signs Locks: `active` or `standby`.
+    ///
+    /// Only one may be active. Every coordinator with the seed derives the
+    /// same key, but each keeps its own once-per-coin ledger, so two serving
+    /// at once can be asked to co-sign two different spends of one coin — and
+    /// both would agree, which is a double-sign proof against the quorum.
+    /// Defaults to `standby`: co-signing is something an operator turns on
+    /// deliberately, on exactly one host.
+    #[arg(long, env = "WRAITH_COORDINATOR_LOCK_ROLE", default_value = "standby")]
+    lock_cosign_role: String,
+
+    /// Largest single Lock spend to co-sign, in satoshis.
+    ///
+    /// Unset means no ceiling, which makes the quorum a rubber stamp against
+    /// a stolen owner key.
+    #[arg(long, env = "WRAITH_COORDINATOR_LOCK_MAX_SPEND_SATS")]
+    lock_max_spend_sats: Option<u64>,
+
+    /// Most to co-sign across a rolling window, in satoshis.
+    ///
+    /// **A ceiling without this bounds nothing**: a thief spends the ceiling
+    /// ten times rather than ten times the ceiling. Set both.
+    #[arg(long, env = "WRAITH_COORDINATOR_LOCK_WINDOW_SATS")]
+    lock_window_sats: Option<u64>,
+
+    /// How long that window is, in seconds. Default 24 hours.
+    #[arg(
+        long,
+        env = "WRAITH_COORDINATOR_LOCK_WINDOW_SECS",
+        default_value_t = 86_400
+    )]
+    lock_window_secs: u64,
+
+    /// Directory for the co-signing ledgers. Defaults to the working
+    /// directory.
+    #[arg(long, env = "WRAITH_COORDINATOR_LOCK_LEDGER_DIR")]
+    lock_ledger_dir: Option<std::path::PathBuf>,
+
     /// Shared HMAC key for the inter-coordinator gossip route. When
     /// set, every outbound gossip POST carries `X-Ghost-Signature` +
     /// `X-Ghost-Timestamp` headers and the receive route verifies
@@ -148,6 +200,30 @@ struct Cli {
     /// Refused on mainnet without a value (see startup checks).
     #[arg(long, env = "WRAITH_COORDINATOR_PEER_SECRET")]
     peer_secret: Option<String>,
+}
+
+/// Read a secret from a file, refusing one others can read.
+///
+/// A file rather than an env var throughout: an env var is readable from
+/// `/proc`, shows up in process listings, and lands in crash dumps.
+fn read_secret_file(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat {path:?}: {e}"))?;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{path:?} is readable by others (mode {:o}); run `chmod 600` on it",
+                meta.permissions().mode() & 0o777
+            ));
+        }
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(format!("{path:?} is empty"));
+    }
+    Ok(zeroize::Zeroizing::new(trimmed))
 }
 
 #[tokio::main]
@@ -269,6 +345,119 @@ async fn main() -> Result<()> {
         broadcaster,
     );
     state.utxo_source = utxo_source;
+
+    // Ghost Lock co-signing. Off unless a seed is configured: a coordinator
+    // with no seed must refuse rather than derive quorum keys from nothing.
+    state.lock_cosign = match &cli.lock_seed_file {
+        None => {
+            info!("no --lock-seed-file: this coordinator does not co-sign Ghost Locks");
+            None
+        }
+        Some(path) => {
+            let role = match cli.lock_cosign_role.trim().to_ascii_lowercase().as_str() {
+                "active" => wraith_protocol::lock_cosign::Role::Active,
+                "standby" => wraith_protocol::lock_cosign::Role::Standby,
+                other => {
+                    anyhow::bail!("--lock-cosign-role must be `active` or `standby`, got `{other}`")
+                }
+            };
+            let phrase =
+                read_secret_file(path).map_err(|e| anyhow::anyhow!("--lock-seed-file: {e}"))?;
+            let passphrase = match &cli.lock_seed_passphrase_file {
+                Some(p) => read_secret_file(p)
+                    .map_err(|e| anyhow::anyhow!("--lock-seed-passphrase-file: {e}"))?,
+                None => zeroize::Zeroizing::new(String::new()),
+            };
+
+            let window =
+                cli.lock_window_sats
+                    .map(|max_sats| wraith_protocol::lock_cosign::VelocityLimit {
+                        max_sats,
+                        window_secs: cli.lock_window_secs,
+                    });
+            let policy = wraith_protocol::lock_cosign::CosignPolicy {
+                max_spend_sats: cli.lock_max_spend_sats,
+                window,
+            };
+
+            // Say what the policy actually is, loudly where it is weak. A
+            // ceiling with no window bounds one transaction and not a theft,
+            // and an operator who set only one should learn that at startup
+            // rather than afterwards.
+            match (policy.max_spend_sats, policy.window) {
+                (None, None) => warn!(
+                    "Lock co-signing has NO ceiling and NO window: this quorum will \
+                     co-sign anything asked of it, which adds nothing against a stolen \
+                     owner key"
+                ),
+                (Some(c), None) => warn!(
+                    ceiling_sats = c,
+                    "Lock co-signing has a ceiling but no window: a thief spends the \
+                     ceiling repeatedly, so this bounds one transaction and not a theft. \
+                     Set --lock-window-sats."
+                ),
+                (None, Some(w)) => info!(
+                    window_sats = w.max_sats,
+                    window_secs = w.window_secs,
+                    "Lock co-signing bounded by a rolling window only"
+                ),
+                (Some(c), Some(w)) => info!(
+                    ceiling_sats = c,
+                    window_sats = w.max_sats,
+                    window_secs = w.window_secs,
+                    "Lock co-signing policy"
+                ),
+            }
+
+            // Required, not defaulted. These ledgers are the once-per-coin
+            // record for co-signing, and that module is explicit that a
+            // forgetful ledger is worse than none: it reports a guarantee it
+            // has stopped providing. Defaulting to the working directory means
+            // a coordinator relaunched from elsewhere silently starts with an
+            // empty one and co-signs a coin it has already co-signed.
+            //
+            // Free to require: Lock co-signing could not work at all until the
+            // quorum key's derivation was un-cycled, so no deployment can
+            // depend on the old default.
+            let Some(dir) = cli.lock_ledger_dir.clone() else {
+                anyhow::bail!(
+                    "--lock-seed-file needs --lock-ledger-dir. The co-signing ledgers record \
+                     which coins this quorum has already signed for, and a coordinator that \
+                     starts with an empty one will sign a coin twice. Point it at durable \
+                     storage that outlives the process, not at the working directory."
+                );
+            };
+            // Always report where the ledgers actually landed, resolved.
+            //
+            // These hold the once-per-coin record for Lock co-signing, and
+            // that module is explicit that a forgetful ledger is worse than
+            // none: it reports a guarantee it has stopped providing. Defaulting
+            // to the working directory means a coordinator relaunched from
+            // somewhere else silently starts with an empty one and will
+            // co-sign a coin it has already co-signed. Saying the absolute
+            // path out loud is the difference between that being visible and
+            // being discovered later.
+            // Report where they landed, resolved, so the path in the log is
+            // the path on disk rather than whatever was typed.
+            let resolved = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            info!(dir = %resolved.display(), "Lock co-signing ledgers");
+            let cosign =
+                wraith_coordinator::LockCosignState::open(&dir, phrase, passphrase, policy, role)
+                    .map_err(|e| anyhow::anyhow!("Lock co-sign ledgers in {dir:?}: {e}"))?;
+
+            match role {
+                wraith_protocol::lock_cosign::Role::Active => {
+                    info!(dir = ?dir, "Lock co-signing ACTIVE on this coordinator")
+                }
+                wraith_protocol::lock_cosign::Role::Standby => info!(
+                    "Lock co-signing configured but on STANDBY: this coordinator will \
+                     refuse until it is made active"
+                ),
+            }
+            Some(cosign)
+        }
+    };
+
     state.gossip_peer_secret = cli.peer_secret.clone();
     if let Some(secs) = cli.fill_window_secs {
         state.fill_window_secs = secs;

@@ -33,69 +33,48 @@ mod server {
     #[cfg_attr(not(unix), allow(unused_imports))]
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use ghost_gsp_proto::{PaymentMode, SessionToken};
     use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
     use interprocess::local_socket::ListenerOptions;
     use secrecy::SecretString;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::RwLock;
 
-    /// Full-duplex IPC stream (splits into [`IpcRecvHalf`] + [`IpcSendHalf`]).
+    /// Full-duplex IPC stream (splits into a read half and [`IpcSendHalf`]).
     type IpcStream = interprocess::local_socket::tokio::Stream;
-    /// Read half of a connection — feeds the newline-delimited request reader.
-    type IpcRecvHalf = interprocess::local_socket::tokio::RecvHalf;
     /// Write half of a connection — carries JSON responses / pushes.
     type IpcSendHalf = interprocess::local_socket::tokio::SendHalf;
     use wraith_wallet_core::auth;
     use wraith_wallet_core::chain::ChainClient;
-    use wraith_wallet_core::gsp::GspClient;
-    use wraith_wallet_core::gsp::{
-        spawn_session_with_bech32, GspError, SessionHandle, SessionPhase, SessionStatus,
-    };
     use wraith_wallet_core::keystore::{Keystore, KeystoreError};
     use wraith_wallet_core::light;
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
-        ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse, DaemonEnvResponse,
-        DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope, ErrorResponse,
-        GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
-        HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
-        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
-        LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse,
-        LocksJumpedResponse, LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse,
-        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
-        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
-        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
-        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
-        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
-        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
-        WraithMixPreparedResponse,
+        AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
+        DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
+        ErrorResponse, EscapeCoin, GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse,
+        GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
+        GhostLockQuorumBindingIdResponse, GhostLockQuorumSignedResponse, GhostLockRecord,
+        GhostLockRoundDestinationResponse, GhostLockSavedResponse, GhostLockSignBegunResponse,
+        GhostLockSignNoncedResponse, GhostLockSignedResponse, HealthResponse, LightBalanceResponse,
+        LightDetectedResponse, LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry,
+        LightL1UtxosResponse, LightReceiveResponse, LightUtxoEntry, LightUtxosResponse,
+        LockSpendOutput, LockSpendSummary, NodeResponse, PsbtBroadcastResponse,
+        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
+        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
+        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
+        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
-    /// Bundled public preset — the Bitcoin Ghost fleet, reachable without
-    /// running your own node. `pool.bitcoinghost.org` round-robins the four
-    /// fleet IPs; ghost-pay serves TLS on :8800 and GSP on :8900. A brand-new
-    /// install defaults here so the wallet works out of the box.
-    const PUBLIC_GHOST_PAY: &str = "https://pool.bitcoinghost.org:8800";
-    const PUBLIC_GSP: &str = "wss://pool.bitcoinghost.org:8900/ws/v1";
-    /// Node-selection preset labels. Persisted in `node.json` and surfaced via
-    /// `DaemonEnv.node_preset` so the settings UI knows which radio is active.
-    const PRESET_PUBLIC: &str = "public";
-    const PRESET_CUSTOM: &str = "custom";
-    /// Optional override for the on-disk node-selection config path. Defaults
-    /// to `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
+    /// Optional override for the on-disk node config path. Defaults to
+    /// `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
     const NODE_CONFIG_ENV: &str = "WRAITHD_NODE_CONFIG";
-    const GHOST_PAY_ENV: &str = "WRAITHD_GHOST_PAY";
-    /// Optional shared secret for ghost-pay's `X-Internal-Auth`
-    /// bypass. When set, the wallet can call ghost-pay's
-    /// authenticated routes (e.g. `/api/v1/utxos/scan`) without
-    /// HMAC. Required for the L1 UTXO scanner; other routes work
-    /// without it.
-    const GHOST_PAY_INTERNAL_AUTH_ENV: &str = "WRAITHD_GHOST_PAY_INTERNAL_AUTH";
+    /// Optional pool node consulted for the coordinator election.
+    const POOL_URL_ENV: &str = "WRAITHD_POOL_URL";
     /// Optional default wraith-coordinator URL. When set, the
     /// `Doctor` check probes its `/api/v1/pool/discover` endpoint
     /// for liveness. Mixes still use the per-call URL the wallet
@@ -109,7 +88,6 @@ mod server {
     /// restarts. Used for retail/POS deployments where untrusted
     /// staff at the till should only be able to take payments.
     const KIOSK_MODE_ENV: &str = "WRAITHD_KIOSK_MODE";
-    const GSP_ENV: &str = "WRAITHD_GSP";
     const WALLETS_DIR_ENV: &str = "WRAITHD_WALLETS_DIR";
     const NETWORK_ENV: &str = "WRAITHD_NETWORK";
     /// Optional SOCKS5 proxy (e.g. `socks5h://127.0.0.1:9050` for Tor).
@@ -140,66 +118,366 @@ mod server {
     /// Unset → no auto-update channel is configured; per-call URLs still work.
     const UPDATE_MANIFEST_ENV: &str = "WRAITHD_UPDATE_MANIFEST_URL";
 
-    /// A `SessionToken` paired with the wallet name that produced it AND a live
-    /// `SessionHandle` running the persistent authenticated WebSocket. Dropping
-    /// the `StoredSession` aborts the session task (via `SessionHandle::Drop`).
-    struct StoredSession {
-        wallet_name: String,
-        token: SessionToken,
-        handle: SessionHandle,
+    /// Turn a refusal into something the wallet can render.
+    ///
+    /// A refusal shown as a sentence gives the user nothing to decide with. The
+    /// figures are what they need: how many entities were actually there, what
+    /// was discounted, and whether the coordinator's claim was the problem.
+    fn refusal_response(
+        session_id: String,
+        min_entities: usize,
+        e: &wraith_wallet_core::wraith::WraithClientError,
+    ) -> Option<WraithMixRefusedResponse> {
+        use wraith_protocol::pre_sign::RefuseToSign;
+        use wraith_wallet_core::wraith::WraithClientError;
+
+        let WraithClientError::RefusedRound { reasons, report } = e else {
+            return None;
+        };
+
+        // An over-claim is not a size problem. The coordinator stated a figure
+        // the chain does not support, and no floor makes that acceptable — so
+        // the wallet must not offer to lower one.
+        let over_claimed = reasons
+            .iter()
+            .any(|r| matches!(r, RefuseToSign::SetOverClaimed { .. }));
+
+        Some(WraithMixRefusedResponse {
+            session_id,
+            report: AnonymitySetReport {
+                seats: report.seats,
+                entities: report.entities,
+                discounted: report.discounted(),
+                unverified: report.unverified,
+                payers: report.payers,
+            },
+            reasons: reasons.iter().map(ToString::to_string).collect(),
+            min_entities,
+            lowering_the_floor_would_help: !over_claimed,
+        })
+    }
+
+    /// Open the store of Ghost Lock definitions.
+    ///
+    /// Beside `node.json`, and beside the signing ledger — which is a different
+    /// kind of file despite the neighbourhood. Losing *this* one costs
+    /// convenience; the lanes rebuild from the same three keys and the keystore.
+    /// Losing the ledger re-permits a double-sign.
+    fn ghost_lock_store_for(
+        state: &Arc<DaemonState>,
+    ) -> std::io::Result<wraith_wallet_core::ghost_lock_store::GhostLockStore> {
+        wraith_wallet_core::ghost_lock_store::GhostLockStore::open(ghost_lock_store_path(state))
+    }
+
+    /// Where remembered Ghost Locks live.
+    fn ghost_lock_store_path(state: &Arc<DaemonState>) -> PathBuf {
+        state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("ghost-locks.json")
+    }
+
+    /// Where one wallet's own records live: `<wallets_dir>/<name>/`.
+    ///
+    /// ⚠ Per wallet, not per daemon, and the distinction is load-bearing.
+    /// These files answer "what happened to *this* wallet" — a history, a set
+    /// of detected coins, a scan bookmark. Shared across wallets they are
+    /// wrong in both directions at once: one wallet's payments appear in
+    /// another's history, and the shared bookmark tells the scanner those
+    /// blocks are already read, so a wallet switched to never gets a history
+    /// at all. The keystore and its descriptors already live here, and
+    /// `WalletDelete` removes the directory, so a deleted wallet takes its
+    /// records with it.
+    fn wallet_data_dir(state: &DaemonState, wallet: &str) -> PathBuf {
+        state.wallets_dir.join(wallet)
+    }
+
+    /// The active wallet's name, or a message saying there isn't one.
+    async fn active_wallet_name(state: &Arc<DaemonState>) -> Result<String, String> {
+        state.active.read().await.clone().ok_or_else(|| {
+            "no active wallet; run `wraith wallet unlock <name>` or \
+             `wraith wallet select <name>` first"
+                .to_string()
+        })
+    }
+
+    /// Open the active wallet's record of what it has sent and received.
+    ///
+    /// This exists because transaction history used to come from the
+    /// operator's GSP session: the wallet asked somebody else what it had
+    /// done. With that gone, nothing remembers unless this does.
+    async fn history_store_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::history_store::HistoryStore, String> {
+        wraith_wallet_core::history_store::HistoryStore::open(wallet_history_path(state).await?)
+            .map_err(|e| format!("history store: {e}"))
+    }
+
+    /// Where the active wallet's history lives. One definition, so the lock
+    /// keys on exactly the path the store opens.
+    async fn wallet_history_path(state: &Arc<DaemonState>) -> Result<PathBuf, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wallet_data_dir(state, &name).join("history.json"))
+    }
+
+    /// Where the active wallet's silent-payment detections live.
+    async fn wallet_detections_path(state: &Arc<DaemonState>) -> Result<PathBuf, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wallet_data_dir(state, &name).join("detections.json"))
+    }
+
+    /// Where the active wallet's scan bookmark lives.
+    async fn wallet_scan_state_path(state: &Arc<DaemonState>) -> Result<PathBuf, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wallet_data_dir(state, &name).join("scan-state.json"))
+    }
+
+    /// Open the active wallet's store of silent payments the scanner found.
+    async fn detection_store_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::detection_store::DetectionStore, String> {
+        wraith_wallet_core::detection_store::DetectionStore::open(
+            wallet_detections_path(state).await?,
+        )
+        .map_err(|e| format!("detections: {e}"))
+    }
+
+    /// Record the height a wallet came into being.
+    ///
+    /// Best-effort by design: a node that is unreachable at creation time must
+    /// not stop a wallet being made. A missing birth height costs history
+    /// depth on a later rescan, which is recoverable by setting one; refusing
+    /// to create the wallet is not.
+    async fn record_birth_height(state: &Arc<DaemonState>, wallet: &str, height: Option<u32>) {
+        let path = wallet_data_dir(state, wallet).join("wallet-meta.json");
+        let meta = wraith_wallet_core::wallet_meta::WalletMeta {
+            birth_height: height,
+        };
+        if let Err(e) = wraith_wallet_core::wallet_meta::save(&path, &meta) {
+            tracing::warn!(wallet, error = %e, "could not record the wallet's birth height");
+        }
+    }
+
+    /// The current chain tip, if a node is reachable.
+    async fn current_tip(state: &Arc<DaemonState>) -> Option<u32> {
+        state
+            .chain()
+            .await
+            .status()
+            .await
+            .ok()
+            .and_then(|s| s.chain_height)
+            .map(|h| h as u32)
+    }
+
+    /// Read the active wallet's metadata.
+    async fn wallet_meta_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::wallet_meta::WalletMeta, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wraith_wallet_core::wallet_meta::load(
+            wallet_data_dir(state, &name).join("wallet-meta.json"),
+        ))
+    }
+
+    /// Open the active wallet's block-scanner bookmark.
+    async fn scan_state_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::scan_state::ScanState, String> {
+        wraith_wallet_core::scan_state::ScanState::open(wallet_scan_state_path(state).await?)
+            .map_err(|e| format!("scan state: {e}"))
+    }
+
+    fn lock_record(l: &wraith_wallet_core::ghost_lock_store::StoredLock) -> GhostLockRecord {
+        GhostLockRecord {
+            lock_id: l.lock_id.clone(),
+            label: l.label.clone(),
+            backup_pubkey: l.backup_pubkey.clone(),
+            heir_pubkey: l.heir_pubkey.clone(),
+            quorum_pubkey: l.quorum_pubkey.clone(),
+            anchor_height: l.anchor_height,
+            inherit_height: l.inherit_height,
+            bip86_index: l.bip86_index,
+        }
+    }
+
+    /// The wallet's own MuSig2 nonce ledger.
+    ///
+    /// Lives beside `node.json` in the wallet's data directory. Opened per
+    /// operation rather than held: the file is small, the write is the
+    /// expensive part either way, and a fresh read means a second process
+    /// touching the same wallet cannot be missed.
+    ///
+    /// Separate file from the round signing ledger: they answer different
+    /// questions (has this coin been signed for / has this nonce been used)
+    /// and sharing a file would make one's corruption the other's outage.
+    fn ghost_lock_nonce_ledger_for(
+        state: &Arc<DaemonState>,
+    ) -> std::io::Result<ghost_lock::nonce_ledger_file::FileNonceLedger> {
+        ghost_lock::nonce_ledger_file::FileNonceLedger::open(nonce_ledger_path(state))
+    }
+
+    /// The write lock for one store file.
+    ///
+    /// Hold it across open-modify-write on that path, and release it before
+    /// any unrelated await. See `DaemonState::store_locks`.
+    fn store_lock(state: &Arc<DaemonState>, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = state
+            .store_locks
+            .lock()
+            // A poisoned registry is still a usable map of `Arc`s, and
+            // refusing to hand out locks because an unrelated request panicked
+            // would take the whole daemon down with it.
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::clone(map.entry(path.to_path_buf()).or_default())
+    }
+
+    /// Write one entry into the active wallet's history, under its lock.
+    ///
+    /// Opens, records and flushes inside the critical section. The scanner and
+    /// a concurrent payment both write this file; `record` merges on txid, but
+    /// only against what was on disk when the store was opened, so the open has
+    /// to be inside the lock too.
+    async fn record_history(
+        state: &Arc<DaemonState>,
+        entry: wraith_wallet_core::history_store::HistoryEntry,
+    ) -> Result<(), String> {
+        let path = wallet_history_path(state).await?;
+        let lock = store_lock(state, &path);
+        let _guard = lock.lock().await;
+        let mut store = history_store_for(state).await?;
+        store.record(entry).map_err(|e| format!("history: {e}"))
+    }
+
+    /// Record silent-payment detections under the detections lock, returning
+    /// how many were new.
+    async fn record_detections(
+        state: &Arc<DaemonState>,
+        found: Vec<wraith_wallet_core::candidate_scan::DetectedPayment>,
+    ) -> Result<usize, String> {
+        let path = wallet_detections_path(state).await?;
+        let lock = store_lock(state, &path);
+        let _guard = lock.lock().await;
+        let mut store = detection_store_for(state).await?;
+        store
+            .record_all(found)
+            .map_err(|e| format!("detections write: {e}"))
+    }
+
+    /// Outcome of the pre-sign check against the once-per-coin ledger.
+    enum LedgerCheck {
+        Passed(Box<wraith_wallet_core::wraith::InspectedMix>),
+        /// The ledger file itself could not be opened. Distinct from a
+        /// refusal: nothing was judged, so nothing can be concluded.
+        Unavailable(std::io::Error),
+        /// The round was inspected and refused.
+        Refused(Box<wraith_wallet_core::wraith::WraithClientError>),
+    }
+
+    /// Inspect a prepared round with the signing ledger held exclusively.
+    ///
+    /// The lock is what makes check-then-record atomic. `signing_ledger_for`
+    /// opens a fresh store that snapshots the file, and `record` rewrites the
+    /// whole table from that snapshot, so two mixes that both opened before
+    /// either wrote would each persist a table missing the other's coin. The
+    /// wallet would then permit a coin into a second round — the one thing the
+    /// ledger exists to refuse. A round's participants routinely share one
+    /// daemon, so this is the ordinary path, not a corner.
+    ///
+    /// The guard dies with this function, before any signing or network work.
+    /// Holding it across a round's round-trips would deadlock a round whose
+    /// participants all share this daemon.
+    async fn check_against_ledger(
+        state: &Arc<DaemonState>,
+        prepared: &wraith_wallet_core::wraith::PreparedMix,
+    ) -> LedgerCheck {
+        let path = signing_ledger_path(state);
+        let lock = store_lock(state, &path);
+        let _guard = lock.lock().await;
+        let mut ledger = match signing_ledger_for(state) {
+            Ok(l) => l,
+            Err(e) => return LedgerCheck::Unavailable(e),
+        };
+        match prepared.inspect(&mut ledger) {
+            Ok(i) => LedgerCheck::Passed(Box::new(i)),
+            Err(e) => LedgerCheck::Refused(Box::new(e)),
+        }
+    }
+
+    fn signing_ledger_for(
+        state: &Arc<DaemonState>,
+    ) -> std::io::Result<
+        wraith_protocol::signing_ledger::SigningLedger<
+            wraith_wallet_core::signing_ledger_file::FileSignatureStore,
+        >,
+    > {
+        Ok(wraith_protocol::signing_ledger::SigningLedger::new(
+            wraith_wallet_core::signing_ledger_file::FileSignatureStore::open(
+                signing_ledger_path(state),
+            )?,
+        ))
+    }
+
+    /// Where the once-per-coin ledger lives. Daemon-wide rather than
+    /// per-wallet: the keys are outpoints, which no two wallets share.
+    fn signing_ledger_path(state: &Arc<DaemonState>) -> PathBuf {
+        state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("wraith-signed-coins.json")
+    }
+
+    /// Where the MuSig2 nonce-burn ledger lives.
+    fn nonce_ledger_path(state: &Arc<DaemonState>) -> PathBuf {
+        state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("ghost-lock-nonces.json")
+    }
+
+    /// One air-gapped Lock signing, between rounds.
+    ///
+    /// The `session` is `Some` only between round 1 and round 2. The owner's
+    /// partial signature is produced as soon as both nonces are known, so no
+    /// secret nonce is held while somebody carries the second payload to the
+    /// device.
+    struct PendingLockSign {
+        keys: Vec<bitcoin::XOnlyPublicKey>,
+        merkle_root: Option<bitcoin::TapNodeHash>,
+        message: [u8; 32],
+        psbt: String,
+        input_index: u32,
+        our_nonce: [u8; 66],
+        /// Consumed at round 2.
+        session: Option<ghost_lock::signing::SigningSession>,
+        /// Set at round 2, with every party's nonce in the order they were
+        /// aggregated.
+        nonces: Vec<[u8; 66]>,
+        our_partial: Option<[u8; 32]>,
     }
 
     /// In-flight Wraith Lite mix between `WraithMixPrepare` and
-    /// `WraithMixSubmit`. Holds the prepared round + the client that
-    /// produced it (so /witness submission re-uses the same HTTP
-    /// client / proxy config without rebuilding it). Caller is
-    /// expected to submit promptly — the coordinator's no-sign
-    /// deadline is ticking.
+    /// `WraithMixSubmit`. Holds the prepared round + the client that produced
+    /// it, so witness submission re-uses the same HTTP client and proxy config
+    /// without rebuilding it. The caller is expected to submit promptly — the
+    /// coordinator's no-sign deadline is ticking.
     struct StoredWraithMix {
-        prepared: wraith_wallet_core::wraith::PreparedMix,
+        /// The **inspected** round. Not a `PreparedMix`: `submit_witness` will
+        /// not accept anything else, so a round cannot reach the wire without
+        /// having been checked and its coin committed.
+        inspected: wraith_wallet_core::wraith::InspectedMix,
         client: Arc<wraith_wallet_core::wraith::WraithSessionClient>,
     }
 
-    /// Local metadata for a Ghost Lock the wallet has prepared.
-    /// Keyed by lock_id in `DaemonState::prepared_locks`. Required for
-    /// the `LocksRecover` (unilateral exit) path — the wallet must
-    /// know its recovery_index (to derive the secret), the full lock
-    /// script details (to reconstruct the witness program), and the
-    /// funding outpoint (to spend the right UTXO).
-    ///
-    /// Persisted to `<wallets_dir>/<wallet>/locks.json` so a daemon
-    /// restart between LocksPrepare and LocksRecover doesn't lose
-    /// the recovery_index. Loaded on wallet unlock; written on
-    /// every prepare / confirm / recover.
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PreparedLockMeta {
-        wallet_name: String,
-        recovery_index: u32,
-        lock_pubkey_hex: String,
-        recovery_pubkey_hex: String,
-        recovery_blocks: u32,
-        creation_height: u32,
-        funding_address: String,
-        capacity_sats: u64,
-        /// Set once `LocksConfirm` lands.
-        funding_txid: Option<String>,
-    }
-
-    /// The live node clients + their configured URLs, held together so a
-    /// runtime endpoint change (`SetNodeEndpoints`) swaps all of them
-    /// atomically under one write lock. Read paths clone the `Arc`s out and
-    /// release the lock immediately, so a slow ghost-pay/GSP call never blocks
-    /// a config change and vice-versa.
+    /// The live chain client, held behind a lock so a runtime endpoint change
+    /// swaps it without a restart. Read paths clone the `Arc` out and release
+    /// the lock immediately, so a slow node call never blocks a config change
+    /// and vice-versa.
     struct NodeClients {
         chain: Arc<dyn ChainClient>,
-        gsp: Arc<GspClient>,
-        /// Ghost-pay base URLs in failover order — surfaced via DaemonEnv.
-        ghost_pay_urls: Vec<String>,
-        /// GSP WS URLs in failover order — passed to spawn_session at gsp_auth time.
-        gsp_urls: Vec<String>,
-        /// Which node preset is active: `public` or `custom`. Drives the
-        /// settings UI's radio selection.
-        preset: String,
     }
 
     struct DaemonState {
@@ -207,18 +485,9 @@ mod server {
         /// The active node clients + endpoint config. Swapped wholesale by
         /// `SetNodeEndpoints` without a daemon restart.
         clients: RwLock<NodeClients>,
-        /// True when `WRAITHD_GHOST_PAY` / `WRAITHD_GSP` pinned the endpoints at
-        /// boot. While either is set the URLs are power-user-owned: the UI shows
-        /// them read-only and `SetNodeEndpoints` refuses to change them.
-        ghost_pay_env_override: bool,
-        gsp_env_override: bool,
         /// Absolute path to the persisted node-selection config (`node.json`).
         node_config_path: PathBuf,
-        /// Optional ghost-pay `X-Internal-Auth` secret, kept so a runtime
-        /// endpoint swap can rebuild the chain client with the same auth.
-        ghost_pay_internal_auth: Option<String>,
-        /// Optional SOCKS5 proxy for both REST and WS (e.g. socks5h://127.0.0.1:9050).
-        /// Threaded into spawn_session so the persistent WS routes through Tor too.
+        /// Optional SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050).
         tor_proxy: Option<String>,
         /// Optional default wraith-coordinator URL — used by Doctor
         /// to probe coordinator liveness in the dev stack. None
@@ -233,7 +502,6 @@ mod server {
         wallets_dir: PathBuf,
         wallets: RwLock<HashMap<String, Keystore>>,
         active: RwLock<Option<String>>,
-        session: RwLock<Option<StoredSession>>,
         network: bitcoin::Network,
         /// Human-readable IPC endpoint (Unix socket path, or Windows
         /// `\\.\pipe\...` name). Surfaced via DaemonEnv for diagnostics.
@@ -258,30 +526,53 @@ mod server {
         /// `WraithSessionClient` that produced it (so submit reuses
         /// the same HTTP client / proxy config).
         wraith_mixes: RwLock<HashMap<String, StoredWraithMix>>,
-        /// Locks the wallet has prepared, keyed by lock_id. Populated
-        /// by `LocksPrepare`, consumed by `LocksRecover` (and consulted
-        /// by `LocksConfirm` to attach the funding txid).
-        prepared_locks: RwLock<HashMap<String, PreparedLockMeta>>,
-        /// Monotonic counter for the wallet's own recovery-key derivation
-        /// indices. Independent of any operator-side index. On wallet unlock it
-        /// is advanced past the highest `recovery_index` persisted in
-        /// `locks.json` (via `fetch_max`), so it never re-issues an index an
-        /// existing lock already uses across a daemon restart.
-        next_recovery_index: AtomicU32,
-        /// Optional bitcoind RPC URL. Required for the LocksRecover
-        /// (unilateral exit) path — wallet talks directly to bitcoind,
-        /// not through ghost-pay. None disables the path; the IPC
-        /// returns a clear "no bitcoind configured" error.
-        ghostd_url: Option<String>,
-        /// Cookie file path (preferred) OR explicit user/pass for
-        /// bitcoind RPC auth. At most one of these branches is set.
-        ghostd_cookie_path: Option<PathBuf>,
-        ghostd_user: Option<String>,
-        ghostd_pass: Option<String>,
-        /// HTTP client used for daemon-side fetches outside the GSP/ghost-pay
-        /// stack (currently just the manifest fetch). Reuses rustls so we
-        /// don't pull in a second TLS implementation.
+        /// Air-gapped Lock signings waiting on the backup device.
+        ///
+        /// In memory by design. A daemon restart loses the secret nonce, which
+        /// is the safe direction: nothing can be reused, and the spend is
+        /// retryable because the nonce ledger keys on the nonce rather than the
+        /// message.
+        lock_signings: RwLock<HashMap<String, PendingLockSign>>,
+        /// Where the node is and how to reach it. Behind a lock so the
+        /// settings screen can change it without a restart. Also pins the
+        /// election beacon to the chain; with no node that check is skipped.
+        ghostd: RwLock<GhostdSettings>,
+        /// A Ghost pool node, consulted only for the coordinator election.
+        pool_url: RwLock<Option<String>>,
+        /// The last verified election, with the epoch it was drawn for.
+        ///
+        /// Cached for the whole epoch — 144 blocks, about a day — so the
+        /// number of times the wallet asks a pool anything stops tracking the
+        /// number of times it mixes. Without that, a pool watching request
+        /// timing learns when its askers are about to mix even though it
+        /// learns nothing from the request itself.
+        election_cache: RwLock<Option<(u64, serde_json::Value)>>,
+        /// True when the environment pinned the node at boot. While it is set
+        /// the settings are power-user-owned and `SetNode` refuses.
+        ghostd_env_override: bool,
+        /// HTTP client used for daemon-side fetches (currently just the
+        /// manifest fetch). Reuses rustls so we don't pull in a second TLS
+        /// implementation.
         http: reqwest::Client,
+        /// Serialises read-modify-write on each store file, keyed by path.
+        ///
+        /// Every store in this daemon is opened per request, read wholly into
+        /// memory, and persisted by rewriting the whole file. Two requests that
+        /// open the same file before either writes each persist a copy missing
+        /// the other's change — a lost update, and for the signing and nonce
+        /// ledgers a lost safety record. Keyed by path so two wallets, or two
+        /// different stores, never wait on each other.
+        ///
+        /// Callers take the lock around open-modify-write and nothing more. A
+        /// store must not be held across unrelated `await`s: the block scanner
+        /// does RPC round-trips between writes, and holding history open across
+        /// a whole batch is what let a concurrent payment be erased by the
+        /// scanner's stale snapshot.
+        ///
+        /// The registry mutex is only ever held long enough to clone an `Arc`,
+        /// never across an await, and a poisoned registry is still a usable
+        /// map — so it recovers rather than cascading.
+        store_locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     }
 
     fn default_wallets_dir() -> PathBuf {
@@ -307,34 +598,51 @@ mod server {
 
     /// Construct a fresh concrete `GhostPayClient` for the glyph
     /// routes. `state.chain` is a `dyn ChainClient` trait object, so
-    /// it can't expose the inherent glyph methods — rebuild from the
-    /// daemon's configured ghost-pay URLs + proxy, attaching the
-    /// internal-auth secret (claim is an authenticated route).
-    async fn build_ghost_pay_client(
-        state: &DaemonState,
-    ) -> Result<wraith_wallet_core::chain::GhostPayClient, String> {
-        let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-            state.ghost_pay_urls().await,
-            state.tor_proxy.as_deref(),
-        )
-        .map_err(|e| format!("ghost-pay client: {e}"))?;
-        if let Some(secret) = state.ghost_pay_internal_auth.as_ref() {
-            if !secret.is_empty() {
-                c = c.with_internal_secret(secret.clone());
-            }
-        }
-        Ok(c)
+    /// Where the wallet's node is, and how to authenticate to it.
+    ///
+    /// All four may be absent: a fresh install has no node, and the wallet
+    /// says so rather than borrowing somebody else's.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct GhostdSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Path to the node's `.cookie`. Preferred over user/pass: it rotates
+        /// with the node and is never typed anywhere.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cookie_path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pass: Option<String>,
     }
 
-    /// Node-selection config persisted to `node.json`. Loaded at boot and
-    /// rewritten whenever the user picks a node via `SetNodeEndpoints`. Absent
-    /// on a fresh install — the daemon then falls back to the public preset.
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    impl GhostdSettings {
+        /// How the wallet authenticates, as one word, for display.
+        ///
+        /// Never the credential itself — this is what goes back over the IPC
+        /// and into the settings screen.
+        fn auth_kind(&self) -> &'static str {
+            if self.cookie_path.is_some() {
+                "cookie"
+            } else if self.user.is_some() || self.pass.is_some() {
+                "userpass"
+            } else {
+                "none"
+            }
+        }
+    }
+
+    /// Node config persisted to `node.json`. Loaded at boot and rewritten
+    /// whenever the user points the wallet at a node. Absent on a fresh
+    /// install, in which case the wallet has no chain backend until one is
+    /// configured.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct NodeConfig {
-        /// `public` or `custom`.
-        preset: String,
-        ghost_pay_urls: Vec<String>,
-        gsp_urls: Vec<String>,
+        #[serde(default)]
+        ghostd: GhostdSettings,
+        /// A Ghost pool node, consulted only for the coordinator election.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_url: Option<String>,
     }
 
     /// Resolve where the node-selection config lives. `WRAITHD_NODE_CONFIG`
@@ -351,8 +659,8 @@ mod server {
     }
 
     /// Read `node.json`. Absent or malformed → `None` (a corrupt file must not
-    /// wedge the daemon; it falls back to the public preset and the next save
-    /// overwrites it).
+    /// wedge the daemon; it starts with no node and the next save overwrites
+    /// it).
     fn load_node_config(path: &std::path::Path) -> Option<NodeConfig> {
         let raw = fs::read_to_string(path).ok()?;
         match serde_json::from_str::<NodeConfig>(&raw) {
@@ -364,161 +672,128 @@ mod server {
         }
     }
 
-    /// Persist `node.json` atomically (temp-file + rename) with 0600 perms on
-    /// unix — the file only lists endpoint URLs, but it lives in the wallet
-    /// data dir so we keep it user-private like the keystores.
+    /// Persist `node.json` atomically, 0600 on unix. It can hold an RPC
+    /// password, so owner-only is not optional.
+    ///
+    /// This previously staged with a plain `fs::write` and no fsync of either
+    /// the file or its directory, so a power loss could lose a saved node
+    /// endpoint that `SetNode` had already reported as stored.
     fn save_node_config(path: &std::path::Path, cfg: &NodeConfig) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(cfg).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    /// Validate + parse a custom node's ghost-pay and GSP URL strings (each may
-    /// be a comma-separated failover list). Rejects empty input and the wrong
-    /// scheme so a typo can't silently leave the wallet pointed at nothing.
-    fn validate_custom_endpoints(
-        pay_raw: &str,
-        gsp_raw: &str,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        let pay = wraith_wallet_core::chain::GhostPayClient::parse_urls(pay_raw);
-        let gsp = wraith_wallet_core::gsp::GspClient::parse_urls(gsp_raw);
-        if pay.is_empty() {
-            return Err("a ghost-pay URL is required for a custom node".to_string());
-        }
-        if gsp.is_empty() {
-            return Err("a GSP URL is required for a custom node".to_string());
-        }
-        for u in &pay {
-            if !(u.starts_with("http://") || u.starts_with("https://")) {
-                return Err(format!(
-                    "ghost-pay URL must start with http:// or https:// — got '{u}'"
-                ));
-            }
-        }
-        for u in &gsp {
-            if !(u.starts_with("ws://") || u.starts_with("wss://")) {
-                return Err(format!(
-                    "GSP URL must start with ws:// or wss:// — got '{u}'"
-                ));
-            }
-        }
-        Ok((pay, gsp))
+        ghost_lock::atomic_file::write_atomic(path, json.as_bytes(), Some(0o600))
     }
 
     impl DaemonState {
         async fn chain(&self) -> Arc<dyn ChainClient> {
             self.clients.read().await.chain.clone()
         }
-        async fn gsp(&self) -> Arc<GspClient> {
-            self.clients.read().await.gsp.clone()
-        }
-        async fn ghost_pay_urls(&self) -> Vec<String> {
-            self.clients.read().await.ghost_pay_urls.clone()
-        }
-        async fn gsp_urls(&self) -> Vec<String> {
-            self.clients.read().await.gsp_urls.clone()
-        }
-        /// Build a fresh ghost-pay chain client for `urls`, reusing the daemon's
-        /// tor proxy + internal-auth secret.
-        fn build_chain(&self, urls: Vec<String>) -> Result<Arc<dyn ChainClient>, String> {
-            let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                urls,
-                self.tor_proxy.as_deref(),
-            )
-            .map_err(|e| format!("ghost-pay client: {e}"))?;
-            if let Some(secret) = self.ghost_pay_internal_auth.as_ref() {
-                if !secret.is_empty() {
-                    c = c.with_internal_secret(secret.clone());
-                }
-            }
-            Ok(Arc::new(c))
+
+        /// The node settings currently in force.
+        async fn ghostd(&self) -> GhostdSettings {
+            self.ghostd.read().await.clone()
         }
 
-        /// Apply a node selection at runtime: rebuild the ghost-pay + GSP
-        /// clients, persist the choice to `node.json`, and drop any live GSP
-        /// session so it re-authenticates against the new endpoint. Refuses
-        /// while an env-var override pins the endpoints (power-user precedence).
-        async fn set_node_endpoints(
+        /// Build the chain backend from the node settings.
+        ///
+        /// No node means `NoChain`, whose every call refuses with a sentence
+        /// saying what to configure. Falling back to somebody else's server
+        /// would be the alternative, and a self-custody wallet quietly asking
+        /// a stranger what it owns is exactly what this is for.
+        async fn build_chain(&self) -> Arc<dyn ChainClient> {
+            match self.build_ghostd_rpc().await {
+                Some(rpc) => {
+                    tracing::info!("chain backend: the wallet's own node");
+                    Arc::new(wraith_wallet_core::chain::GhostdChainClient::new(
+                        rpc,
+                        self.network.to_string(),
+                    ))
+                }
+                None => {
+                    tracing::warn!(
+                        "chain backend: none — no node is configured, so balances, \
+                         scans and broadcasts will all refuse until one is"
+                    );
+                    Arc::new(wraith_wallet_core::chain::NoChain)
+                }
+            }
+        }
+
+        /// An RPC connection to the owner's node, if one is configured.
+        ///
+        /// Shared with the election-beacon check rather than built twice: two
+        /// constructions of the same connection drift, and the one that drifts
+        /// is always the one nobody is looking at.
+        async fn build_ghostd_rpc(&self) -> Option<wraith_wallet_core::ghostd::GhostdRpc> {
+            use wraith_wallet_core::ghostd::GhostdRpc;
+            let cfg = self.ghostd().await;
+            let url = cfg.url.as_deref()?;
+            match (
+                cfg.cookie_path.as_ref(),
+                cfg.user.as_deref(),
+                cfg.pass.as_deref(),
+            ) {
+                (Some(cookie), _, _) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ghostd cookie unreadable; falling back");
+                        None
+                    }
+                },
+                (None, Some(u), Some(p)) => Some(GhostdRpc::new(url, u, p)),
+                _ => None,
+            }
+        }
+
+        /// Point the wallet at a node, at runtime.
+        ///
+        /// Persists first, then swaps: if the disk write fails the daemon
+        /// keeps running on the old settings rather than on a config a
+        /// restart would silently revert. Refuses while the environment pins
+        /// the node — a power user who set `WRAITHD_GHOSTD_URL` did not mean
+        /// for a settings screen to overrule it.
+        async fn set_node(
             &self,
-            preset: &str,
-            ghost_pay_url: Option<String>,
-            gsp_url: Option<String>,
-        ) -> Result<NodeEndpointsResponse, String> {
-            if self.ghost_pay_env_override || self.gsp_env_override {
-                return Err("node endpoints are pinned by environment variables \
-                     (WRAITHD_GHOST_PAY / WRAITHD_GSP); unset them to manage the \
+            next: GhostdSettings,
+            pool_url: Option<String>,
+        ) -> Result<NodeResponse, String> {
+            if self.ghostd_env_override {
+                return Err("the node is pinned by environment variables \
+                     (WRAITHD_GHOSTD_URL and friends); unset them to manage the \
                      node from the wallet"
                     .to_string());
             }
-            let (ghost_pay_urls, gsp_urls, preset_label) = match preset {
-                PRESET_PUBLIC => (
-                    vec![PUBLIC_GHOST_PAY.to_string()],
-                    vec![PUBLIC_GSP.to_string()],
-                    PRESET_PUBLIC.to_string(),
-                ),
-                PRESET_CUSTOM => {
-                    let (pay, gsp) = validate_custom_endpoints(
-                        ghost_pay_url.as_deref().unwrap_or(""),
-                        gsp_url.as_deref().unwrap_or(""),
-                    )?;
-                    (pay, gsp, PRESET_CUSTOM.to_string())
+            for (what, url) in [("node", next.url.as_deref()), ("pool", pool_url.as_deref())] {
+                if let Some(url) = url {
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(format!(
+                            "{what} URL must start with http:// or https:// (got '{url}')"
+                        ));
+                    }
                 }
-                other => {
-                    return Err(format!(
-                        "unknown node preset '{other}' (expected 'public' or 'custom')"
-                    ))
-                }
-            };
-            // Build the replacements before touching anything — if either fails
-            // we leave the running config untouched.
-            let chain = self.build_chain(ghost_pay_urls.clone())?;
-            let gsp = Arc::new(
-                wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
-                    gsp_urls.clone(),
-                    self.tor_proxy.as_deref(),
-                )
-                .map_err(|e| format!("gsp client: {e}"))?,
-            );
-            // Persist first: if the disk write fails we refuse rather than run
-            // on a config a restart would silently revert.
-            let cfg = NodeConfig {
-                preset: preset_label.clone(),
-                ghost_pay_urls: ghost_pay_urls.clone(),
-                gsp_urls: gsp_urls.clone(),
-            };
-            save_node_config(&self.node_config_path, &cfg)
-                .map_err(|e| format!("persist node.json: {e}"))?;
-            {
-                let mut w = self.clients.write().await;
-                w.chain = chain;
-                w.gsp = gsp;
-                w.ghost_pay_urls = ghost_pay_urls.clone();
-                w.gsp_urls = gsp_urls.clone();
-                w.preset = preset_label.clone();
             }
-            // Old session points at the old GSP URL; drop it so the header's
-            // auto-auth re-establishes one against the new endpoint.
-            *self.session.write().await = None;
-            tracing::info!(
-                preset = %preset_label,
-                ghost_pay = ?ghost_pay_urls,
-                gsp = ?gsp_urls,
-                "node endpoints updated at runtime",
-            );
-            Ok(NodeEndpointsResponse {
-                preset: preset_label,
-                ghost_pay_urls,
-                gsp_urls,
+            save_node_config(
+                &self.node_config_path,
+                &NodeConfig {
+                    ghostd: next.clone(),
+                    pool_url: pool_url.clone(),
+                },
+            )
+            .map_err(|e| format!("persist node.json: {e}"))?;
+            *self.ghostd.write().await = next.clone();
+            *self.pool_url.write().await = pool_url.clone();
+            // A different pool, or none, invalidates what the last one said.
+            *self.election_cache.write().await = None;
+            let chain = self.build_chain().await;
+            self.clients.write().await.chain = chain;
+            tracing::info!(url = ?next.url, auth = next.auth_kind(), "node updated at runtime");
+            let auth = next.auth_kind().to_string();
+            Ok(NodeResponse {
+                ghostd_url: next.url,
+                pool_url,
+                // The credential itself never crosses the IPC. Which *kind*
+                // is in use is what a settings screen needs to show.
+                auth,
+                env_pinned: false,
             })
         }
     }
@@ -528,14 +803,6 @@ mod server {
     /// pixels)). Must stay byte-for-byte identical to
     /// `GhostGlyph::compute_bitmap_hash` or `check` queries the
     /// wrong key.
-    fn glyph_bitmap_hash_hex(pixels: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"GhostGlyphBitmap/v1");
-        hasher.update(pixels);
-        hex::encode(hasher.finalize())
-    }
-
     fn parse_network(s: &str) -> Option<bitcoin::Network> {
         match s.trim().to_ascii_lowercase().as_str() {
             "mainnet" | "bitcoin" => Some(bitcoin::Network::Bitcoin),
@@ -575,44 +842,6 @@ mod server {
     /// operator's election is not made dishonest by the wallet's own bitcoind
     /// being down, and treating it as such would hand anyone who can knock
     /// out a wallet's node the power to force it onto a manual coordinator.
-    fn beacon_pinned_to_chain(state: &DaemonState, election: &serde_json::Value) -> bool {
-        use wraith_wallet_core::ghostd::GhostdRpc;
-
-        let Some((anchor_height, _)) =
-            crate::coordinator_resolve::beacon_anchor_expectation(election)
-        else {
-            // No beacon published at all — `election_is_honest` refuses this
-            // on its own, so there is nothing to add here.
-            return true;
-        };
-        let Some(url) = state.ghostd_url.as_deref() else {
-            tracing::debug!("no bitcoind configured; election beacon not pinned to the chain");
-            return true;
-        };
-        let rpc = match (
-            state.ghostd_cookie_path.as_ref(),
-            state.ghostd_user.as_deref(),
-            state.ghostd_pass.as_deref(),
-        ) {
-            (Some(cookie), None, None) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(error = %e, "bitcoind auth unusable; beacon not pinned");
-                    return true;
-                }
-            },
-            (None, Some(u), Some(p)) => GhostdRpc::new(url, u, p),
-            _ => return true,
-        };
-        match rpc.get_block_hash(anchor_height) {
-            Ok(hash) => crate::coordinator_resolve::beacon_matches_chain(election, &hash),
-            Err(e) => {
-                tracing::debug!(error = %e, anchor_height, "anchor block unreachable; beacon not pinned");
-                true
-            }
-        }
-    }
-
     fn validate_wallet_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("wallet name must not be empty".into());
@@ -659,114 +888,6 @@ mod server {
         Ok(())
     }
 
-    /// Per-wallet on-disk index of prepared Ghost Locks. Each entry
-    /// carries everything `LocksRecover` needs to spend the recovery
-    /// branch without operator cooperation: the recovery_index, the
-    /// full lock script details, and the funding outpoint.
-    ///
-    /// Stored as plain JSON at `<wallets_dir>/<name>/locks.json`
-    /// with file mode 0600. The data isn't a seed — losing the
-    /// file means the wallet can't recover via this path, but the
-    /// recovery_secret can still be re-derived from the keystore
-    /// if the user remembers / can scan back through indices.
-    /// Treating the file as plain (not encrypted) keeps the
-    /// recovery flow accessible even if the keystore is locked at
-    /// scan time. This is a deliberate trade-off; documented.
-    fn locks_path(wallets_dir: &Path, name: &str) -> PathBuf {
-        wallets_dir.join(name).join("locks.json")
-    }
-
-    /// Persist the subset of prepared_locks that belongs to
-    /// `wallet_name`. Called from every dispatch arm that mutates
-    /// the in-memory map (LocksPrepare, LocksConfirm, LocksRecover).
-    /// Filtering by wallet_name keeps each wallet's locks file
-    /// isolated even when multiple wallets are unlocked at once.
-    async fn persist_prepared_locks(state: &Arc<DaemonState>, wallet_name: &str) {
-        let snapshot: HashMap<String, PreparedLockMeta> = state
-            .prepared_locks
-            .read()
-            .await
-            .iter()
-            .filter(|(_, m)| m.wallet_name == wallet_name)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if let Err(e) = save_locks_for_wallet(&state.wallets_dir, wallet_name, &snapshot) {
-            tracing::warn!(wallet = %wallet_name, error = %e, "failed to persist locks");
-        }
-    }
-
-    /// Atomic write to `path`: serialise `locks` as pretty JSON,
-    /// write to a temp file, fsync, rename. Mode 0600.
-    fn save_locks_for_wallet(
-        wallets_dir: &Path,
-        wallet_name: &str,
-        locks: &HashMap<String, PreparedLockMeta>,
-    ) -> std::io::Result<()> {
-        let path = locks_path(wallets_dir, wallet_name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec_pretty(locks).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            use std::io::Write;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        // mode 0600 on Unix; Windows inherits the user-profile ACL.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&tmp)?.permissions();
-            perm.set_mode(0o600);
-            std::fs::set_permissions(&tmp, perm)?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    /// Load whatever's at `<wallets_dir>/<name>/locks.json`. Returns
-    /// an empty map when the file doesn't exist. Logs and returns
-    /// empty on parse error rather than refusing to unlock — a
-    /// corrupt locks file shouldn't make the wallet unusable.
-    fn load_locks_for_wallet(
-        wallets_dir: &Path,
-        wallet_name: &str,
-    ) -> HashMap<String, PreparedLockMeta> {
-        let path = locks_path(wallets_dir, wallet_name);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-            Err(e) => {
-                tracing::warn!(?path, error = %e, "could not read locks file");
-                return HashMap::new();
-            }
-        };
-        match serde_json::from_slice::<HashMap<String, PreparedLockMeta>>(&bytes) {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::warn!(?path, error = %e, "locks file is corrupt — ignoring");
-                HashMap::new()
-            }
-        }
-    }
-
-    /// Advance `counter` past the highest `recovery_index` present in `locks`,
-    /// monotonically (`fetch_max` never lowers it). Called on every wallet
-    /// unlock so a daemon restart never re-issues a recovery-derivation index an
-    /// existing lock already uses — which would re-derive the same recovery key
-    /// and break the lock's unilateral-exit guarantee. No-op when `locks` is
-    /// empty.
-    fn advance_recovery_index_past_locks(
-        counter: &AtomicU32,
-        locks: &HashMap<String, PreparedLockMeta>,
-    ) {
-        if let Some(max_idx) = locks.values().map(|m| m.recovery_index).max() {
-            counter.fetch_max(max_idx + 1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
     /// Enumerate every directory under `wallets_dir` that contains a `keystore.bin`.
     fn list_on_disk(wallets_dir: &Path) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(wallets_dir) else {
@@ -803,13 +924,19 @@ mod server {
         };
         let endpoint_display = wraith_wallet_ipc::endpoint_display();
         let tor_proxy = std::env::var(TOR_PROXY_ENV).ok();
-        let ghostd_url = std::env::var(GHOSTD_URL_ENV).ok();
-        let ghostd_cookie_path = std::env::var(GHOSTD_COOKIE_ENV).ok().map(PathBuf::from);
-        let ghostd_user = std::env::var(GHOSTD_USER_ENV).ok();
-        let ghostd_pass = std::env::var(GHOSTD_PASS_ENV).ok();
-        let ghost_pay_internal_auth = std::env::var(GHOST_PAY_INTERNAL_AUTH_ENV)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let ghostd_env = GhostdSettings {
+            url: std::env::var(GHOSTD_URL_ENV).ok().filter(|s| !s.is_empty()),
+            cookie_path: std::env::var(GHOSTD_COOKIE_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            user: std::env::var(GHOSTD_USER_ENV)
+                .ok()
+                .filter(|s| !s.is_empty()),
+            pass: std::env::var(GHOSTD_PASS_ENV)
+                .ok()
+                .filter(|s| !s.is_empty()),
+        };
         let wallets_dir = default_wallets_dir();
         let node_config_path = node_config_path(&wallets_dir);
         let network = std::env::var(NETWORK_ENV)
@@ -817,76 +944,41 @@ mod server {
             .and_then(|s| parse_network(&s))
             .unwrap_or(bitcoin::Network::Bitcoin);
 
-        // Endpoint resolution precedence, per field:
-        //   1. WRAITHD_GHOST_PAY / WRAITHD_GSP env var (power-user override)
+        // Node resolution, in order:
+        //   1. the environment (power-user override, pins the settings screen)
         //   2. persisted node.json (the choice made in the wallet UI)
-        //   3. bundled public preset (so a fresh install works out of the box)
-        // Both env vars still accept a comma-separated failover list.
+        //   3. nothing — the wallet has no chain backend and says so
+        //
+        // There is deliberately no bundled default. A wallet that silently
+        // points at somebody else's node on a fresh install is a wallet whose
+        // owner never chose who gets to see their addresses.
+        let ghostd_env_override = ghostd_env.url.is_some();
         let persisted = load_node_config(&node_config_path);
-        let ghost_pay_env = std::env::var(GHOST_PAY_ENV).ok().filter(|s| !s.is_empty());
-        let gsp_env = std::env::var(GSP_ENV).ok().filter(|s| !s.is_empty());
-        let ghost_pay_env_override = ghost_pay_env.is_some();
-        let gsp_env_override = gsp_env.is_some();
-        // A persisted `public` preset is symbolic — it always resolves to the
-        // *current* bundled fleet URLs, so a client that once picked "public"
-        // follows the fleet if these constants change in a later release.
-        let persisted_is_public = persisted.as_ref().map(|c| c.preset == PRESET_PUBLIC);
-        let ghost_pay_urls = if let Some(raw) = ghost_pay_env {
-            wraith_wallet_core::chain::GhostPayClient::parse_urls(&raw)
-        } else if persisted_is_public == Some(false) {
-            persisted.as_ref().unwrap().ghost_pay_urls.clone()
+        let ghostd = if ghostd_env_override {
+            ghostd_env
         } else {
-            vec![PUBLIC_GHOST_PAY.to_string()]
+            persisted.clone().map(|c| c.ghostd).unwrap_or_default()
         };
-        let gsp_urls = if let Some(raw) = gsp_env {
-            wraith_wallet_core::gsp::GspClient::parse_urls(&raw)
-        } else if persisted_is_public == Some(false) {
-            persisted.as_ref().unwrap().gsp_urls.clone()
-        } else {
-            vec![PUBLIC_GSP.to_string()]
-        };
-        // Preset label for the settings UI: a persisted choice wins; otherwise
-        // an env override reads as `custom`, and a clean fresh install reads as
-        // `public` (the bundled default it just fell back to).
-        let node_preset = if let Some(cfg) = persisted.as_ref() {
-            cfg.preset.clone()
-        } else if ghost_pay_env_override || gsp_env_override {
-            PRESET_CUSTOM.to_string()
-        } else {
-            PRESET_PUBLIC.to_string()
-        };
+        let pool_url = std::env::var(POOL_URL_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| persisted.and_then(|c| c.pool_url));
         tracing::info!(
-            preset = %node_preset,
-            ghost_pay = ?ghost_pay_urls,
-            gsp = ?gsp_urls,
+            node = ?ghostd.url,
+            auth = ghostd.auth_kind(),
             wallets_dir = %wallets_dir.display(),
             network = ?network,
             tor_proxy = ?tor_proxy,
-            ghost_pay_env_override,
-            gsp_env_override,
-            "node endpoints + wallets dir + network configured",
+            ghostd_env_override,
+            "node + wallets dir + network configured",
         );
-
-        let chain: Arc<dyn ChainClient> = {
-            let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                ghost_pay_urls.clone(),
-                tor_proxy.as_deref(),
-            )
-            .map_err(|e| std::io::Error::other(format!("ghost-pay client: {e}")))?;
-            if let Some(secret) = ghost_pay_internal_auth.as_ref() {
-                if !secret.is_empty() {
-                    c = c.with_internal_secret(secret.clone());
-                }
-            }
-            Arc::new(c)
-        };
-        let gsp = Arc::new(
-            wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
-                gsp_urls.clone(),
-                tor_proxy.as_deref(),
-            )
-            .map_err(|e| std::io::Error::other(format!("gsp client: {e}")))?,
-        );
+        if ghostd.url.is_none() {
+            tracing::warn!(
+                "no node configured — set one in Settings or via \
+                 WRAITHD_GHOSTD_URL; until then the wallet cannot read or \
+                 write the chain"
+            );
+        }
 
         let idle_lock_secs = std::env::var(IDLE_LOCK_ENV)
             .ok()
@@ -918,24 +1010,18 @@ mod server {
         }
         let state = Arc::new(DaemonState {
             started: Instant::now(),
+            // Placeholder: the real backend is built from `ghostd` just
+            // below, once the state exists to build it from.
             clients: RwLock::new(NodeClients {
-                chain,
-                gsp,
-                ghost_pay_urls,
-                gsp_urls,
-                preset: node_preset,
+                chain: Arc::new(wraith_wallet_core::chain::NoChain),
             }),
-            ghost_pay_env_override,
-            gsp_env_override,
             node_config_path,
-            ghost_pay_internal_auth,
             tor_proxy: tor_proxy.clone(),
             wraith_coordinator_url,
             kiosk_mode,
             wallets_dir,
             wallets: RwLock::new(HashMap::new()),
             active: RwLock::new(None),
-            session: RwLock::new(None),
             network,
             endpoint_display: endpoint_display.clone(),
             last_activity: std::sync::atomic::AtomicU64::new(now_unix_secs()),
@@ -943,30 +1029,58 @@ mod server {
             shroud_max_ms,
             update_manifest_url,
             http,
+            store_locks: std::sync::Mutex::new(HashMap::new()),
             wraith_mixes: RwLock::new(HashMap::new()),
-            prepared_locks: RwLock::new(HashMap::new()),
-            next_recovery_index: AtomicU32::new(0),
-            ghostd_url,
-            ghostd_cookie_path,
-            ghostd_user,
-            ghostd_pass,
+            lock_signings: RwLock::new(HashMap::new()),
+            ghostd: RwLock::new(ghostd),
+            ghostd_env_override,
+            pool_url: RwLock::new(pool_url),
+            election_cache: RwLock::new(None),
         });
+        state.clients.write().await.chain = state.build_chain().await;
 
         // Auto-lock task. Wakes every 30 s. If idle_lock_secs is 0 the task
         // exits immediately — no overhead when the feature is disabled.
+        // Watch the chain for money arriving. Cheap when there is nothing to
+        // do: it returns immediately without an unlocked wallet or a node.
+        tokio::spawn(block_scan_task(state.clone()));
+
         if idle_lock_secs > 0 {
             tokio::spawn(idle_lock_task(state.clone()));
         }
 
-        // Unix-domain sockets leave a filesystem entry; clear any stale one
-        // and ensure the parent dir exists before binding. Windows named
-        // pipes have no such artefact, so this housekeeping is unix-only.
+        // Unix-domain sockets leave a filesystem entry; clear a stale one and
+        // ensure the parent dir exists before binding. Windows named pipes have
+        // no such artefact, so this housekeeping is unix-only.
+        //
+        // The entry is only stale if nothing answers on it. This used to remove
+        // it unconditionally, which let a second daemon take the endpoint away
+        // from a running one. Both then served the same wallets directory with
+        // their own in-process locks, which is precisely the arrangement the
+        // store locks cannot protect: every read-modify-write race they exist
+        // to stop comes back across the process boundary, and the first daemon
+        // is left holding a listener nothing will ever connect to.
         #[cfg(unix)]
         {
             if socket_path.exists() {
+                let live = match wraith_wallet_ipc::endpoint_name() {
+                    Ok(name) => IpcStream::connect(name).await.is_ok(),
+                    Err(_) => false,
+                };
+                if live {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "another wraithd is already listening on {} and serving this \
+                             wallets directory. Two daemons on one directory corrupt each \
+                             other's stores. Stop the running one first.",
+                            socket_path.display()
+                        ),
+                    ));
+                }
                 tracing::warn!(
                     path = %socket_path.display(),
-                    "stale socket file present, removing"
+                    "stale socket file present (nothing answered on it), removing"
                 );
                 fs::remove_file(&socket_path)?;
             }
@@ -1015,8 +1129,6 @@ mod server {
             }
         }
 
-        // Drop the active GSP session (SessionHandle::Drop aborts the task).
-        *state.session.write().await = None;
         // Wallets clear on drop (zeroized).
         state.wallets.write().await.clear();
         // Remove the socket so the next startup doesn't see a stale file.
@@ -1068,20 +1180,6 @@ mod server {
         let (reader, mut writer) = stream.split();
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            // Streaming subscriptions short-circuit the request/response cycle:
-            // we ack on the original id, then keep writing pushes (id=0) until
-            // the client drops. After the stream ends the connection is done —
-            // we don't try to read more requests on the same connection.
-            if let Ok(env) = serde_json::from_str::<Envelope<Request>>(&line) {
-                if matches!(env.payload, Request::WatchPayments) {
-                    let ack: Envelope<Response> = Envelope::new(env.id, Response::Watching);
-                    if !write_envelope(&mut writer, &ack).await {
-                        return;
-                    }
-                    run_watch_payments(writer, lines, state.clone()).await;
-                    return;
-                }
-            }
             let response = dispatch(&line, &state).await;
             if !write_envelope(&mut writer, &response).await {
                 return;
@@ -1109,335 +1207,14 @@ mod server {
     /// payment-detection broadcast and forwards each event as a push envelope
     /// (id=0). Exits when the client disconnects, the active session is
     /// rotated out, or the broadcast channel is closed.
-    async fn run_watch_payments(
-        mut writer: IpcSendHalf,
-        mut lines: tokio::io::Lines<BufReader<IpcRecvHalf>>,
-        state: Arc<DaemonState>,
-    ) {
-        let mut rx = match state.session.read().await.as_ref() {
-            Some(s) => s.handle.subscribe_payments(),
-            None => {
-                let err: Envelope<Response> = Envelope::new(
-                    0,
-                    Response::Error(ErrorResponse {
-                        message: "no active session; call gsp_auth first".to_string(),
-                    }),
-                );
-                let _ = write_envelope(&mut writer, &err).await;
-                return;
-            }
-        };
-        loop {
-            tokio::select! {
-                read = lines.next_line() => {
-                    // The client closed (or sent another request — we don't accept
-                    // anything else on a watch connection; just hang up).
-                    match read {
-                        Ok(Some(_)) => return,
-                        _ => return,
-                    }
-                }
-                event = rx.recv() => {
-                    match event {
-                        Ok(d) => {
-                            let push: Envelope<Response> = Envelope::new(
-                                0,
-                                Response::PaymentDetected(DetectedPaymentEntry {
-                                    txid: d.txid,
-                                    block_height: d.block_height,
-                                    vout: d.vout,
-                                    amount_sats: d.amount_sats,
-                                    k: d.k,
-                                    received_at: d.received_at,
-                                }),
-                            );
-                            if !write_envelope(&mut writer, &push).await {
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "watch_payments lagged; client should resync via light_detected");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            // Session was rotated out — close the watch.
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// `GspAuth` orchestration: register-if-needed + session. Stores the resulting
     /// `SessionToken` in `state.session` so subsequent commits can use it to open
     /// a persistent authenticated WebSocket.
-    async fn gsp_auth(state: &Arc<DaemonState>) -> Result<GspAuthResponse, String> {
-        // 1. Get the auth keypair + active wallet name.
-        let (active_name, kp) = {
-            let active = state
-                .active
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| "no active wallet".to_string())?;
-            let wallets = state.wallets.read().await;
-            let ks = wallets
-                .get(&active)
-                .ok_or_else(|| format!("active wallet '{active}' is not unlocked"))?;
-            let kp = auth::auth_keypair(ks).map_err(|e| format!("auth keypair: {e}"))?;
-            (active, kp)
-        };
-        let wallet_id = auth::wallet_id_hex(&kp);
-
-        // 2. Register (idempotent — treat "already registered" server errors as success).
-        let gsp = state.gsp().await;
-        let register_proof =
-            auth::make_proof(&kp, "register").map_err(|e| format!("register proof: {e}"))?;
-        let already_registered = match gsp.register(register_proof, None).await {
-            Ok(_) => false,
-            Err(GspError::Server(msg)) if msg.to_ascii_lowercase().contains("already") => true,
-            Err(e) => return Err(format!("register: {e}")),
-        };
-
-        // 3. Generate session_nonce + sign session proof + create session.
-        use rand::RngCore;
-        let mut nonce_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let session_nonce = hex::encode(nonce_bytes);
-
-        let session_proof =
-            auth::make_proof(&kp, "session").map_err(|e| format!("session proof: {e}"))?;
-        let token = gsp
-            .create_session(session_proof, Some(session_nonce))
-            .await
-            .map_err(|e| format!("session: {e}"))?;
-
-        let token_prefix: String = token.token.chars().take(12).collect();
-        let expires_at = token.expires_at;
-        let jwt_for_session = token.token.clone();
-
-        // Derive ghost keys for client-side BIP-352 detection. Best-effort:
-        // failure here just means the session won't auto-scan; auth still works.
-        let scan_keys = {
-            let wallets = state.wallets.read().await;
-            wallets
-                .get(&active_name)
-                .and_then(|ks| ks.ghost_keys().ok())
-        };
-
-        // Compute the wallet's network-correct bech32 ghost-id once
-        // up front. The session forwards it with each
-        // GetTransactions so ghost-pay can match recipient-side
-        // rows. `GhostKeys::ghost_id().to_string()` would emit the
-        // mainnet HRP — wrong for regtest/signet/testnet.
-        let ghost_id_bech32 = scan_keys.as_ref().and_then(|gk| {
-            gk.ghost_id()
-                .encode_for_network(ghost_network_from_bitcoin(state.network))
-                .ok()
-        });
-
-        // 4. Stash the token + spawn a persistent authenticated session task.
-        //    Replacing an existing slot drops the old SessionHandle, which aborts
-        //    its task before the new one starts.
-        let handle = spawn_session_with_bech32(
-            state.gsp_urls().await,
-            jwt_for_session,
-            scan_keys,
-            ghost_id_bech32,
-            state.tor_proxy.clone(),
-        );
-        *state.session.write().await = Some(StoredSession {
-            wallet_name: active_name,
-            token,
-            handle,
-        });
-
-        Ok(GspAuthResponse {
-            wallet_id,
-            already_registered,
-            token_prefix,
-            expires_at,
-        })
-    }
-
-    /// Helpers shared by lock operations: pull the auth keypair from the session's wallet.
-    /// Used so each lock op binds to the wallet that produced the session token.
-    async fn auth_keypair_for_session(
-        state: &Arc<DaemonState>,
-    ) -> Result<bitcoin::secp256k1::Keypair, String> {
-        let session = state.session.read().await;
-        let session = session
-            .as_ref()
-            .ok_or_else(|| "no GSP session — run `wraith gsp auth` first".to_string())?;
-        let wallets = state.wallets.read().await;
-        let ks = wallets.get(&session.wallet_name).ok_or_else(|| {
-            format!(
-                "wallet '{}' (the session's wallet) is not unlocked",
-                session.wallet_name
-            )
-        })?;
-        wraith_wallet_core::auth::auth_keypair(ks).map_err(|e| format!("auth keypair: {e}"))
-    }
-
-    fn parse_jump_priority(s: &str) -> Result<String, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "normal" => Ok("normal".to_string()),
-            "high" => Ok("high".to_string()),
-            "urgent" => Ok("urgent".to_string()),
-            other => Err(format!(
-                "unknown jump priority '{other}' (try normal, high, urgent)"
-            )),
-        }
-    }
-
-    fn parse_payment_mode(s: &str) -> Result<PaymentMode, String> {
-        // Send only exposes the instant L2 ledger transfer (`ghostpay`).
-        // The `wraith` and `confidential` modes were retired here because
-        // they never had a real code path in Send — both silently took the
-        // plaintext L2 ledger route, so advertising them was a
-        // truth-in-advertising defect. Unlinkable L1 spends live in the Mix
-        // tab (Wraith CoinJoin); a shielded confidential L2 transfer needs
-        // client-side ZK proving the wallet-core cannot yet produce, so it
-        // is not offered rather than faked. Both are rejected below instead
-        // of silently accepted — a rejected send can never leak as a
-        // plaintext one.
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "ghostpay" | "ghost-pay" | "ghost_pay" => Ok(PaymentMode::GhostPay),
-            "wraith" => Err(
-                "payment mode 'wraith' is not available from Send — unlinkable L1 spends go \
-                 through the Mix tab (Wraith CoinJoin)"
-                    .to_string(),
-            ),
-            "confidential" => Err(
-                "payment mode 'confidential' is not available: shielded L2 transfers require \
-                 client-side ZK proving that is not yet supported"
-                    .to_string(),
-            ),
-            other => Err(format!("unknown payment mode '{other}' (try ghostpay)")),
-        }
-    }
-
     /// `LightSend` orchestration: PreparePayment → sign sighash with auth key → SubmitSignedPayment.
     /// Mirrors `ghost-light-wallet::payments::send::sign_and_submit` so wire format matches.
-    async fn light_send(
-        state: &Arc<DaemonState>,
-        recipient: String,
-        amount_sats: u64,
-        mode_str: String,
-        memo: Option<String>,
-        shroud_override_ms: Option<u64>,
-    ) -> Result<LightSentResponse, String> {
-        // The `mode` field on the IPC is parsed and validated. Only
-        // `ghostpay` (the instant L2 ledger transfer) is accepted; the
-        // retired `wraith`/`confidential` modes are rejected here so a
-        // stale caller can never fall through to a plaintext send it
-        // did not intend (see `parse_payment_mode`).
-        let mode = parse_payment_mode(&mode_str)?;
-        let mode_label = format!("{mode}");
-
-        let session = state.session.read().await;
-        let session = session
-            .as_ref()
-            .ok_or_else(|| "no GSP session — run `wraith gsp auth` first".to_string())?;
-
-        // Auth keypair from the active wallet (must match session's wallet).
-        let kp = {
-            let wallets = state.wallets.read().await;
-            let ks = wallets.get(&session.wallet_name).ok_or_else(|| {
-                format!(
-                    "wallet '{}' (the session's wallet) is not unlocked",
-                    session.wallet_name
-                )
-            })?;
-            wraith_wallet_core::auth::auth_keypair(ks).map_err(|e| format!("auth keypair: {e}"))?
-        };
-
-        // Phase 9 Shroud: hold the request for a uniform random delay
-        // in [0, max] before sending. For L2 ledger ops there's no P2P
-        // broadcast to correlate against, but a network observer with
-        // both wallet→ghost-pay HTTP and ghost-pay→peer ledger update
-        // vantage points could still correlate "user typed send" with
-        // "ledger updated" — the shroud breaks that timing seam.
-        let max_ms = shroud_override_ms.unwrap_or(state.shroud_max_ms);
-        let shroud_delay_ms = shroud_pick_delay(max_ms);
-        if let Some(chosen) = shroud_delay_ms {
-            tracing::debug!(
-                shroud_max_ms = max_ms,
-                chosen_ms = chosen,
-                "shroud relay: holding L2 send before submit"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(chosen)).await;
-        }
-
-        // Fresh per-call auth proof and a single SendL2Payment.
-        // Replaces the prepare/sign/submit dance — L2 transfers are
-        // session-authenticated ledger ops, not Bitcoin txs requiring
-        // per-payment sighash signatures.
-        let proof = wraith_wallet_core::auth::make_proof(&kp, "send_l2_payment")
-            .map_err(|e| format!("send_l2_payment proof: {e}"))?;
-
-        let result = session
-            .handle
-            .send_l2_payment(recipient.clone(), amount_sats, proof, memo.clone())
-            .await
-            .map_err(|e| format!("SendL2Payment: {e}"))?;
-
-        Ok(LightSentResponse {
-            payment_id: result.payment_id,
-            // L2 transfers are off-chain ledger ops — there's no
-            // bitcoin txid until the eventual settlement step
-            // (reconciliation or confidential-transfer ZK proof).
-            txid: None,
-            recipient,
-            amount_sats: result.amount_sats,
-            // ghost-pay's L2 send doesn't currently expose a fee
-            // breakdown in its response. v1 reports 0; the
-            // operator-side fee accounting can surface later via
-            // a separate query if/when needed.
-            fee_sats: 0,
-            mode: mode_label,
-            shroud_delay_ms,
-        })
-    }
-
     /// Send `RegisterScanKey` over the persistent session: derives the wallet's
     /// BIP-352 scan pubkey, signs a `register_scan_key` proof, and delegates to
     /// the session task. Returns (wallet_id, scan_pubkey_hex) on success.
-    async fn gsp_register_scan_key(state: &Arc<DaemonState>) -> Result<(String, String), String> {
-        let session = state.session.read().await;
-        let session = session
-            .as_ref()
-            .ok_or_else(|| "no GSP session — run `wraith gsp auth` first".to_string())?;
-
-        // Derive scan pubkey + auth keypair from the session's wallet.
-        let (scan_pubkey_hex, kp) = {
-            let wallets = state.wallets.read().await;
-            let ks = wallets.get(&session.wallet_name).ok_or_else(|| {
-                format!(
-                    "wallet '{}' (the session's wallet) is not unlocked",
-                    session.wallet_name
-                )
-            })?;
-            let gk = ks.ghost_keys().map_err(|e| format!("ghost-keys: {e}"))?;
-            let scan_hex = hex::encode(gk.scan_pubkey().serialize());
-            let kp = wraith_wallet_core::auth::auth_keypair(ks)
-                .map_err(|e| format!("auth keypair: {e}"))?;
-            (scan_hex, kp)
-        };
-
-        let proof = wraith_wallet_core::auth::make_proof(&kp, "register_scan_key")
-            .map_err(|e| format!("register_scan_key proof: {e}"))?;
-        let wallet_id = wraith_wallet_core::auth::wallet_id_hex(&kp);
-
-        session
-            .handle
-            .register_scan_key(scan_pubkey_hex.clone(), proof)
-            .await
-            .map_err(|e| format!("RegisterScanKey: {e}"))?;
-
-        Ok((wallet_id, scan_pubkey_hex))
-    }
-
     /// Run all connectivity / liveness checks and return a summary.
     async fn doctor_run(state: &Arc<DaemonState>) -> DoctorResponse {
         let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -1454,50 +1231,40 @@ mod server {
             ),
         });
 
-        // 2. ghost-pay /api/v1/status round-trip + latency.
+        // 2. The node: reachability, sync, and round-trip.
         let t0 = std::time::Instant::now();
+        let configured = state.ghostd().await.url.is_some();
         match state.chain().await.status().await {
             Ok(s) => {
                 let rtt = t0.elapsed().as_millis();
+                let height = match s.chain_height {
+                    Some(h) => h.to_string(),
+                    None => "unknown".into(),
+                };
                 checks.push(DoctorCheck {
-                    name: "ghost-pay".into(),
+                    name: "node".into(),
                     status: "pass".into(),
                     detail: format!(
-                        "v{} ({}) — locks={}, sessions={} — round-trip {rtt}ms",
-                        s.backend_version, s.network, s.lock_count, s.active_sessions
+                        "{} ({}) — height {height} — round-trip {rtt}ms",
+                        s.backend_version, s.network
                     ),
                 });
             }
+            // No node configured is a setup step, not a failure: it does not
+            // fail the run, because there is nothing broken to fix — only
+            // something not yet chosen.
+            Err(e) if !configured => checks.push(DoctorCheck {
+                name: "node".into(),
+                status: "skip".into(),
+                detail: format!("{e}"),
+            }),
             Err(e) => {
                 all_pass = false;
                 let rtt = t0.elapsed().as_millis();
                 checks.push(DoctorCheck {
-                    name: "ghost-pay".into(),
+                    name: "node".into(),
                     status: "fail".into(),
                     detail: format!("{e} (after {rtt}ms)"),
-                });
-            }
-        }
-
-        // 3. GSP ping round-trip.
-        match state.gsp().await.ping().await {
-            Ok(p) => {
-                let detail = match p.round_trip_ms {
-                    Some(rtt) => format!("server_time {} — round-trip {}ms", p.server_time, rtt),
-                    None => format!("server_time {}", p.server_time),
-                };
-                checks.push(DoctorCheck {
-                    name: "ghost-gsp".into(),
-                    status: "pass".into(),
-                    detail,
-                });
-            }
-            Err(e) => {
-                all_pass = false;
-                checks.push(DoctorCheck {
-                    name: "ghost-gsp".into(),
-                    status: "fail".into(),
-                    detail: format!("{e}"),
                 });
             }
         }
@@ -1514,35 +1281,6 @@ mod server {
                     name: "active wallet".into(),
                     status: "skip".into(),
                     detail: "no wallet selected — `wraith wallet unlock <name>`".into(),
-                });
-            }
-        }
-
-        // 5. Session — present?
-        match state.session.read().await.as_ref() {
-            None => checks.push(DoctorCheck {
-                name: "gsp session".into(),
-                status: "skip".into(),
-                detail: "no session — `wraith gsp auth`".into(),
-            }),
-            Some(s) => {
-                let snap = s.handle.snapshot().await;
-                let phase = phase_label(snap.phase);
-                let status = if matches!(snap.phase, SessionPhase::Authenticated) {
-                    "pass".to_string()
-                } else {
-                    all_pass = false;
-                    "fail".to_string()
-                };
-                checks.push(DoctorCheck {
-                    name: "gsp session".into(),
-                    status,
-                    detail: format!(
-                        "{} (connects: {}, expires in {}s)",
-                        phase,
-                        snap.connect_count,
-                        s.token.remaining_secs()
-                    ),
                 });
             }
         }
@@ -1584,11 +1322,9 @@ mod server {
         // checks here aren't run on signet / testnet / regtest because the
         // privacy-and-integrity stakes don't apply to test networks.
         if state.network == bitcoin::Network::Bitcoin {
-            let ghost_pay_urls = state.ghost_pay_urls().await;
-            let gsp_urls = state.gsp_urls().await;
+            let node = state.ghostd().await;
             mainnet_readiness_checks(
-                &ghost_pay_urls,
-                &gsp_urls,
+                node.url.as_deref(),
                 state.tor_proxy.as_deref(),
                 &mut checks,
                 &mut all_pass,
@@ -1615,106 +1351,64 @@ mod server {
         matches!(host, "127.0.0.1" | "::1" | "localhost")
     }
 
-    /// Phase: mainnet-only doctor checks. Flags plaintext non-loopback
-    /// URLs (real privacy hole on real bitcoin) and the absence of a Tor
-    /// proxy (advisory — Tor is opt-in by design, but worth surfacing so
-    /// the user knows they're publishing their IP to ghost-pay/GSP).
+    /// Extra rows emitted only on mainnet, where the stakes are real.
+    ///
+    /// Test networks are excluded deliberately: a plaintext regtest node is
+    /// not a privacy problem, and failing on it would train people to ignore
+    /// the row that matters.
     fn mainnet_readiness_checks(
-        ghost_pay_urls: &[String],
-        gsp_urls: &[String],
+        node_url: Option<&str>,
         tor_proxy: Option<&str>,
         checks: &mut Vec<DoctorCheck>,
         all_pass: &mut bool,
     ) {
-        let plaintext_pay: Vec<&String> = ghost_pay_urls
-            .iter()
-            .filter(|u| u.starts_with("http://") && !is_loopback_url(u))
-            .collect();
-        let plaintext_gsp: Vec<&String> = gsp_urls
-            .iter()
-            .filter(|u| u.starts_with("ws://") && !is_loopback_url(u))
-            .collect();
-
-        // Plaintext ghost-pay row. Fail = wallet→ghost-pay traffic is
-        // visible to anyone on the path; an observer can correlate
-        // submissions with broadcasts.
-        if plaintext_pay.is_empty() {
-            checks.push(DoctorCheck {
-                name: "mainnet/ghost-pay tls".into(),
+        // Plaintext RPC row. The node connection carries the wallet's
+        // addresses and its transactions before they are broadcast; in the
+        // clear, anyone on the path learns both. Loopback is exempt — the
+        // traffic never leaves the machine, and TLS there is CPU burned for
+        // no privacy gain.
+        match node_url {
+            None => checks.push(DoctorCheck {
+                name: "mainnet/node tls".into(),
+                status: "skip".into(),
+                detail: "no node configured".into(),
+            }),
+            Some(u) if u.starts_with("http://") && !is_loopback_url(u) => {
+                *all_pass = false;
+                checks.push(DoctorCheck {
+                    name: "mainnet/node tls".into(),
+                    status: "fail".into(),
+                    detail: format!(
+                        "{u} is plaintext and not loopback — your addresses and \
+                         unbroadcast transactions are visible to anyone on the path. \
+                         use https://, or reach the node over loopback or an SSH tunnel."
+                    ),
+                });
+            }
+            Some(_) => checks.push(DoctorCheck {
+                name: "mainnet/node tls".into(),
                 status: "pass".into(),
-                detail: "all ghost-pay endpoints use https or are loopback-bound".into(),
-            });
-        } else {
-            *all_pass = false;
-            checks.push(DoctorCheck {
-                name: "mainnet/ghost-pay tls".into(),
-                status: "fail".into(),
-                detail: format!(
-                    "{} non-TLS endpoint(s): {}. switch to https:// or run ghost-pay on \
-                     loopback.",
-                    plaintext_pay.len(),
-                    plaintext_pay
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
+                detail: "the node is reached over https or loopback".into(),
+            }),
         }
 
-        // Plaintext GSP row. Same threat: ws:// leaks the wallet's
-        // existence + auth identity to anyone on the path.
-        if plaintext_gsp.is_empty() {
-            checks.push(DoctorCheck {
-                name: "mainnet/gsp tls".into(),
-                status: "pass".into(),
-                detail: "all gsp endpoints use wss or are loopback-bound".into(),
-            });
-        } else {
-            *all_pass = false;
-            checks.push(DoctorCheck {
-                name: "mainnet/gsp tls".into(),
-                status: "fail".into(),
-                detail: format!(
-                    "{} non-TLS endpoint(s): {}. switch to wss:// or run GSP on loopback.",
-                    plaintext_gsp.len(),
-                    plaintext_gsp
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
-
-        // Tor row. Advisory only — Tor is opt-in by design, and forcing
-        // it would break legitimate setups (e.g. an operator running
-        // their own ghost-pay on a private network). "skip" rather than
-        // "fail" so all_pass isn't lowered.
-        if tor_proxy.is_none() {
-            checks.push(DoctorCheck {
+        // Tor row. Advisory only — Tor is opt-in by design, and forcing it
+        // would break legitimate setups (a node on a private network, say).
+        // "skip" rather than "fail" so all_pass isn't lowered.
+        match tor_proxy {
+            None => checks.push(DoctorCheck {
                 name: "mainnet/tor".into(),
                 status: "skip".into(),
-                detail: "WRAITHD_TOR_PROXY unset — your IP is visible to ghost-pay and GSP. \
-                         set e.g. socks5h://127.0.0.1:9050 to route through Tor."
+                detail: "WRAITHD_TOR_PROXY unset — your IP is visible to anything the \
+                         wallet talks to. set e.g. socks5h://127.0.0.1:9050 to route \
+                         through Tor."
                     .into(),
-            });
-        } else {
-            checks.push(DoctorCheck {
+            }),
+            Some(p) => checks.push(DoctorCheck {
                 name: "mainnet/tor".into(),
                 status: "pass".into(),
-                detail: format!("routing through {}", tor_proxy.unwrap_or("?")),
-            });
-        }
-    }
-
-    fn phase_label(p: SessionPhase) -> &'static str {
-        match p {
-            SessionPhase::Disconnected => "disconnected",
-            SessionPhase::Connecting => "connecting",
-            SessionPhase::Authenticating => "authenticating",
-            SessionPhase::Authenticated => "authenticated",
-            SessionPhase::Backoff => "backoff",
+                detail: format!("routing through {p}"),
+            }),
         }
     }
 
@@ -1939,15 +1633,38 @@ mod server {
         }
 
         // 4. Build the unsigned PSBT.
-        let (psbt, meta) = psbt_mod::create_psbt(
-            &available,
+        //
+        // A Ghost ID is paid differently from an address: the money goes to a
+        // taproot output derived per-payment, and an OP_RETURN alongside it
+        // carries the ephemeral key the recipient needs to find it. Routed on
+        // the recipient's form rather than on a flag, so the caller cannot ask
+        // for one and get the other.
+        let (psbt, meta) = if wraith_wallet_core::silent_payment::looks_like_ghost_id(
             recipient_address,
-            amount_sats,
-            &change_addr,
             network,
-            fee_rate_sats_per_vb,
-        )
-        .map_err(|e| format!("create_psbt: {e}"))?;
+        ) {
+            let pay = wraith_wallet_core::silent_payment::build(recipient_address, network, 0)
+                .map_err(|e| format!("silent payment: {e}"))?;
+            psbt_mod::create_psbt_to_scripts(
+                &available,
+                pay.output_script,
+                amount_sats,
+                std::slice::from_ref(&pay.announcement_script),
+                &change_addr,
+                fee_rate_sats_per_vb,
+            )
+            .map_err(|e| format!("create_psbt: {e}"))?
+        } else {
+            psbt_mod::create_psbt(
+                &available,
+                recipient_address,
+                amount_sats,
+                &change_addr,
+                network,
+                fee_rate_sats_per_vb,
+            )
+            .map_err(|e| format!("create_psbt: {e}"))?
+        };
 
         let encoded = psbt_mod::encode_psbt(&psbt, psbt_mod::PsbtEncoding::Base64);
         Ok(wraith_wallet_ipc::PsbtCreateResponse {
@@ -1965,12 +1682,125 @@ mod server {
         })
     }
 
+    /// What one on-chain payment needs to know.
+    ///
+    /// A struct rather than a long argument list: every field but the first
+    /// two is optional in spirit, and eight positional arguments of mostly
+    /// numbers is a place where two of them quietly swap.
+    struct L1SendParams {
+        recipient_address: String,
+        amount_sats: u64,
+        fee_rate_sats_per_vb: u64,
+        change_index: Option<u32>,
+        bip86_scan_max: u32,
+        selected_outpoints: Vec<wraith_wallet_ipc::OutpointRef>,
+        memo: Option<String>,
+        shroud_override_ms: Option<u64>,
+    }
+
+    /// Build, sign and broadcast an ordinary on-chain payment.
+    ///
+    /// Composed from the three verbs that already exist rather than
+    /// re-implementing any of them: `psbt_create_handler` selects coins and
+    /// sets the change, `sign_owned_inputs` signs what the wallet owns, and
+    /// `psbt_broadcast_handler` is the single place a transaction reaches the
+    /// network and the single place history is written.
+    ///
+    /// It stops with a clear error rather than broadcasting a partly signed
+    /// transaction. An incomplete PSBT here means a selected input was not
+    /// ours to sign — which is worth saying, because the alternative is a
+    /// rejection from the node whose message explains nothing.
+    async fn l1_send(
+        state: &Arc<DaemonState>,
+        p: L1SendParams,
+    ) -> Result<wraith_wallet_ipc::L1SendResponse, String> {
+        use wraith_wallet_core::psbt as psbt_mod;
+
+        let L1SendParams {
+            recipient_address,
+            amount_sats,
+            fee_rate_sats_per_vb,
+            change_index,
+            bip86_scan_max,
+            selected_outpoints,
+            memo,
+            shroud_override_ms,
+        } = p;
+
+        let built = psbt_create_handler(
+            state,
+            &recipient_address,
+            amount_sats,
+            fee_rate_sats_per_vb,
+            change_index,
+            bip86_scan_max,
+            &selected_outpoints,
+        )
+        .await?;
+
+        let network = state.network;
+        let scan_max = bip86_scan_max.max(1);
+        let (mut parsed, encoding) =
+            psbt_mod::decode_psbt(&built.psbt).map_err(|e| format!("decode: {e}"))?;
+        let signed_count = with_active_wallet(state, move |_, ks| {
+            psbt_mod::sign_owned_inputs(&mut parsed, ks, network, scan_max)
+                .map(|n| (n, parsed))
+                .map_err(|e| format!("sign: {e}"))
+        })
+        .await?;
+        let (signed, signed_psbt) = signed_count;
+        if !psbt_mod::is_complete(&signed_psbt) {
+            return Err(format!(
+                "signed {} of {} inputs — the rest are not this wallet's to sign, \
+                 so nothing was broadcast",
+                signed.len(),
+                signed_psbt.inputs.len()
+            ));
+        }
+
+        // The same shroud as `LightSend`, and it means more here: this one
+        // does reach the P2P network, where the moment of broadcast is what an
+        // observer correlates against the user's keystrokes.
+        let max_ms = shroud_override_ms.unwrap_or(state.shroud_max_ms);
+        let shroud_delay_ms = shroud_pick_delay(max_ms);
+        if let Some(chosen) = shroud_delay_ms {
+            tracing::debug!(
+                shroud_max_ms = max_ms,
+                chosen_ms = chosen,
+                "shroud relay: holding L1 payment before broadcast"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(chosen)).await;
+        }
+
+        let encoded = psbt_mod::encode_psbt(&signed_psbt, encoding);
+        let txid = psbt_broadcast_handler(state, &encoded, "send", memo).await?;
+
+        Ok(wraith_wallet_ipc::L1SendResponse {
+            txid,
+            recipient: recipient_address,
+            // From the built transaction, not from the request: coin selection
+            // decides what the fee ends up being.
+            amount_sats: built.recipient_sats,
+            fee_sats: built.fee_sats,
+            change_sats: built.change_sats,
+            input_count: built.input_count,
+            shroud_delay_ms,
+        })
+    }
+
     /// Extract a finalized tx from a PSBT (or accept raw tx hex
-    /// directly) and broadcast it via ghost-pay. Returns the
-    /// txid bitcoind accepted.
+    /// directly), broadcast it, and write it into the local history.
+    /// Returns the txid the node accepted.
+    ///
+    /// This is the one place a transaction reaches the network, which is why
+    /// it is also the one place history is written: a spend that never left
+    /// is not something the wallet did, and one that left must not be
+    /// forgotten.
     async fn psbt_broadcast_handler(
-        state: &DaemonState,
+        state: &Arc<DaemonState>,
         psbt_or_tx_hex: &str,
+        kind: &str,
+        memo: Option<String>,
     ) -> Result<String, String> {
         use wraith_wallet_core::psbt as psbt_mod;
         let trimmed = psbt_or_tx_hex.trim();
@@ -1978,6 +1808,7 @@ mod server {
         // Anything else, treat as raw consensus-encoded tx hex.
         let is_psbt =
             trimmed.to_lowercase().starts_with("70736274ff") || trimmed.starts_with("cHNidP");
+        let mut source_psbt = None;
         let tx_hex = if is_psbt {
             let (parsed, _) =
                 psbt_mod::decode_psbt(trimmed).map_err(|e| format!("decode_psbt: {e}"))?;
@@ -1987,21 +1818,162 @@ mod server {
                 );
             }
             let tx = parsed
+                .clone()
                 .extract_tx()
                 .map_err(|e| format!("extract_tx: {e}"))?;
-            bitcoin::consensus::encode::serialize_hex(&tx)
+            let hex = bitcoin::consensus::encode::serialize_hex(&tx);
+            // Kept for the history entry: a PSBT carries the input values, so
+            // it is the only form from which the fee and the true net change
+            // can be worked out. A bare transaction does not carry them.
+            source_psbt = Some(parsed);
+            hex
         } else {
             let bytes = hex::decode(trimmed).map_err(|e| format!("hex: {e}"))?;
             let _: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes)
                 .map_err(|e| format!("invalid raw tx: {e}"))?;
             trimmed.to_string()
         };
-        state
+        let txid = state
             .chain()
             .await
             .broadcast_tx(&tx_hex)
             .await
-            .map_err(|e| format!("broadcast: {e}"))
+            .map_err(|e| format!("broadcast: {e}"))?;
+        // Recorded after the node accepted it, because a transaction the node
+        // rejected is not something the wallet did. A failure to record is
+        // logged and not propagated: the money has already moved, and
+        // reporting the broadcast as failed would be the more damaging lie.
+        if let Err(e) = record_broadcast(state, &txid, source_psbt.as_ref(), kind, memo).await {
+            tracing::warn!(
+                txid = %txid,
+                error = %e,
+                "broadcast succeeded but could not be written to local history"
+            );
+        }
+        Ok(txid)
+    }
+
+    /// Write one broadcast into the local history.
+    ///
+    /// Both figures come from the PSBT or from nowhere. A raw transaction does
+    /// not carry its input values, so neither the fee nor the net change can
+    /// be derived from one; the entry is then recorded with `None` for both
+    /// rather than with a plausible-looking wrong number. `None` reads as "—"
+    /// in the UI, where a `0` would read as "moved nothing".
+    async fn record_broadcast(
+        state: &Arc<DaemonState>,
+        txid: &str,
+        source_psbt: Option<&bitcoin::psbt::Psbt>,
+        kind: &str,
+        memo: Option<String>,
+    ) -> Result<(), String> {
+        let (amount_sats, fee_sats) = match source_psbt {
+            Some(p) => match own_script_pubkeys(state).await {
+                Some(ours) => psbt_ledger_effect(p, &ours),
+                // Locked wallet: the fee is still inputs minus outputs and
+                // needs no keys, but which coins were ours does.
+                None => (None, psbt_ledger_effect_fee(p)),
+            },
+            None => (None, None),
+        };
+        record_history(
+            state,
+            wraith_wallet_core::history_store::HistoryEntry {
+                txid: txid.to_string(),
+                at: now_unix_secs() as i64,
+                // Unconfirmed until the scanner sees it mined.
+                block_height: None,
+                amount_sats,
+                fee_sats,
+                kind: kind.to_string(),
+                memo,
+            },
+        )
+        .await
+    }
+
+    /// The value backing one PSBT input, from whichever UTXO field carries it.
+    fn psbt_input_value(psbt: &bitcoin::psbt::Psbt, i: usize) -> Option<&bitcoin::TxOut> {
+        let input = psbt.inputs.get(i)?;
+        if let Some(txout) = input.witness_utxo.as_ref() {
+            return Some(txout);
+        }
+        // Legacy inputs carry the whole previous transaction instead.
+        let prev = input.non_witness_utxo.as_ref()?;
+        let outpoint = psbt.unsigned_tx.input.get(i)?.previous_output;
+        prev.output.get(outpoint.vout as usize)
+    }
+
+    /// Miner fee: every input value minus every output value.
+    ///
+    /// `None` if any input's value is missing — a fee computed from a subset
+    /// of the inputs is not a smaller fee, it is a wrong one.
+    fn psbt_ledger_effect_fee(psbt: &bitcoin::psbt::Psbt) -> Option<u64> {
+        let mut inputs = 0u64;
+        for i in 0..psbt.unsigned_tx.input.len() {
+            inputs = inputs.saturating_add(psbt_input_value(psbt, i)?.value.to_sat());
+        }
+        let outputs: u64 = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|o| o.value.to_sat())
+            .sum();
+        Some(inputs.saturating_sub(outputs))
+    }
+
+    /// What this PSBT does to the wallet's balance, and what it pays in fee.
+    ///
+    /// The net is our outputs minus our inputs, so it accounts for change and
+    /// for the fee without either being special-cased: a 50,000 sat payment
+    /// costing 500 in fee nets −50,500, which is the number the balance will
+    /// actually move by. Addresses beyond the scan window read as somebody
+    /// else's and overstate what left — the safer direction to be wrong in for
+    /// a record the user checks against their memory of the payment.
+    fn psbt_ledger_effect(
+        psbt: &bitcoin::psbt::Psbt,
+        ours: &std::collections::HashSet<Vec<u8>>,
+    ) -> (Option<i64>, Option<u64>) {
+        let fee = psbt_ledger_effect_fee(psbt);
+        let mut spent: i64 = 0;
+        for i in 0..psbt.unsigned_tx.input.len() {
+            let Some(txout) = psbt_input_value(psbt, i) else {
+                // One unknown input value makes the net unknowable; the fee
+                // is already `None` for the same reason.
+                return (None, fee);
+            };
+            if ours.contains(txout.script_pubkey.as_bytes()) {
+                spent = spent.saturating_add(txout.value.to_sat() as i64);
+            }
+        }
+        let mut received: i64 = 0;
+        for out in &psbt.unsigned_tx.output {
+            if ours.contains(out.script_pubkey.as_bytes()) {
+                received = received.saturating_add(out.value.to_sat() as i64);
+            }
+        }
+        (Some(received.saturating_sub(spent)), fee)
+    }
+
+    /// The scripts this wallet can spend, over the scan window.
+    ///
+    /// `None` when the wallet is locked — deriving needs the keys. Change
+    /// addresses beyond the window read as somebody else's, which overstates
+    /// what left; that is the safer direction to be wrong in for a record the
+    /// user checks against their own memory of the payment.
+    async fn own_script_pubkeys(state: &DaemonState) -> Option<std::collections::HashSet<Vec<u8>>> {
+        let network = state.network;
+        with_active_wallet(state, move |_, ks| {
+            let mut set = std::collections::HashSet::new();
+            for i in 0..wraith_wallet_core::psbt::DEFAULT_SCAN_INDEX_MAX {
+                let a = light::receive_address(ks, i, network)
+                    .map_err(|e| format!("derive index {i}: {e}"))?;
+                set.insert(a.script_pubkey().as_bytes().to_vec());
+            }
+            Ok(set)
+        })
+        .await
+        .ok()
     }
 
     /// Inspect a multisig descriptor. Pure function: parse, derive
@@ -2376,19 +2348,6 @@ mod server {
         }
     }
 
-    /// Error text for `locks_recover` when we hold no local metadata for the
-    /// requested lock. Prepared locks are persisted to `<wallet>/locks.json`
-    /// and reloaded on `WalletUnlock`, so a miss means the entry belongs to a
-    /// different wallet/daemon or its `locks.json` row is gone — not that the
-    /// index was lost to a restart. Pulled out so the message is unit-testable.
-    fn missing_lock_metadata_error(lock_id: &str) -> String {
-        format!(
-            "no local metadata for lock '{lock_id}' — either it was prepared \
-            by a different wallet/daemon, or its locks.json entry is missing. \
-            Unlock the wallet that prepared it and retry."
-        )
-    }
-
     /// Error text for `WraithMixSubmit` when the `session_id` is unknown. The
     /// `wraith_mixes` map is in-memory only by design (the coordinator's
     /// no-sign deadline is ticking), so a miss means the round expired or the
@@ -2408,15 +2367,11 @@ mod server {
     }
 
     /// Returns true iff this request counts as user-facing activity for the
-    /// idle-lock timer. Diagnostics (Health, Doctor, DaemonEnv) and the watch
-    /// stream itself don't reset the timer — they're either too quiet to
-    /// indicate a present user, or they're held open continuously and would
-    /// defeat the feature.
+    /// idle-lock timer. Diagnostics (Health, Doctor, DaemonEnv) don't reset
+    /// it — they are too quiet to indicate a present user, and a status bar
+    /// polling every few seconds would defeat the feature outright.
     fn is_activity(req: &Request) -> bool {
-        !matches!(
-            req,
-            Request::Health | Request::Doctor | Request::DaemonEnv | Request::WatchPayments
-        )
+        !matches!(req, Request::Health | Request::Doctor | Request::DaemonEnv)
     }
 
     /// Background task that locks every unlocked wallet after
@@ -2458,9 +2413,1096 @@ mod server {
             }
             drop(wallets);
             *state.active.write().await = None;
-            // Active GSP session belonged to one of those wallets; drop it.
-            *state.session.write().await = None;
         }
+    }
+
+    /// How many blocks one scan tick will read.
+    ///
+    /// A wallet that has been shut for a week has a lot to catch up on, and
+    /// reading it in one go would hold the runtime and the node for minutes.
+    /// Bounded work per tick means it catches up steadily and stays responsive
+    /// while it does.
+    const SCAN_BATCH_BLOCKS: u32 = 50;
+
+    /// How far back a reorg is looked for before giving up.
+    ///
+    /// Deeper than any reorg this chain has seen. If the fork is further back
+    /// than this the scanner says so rather than guessing — a bookmark that
+    /// cannot be reconciled is a thing to report, not to paper over.
+    const REORG_SEARCH_DEPTH: u32 = 100;
+
+    /// Read new blocks and record what they did to the wallet.
+    ///
+    /// # What this replaces
+    ///
+    /// The operator's GSP watched the chain and pushed what it found, which
+    /// meant giving somebody a scan key and believing the answer. This asks
+    /// the wallet's own node instead. The cost is latency — a payment appears
+    /// within a tick rather than the instant it is relayed — and the gain is
+    /// that nobody else needs to know the wallet is watching.
+    async fn block_scan_task(state: Arc<DaemonState>) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            loop {
+                match scan_new_blocks(&state).await {
+                    Ok(0) => break,
+                    // A full batch means there is more waiting. Go straight
+                    // round again rather than sleeping: a wallet restored from
+                    // a year ago has fifty thousand blocks to read, and doing
+                    // that at one batch per tick would take most of a day.
+                    // Idle, this still costs nothing — the first pass returns
+                    // zero and the loop ends.
+                    Ok(n) if n >= SCAN_BATCH_BLOCKS => continue,
+                    Ok(n) => {
+                        tracing::debug!(blocks = n, "block scan caught up");
+                        break;
+                    }
+                    // A node that is down, syncing or mid-restart is the common
+                    // case and not worth an error line every twenty seconds.
+                    // The status header already says the node is unreachable.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "block scan tick did not complete");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One pass of the scanner. Returns how many blocks it read.
+    ///
+    /// Does nothing at all without an unlocked wallet — deriving the scripts
+    /// to match against needs the keys, and there is no useful work to do
+    /// while the wallet is locked.
+    async fn scan_new_blocks(state: &Arc<DaemonState>) -> Result<u32, String> {
+        let Some(ours) = own_script_pubkeys(state).await else {
+            return Ok(0);
+        };
+        // The Ghost ID's scan and spend keys. A silent payment lands on a key
+        // derived from these rather than on any address the wallet published,
+        // so `ours` above cannot find one.
+        let ghost_keys = with_active_wallet(state, |_, ks| {
+            ks.ghost_keys().map_err(|e| format!("ghost keys: {e}"))
+        })
+        .await
+        .ok();
+        let Some(rpc) = state.build_ghostd_rpc().await else {
+            return Ok(0);
+        };
+        let rpc = Arc::new(rpc);
+
+        let tip = {
+            let rpc = rpc.clone();
+            tokio::task::spawn_blocking(move || rpc.get_block_count())
+                .await
+                .map_err(|e| format!("join: {e}"))?
+                .map_err(|e| format!("get_block_count: {e}"))? as u32
+        };
+
+        let mut bookmark = scan_state_for(state).await?;
+
+        // Where a wallet that has never scanned begins.
+        //
+        // Its birth height when it has one: a wallet created here recorded the
+        // tip, and a restored one recorded whatever its owner said. Reading
+        // forward from there rebuilds the history.
+        //
+        // Otherwise the tip — not genesis. Reading the whole chain to find a
+        // wallet that may have no history at all is hours of work for, usually,
+        // nothing, and the wallet cannot tell the difference between "restored
+        // from years ago" and "made this morning" unless it is told. Coins that
+        // arrived before this point are not lost from view — the balance and
+        // the UTXO list scan the entire UTXO set — they are absent from the
+        // *history*, which is a narrower claim and a stated one.
+        let Some(point) = bookmark.point().cloned() else {
+            let birth = wallet_meta_for(state)
+                .await
+                .ok()
+                .and_then(|m| m.birth_height);
+            let start = birth.unwrap_or(tip).min(tip);
+            // One before the start, because the loop below scans from
+            // `from + 1`: the birth block itself can hold the first payment.
+            let anchor = start.saturating_sub(1);
+            let hash = block_hash_at(&rpc, anchor).await?;
+            bookmark
+                .set(anchor, hash)
+                .map_err(|e| format!("scan state write: {e}"))?;
+            match birth {
+                Some(b) => tracing::info!(
+                    birth_height = b,
+                    tip,
+                    behind = tip.saturating_sub(b),
+                    "block scanner rebuilding history from the wallet's birth height"
+                ),
+                None => tracing::info!(
+                    height = tip,
+                    "block scanner started watching from the tip — this wallet has no \
+                     recorded birth height, so nothing before now will appear in its history"
+                ),
+            }
+            return Ok(0);
+        };
+
+        // Is the chain we read still the chain that exists?
+        let mut from = point.height;
+        if block_hash_at(&rpc, point.height).await? != point.hash {
+            let mut fork = None;
+            let floor = point.height.saturating_sub(REORG_SEARCH_DEPTH);
+            for h in (floor..point.height).rev() {
+                // Walking back to a height both chains agree on. The first
+                // agreement is the fork point; everything above it was read
+                // from blocks that are no longer in the chain.
+                if let Some(known) = recorded_hash_at(state, h).await {
+                    if block_hash_at(&rpc, h).await? == known {
+                        fork = Some(h);
+                        break;
+                    }
+                }
+            }
+            let restart = fork.unwrap_or(floor);
+            let n = {
+                let hpath = wallet_history_path(state).await?;
+                let hlock = store_lock(state, &hpath);
+                let _hguard = hlock.lock().await;
+                let mut history = history_store_for(state).await?;
+                history
+                    .unconfirm_from(restart + 1)
+                    .map_err(|e| format!("history: {e}"))?
+            };
+            tracing::warn!(
+                was = point.height,
+                restart_from = restart,
+                unconfirmed = n,
+                "chain reorganised under the scanner; rescanning"
+            );
+            from = restart;
+        }
+
+        if from >= tip {
+            return Ok(0);
+        }
+        let end = tip.min(from + SCAN_BATCH_BLOCKS);
+        // History is opened per write, not held across the batch. Each
+        // iteration below awaits several RPC round-trips, and a store held
+        // open across them keeps a snapshot that predates any payment made
+        // meanwhile — flushing it erases that payment. `record` merges on
+        // txid, so re-opening per write is also what makes the merge see
+        // what the other writer left.
+        for height in (from + 1)..=end {
+            let hash = block_hash_at(&rpc, height).await?;
+            let block = {
+                let rpc = rpc.clone();
+                let h = hash.clone();
+                tokio::task::spawn_blocking(move || rpc.get_block_with_prevouts(&h))
+                    .await
+                    .map_err(|e| format!("join: {e}"))?
+                    .map_err(|e| format!("getblock {height}: {e}"))?
+            };
+            // Silent payments first: a detection is also money arriving, and
+            // recording it as history below keeps one story rather than two.
+            if let Some(keys) = ghost_keys.as_ref() {
+                let mut found = Vec::new();
+                for (txid, ephemeral, outputs) in
+                    wraith_wallet_core::block_scan::candidates_in_block(&block)
+                {
+                    match wraith_wallet_core::candidate_scan::scan_candidate(
+                        keys,
+                        &ephemeral,
+                        &outputs,
+                        &txid,
+                        Some(height),
+                    ) {
+                        Ok(hits) => found.extend(hits),
+                        // A malformed announcement is somebody else's problem,
+                        // not a reason to stop scanning the chain.
+                        Err(e) => tracing::debug!(txid = %txid, error = %e, "candidate skipped"),
+                    }
+                }
+                if !found.is_empty() {
+                    let credited: i64 = found
+                        .iter()
+                        .filter_map(|d| d.amount_sats)
+                        .fold(0i64, |a, v| a.saturating_add(v as i64));
+                    let txid = found[0].txid.clone();
+                    let n = record_detections(state, found).await?;
+                    if n > 0 {
+                        tracing::info!(height, coins = n, "silent payment detected");
+                        record_history(
+                            state,
+                            wraith_wallet_core::history_store::HistoryEntry {
+                                txid,
+                                at: block.time,
+                                block_height: Some(height),
+                                amount_sats: Some(credited),
+                                // The sender paid the fee; the receiver of a
+                                // silent payment has no way to know what it was
+                                // and no reason to be charged for it on paper.
+                                fee_sats: None,
+                                kind: "receive".to_string(),
+                                memo: None,
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            for m in wraith_wallet_core::block_scan::scan_block(&block, &ours) {
+                record_history(
+                    state,
+                    wraith_wallet_core::history_store::HistoryEntry {
+                        amount_sats: Some(m.net_sats()),
+                        txid: m.txid,
+                        at: m.time,
+                        block_height: Some(m.height as u32),
+                        fee_sats: m.fee_sats,
+                        kind: if m.is_incoming { "receive" } else { "send" }.to_string(),
+                        // The scanner cannot see a memo. `record` merges, so
+                        // `None` here leaves any memo already recorded alone.
+                        memo: None,
+                    },
+                )
+                .await?;
+            }
+            // Advanced per block, not per batch: an interrupted catch-up
+            // resumes where it stopped instead of re-reading from the start.
+            bookmark
+                .set(height, hash)
+                .map_err(|e| format!("scan state write: {e}"))?;
+        }
+        Ok(end - from)
+    }
+
+    /// The hash the node reports at `height`.
+    async fn block_hash_at(
+        rpc: &Arc<wraith_wallet_core::ghostd::GhostdRpc>,
+        height: u32,
+    ) -> Result<String, String> {
+        let rpc = rpc.clone();
+        tokio::task::spawn_blocking(move || rpc.get_block_hash(height as u64))
+            .await
+            .map_err(|e| format!("join: {e}"))?
+            .map_err(|e| format!("get_block_hash {height}: {e}"))
+    }
+
+    /// The hash the bookmark holds for `height`, if it is the bookmarked one.
+    ///
+    /// Only one height is remembered, so the reorg walk can confirm agreement
+    /// at exactly that point and otherwise falls back to rescanning the search
+    /// depth — which is correct, just more work.
+    async fn recorded_hash_at(state: &Arc<DaemonState>, height: u32) -> Option<String> {
+        let bookmark = scan_state_for(state).await.ok()?;
+        let p = bookmark.point()?;
+        (p.height == height).then(|| p.hash.clone())
+    }
+
+    /// The coordinator election for the current epoch, verified.
+    ///
+    /// # Where it comes from, and what that costs
+    ///
+    /// A pool node publishes the draw at `/api/v1/pool/coordinator`. The
+    /// wallet used to reach that through Ghost Pay, precisely so it never
+    /// spoke to the pool itself; with the operator gone the choice is between
+    /// asking a pool directly and not rotating coordinators at all. A single
+    /// hard-coded coordinator URL defeats the point of the election, which
+    /// exists so coordination moves across the qualified set instead of
+    /// settling on whoever the wallet was shipped pointing at.
+    ///
+    /// So it asks, and pays for it in two ways that are worth naming:
+    ///
+    /// * The pool learns this IP asked. Route it through Tor if that matters —
+    ///   the proxy is used when one is configured.
+    /// * The pool could learn *when* somebody is about to mix, if the ask
+    ///   happened per mix. It does not: the result is cached for the whole
+    ///   epoch (144 blocks, about a day), so the number of asks stops tracking
+    ///   the number of mixes.
+    ///
+    /// # What is checked
+    ///
+    /// The draw is recomputed from the beacon and roster published beside it,
+    /// and the beacon is re-derived from the anchor block's hash **as the
+    /// wallet's own node reports it**. A pool that names itself every seat is
+    /// refused (#697).
+    ///
+    /// ⚠ The roster is still trusted. The published seat list must follow from
+    /// the roster, but nothing here proves the roster is the real qualified
+    /// set — a pool that omits honest candidates produces a self-consistent
+    /// election over a subset it prefers. Closing that needs the qualified set
+    /// to come from consensus, and it cannot come from the mesh node-list
+    /// checkpoint: that one carries *public-mining* nodes and their stratum
+    /// ports, while this draws from *coordinator*-opted-in nodes. ghost-pool
+    /// builds the coordinator roster from live mesh state and says so —
+    /// "the roster comes from live mesh state, which is the defect this value
+    /// exposes rather than repairs" — so two nodes can legitimately disagree,
+    /// and `roster_commitment` exists to make that visible. A trustless roster
+    /// needs its own BFT-finalised checkpoint on the pool side, with a height
+    /// gate and a fleet roll. Until then this is chain-anchored, not
+    /// trustless, and the difference is the roster.
+    async fn verified_election(state: &Arc<DaemonState>) -> Option<serde_json::Value> {
+        let pool_url = state.pool_url.read().await.clone()?;
+
+        // Which epoch we are in, from our own node. Asking the pool would let
+        // it choose which epoch it answers for.
+        let tip = current_tip(state).await?;
+        let epoch = wraith_protocol::epoch_for_height(tip as u64);
+
+        if let Some((cached_epoch, view)) = state.election_cache.read().await.as_ref() {
+            if *cached_epoch == epoch {
+                return Some(view.clone());
+            }
+        }
+
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+        if let Some(proxy) = state.tor_proxy.as_deref() {
+            match reqwest::Proxy::all(proxy) {
+                Ok(p) => builder = builder.proxy(p),
+                // Refusing rather than falling back to a direct request: the
+                // user asked for Tor, and quietly revealing their IP instead
+                // is the one outcome they were trying to avoid.
+                Err(e) => {
+                    tracing::warn!(error = %e, "tor proxy unusable; not asking the pool");
+                    return None;
+                }
+            }
+        }
+        let client = builder.build().ok()?;
+        let url = format!("{}/api/v1/pool/coordinator", pool_url.trim_end_matches('/'));
+        let election: serde_json::Value = match client.get(&url).send().await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "election view was not JSON");
+                    return None;
+                }
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "could not reach the pool for the election");
+                return None;
+            }
+        };
+
+        if election.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+            tracing::debug!("the pool has coordinator elections turned off");
+            return None;
+        }
+
+        // Pin the beacon to the chain. Verifying the draw against the beacon
+        // published beside it only proves internal consistency; the anchor
+        // block's hash is a fact the pool does not get to state.
+        let (anchor_height, _) = crate::coordinator_resolve::beacon_anchor_expectation(&election)?;
+        let rpc = state.build_ghostd_rpc().await?;
+        let anchor_hash = tokio::task::spawn_blocking(move || rpc.get_block_hash(anchor_height))
+            .await
+            .ok()?
+            .ok()?;
+        if !crate::coordinator_resolve::beacon_matches_chain(&election, &anchor_hash) {
+            tracing::warn!(
+                anchor_height,
+                "the published election beacon does not follow from the anchor block — \
+                 refusing the election"
+            );
+            return None;
+        }
+
+        // A draw over one candidate is not a draw. Said plainly, because a
+        // wallet that mixes through a single-node "election" has the privacy
+        // of not mixing at all and no way to tell (#708).
+        if election.get("degraded").and_then(|v| v.as_bool()) == Some(true) {
+            tracing::warn!(
+                roster_size = election.get("roster_size").and_then(|v| v.as_u64()),
+                "the coordinator election is degraded — too few candidates for the draw \
+                 to mean anything"
+            );
+        }
+
+        *state.election_cache.write().await = Some((epoch, election.clone()));
+        Some(election)
+    }
+
+    /// Derive a Lock's four lanes from the supplied keys plus the active
+    /// wallet's owner key.
+    ///
+    /// One definition, deliberately. `GhostLockLanes` and
+    /// `GhostLockRoundDestination` must not be able to derive different
+    /// addresses for the same Lock — a round paying into an address the
+    /// balance view does not watch would look exactly like a lost deposit.
+    async fn build_lock_account(
+        state: &Arc<DaemonState>,
+        backup_pubkey: &str,
+        heir_pubkey: &str,
+        quorum_pubkey: &str,
+        inherit_height: u32,
+        anchor_height: u32,
+        bip86_index: Option<u32>,
+    ) -> Result<wraith_wallet_core::ghost_lock_account::GhostLockAccount, String> {
+        use bitcoin::secp256k1::Secp256k1;
+        use bitcoin::XOnlyPublicKey;
+        use std::str::FromStr;
+        use wraith_wallet_core::ghost_lock_account::{GhostLockAccount, LockKeys};
+
+        fn xonly(label: &str, hexstr: &str) -> Result<XOnlyPublicKey, String> {
+            XOnlyPublicKey::from_str(hexstr.trim())
+                .map_err(|e| format!("{label} is not an x-only public key: {e}"))
+        }
+
+        // The owner key comes from the active keystore; the backup, heir and
+        // quorum keys are supplied. The two MuSig2 aggregates are DERIVED
+        // below, not supplied — BIP-327 key aggregation is a deterministic
+        // function of the public keys, so no ceremony and no other party
+        // online is needed to CREATE a Lock. Interaction is only required to
+        // SIGN a key-path spend.
+        let idx = bip86_index.unwrap_or(0);
+        let network = state.network;
+        let owner = with_active_wallet(state, move |_, ks| {
+            let path = lock_owner_path(idx);
+            let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
+            let secp = Secp256k1::new();
+            let sk = bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
+                .map_err(|e| format!("owner key: {e}"))?;
+            Ok::<XOnlyPublicKey, String>(
+                bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk)
+                    .x_only_public_key()
+                    .0,
+            )
+        })
+        .await?;
+
+        let backup = xonly("backup_pubkey", backup_pubkey)?;
+        let quorum = xonly("quorum_pubkey", quorum_pubkey)?;
+
+        // Derived here rather than accepted from the caller. BIP-327
+        // aggregation is deterministic, so both sides reach the same answer
+        // independently — and a pasted aggregate that did not match its parts
+        // would build a Lock whose key path nobody can satisfy, with nothing
+        // noticing until a spend failed.
+        let owner_backup_aggregate = ghost_lock::aggregate(&[owner, backup])
+            .map_err(|e| format!("owner+backup aggregate: {e}"))?;
+        let owner_quorum_aggregate = ghost_lock::aggregate(&[owner, quorum])
+            .map_err(|e| format!("owner+quorum aggregate: {e}"))?;
+
+        let keys = LockKeys {
+            owner,
+            backup,
+            heir: xonly("heir_pubkey", heir_pubkey)?,
+            owner_backup_aggregate,
+            owner_quorum_aggregate,
+            quorum,
+        };
+        let secp = Secp256k1::verification_only();
+        GhostLockAccount::build(&secp, &keys, network, anchor_height, inherit_height)
+            .map_err(|e| format!("lock: {e}"))
+    }
+
+    fn unhex32(label: &str, s: &str) -> Result<[u8; 32], String> {
+        let raw = hex::decode(s.trim()).map_err(|e| format!("{label} is not hex: {e}"))?;
+        raw.try_into()
+            .map_err(|_| format!("{label} must be 32 bytes"))
+    }
+
+    fn unhex66(label: &str, s: &str) -> Result<[u8; 66], String> {
+        let raw = hex::decode(s.trim()).map_err(|e| format!("{label} is not hex: {e}"))?;
+        raw.try_into()
+            .map_err(|_| format!("{label} must be 66 bytes"))
+    }
+
+    fn lock_spend_summary(s: &ghost_lock::airgap::SpendSummary) -> LockSpendSummary {
+        LockSpendSummary {
+            input_index: s.input_index,
+            input_sats: s.input_sats,
+            input_address: s.input_address.clone(),
+            outputs: s
+                .outputs
+                .iter()
+                .map(|o| LockSpendOutput {
+                    address: o.address.clone(),
+                    sats: o.sats,
+                })
+                .collect(),
+            fee_sats: s.fee_sats,
+            input_count: s.input_count,
+        }
+    }
+
+    /// Load a remembered Lock, derive its lanes, and resolve the named lane.
+    ///
+    /// Shares `build_lock_account` with the balance view and the round
+    /// destination, so all three derive one Lock's addresses identically.
+    async fn lock_lane_for(
+        state: &Arc<DaemonState>,
+        lock_id: &str,
+        lane: &str,
+    ) -> Result<
+        (
+            wraith_wallet_core::ghost_lock_account::GhostLockAccount,
+            wraith_wallet_core::ghost_lock_account::LaneKind,
+            wraith_wallet_core::ghost_lock_store::StoredLock,
+        ),
+        String,
+    > {
+        let kind = parse_lane(lane)?;
+        let (account, record) = lock_account_for(state, lock_id).await?;
+        Ok((account, kind, record))
+    }
+
+    /// Rebuild one remembered Lock's four lanes.
+    async fn lock_account_for(
+        state: &Arc<DaemonState>,
+        lock_id: &str,
+    ) -> Result<
+        (
+            wraith_wallet_core::ghost_lock_account::GhostLockAccount,
+            wraith_wallet_core::ghost_lock_store::StoredLock,
+        ),
+        String,
+    > {
+        let record = {
+            let store = ghost_lock_store_for(state).map_err(|e| format!("lock store: {e}"))?;
+            store
+                .get(lock_id)
+                .cloned()
+                .ok_or_else(|| format!("no remembered Lock '{lock_id}'"))?
+        };
+        let account = build_lock_account(
+            state,
+            &record.backup_pubkey,
+            &record.heir_pubkey,
+            &record.quorum_pubkey,
+            record.inherit_height,
+            record.anchor_height,
+            Some(record.bip86_index),
+        )
+        .await?;
+        Ok((account, record))
+    }
+
+    /// Which compartment a coin belongs to, across every remembered Lock.
+    ///
+    /// `None` when the script matches no lane of any Lock — a loose wallet
+    /// coin, which the compartment rules do not speak about.
+    ///
+    /// A Lock whose lanes cannot be rebuilt right now (wallet locked, record
+    /// malformed) is skipped rather than reported as "not a lane". Treating an
+    /// unknown as a refusal would block ordinary mixing whenever a Lock is
+    /// unreadable, and treating it as Private would be a claim we cannot
+    /// support; skipping keeps this a best-effort classifier, with the
+    /// authoritative recount still ahead at `inspect`.
+    async fn compartment_of_script(
+        state: &Arc<DaemonState>,
+        scriptpubkey_hex: &str,
+    ) -> Option<ghost_lock::Compartment> {
+        lane_of_script(state, scriptpubkey_hex)
+            .await
+            .map(|(_, kind)| kind.compartment())
+    }
+
+    /// Which Lock and lane a coin sits in, if any.
+    ///
+    /// The lane matters and not just the compartment: two coins in different
+    /// lanes of one Lock are in the same compartment, and spending them
+    /// together still collapses the separation the lanes exist to create.
+    async fn lane_of_script(
+        state: &Arc<DaemonState>,
+        scriptpubkey_hex: &str,
+    ) -> Option<(String, wraith_wallet_core::ghost_lock_account::LaneKind)> {
+        let want = scriptpubkey_hex.trim();
+        let ids: Vec<String> = {
+            let store = ghost_lock_store_for(state).ok()?;
+            store.list().iter().map(|l| l.lock_id.clone()).collect()
+        };
+        for id in ids {
+            let Ok((account, _)) = lock_account_for(state, &id).await else {
+                continue;
+            };
+            for built in &account.lanes {
+                let spk = hex::encode(built.lane.address.script_pubkey().as_bytes());
+                if spk.eq_ignore_ascii_case(want) {
+                    return Some((id, built.kind));
+                }
+            }
+        }
+        None
+    }
+
+    /// Refuse a Lock spend that reaches outside the lane being signed.
+    ///
+    /// `check_spend_together` states the Cash boundary. This states the
+    /// stricter rule the lanes actually need, and it rests on the same
+    /// sentence that rule is built on: spending two coins together proves they
+    /// share an owner. That is true of any two coins, not only of a Cash coin
+    /// beside a private one.
+    ///
+    /// A transaction spending a Savings coin beside a Spending coin collapses
+    /// two lanes into one, even though both are `Compartment::Private`. Beside
+    /// an ordinary account-1'-less wallet coin it ties the lane to the public
+    /// wallet. Neither is caught by the compartment rule, and both are exactly
+    /// the linkage the Lock exists to prevent.
+    ///
+    /// So every input must sit in the same lane of the same Lock as the one
+    /// being signed. An input whose previous output the PSBT does not carry is
+    /// refused too: it cannot be shown to be in the lane, and for a rule about
+    /// what a signature reveals, unproven is not good enough.
+    async fn refuse_if_spend_leaves_the_lane(
+        state: &Arc<DaemonState>,
+        psbt: &bitcoin::psbt::Psbt,
+        lock_id: &str,
+        lane: wraith_wallet_core::ghost_lock_account::LaneKind,
+    ) -> Option<String> {
+        for i in 0..psbt.inputs.len() {
+            let Some(txout) = psbt_input_value(psbt, i) else {
+                return Some(format!(
+                    "input {i} carries no previous output, so it cannot be shown to be \
+                     in the {lane:?} lane; refusing rather than signing a transaction \
+                     whose other inputs are unknown"
+                ));
+            };
+            let spk = hex::encode(txout.script_pubkey.as_bytes());
+            match lane_of_script(state, &spk).await {
+                Some((id, kind)) if id == lock_id && kind == lane => {}
+                Some((id, kind)) => {
+                    return Some(format!(
+                        "input {i} is in the {kind:?} lane of Lock {id}, not the {lane:?} \
+                         lane of Lock {lock_id}; spending them together proves one owner \
+                         and collapses the separation the lanes exist to create"
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "input {i} is not in any remembered Lock lane; spending it \
+                         alongside a {lane:?} coin ties that lane to the rest of the \
+                         wallet"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Every check a Lock spend must pass before a signature exists.
+    ///
+    /// One place, because there are three handlers that sign an input of a
+    /// PSBT the caller supplied — quorum co-sign, escape spend, and the
+    /// air-gapped key-path spend — and a rule applied to two of them is a rule
+    /// with a way around it.
+    async fn refuse_unsafe_lock_spend(
+        state: &Arc<DaemonState>,
+        psbt_str: &str,
+        lock_id: &str,
+        lane: &str,
+    ) -> Option<String> {
+        let kind = match parse_lane(lane) {
+            Ok(k) => k,
+            Err(e) => return Some(e),
+        };
+        let parsed = match wraith_wallet_core::psbt::decode_psbt(psbt_str) {
+            Ok((p, _)) => p,
+            Err(e) => return Some(format!("decode psbt: {e}")),
+        };
+        if let Some(reason) = refuse_if_spend_links_compartments(state, &parsed).await {
+            return Some(reason);
+        }
+        refuse_if_spend_leaves_the_lane(state, &parsed, lock_id, kind).await
+    }
+
+    /// Refuse a spend that would link two compartments.
+    ///
+    /// Rule 3 of `ghost_lock::compartment`, which had no callers at all
+    /// outside its own tests. It is reachable here because the Lock signing
+    /// handlers sign one input of a PSBT the **caller** built — so the caller
+    /// chooses the other inputs. A transaction spending a Cash coin alongside
+    /// a private-lane coin publishes the link between them, undoing the
+    /// separation the lanes exist to create, in a transaction this wallet
+    /// signed itself.
+    ///
+    /// Inputs that belong to no Lock lane are not counted. The rule is stated
+    /// over compartments, and a loose wallet coin is not in one. That leaves a
+    /// real gap — spending a Savings coin beside an ordinary account-0' coin
+    /// still links Savings to the public wallet — but closing it means
+    /// deciding that non-Lock coins are Cash-like, which is a policy choice
+    /// this function is not the place to make silently.
+    async fn refuse_if_spend_links_compartments(
+        state: &Arc<DaemonState>,
+        psbt: &bitcoin::psbt::Psbt,
+    ) -> Option<String> {
+        let mut compartments = Vec::new();
+        for i in 0..psbt.inputs.len() {
+            let Some(txout) = psbt_input_value(psbt, i) else {
+                continue;
+            };
+            let spk = hex::encode(txout.script_pubkey.as_bytes());
+            if let Some(c) = compartment_of_script(state, &spk).await {
+                compartments.push(c);
+            }
+        }
+        ghost_lock::check_spend_together(&compartments)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// Refuse a coin the compartment rule keeps out of rounds.
+    ///
+    /// Rule 1 of `ghost_lock::compartment`, which until now was computed only
+    /// to colour a lane in the UI and never actually enforced. A Cash coin is
+    /// public by design, and mixing one re-links the strangers it is mixed
+    /// with — their problem, not the owner's, which is why the wallet must not
+    /// leave it to the user.
+    ///
+    /// Enforceable only since Lock keys moved off the plain wallet's account:
+    /// while the Cash lane was the wallet's own receive address, this would
+    /// have refused every ordinary coin.
+    async fn refuse_if_not_round_eligible(
+        state: &Arc<DaemonState>,
+        scriptpubkey_hex: &str,
+    ) -> Option<String> {
+        let compartment = compartment_of_script(state, scriptpubkey_hex).await?;
+        ghost_lock::check_round_eligible(compartment)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// Every receive address the wallet would use, up to `scan_max`.
+    ///
+    /// Shared by the UTXO list and the balance, so the two cannot be computed
+    /// over different address sets and disagree about how much money there is.
+    async fn derived_receive_addresses(
+        state: &Arc<DaemonState>,
+        scan_max: u32,
+    ) -> Result<Vec<(u32, String, String)>, String> {
+        let network = state.network;
+        with_active_wallet(state, move |_, ks| {
+            let mut out = Vec::with_capacity(scan_max as usize);
+            for i in 0..scan_max {
+                let a = light::receive_address(ks, i, network)
+                    .map_err(|e| format!("derive index {i}: {e}"))?;
+                let spk = hex::encode(a.script_pubkey().as_bytes());
+                out.push((i, a.to_string(), spk));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// The wallet's on-chain balance, from the configured chain backend.
+    ///
+    /// Settled and unsettled are summed separately and never added together:
+    /// money that can still vanish must not read as money you have. That is
+    /// the same rule the Lock lanes follow, and for the same reason.
+    async fn l1_balance(
+        state: &Arc<DaemonState>,
+        scan_max: u32,
+    ) -> Result<(u64, u64, u32), String> {
+        let pairs = derived_receive_addresses(state, scan_max).await?;
+        let addresses: Vec<String> = pairs.into_iter().map(|(_, a, _)| a).collect();
+        // Scanned at zero confirmations, then split here — one round trip
+        // gives both figures, where two scans could disagree with each other.
+        let scan = state
+            .chain()
+            .await
+            .scan_utxos(&addresses, 0)
+            .await
+            .map_err(|e| format!("scan: {e}"))?;
+        let mut confirmed = 0u64;
+        let mut unconfirmed = 0u64;
+        for u in &scan.utxos {
+            if u.confirmations == 0 {
+                unconfirmed = unconfirmed.saturating_add(u.amount_sats);
+            } else {
+                confirmed = confirmed.saturating_add(u.amount_sats);
+            }
+        }
+        Ok((confirmed, unconfirmed, scan.chain_height))
+    }
+
+    /// The wallet's spendable outputs, from the node.
+    ///
+    /// Shares its derivation and scan with [`l1_balance`], so the balance and
+    /// the coin list can never disagree about which coins exist — they are two
+    /// readings of one answer, not two questions asked separately.
+    async fn l1_utxo_entries(
+        state: &Arc<DaemonState>,
+        scan_max: u32,
+        min_confirmations: u32,
+    ) -> Result<(Vec<LightUtxoEntry>, u64), String> {
+        let pairs = derived_receive_addresses(state, scan_max).await?;
+        let addresses: Vec<String> = pairs.into_iter().map(|(_, a, _)| a).collect();
+        let scan = state
+            .chain()
+            .await
+            .scan_utxos(&addresses, min_confirmations)
+            .await
+            .map_err(|e| format!("scan: {e}"))?;
+        let mut total = 0u64;
+        let mut out = Vec::with_capacity(scan.utxos.len());
+        for u in scan.utxos {
+            total = total.saturating_add(u.amount_sats);
+            out.push(LightUtxoEntry {
+                txid: u.txid,
+                vout: u.vout,
+                amount_sats: u.amount_sats,
+                confirmations: u.confirmations,
+                // Every address the wallet derives is BIP86 taproot; the scan
+                // only looked at those, so anything it returned is one.
+                script_type: "p2tr".to_string(),
+                // The scan filtered on confirmations already, and these are
+                // the wallet's own single-key outputs.
+                spendable: true,
+            });
+        }
+        Ok((out, total))
+    }
+
+    /// Transaction history from the wallet's own record, confirmed against the
+    /// node.
+    ///
+    /// # What this can and cannot show
+    ///
+    /// Both directions, now that the block scanner runs: what the wallet sent,
+    /// recorded at broadcast, and what arrived, recorded when a block carrying
+    /// it was read.
+    ///
+    /// The one gap is what happened before the scanner started watching. It
+    /// begins at the tip on first run rather than reading the chain from
+    /// genesis, so a restored wallet's older payments are absent from the
+    /// history. They are not absent from the wallet: the balance and the UTXO
+    /// list scan the whole UTXO set and see every coin. It is a narrower claim
+    /// than it used to be, and a stated one.
+    async fn l1_history(state: &Arc<DaemonState>, limit: u32, offset: u32) -> Response {
+        let store = match history_store_for(state).await {
+            Ok(s) => s,
+            Err(message) => return Response::Error(ErrorResponse { message }),
+        };
+        let all = store.list();
+        let total_count = all.len() as u32;
+        let page: Vec<_> = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        let chain = state.chain().await;
+        // One tip read for the whole page. Confirmations are derived from the
+        // height the scanner recorded, so a settled history costs a single
+        // round trip rather than one per row.
+        let tip = chain.status().await.ok().and_then(|s| s.chain_height);
+
+        let mut transactions = Vec::with_capacity(page.len());
+        for e in page {
+            let confirmations = match (e.block_height, tip) {
+                // Inclusive of the block it landed in: an entry in the tip
+                // block has one confirmation, not zero. That off-by-one is the
+                // difference between "spendable" and "invisible".
+                (Some(h), Some(t)) if t >= h as u64 => Some((t - h as u64 + 1) as u32),
+                // Mined deeper than the tip we just read means the tip moved
+                // backwards under us — a reorg the scanner has not caught up
+                // with yet. Unknown is the honest answer for one tick.
+                (Some(_), Some(_)) => None,
+                (Some(_), None) => None,
+                // Never seen in a block. Ask the node whether it at least
+                // holds the transaction, which distinguishes "in the mempool"
+                // from "the node has never heard of this".
+                (None, _) => chain.tx_confirmations(&e.txid).await.unwrap_or(None),
+            };
+            transactions.push(LightHistoryEntry {
+                txid: e.txid,
+                block_height: e.block_height,
+                timestamp: e.at,
+                amount_sats: e.amount_sats,
+                fee_sats: e.fee_sats,
+                tx_type: e.kind,
+                confirmations,
+                memo: e.memo,
+            });
+        }
+        Response::LightHistory(LightHistoryResponse {
+            transactions,
+            total_count,
+        })
+    }
+
+    /// One lane-name parser, so every caller accepts the same words.
+    fn parse_lane(lane: &str) -> Result<wraith_wallet_core::ghost_lock_account::LaneKind, String> {
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+        match lane.trim().to_ascii_lowercase().as_str() {
+            "savings" => Ok(LaneKind::Savings),
+            "spending" => Ok(LaneKind::Spending),
+            "cash" => Ok(LaneKind::Cash),
+            "investments" => Ok(LaneKind::Investments),
+            other => Err(format!(
+                "unknown lane '{other}' (try savings, spending, cash, investments)"
+            )),
+        }
+    }
+
+    /// Resolve a lane and the escape its owner can take.
+    ///
+    /// Refuses the lanes with no owner escape by name. Cash has no leaves at
+    /// all — it is the owner's key on the key path, so there is nothing to
+    /// escape from.
+    async fn lock_escape_for(
+        state: &Arc<DaemonState>,
+        lock_id: &str,
+        lane: &str,
+    ) -> Result<
+        (
+            wraith_wallet_core::ghost_lock_account::GhostLockAccount,
+            wraith_wallet_core::ghost_lock_account::LaneKind,
+            wraith_wallet_core::ghost_lock_store::StoredLock,
+            ghost_lock::escape::OwnerEscape,
+        ),
+        String,
+    > {
+        use ghost_lock::escape::OwnerEscape;
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+
+        // Resolve the lane BEFORE loading the Lock. Both orders are correct;
+        // only this one is useful. Asking about Cash with an unknown lock_id
+        // should say Cash has no escape, not that the Lock is missing — the
+        // second answer sends someone looking for the wrong problem.
+        let kind = parse_lane(lane)?;
+        let escape = match kind {
+            LaneKind::Savings => OwnerEscape::SavingsRecovery,
+            LaneKind::Spending => OwnerEscape::SpendingExit,
+            LaneKind::Investments => OwnerEscape::InvestmentsRecall,
+            LaneKind::Cash => {
+                return Err(
+                    "Cash has no escape leaf: it already spends with your key alone, so \
+                     there is nothing to wait for"
+                        .into(),
+                )
+            }
+        };
+        let (account, kind, record) = lock_lane_for(state, lock_id, lane).await?;
+        Ok((account, kind, record, escape))
+    }
+
+    /// Decode a base64 PSBT and pull out every prevout.
+    ///
+    /// Every one, because a Taproot sighash commits to all of them. A missing
+    /// prevout is refused rather than defaulted: the signature would be over a
+    /// transaction different from the one presented.
+    fn decode_psbt_with_prevouts(
+        psbt_b64: &str,
+    ) -> Result<(bitcoin::psbt::Psbt, Vec<bitcoin::TxOut>), String> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(psbt_b64.trim())
+            .map_err(|e| format!("psbt is not base64: {e}"))?;
+        let psbt = bitcoin::psbt::Psbt::deserialize(&raw).map_err(|e| format!("psbt: {e}"))?;
+        let mut prevouts = Vec::with_capacity(psbt.inputs.len());
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
+                format!(
+                    "input {i} has no witness_utxo, so its value and script are unknown — \
+                     the Taproot sighash commits to every input, so this cannot be signed \
+                     correctly"
+                )
+            })?;
+            prevouts.push(utxo.clone());
+        }
+        Ok((psbt, prevouts))
+    }
+
+    /// Which keys spend a lane by its key path.
+    ///
+    /// Not one answer for the whole Lock: each lane's Taproot internal key is a
+    /// different thing, and signing under the wrong pair produces a signature
+    /// that fails against the address with nothing to say why.
+    ///
+    ///   * **Savings** — MuSig2 of owner + backup. The air-gapped case.
+    ///   * **Spending** — MuSig2 of owner + quorum. Networked.
+    ///   * **Cash** — the owner's key alone. Ordinary single-sig; a MuSig2
+    ///     ceremony here would be two rounds of theatre.
+    ///   * **Investments** — the quorum's key alone. The owner cannot spend it
+    ///     by the key path at all; the owner's route out is the recall leaf.
+    fn lane_cosigners(
+        kind: wraith_wallet_core::ghost_lock_account::LaneKind,
+        owner: bitcoin::XOnlyPublicKey,
+        record: &wraith_wallet_core::ghost_lock_store::StoredLock,
+    ) -> Result<Vec<bitcoin::XOnlyPublicKey>, String> {
+        use std::str::FromStr;
+        use wraith_wallet_core::ghost_lock_account::LaneKind;
+        let parse = |label: &str, hexstr: &str| {
+            bitcoin::XOnlyPublicKey::from_str(hexstr.trim())
+                .map_err(|e| format!("{label} is not an x-only public key: {e}"))
+        };
+        match kind {
+            LaneKind::Savings => Ok(vec![owner, parse("backup_pubkey", &record.backup_pubkey)?]),
+            LaneKind::Spending => Ok(vec![owner, parse("quorum_pubkey", &record.quorum_pubkey)?]),
+            LaneKind::Cash => Err(
+                "Cash spends with your key alone — sign it as an ordinary single-sig input, \
+                 not through a MuSig2 ceremony"
+                    .into(),
+            ),
+            LaneKind::Investments => Err(
+                "Investments spends by the quorum's key alone, so there is no key path for \
+                 you to co-sign; your route out is the recall leaf after its delay"
+                    .into(),
+            ),
+        }
+    }
+
+    /// Derivation path for a Ghost Lock's owner key.
+    ///
+    /// Account `1'`, deliberately not the account the plain wallet receives and
+    /// spends on.
+    ///
+    /// These keys used to share account `0'` with `light receive`, and the Cash
+    /// lane is a bare key-path output for the owner key — so the Cash lane came
+    /// out byte-identical to the wallet's receive address at the same index.
+    /// One coin then appeared in both the wallet's balance and the Lock's
+    /// total, and the compartment rule that a Cash coin must never enter a
+    /// round could not be enforced without refusing every ordinary coin along
+    /// with it.
+    ///
+    /// A Lock coin and a loose coin are now different coins.
+    fn lock_owner_path(index: u32) -> String {
+        // One definition, in `light`, because the ordinary PSBT signer has to
+        // walk this same family to sign a Cash lane input.
+        wraith_wallet_core::light::lock_owner_path(index)
+    }
+
+    /// The owner's signing key for a Lock, from the active keystore.
+    async fn lock_owner_seckey(
+        state: &Arc<DaemonState>,
+        bip86_index: u32,
+    ) -> Result<bitcoin::secp256k1::SecretKey, String> {
+        with_active_wallet(state, move |_, ks| {
+            let path = lock_owner_path(bip86_index);
+            let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
+            bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
+                .map_err(|e| format!("owner key: {e}"))
+        })
+        .await
+    }
+
+    /// Attach a finished key-path signature to the PSBT input.
+    ///
+    /// A key-path spend's witness is the signature and nothing else, so this is
+    /// the whole of finalisation for that input.
+    fn attach_key_path_signature(
+        psbt_b64: &str,
+        input_index: u32,
+        sig: &bitcoin::secp256k1::schnorr::Signature,
+    ) -> Result<String, String> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(psbt_b64.trim())
+            .map_err(|e| format!("psbt is not base64: {e}"))?;
+        let mut psbt = bitcoin::psbt::Psbt::deserialize(&raw).map_err(|e| format!("psbt: {e}"))?;
+        let idx = input_index as usize;
+        let input = psbt
+            .inputs
+            .get_mut(idx)
+            .ok_or_else(|| format!("input {idx} does not exist"))?;
+        input.tap_key_sig = Some(bitcoin::taproot::Signature {
+            signature: *sig,
+            sighash_type: bitcoin::TapSighashType::Default,
+        });
+        let mut witness = bitcoin::Witness::new();
+        witness.push(sig.serialize());
+        input.final_script_witness = Some(witness);
+        Ok(base64::engine::general_purpose::STANDARD.encode(psbt.serialize()))
     }
 
     async fn dispatch(line: &str, state: &Arc<DaemonState>) -> Envelope<Response> {
@@ -2495,180 +3537,1091 @@ mod server {
                 Ok(s) => Response::ChainStatus(ChainStatusResponse {
                     backend_version: s.backend_version,
                     network: s.network,
-                    has_keys: s.has_keys,
-                    lock_count: s.lock_count,
-                    active_sessions: s.active_sessions,
                     chain_height: s.chain_height,
                     chain_headers: s.chain_headers,
                     chain_verification_progress: s.chain_verification_progress,
                     chain_initial_block_download: s.chain_initial_block_download,
-                    l2_height: s.l2_height,
-                    l2_epoch: s.l2_epoch,
                 }),
                 Err(e) => Response::Error(ErrorResponse {
                     message: format!("chain: {e}"),
                 }),
             },
-            Request::GspPing => match state.gsp().await.ping().await {
-                Ok(p) => Response::GspPing(GspPingResponse {
-                    server_time: p.server_time,
-                    round_trip_ms: p.round_trip_ms,
-                }),
-                Err(e) => Response::Error(ErrorResponse {
-                    message: format!("gsp: {e}"),
-                }),
-            },
-            Request::GspAuth => match gsp_auth(state).await {
-                Ok(r) => Response::GspAuth(r),
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::GspRegisterScanKey => match gsp_register_scan_key(state).await {
-                Ok((wallet_id, scan_pubkey_hex)) => Response::GspScanKeyRegistered {
-                    wallet_id,
-                    scan_pubkey_hex,
-                },
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::GspSessionStatus => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    Some(s) => {
-                        let snap: SessionStatus = s.handle.snapshot().await;
-                        Response::GspSessionStatus(GspSessionStatusResponse {
-                            have_token: true,
-                            wallet_name: Some(s.wallet_name.clone()),
-                            wallet_id: Some(s.token.wallet_id.0.clone()),
-                            expires_at: Some(s.token.expires_at),
-                            remaining_secs: Some(s.token.remaining_secs()),
-                            phase: Some(phase_label(snap.phase).to_string()),
-                            connect_count: Some(snap.connect_count),
-                            last_error: snap.last_error,
-                        })
-                    }
-                    None => Response::GspSessionStatus(GspSessionStatusResponse {
-                        have_token: false,
-                        wallet_name: None,
-                        wallet_id: None,
-                        expires_at: None,
-                        remaining_secs: None,
-                        phase: None,
-                        connect_count: None,
-                        last_error: None,
-                    }),
-                }
-            }
             Request::ConnectionStatus => {
-                // One probe answers "is ghost-pay reachable" AND supplies the
-                // chain fields. On error we report unreachable rather than
-                // surfacing a Response::Error — the whole point is a header
+                // One probe answers "is the node reachable" AND supplies the
+                // chain fields. An unreachable node is reported as a field
+                // rather than as an error: the point of this call is a header
                 // that says "unreachable" instead of spinning forever.
-                let (
-                    ghost_pay_reachable,
-                    ghost_pay_version,
-                    ghost_pay_error,
-                    chain_height,
-                    chain_headers,
-                    chain_ibd,
-                    l2_height,
-                ) = match state.chain().await.status().await {
-                    Ok(s) => (
-                        true,
-                        Some(s.backend_version),
-                        None,
-                        s.chain_height,
-                        s.chain_headers,
-                        s.chain_initial_block_download,
-                        s.l2_height,
-                    ),
-                    Err(e) => (false, None, Some(format!("{e}")), None, None, None, None),
-                };
+                let node_configured = state.ghostd().await.url.is_some();
+                let (node_reachable, node_version, node_error, chain_height, chain_headers, ibd) =
+                    match state.chain().await.status().await {
+                        Ok(s) => (
+                            true,
+                            Some(s.backend_version),
+                            None,
+                            s.chain_height,
+                            s.chain_headers,
+                            s.chain_initial_block_download,
+                        ),
+                        // With no node configured there is nothing to be
+                        // unreachable, and `NoChain`'s refusal is a setup
+                        // instruction rather than a probe failure — so it is
+                        // not reported as one.
+                        Err(e) => (
+                            false,
+                            None,
+                            node_configured.then(|| format!("{e}")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    };
                 // Same rule the GUI's SyncIndicator uses: verified height has
-                // caught the header tip (or headers unknown) AND bitcoind is
+                // caught the header tip (or headers unknown) AND the node is
                 // out of initial block download.
-                let chain_synced = ghost_pay_reachable
+                let chain_synced = node_reachable
                     && chain_height.is_some()
                     && chain_headers.is_none_or(|h| chain_height.unwrap_or(0) >= h)
-                    && chain_ibd == Some(false);
-                let (gsp_have_token, gsp_phase) = {
-                    let guard = state.session.read().await;
-                    match guard.as_ref() {
-                        Some(s) => {
-                            let snap = s.handle.snapshot().await;
-                            (true, Some(phase_label(snap.phase).to_string()))
-                        }
-                        None => (false, None),
-                    }
-                };
-                let gsp_connected = gsp_phase.as_deref() == Some("authenticated");
+                    && ibd == Some(false);
                 Response::ConnectionStatus(ConnectionStatusResponse {
                     network: network_label(state.network).to_string(),
-                    ghost_pay_reachable,
-                    ghost_pay_version,
-                    ghost_pay_error,
-                    gsp_have_token,
-                    gsp_connected,
-                    gsp_phase,
+                    node_configured,
+                    node_reachable,
+                    node_version,
+                    node_error,
                     chain_height,
                     chain_headers,
                     chain_synced,
-                    l2_height,
                 })
             }
-            Request::LightBalance => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
+            Request::LightBalance => match l1_balance(state, 1024).await {
+                Ok((confirmed, unconfirmed, _height)) => {
+                    Response::LightBalance(LightBalanceResponse {
+                        confirmed_sats: Some(confirmed),
+                        unconfirmed_sats: Some(unconfirmed),
+                        // An operator-side concept with no on-chain meaning.
+                        // `None` says "not applicable" rather than claiming
+                        // nothing is locked.
+                        locked_sats: None,
+                        received_at: Some(now_unix_secs() as i64),
+                    })
+                }
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
+            Request::LightUtxos { min_confirmations } => {
+                match l1_utxo_entries(state, 1024, min_confirmations).await {
+                    Ok((utxos, total_sats)) => {
+                        Response::LightUtxos(LightUtxosResponse { utxos, total_sats })
+                    }
+                    Err(message) => Response::Error(ErrorResponse { message }),
+                }
+            }
+            Request::GhostLockSave {
+                label,
+                backup_pubkey,
+                heir_pubkey,
+                quorum_pubkey,
+                anchor_height,
+                inherit_height,
+                bip86_index,
+            } => {
+                use wraith_wallet_core::ghost_lock_store::StoredLock;
+                // Refuse a key that cannot build a lane, HERE, rather than at
+                // the first operation that needs one.
+                //
+                // Saving is where a person hands over a key they pasted from
+                // somewhere, and it was the one place that never checked. A
+                // malformed pubkey stored happily, reported `created: true`,
+                // and then every `lanes`, `destination`, `escape` and spend on
+                // that Lock failed — with the failure landing far from the
+                // typo that caused it, on a Lock the wallet says it has.
+                let mut bad: Option<String> = None;
+                for (what, key) in [
+                    ("backup_pubkey", &backup_pubkey),
+                    ("heir_pubkey", &heir_pubkey),
+                    ("quorum_pubkey", &quorum_pubkey),
+                ] {
+                    if let Err(e) =
+                        <bitcoin::XOnlyPublicKey as std::str::FromStr>::from_str(key.trim())
+                    {
+                        bad = Some(format!("{what} is not an x-only public key: {e}"));
+                        break;
+                    }
+                }
+                if let Some(message) = bad {
+                    return Envelope::new(id, Response::Error(ErrorResponse { message }));
+                }
+                let lock = StoredLock::new(
+                    label,
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index.unwrap_or(0),
+                );
+                // Open-modify-write under the store's lock: `put` rewrites
+                // the whole file from the snapshot `open` read, so a
+                // concurrent save would otherwise drop one of the two locks.
+                let lock_store_lock = store_lock(state, &ghost_lock_store_path(state));
+                let _lock_store_guard = lock_store_lock.lock().await;
+                match ghost_lock_store_for(state) {
+                    Err(e) => Response::Error(ErrorResponse {
+                        message: format!("lock store: {e}"),
                     }),
-                    Some(s) => {
-                        let snap = s.handle.snapshot().await;
-                        match snap.last_balance {
-                            None => Response::LightBalance(LightBalanceResponse {
-                                confirmed_sats: None,
-                                unconfirmed_sats: None,
-                                locked_sats: None,
-                                received_at: None,
+                    Ok(mut store) => {
+                        let created = store.get(&lock.lock_id).is_none();
+                        match store.put(lock.clone()) {
+                            Err(e) => Response::Error(ErrorResponse {
+                                message: format!("save lock: {e}"),
                             }),
-                            Some(b) => Response::LightBalance(LightBalanceResponse {
-                                confirmed_sats: Some(b.confirmed_sats),
-                                unconfirmed_sats: Some(b.unconfirmed_sats),
-                                locked_sats: Some(b.locked_sats),
-                                received_at: Some(b.received_at),
+                            Ok(()) => Response::GhostLockSaved(GhostLockSavedResponse {
+                                lock: lock_record(&lock),
+                                created,
                             }),
                         }
                     }
                 }
             }
-            Request::LightUtxos { min_confirmations } => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
+            Request::GhostLockQuorumSign {
+                lock_id,
+                lane,
+                psbt,
+                input_index,
+                coordinator_url,
+            } => {
+                use wraith_wallet_core::ghost_lock_account::LaneKind;
+                // The PSBT came from the caller, so its other inputs are the
+                // caller's choice. Judge them before a signature exists.
+                if let Some(reason) = refuse_unsafe_lock_spend(state, &psbt, &lock_id, &lane).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the spend: {reason}"),
+                        }),
+                    );
+                }
+                let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                if kind != LaneKind::Spending {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "the quorum only co-signs Spending; {} is signed another way",
+                                kind.label()
+                            ),
+                        }),
+                    );
+                }
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: "Lock has no Spending lane".into(),
+                        }),
+                    );
+                };
+                let root = built.lane.spend_info.merkle_root();
+
+                let owner_sk = match lock_owner_seckey(state, record.bip86_index).await {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let owner_xonly = owner_sk
+                    .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0;
+                let keys = match lane_cosigners(kind, owner_xonly, &record) {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let request = ghost_lock::airgap::SigningRequest {
+                    psbt: psbt.clone(),
+                    input_index,
+                    keys: keys.iter().map(|k| hex::encode(k.serialize())).collect(),
+                    merkle_root: root.map(|r| {
+                        use bitcoin::hashes::Hash as _;
+                        hex::encode(r.to_byte_array())
                     }),
-                    Some(s) => match s.handle.get_utxos(min_confirmations).await {
-                        Ok(result) => {
-                            let utxos = result
-                                .utxos
-                                .into_iter()
-                                .map(|u| LightUtxoEntry {
-                                    txid: u.txid,
-                                    vout: u.vout,
-                                    amount_sats: u.amount_sats,
-                                    confirmations: u.confirmations,
-                                    script_type: u.script_type,
-                                    spendable: u.spendable,
-                                })
-                                .collect();
-                            Response::LightUtxos(LightUtxosResponse {
-                                utxos,
-                                total_sats: result.total_sats,
-                            })
+                };
+
+                let (summary, message) = match ghost_lock::airgap::review(&request, state.network) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("review: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // The input must be the lane's, checked here rather than trusted
+                // from whoever supplied the PSBT.
+                let expected = built.lane.address.to_string();
+                if summary.input_address.as_deref() != Some(expected.as_str()) {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "input {input_index} is not the Spending lane: it pays to {}, \
+                                 the lane is {expected}",
+                                summary
+                                    .input_address
+                                    .as_deref()
+                                    .unwrap_or("an unrenderable script")
+                            ),
+                        }),
+                    );
+                }
+
+                // Under the nonce ledger's lock for as long as the ledger is
+                // alive. A MuSig2 secret nonce used twice publishes the
+                // signer's key, and the burn is only durable if the record
+                // that survives is written from a table that already contains
+                // every other burn — which means opening inside the lock.
+                let nonce_lock = store_lock(state, &nonce_ledger_path(state));
+                let _nonce_guard = nonce_lock.lock().await;
+                let mut ledger = match ghost_lock_nonce_ledger_for(state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("nonce ledger unavailable: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // The BINDING id, not the lock id. The quorum derives its key
+                // from what it is handed, and the lock id is a hash over that
+                // very key — so handing it the lock id asks for a key that
+                // could not have been in the Lock. See
+                // `StoredLock::quorum_binding_id`.
+                let binding_id = record.binding_id();
+                let (sig, view) = match wraith_wallet_core::lock_cosign_client::cosign_with_quorum(
+                    &state.http,
+                    &coordinator_url,
+                    &binding_id,
+                    &request,
+                    &owner_sk,
+                    &keys,
+                    root,
+                    &message,
+                    &mut ledger,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("{e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let psbt_out = match attach_key_path_signature(&psbt, input_index, &sig) {
+                    Ok(p) => p,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                // The finished transaction, when every input is signed. A
+                // multi-input spend may still be waiting on somebody else, so
+                // an empty string here means "signed, not yet complete" rather
+                // than a failure — the PSBT above is the thing to pass on.
+                let tx_hex = {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(psbt_out.trim())
+                        .ok()
+                        .and_then(|raw| bitcoin::psbt::Psbt::deserialize(&raw).ok())
+                        .and_then(|p| p.extract_tx().ok())
+                        .map(|tx| bitcoin::consensus::encode::serialize_hex(&tx))
+                        .unwrap_or_default()
+                };
+
+                Response::GhostLockQuorumSigned(GhostLockQuorumSignedResponse {
+                    lock_id,
+                    signature: hex::encode(sig.serialize()),
+                    psbt: psbt_out,
+                    tx_hex,
+                    quorum_saw_input_sats: view.input_sats,
+                    quorum_saw_fee_sats: view.fee_sats,
+                })
+            }
+
+            Request::GhostLockEscapePlan { lock_id, lane } => {
+                let (account, kind, _record, escape) =
+                    match lock_escape_for(state, &lock_id, &lane).await {
+                        Ok(v) => v,
+                        Err(message) => {
+                            return Envelope::new(id, Response::Error(ErrorResponse { message }))
                         }
+                    };
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("Lock has no {} lane", kind.label()),
+                        }),
+                    );
+                };
+                let address = built.lane.address.to_string();
+
+                let seq = match ghost_lock::escape::escape_sequence(escape.blocks()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("sequence: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // Scanned at zero confirmations so an immature coin is listed
+                // with the wait still to go, rather than being invisible until
+                // it is already spendable.
+                let scan = match state
+                    .chain()
+                    .await
+                    .scan_utxos(std::slice::from_ref(&address), 0)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("scan: {e}"),
+                            }),
+                        )
+                    }
+                };
+                let coins: Vec<EscapeCoin> = scan
+                    .utxos
+                    .iter()
+                    .map(|u| EscapeCoin {
+                        txid: u.txid.clone(),
+                        vout: u.vout,
+                        sats: u.amount_sats,
+                        confirmations: u.confirmations,
+                        blocks_remaining: escape.blocks().saturating_sub(u.confirmations),
+                    })
+                    .collect();
+
+                Response::GhostLockEscapePlan(GhostLockEscapePlanResponse {
+                    lock_id,
+                    lane: kind.label().to_ascii_lowercase(),
+                    escape: escape.label().to_string(),
+                    delay_blocks: escape.blocks(),
+                    required_sequence: seq.0,
+                    lane_address: address,
+                    coins,
+                })
+            }
+
+            Request::GhostLockEscapeSign {
+                lock_id,
+                lane,
+                psbt,
+                input_index,
+            } => {
+                // Same guard as the other two signing paths: an escape spend
+                // is still a signature over a transaction the caller built.
+                if let Some(reason) = refuse_unsafe_lock_spend(state, &psbt, &lock_id, &lane).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the spend: {reason}"),
+                        }),
+                    );
+                }
+                let (account, kind, record, escape) =
+                    match lock_escape_for(state, &lock_id, &lane).await {
+                        Ok(v) => v,
+                        Err(message) => {
+                            return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                        }
+                    };
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("Lock has no {} lane", kind.label()),
+                        }),
+                    );
+                };
+
+                let owner_sk = match lock_owner_seckey(state, record.bip86_index).await {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let owner_xonly = owner_sk
+                    .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0;
+                let leaf = match escape.leaf(&owner_xonly) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("leaf: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let (mut parsed, prevouts) = match decode_psbt_with_prevouts(&psbt) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                // The input must be this lane's. Otherwise the daemon would
+                // sign whatever input it was pointed at, on the say-so of
+                // whoever supplied the PSBT.
+                let idx = input_index as usize;
+                let Some(prev) = prevouts.get(idx) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("input {idx} does not exist"),
+                        }),
+                    );
+                };
+                if prev.script_pubkey != built.lane.address.script_pubkey() {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "input {idx} is not the {} lane — it pays to a different script",
+                                kind.label()
+                            ),
+                        }),
+                    );
+                }
+
+                let witness = match ghost_lock::escape::sign_escape(
+                    &built.lane,
+                    &leaf,
+                    escape.blocks(),
+                    &owner_sk,
+                    &parsed.unsigned_tx,
+                    idx,
+                    &prevouts,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("{e}"),
+                            }),
+                        )
+                    }
+                };
+
+                parsed.inputs[idx].final_script_witness = Some(witness);
+                let tx_hex = match parsed.clone().extract_tx() {
+                    Ok(tx) => bitcoin::consensus::encode::serialize_hex(&tx),
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!(
+                                    "the spend is signed but not complete ({e}); every input \
+                                     needs its own witness before this can be broadcast"
+                                ),
+                            }),
+                        )
+                    }
+                };
+                use base64::Engine as _;
+                Response::GhostLockEscapeSigned(GhostLockEscapeSignedResponse {
+                    lock_id,
+                    lane: kind.label().to_ascii_lowercase(),
+                    escape: escape.label().to_string(),
+                    psbt: base64::engine::general_purpose::STANDARD.encode(parsed.serialize()),
+                    tx_hex,
+                })
+            }
+
+            Request::GhostLockSignBegin {
+                lock_id,
+                lane,
+                psbt,
+                input_index,
+            } => {
+                // The PSBT came from the caller, so its other inputs are the
+                // caller's choice. Judge them before a signature exists.
+                if let Some(reason) = refuse_unsafe_lock_spend(state, &psbt, &lock_id, &lane).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the spend: {reason}"),
+                        }),
+                    );
+                }
+                let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let Some(built) = account.lanes.iter().find(|l| l.kind == kind) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("Lock has no {} lane", kind.label()),
+                        }),
+                    );
+                };
+
+                let root = built.lane.spend_info.merkle_root();
+
+                let owner_sk = match lock_owner_seckey(state, record.bip86_index).await {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+                let owner_xonly = owner_sk
+                    .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0;
+                let keys = match lane_cosigners(kind, owner_xonly, &record) {
+                    Ok(k) => k,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let request = ghost_lock::airgap::SigningRequest {
+                    psbt: psbt.clone(),
+                    input_index,
+                    keys: keys.iter().map(|k| hex::encode(k.serialize())).collect(),
+                    merkle_root: root.map(|r| {
+                        use bitcoin::hashes::Hash as _;
+                        hex::encode(r.to_byte_array())
+                    }),
+                };
+
+                let (summary, message) = match ghost_lock::airgap::review(&request, state.network) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("review: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // The input must be the lane's. Without this the daemon would
+                // happily sign an input belonging to somebody else's script,
+                // on the say-so of whoever supplied the PSBT.
+                let expected = built.lane.address.to_string();
+                if summary.input_address.as_deref() != Some(expected.as_str()) {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "input {input_index} is not the {} lane: it pays to {},                                  the lane is {expected}",
+                                kind.label(),
+                                summary.input_address.as_deref().unwrap_or("an unrenderable script")
+                            ),
+                        }),
+                    );
+                }
+
+                let (session, commitment) = match ghost_lock::signing::SigningSession::begin(
+                    &keys, &owner_sk, root, &message,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("round 1: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let session_hex = hex::encode(commitment.session.as_bytes());
+                let our_nonce = commitment.public_nonce;
+                state.lock_signings.write().await.insert(
+                    session_hex.clone(),
+                    PendingLockSign {
+                        keys,
+                        merkle_root: root,
+                        message,
+                        psbt,
+                        input_index,
+                        our_nonce,
+                        session: Some(session),
+                        nonces: Vec::new(),
+                        our_partial: None,
+                    },
+                );
+
+                Response::GhostLockSignBegun(GhostLockSignBegunResponse {
+                    session: session_hex,
+                    summary: lock_spend_summary(&summary),
+                    device_request: match serde_json::to_string_pretty(&request) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!("device request: {e}"),
+                                }),
+                            )
+                        }
+                    },
+                    our_nonce: hex::encode(our_nonce),
+                })
+            }
+
+            Request::GhostLockSignNonce {
+                session,
+                device_nonce,
+            } => {
+                let device = match unhex66("device_nonce", &device_nonce) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let mut guard = state.lock_signings.write().await;
+                let Some(pending) = guard.get_mut(&session) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!(
+                                "no signing session '{session}' — a daemon restart drops \
+                                 these, which is safe: start again with `lock sign begin`"
+                            ),
+                        }),
+                    );
+                };
+                let Some(sess) = pending.session.take() else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: "this session already has its nonce round; the next step \
+                                      is `lock sign complete`"
+                                .into(),
+                        }),
+                    );
+                };
+
+                // Nonce order must match what every party aggregates. Sorted,
+                // so both sides reach the same aggregate without agreeing who
+                // goes first — the same reason the keys are sorted.
+                let mut nonces = vec![pending.our_nonce, device];
+                nonces.sort_unstable();
+
+                // Sign now, while both nonces are known. After this the daemon
+                // holds no secret nonce, so none is sitting in memory while the
+                // second payload is carried to the device.
+                // Under the nonce ledger's lock for as long as the ledger is
+                // alive. A MuSig2 secret nonce used twice publishes the
+                // signer's key, and the burn is only durable if the record
+                // that survives is written from a table that already contains
+                // every other burn — which means opening inside the lock.
+                let nonce_lock = store_lock(state, &nonce_ledger_path(state));
+                let _nonce_guard = nonce_lock.lock().await;
+                let mut ledger = match ghost_lock_nonce_ledger_for(state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("nonce ledger unavailable: {e}"),
+                            }),
+                        )
+                    }
+                };
+                let partial = match sess.sign(&mut ledger, &nonces) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("round 2: {e}"),
+                            }),
+                        )
+                    }
+                };
+                pending.nonces = nonces.clone();
+                pending.our_partial = Some(partial);
+
+                let req = ghost_lock::airgap::PartialRequest {
+                    session: session.clone(),
+                    public_nonces: nonces.iter().map(hex::encode).collect(),
+                };
+                Response::GhostLockSignNonced(GhostLockSignNoncedResponse {
+                    session,
+                    device_request: match serde_json::to_string_pretty(&req) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!("device request: {e}"),
+                                }),
+                            )
+                        }
+                    },
+                })
+            }
+
+            Request::GhostLockSignComplete {
+                session,
+                device_partial,
+            } => {
+                let device = match unhex32("device_partial", &device_partial) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let mut guard = state.lock_signings.write().await;
+                let Some(pending) = guard.get(&session) else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("no signing session '{session}'"),
+                        }),
+                    );
+                };
+                let Some(ours) = pending.our_partial else {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: "this session has not completed its nonce round yet".into(),
+                        }),
+                    );
+                };
+
+                let sig = match ghost_lock::signing::combine(
+                    &pending.keys,
+                    pending.merkle_root,
+                    &pending.nonces,
+                    &[ours, device],
+                    &pending.message,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("combine: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                let psbt_out =
+                    match attach_key_path_signature(&pending.psbt, pending.input_index, &sig) {
+                        Ok(p) => p,
+                        Err(message) => {
+                            return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                        }
+                    };
+                let out = Response::GhostLockSigned(GhostLockSignedResponse {
+                    session: session.clone(),
+                    signature: hex::encode(sig.serialize()),
+                    psbt: psbt_out,
+                });
+                guard.remove(&session);
+                out
+            }
+
+            Request::GhostLockRoundDestination { lock_id, lane } => {
+                use wraith_wallet_core::ghost_lock_account::LaneKind;
+
+                // Name the lane, never accept an address. The whole point of
+                // private entry is that the round's output IS the lane, so if
+                // a caller could hand in an arbitrary address then "fund my
+                // Savings privately" and "pay this stranger" would be the same
+                // request with the same audit trail.
+                let kind = match lane.trim().to_ascii_lowercase().as_str() {
+                    "savings" => LaneKind::Savings,
+                    "spending" => LaneKind::Spending,
+                    "cash" => LaneKind::Cash,
+                    "investments" => LaneKind::Investments,
+                    other => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!(
+                                "unknown lane '{other}' (try savings, spending, cash, investments)"
+                            ),
+                            }),
+                        )
+                    }
+                };
+
+                // Refused here rather than in the CLI. A rule enforced only in
+                // the client is enforced only for clients that ask nicely.
+                if let Err(e) = ghost_lock::check_round_destination(kind.compartment()) {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("{} lane: {e}", kind.label()),
+                        }),
+                    );
+                }
+
+                let record = match ghost_lock_store_for(state) {
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("lock store: {e}"),
+                            }),
+                        )
+                    }
+                    Ok(store) => match store.get(&lock_id) {
+                        Some(l) => l.clone(),
+                        None => {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!(
+                                        "no remembered Lock '{lock_id}' — `wraith lock list` shows the ones this wallet knows"
+                                    ),
+                                }),
+                            )
+                        }
+                    },
+                };
+
+                let account = match build_lock_account(
+                    state,
+                    &record.backup_pubkey,
+                    &record.heir_pubkey,
+                    &record.quorum_pubkey,
+                    record.inherit_height,
+                    record.anchor_height,
+                    Some(record.bip86_index),
+                )
+                .await
+                {
+                    Ok(a) => a,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                match account.lanes.iter().find(|l| l.kind == kind) {
+                    Some(built) => {
+                        Response::GhostLockRoundDestination(GhostLockRoundDestinationResponse {
+                            lock_id: record.lock_id.clone(),
+                            lane: lane.trim().to_ascii_lowercase(),
+                            label: kind.label().to_string(),
+                            address: built.lane.address.to_string(),
+                        })
+                    }
+                    None => Response::Error(ErrorResponse {
+                        message: format!("Lock has no {} lane", kind.label()),
+                    }),
+                }
+            }
+            Request::GhostLockList => match ghost_lock_store_for(state) {
+                Err(e) => Response::Error(ErrorResponse {
+                    message: format!("lock store: {e}"),
+                }),
+                Ok(store) => Response::GhostLockList(GhostLockListResponse {
+                    locks: store.list().iter().map(lock_record).collect(),
+                }),
+            },
+            Request::GhostLockQuorumBindingId {
+                backup_pubkey,
+                heir_pubkey,
+                anchor_height,
+                inherit_height,
+                bip86_index,
+            } => {
+                // Validate the keys here rather than hashing whatever arrives.
+                // A binding id built from a typo is a co-signing key nobody can
+                // produce, and the failure would surface much later as a Lock
+                // whose quorum simply never matches.
+                let mut bad = None;
+                for (name, k) in [
+                    ("backup_pubkey", &backup_pubkey),
+                    ("heir_pubkey", &heir_pubkey),
+                ] {
+                    if <bitcoin::XOnlyPublicKey as std::str::FromStr>::from_str(k.trim()).is_err() {
+                        bad = Some(format!("{name} is not an x-only public key"));
+                        break;
+                    }
+                }
+                if let Some(message) = bad {
+                    return Envelope::new(id, Response::Error(ErrorResponse { message }));
+                }
+                let idx = bip86_index.unwrap_or(0);
+                let binding_id =
+                    wraith_wallet_core::ghost_lock_store::StoredLock::quorum_binding_id(
+                        &backup_pubkey,
+                        &heir_pubkey,
+                        anchor_height,
+                        inherit_height,
+                        idx,
+                    );
+                Response::GhostLockQuorumBindingId(GhostLockQuorumBindingIdResponse {
+                    derive_with: format!(
+                        "ghost-lock-signer quorum-pubkey --seed <quorum-seed> --lock-id {binding_id}"
+                    ),
+                    binding_id,
+                })
+            }
+            Request::GhostLockForget { lock_id } => {
+                let lock_store_lock = store_lock(state, &ghost_lock_store_path(state));
+                let _lock_store_guard = lock_store_lock.lock().await;
+                match ghost_lock_store_for(state) {
+                    Err(e) => Response::Error(ErrorResponse {
+                        message: format!("lock store: {e}"),
+                    }),
+                    Ok(mut store) => match store.remove(&lock_id) {
                         Err(e) => Response::Error(ErrorResponse {
-                            message: format!("light utxos: {e}"),
+                            message: format!("forget lock: {e}"),
+                        }),
+                        Ok(existed) => Response::GhostLockForgotten(GhostLockForgottenResponse {
+                            lock_id,
+                            existed,
                         }),
                     },
                 }
+            }
+            Request::GhostLockLanes {
+                backup_pubkey,
+                heir_pubkey,
+                quorum_pubkey,
+                inherit_height,
+                anchor_height,
+                bip86_index,
+            } => {
+                use wraith_wallet_core::ghost_lock_account::balances;
+
+                let account = match build_lock_account(
+                    state,
+                    &backup_pubkey,
+                    &heir_pubkey,
+                    &quorum_pubkey,
+                    inherit_height,
+                    anchor_height,
+                    bip86_index,
+                )
+                .await
+                {
+                    Ok(a) => a,
+                    Err(message) => {
+                        return Envelope::new(id, Response::Error(ErrorResponse { message }))
+                    }
+                };
+
+                let addresses: Vec<String> = account
+                    .lanes
+                    .iter()
+                    .map(|l| l.lane.address.to_string())
+                    .collect();
+
+                // Scanned at ZERO confirmations, then split. One round trip
+                // gives both figures, and the split happens here rather than
+                // being two scans that could disagree with each other.
+                let scan = match state.chain().await.scan_utxos(&addresses, 0).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("scan: {e}"),
+                            }),
+                        )
+                    }
+                };
+
+                // Attribute each UTXO to its lane by scriptPubKey.
+                //
+                // ⚠ NOT by address, which is what this did and why every lane
+                // read as empty. `scantxoutset` returns scripts, not addresses
+                // — it normalises `addr(<bech32>)` into `rawtr(<spk-hex>)` on
+                // the way out — so `GhostdChainClient` leaves `address` as
+                // `None` rather than inventing a form bitcoind did not send.
+                // Matching on it therefore skipped every coin, and a Lock
+                // holding real money reported zero in all four compartments.
+                //
+                // The script is the canonical thing both sides agree on, and
+                // it is what the L1 UTXO listing already matches on.
+                let lane_spk: Vec<(usize, String)> = account
+                    .lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (i, hex::encode(l.lane.address.script_pubkey().as_bytes())))
+                    .collect();
+                let mut per_lane: Vec<wraith_wallet_core::ghost_lock_account::LaneCoin> =
+                    Vec::new();
+                for u in &scan.utxos {
+                    if let Some(b) = lane_spk
+                        .iter()
+                        .find(|(_, spk)| spk.eq_ignore_ascii_case(&u.scriptpubkey_hex))
+                        .and_then(|(i, _)| account.lanes.get(*i))
+                    {
+                        per_lane.push(wraith_wallet_core::ghost_lock_account::LaneCoin {
+                            kind: b.kind,
+                            sats: u.amount_sats,
+                            confirmations: u.confirmations,
+                        });
+                    }
+                }
+
+                let b = balances(&account, &per_lane);
+                Response::GhostLockLanes(GhostLockLanesResponse {
+                    lanes: b
+                        .lanes
+                        .iter()
+                        .map(|l| GhostLockLane {
+                            kind: format!("{:?}", l.kind).to_lowercase(),
+                            label: l.label.clone(),
+                            address: l.address.clone(),
+                            balance_sats: l.balance_sats,
+                            pending_sats: l.pending_sats,
+                            quorum_can_spend_alone: l.quorum_can_spend_alone,
+                            round_eligible: l.round_eligible,
+                        })
+                        .collect(),
+                    total_sats: b.total_sats,
+                    total_pending_sats: b.total_pending_sats,
+                    custodial_sats: b.custodial_sats,
+                    chain_height: scan.chain_height,
+                })
             }
             Request::LightL1Utxos {
                 scan_max_index,
@@ -2773,38 +4726,6 @@ mod server {
                     scanned_max_index: scan_max,
                 })
             }
-            Request::LightDetected => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
-                    }),
-                    Some(s) => {
-                        let snap = s.handle.snapshot().await;
-                        let detections = snap
-                            .detections
-                            .into_iter()
-                            .map(|d| DetectedPaymentEntry {
-                                txid: d.txid,
-                                block_height: d.block_height,
-                                vout: d.vout,
-                                amount_sats: d.amount_sats,
-                                k: d.k,
-                                received_at: d.received_at,
-                            })
-                            .collect();
-                        Response::LightDetected(LightDetectedResponse { detections })
-                    }
-                }
-            }
-            // Streaming subscription. handle_connection intercepts this before
-            // dispatch; reaching the dispatcher means the connection wasn't
-            // running our normal IPC loop. Fail loudly so misuse is obvious.
-            Request::WatchPayments => Response::Error(ErrorResponse {
-                message: "watch_payments must be sent on a fresh connection — \
-                          handled in handle_connection, not dispatch"
-                    .to_string(),
-            }),
             Request::DaemonEnv => {
                 let network = match state.network {
                     bitcoin::Network::Bitcoin => "mainnet",
@@ -2814,13 +4735,12 @@ mod server {
                     _ => "unknown",
                 }
                 .to_string();
-                let clients = state.clients.read().await;
+                let ghostd = state.ghostd().await;
                 Response::DaemonEnv(DaemonEnvResponse {
-                    ghost_pay_urls: clients.ghost_pay_urls.clone(),
-                    gsp_urls: clients.gsp_urls.clone(),
-                    node_preset: clients.preset.clone(),
-                    ghost_pay_env_override: state.ghost_pay_env_override,
-                    gsp_env_override: state.gsp_env_override,
+                    ghostd_url: ghostd.url.clone(),
+                    ghostd_auth: ghostd.auth_kind().to_string(),
+                    ghostd_env_override: state.ghostd_env_override,
+                    pool_url: state.pool_url.read().await.clone(),
                     network,
                     wallets_dir: state.wallets_dir.display().to_string(),
                     tor_proxy: state.tor_proxy.clone(),
@@ -2831,15 +4751,25 @@ mod server {
                     kiosk_mode: state.kiosk_mode,
                 })
             }
-            Request::SetNodeEndpoints {
-                preset,
-                ghost_pay_url,
-                gsp_url,
+            Request::SetNode {
+                ghostd_url,
+                cookie_path,
+                user,
+                pass,
+                pool_url,
             } => match state
-                .set_node_endpoints(&preset, ghost_pay_url, gsp_url)
+                .set_node(
+                    GhostdSettings {
+                        url: ghostd_url,
+                        cookie_path: cookie_path.map(PathBuf::from),
+                        user,
+                        pass,
+                    },
+                    pool_url,
+                )
                 .await
             {
-                Ok(applied) => Response::NodeEndpointsSet(applied),
+                Ok(applied) => Response::NodeSet(applied),
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
             Request::CheckForUpdate { manifest_url } => {
@@ -2848,502 +4778,55 @@ mod server {
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
+            Request::LightDetected => match detection_store_for(state).await {
+                Err(e) => Response::Error(ErrorResponse {
+                    message: format!("detections: {e}"),
+                }),
+                Ok(store) => Response::LightDetected(LightDetectedResponse {
+                    detections: store
+                        .list()
+                        .into_iter()
+                        .map(|d| DetectedPaymentEntry {
+                            txid: d.txid,
+                            vout: d.vout,
+                            amount_sats: d.amount_sats,
+                            block_height: d.block_height,
+                            k: d.k,
+                            received_at: d.received_at,
+                        })
+                        .collect(),
+                }),
+            },
             Request::LightHistory { limit, offset } => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
-                    }),
-                    Some(s) => match s.handle.get_transactions(limit, offset).await {
-                        Ok(result) => {
-                            let transactions = result
-                                .transactions
-                                .into_iter()
-                                .map(|t| LightHistoryEntry {
-                                    txid: t.txid,
-                                    block_height: t.block_height,
-                                    timestamp: t.timestamp,
-                                    amount_sats: t.amount_sats,
-                                    fee_sats: t.fee_sats,
-                                    tx_type: t.tx_type,
-                                    confirmations: t.confirmations,
-                                    memo: t.memo,
-                                })
-                                .collect();
-                            Response::LightHistory(LightHistoryResponse {
-                                transactions,
-                                total_count: result.total_count,
-                            })
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("light history: {e}"),
-                        }),
-                    },
-                }
+                return Envelope::new(id, l1_history(state, limit, offset).await)
             }
-            Request::LightSend {
-                recipient,
+            Request::L1Send {
+                recipient_address,
                 amount_sats,
-                mode,
+                fee_rate_sats_per_vb,
+                change_index,
+                bip86_scan_max,
+                selected_outpoints,
                 memo,
                 shroud_max_ms,
-            } => match light_send(state, recipient, amount_sats, mode, memo, shroud_max_ms).await {
-                Ok(r) => Response::LightSent(r),
+            } => match l1_send(
+                state,
+                L1SendParams {
+                    recipient_address,
+                    amount_sats,
+                    fee_rate_sats_per_vb,
+                    change_index,
+                    bip86_scan_max,
+                    selected_outpoints,
+                    memo,
+                    shroud_override_ms: shroud_max_ms,
+                },
+            )
+            .await
+            {
+                Ok(r) => Response::L1Sent(r),
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
-            Request::LocksPrepare { capacity_sats } => {
-                let kp = match auth_keypair_for_session(state).await {
-                    Ok(k) => k,
-                    Err(message) => {
-                        return Envelope::new(id, Response::Error(ErrorResponse { message }));
-                    }
-                };
-                let owner_pubkey = hex::encode(wraith_wallet_core::auth::xonly_pubkey_bytes(&kp));
-
-                // Derive the wallet's recovery_pubkey at the next free
-                // index. The matching recovery_secret stays in the
-                // wallet's keystore, never crossing the wire. This is
-                // what makes the timelock recovery branch a real
-                // unilateral exit: the operator holds the lock_pubkey
-                // (cooperative path), the user holds this
-                // recovery_pubkey's matching secret.
-                let recovery_index = state
-                    .next_recovery_index
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let active_name = match state.active.read().await.clone() {
-                    Some(n) => n,
-                    None => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: "no active wallet".into(),
-                            }),
-                        );
-                    }
-                };
-                let recovery_pubkey_hex = match with_active_wallet(state, |_, ks| {
-                    let ghost_keys = ks.ghost_keys().map_err(|e| format!("ghost_keys: {e}"))?;
-                    let pk_bytes = ghost_keys
-                        .derive_recovery_pubkey(recovery_index)
-                        .map_err(|e| format!("derive_recovery_pubkey: {e}"))?;
-                    Ok::<String, String>(hex::encode(pk_bytes))
-                })
-                .await
-                {
-                    Ok(s) => s,
-                    Err(message) => {
-                        return Envelope::new(id, Response::Error(ErrorResponse { message }));
-                    }
-                };
-
-                let session = state.session.read().await;
-                let session = session.as_ref().expect("just checked above");
-                match session
-                    .handle
-                    .prepare_ghost_lock(
-                        owner_pubkey,
-                        capacity_sats,
-                        recovery_pubkey_hex.clone(),
-                        recovery_index,
-                    )
-                    .await
-                {
-                    Ok(r) => {
-                        // Belt-and-braces: server MUST echo the same
-                        // recovery_pubkey we sent. If it doesn't, the
-                        // operator has substituted its own key and the
-                        // recovery path is no longer ours. Refuse.
-                        if r.recovery_pubkey != recovery_pubkey_hex
-                            || r.recovery_index != recovery_index
-                        {
-                            return Envelope::new(
-                                id,
-                                Response::Error(ErrorResponse {
-                                    message: format!(
-                                        "operator returned mismatched recovery key \
-                                         (sent {} idx={}, got {} idx={}); refusing lock — \
-                                         possible operator substitution attack",
-                                        recovery_pubkey_hex,
-                                        recovery_index,
-                                        r.recovery_pubkey,
-                                        r.recovery_index,
-                                    ),
-                                }),
-                            );
-                        }
-
-                        // Stash everything LocksRecover will need.
-                        state.prepared_locks.write().await.insert(
-                            r.lock_id.clone(),
-                            PreparedLockMeta {
-                                wallet_name: active_name.clone(),
-                                recovery_index,
-                                lock_pubkey_hex: r.lock_pubkey.clone(),
-                                recovery_pubkey_hex: r.recovery_pubkey.clone(),
-                                recovery_blocks: r.recovery_blocks,
-                                creation_height: r.creation_height,
-                                funding_address: r.funding_address.clone(),
-                                capacity_sats: r.required_sats,
-                                funding_txid: None,
-                            },
-                        );
-                        persist_prepared_locks(state, &active_name).await;
-
-                        Response::LocksPrepared(LocksPreparedResponse {
-                            lock_id: r.lock_id,
-                            funding_address: r.funding_address,
-                            required_sats: r.required_sats,
-                        })
-                    }
-                    Err(message) => Response::Error(ErrorResponse {
-                        message: format!("locks prepare: {message}"),
-                    }),
-                }
-            }
-            Request::LocksConfirm {
-                lock_id,
-                funding_txid,
-            } => {
-                let kp = match auth_keypair_for_session(state).await {
-                    Ok(k) => k,
-                    Err(message) => {
-                        return Envelope::new(id, Response::Error(ErrorResponse { message }));
-                    }
-                };
-                let proof = match wraith_wallet_core::auth::make_proof(&kp, "confirm_lock") {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("confirm_lock proof: {e}"),
-                            }),
-                        );
-                    }
-                };
-                let session = state.session.read().await;
-                let session = session.as_ref().expect("just checked above");
-                match session
-                    .handle
-                    .confirm_ghost_lock_funding(lock_id, funding_txid, proof)
-                    .await
-                {
-                    Ok(r) => {
-                        // Attach the funding txid to our local lock
-                        // metadata so LocksRecover can spend the right
-                        // outpoint without going back to the operator.
-                        // Capture the wallet_name out of the meta so we
-                        // can persist after dropping the write guard.
-                        let wallet_to_persist = {
-                            let mut guard = state.prepared_locks.write().await;
-                            guard.get_mut(&r.lock_id).map(|m| {
-                                m.funding_txid = Some(r.txid.clone());
-                                m.wallet_name.clone()
-                            })
-                        };
-                        if let Some(wallet) = wallet_to_persist {
-                            persist_prepared_locks(state, &wallet).await;
-                        }
-                        Response::LocksConfirmed(LocksConfirmedResponse {
-                            lock_id: r.lock_id,
-                            txid: r.txid,
-                            block_height: r.block_height,
-                        })
-                    }
-                    Err(message) => Response::Error(ErrorResponse {
-                        message: format!("locks confirm: {message}"),
-                    }),
-                }
-            }
-            Request::LocksJump {
-                lock_id,
-                target_address,
-                priority,
-            } => {
-                let priority = match parse_jump_priority(&priority) {
-                    Ok(p) => p,
-                    Err(message) => {
-                        return Envelope::new(id, Response::Error(ErrorResponse { message }));
-                    }
-                };
-                let kp = match auth_keypair_for_session(state).await {
-                    Ok(k) => k,
-                    Err(message) => {
-                        return Envelope::new(id, Response::Error(ErrorResponse { message }));
-                    }
-                };
-                let proof = match wraith_wallet_core::auth::make_proof(&kp, "request_jump") {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("request_jump proof: {e}"),
-                            }),
-                        );
-                    }
-                };
-                let session = state.session.read().await;
-                let session = session.as_ref().expect("just checked above");
-                match session
-                    .handle
-                    .request_jump(lock_id, priority, target_address, proof)
-                    .await
-                {
-                    Ok(r) => Response::LocksJumped(LocksJumpedResponse {
-                        lock_id: r.lock_id,
-                        jump_txid: r.jump_txid,
-                    }),
-                    Err(message) => Response::Error(ErrorResponse {
-                        message: format!("locks jump: {message}"),
-                    }),
-                }
-            }
-            Request::LocksRecover {
-                lock_id,
-                destination_address,
-                fee_sats,
-            } => {
-                use wraith_wallet_core::ghostd::GhostdRpc;
-                use wraith_wallet_core::lock_recovery::{
-                    build_recovery_spend, RecoverySpendInputs,
-                };
-
-                // 1. bitcoind must be configured. Without it the
-                //    recovery path can't reach L1 — this is the only
-                //    IPC method that talks straight to bitcoind.
-                let url = match state.ghostd_url.as_deref() {
-                    Some(u) => u,
-                    None => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: "no bitcoind RPC configured \
-                                    (set WRAITHD_GHOSTD_URL + WRAITHD_GHOSTD_COOKIE \
-                                    or WRAITHD_GHOSTD_USER+PASS)"
-                                    .into(),
-                            }),
-                        );
-                    }
-                };
-                let rpc_result = match (
-                    state.ghostd_cookie_path.as_ref(),
-                    state.ghostd_user.as_deref(),
-                    state.ghostd_pass.as_deref(),
-                ) {
-                    (Some(cookie), None, None) => GhostdRpc::from_cookie(url, cookie),
-                    (None, Some(u), Some(p)) => Ok(GhostdRpc::new(url, u, p)),
-                    _ => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: "bitcoind auth misconfigured: supply either \
-                                    cookie path or user+pass, not both / neither"
-                                    .into(),
-                            }),
-                        );
-                    }
-                };
-                let rpc = match rpc_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bitcoind init: {e}"),
-                            }),
-                        );
-                    }
-                };
-
-                // 2. Pull the prepared-lock metadata from our local
-                //    stash. Without it we can't reconstruct the
-                //    witness script or know which recovery_secret to
-                //    sign with.
-                let meta = match state.prepared_locks.read().await.get(&lock_id).cloned() {
-                    Some(m) => m,
-                    None => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: missing_lock_metadata_error(&lock_id),
-                            }),
-                        );
-                    }
-                };
-                let funding_txid = match meta.funding_txid.clone() {
-                    Some(t) => t,
-                    None => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!(
-                                    "lock '{lock_id}' has no recorded funding txid \
-                                    (call locks confirm first)"
-                                ),
-                            }),
-                        );
-                    }
-                };
-
-                // 3. Resolve the funding outpoint via bitcoind. Walk
-                //    the tx vouts for one whose address matches our
-                //    funding_address. (P2WSH addresses are unique
-                //    per script so a single match is all we need.)
-                let raw_tx = match rpc.get_raw_transaction_verbose(&funding_txid) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bitcoind getrawtransaction: {e}"),
-                            }),
-                        );
-                    }
-                };
-                let matching_vout = raw_tx.vout.iter().find(|v| {
-                    v.script_pubkey.first_address() == Some(meta.funding_address.as_str())
-                });
-                let vout = match matching_vout {
-                    Some(v) => v,
-                    None => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!(
-                                    "funding tx {funding_txid} has no output \
-                                    paying lock address {}",
-                                    meta.funding_address
-                                ),
-                            }),
-                        );
-                    }
-                };
-
-                // 4. Maturity check.
-                let current_height = match rpc.get_block_count() {
-                    Ok(h) => h as u32,
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("bitcoind getblockcount: {e}"),
-                            }),
-                        );
-                    }
-                };
-
-                // 5. Build the recovery tx using the wallet's own
-                //    recovery_secret. with_active_wallet locks the
-                //    keystore briefly for the (sync) sighash + ECDSA
-                //    sign step.
-                let prev_value_sats = vout.value_sats();
-                let funding_scriptpubkey_hex = vout.script_pubkey.hex.clone();
-                let funding_vout_n = vout.n;
-                let recovery_index = meta.recovery_index;
-                let inputs = RecoverySpendInputs {
-                    lock_pubkey_hex: meta.lock_pubkey_hex.clone(),
-                    recovery_pubkey_hex: meta.recovery_pubkey_hex.clone(),
-                    recovery_blocks: meta.recovery_blocks,
-                    funding_txid: funding_txid.clone(),
-                    funding_vout: funding_vout_n,
-                    prev_value_sats,
-                    funding_scriptpubkey_hex,
-                    destination_address: destination_address.clone(),
-                    fee_sats,
-                    network: state.network,
-                    current_height,
-                    creation_height: meta.creation_height,
-                };
-
-                let built = match with_active_wallet(state, |_, ks| {
-                    let ghost_keys = ks.ghost_keys().map_err(|e| format!("ghost_keys: {e}"))?;
-                    let recovery_secret = ghost_keys
-                        .derive_recovery_secret(recovery_index)
-                        .map_err(|e| format!("derive_recovery_secret: {e}"))?;
-                    build_recovery_spend(&inputs, &recovery_secret)
-                        .map_err(|e| format!("build recovery: {e}"))
-                })
-                .await
-                {
-                    Ok(b) => b,
-                    Err(message) => {
-                        return Envelope::new(id, Response::Error(ErrorResponse { message }));
-                    }
-                };
-
-                // 6. Broadcast.
-                match rpc.send_raw_transaction(&built.raw_hex) {
-                    Ok(network_txid) => {
-                        tracing::info!(
-                            %lock_id,
-                            broadcast_txid = %network_txid,
-                            recovered_sats = prev_value_sats - fee_sats,
-                            "lock recovery broadcast — unilateral exit complete",
-                        );
-                        // The lock is spent — drop it from the stash
-                        // so subsequent recovery attempts on the same
-                        // lock_id fail cleanly. Persist the change.
-                        let wallet_to_persist = state
-                            .prepared_locks
-                            .write()
-                            .await
-                            .remove(&lock_id)
-                            .map(|m| m.wallet_name);
-                        if let Some(wallet) = wallet_to_persist {
-                            persist_prepared_locks(state, &wallet).await;
-                        }
-                        Response::LocksRecovered(LocksRecoveredResponse {
-                            lock_id,
-                            broadcast_txid: network_txid,
-                            destination_address,
-                            recovered_sats: prev_value_sats - fee_sats,
-                            fee_sats,
-                        })
-                    }
-                    Err(e) => Response::Error(ErrorResponse {
-                        message: format!("bitcoind sendrawtransaction: {e}"),
-                    }),
-                }
-            }
-            Request::LocksList => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
-                    }),
-                    Some(s) => match s.handle.get_ghost_locks().await {
-                        Ok(result) => {
-                            let locks = result
-                                .locks
-                                .into_iter()
-                                .map(|l| LockEntry {
-                                    lock_id: l.lock_id,
-                                    // Canonical lowercase via Display ("pending"/"active"/"in_use");
-                                    // Debug formatting would render multi-word variants wrong (e.g. "inuse").
-                                    status: l.status.to_string(),
-                                    capacity_sats: l.capacity_sats,
-                                    balance_sats: l.balance_sats,
-                                    denomination: l.denomination,
-                                    timelock_tier: l.timelock_tier,
-                                    funding_address: l.funding_address,
-                                    funding_txid: l.funding_txid,
-                                    funding_vout: l.funding_vout,
-                                    creation_height: l.creation_height,
-                                    recovery_height: l.recovery_height,
-                                })
-                                .collect();
-                            Response::LocksList(LocksListResponse {
-                                locks,
-                                total_locked_sats: result.total_locked_sats,
-                            })
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("locks list: {e}"),
-                        }),
-                    },
-                }
-            }
             Request::WalletCreate {
                 name,
                 passphrase,
@@ -3386,6 +4869,12 @@ mod server {
                                 Ok(()) => {
                                     state.wallets.write().await.insert(name.clone(), ks);
                                     *state.active.write().await = Some(name.clone());
+                                    // A wallet cannot have been paid before it
+                                    // existed, so the tip is its birth height
+                                    // and the scanner need never look further
+                                    // back than this.
+                                    let tip = current_tip(state).await;
+                                    record_birth_height(state, &name, tip).await;
                                     Response::WalletCreate(WalletCreateResponse {
                                         name,
                                         mnemonic,
@@ -3407,6 +4896,7 @@ mod server {
                 name,
                 mnemonic,
                 passphrase,
+                birth_height,
             } => {
                 if let Some(refused) = refuse_in_kiosk_mode(state, "wallet import") {
                     return Envelope::new(id, refused);
@@ -3441,6 +4931,11 @@ mod server {
                                 Ok(()) => {
                                     state.wallets.write().await.insert(name.clone(), ks);
                                     *state.active.write().await = Some(name.clone());
+                                    // Whatever the owner said, and nothing if
+                                    // they said nothing. Defaulting to the tip
+                                    // here would look like a birth height and
+                                    // silently mean "no history before now".
+                                    record_birth_height(state, &name, birth_height).await;
                                     Response::WalletImported {
                                         name,
                                         path: path.display().to_string(),
@@ -3472,25 +4967,6 @@ mod server {
                             Ok(ks) => {
                                 state.wallets.write().await.insert(name.clone(), ks);
                                 *state.active.write().await = Some(name.clone());
-                                // Restore the wallet's previously-prepared locks
-                                // from disk. Merges into the in-memory map so
-                                // multi-wallet setups don't clobber each other.
-                                let restored = load_locks_for_wallet(&state.wallets_dir, &name);
-                                if !restored.is_empty() {
-                                    let mut guard = state.prepared_locks.write().await;
-                                    for (k, v) in restored {
-                                        guard.insert(k, v);
-                                    }
-                                    // Advance the recovery-index counter past every
-                                    // index already committed to disk so a restart
-                                    // never re-issues (and thus re-derives) a recovery
-                                    // key an existing lock already uses.
-                                    advance_recovery_index_past_locks(
-                                        &state.next_recovery_index,
-                                        &guard,
-                                    );
-                                    tracing::info!(wallet = %name, "restored prepared locks from disk");
-                                }
                                 Response::WalletUnlocked
                             }
                             Err(KeystoreError::Decrypt) => Response::Error(ErrorResponse {
@@ -3531,11 +5007,6 @@ mod server {
                     if active.as_deref() == Some(target.as_str()) {
                         *active = None;
                     }
-                    // Drop any GSP session bound to the wallet we just locked.
-                    let mut session = state.session.write().await;
-                    if session.as_ref().is_some_and(|s| s.wallet_name == target) {
-                        *session = None;
-                    }
                     Response::WalletLocked { name: target }
                 }
             }
@@ -3567,10 +5038,6 @@ mod server {
                         let mut active = state.active.write().await;
                         if active.as_deref() == Some(name.as_str()) {
                             *active = None;
-                        }
-                        let mut session = state.session.write().await;
-                        if session.as_ref().is_some_and(|s| s.wallet_name == name) {
-                            *session = None;
                         }
                         Response::WalletDeleted { name }
                     }
@@ -3627,11 +5094,6 @@ mod server {
                     })
                 } else {
                     *state.active.write().await = Some(name.clone());
-                    // Drop any GSP session that belongs to a different wallet.
-                    let mut session = state.session.write().await;
-                    if session.as_ref().is_some_and(|s| s.wallet_name != name) {
-                        *session = None;
-                    }
                     Response::WalletSelected { name }
                 }
             }
@@ -3743,54 +5205,6 @@ mod server {
                         scan_public_key_hex: scan,
                         spend_public_key_hex: spend,
                     }),
-                    Err(message) => Response::Error(ErrorResponse { message }),
-                }
-            }
-            Request::WalletGlyph { ghost_id } => match build_ghost_pay_client(state).await {
-                Ok(client) => match client.get_glyph(&ghost_id).await {
-                    Ok(v) => match serde_json::from_value::<GlyphInfo>(v) {
-                        Ok(info) => Response::WalletGlyph(info),
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph parse: {e}"),
-                        }),
-                    },
-                    Err(e) => Response::Error(ErrorResponse {
-                        message: format!("glyph: {e}"),
-                    }),
-                },
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::WalletGlyphCheck { pixels } => match build_ghost_pay_client(state).await {
-                Ok(client) => {
-                    let bitmap_hash_hex = glyph_bitmap_hash_hex(&pixels);
-                    match client.check_glyph(&bitmap_hash_hex).await {
-                        Ok(v) => {
-                            let available = v
-                                .get("available")
-                                .and_then(|b| b.as_bool())
-                                .unwrap_or(false);
-                            Response::WalletGlyphChecked { available }
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph check: {e}"),
-                        }),
-                    }
-                }
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::WalletGlyphClaim { ghost_id, pixels } => {
-                match build_ghost_pay_client(state).await {
-                    Ok(client) => match client.claim_glyph(&ghost_id, &pixels).await {
-                        Ok(v) => match serde_json::from_value::<GlyphClaimResult>(v) {
-                            Ok(r) => Response::WalletGlyphClaimed(r),
-                            Err(e) => Response::Error(ErrorResponse {
-                                message: format!("glyph claim parse: {e}"),
-                            }),
-                        },
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph claim: {e}"),
-                        }),
-                    },
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
@@ -3981,6 +5395,7 @@ mod server {
                 utxo_value_sats,
                 utxo_scriptpubkey_hex,
                 mix_output_address,
+                min_entities,
             } => {
                 use wraith_wallet_core::wraith::{
                     MixRequest, ParticipantUtxo, WraithClientError, WraithSessionClient,
@@ -4012,6 +5427,21 @@ mod server {
                         );
                     }
                 };
+                // Compartment rule 1, before the coin is offered to anyone.
+                // A Cash coin is public by design; mixing one re-links the
+                // strangers it is mixed with, which is their problem rather
+                // than the owner's — so the wallet refuses it rather than
+                // leaving the choice to whoever typed the command.
+                if let Some(reason) =
+                    refuse_if_not_round_eligible(state, &utxo_scriptpubkey_hex).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the round: {reason}"),
+                        }),
+                    );
+                }
                 // Same reason: `req` takes the scriptPubKey, and the
                 // ownership proof needs it to find the key that owns it.
                 let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
@@ -4027,6 +5457,8 @@ mod server {
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
                     mix_output_address,
+                    min_entities: min_entities
+                        .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
                 };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
@@ -4054,20 +5486,47 @@ mod server {
                 };
                 match client.prepare_mix(req, prove_ownership).await {
                     Ok(prepared) => {
-                        let resp = WraithMixPreparedResponse {
-                            session_id: prepared.session_id.clone(),
-                            unsigned_tx_hex: bitcoin::consensus::encode::serialize_hex(
-                                &prepared.unsigned_tx,
-                            ),
-                            input_index: prepared.input_index as u32,
-                            prev_amount_sats: prepared.prev_amount_sats,
-                            mixed_output_tx_index: prepared.mixed_output_tx_index as u32,
-                        };
-                        state.wraith_mixes.write().await.insert(
-                            prepared.session_id.clone(),
-                            StoredWraithMix { prepared, client },
-                        );
-                        Response::WraithMixPrepared(resp)
+                        // Inspect here, at prepare time — before the caller is
+                        // handed a transaction to sign. Checking later would
+                        // mean the wallet had already produced a signature over
+                        // a round it never verified.
+                        match check_against_ledger(state, &prepared).await {
+                            LedgerCheck::Unavailable(e) => Response::Error(ErrorResponse {
+                                message: format!("signing ledger unavailable: {e}"),
+                            }),
+                            LedgerCheck::Refused(e) => match refusal_response(
+                                prepared.session_id.clone(),
+                                min_entities
+                                    .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
+                                &e,
+                            ) {
+                                Some(r) => Response::WraithMixRefused(r),
+                                None => Response::Error(ErrorResponse {
+                                    message: format!("refused the round: {e}"),
+                                }),
+                            },
+                            LedgerCheck::Passed(inspected) => {
+                                let p = inspected.prepared();
+                                let resp = WraithMixPreparedResponse {
+                                    session_id: p.session_id.clone(),
+                                    unsigned_tx_hex: bitcoin::consensus::encode::serialize_hex(
+                                        &p.unsigned_tx,
+                                    ),
+                                    input_index: p.input_index as u32,
+                                    prev_amount_sats: p.prev_amount_sats,
+                                    mixed_output_tx_index: p.mixed_output_tx_index as u32,
+                                };
+                                let sid = p.session_id.clone();
+                                state.wraith_mixes.write().await.insert(
+                                    sid,
+                                    StoredWraithMix {
+                                        inspected: *inspected,
+                                        client,
+                                    },
+                                );
+                                Response::WraithMixPrepared(resp)
+                            }
+                        }
                     }
                     Err(e) => Response::Error(ErrorResponse {
                         message: format!("wraith prepare: {e}"),
@@ -4126,7 +5585,7 @@ mod server {
                     };
                 match stored
                     .client
-                    .submit_witness(&stored.prepared, witness)
+                    .submit_witness(&stored.inspected, witness)
                     .await
                 {
                     Ok(outcome) => Response::WraithMixCompleted(WraithMixCompletedResponse {
@@ -4178,44 +5637,17 @@ mod server {
                 }
             }
             Request::WraithResolveCoordinator { tier_id } => {
-                // Fetch the node's election view THROUGH ghost-pay (wallet hard
-                // rule: never the pool API directly), then resolve the seat that
-                // owns this tier. Any failure → (None, None) so the caller falls
-                // back to a manually-configured coordinator URL.
-                let (endpoint, epoch) =
-                    match wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                        state.ghost_pay_urls().await,
-                        None,
-                    ) {
-                        Ok(client) => match client.coordinator_election().await {
-                            Ok(election) => {
-                                // Pin the beacon to the chain if this wallet has
-                                // its own node. Verifying the draw against the
-                                // beacon published beside it only proves internal
-                                // consistency; the block hash is a fact the
-                                // operator does not get to state (#697).
-                                if !beacon_pinned_to_chain(state, &election) {
-                                    tracing::warn!(
-                                        "resolve coordinator: published beacon does not match \
-                                         the anchor block; refusing the election"
-                                    );
-                                    (None, election.get("epoch").and_then(|e| e.as_u64()))
-                                } else {
-                                    crate::coordinator_resolve::resolve_from_election(
-                                        &election, &tier_id,
-                                    )
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "resolve coordinator: election fetch failed");
-                                (None, None)
-                            }
-                        },
-                        Err(e) => {
-                            tracing::debug!(error = %e, "resolve coordinator: ghost-pay client build failed");
-                            (None, None)
-                        }
-                    };
+                // A verified election, or no answer. "No answer" is not a
+                // failure here: the caller falls back to a coordinator URL the
+                // user supplied, which is a worse answer than a verified
+                // election and a better one than obeying an unverifiable claim
+                // about who is in charge.
+                let (endpoint, epoch) = match verified_election(state).await {
+                    Some(election) => {
+                        crate::coordinator_resolve::resolve_from_election(&election, &tier_id)
+                    }
+                    None => (None, None),
+                };
                 Response::WraithCoordinatorResolved { endpoint, epoch }
             }
             Request::WraithMixOneShot {
@@ -4231,6 +5663,7 @@ mod server {
                 mix_output_address,
                 bip86_index,
                 bip86_scan_max,
+                min_entities,
             } => {
                 use wraith_wallet_core::wraith::{
                     MixRequest, ParticipantUtxo, WraithClientError, WraithSessionClient,
@@ -4265,6 +5698,21 @@ mod server {
                         );
                     }
                 };
+                // Compartment rule 1, before the coin is offered to anyone.
+                // A Cash coin is public by design; mixing one re-links the
+                // strangers it is mixed with, which is their problem rather
+                // than the owner's — so the wallet refuses it rather than
+                // leaving the choice to whoever typed the command.
+                if let Some(reason) =
+                    refuse_if_not_round_eligible(state, &utxo_scriptpubkey_hex).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the round: {reason}"),
+                        }),
+                    );
+                }
                 // Same reason: `req` takes the scriptPubKey, and the
                 // ownership proof needs it to find the key that owns it.
                 let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
@@ -4280,6 +5728,8 @@ mod server {
                         scriptpubkey_hex: utxo_scriptpubkey_hex,
                     },
                     mix_output_address,
+                    min_entities: min_entities
+                        .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
                 };
                 // Prove control of the input UTXO. The coordinator checks
                 // this against the scriptPubKey the chain reports for the
@@ -4316,6 +5766,37 @@ mod server {
                         );
                     }
                 };
+
+                // Inspect BEFORE signing. This path is the one-shot mix, and it
+                // previously went from `/round-tx` straight to the keystore —
+                // no check that the wallet's own input and output were in the
+                // round, no anonymity floor, and no commitment of the coin.
+                let inspected = match check_against_ledger(state, &prepared).await {
+                    LedgerCheck::Passed(i) => *i,
+                    LedgerCheck::Unavailable(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("signing ledger unavailable: {e}"),
+                            }),
+                        );
+                    }
+                    LedgerCheck::Refused(e) => {
+                        let resp = match refusal_response(
+                            prepared.session_id.clone(),
+                            min_entities
+                                .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
+                            &e,
+                        ) {
+                            Some(r) => Response::WraithMixRefused(r),
+                            None => Response::Error(ErrorResponse {
+                                message: format!("refused the round: {e}"),
+                            }),
+                        };
+                        return Envelope::new(id, resp);
+                    }
+                };
+
                 // Sign with the active wallet's keystore. `with_active_wallet`
                 // is async and re-locks the keystore RwLock on each call;
                 // we hold the lock just for the (sync) sighash + Schnorr step.
@@ -4350,7 +5831,7 @@ mod server {
                         return Envelope::new(id, Response::Error(ErrorResponse { message }));
                     }
                 };
-                match client.submit_witness(&prepared, witness).await {
+                match client.submit_witness(&inspected, witness).await {
                     Ok(outcome) => Response::WraithMixCompleted(WraithMixCompletedResponse {
                         session_id: outcome.session_id,
                         broadcast_txid: outcome.broadcast_txid.to_string(),
@@ -4538,7 +6019,7 @@ mod server {
                 Err(e) => Response::Error(ErrorResponse { message: e }),
             },
             Request::PsbtBroadcast { psbt_or_tx_hex } => {
-                match psbt_broadcast_handler(state, &psbt_or_tx_hex).await {
+                match psbt_broadcast_handler(state, &psbt_or_tx_hex, "send", None).await {
                     Ok(txid) => Response::PsbtBroadcast(PsbtBroadcastResponse { txid }),
                     Err(e) => Response::Error(ErrorResponse { message: e }),
                 }
@@ -4599,146 +6080,6 @@ mod server {
     mod tests {
         use super::*;
 
-        fn fixture_meta(wallet: &str, lock_id: &str) -> PreparedLockMeta {
-            PreparedLockMeta {
-                wallet_name: wallet.into(),
-                recovery_index: 7,
-                lock_pubkey_hex: "02".to_string() + &"00".repeat(32),
-                recovery_pubkey_hex: "03".to_string() + &"11".repeat(32),
-                recovery_blocks: 1008,
-                creation_height: 800_000,
-                funding_address: format!("tb1q{lock_id}"),
-                capacity_sats: 100_000,
-                funding_txid: Some("aa".repeat(32)),
-            }
-        }
-
-        #[test]
-        fn round_trip_locks_to_disk_preserves_every_field() {
-            let dir = tempfile::tempdir().unwrap();
-            let mut map = HashMap::new();
-            let meta = fixture_meta("alice", "lock-A");
-            map.insert("lock-A".to_string(), meta.clone());
-            super::save_locks_for_wallet(dir.path(), "alice", &map).unwrap();
-
-            let restored = super::load_locks_for_wallet(dir.path(), "alice");
-            assert_eq!(restored.len(), 1);
-            let r = restored.get("lock-A").unwrap();
-            assert_eq!(r.wallet_name, meta.wallet_name);
-            assert_eq!(r.recovery_index, meta.recovery_index);
-            assert_eq!(r.lock_pubkey_hex, meta.lock_pubkey_hex);
-            assert_eq!(r.recovery_pubkey_hex, meta.recovery_pubkey_hex);
-            assert_eq!(r.recovery_blocks, meta.recovery_blocks);
-            assert_eq!(r.creation_height, meta.creation_height);
-            assert_eq!(r.funding_address, meta.funding_address);
-            assert_eq!(r.capacity_sats, meta.capacity_sats);
-            assert_eq!(r.funding_txid, meta.funding_txid);
-        }
-
-        #[test]
-        fn load_returns_empty_when_file_missing() {
-            let dir = tempfile::tempdir().unwrap();
-            let restored = super::load_locks_for_wallet(dir.path(), "missing");
-            assert!(restored.is_empty());
-        }
-
-        #[test]
-        fn recovery_index_advances_past_persisted_locks() {
-            use std::sync::atomic::Ordering::SeqCst;
-
-            // Regression: the counter reset to 0 each boot, so after a restart a
-            // freshly-prepared lock re-issued an index an existing lock already
-            // used — re-deriving the same recovery key.
-            let counter = AtomicU32::new(0);
-            let mut map = HashMap::new();
-            let mut a = fixture_meta("alice", "lock-A");
-            a.recovery_index = 4;
-            let mut b = fixture_meta("alice", "lock-B");
-            b.recovery_index = 9; // highest
-            let mut c = fixture_meta("alice", "lock-C");
-            c.recovery_index = 2;
-            map.insert("lock-A".to_string(), a);
-            map.insert("lock-B".to_string(), b);
-            map.insert("lock-C".to_string(), c);
-
-            super::advance_recovery_index_past_locks(&counter, &map);
-            assert_eq!(
-                counter.load(SeqCst),
-                10,
-                "counter must sit one past the highest persisted recovery_index"
-            );
-
-            // Monotonic: a second wallet with lower indices must not lower it.
-            let mut map2 = HashMap::new();
-            let mut d = fixture_meta("bob", "lock-D");
-            d.recovery_index = 3;
-            map2.insert("lock-D".to_string(), d);
-            super::advance_recovery_index_past_locks(&counter, &map2);
-            assert_eq!(
-                counter.load(SeqCst),
-                10,
-                "fetch_max must never lower the counter"
-            );
-
-            // Empty set is a no-op.
-            super::advance_recovery_index_past_locks(&counter, &HashMap::new());
-            assert_eq!(counter.load(SeqCst), 10);
-        }
-
-        #[test]
-        fn load_returns_empty_when_file_corrupt() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = super::locks_path(dir.path(), "borked");
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"this is not json").unwrap();
-            let restored = super::load_locks_for_wallet(dir.path(), "borked");
-            assert!(
-                restored.is_empty(),
-                "corrupt file is logged + ignored, never bubbles"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn save_writes_with_mode_0600() {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
-            let mut map = HashMap::new();
-            map.insert("k".to_string(), fixture_meta("w", "k"));
-            super::save_locks_for_wallet(dir.path(), "w", &map).unwrap();
-            let path = super::locks_path(dir.path(), "w");
-            let perm = std::fs::metadata(&path).unwrap().permissions();
-            assert_eq!(
-                perm.mode() & 0o777,
-                0o600,
-                "locks file must be wallet-owner-only readable",
-            );
-        }
-
-        #[test]
-        fn missing_lock_metadata_error_is_accurate() {
-            let msg = super::missing_lock_metadata_error("lock-XYZ");
-            // Names the offending lock so the operator can act on it.
-            assert!(msg.contains("lock-XYZ"), "must name the lock: {msg}");
-            // Points at the real recovery path now that locks persist to
-            // locks.json and reload on WalletUnlock.
-            assert!(msg.contains("locks.json"), "must mention locks.json: {msg}");
-            assert!(
-                msg.contains("different wallet/daemon"),
-                "must explain the cross-wallet/daemon case: {msg}"
-            );
-            // Regression guard: the old message falsely claimed the index was
-            // in-memory only and lost on restart. That is no longer true.
-            assert!(
-                !msg.contains("restarts lose the index"),
-                "stale, now-false claim must be gone: {msg}"
-            );
-            assert!(
-                !msg.contains("in-memory"),
-                "stale in-memory claim must be gone: {msg}"
-            );
-        }
-
         #[test]
         fn unknown_mix_session_error_is_clear() {
             let msg = super::unknown_mix_session_error("sess-123");
@@ -4795,56 +6136,9 @@ mod server {
             panic!("did not see both 0 and 1 across 1000 samples");
         }
 
-        // ---- payment-mode gating -------------------------------------
-        //
-        // Send exposes exactly one real mode (`ghostpay`). The former
-        // `wraith`/`confidential` modes were cosmetic — they parsed into
-        // a label but took the same plaintext L2 ledger path — so they
-        // are now refused. These tests lock that in: a retired mode must
-        // never resolve into an accepted send.
-
-        #[test]
-        fn parse_payment_mode_accepts_ghostpay_aliases_and_default() {
-            for s in [
-                "",
-                "ghostpay",
-                "GhostPay",
-                "ghost-pay",
-                "ghost_pay",
-                "  ghostpay  ",
-            ] {
-                assert!(
-                    matches!(super::parse_payment_mode(s), Ok(PaymentMode::GhostPay)),
-                    "{s:?} should resolve to GhostPay"
-                );
-            }
-        }
-
-        #[test]
-        fn parse_payment_mode_rejects_retired_modes() {
-            for s in ["wraith", "Wraith", "confidential", "CONFIDENTIAL"] {
-                let err = super::parse_payment_mode(s)
-                    .expect_err(&format!("retired mode {s:?} must be rejected"));
-                assert!(
-                    err.contains("not available"),
-                    "{s:?} rejection should explain it is unavailable; got: {err}"
-                );
-            }
-        }
-
-        #[test]
-        fn parse_payment_mode_rejects_unknown() {
-            let err =
-                super::parse_payment_mode("banana").expect_err("an unknown mode must be rejected");
-            assert!(
-                err.contains("unknown payment mode"),
-                "unexpected error text: {err}"
-            );
-        }
-
-        /// Minimal `ChainClient` stub — `light_send` never touches the
-        /// chain (its gating happens before any I/O), so a status-only
-        /// error stub is all we need to satisfy the `DaemonState` field.
+        /// Minimal `ChainClient` stub. The handlers exercised here refuse
+        /// before any I/O, so a status-only error stub is all the
+        /// `DaemonState` field needs.
         struct RejectChain;
 
         #[async_trait::async_trait]
@@ -4859,6 +6153,888 @@ mod server {
             }
         }
 
+        /// A distinct taproot-shaped script, so "ours" and "theirs" can be
+        /// told apart without needing real keys.
+        fn spk(tag: u8) -> bitcoin::ScriptBuf {
+            let mut v = vec![0x51, 0x20];
+            v.extend_from_slice(&[tag; 32]);
+            bitcoin::ScriptBuf::from_bytes(v)
+        }
+
+        /// A PSBT spending `inputs` into `outputs`, each entry a value and the
+        /// script tag paying it.
+        fn test_psbt(inputs: &[(u64, u8)], outputs: &[(u64, u8)]) -> bitcoin::psbt::Psbt {
+            use bitcoin::hashes::Hash;
+            use bitcoin::{absolute::LockTime, transaction::Version, Amount, Transaction, TxOut};
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: (0..inputs.len())
+                    .map(|i| bitcoin::TxIn {
+                        previous_output: bitcoin::OutPoint {
+                            txid: bitcoin::Txid::from_byte_array([i as u8; 32]),
+                            vout: 0,
+                        },
+                        ..Default::default()
+                    })
+                    .collect(),
+                output: outputs
+                    .iter()
+                    .map(|(v, tag)| TxOut {
+                        value: Amount::from_sat(*v),
+                        script_pubkey: spk(*tag),
+                    })
+                    .collect(),
+            };
+            let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).unwrap();
+            for (i, (v, tag)) in inputs.iter().enumerate() {
+                psbt.inputs[i].witness_utxo = Some(TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: spk(*tag),
+                });
+            }
+            psbt
+        }
+
+        /// The net is what the balance will actually move by — the payment
+        /// *and* the fee, with change netted back out. A history that showed
+        /// only the payment would never reconcile against the balance.
+        #[test]
+        fn the_net_change_counts_the_fee_and_nets_out_change() {
+            let ours: std::collections::HashSet<Vec<u8>> =
+                [spk(0xaa).to_bytes()].into_iter().collect();
+            // 100,000 of ours in; 50,000 to a stranger, 49,500 back as change.
+            let psbt = test_psbt(&[(100_000, 0xaa)], &[(50_000, 0xbb), (49_500, 0xaa)]);
+            let (net, fee) = psbt_ledger_effect(&psbt, &ours);
+            assert_eq!(fee, Some(500));
+            assert_eq!(
+                net,
+                Some(-50_500),
+                "the balance drops by the payment plus the fee, not the payment alone"
+            );
+        }
+
+        /// A consolidation pays only the miner. It is not a zero-value event.
+        #[test]
+        fn a_self_send_nets_the_fee_only() {
+            let ours: std::collections::HashSet<Vec<u8>> =
+                [spk(0xaa).to_bytes()].into_iter().collect();
+            let psbt = test_psbt(&[(10_000, 0xaa), (10_000, 0xaa)], &[(19_800, 0xaa)]);
+            let (net, fee) = psbt_ledger_effect(&psbt, &ours);
+            assert_eq!(fee, Some(200));
+            assert_eq!(net, Some(-200));
+        }
+
+        /// One input of unknown value makes both figures unknowable. A fee
+        /// computed from only the inputs that happened to be present is not a
+        /// smaller fee — it is a wrong one, and it would read as authoritative.
+        #[test]
+        fn a_missing_input_value_yields_no_figures_rather_than_partial_ones() {
+            let ours: std::collections::HashSet<Vec<u8>> =
+                [spk(0xaa).to_bytes()].into_iter().collect();
+            let mut psbt = test_psbt(&[(100_000, 0xaa), (100_000, 0xaa)], &[(199_000, 0xbb)]);
+            psbt.inputs[1].witness_utxo = None;
+            let (net, fee) = psbt_ledger_effect(&psbt, &ours);
+            assert_eq!(fee, None, "a partial fee is a wrong fee");
+            assert_eq!(net, None);
+        }
+
+        /// A chain stub returning one UTXO at a given script, with `address`
+        /// left `None` — exactly what `scantxoutset` gives back.
+        struct SpkChain {
+            spk_hex: String,
+            sats: u64,
+        }
+
+        #[async_trait::async_trait]
+        impl ChainClient for SpkChain {
+            async fn status(
+                &self,
+            ) -> Result<wraith_wallet_core::chain::ChainStatus, wraith_wallet_core::chain::ChainError>
+            {
+                Err(wraith_wallet_core::chain::ChainError::Backend(
+                    "stub".into(),
+                ))
+            }
+            async fn scan_utxos(
+                &self,
+                _addresses: &[String],
+                _min_confirmations: u32,
+            ) -> Result<
+                wraith_wallet_core::chain::ScanUtxosResponse,
+                wraith_wallet_core::chain::ChainError,
+            > {
+                Ok(wraith_wallet_core::chain::ScanUtxosResponse {
+                    utxos: vec![wraith_wallet_core::chain::ScannedL1Utxo {
+                        txid: "aa".repeat(32),
+                        vout: 0,
+                        amount_sats: self.sats,
+                        scriptpubkey_hex: self.spk_hex.clone(),
+                        // The whole point: the node does not send an address.
+                        address: None,
+                        confirmations: 3,
+                        height: 900_000,
+                    }],
+                    total_sats: self.sats,
+                    chain_height: 900_002,
+                })
+            }
+        }
+
+        /// A Lock that cannot derive lanes must not save.
+        ///
+        /// Saving is where somebody pastes a key, and it was the one place
+        /// that never checked one. A malformed pubkey stored happily and
+        /// reported `created: true`; every later operation on that Lock then
+        /// failed, far from the typo, on a Lock the wallet claimed to have.
+        #[tokio::test]
+        async fn a_lock_with_a_malformed_key_is_refused_at_save() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            // 32 bytes that are not a curve point — what `openssl rand -hex 32`
+            // gives you about half the time.
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockSave {
+                    label: Some("broken".into()),
+                    backup_pubkey: "11".repeat(32),
+                    heir_pubkey: "22".repeat(32),
+                    quorum_pubkey: "33".repeat(32),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&req, &state).await.payload {
+                Response::Error(e) => assert!(
+                    e.message.contains("x-only public key"),
+                    "the error must name what is wrong: {}",
+                    e.message
+                ),
+                other => panic!("a malformed key must not save, got {other:?}"),
+            }
+            assert!(
+                ghost_lock_store_for(&state).unwrap().list().is_empty(),
+                "and nothing may be persisted"
+            );
+        }
+
+        /// A funded lane must not read as empty.
+        ///
+        /// Lane coins were attributed by matching the scan's `address` field
+        /// against the lane's address. `scantxoutset` does not return
+        /// addresses — it normalises `addr(<bech32>)` into `rawtr(<spk-hex>)`
+        /// — so the chain client leaves that field `None` rather than
+        /// inventing one, every coin was skipped, and a Lock holding real
+        /// money reported zero in all four compartments.
+        ///
+        /// Worth driving the real handler because the failure is silent and
+        /// reads as a fact: "0 sats" looks like an empty lane, not like a
+        /// lookup that matched nothing. A test that only checked the fixture's
+        /// shape would have passed against the broken code.
+        #[tokio::test]
+        async fn a_funded_lane_is_attributed_by_script_not_address() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            // A real keystore, because the lanes are derived from the owner's
+            // key and a stub cannot stand in for it.
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+            state
+                .wallets
+                .write()
+                .await
+                .insert("harness".to_string(), ks);
+
+            // Real x-only keys — 32 arbitrary bytes are not a curve point, and
+            // the handler rightly refuses them.
+            let xonly = |seed: u8| {
+                use bitcoin::secp256k1::{Secp256k1, SecretKey};
+                let sk = SecretKey::from_slice(&[seed; 32]).expect("nonzero scalar");
+                let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
+                hex::encode(xk.serialize())
+            };
+            let lanes_req = |id: u64| {
+                serde_json::to_string(&Envelope::new(
+                    id,
+                    Request::GhostLockLanes {
+                        backup_pubkey: xonly(0x11),
+                        heir_pubkey: xonly(0x22),
+                        quorum_pubkey: xonly(0x33),
+                        anchor_height: 900_000,
+                        inherit_height: 950_000,
+                        bip86_index: None,
+                    },
+                ))
+                .unwrap()
+            };
+
+            // First pass: nothing on chain, so learn the lane addresses.
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: "51".to_string() + "20" + &"ff".repeat(32),
+                sats: 0,
+            });
+            let cash_addr = match super::dispatch(&lanes_req(1), &state).await.payload {
+                Response::GhostLockLanes(r) => r
+                    .lanes
+                    .iter()
+                    .find(|l| l.kind == "cash")
+                    .map(|l| l.address.clone())
+                    .expect("a cash lane"),
+                other => panic!("expected lanes, got {other:?}"),
+            };
+
+            // Now put a coin at exactly that lane's script — reporting it the
+            // way the node does, with no address field.
+            let spk = cash_addr
+                .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                .unwrap()
+                .assume_checked()
+                .script_pubkey();
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: hex::encode(spk.as_bytes()),
+                sats: 1_000_000,
+            });
+
+            match super::dispatch(&lanes_req(2), &state).await.payload {
+                Response::GhostLockLanes(r) => {
+                    let cash = r.lanes.iter().find(|l| l.kind == "cash").unwrap();
+                    assert_eq!(
+                        cash.balance_sats, 1_000_000,
+                        "the funded lane must show its coin, not zero"
+                    );
+                    let others: u64 = r
+                        .lanes
+                        .iter()
+                        .filter(|l| l.kind != "cash")
+                        .map(|l| l.balance_sats)
+                        .sum();
+                    assert_eq!(others, 0, "and the coin must land in ONE compartment");
+                }
+                other => panic!("expected lanes, got {other:?}"),
+            }
+        }
+
+        /// Concurrent history writers must not erase each other.
+        ///
+        /// The block scanner and an outgoing payment both write this file.
+        /// `record` merges — but only against the snapshot taken when the
+        /// store was opened, so without a lock around open-modify-write
+        /// whoever flushes last persists a table missing everything the other
+        /// recorded meanwhile. The scanner used to hold one store open across
+        /// a whole batch of block fetches, which made that window seconds
+        /// wide and a payment made during a catch-up scan simply vanished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_history_writers_do_not_erase_each_other() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            const WRITERS: usize = 24;
+            let mut tasks = Vec::with_capacity(WRITERS);
+            for i in 0..WRITERS {
+                let state = Arc::clone(&state);
+                tasks.push(tokio::spawn(async move {
+                    record_history(
+                        &state,
+                        wraith_wallet_core::history_store::HistoryEntry {
+                            txid: format!("tx-{i:04}"),
+                            at: 1_700_000_000 + i as i64,
+                            block_height: None,
+                            amount_sats: Some(1_000 + i as i64),
+                            fee_sats: None,
+                            kind: "send".into(),
+                            memo: None,
+                        },
+                    )
+                    .await
+                }));
+            }
+            for (i, t) in tasks.into_iter().enumerate() {
+                t.await
+                    .unwrap_or_else(|e| panic!("writer {i} panicked: {e}"))
+                    .unwrap_or_else(|e| panic!("writer {i} failed: {e}"));
+            }
+
+            let store = history_store_for(&state).await.unwrap();
+            assert_eq!(
+                store.len(),
+                WRITERS,
+                "history lost entries: {} of {WRITERS} survived",
+                store.len()
+            );
+        }
+
+        /// A Cash coin is refused from a round; a private-lane coin is not.
+        ///
+        /// Compartment rule 1 — "a Cash coin must never enter a round" — was
+        /// written, tested inside `ghost-lock`, and never called. The only
+        /// caller of `check_round_eligible` computed a flag for the UI to
+        /// colour a lane with. Nothing stopped the coin.
+        ///
+        /// It could not be enforced before, either: Lock owner keys shared
+        /// account 0' with the plain wallet, so the Cash lane WAS the wallet's
+        /// receive address and refusing Cash would have refused every ordinary
+        /// coin. Keys moved to account 1', which is what makes this checkable.
+        ///
+        /// Driven through `dispatch` with an unreachable coordinator on
+        /// purpose: the refusal must come from the compartment rule, not from
+        /// a failed connection, which also proves the check runs before the
+        /// coin is offered to anybody.
+        #[tokio::test]
+        async fn a_cash_coin_is_refused_from_a_round_and_a_private_one_is_not() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+            state
+                .wallets
+                .write()
+                .await
+                .insert("harness".to_string(), ks);
+
+            let xonly = |seed: u8| {
+                use bitcoin::secp256k1::{Secp256k1, SecretKey};
+                let sk = SecretKey::from_slice(&[seed; 32]).expect("nonzero scalar");
+                let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
+                hex::encode(xk.serialize())
+            };
+
+            // Remember a Lock, so its lanes are classifiable.
+            let save = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockSave {
+                    label: Some("compartment-test".into()),
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&save, &state).await.payload {
+                Response::GhostLockSaved(_) => {}
+                other => panic!("could not remember a Lock: {other:?}"),
+            }
+
+            // Lane derivation reports balances, so it needs a chain that can
+            // scan. Nothing is funded; only the addresses matter here.
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: "51".to_string() + "20" + &"ff".repeat(32),
+                sats: 0,
+            });
+
+            let lanes = serde_json::to_string(&Envelope::new(
+                2,
+                Request::GhostLockLanes {
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            let addr_of = match super::dispatch(&lanes, &state).await.payload {
+                Response::GhostLockLanes(r) => r
+                    .lanes
+                    .iter()
+                    .map(|l| (l.kind.clone(), l.address.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                other => panic!("expected lanes, got {other:?}"),
+            };
+            let spk_of = |kind: &str| {
+                let a = addr_of
+                    .get(kind)
+                    .unwrap_or_else(|| panic!("no {kind} lane"));
+                let addr = a
+                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                    .expect("lane address")
+                    .assume_checked();
+                hex::encode(addr.script_pubkey().as_bytes())
+            };
+
+            let mix_req = |id: u64, spk: String| {
+                serde_json::to_string(&Envelope::new(
+                    id,
+                    Request::WraithMixPrepare {
+                        // Deliberately unreachable: a compartment refusal must
+                        // not depend on a coordinator being there.
+                        coordinator_url: "http://127.0.0.1:1".into(),
+                        socks5_proxy: None,
+                        coordinator_peers: vec![],
+                        tier_id: "100k_sats".into(),
+                        ghost_id: "compartment-test".into(),
+                        utxo_txid: "11".repeat(32),
+                        utxo_vout: 0,
+                        utxo_value_sats: 100_000,
+                        utxo_scriptpubkey_hex: spk,
+                        mix_output_address: addr_of.get("savings").expect("savings lane").clone(),
+                        min_entities: Some(1),
+                    },
+                ))
+                .unwrap()
+            };
+
+            // Cash: refused, and by the compartment rule.
+            match super::dispatch(&mix_req(3, spk_of("cash")), &state)
+                .await
+                .payload
+            {
+                Response::Error(e) => assert!(
+                    e.message.contains("Cash") || e.message.contains("cash"),
+                    "a Cash coin must be refused by the compartment rule, got: {}",
+                    e.message
+                ),
+                other => panic!("a Cash coin entered a round: {other:?}"),
+            }
+
+            // Savings: gets past the compartment gate. It still fails, because
+            // the coordinator does not exist — which is the point: the failure
+            // must be the connection, not the rule.
+            match super::dispatch(&mix_req(4, spk_of("savings")), &state)
+                .await
+                .payload
+            {
+                Response::Error(e) => assert!(
+                    !e.message.contains("Cash") && !e.message.contains("cash"),
+                    "a private-lane coin was refused by the Cash rule: {}",
+                    e.message
+                ),
+                other => panic!("unexpected success against a dead coordinator: {other:?}"),
+            }
+        }
+
+        /// A Lock spend may not reach outside the lane being signed.
+        ///
+        /// Three signing handlers — quorum co-sign, escape, and the air-gapped
+        /// key-path spend — sign one input of a PSBT the CALLER built, so the
+        /// caller chooses the other inputs. Nothing checked them.
+        ///
+        /// `check_spend_together` (compartment rule 3) had no callers at all
+        /// outside its own tests, and even called it only covers the Cash
+        /// boundary. It says nothing about a Savings coin spent beside a
+        /// Spending coin — both are `Compartment::Private` — or beside an
+        /// ordinary wallet coin. Both prove one owner and collapse exactly the
+        /// separation the lanes exist to create.
+        ///
+        /// The last case is the one that keeps this honest: two coins in the
+        /// SAME lane must still be spendable together, or the rule has just
+        /// broken ordinary use.
+        #[tokio::test]
+        async fn a_lock_spend_may_not_reach_outside_its_lane() {
+            use bitcoin::{absolute::LockTime, transaction::Version, OutPoint, TxIn, TxOut};
+
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+            state
+                .wallets
+                .write()
+                .await
+                .insert("harness".to_string(), ks);
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: "51".to_string() + "20" + &"ff".repeat(32),
+                sats: 0,
+            });
+
+            let xonly = |seed: u8| {
+                use bitcoin::secp256k1::{Secp256k1, SecretKey};
+                let sk = SecretKey::from_slice(&[seed; 32]).expect("nonzero scalar");
+                let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
+                hex::encode(xk.serialize())
+            };
+            let save = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockSave {
+                    label: Some("lane-rule".into()),
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            let lock_id = match super::dispatch(&save, &state).await.payload {
+                Response::GhostLockSaved(r) => r.lock.lock_id,
+                other => panic!("could not remember a Lock: {other:?}"),
+            };
+            let lanes = serde_json::to_string(&Envelope::new(
+                2,
+                Request::GhostLockLanes {
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            let addr_of = match super::dispatch(&lanes, &state).await.payload {
+                Response::GhostLockLanes(r) => r
+                    .lanes
+                    .iter()
+                    .map(|l| (l.kind.clone(), l.address.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                other => panic!("expected lanes, got {other:?}"),
+            };
+            let to_spk = |a: &str| {
+                a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                    .expect("address")
+                    .assume_checked()
+                    .script_pubkey()
+            };
+            let spk_of = |kind: &str| {
+                to_spk(
+                    addr_of
+                        .get(kind)
+                        .unwrap_or_else(|| panic!("no {kind} lane")),
+                )
+            };
+
+            // The wallet's own ordinary receive address — in no lane at all.
+            let loose =
+                serde_json::to_string(&Envelope::new(3, Request::LightReceive { index: 0 }))
+                    .unwrap();
+            let loose_spk = match super::dispatch(&loose, &state).await.payload {
+                Response::LightReceive(r) => to_spk(&r.address),
+                other => panic!("expected a receive address, got {other:?}"),
+            };
+
+            let build = |second: bitcoin::ScriptBuf| {
+                let input = |vout: u32| TxIn {
+                    previous_output: OutPoint {
+                        txid: "11".repeat(32).parse().unwrap(),
+                        vout,
+                    },
+                    ..Default::default()
+                };
+                let tx = bitcoin::Transaction {
+                    version: Version(2),
+                    lock_time: LockTime::ZERO,
+                    input: vec![input(0), input(1)],
+                    output: vec![TxOut {
+                        value: bitcoin::Amount::from_sat(150_000),
+                        script_pubkey: spk_of("investments"),
+                    }],
+                };
+                let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).expect("psbt");
+                psbt.inputs[0].witness_utxo = Some(TxOut {
+                    value: bitcoin::Amount::from_sat(100_000),
+                    script_pubkey: spk_of("savings"),
+                });
+                psbt.inputs[1].witness_utxo = Some(TxOut {
+                    value: bitcoin::Amount::from_sat(60_000),
+                    script_pubkey: second,
+                });
+                // base64: the review step downstream accepts only that form,
+                // so the case that must be ALLOWED has to reach it.
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+            };
+
+            let sign_req = |id: u64, psbt: String| {
+                serde_json::to_string(&Envelope::new(
+                    id,
+                    Request::GhostLockSignBegin {
+                        lock_id: lock_id.clone(),
+                        lane: "savings".into(),
+                        psbt,
+                        input_index: 0,
+                    },
+                ))
+                .unwrap()
+            };
+
+            // Every one of these, spent beside a Savings coin, is linkage.
+            for (label, second) in [
+                ("a Cash coin", spk_of("cash")),
+                ("another lane of the same Lock", spk_of("spending")),
+                ("the wallet's own receive address", loose_spk),
+            ] {
+                match super::dispatch(&sign_req(10, build(second)), &state)
+                    .await
+                    .payload
+                {
+                    Response::Error(e) => assert!(
+                        e.message.contains("refused the spend"),
+                        "spending a Savings coin beside {label} must be refused, got: {}",
+                        e.message
+                    ),
+                    other => panic!("the wallet agreed to link Savings to {label}: {other:?}"),
+                }
+            }
+
+            // And the rule must not have broken ordinary use: two coins in the
+            // same lane still belong in one transaction.
+            // Reaching the signing machinery at all is a pass: it got past the
+            // rule. Only a refusal BY the rule is a failure.
+            if let Response::Error(e) =
+                super::dispatch(&sign_req(20, build(spk_of("savings"))), &state)
+                    .await
+                    .payload
+            {
+                assert!(
+                    !e.message.contains("refused the spend"),
+                    "two coins in the SAME lane must still be spendable together, got: {}",
+                    e.message
+                );
+            }
+        }
+
+        /// A chain stub that answers with a fixed tip, so confirmation
+        /// arithmetic can be tested without a node.
+        struct TipChain(u64);
+
+        #[async_trait::async_trait]
+        impl ChainClient for TipChain {
+            async fn status(
+                &self,
+            ) -> Result<wraith_wallet_core::chain::ChainStatus, wraith_wallet_core::chain::ChainError>
+            {
+                Ok(wraith_wallet_core::chain::ChainStatus {
+                    backend_version: "stub".into(),
+                    network: "regtest".into(),
+                    chain_height: Some(self.0),
+                    chain_headers: Some(self.0),
+                    chain_verification_progress: None,
+                    chain_initial_block_download: Some(false),
+                })
+            }
+        }
+
+        /// Confirmations count the block the transaction landed in.
+        ///
+        /// An entry mined in the tip block has one confirmation, not zero.
+        /// That off-by-one is the difference between a coin reading as
+        /// spendable and reading as not there yet.
+        #[tokio::test]
+        async fn confirmations_are_inclusive_of_the_mining_block() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            state.clients.write().await.chain = Arc::new(TipChain(900_010));
+
+            let mut store = history_store_for(&state).await.unwrap();
+            for (txid, height) in [("tip", 900_010u32), ("ten_deep", 900_001)] {
+                store
+                    .record(wraith_wallet_core::history_store::HistoryEntry {
+                        txid: txid.into(),
+                        at: 1,
+                        block_height: Some(height),
+                        amount_sats: Some(1_000),
+                        fee_sats: None,
+                        kind: "receive".into(),
+                        memo: None,
+                    })
+                    .unwrap();
+            }
+
+            match l1_history(&state, 10, 0).await {
+                Response::LightHistory(h) => {
+                    let by: std::collections::HashMap<_, _> = h
+                        .transactions
+                        .into_iter()
+                        .map(|t| (t.txid.clone(), t))
+                        .collect();
+                    assert_eq!(by["tip"].confirmations, Some(1), "the tip block counts");
+                    assert_eq!(by["ten_deep"].confirmations, Some(10));
+                    assert_eq!(by["tip"].block_height, Some(900_010));
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
+        }
+
+        /// An entry the scanner has not seen mined must not borrow the tip and
+        /// claim a depth. It is unconfirmed, and the honest count is unknown
+        /// until the node is asked about it directly.
+        #[tokio::test]
+        async fn an_unmined_entry_does_not_infer_confirmations_from_the_tip() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            state.clients.write().await.chain = Arc::new(TipChain(900_010));
+
+            let mut store = history_store_for(&state).await.unwrap();
+            store
+                .record(wraith_wallet_core::history_store::HistoryEntry {
+                    txid: "pending".into(),
+                    at: 1,
+                    block_height: None,
+                    amount_sats: Some(-1_000),
+                    fee_sats: None,
+                    kind: "send".into(),
+                    memo: None,
+                })
+                .unwrap();
+
+            match l1_history(&state, 10, 0).await {
+                Response::LightHistory(h) => {
+                    assert_eq!(h.transactions[0].confirmations, None);
+                    assert_eq!(h.transactions[0].block_height, None);
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
+        }
+
+        /// One wallet's history must not appear in another's.
+        ///
+        /// The stores used to sit beside `node.json`, shared by every wallet.
+        /// That is wrong twice over: payments show up under the wrong wallet,
+        /// and the shared scan bookmark tells the scanner those blocks are
+        /// already read — so a wallet switched to would never build a history
+        /// at all.
+        #[tokio::test]
+        async fn two_wallets_do_not_share_a_history() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+
+            *state.active.write().await = Some("alice".to_string());
+            history_store_for(&state)
+                .await
+                .unwrap()
+                .record(wraith_wallet_core::history_store::HistoryEntry {
+                    txid: "alice-tx".into(),
+                    at: 1,
+                    block_height: Some(900_000),
+                    amount_sats: Some(1_000),
+                    fee_sats: None,
+                    kind: "receive".into(),
+                    memo: None,
+                })
+                .unwrap();
+
+            *state.active.write().await = Some("bob".to_string());
+            let bob = history_store_for(&state).await.unwrap();
+            assert!(
+                bob.is_empty(),
+                "bob must not see alice's payment, got {:?}",
+                bob.list()
+            );
+
+            *state.active.write().await = Some("alice".to_string());
+            assert_eq!(
+                history_store_for(&state).await.unwrap().len(),
+                1,
+                "and alice must still have her own"
+            );
+        }
+
+        /// A store keyed on the active wallet has nothing to open when there
+        /// is no active wallet, and says so rather than falling back to a
+        /// shared file.
+        #[tokio::test]
+        async fn a_store_without_an_active_wallet_refuses() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let err = history_store_for(&state).await.expect_err("must refuse");
+            assert!(err.contains("no active wallet"), "got: {err}");
+        }
+
+        /// The birth height is what a restore reads forward from. Recording
+        /// one and reading it back is the whole contract the scanner relies
+        /// on, so it is pinned end to end rather than trusted.
+        #[tokio::test]
+        async fn a_recorded_birth_height_is_read_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            assert_eq!(
+                wallet_meta_for(&state).await.unwrap().birth_height,
+                None,
+                "a wallet with no recorded height must not invent one"
+            );
+
+            record_birth_height(&state, "harness", Some(880_000)).await;
+            assert_eq!(
+                wallet_meta_for(&state).await.unwrap().birth_height,
+                Some(880_000)
+            );
+        }
+
+        /// A locked wallet cannot tell its own outputs from a stranger's, so
+        /// it records no amount. Recording a `0` would tell the user the
+        /// transaction moved nothing, which is the one reading that is
+        /// certainly wrong.
+        #[tokio::test]
+        async fn a_broadcast_without_keys_records_no_amount_rather_than_zero() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            let psbt = test_psbt(&[(10_000, 0xaa)], &[(9_500, 0xbb)]);
+            record_broadcast(&state, "deadbeef", Some(&psbt), "send", None)
+                .await
+                .expect("recording must succeed even with no wallet unlocked");
+            let store = history_store_for(&state).await.unwrap();
+            let rows = store.list();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].amount_sats, None,
+                "no keys means no amount, not a zero amount"
+            );
+            assert_eq!(
+                rows[0].fee_sats,
+                Some(500),
+                "the fee needs no keys — it is inputs minus outputs"
+            );
+        }
+
+        /// A backend that cannot answer must not have its silence rendered as
+        /// "unconfirmed" — that would show every settled payment as pending.
+        #[tokio::test]
+        async fn history_reports_unknown_confirmations_as_unknown() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            record_broadcast(&state, "aa11", None, "send", None)
+                .await
+                .unwrap();
+            match l1_history(&state, 10, 0).await {
+                Response::LightHistory(h) => {
+                    assert_eq!(h.total_count, 1);
+                    assert_eq!(
+                        h.transactions[0].confirmations, None,
+                        "the stub chain cannot say, so the history must not claim zero"
+                    );
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
+        }
+
+        /// `total_count` is the whole history, not the size of the page — a
+        /// pager that reports the page length can never advance past page one.
+        #[tokio::test]
+        async fn paging_reports_the_full_total_not_the_page_size() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            for i in 0..5u32 {
+                record_broadcast(&state, &format!("tx{i}"), None, "send", None)
+                    .await
+                    .unwrap();
+            }
+            match l1_history(&state, 2, 0).await {
+                Response::LightHistory(h) => {
+                    assert_eq!(h.transactions.len(), 2, "the page is two");
+                    assert_eq!(h.total_count, 5, "the total is five");
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
+        }
+
         /// A session-less `DaemonState` sufficient to exercise
         /// `light_send`'s mode gate. Everything past the gate needs a
         /// live GSP session, which the IPC integration tests cover; here
@@ -4867,28 +7043,30 @@ mod server {
             test_state_in(std::env::temp_dir())
         }
 
+        /// A state whose per-wallet stores resolve, without unlocking a real
+        /// keystore. The stores key on the ACTIVE wallet's name; a harness
+        /// without one exercises the "no active wallet" path instead of the
+        /// behaviour under test.
+        async fn test_state_with_wallet(wallets_dir: std::path::PathBuf) -> Arc<DaemonState> {
+            let state = test_state_in(wallets_dir);
+            *state.active.write().await = Some("harness".to_string());
+            state
+        }
+
         fn test_state_in(wallets_dir: std::path::PathBuf) -> Arc<DaemonState> {
             let node_config_path = wallets_dir.join("node.json");
             Arc::new(DaemonState {
                 started: Instant::now(),
                 clients: RwLock::new(NodeClients {
                     chain: Arc::new(RejectChain),
-                    gsp: Arc::new(GspClient::new("ws://127.0.0.1:0")),
-                    ghost_pay_urls: vec!["http://127.0.0.1:0".to_string()],
-                    gsp_urls: vec!["ws://127.0.0.1:0".to_string()],
-                    preset: PRESET_CUSTOM.to_string(),
                 }),
-                ghost_pay_env_override: false,
-                gsp_env_override: false,
                 node_config_path,
-                ghost_pay_internal_auth: None,
                 tor_proxy: None,
                 wraith_coordinator_url: None,
                 kiosk_mode: false,
                 wallets_dir,
                 wallets: RwLock::new(HashMap::new()),
                 active: RwLock::new(None),
-                session: RwLock::new(None),
                 network: bitcoin::Network::Regtest,
                 endpoint_display: std::env::temp_dir()
                     .join("wraithd-modegate-test.sock")
@@ -4898,69 +7076,190 @@ mod server {
                 idle_lock_secs: 0,
                 shroud_max_ms: 0,
                 update_manifest_url: None,
+                store_locks: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::new(),
                 wraith_mixes: RwLock::new(HashMap::new()),
-                prepared_locks: RwLock::new(HashMap::new()),
-                next_recovery_index: AtomicU32::new(0),
-                ghostd_url: None,
-                ghostd_cookie_path: None,
-                ghostd_user: None,
-                ghostd_pass: None,
+                lock_signings: RwLock::new(HashMap::new()),
+                ghostd: RwLock::new(GhostdSettings::default()),
+                ghostd_env_override: false,
+                pool_url: RwLock::new(None),
+                election_cache: RwLock::new(None),
             })
         }
 
+        /// Cash is refused an escape, and told why rather than just "no".
+        ///
+        /// Every other lane has a leaf that lets the owner leave alone. Cash
+        /// does not need one — it already spends with the owner's key on the
+        /// key path — and a caller who asks should learn that rather than
+        /// conclude the lane is stuck.
         #[tokio::test]
-        async fn light_send_refuses_retired_modes_before_any_send() {
+        async fn cash_has_no_escape_and_says_so() {
             let state = test_state();
-            for mode in ["wraith", "confidential"] {
-                let err = super::light_send(
-                    &state,
-                    "tghost1qexample".into(),
-                    1000,
-                    mode.into(),
-                    None,
-                    Some(0),
-                )
-                .await
-                .expect_err("a retired mode must be refused, never silently sent");
-                // Must fail at the mode gate — NOT by reaching the session
-                // step. If it reached the session it would return the
-                // "no GSP session" error, which would mean the mode was
-                // (wrongly) accepted as sendable.
+            let line = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockEscapePlan {
+                    lock_id: "no-such-lock".into(),
+                    lane: "cash".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&line, &state).await;
+            let Response::Error(e) = resp.payload else {
+                panic!("Cash must not resolve to an escape plan");
+            };
+            assert!(
+                e.message.contains("nothing to wait for"),
+                "the refusal must explain, not just decline: {}",
+                e.message
+            );
+            // The lock_id is nonsense on purpose: if the error were about the
+            // Lock, the lane check would be running too late to be useful.
+            assert!(
+                !e.message.contains("no remembered Lock"),
+                "Cash must be refused before the Lock lookup: {}",
+                e.message
+            );
+        }
+
+        /// Each lane's key path has different co-signers, and two lanes have
+        /// no owner-signable key path at all.
+        ///
+        /// Getting this wrong does not fail loudly: signing under the wrong
+        /// pair produces a well-formed signature that simply does not verify
+        /// against the address, discovered at broadcast.
+        #[test]
+        fn each_lane_names_its_own_cosigners() {
+            use std::str::FromStr;
+            use wraith_wallet_core::ghost_lock_account::LaneKind;
+
+            let k = |b: u8| {
+                let sk = bitcoin::secp256k1::SecretKey::from_slice(&[b; 32]).unwrap();
+                sk.x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .0
+            };
+            let owner = k(1);
+            let backup = k(2);
+            let quorum = k(3);
+            let record = wraith_wallet_core::ghost_lock_store::StoredLock {
+                lock_id: "l".into(),
+                label: None,
+                backup_pubkey: hex::encode(backup.serialize()),
+                heir_pubkey: hex::encode(k(4).serialize()),
+                quorum_pubkey: hex::encode(quorum.serialize()),
+                anchor_height: 1,
+                inherit_height: 2,
+                bip86_index: 0,
+            };
+
+            // Savings co-signs with the backup device.
+            let savings = super::lane_cosigners(LaneKind::Savings, owner, &record).unwrap();
+            assert_eq!(savings, vec![owner, backup]);
+
+            // Spending co-signs with the quorum — a DIFFERENT pair.
+            let spending = super::lane_cosigners(LaneKind::Spending, owner, &record).unwrap();
+            assert_eq!(spending, vec![owner, quorum]);
+            assert_ne!(
+                savings, spending,
+                "the two co-signed lanes must not share a key set"
+            );
+
+            // Cash is single-sig; a ceremony here would be theatre.
+            let err = super::lane_cosigners(LaneKind::Cash, owner, &record)
+                .expect_err("Cash has no MuSig2 key path");
+            assert!(err.contains("your key alone"), "{err}");
+
+            // Investments is the quorum's alone — the owner cannot co-sign it.
+            let err = super::lane_cosigners(LaneKind::Investments, owner, &record)
+                .expect_err("Investments has no owner key path");
+            assert!(
+                err.contains("recall leaf"),
+                "the refusal must name the way out: {err}"
+            );
+
+            let _ = bitcoin::XOnlyPublicKey::from_str(&record.backup_pubkey).unwrap();
+        }
+
+        /// Private entry must refuse the Cash lane, and refuse it at the gate
+        /// — before the Lock is even looked up.
+        ///
+        /// Tested through `dispatch` rather than a helper because the point of
+        /// putting the rule in the daemon is that it holds for anything that
+        /// speaks the wire, not just for the CLI that asks nicely.
+        #[tokio::test]
+        async fn a_round_may_not_be_pointed_at_the_cash_lane() {
+            let state = test_state();
+            let line = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockRoundDestination {
+                    lock_id: "no-such-lock".into(),
+                    lane: "cash".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&line, &state).await;
+            let Response::Error(e) = resp.payload else {
+                panic!("Cash must be refused, never resolved to an address");
+            };
+            assert!(
+                e.message.contains("Cash"),
+                "the refusal must name the lane: {}",
+                e.message
+            );
+            // The lock_id is deliberately nonsense. If the error is about the
+            // Lock not being found, the compartment rule ran too late — a real
+            // lock_id would then have sailed past it.
+            assert!(
+                !e.message.contains("no remembered Lock"),
+                "Cash must be refused BEFORE the Lock lookup; got: {}",
+                e.message
+            );
+        }
+
+        /// The three private lanes get past the compartment gate. They stop at
+        /// the Lock lookup instead, which is what proves the gate let them
+        /// through rather than the request failing for some earlier reason.
+        #[tokio::test]
+        async fn the_private_lanes_get_past_the_compartment_gate() {
+            let state = test_state();
+            for lane in ["savings", "spending", "investments"] {
+                let line = serde_json::to_string(&Envelope::new(
+                    1,
+                    Request::GhostLockRoundDestination {
+                        lock_id: "no-such-lock".into(),
+                        lane: lane.into(),
+                    },
+                ))
+                .unwrap();
+                let resp = super::dispatch(&line, &state).await;
+                let Response::Error(e) = resp.payload else {
+                    panic!("{lane}: a nonexistent Lock cannot resolve to an address");
+                };
                 assert!(
-                    !err.contains("no GSP session"),
-                    "mode `{mode}` must be rejected at the gate before the send path; got: {err}"
-                );
-                assert!(
-                    err.contains("not available"),
-                    "mode `{mode}` rejection should explain it is unavailable; got: {err}"
+                    !e.message.contains("cannot pay out into Cash"),
+                    "{lane} is a private lane and must not hit the Cash rule: {}",
+                    e.message
                 );
             }
         }
 
+        /// An unknown lane name is refused, not silently coerced to a default.
         #[tokio::test]
-        async fn light_send_accepts_ghostpay_past_the_mode_gate() {
-            // ghostpay (and the empty default) must pass the mode gate.
-            // With no session configured the send can't complete, but it
-            // must advance to the session step — proven by the
-            // "no GSP session" error rather than a mode-rejection error.
+        async fn an_unknown_lane_is_refused() {
             let state = test_state();
-            for mode in ["ghostpay", ""] {
-                let err = super::light_send(
-                    &state,
-                    "tghost1qexample".into(),
-                    1000,
-                    mode.into(),
-                    None,
-                    Some(0),
-                )
-                .await
-                .expect_err("no session is configured in this unit test");
-                assert!(
-                    err.contains("no GSP session"),
-                    "ghostpay must clear the mode gate and reach the session step; got: {err}"
-                );
-            }
+            let line = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockRoundDestination {
+                    lock_id: "no-such-lock".into(),
+                    lane: "chequing".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&line, &state).await;
+            let Response::Error(e) = resp.payload else {
+                panic!("an unknown lane must not resolve to an address");
+            };
+            assert!(e.message.contains("unknown lane"), "got: {}", e.message);
         }
 
         #[tokio::test]
@@ -5033,11 +7332,11 @@ mod server {
 
         #[tokio::test]
         async fn connection_status_reports_unreachable_without_erroring() {
-            // With the RejectChain stub (ghost-pay unreachable) and no GSP
-            // session, ConnectionStatus must still return a structured
-            // snapshot — NOT a Response::Error. This is what lets the header
-            // render a clear "unreachable" state instead of a perpetual
-            // "connecting…" spinner on a laptop with no local endpoints.
+            // With the RejectChain stub standing in for an unreachable node,
+            // ConnectionStatus must still return a structured snapshot — NOT
+            // a Response::Error. That is what lets the header render a clear
+            // "unreachable" state instead of a perpetual "connecting…"
+            // spinner on a laptop with nothing running locally.
             let state = test_state();
             let req = serde_json::to_string(&Envelope::new(1, Request::ConnectionStatus)).unwrap();
             let resp = super::dispatch(&req, &state).await;
@@ -5047,113 +7346,221 @@ mod server {
                         s.network, "regtest",
                         "network is read from config, not the backend"
                     );
+                    assert!(!s.node_reachable, "the stub must read as unreachable");
                     assert!(
-                        !s.ghost_pay_reachable,
-                        "RejectChain stub must read as unreachable"
+                        !s.node_configured,
+                        "this harness has no node set, and that is a different \
+                         state from one that is set and not answering"
                     );
                     assert!(
-                        s.ghost_pay_error.is_some(),
-                        "an unreachable backend should carry an error hint"
+                        s.node_error.is_none(),
+                        "with no node configured there is nothing to have failed — \
+                         reporting a probe error would send the user hunting for a \
+                         fault instead of a setting"
                     );
-                    assert!(s.ghost_pay_version.is_none());
-                    assert!(!s.gsp_have_token, "no session configured in this test");
-                    assert!(!s.gsp_connected);
-                    assert!(s.gsp_phase.is_none());
-                    assert!(
-                        !s.chain_synced,
-                        "cannot be synced while ghost-pay is unreachable"
-                    );
+                    assert!(s.node_version.is_none());
+                    assert!(!s.chain_synced, "cannot be synced with no node");
                     assert!(s.chain_height.is_none());
                 }
                 other => panic!("expected ConnectionStatus, got {other:?}"),
             }
         }
 
-        /// SetNodeEndpoints must: apply the new URLs at runtime, persist them to
-        /// node.json, and have DaemonEnv reflect the change — all without a
-        /// restart.
+        /// `SetNode` must apply at runtime, persist to node.json, and be
+        /// reflected by `DaemonEnv` — all without a restart.
         #[tokio::test]
-        async fn set_node_endpoints_applies_persists_and_surfaces() {
+        async fn set_node_applies_persists_and_surfaces() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
 
-            // Switch to a custom node.
             let req = serde_json::to_string(&Envelope::new(
                 1,
-                Request::SetNodeEndpoints {
-                    preset: "custom".into(),
-                    ghost_pay_url: Some("https://pay.example.com:8800".into()),
-                    gsp_url: Some("wss://gsp.example.com:8900/ws/v1".into()),
+                Request::SetNode {
+                    ghostd_url: Some("https://node.example.com:8332".into()),
+                    cookie_path: Some("/home/test/.ghost/.cookie".into()),
+                    user: None,
+                    pass: None,
+                    pool_url: None,
                 },
             ))
             .unwrap();
             match super::dispatch(&req, &state).await.payload {
-                Response::NodeEndpointsSet(r) => {
-                    assert_eq!(r.preset, "custom");
-                    assert_eq!(r.ghost_pay_urls, vec!["https://pay.example.com:8800"]);
-                    assert_eq!(r.gsp_urls, vec!["wss://gsp.example.com:8900/ws/v1"]);
+                Response::NodeSet(r) => {
+                    assert_eq!(
+                        r.ghostd_url.as_deref(),
+                        Some("https://node.example.com:8332")
+                    );
+                    assert_eq!(r.auth, "cookie");
+                    assert!(!r.env_pinned);
                 }
-                other => panic!("expected NodeEndpointsSet, got {other:?}"),
+                other => panic!("expected NodeSet, got {other:?}"),
             }
 
-            // Persisted to node.json, and reloadable.
             let persisted =
                 super::load_node_config(&state.node_config_path).expect("node.json written");
-            assert_eq!(persisted.preset, "custom");
             assert_eq!(
-                persisted.ghost_pay_urls,
-                vec!["https://pay.example.com:8800"]
+                persisted.ghostd.url.as_deref(),
+                Some("https://node.example.com:8332")
             );
 
-            // Live state reflects it via the accessors + DaemonEnv.
-            assert_eq!(
-                state.ghost_pay_urls().await,
-                vec!["https://pay.example.com:8800".to_string()]
-            );
             let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
             match super::dispatch(&env, &state).await.payload {
                 Response::DaemonEnv(e) => {
-                    assert_eq!(e.node_preset, "custom");
-                    assert_eq!(e.gsp_urls, vec!["wss://gsp.example.com:8900/ws/v1"]);
-                    assert!(!e.ghost_pay_env_override);
+                    assert_eq!(
+                        e.ghostd_url.as_deref(),
+                        Some("https://node.example.com:8332")
+                    );
+                    assert_eq!(e.ghostd_auth, "cookie");
+                    assert!(!e.ghostd_env_override);
                 }
                 other => panic!("expected DaemonEnv, got {other:?}"),
             }
-
-            // Switching to the public preset ignores the URL fields and applies
-            // the bundled fleet endpoints.
-            let pub_req = serde_json::to_string(&Envelope::new(
-                3,
-                Request::SetNodeEndpoints {
-                    preset: "public".into(),
-                    ghost_pay_url: None,
-                    gsp_url: None,
-                },
-            ))
-            .unwrap();
-            match super::dispatch(&pub_req, &state).await.payload {
-                Response::NodeEndpointsSet(r) => {
-                    assert_eq!(r.preset, "public");
-                    assert_eq!(r.ghost_pay_urls, vec![super::PUBLIC_GHOST_PAY.to_string()]);
-                    assert_eq!(r.gsp_urls, vec![super::PUBLIC_GSP.to_string()]);
-                }
-                other => panic!("expected NodeEndpointsSet, got {other:?}"),
-            }
         }
 
-        /// A custom node with a wrong-scheme URL is rejected, and nothing is
-        /// persisted — a typo must never silently point the wallet at nothing.
+        /// The pool is optional, and its absence is silence rather than an
+        /// error: mixing still works with a coordinator URL supplied per
+        /// round, it just never rotates.
         #[tokio::test]
-        async fn set_node_endpoints_rejects_bad_scheme() {
+        async fn no_pool_configured_means_no_election_and_no_network_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            assert!(state.pool_url.read().await.is_none());
+            // Returns without touching the chain stub, which would error.
+            assert!(verified_election(&state).await.is_none());
+        }
+
+        /// The pool URL is persisted and reported back, so a settings screen
+        /// can show what is in force after a restart.
+        #[tokio::test]
+        async fn a_pool_url_is_persisted_and_surfaced() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
             let req = serde_json::to_string(&Envelope::new(
                 1,
-                Request::SetNodeEndpoints {
-                    preset: "custom".into(),
-                    // ws:// where http(s):// is required for ghost-pay.
-                    ghost_pay_url: Some("ws://pay.example.com:8800".into()),
-                    gsp_url: Some("wss://gsp.example.com:8900/ws/v1".into()),
+                Request::SetNode {
+                    ghostd_url: Some("http://127.0.0.1:8332".into()),
+                    cookie_path: None,
+                    user: None,
+                    pass: None,
+                    pool_url: Some("https://pool.example:8443".into()),
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&req, &state).await.payload {
+                Response::NodeSet(r) => {
+                    assert_eq!(r.pool_url.as_deref(), Some("https://pool.example:8443"))
+                }
+                other => panic!("expected NodeSet, got {other:?}"),
+            }
+            let persisted = super::load_node_config(&state.node_config_path).unwrap();
+            assert_eq!(
+                persisted.pool_url.as_deref(),
+                Some("https://pool.example:8443")
+            );
+
+            let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
+            match super::dispatch(&env, &state).await.payload {
+                Response::DaemonEnv(e) => {
+                    assert_eq!(e.pool_url.as_deref(), Some("https://pool.example:8443"))
+                }
+                other => panic!("expected DaemonEnv, got {other:?}"),
+            }
+        }
+
+        /// Changing the pool must drop what the last one said.
+        ///
+        /// The election is cached for a whole epoch — about a day — so a stale
+        /// entry would keep sending rounds to the previous pool's seat long
+        /// after the user pointed the wallet somewhere else.
+        #[tokio::test]
+        async fn changing_the_pool_invalidates_the_cached_election() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            *state.election_cache.write().await = Some((7, serde_json::json!({ "enabled": true })));
+
+            state
+                .set_node(
+                    GhostdSettings {
+                        url: Some("http://127.0.0.1:8332".into()),
+                        ..Default::default()
+                    },
+                    Some("https://other.example:8443".into()),
+                )
+                .await
+                .expect("set node");
+
+            assert!(
+                state.election_cache.read().await.is_none(),
+                "a cached election must not outlive the pool that served it"
+            );
+        }
+
+        /// A malformed pool URL is refused, and nothing is persisted — the
+        /// same rule the node URL follows.
+        #[tokio::test]
+        async fn a_pool_url_with_the_wrong_scheme_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let err = state
+                .set_node(GhostdSettings::default(), Some("ws://pool.example".into()))
+                .await
+                .expect_err("must refuse");
+            assert!(err.contains("pool URL"), "got: {err}");
+            assert!(
+                !state.node_config_path.exists(),
+                "a rejected change must not write node.json"
+            );
+        }
+
+        /// The RPC password must never come back out over the IPC.
+        ///
+        /// A settings screen needs to know *how* the wallet authenticates, and
+        /// nothing more. Echoing the secret back would put it in every log,
+        /// screenshot and bug report that captured an IPC trace.
+        #[tokio::test]
+        async fn the_node_password_never_crosses_the_ipc() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::SetNode {
+                    ghostd_url: Some("http://127.0.0.1:8332".into()),
+                    cookie_path: None,
+                    user: Some("ghost".into()),
+                    pass: Some("hunter2-the-secret".into()),
+                    pool_url: None,
+                },
+            ))
+            .unwrap();
+            let reply = super::dispatch(&req, &state).await;
+            let wire = serde_json::to_string(&reply).unwrap();
+            assert!(
+                !wire.contains("hunter2-the-secret"),
+                "the password must not appear in the reply: {wire}"
+            );
+            let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
+            let wire = serde_json::to_string(&super::dispatch(&env, &state).await).unwrap();
+            assert!(
+                !wire.contains("hunter2-the-secret"),
+                "the password must not appear in DaemonEnv either: {wire}"
+            );
+        }
+
+        /// A wrong-scheme URL is rejected, and nothing is persisted — a typo
+        /// must never silently point the wallet at nothing.
+        #[tokio::test]
+        async fn set_node_rejects_bad_scheme() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::SetNode {
+                    // ws:// where http(s):// is required for an RPC endpoint.
+                    ghostd_url: Some("ws://node.example.com:8332".into()),
+                    cookie_path: None,
+                    user: None,
+                    pass: None,
+                    pool_url: None,
                 },
             ))
             .unwrap();
@@ -5171,16 +7578,15 @@ mod server {
             );
         }
 
-        /// While an env-var override pins the endpoints, SetNodeEndpoints is
-        /// refused — env vars keep power-user precedence.
+        /// While the environment pins the node, `SetNode` is refused — env
+        /// vars keep power-user precedence.
         #[tokio::test]
-        async fn set_node_endpoints_refused_under_env_override() {
+        async fn set_node_refused_under_env_override() {
             let dir = tempfile::tempdir().unwrap();
             let mut state = test_state_in(dir.path().to_path_buf());
-            // Simulate a boot with WRAITHD_GHOST_PAY set.
-            Arc::get_mut(&mut state).unwrap().ghost_pay_env_override = true;
+            Arc::get_mut(&mut state).unwrap().ghostd_env_override = true;
             let err = state
-                .set_node_endpoints("public", None, None)
+                .set_node(GhostdSettings::default(), None)
                 .await
                 .expect_err("must refuse while env override is active");
             assert!(

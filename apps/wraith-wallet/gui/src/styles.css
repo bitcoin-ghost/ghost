@@ -1262,3 +1262,201 @@ code {
   background: var(--accent);
   transform: scale(1.25);
 }
+
+/* ── Anonymity set panel ────────────────────────────────────────────────── */
+/* The headline is the entity count. Seats sit beside it in a quieter weight,
+   because the gap between them is the signal and hiding either one hides it. */
+
+.anon-card { border-left: 3px solid var(--rule-strong); }
+.anon-card.anon-pass { border-left-color: var(--pass); }
+.anon-card.anon-warn { border-left-color: var(--warn); }
+.anon-card.anon-fail { border-left-color: var(--fail); }
+
+.anon-headline {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.anon-headline .eyebrow { flex-basis: 100%; }
+.anon-figure {
+  font-size: 2.25rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.anon-pass .anon-figure { color: var(--pass); }
+.anon-warn .anon-figure { color: var(--warn); }
+.anon-fail .anon-figure { color: var(--fail); }
+.anon-of { font-size: 0.875rem; }
+
+.anon-breakdown {
+  margin: 0 0 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+.anon-breakdown .kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+.anon-breakdown dt { margin: 0; }
+.anon-breakdown dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.anon-alert {
+  margin: 0 0 0.75rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: 4px;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.anon-warn .anon-alert { background: var(--warn-weak); }
+.anon-fail .anon-alert { background: var(--fail-weak); }
+
+.anon-proof {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--dim);
+}
+.anon-proof.anon-unchecked { color: var(--warn); }
+
+/* Refusal block: the panel and its explanation read as one unit. */
+.mix-refusal { display: flex; flex-direction: column; gap: 0.75rem; }
+.mix-reasons { margin: 0 0 0.75rem; padding-left: 1.25rem; font-size: 0.875rem; line-height: 1.6; }
+.mix-reasons li { margin-bottom: 0.25rem; }
+
+/* ── Ghost Lock lanes ───────────────────────────────────────────────────── */
+/* The total leads because it answers the question. Pending and custodial sit
+   beside it rather than inside it — both would mislead if folded in. */
+
+.lock-total { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.5rem 0.75rem; margin-bottom: 0.75rem; }
+.lock-total .eyebrow { flex-basis: 100%; }
+.lock-total-figure { font-size: 2rem; line-height: 1; font-variant-numeric: tabular-nums; }
+.lock-total-pending { font-size: 0.875rem; }
+
+.lock-custodial-note {
+  margin: 0 0 1rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: 4px;
+  background: var(--warn-weak);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.lane-list { display: flex; flex-direction: column; gap: 0.75rem; }
+.lane-row { padding: 0.625rem 0.75rem; border: 1px solid var(--rule); border-radius: 4px; }
+.lane-row.lane-custodial { border-color: var(--warn); }
+.lane-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem; }
+.lane-name { font-weight: 600; }
+.lane-figures { display: flex; align-items: baseline; gap: 0.75rem; }
+.lane-settled { font-size: 1.125rem; font-variant-numeric: tabular-nums; }
+.lane-pending { font-size: 0.8125rem; }
+.lane-addr { font-size: 0.75rem; overflow-wrap: anywhere; margin-top: 0.25rem; }
+.lane-funding { font-size: 0.72rem; line-height: 1.45; margin: 0.35rem 0 0; }
+.lane-funding code {
+  font-size: 0.95em;
+  padding: 0.05rem 0.25rem;
+  border-radius: 3px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+}
+.lock-height { margin: 0.75rem 0 0; font-size: 0.8125rem; }
+
+/* Ghost Lock key entry. Public keys only — nothing secret is typed here. */
+.ghost-lock-panel { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; }
+.lock-key-form { display: flex; flex-direction: column; gap: 0.75rem; margin: 0.75rem 0; }
+.lock-key-field { display: flex; flex-direction: column; gap: 0.25rem; }
+.lock-key-field input { width: 100%; font-size: 0.8125rem; }
+.lock-key-hint { font-size: 0.75rem; }
+
+.saved-locks { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+.saved-lock { display: flex; align-items: center; gap: 0.25rem; }
+
+/* --- Offline device -------------------------------------------------- */
+.device-title { display: flex; align-items: center; gap: 0.5rem; }
+.device-title svg { flex: 0 0 auto; }
+.device-done h2 { display: flex; align-items: center; gap: 0.5rem; }
+
+.device-summary-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--hairline, rgba(127, 127, 127, 0.18));
+}
+.device-summary-row:last-of-type { border-bottom: 0; }
+.device-addr { overflow-wrap: anywhere; text-align: right; }
+
+/* The one figure that changes what a person should do, so it does not sit
+   in the same visual register as the rest. */
+.device-warn {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  background: var(--warn-bg, rgba(200, 140, 0, 0.12));
+}
+
+.device-payload { margin: 0.8rem 0; }
+.device-payload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.4rem;
+}
+.device-qr {
+  display: flex;
+  justify-content: center;
+  padding: 0.9rem;
+  border-radius: 6px;
+  /* Always light behind a QR: a dark-themed code is one a camera cannot read. */
+  background: #fff;
+}
+.device-payload-body {
+  max-height: 11rem;
+  overflow: auto;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  margin: 0.5rem 0 0;
+  padding: 0.6rem;
+  border-radius: 4px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.1));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.device-lock-pick { display: flex; gap: 0.5rem; align-items: center; }
+.device-lock-pick select { flex: 1 1 auto; }
+
+/* --- Leaving alone ---------------------------------------------------- */
+.escape-panel h2 { margin-top: 0; }
+.escape-plan { margin-top: 1rem; }
+.escape-plan h3 { margin-bottom: 0.5rem; }
+.escape-plan h4 {
+  margin: 0.9rem 0 0.3rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+.escape-facts { display: grid; gap: 0.35rem; margin-bottom: 0.6rem; }
+.escape-facts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.82rem;
+}
+.escape-addr { overflow-wrap: anywhere; text-align: right; }
+.escape-coins { list-style: none; padding: 0; margin: 0; font-size: 0.82rem; }
+.escape-coins li { padding: 0.2rem 0; }
+.escape-tx {
+  max-height: 8rem;
+  overflow: auto;
+  font-size: 0.7rem;
+  padding: 0.6rem;
+  border-radius: 4px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.1));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

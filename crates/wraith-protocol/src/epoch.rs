@@ -68,24 +68,70 @@ pub fn shard_key_for_tier_epoch(tier_id: &str, epoch: u64) -> [u8; 32] {
 /// Domain separator for the per-epoch beacon.
 const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
 
-/// Derive the 32-byte per-epoch beacon from the anchor block's hash:
-/// `SHA256(domain ‖ epoch_le ‖ anchor_hash)`.
+/// How many consecutive block hashes the beacon combines.
 ///
-/// Lives here, beside [`snapshot_height_for_epoch`], because a node and a
-/// wallet must derive the byte-identical beacon or every verification fails.
-/// It was previously defined in `ghost-pool`'s wiring layer, where a wallet
-/// could not reach it — and where it anchored on a different block than this
-/// module documents (see that function).
+/// One hash gives the miner of that single block a free look: they see the
+/// beacon their block produces before publishing, and can discard it. Combining
+/// several means influencing the beacon requires mining several *specific
+/// consecutive* blocks, which multiplies the cost out of reach.
+pub const BEACON_ANCHOR_BLOCKS: usize = 6;
+
+/// Derive an epoch's beacon from several consecutive block hashes.
 ///
-/// `anchor_hash` is the block hash **exactly as the node's JSON-RPC returns
-/// it**, hex-decoded with no byte reversal. Both sides must agree on that or
-/// the beacons differ silently.
+/// # Why this is not commit-reveal
 ///
-/// SECURITY: the miner of the anchor block can choose among the candidate
-/// hashes it could publish, so this beacon's grinding-resistance is BOUNDED.
-/// The unbiasable construction is the threshold-VRF / DKG one, gated on an
-/// external crypto audit. Everything downstream takes the beacon as a value,
-/// so swapping it changes nothing else.
+/// The earlier assessment of single-hash grinding was overstated, and correcting
+/// it changed the design. There is no cheap re-roll: a block hash does not exist
+/// until the proof of work succeeds, so grinding the extranonce or timestamp
+/// yields nothing usable. A second look requires finding a **second valid block
+/// at the same height**, and while searching the miner is likely to lose the
+/// height altogether.
+///
+/// So the attack was: one free look, and declining it forfeits a full block
+/// reward — bought for one tier's sessions for one epoch, with no ability to
+/// link inputs to outputs because the outputs are blind-signed. Nobody pays
+/// that.
+///
+/// The residual is that one free look, and combining `BEACON_ANCHOR_BLOCKS`
+/// hashes removes it for nothing: no new messages, no transport, no liveness
+/// dependency, and no last-revealer withholding weakness. `beacon::BeaconRound`
+/// stays unwired, because commit-reveal solves a problem that does not pay for
+/// itself and brings costs a block hash does not have.
+///
+/// # Order matters and is fixed
+///
+/// Hashes are folded oldest-first. The caller must supply them in ascending
+/// height order; the same set in a different order gives a different beacon,
+/// which would be a split.
+///
+/// # A fixed height, never the tip
+///
+/// Nodes see different tips and reorgs happen, so anchoring on a live tip trades
+/// grinding for disagreement — the more expensive of the two problems.
+pub fn derive_beacon_multi(epoch: u64, anchor_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(BEACON_DOMAIN);
+    h.update(epoch.to_le_bytes());
+    // Length-prefixed so two different runs of hashes cannot fold to the same
+    // beacon by concatenating differently.
+    h.update((anchor_hashes.len() as u64).to_le_bytes());
+    for a in anchor_hashes {
+        h.update(a);
+    }
+    h.finalize().into()
+}
+
+/// Single-anchor beacon.
+///
+/// Retained for callers that have one hash, and equivalent to
+/// [`derive_beacon_multi`] with a one-element slice is **not** true — the
+/// multi-hash form is length-prefixed and this is not, deliberately, so the two
+/// cannot be confused for one another by a caller that supplies the wrong
+/// number of anchors.
+///
+/// Prefer `derive_beacon_multi` with [`BEACON_ANCHOR_BLOCKS`] hashes. See its
+/// documentation for why that closes the miner's one free look, and why
+/// commit-reveal is not the answer.
 pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(BEACON_DOMAIN);
@@ -139,6 +185,11 @@ impl EpochCoordinators {
     /// wanting the same denomination in the same epoch converge on the same
     /// seat, which is a larger anonymity set rather than load spreading.
     ///
+    /// Takes no epoch: it is always `self.epoch`. It used to be a parameter,
+    /// which let a caller pair one epoch's election with another epoch's shard
+    /// key and silently get a different seat — the same class of mistake as the
+    /// one below, and reachable by a plain typo.
+    ///
     /// This replaced a `coordinator_for_session(session_id)` that documented
     /// itself as the value "a wallet and every node agree" on, while the
     /// wallet actually sharded by `(tier, epoch)` and nothing called the
@@ -146,11 +197,11 @@ impl EpochCoordinators {
     /// dead and inviting: whoever wired up its `owns_session` companion would
     /// have had wallets dialling one seat while another believed it owned the
     /// work.
-    pub fn coordinator_for_tier(&self, tier_id: &str, epoch: u64) -> Option<&ElectedCoordinator> {
+    pub fn coordinator_for_tier(&self, tier_id: &str) -> Option<&ElectedCoordinator> {
         if self.coordinators.is_empty() {
             return None;
         }
-        let key = shard_key_for_tier_epoch(tier_id, epoch);
+        let key = shard_key_for_tier_epoch(tier_id, self.epoch);
         let seat = shard_for(&key, self.coordinators.len());
         // seats are exactly 0..len in seat order, so index directly.
         self.coordinators.get(seat as usize)
@@ -202,6 +253,9 @@ mod tests {
         assert_eq!(epoch_for_height(snapshot_height_for_epoch(e)), e - 1);
     }
 
+    /// Pins the relationship between the placeholder and its replacement, so
+    /// the two beacon derivations cannot drift apart unnoticed — one of them is
+    /// grindable and it is the one currently wired up.
     #[test]
     fn canonical_roster_is_order_independent_and_deduped() {
         let mut a = qualified(6);
@@ -237,13 +291,13 @@ mod tests {
         let ec = EpochCoordinators::elect(3, &beacon(2), &q, 5);
         for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
             let c = ec
-                .coordinator_for_tier(tier, 3)
+                .coordinator_for_tier(tier)
                 .expect("a coordinator owns every tier");
             assert!(ec.is_coordinator(&c.node_id));
             // Stable: every wallet asking for this tier in this epoch lands
             // on the same seat, which is the point — a larger anonymity set,
             // not load spreading.
-            assert_eq!(ec.coordinator_for_tier(tier, 3).unwrap().node_id, c.node_id);
+            assert_eq!(ec.coordinator_for_tier(tier).unwrap().node_id, c.node_id);
         }
     }
 
@@ -252,10 +306,13 @@ mod tests {
     #[test]
     fn a_tier_moves_between_seats_across_epochs() {
         let q = qualified(15);
-        let ec = EpochCoordinators::elect(3, &beacon(2), &q, 5);
         let mut hit = std::collections::HashSet::new();
+        // Re-elect each epoch, as a node does. This used to hold one election
+        // and vary only the epoch argument, which exercised a pairing that
+        // cannot occur now the argument is gone.
         for epoch in 0u64..200 {
-            hit.insert(ec.coordinator_for_tier("100k_sats", epoch).unwrap().seat);
+            let ec = EpochCoordinators::elect(epoch, &beacon(2), &q, 5);
+            hit.insert(ec.coordinator_for_tier("100k_sats").unwrap().seat);
         }
         assert_eq!(hit.len(), 5, "every seat serves the tier in some epoch");
     }
@@ -311,6 +368,67 @@ mod tests {
     fn empty_roster_seats_nobody() {
         let ec = EpochCoordinators::elect(1, &beacon(1), &[], 4);
         assert_eq!(ec.seats(), 0);
-        assert!(ec.coordinator_for_tier("100k_sats", 1).is_none());
+        assert!(ec.coordinator_for_tier("100k_sats").is_none());
+    }
+    fn anchors(n: usize) -> Vec<[u8; 32]> {
+        (0..n as u8).map(|i| [i.wrapping_add(1); 32]).collect()
+    }
+
+    #[test]
+    fn the_multi_anchor_beacon_depends_on_every_hash() {
+        // Influencing it must require mining every one of the blocks, so
+        // changing any single hash has to change the beacon.
+        let base = derive_beacon_multi(7, &anchors(BEACON_ANCHOR_BLOCKS));
+        for i in 0..BEACON_ANCHOR_BLOCKS {
+            let mut a = anchors(BEACON_ANCHOR_BLOCKS);
+            a[i] = [0xEE; 32];
+            assert_ne!(
+                base,
+                derive_beacon_multi(7, &a),
+                "changing anchor {i} must change the beacon"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_order_is_part_of_the_beacon() {
+        // Callers must supply ascending height order. Two nodes folding the
+        // same hashes differently would be a split, so the order has to bind.
+        let a = anchors(BEACON_ANCHOR_BLOCKS);
+        let mut reversed = a.clone();
+        reversed.reverse();
+        assert_ne!(
+            derive_beacon_multi(7, &a),
+            derive_beacon_multi(7, &reversed)
+        );
+    }
+
+    #[test]
+    fn the_epoch_binds_too() {
+        let a = anchors(BEACON_ANCHOR_BLOCKS);
+        assert_ne!(derive_beacon_multi(7, &a), derive_beacon_multi(8, &a));
+    }
+
+    #[test]
+    fn a_different_anchor_count_gives_a_different_beacon() {
+        // Length-prefixed, so a caller supplying the wrong number of anchors
+        // cannot collide with the right one by concatenation.
+        let five = anchors(5);
+        let six = anchors(6);
+        assert_ne!(derive_beacon_multi(7, &five), derive_beacon_multi(7, &six));
+    }
+
+    #[test]
+    fn the_single_and_multi_forms_are_not_interchangeable() {
+        // Deliberate: a caller that passes one anchor where six were intended
+        // should not silently produce the single-anchor beacon.
+        let one = [3u8; 32];
+        assert_ne!(derive_beacon(7, &one), derive_beacon_multi(7, &[one]));
+    }
+
+    #[test]
+    fn the_beacon_is_deterministic() {
+        let a = anchors(BEACON_ANCHOR_BLOCKS);
+        assert_eq!(derive_beacon_multi(9, &a), derive_beacon_multi(9, &a));
     }
 }

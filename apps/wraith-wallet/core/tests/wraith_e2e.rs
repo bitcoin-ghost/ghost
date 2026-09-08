@@ -140,6 +140,10 @@ async fn five_wallets_complete_a_full_mix_round() {
                 scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
             };
             let req = MixRequest {
+                // The flow is what is under test here, not the anonymity floor;
+                // a dedicated test covers the refusal. Set to 1 so a small
+                // fixture round does not fail for the wrong reason.
+                min_entities: 1,
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo,
@@ -147,8 +151,15 @@ async fn five_wallets_complete_a_full_mix_round() {
                 mix_output_address: participant_address(i as u8 + 10).to_string(),
             };
             let signer = |_tx: &bitcoin::Transaction, _idx: usize, _amt: u64| {
+                // 64 bytes, the length a real BIP-341 SIGHASH_DEFAULT signature
+                // has. The bytes are not a valid signature — this test drives
+                // the protocol flow, and `five_wallets_sign_real_taproot_...`
+                // covers real signing — but the LENGTH has to be realistic,
+                // because `check_witness_sighash` reads it to detect a sighash
+                // type that would void the pre-sign inspection. A four-byte
+                // placeholder was never something that could reach a chain.
                 let mut w = Witness::new();
-                w.push([0xde, 0xad, 0xbe, 0xef]);
+                w.push([0xdeu8; 64]);
                 Ok::<Witness, WraithClientError>(w)
             };
             let prove = move |challenge: &str| {
@@ -161,7 +172,13 @@ async fn five_wallets_complete_a_full_mix_round() {
                     Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
                 }
             };
-            client.execute_mix(req, signer, prove).await
+            // Each wallet keeps its own ledger, as each would in production.
+            // Volatile is right here: the test is one process and one round, and
+            // the durable store has its own tests.
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            client.execute_mix(req, signer, prove, &mut ledger).await
         });
         handles.push(handle);
     }
@@ -255,6 +272,123 @@ async fn wait_for_quorum(state: &CoordinatorState) -> String {
     }
 }
 
+/// A round below the wallet's floor is left BEFORE the coin is committed.
+///
+/// The protocol assembles rounds at five participants; this wallet's default
+/// floor is ten. Landing in a legal round that is too small is therefore
+/// ordinary, and it must be free to walk away from.
+///
+/// It was not. The floor was only checked by `inspect`, which runs on the
+/// assembled transaction — long after `/inputs` has committed the outpoint to
+/// the round. A wallet that then declined to sign was swept as a non-signer
+/// and had its own outpoint banned for a cooldown: punished for enforcing its
+/// own privacy policy.
+///
+/// The assertion that matters is the second one. An error alone would still be
+/// satisfied by refusing too late, so this checks the coordinator's input
+/// store is empty — that the coin was never handed over.
+#[tokio::test]
+async fn a_round_below_the_floor_is_left_before_the_coin_is_committed() {
+    let stub_broadcaster = StubBroadcaster::new();
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(wraith_protocol::SystemClock),
+            Arc::new(wraith_protocol::RandomSessionIdGenerator),
+            Some(signet_addr(99)),
+            Some(Arc::new(stub_broadcaster.clone()) as Arc<dyn Broadcaster>),
+        )
+        .with_utxo_source(Arc::new(participant_utxos())),
+    );
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("axum serve");
+    });
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    // Five wallets enrol — a legal round, and exactly the size the protocol
+    // is allowed to assemble.
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let base_url = base_url.clone();
+        handles.push(tokio::spawn(async move {
+            let client = WraithSessionClient::new(base_url, Network::Signet);
+            let req = MixRequest {
+                // Ten: the wallet's real default, and twice what this round
+                // can hold.
+                min_entities: 10,
+                tier_id: TIER_ID.into(),
+                ghost_id: format!("wallet-{i}"),
+                utxo: ParticipantUtxo {
+                    txid: "11".repeat(32),
+                    vout: i as u32,
+                    value_sats: SEAT_PRICE,
+                    scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
+                },
+                mix_output_address: participant_address(i as u8 + 10).to_string(),
+            };
+            let prove = move |challenge: &str| {
+                let challenge = challenge.to_string();
+                async move {
+                    let txid = "11".repeat(32);
+                    let sid = challenge.lines().nth(1).unwrap_or_default().to_string();
+                    Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
+                }
+            };
+            client.prepare_mix(req, prove).await
+        }));
+    }
+
+    // Drive the round to Locked, the point at which the headcount is knowable.
+    let session_id = wait_for_quorum(&state).await;
+    state
+        .sessions
+        .apply_event(SessionGossipEvent::StateChanged {
+            session_id: session_id.clone(),
+            new_state: LiteSessionState::Locked,
+        })
+        .expect("apply Locked");
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let outcome = h.await.expect("wallet task");
+        match outcome {
+            Err(WraithClientError::RoundTooSmallToJoin {
+                seats,
+                min_entities,
+            }) => {
+                assert_eq!(min_entities, 10, "wallet {i} reported the wrong floor");
+                assert_eq!(
+                    seats, N,
+                    "wallet {i} should have seen all {N} enrolled seats, saw {seats} — \
+                     a count that is zero before anyone commits would make this test \
+                     pass for the wrong reason"
+                );
+            }
+            other => panic!("wallet {i} should have left the round early, got {other:?}"),
+        }
+    }
+
+    // The point of leaving early: nothing was committed, so nothing can be
+    // swept as a non-signer.
+    let committed = state
+        .inputs_store
+        .lock()
+        .expect("inputs_store")
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        committed.is_empty(),
+        "{} coins were committed to a round every wallet refused; each is now \
+         exposed to the non-signer sweep",
+        committed.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SOCKS5 proxy wiring (B: Tor anonymity for /outputs)
 // ---------------------------------------------------------------------------
@@ -316,6 +450,10 @@ async fn prepare_then_submit_works_via_split_api() {
             let client = WraithSessionClient::new(base_url, Network::Signet);
             let ghost = format!("wallet-{i}");
             let req = MixRequest {
+                // The flow is what is under test here, not the anonymity floor;
+                // a dedicated test covers the refusal. Set to 1 so a small
+                // fixture round does not fail for the wrong reason.
+                min_entities: 1,
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo: ParticipantUtxo {
@@ -350,10 +488,16 @@ async fn prepare_then_submit_works_via_split_api() {
             // Schnorr / ECDSA sign).
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             let mut w = Witness::new();
-            w.push([0xab, 0xcd, 0xef]);
+            w.push([0xabu8; 64]);
 
             // Phase 2: submit.
-            client.submit_witness(&prepared, w).await
+            // The split API now requires proof of inspection, exactly as the
+            // daemon's two-phase flow does.
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            let inspected = prepared.inspect(&mut ledger).expect("round inspects");
+            client.submit_witness(&inspected, w).await
         }));
     }
 
@@ -466,6 +610,10 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
             let client = WraithSessionClient::new(base_url, Network::Signet);
             let ghost = format!("wallet-{i}");
             let req = MixRequest {
+                // The flow is what is under test here, not the anonymity floor;
+                // a dedicated test covers the refusal. Set to 1 so a small
+                // fixture round does not fail for the wrong reason.
+                min_entities: 1,
                 tier_id: TIER_ID.into(),
                 ghost_id: ghost.clone(),
                 utxo: ParticipantUtxo {
@@ -508,7 +656,11 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
                 DEFAULT_SCAN_INDEX_MAX.min(16),
             )
             .expect("real signer ok");
-            client.submit_witness(&prepared, witness).await
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            let inspected = prepared.inspect(&mut ledger).expect("round inspects");
+            client.submit_witness(&inspected, witness).await
         });
         handles.push(handle);
     }
@@ -535,9 +687,15 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
     let final_tx = stub_broadcaster.last().expect("broadcast happened");
     assert_eq!(final_tx.input.len(), N);
 
-    // Reconstruct prevouts in tx order. inputs_store still holds the
-    // per-participant records; we walk it the same way the coordinator
-    // did when shipping prevouts on /round-tx.
+    // Reconstruct prevouts BY OUTPOINT, in transaction order.
+    //
+    // This used to walk `inputs_store` in registration order and claim that was
+    // "the same way the coordinator did". It no longer is: round inputs are
+    // shuffled, because registration order is close to arrival order and leaked
+    // who joined when. `/round-tx` keys its prevouts by outpoint for exactly
+    // this reason, and so must anything recomputing a sighash — a prevout list
+    // in the wrong order produces a wrong sighash and a signature that looks
+    // forged.
     let inputs = state
         .inputs_store
         .lock()
@@ -545,18 +703,45 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
         .get(&session_id)
         .cloned()
         .unwrap_or_default();
-    let mut prev_txouts: Vec<TxOut> = Vec::with_capacity(inputs.len());
-    for inp in &inputs {
+
+    let by_outpoint: std::collections::HashMap<(String, u32), _> = inputs
+        .iter()
+        .flat_map(|a| {
+            a.inputs
+                .iter()
+                .map(move |r| ((r.txid.trim().to_ascii_lowercase(), r.vout), (a, r)))
+        })
+        .collect();
+
+    let mut prev_txouts: Vec<TxOut> = Vec::with_capacity(final_tx.input.len());
+    for txin in &final_tx.input {
+        let key = (
+            txin.previous_output.txid.to_string().to_ascii_lowercase(),
+            txin.previous_output.vout,
+        );
+        let (_, r) = by_outpoint.get(&key).expect("prevout for every tx input");
         prev_txouts.push(TxOut {
-            value: bitcoin::Amount::from_sat(inp.input.value_sats),
-            script_pubkey: ScriptBuf::from_bytes(hex::decode(&inp.input.scriptpubkey_hex).unwrap()),
+            value: bitcoin::Amount::from_sat(r.value_sats),
+            script_pubkey: ScriptBuf::from_bytes(hex::decode(&r.scriptpubkey_hex).unwrap()),
         });
     }
 
     let secp = Secp256k1::new();
     use bitcoin::hashes::Hash as _;
     use bitcoin::key::TapTweak;
-    for (idx, inp) in inputs.iter().enumerate() {
+    // Iterate the TRANSACTION's inputs, not the registration list — the two
+    // are no longer in the same order, and using the registration index would
+    // verify each signature against somebody else's input.
+    for idx in 0..final_tx.input.len() {
+        let key = (
+            final_tx.input[idx]
+                .previous_output
+                .txid
+                .to_string()
+                .to_ascii_lowercase(),
+            final_tx.input[idx].previous_output.vout,
+        );
+        let (inp, _) = by_outpoint.get(&key).expect("record for every tx input");
         // Recompute the sighash for this input.
         let mut cache = SighashCache::new(&final_tx);
         let sighash = cache
@@ -601,4 +786,149 @@ async fn five_wallets_sign_real_taproot_witnesses_end_to_end() {
             panic!("input {idx} (wallet-{wallet_idx}) signature failed verify: {e}")
         });
     }
+}
+
+/// The floor refuses a round that is too small, and refuses it BEFORE signing.
+///
+/// The wallet used to go straight from `/round-tx` to `sign` with no inspection
+/// at all — no check that its own input was there, that its own output existed
+/// for the right amount, or that the anonymity set was worth anything. This
+/// pins the check that closed that.
+#[test]
+fn a_prepared_round_below_the_floor_is_refused_before_signing() {
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Transaction, TxIn,
+        TxOut,
+    };
+    use wraith_wallet_core::wraith::{PreparedMix, PreparedPrevOut, WraithClientError};
+
+    // Three inputs, all siblings of one funding transaction — one entity.
+    let shared = bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
+    let spk = ScriptBuf::from_bytes(
+        hex::decode("0014000102030405060708090a0b0c0d0e0f1011121314").unwrap(),
+    );
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: (0..3u32)
+            .map(|vout| TxIn {
+                previous_output: OutPoint { txid: shared, vout },
+                ..Default::default()
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+
+    let prepared = PreparedMix {
+        session_id: "s".into(),
+        unsigned_tx: tx,
+        input_index: 0,
+        prev_amount_sats: 150_000,
+        prevouts: (0..3)
+            .map(|_| PreparedPrevOut {
+                scriptpubkey_hex: hex::encode(spk.as_bytes()),
+                value_sats: 150_000,
+            })
+            .collect(),
+        mixed_output_tx_index: 0,
+        ghost_id: "g".into(),
+        min_entities: 5,
+        expected_output_sats: 100_000,
+        expected_output_script: spk,
+    };
+
+    let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+        wraith_protocol::signing_ledger::VolatileStore::default(),
+    );
+    match prepared.inspect(&mut ledger) {
+        Err(WraithClientError::RefusedRound { reasons, report }) => {
+            assert_eq!(
+                report.entities, 1,
+                "three siblings of one funding tx are one entity, not three"
+            );
+            assert_eq!(report.seats, 3, "seats and entities must both be reported");
+            assert!(
+                reasons.iter().any(|r| matches!(
+                    r,
+                    wraith_protocol::pre_sign::RefuseToSign::SetTooSmall { .. }
+                )),
+                "{reasons:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A signature made under the wrong sighash voids the inspection, and is caught
+/// by its length rather than by trusting the signer.
+///
+/// `client_session::Verified::authorise` performs this check and was never
+/// called from anywhere — `inspect` returns the report and drops the `Verified`.
+/// The wallet's own signer happens to use SIGHASH_DEFAULT, so it would have
+/// passed; that is luck, not a check, and it would not hold for a hardware
+/// wallet or a remote signer that chose differently.
+#[test]
+fn a_signature_under_the_wrong_sighash_is_refused_by_its_length() {
+    use bitcoin::Witness;
+    use wraith_wallet_core::wraith::{check_witness_sighash, WraithClientError};
+
+    // 64 bytes: SIGHASH_DEFAULT, commits to every input and output.
+    let good = Witness::from_slice(&[vec![0u8; 64]]);
+    assert!(check_witness_sighash(&good, 0).is_ok());
+
+    // 65 bytes: some other type, with its flag appended. The extra byte is the
+    // whole tell — it means the round can be edited after inspection.
+    let flagged = Witness::from_slice(&[vec![0u8; 65]]);
+    assert!(matches!(
+        check_witness_sighash(&flagged, 3),
+        Err(WraithClientError::UnsafeSighash {
+            input_index: 3,
+            len: 65
+        })
+    ));
+
+    // Nothing at all cannot have committed to anything.
+    let empty = Witness::new();
+    assert!(matches!(
+        check_witness_sighash(&empty, 0),
+        Err(WraithClientError::UnsafeSighash { len: 0, .. })
+    ));
+}
+
+/// The same coin cannot be signed into two different rounds.
+///
+/// `SigningLedger` existed with no caller anywhere, so the rule was written down
+/// and not enforced. That matters more than it sounds: a coin signed into two
+/// rounds double-spends itself, one round dies at broadcast, and every other
+/// participant in it loses their round — and their coin's freedom, once the
+/// no-sign sweep puts it in cooldown — through no fault of their own.
+#[test]
+fn a_coin_committed_to_one_round_is_refused_for_another() {
+    use wraith_protocol::signing_ledger::{Decision, LedgerError, OutPointKey, SigningLedger};
+    use wraith_wallet_core::signing_ledger_file::FileSignatureStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("signed.json");
+    let coin = OutPointKey::new([0xAB; 32], 1);
+
+    let mut ledger = SigningLedger::new(FileSignatureStore::open(&path).unwrap());
+    assert_eq!(ledger.authorise(coin, [0x11; 32]), Ok(Decision::Sign));
+
+    // A second, different round wants the same coin.
+    assert_eq!(
+        ledger.authorise(coin, [0x22; 32]),
+        Err(LedgerError::Conflict {
+            existing_txid: [0x11; 32]
+        })
+    );
+    assert_eq!(ledger.refusals(), 1, "the refusal must be countable");
+
+    // And it still refuses after a restart, which is the case a volatile store
+    // would silently get wrong.
+    drop(ledger);
+    let mut reopened = SigningLedger::new(FileSignatureStore::open(&path).unwrap());
+    assert!(reopened.authorise(coin, [0x22; 32]).is_err());
 }

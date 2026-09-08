@@ -30,7 +30,114 @@ use crate::witnesses::AcceptedWitness;
 /// without holding the outer registry mutex.
 pub type SharedSigner = Arc<Mutex<CoordinatorSigner>>;
 
+impl LockCosignState {
+    /// Open the ledgers under `dir` and assemble the co-signing state.
+    ///
+    /// Both stores are opened here rather than lazily: a coordinator that
+    /// cannot write its ledgers must fail at startup, where an operator sees
+    /// it, rather than on the first spend, where it looks like a refusal.
+    pub fn open(
+        dir: &std::path::Path,
+        seed_phrase: zeroize::Zeroizing<String>,
+        seed_passphrase: zeroize::Zeroizing<String>,
+        policy: wraith_protocol::lock_cosign::CosignPolicy,
+        role: wraith_protocol::lock_cosign::Role,
+    ) -> std::io::Result<Self> {
+        // Retain at least the window the policy enforces; a shorter retention
+        // would prune history the window still needs and quietly raise the
+        // limit.
+        let retain = policy.window.map(|w| w.window_secs).unwrap_or(86_400);
+        Ok(Self {
+            seed_phrase,
+            seed_passphrase,
+            policy,
+            role,
+            coins: Mutex::new(wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger_file::FileSignatureStore::open(
+                    dir.join("lock-cosigned-coins.json"),
+                )?,
+            )),
+            spends: Mutex::new(wraith_protocol::spend_log_file::FileSpendLog::open(
+                dir.join("lock-cosign-spends.json"),
+                retain,
+            )?),
+            pending: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+/// Everything the quorum needs to co-sign Ghost Locks.
+///
+/// Held together because the three pieces are only safe as a set: the seed
+/// without the ledgers would equivocate, and the ledgers without the role
+/// would let a standby serve alongside the active coordinator and equivocate
+/// anyway.
+pub struct LockCosignState {
+    /// BIP39 phrase this coordinator derives per-Lock quorum keys from.
+    ///
+    /// Shared across the coordinator set so any of them can take over; which
+    /// one actually serves is decided by `role`, not by who holds the seed.
+    pub seed_phrase: zeroize::Zeroizing<String>,
+    /// BIP39 passphrase, empty if unused.
+    pub seed_passphrase: zeroize::Zeroizing<String>,
+    /// What this coordinator will co-sign.
+    pub policy: wraith_protocol::lock_cosign::CosignPolicy,
+    /// Whether this coordinator co-signs at all right now.
+    pub role: wraith_protocol::lock_cosign::Role,
+    /// Once-per-coin ledger, on disk.
+    ///
+    /// Durable because a forgotten commitment is a second signature over the
+    /// same coin, which is a valid double-sign proof against this quorum.
+    pub coins: Mutex<
+        wraith_protocol::signing_ledger::SigningLedger<
+            wraith_protocol::signing_ledger_file::FileSignatureStore,
+        >,
+    >,
+    /// Rolling spend window, on disk.
+    ///
+    /// Durable because a window that resets on restart is bypassed by crashing
+    /// the service, which is cheaper than stealing the key it bounds.
+    pub spends: Mutex<wraith_protocol::spend_log_file::FileSpendLog>,
+    /// Co-signings waiting on their second round, keyed by session.
+    ///
+    /// In memory: a restart drops the secret nonce, which is the safe
+    /// direction, and the owner retries with a fresh one.
+    pub pending: Mutex<HashMap<String, wraith_protocol::lock_cosign::CosignSession>>,
+}
+
 /// Process-global state shared across HTTP handlers.
+/// Everything a round's placement derivation needs for the current epoch.
+///
+/// Supplied by the node rather than fetched here, so the coordinator has one
+/// source of truth for the epoch and the tests can pin it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochContext {
+    /// Current coordinator epoch.
+    pub epoch: u64,
+    /// The epoch's beacon, folded from several consecutive block hashes.
+    pub beacon: [u8; 32],
+    /// Committed payment volume, which fixes `open_rounds`.
+    ///
+    /// Committed rather than live: the modulus must not be something the
+    /// coordinator can narrow mid-epoch, because narrowing it to 1 funnels every
+    /// participant into one round while appearing to follow the rule.
+    pub committed_volume: u64,
+}
+
+/// Source of the current [`EpochContext`].
+///
+/// `None` means no beacon is available — a node still syncing, or an RPC that
+/// is down. Placement then falls back to a single round, which is the same
+/// behaviour as low volume and is safe: it removes the concentration defence
+/// rather than splitting participants incorrectly.
+///
+/// That fallback must be **visible**. A silently disabled defence is worse than
+/// an absent one, because it reads as protection in the status output.
+pub trait EpochSource: Send + Sync {
+    /// The current epoch context, or `None` when unavailable.
+    fn epoch_context(&self) -> Option<EpochContext>;
+}
+
 pub struct CoordinatorState {
     /// Bitcoin network this coordinator serves.
     pub network: Network,
@@ -57,6 +164,10 @@ pub struct CoordinatorState {
     /// while it is, because registration must never fall back to
     /// trusting the wallet's own account of its input (#699).
     pub utxo_source: Option<Arc<dyn UtxoSource>>,
+    /// Source of the epoch beacon that fixes round placement. `None` until an
+    /// operator wires a chain connection; placement then falls back to a single
+    /// round and `/session/{id}` reports that it is unavailable.
+    pub epoch_source: Option<Arc<dyn EpochSource>>,
     /// Coordinator's fee-collection address. Used as the destination for
     /// the per-Mix-round service-fee output. `None` until the operator
     /// supplies one (CLI flag / config). `/inputs` returns
@@ -110,6 +221,11 @@ pub struct CoordinatorState {
     /// When `None`, the route accepts unsigned requests — operators
     /// must firewall the `/api/v1/internal/` prefix.
     pub gossip_peer_secret: Option<String>,
+    /// Ghost Lock co-signing, or `None` if this coordinator does not offer it.
+    ///
+    /// Absent by default: a coordinator with no quorum seed configured should
+    /// refuse Lock co-signing rather than derive keys from nothing.
+    pub lock_cosign: Option<LockCosignState>,
     /// Unix-seconds the binary started. `/health` reports uptime.
     pub started_at: u64,
     /// Override for the per-session fill window in seconds. Defaults
@@ -148,6 +264,9 @@ impl CoordinatorState {
     ) -> Self {
         let started_at = clock.unix_secs();
         Self {
+            // Off unless a quorum seed is configured: a coordinator with no seed
+            // must refuse Lock co-signing, not derive keys from nothing.
+            lock_cosign: None,
             network,
             sessions: LiteSessionRegistry::new(),
             remix: RemixQueue::new(),
@@ -155,6 +274,7 @@ impl CoordinatorState {
             id_gen,
             bans: BanList::new(),
             utxo_source: None,
+            epoch_source: None,
             coordinator_fee_address,
             inputs_store: Mutex::new(HashMap::new()),
             outputs_store: Mutex::new(HashMap::new()),
@@ -174,6 +294,17 @@ impl CoordinatorState {
     /// callers chain it: `with_components(..).with_utxo_source(src)`.
     pub fn with_utxo_source(mut self, source: Arc<dyn UtxoSource>) -> Self {
         self.utxo_source = Some(source);
+        self
+    }
+
+    /// Install the epoch beacon source that fixes round placement.
+    ///
+    /// Without one, every participant lands in round 0 — the single-round case.
+    /// That is safe but it is *not* the concentration defence running, so
+    /// `/session/{id}` reports its absence rather than leaving the difference
+    /// invisible.
+    pub fn with_epoch_source(mut self, source: Arc<dyn EpochSource>) -> Self {
+        self.epoch_source = Some(source);
         self
     }
 

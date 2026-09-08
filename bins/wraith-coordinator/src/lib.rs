@@ -20,12 +20,13 @@ pub mod inputs;
 pub mod no_sign_sweep;
 pub mod outputs;
 pub mod rpc;
+pub mod set_report;
 pub mod state;
 pub mod tick;
 pub mod utxo_source;
 pub mod witnesses;
 
-pub use state::CoordinatorState;
+pub use state::{CoordinatorState, LockCosignState};
 
 /// Construct the Axum router for a given coordinator state. Pure
 /// function so tests can build it deterministically.
@@ -67,6 +68,14 @@ pub fn build_router(state: Arc<CoordinatorState>) -> Router {
         .route(
             "/api/v1/session/:session_id/witness",
             axum::routing::post(api::session_witness::post),
+        )
+        .route(
+            "/api/v1/lock/cosign/nonce",
+            axum::routing::post(api::lock_cosign::post_nonce),
+        )
+        .route(
+            "/api/v1/lock/cosign/partial",
+            axum::routing::post(api::lock_cosign::post_partial),
         )
         // Internal coordinator-to-coordinator state replication.
         // Operator firewalls this prefix to the pool's address range

@@ -22,14 +22,43 @@ pub enum LightError {
     Bitcoin(String),
 }
 
+/// The plain wallet's receive chain: BIP86 account `0'`.
+pub fn receive_path(index: u32) -> String {
+    format!("m/86'/{}'/0'/0/{}", GHOST_COIN_TYPE, index)
+}
+
+/// A Ghost Lock owner key: account `1'`, kept off the plain wallet's account
+/// so a Lock coin and a loose coin are never the same coin.
+///
+/// The Cash lane is a bare key-path output for this key, so an address derived
+/// here is a Cash lane address — which is why the ordinary signer has to know
+/// about this family. Cash spends with the owner's key alone, and if the
+/// signer only walks the receive chain those coins cannot be spent at all.
+pub fn lock_owner_path(index: u32) -> String {
+    format!("m/86'/{}'/1'/0/{}", GHOST_COIN_TYPE, index)
+}
+
 /// Derive a fresh BIP86 (taproot) receive address at index `index`.
 pub fn receive_address(
     keystore: &Keystore,
     index: u32,
     network: Network,
 ) -> Result<Address, LightError> {
-    let path = format!("m/86'/{}'/0'/0/{}", GHOST_COIN_TYPE, index);
-    let xprv = keystore.derive_xprv(&path)?;
+    address_at(keystore, &receive_path(index), network)
+}
+
+/// The key-path address for a Lock owner key at `index` — i.e. its Cash lane.
+pub fn lock_owner_address(
+    keystore: &Keystore,
+    index: u32,
+    network: Network,
+) -> Result<Address, LightError> {
+    address_at(keystore, &lock_owner_path(index), network)
+}
+
+/// The BIP86 key-path address for one derivation path.
+fn address_at(keystore: &Keystore, path: &str, network: Network) -> Result<Address, LightError> {
+    let xprv = keystore.derive_xprv(path)?;
 
     // bip32 returns a 33-byte SEC1 compressed pubkey; for taproot we want the
     // 32-byte x-only form (drop the parity prefix byte).

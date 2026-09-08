@@ -91,7 +91,7 @@ info() { echo "  $*"; }
 
 [ -n "$NODE" ] && [ -n "$BINARY" ] || die "usage: deploy-node.sh <node> <binary> [--canary]"
 case "$BINARY" in
-  ghost-pool|pool_sv2|translator_sv2|ghost-pay|ghost-gsp) ;;
+  ghost-pool|pool_sv2|translator_sv2) ;;
   *) die "unknown binary '$BINARY'" ;;
 esac
 
@@ -100,13 +100,15 @@ esac
 # It decides two gates below, and getting it wrong is not a slow deploy but a WRONG VERDICT:
 #
 #   * the SV1 stratum smoke test, which dials :3333 — a port the TRANSLATOR owns. Run it for
-#     ghost-pay and it passes whether or not ghost-pay works, because it is not testing
-#     ghost-pay at all. A check that cannot fail, guarding a rollback.
-#   * the post-swap throughput check, which rolls back when shares stop being credited.
-#     ghost-pay and ghost-gsp do not carry shares, so their deploy would be judged — and
-#     could be rolled back — on traffic they never touch.
+#     a service that does not own that port and it passes whether or not the service works,
+#     because it is not testing that service at all. A check that cannot fail, guarding a
+#     rollback.
+#   * the post-swap throughput check, which rolls back when shares stop being credited. A
+#     binary that carries no shares would be judged — and could be rolled back — on traffic
+#     it never touches.
 #
-# So they get their own health check instead, on the port they actually serve.
+# Every binary shipped today is on the share path. The distinction is kept because the day it
+# stops being true is the day both gates above start lying, quietly.
 case "$BINARY" in
   ghost-pool|pool_sv2|translator_sv2) SHARE_PATH_BINARY=yes ;;
   *)                                  SHARE_PATH_BINARY=no  ;;
@@ -118,21 +120,23 @@ case "$BINARY" in
   ghost-pool)      SERVICE=ghost-pool ;;
   pool_sv2)        SERVICE=sri-pool ;;
   translator_sv2)  SERVICE=sri-translator ;;
-  ghost-pay)       SERVICE=ghost-pay ;;
-  ghost-gsp)       SERVICE=ghost-gsp ;;
 esac
 
 # Binaries that NO canary node carries.
 #
-# `ghost-pay` and `ghost-gsp` are installed only on vm1-vm4, and every one of those is a
-# PRODUCTION node. The canary soak is therefore not merely skipped for them, it is
-# UNSATISFIABLE: there is no canary to soak on, so the gate could only ever refuse, and the
-# binaries had no enforced path to production at all (#759).
+# EMPTY, and that is the safe state. It held `ghost-pay` and `ghost-gsp`, which lived only on
+# vm1-vm4 — all production nodes — so the canary soak was not merely skipped for them but
+# UNSATISFIABLE: the gate could only ever refuse, and they had no enforced path to production
+# at all (#759). The relaxation made the FIRST production node deployed act as the canary,
+# soaking the full SOAK_MINUTES before any other production node accepted the build: a real
+# soak, real traffic, real time, rather than a waiver.
 #
-# For these the FIRST production node deployed acts as the canary: it soaks the full
-# SOAK_MINUTES before any other production node accepts the build. That keeps a real soak —
-# real traffic, real time — rather than waiving it.
-PRODUCTION_ONLY_BINARIES="ghost-pay ghost-gsp"
+# Both services are gone. The mechanism stays because the next binary that no canary carries
+# will need it, and rebuilding it under a deadline is how #808 shipped a relaxation whose
+# remedy was inert. ⚠ Adding a name here weakens the soak gate for it — `test-deploy-gate.sh`
+# asserts this list is empty, so doing so fails the gate's own tests until the cases that
+# cover the relaxation are restored alongside.
+PRODUCTION_ONLY_BINARIES=""
 
 cd "$REPO_ROOT"
 
@@ -181,8 +185,6 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
         ghost-pool)      SRC_PATHS="bins/ghost-pool crates" ;;
         pool_sv2)        SRC_PATHS="bins/pool-sv2 crates" ;;
         translator_sv2)  SRC_PATHS="bins/translator-sv2 crates" ;;
-        ghost-pay)       SRC_PATHS="bins/ghost-pay crates" ;;
-        ghost-gsp)       SRC_PATHS="bins/ghost-gsp crates" ;;
         *)               SRC_PATHS="" ;;
     esac
     if [ -n "$SRC_PATHS" ] && ! git diff --quiet "$SHA" origin/main -- $SRC_PATHS 2>/dev/null; then
@@ -1014,8 +1016,6 @@ case "$BINARY" in
   ghost-pool)      READY_PORT=8442 ;;   # TDP, what pool_sv2 connects to
   pool_sv2)        READY_PORT=34255 ;;  # SV2, what the translator connects to
   translator_sv2)  READY_PORT=3333 ;;   # SV1, what miners connect to
-  ghost-pay)       READY_PORT=8800 ;;   # HTTPS API, what the dashboard reads
-  ghost-gsp)       READY_PORT=8900 ;;   # HTTPS API
 esac
 
 READY_TIMEOUT="${READY_TIMEOUT:-180}"

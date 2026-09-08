@@ -26,7 +26,7 @@ struct Cli {
 enum Command {
     /// Round-trip a health request to wraithd.
     Health,
-    /// One-shot summary of daemon + ghost-pay + ghost-gsp + active wallet + session.
+    /// One-shot summary: daemon, node, active wallet and balance.
     Doctor,
     /// Print the daemon's configured environment (URLs, network, paths).
     Env,
@@ -39,10 +39,10 @@ enum Command {
         #[command(subcommand)]
         sub: ChainCommand,
     },
-    /// GSP WebSocket commands.
-    Gsp {
+    /// Point the wallet at your node.
+    Node {
         #[command(subcommand)]
-        sub: GspCommand,
+        sub: NodeCommand,
     },
     /// Wallet (keystore) commands.
     Wallet {
@@ -53,11 +53,6 @@ enum Command {
     Light {
         #[command(subcommand)]
         sub: LightCommand,
-    },
-    /// Ghost Locks (custody primitive) commands.
-    Locks {
-        #[command(subcommand)]
-        sub: LocksCommand,
     },
     /// Release / update commands.
     Update {
@@ -72,6 +67,25 @@ enum Command {
     Mix {
         #[command(subcommand)]
         sub: MixCommand,
+    },
+    /// Sign a PSBT with the active wallet.
+    ///
+    /// Signs every input the keystore owns and leaves the rest alone. Covers
+    /// the plain receive chain and Lock owner keys, so a Cash lane coin —
+    /// which spends with the owner's key alone — signs here like any other
+    /// single-sig input.
+    Psbt {
+        #[command(subcommand)]
+        sub: PsbtCommand,
+    },
+    /// Ghost Lock: one account, four compartments.
+    ///
+    /// Savings needs your backup device; Spending co-signs with the Wraith
+    /// quorum; Cash is yours alone and deliberately not private; Investments
+    /// is the one lane the quorum can move without you.
+    Lock {
+        #[command(subcommand)]
+        sub: LockCommand,
     },
     /// Print a shell-completion script to stdout. Pipe into your shell's
     /// completion location, e.g.:
@@ -223,22 +237,284 @@ enum MixCommand {
 }
 
 #[derive(Subcommand)]
+enum PsbtCommand {
+    /// Sign every input the active wallet owns.
+    Sign {
+        /// The PSBT, base64 or hex.
+        #[arg(long)]
+        psbt: String,
+        /// Bound on the derivation search per input.
+        #[arg(long)]
+        bip86_scan_max: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LockCommand {
+    /// Every Lock this wallet remembers.
+    List,
+    /// Remember a Lock's definition.
+    ///
+    /// Stores the keys it is built from, not the coins. The lanes are derived
+    /// from these every time, so forgetting a Lock never moves money.
+    Save {
+        /// Optional name, so a list of ids is a list of things.
+        #[arg(long)]
+        label: Option<String>,
+        /// Backup device's x-only key, hex.
+        #[arg(long)]
+        backup_pubkey: String,
+        /// Heir's x-only key, hex.
+        #[arg(long)]
+        heir_pubkey: String,
+        /// Wraith quorum's x-only key, hex.
+        #[arg(long)]
+        quorum_pubkey: String,
+        /// Height the Lock is anchored at — normally the current tip.
+        #[arg(long)]
+        anchor_height: u32,
+        /// Absolute height the inheritance leaf matures at.
+        #[arg(long)]
+        inherit_height: u32,
+        /// BIP86 index for the owner key. Defaults to 0.
+        #[arg(long)]
+        bip86_index: Option<u32>,
+    },
+    /// Forget a Lock's definition. The funds stay exactly where they are.
+    Forget {
+        #[arg(long)]
+        lock_id: String,
+    },
+    /// Show a Lock's four lanes, their addresses and balances.
+    Lanes {
+        #[arg(long)]
+        backup_pubkey: String,
+        #[arg(long)]
+        heir_pubkey: String,
+        #[arg(long)]
+        quorum_pubkey: String,
+        #[arg(long)]
+        anchor_height: u32,
+        #[arg(long)]
+        inherit_height: u32,
+        #[arg(long)]
+        bip86_index: Option<u32>,
+    },
+    /// Where a round should pay to fund one lane privately.
+    ///
+    /// Prints the address without running anything, for when you want to
+    /// drive the round yourself. `lock fund` does both in one step.
+    Destination {
+        #[arg(long)]
+        lock_id: String,
+        /// savings, spending or investments. Cash is refused.
+        #[arg(long)]
+        lane: String,
+    },
+    /// Spend the Spending lane with the quorum.
+    ///
+    /// One command: the wallet does both MuSig2 rounds against the coordinator
+    /// itself, because the counterparty is a service and nobody has to carry
+    /// anything.
+    ///
+    /// The quorum may refuse — a ceiling, a spending window, or a coin it has
+    /// already signed for. That is what makes it a second factor rather than a
+    /// rubber stamp, and the refusal says which rule applied.
+    /// The id a quorum derives this Lock's co-signing key from.
+    ///
+    /// Run this BEFORE building the Lock. Hand the id to whoever holds the
+    /// quorum seed, and put the key they return in `--quorum-pubkey`. The id
+    /// cannot be the Lock's own id, because the Lock's id is a hash over the
+    /// quorum key you are asking them to produce.
+    QuorumId {
+        #[arg(long)]
+        backup_pubkey: String,
+        #[arg(long)]
+        heir_pubkey: String,
+        #[arg(long)]
+        anchor_height: u32,
+        #[arg(long)]
+        inherit_height: u32,
+        /// Must match the index the Lock is built at.
+        #[arg(long)]
+        bip86_index: Option<u32>,
+    },
+    QuorumSign {
+        #[arg(long)]
+        lock_id: String,
+        /// Only `spending` is co-signed by the quorum.
+        #[arg(long, default_value = "spending")]
+        lane: String,
+        #[arg(long)]
+        psbt: String,
+        #[arg(long)]
+        input_index: u32,
+        /// Base URL of the coordinator to ask.
+        #[arg(long)]
+        coordinator: String,
+    },
+    /// What leaving alone needs, and whether the coins are old enough.
+    ///
+    /// Ask before building the transaction: the input's `nSequence` is fixed by
+    /// the leaf's delay, and a wrong one is rejected as non-final.
+    EscapePlan {
+        #[arg(long)]
+        lock_id: String,
+        /// savings, spending or investments.
+        #[arg(long)]
+        lane: String,
+    },
+    /// Sign a lane's escape leaf — leaving alone, after the delay.
+    ///
+    /// No quorum, no backup device, no ceremony. This is the path that stops a
+    /// silent quorum from being the end of the money.
+    Escape {
+        #[arg(long)]
+        lock_id: String,
+        #[arg(long)]
+        lane: String,
+        /// The spend, base64 PSBT, with the nSequence `escape-plan` reported.
+        #[arg(long)]
+        psbt: String,
+        #[arg(long)]
+        input_index: u32,
+    },
+    /// Air-gapped key-path signing, in three steps.
+    ///
+    /// MuSig2 needs two rounds, so a spend is: begin (carry a request to the
+    /// device), nonce (carry the device's reply back, then a second request
+    /// out), complete (carry the device's signature back). The device never
+    /// receives a bare hash — it gets the whole transaction and derives the
+    /// hash itself, so what it shows you and what it signs cannot differ.
+    Sign {
+        #[command(subcommand)]
+        sub: LockSignCommand,
+    },
+    /// Fund one lane through a round — private entry.
+    ///
+    /// The round's output IS the lane, so on-chain the deposit looks like any
+    /// other round output rather than a transfer from a wallet you are known
+    /// to control. Funding a lane directly works too; it just publishes the
+    /// link between those coins and the Lock.
+    ///
+    /// You name the lane, never an address: the daemon derives it from the
+    /// remembered Lock, so a typo cannot send a round's proceeds to a
+    /// stranger. Cash is refused — it is public by design, so a round would
+    /// buy unlinkability the lane discards on arrival.
+    Fund {
+        /// `lock_id` from `wraith lock list`.
+        #[arg(long)]
+        lock_id: String,
+        /// Lane to fund: savings, spending or investments.
+        #[arg(long)]
+        lane: String,
+        #[arg(long)]
+        coordinator: String,
+        /// Optional fallback coordinator URLs. Repeatable.
+        #[arg(long = "coordinator-peer")]
+        coordinator_peers: Vec<String>,
+        #[arg(long)]
+        socks5_proxy: Option<String>,
+        #[arg(long)]
+        tier: String,
+        #[arg(long)]
+        ghost_id: String,
+        #[arg(long)]
+        utxo: String,
+        #[arg(long)]
+        utxo_value: u64,
+        #[arg(long)]
+        utxo_scriptpubkey: String,
+        #[arg(long)]
+        bip86_index: Option<u32>,
+        #[arg(long)]
+        bip86_scan_max: Option<u32>,
+        /// Smallest anonymity set, in distinct entities, worth signing into.
+        /// Stating a floor is a decision; dismissing a dialog is a reflex.
+        #[arg(long)]
+        min_entities: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LockSignCommand {
+    /// Round 1. Review the spend and commit this wallet's nonce.
+    ///
+    /// Prints what the spend does — check it — and the JSON to carry to the
+    /// backup device.
+    Begin {
+        #[arg(long)]
+        lock_id: String,
+        /// savings or spending. Cash signs as ordinary single-sig;
+        /// Investments has no owner key path.
+        #[arg(long)]
+        lane: String,
+        /// The unsigned spend, base64 PSBT.
+        #[arg(long)]
+        psbt: String,
+        /// Which input belongs to the lane.
+        #[arg(long)]
+        input_index: u32,
+    },
+    /// Round 1 reply. Hand back the device's public nonce.
+    ///
+    /// This wallet signs its own share here, so its nonce is burned durably
+    /// before the second payload goes out — no secret nonce is held while you
+    /// walk to the device again.
+    Nonce {
+        #[arg(long)]
+        session: String,
+        /// The device's public nonce, hex.
+        #[arg(long)]
+        device_nonce: String,
+    },
+    /// Round 2 reply. Hand back the device's partial signature.
+    Complete {
+        #[arg(long)]
+        session: String,
+        /// The device's partial signature, hex.
+        #[arg(long)]
+        device_partial: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ChainCommand {
     /// Query ghost-pay's `/api/v1/status` via wraithd.
     Status,
 }
 
 #[derive(Subcommand)]
-enum GspCommand {
-    /// Open a WebSocket to GSP, send Ping, wait for Pong.
-    Ping,
-    /// Register the active wallet with GSP (idempotent) and create a session.
-    Auth,
-    /// Show the daemon's stored GSP session token.
-    SessionStatus,
-    /// Register the active wallet's BIP-352 scan public key with the GSP so the
-    /// server can detect incoming silent payments on its behalf.
-    RegisterScanKey,
+enum NodeCommand {
+    /// Set the node the wallet reads and writes the chain through.
+    ///
+    /// A cookie is preferred over a username and password: it rotates with
+    /// the node and never has to be typed anywhere.
+    Set {
+        /// RPC URL, e.g. http://127.0.0.1:8332.
+        url: String,
+        /// Path to the node's `.cookie` file.
+        #[arg(long, conflicts_with_all = ["user", "pass"])]
+        cookie: Option<String>,
+        #[arg(long, requires = "pass")]
+        user: Option<String>,
+        #[arg(long, requires = "user")]
+        pass: Option<String>,
+        /// A Ghost pool node, consulted only for the Wraith coordinator
+        /// election — which coordinator holds a tier's seat this epoch.
+        ///
+        /// Optional. Without it, mixing needs a coordinator URL supplied per
+        /// round, which works but never rotates. What comes back is verified
+        /// against your own node rather than believed; what the pool still
+        /// learns is that your IP asked, so route it through Tor if that
+        /// matters.
+        #[arg(long, value_name = "URL")]
+        pool_url: Option<String>,
+    },
+    /// Forget the node. The wallet will refuse chain operations until one is
+    /// set again — which is the point: it will not quietly use somebody
+    /// else's.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -256,8 +532,8 @@ enum LightCommand {
         #[arg(short = 'c', long, default_value_t = 1)]
         min_confirmations: u32,
     },
-    /// Scan ghost-pay's bitcoind for unspent L1 outputs at the
-    /// active wallet's BIP86 receive addresses 0..`scan_max_index`.
+    /// Scan the node for unspent outputs at the active wallet's BIP86
+    /// receive addresses 0..`scan_max_index`.
     /// Each row comes back tagged with the BIP86 derivation index
     /// that produced its address — drop straight into a Wraith mix
     /// request to skip the daemon-side address scan.
@@ -270,12 +546,12 @@ enum LightCommand {
         #[arg(short = 'c', long, default_value_t = 0)]
         min_confirmations: u32,
     },
-    /// Show BIP-352 silent-payment matches detected by the persistent
-    /// session's local scanner since `wraith gsp auth` ran.
+    /// Show silent payments the block scanner has found.
+    ///
+    /// These do not show up in `utxos`: a silent payment lands on a key
+    /// derived from the sender's ephemeral key and this wallet's Ghost ID,
+    /// not on an address the wallet published.
     Detected,
-    /// Stream BIP-352 detections live as they arrive. Holds the connection
-    /// open and prints each detection on a new line. Ctrl-C to exit.
-    Watch,
     /// Show the active wallet's transaction history.
     History {
         /// Maximum number of transactions to return.
@@ -285,26 +561,33 @@ enum LightCommand {
         #[arg(short, long, default_value_t = 0)]
         offset: u32,
     },
-    /// Send an instant L2 payment. Mode is `ghostpay` (the only accepted
-    /// value; default). For unlinkable L1 spends use the Mix flow instead.
-    Send {
-        /// Recipient: a Bitcoin address or a Ghost ID.
-        recipient: String,
-        /// Amount in satoshis.
+    /// Pay someone on-chain: build, sign and broadcast in one step.
+    ///
+    /// This spends the wallet's own coins through the configured node. No
+    /// operator is involved and nobody else has to be online.
+    Pay {
+        /// Recipient: a Bitcoin address, or a Ghost ID for a silent payment.
+        ///
+        /// A Ghost ID pays a fresh taproot output only the recipient can
+        /// find, announced by an OP_RETURN carrying the ephemeral key. That
+        /// hides *who* was paid, not *that* a payment happened — the
+        /// OP_RETURN is visible to anyone looking.
+        recipient_address: String,
+        /// Amount in satoshis. The miner fee is charged on top.
         amount_sats: u64,
-        /// Payment mode. Only `ghostpay` (instant L2) is supported.
-        #[arg(long, default_value = "ghostpay")]
-        mode: String,
-        /// Optional memo, included with the payment metadata.
+        /// Fee rate in satoshis per virtual byte.
+        #[arg(long, default_value_t = 5)]
+        fee_rate: u64,
+        /// Highest BIP86 receive index to scan for spendable coins.
+        #[arg(long, default_value_t = 32)]
+        scan_max: u32,
+        /// Note kept in the local history. Never goes on-chain.
         #[arg(long)]
         memo: Option<String>,
-        /// Skip the wallet's outbound-broadcast shroud delay for this send.
-        /// Equivalent to --shroud-max-ms=0. Use only when latency matters
-        /// more than origin-timing privacy.
+        /// Skip the outbound-broadcast shroud delay for this payment.
         #[arg(long, conflicts_with = "shroud_max_ms")]
         immediate: bool,
-        /// Override the daemon's default shroud window (ms) for this send.
-        /// `0` disables; `n` picks a uniform random delay in `[0, n]`.
+        /// Override the daemon's default shroud window (ms).
         #[arg(long, value_name = "MS")]
         shroud_max_ms: Option<u64>,
     },
@@ -318,91 +601,6 @@ enum UpdateCommand {
         /// Override the daemon's configured manifest URL for this call.
         #[arg(long, value_name = "URL")]
         manifest_url: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum LocksCommand {
-    /// List all Ghost Locks for the active wallet.
-    List,
-    /// Ask GSP to prepare a new ghost lock — returns a funding address.
-    Prepare {
-        /// Capacity of the lock in satoshis.
-        capacity_sats: u64,
-    },
-    /// Confirm that a prepared lock has been funded on-chain.
-    Confirm {
-        lock_id: String,
-        funding_txid: String,
-    },
-    /// Initiate a jump (key rotation) for an existing lock.
-    Jump {
-        lock_id: String,
-        /// Target address for the new lock.
-        target_address: String,
-        /// Priority: normal (default), high, or urgent.
-        #[arg(long, default_value = "normal")]
-        priority: String,
-    },
-    /// Prepare a lock AND fund it through a Wraith CoinJoin in one
-    /// shot. The mix's denom output is the lock's funding output, so
-    /// chain analysts see a CoinJoin — they cannot tell which output
-    /// became which user's L2 entry. This is the private-entry path
-    /// that distinguishes Ghost Locks from typical L2 funding (where
-    /// the channel-open tx is a chain-analysis goldmine).
-    ///
-    /// CLI chains three IPC calls under the hood:
-    ///   1. LocksPrepare(capacity_sats)               → funding_address
-    ///   2. WraithMixOneShot(mix_output=funding_addr) → broadcast_txid
-    ///   3. LocksConfirm(lock_id, broadcast_txid)     → block_height
-    ///
-    PrepareViaWraith {
-        /// Lock capacity in satoshis. Must match a Wraith Lite tier
-        /// denomination (100k_sats / 1m_sats / 10m_sats / 100m_sats).
-        #[arg(long)]
-        capacity_sats: u64,
-        /// HTTP URL of the wraith-coordinator endpoint.
-        #[arg(long)]
-        coordinator: String,
-        /// Wraith Lite tier id matching `capacity_sats`.
-        #[arg(long)]
-        tier: String,
-        /// Wallet's per-round identity for the wraith coordinator.
-        #[arg(long)]
-        ghost_id: String,
-        /// Optional SOCKS5 proxy for the /outputs anonymous step
-        /// (e.g. `socks5h://127.0.0.1:9050` for Tor).
-        #[arg(long)]
-        socks5_proxy: Option<String>,
-        /// UTXO outpoint feeding the mix as `txid:vout`.
-        #[arg(long)]
-        utxo: String,
-        /// UTXO value in satoshis.
-        #[arg(long)]
-        utxo_value: u64,
-        /// UTXO scriptPubKey, hex.
-        #[arg(long)]
-        utxo_scriptpubkey: String,
-        /// Optional BIP86 derivation index of the wallet key that
-        /// owns the input UTXO. None → daemon scans 0..1024.
-        #[arg(long)]
-        bip86_index: Option<u32>,
-    },
-    /// Unilateral exit — spend a Ghost Lock via the timelock recovery
-    /// branch to a wallet-controlled L1 destination, without any
-    /// operator cooperation. Daemon talks straight to bitcoind. Only
-    /// works once the lock's CSV timelock has matured (current height
-    /// >= creation_height + recovery_blocks).
-    Recover {
-        /// Lock to recover.
-        #[arg(long)]
-        lock_id: String,
-        /// L1 destination address for the recovered funds.
-        #[arg(long, value_name = "ADDR")]
-        to: String,
-        /// Mining fee in sats. Subtracted from the lock value.
-        #[arg(long, default_value_t = 1000)]
-        fee_sats: u64,
     },
 }
 
@@ -425,7 +623,20 @@ enum WalletCommand {
     /// Import a wallet from an existing BIP-39 mnemonic. Prompts for the words
     /// and a new passphrase. Refuses to overwrite an existing wallet of the
     /// same name.
-    Import { name: String },
+    Import {
+        name: String,
+        /// The chain height this seed was first used at.
+        ///
+        /// The block scanner reads forward from here to rebuild the wallet's
+        /// history. Without it, scanning starts at the tip and nothing this
+        /// seed did before now appears in the history — the coins are still
+        /// all found, but what they did is not.
+        ///
+        /// Guessing low is safe and slow; guessing high loses history
+        /// silently, so when in doubt pick a height before the seed existed.
+        #[arg(long, value_name = "HEIGHT")]
+        birth_height: Option<u32>,
+    },
     /// Unlock the named wallet (becomes active).
     Unlock { name: String },
     /// Lock a wallet by name, or the active one if no name is given.
@@ -509,8 +720,8 @@ mod client {
     }
 
     use crate::{
-        ChainCommand, Command, GspCommand, LightCommand, LocksCommand, MixCommand, UpdateCommand,
-        WalletCommand,
+        ChainCommand, Command, LightCommand, LockCommand, LockSignCommand, MixCommand, NodeCommand,
+        PsbtCommand, UpdateCommand, WalletCommand,
     };
 
     pub async fn run(command: Command, json: bool, no_spawn: bool) -> std::process::ExitCode {
@@ -531,57 +742,57 @@ mod client {
             }
         }
 
-        // Streaming subcommand: handed off to its own code path so we don't
-        // try to render it as a single Response.
-        if let Command::Light {
-            sub: LightCommand::Watch,
+        // Multi-call: private entry chains the lane lookup and the round so
+        // the user issues one command. The lookup must come first — the round
+        // needs the lane's address as its output, and the daemon refuses a
+        // lane a round must not pay into before any coin is committed.
+        if let Command::Lock {
+            sub: LockCommand::Fund { .. },
         } = &command
         {
-            return run_watch(json).await;
+            if let Command::Lock {
+                sub:
+                    LockCommand::Fund {
+                        lock_id,
+                        lane,
+                        coordinator,
+                        coordinator_peers,
+                        socks5_proxy,
+                        tier,
+                        ghost_id,
+                        utxo,
+                        utxo_value,
+                        utxo_scriptpubkey,
+                        bip86_index,
+                        bip86_scan_max,
+                        min_entities,
+                    },
+            } = command
+            {
+                return run_fund_lock(
+                    json,
+                    lock_id,
+                    lane,
+                    coordinator,
+                    coordinator_peers,
+                    socks5_proxy,
+                    tier,
+                    ghost_id,
+                    utxo,
+                    utxo_value,
+                    utxo_scriptpubkey,
+                    bip86_index,
+                    bip86_scan_max,
+                    min_entities,
+                )
+                .await;
+            }
         }
 
         // Multi-call summary: aggregate several IPC round-trips into one
         // terminal-friendly view.
         if matches!(&command, Command::Status) {
             return run_status(json).await;
-        }
-
-        // Multi-call entry-via-wraith flow: chains LocksPrepare →
-        // WraithMixOneShot → LocksConfirm under the hood, so the
-        // user sees one command.
-        if let Command::Locks {
-            sub: LocksCommand::PrepareViaWraith { .. },
-        } = &command
-        {
-            if let Command::Locks {
-                sub:
-                    LocksCommand::PrepareViaWraith {
-                        capacity_sats,
-                        coordinator,
-                        tier,
-                        ghost_id,
-                        socks5_proxy,
-                        utxo,
-                        utxo_value,
-                        utxo_scriptpubkey,
-                        bip86_index,
-                    },
-            } = command
-            {
-                return run_prepare_via_wraith(
-                    json,
-                    capacity_sats,
-                    coordinator,
-                    tier,
-                    ghost_id,
-                    socks5_proxy,
-                    utxo,
-                    utxo_value,
-                    utxo_scriptpubkey,
-                    bip86_index,
-                )
-                .await;
-            }
         }
 
         let request = match command {
@@ -591,11 +802,27 @@ mod client {
             Command::Chain { sub } => match sub {
                 ChainCommand::Status => Request::ChainStatus,
             },
-            Command::Gsp { sub } => match sub {
-                GspCommand::Ping => Request::GspPing,
-                GspCommand::Auth => Request::GspAuth,
-                GspCommand::SessionStatus => Request::GspSessionStatus,
-                GspCommand::RegisterScanKey => Request::GspRegisterScanKey,
+            Command::Node { sub } => match sub {
+                NodeCommand::Set {
+                    url,
+                    cookie,
+                    user,
+                    pass,
+                    pool_url,
+                } => Request::SetNode {
+                    ghostd_url: Some(url),
+                    cookie_path: cookie,
+                    user,
+                    pass,
+                    pool_url,
+                },
+                NodeCommand::Clear => Request::SetNode {
+                    ghostd_url: None,
+                    cookie_path: None,
+                    user: None,
+                    pass: None,
+                    pool_url: None,
+                },
             },
             Command::Light { sub } => match sub {
                 LightCommand::Receive { index } => Request::LightReceive { index },
@@ -610,58 +837,26 @@ mod client {
                     scan_max_index,
                     min_confirmations,
                 },
-                LightCommand::History { limit, offset } => Request::LightHistory { limit, offset },
                 LightCommand::Detected => Request::LightDetected,
-                LightCommand::Watch => unreachable!("Watch handled above"),
-                LightCommand::Send {
-                    recipient,
+                LightCommand::History { limit, offset } => Request::LightHistory { limit, offset },
+                LightCommand::Pay {
+                    recipient_address,
                     amount_sats,
-                    mode,
+                    fee_rate,
+                    scan_max,
                     memo,
                     immediate,
                     shroud_max_ms,
-                } => Request::LightSend {
-                    recipient,
+                } => Request::L1Send {
+                    recipient_address,
                     amount_sats,
-                    mode,
+                    fee_rate_sats_per_vb: fee_rate,
+                    change_index: None,
+                    bip86_scan_max: scan_max,
+                    selected_outpoints: Vec::new(),
                     memo,
                     shroud_max_ms: if immediate { Some(0) } else { shroud_max_ms },
                 },
-            },
-            Command::Locks { sub } => match sub {
-                LocksCommand::List => Request::LocksList,
-                LocksCommand::Prepare { capacity_sats } => Request::LocksPrepare { capacity_sats },
-                LocksCommand::Confirm {
-                    lock_id,
-                    funding_txid,
-                } => Request::LocksConfirm {
-                    lock_id,
-                    funding_txid,
-                },
-                LocksCommand::Jump {
-                    lock_id,
-                    target_address,
-                    priority,
-                } => Request::LocksJump {
-                    lock_id,
-                    target_address,
-                    priority,
-                },
-                LocksCommand::Recover {
-                    lock_id,
-                    to,
-                    fee_sats,
-                } => Request::LocksRecover {
-                    lock_id,
-                    destination_address: to,
-                    fee_sats,
-                },
-                // Multi-call flow — handled before this match in
-                // run() proper. The arm exists only so the match
-                // is exhaustive.
-                LocksCommand::PrepareViaWraith { .. } => {
-                    unreachable!("PrepareViaWraith handled by run_prepare_via_wraith")
-                }
             },
             Command::Update { sub } => match sub {
                 UpdateCommand::Check { manifest_url } => Request::CheckForUpdate { manifest_url },
@@ -685,7 +880,7 @@ mod client {
                         Err(e) => return io_err(e),
                     }
                 }
-                WalletCommand::Import { name } => {
+                WalletCommand::Import { name, birth_height } => {
                     let mnemonic = match prompt_mnemonic() {
                         Ok(m) => m,
                         Err(e) => return io_err(e),
@@ -698,6 +893,7 @@ mod client {
                         name,
                         mnemonic,
                         passphrase: pass,
+                        birth_height,
                     }
                 }
                 WalletCommand::Unlock { name } => match prompt_passphrase("passphrase: ") {
@@ -726,6 +922,123 @@ mod client {
                     name,
                     from_path: from,
                 },
+            },
+            Command::Psbt { sub } => match sub {
+                PsbtCommand::Sign {
+                    psbt,
+                    bip86_scan_max,
+                } => Request::PsbtSign {
+                    psbt,
+                    bip86_scan_max,
+                },
+            },
+            Command::Lock { sub } => match sub {
+                LockCommand::List => Request::GhostLockList,
+                LockCommand::Save {
+                    label,
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                } => Request::GhostLockSave {
+                    label,
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                },
+                LockCommand::Forget { lock_id } => Request::GhostLockForget { lock_id },
+                LockCommand::Lanes {
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                } => Request::GhostLockLanes {
+                    backup_pubkey,
+                    heir_pubkey,
+                    quorum_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                },
+                LockCommand::Destination { lock_id, lane } => {
+                    Request::GhostLockRoundDestination { lock_id, lane }
+                }
+                LockCommand::QuorumSign {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                    coordinator,
+                } => Request::GhostLockQuorumSign {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                    coordinator_url: coordinator,
+                },
+                LockCommand::QuorumId {
+                    backup_pubkey,
+                    heir_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                } => Request::GhostLockQuorumBindingId {
+                    backup_pubkey,
+                    heir_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                },
+                LockCommand::EscapePlan { lock_id, lane } => {
+                    Request::GhostLockEscapePlan { lock_id, lane }
+                }
+                LockCommand::Escape {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                } => Request::GhostLockEscapeSign {
+                    lock_id,
+                    lane,
+                    psbt,
+                    input_index,
+                },
+                LockCommand::Sign { sub } => match sub {
+                    LockSignCommand::Begin {
+                        lock_id,
+                        lane,
+                        psbt,
+                        input_index,
+                    } => Request::GhostLockSignBegin {
+                        lock_id,
+                        lane,
+                        psbt,
+                        input_index,
+                    },
+                    LockSignCommand::Nonce {
+                        session,
+                        device_nonce,
+                    } => Request::GhostLockSignNonce {
+                        session,
+                        device_nonce,
+                    },
+                    LockSignCommand::Complete {
+                        session,
+                        device_partial,
+                    } => Request::GhostLockSignComplete {
+                        session,
+                        device_partial,
+                    },
+                },
+                // Intercepted above: private entry is two calls, not one.
+                LockCommand::Fund { .. } => unreachable!("lock fund handled above"),
             },
             Command::Mix { sub } => match sub {
                 MixCommand::PrepareCoin {
@@ -764,6 +1077,7 @@ mod client {
                         }
                     };
                     Request::WraithMixPrepare {
+                        min_entities: None,
                         coordinator_url: coordinator,
                         coordinator_peers,
                         socks5_proxy,
@@ -813,6 +1127,7 @@ mod client {
                         }
                     };
                     Request::WraithMixOneShot {
+                        min_entities: None,
                         coordinator_url: coordinator,
                         coordinator_peers,
                         socks5_proxy,
@@ -909,68 +1224,13 @@ mod client {
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::ChainStatus(s)) => {
-                println!("ghost-pay {} ({})", s.backend_version, s.network);
-                println!(
-                    "  keys: {}   locks: {}   active sessions: {}",
-                    if s.has_keys { "yes" } else { "no" },
-                    s.lock_count,
-                    s.active_sessions,
-                );
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspPing(p)) => {
-                match p.round_trip_ms {
-                    Some(rtt) => println!(
-                        "gsp ok — server_time {} — round-trip {}ms",
-                        p.server_time, rtt
-                    ),
-                    None => println!("gsp ok — server_time {}", p.server_time),
-                }
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspAuth(a)) => {
-                if a.already_registered {
-                    println!("(already registered) — session created");
-                } else {
-                    println!("registered + session created");
-                }
-                println!("  wallet_id:    {}", a.wallet_id);
-                println!("  token (prefix): {}...", a.token_prefix);
-                println!("  expires_at:   {}", a.expires_at);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspScanKeyRegistered {
-                wallet_id,
-                scan_pubkey_hex,
-            }) => {
-                println!("scan key registered with GSP");
-                println!("  wallet_id:   {wallet_id}");
-                println!("  scan_pubkey: {scan_pubkey_hex}");
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspSessionStatus(s)) => {
-                if !s.have_token {
-                    println!("(no session — run `wraith gsp auth`)");
-                } else {
-                    println!("session active");
-                    if let Some(n) = s.wallet_name {
-                        println!("  wallet:        {n}");
+                println!("{} ({})", s.backend_version, s.network);
+                match (s.chain_height, s.chain_headers) {
+                    (Some(h), Some(t)) if h < t => {
+                        println!("  height: {h} of {t} (syncing)")
                     }
-                    if let Some(id) = s.wallet_id {
-                        println!("  wallet_id:     {id}");
-                    }
-                    if let Some(p) = s.phase {
-                        let cnt = s.connect_count.unwrap_or(0);
-                        println!("  ws phase:      {p} (connects: {cnt})");
-                    }
-                    if let Some(err) = s.last_error {
-                        println!("  last error:    {err}");
-                    }
-                    if let Some(rem) = s.remaining_secs {
-                        let hours = rem / 3600;
-                        let mins = (rem % 3600) / 60;
-                        println!("  expires in:    {hours}h {mins}m ({rem}s)");
-                    }
+                    (Some(h), _) => println!("  height: {h}"),
+                    (None, _) => println!("  height: unknown"),
                 }
                 std::process::ExitCode::SUCCESS
             }
@@ -1024,27 +1284,135 @@ mod client {
                 }
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::LightDetected(d)) => {
-                if d.detections.is_empty() {
-                    println!("(no detections — server scanner may not be wired yet,");
-                    println!(" or no incoming silent payments since auth)");
+            Ok(Response::GhostLockQuorumSigned(r)) => {
+                println!("the quorum co-signed {}", r.lock_id);
+                println!(
+                    "  it read the spend as {} sats out, {} sats fee",
+                    r.quorum_saw_input_sats, r.quorum_saw_fee_sats
+                );
+                println!("  compare that with what you meant before broadcasting.");
+                println!("\nsignature: {}", r.signature);
+                if r.tx_hex.is_empty() {
+                    println!("\nsigned, but the transaction still needs other inputs;");
+                    println!("pass this psbt on:\n{}", r.psbt);
                 } else {
-                    for det in &d.detections {
-                        let amt = det
-                            .amount_sats
-                            .map(|a| format!("{a} sats"))
-                            .unwrap_or_else(|| "?".into());
-                        let height = det
-                            .block_height
-                            .map(|h| h.to_string())
-                            .unwrap_or_else(|| "(mempool)".into());
-                        println!(
-                            "{}:{}  {amt}  k={}  height {height}",
-                            det.txid, det.vout, det.k
-                        );
-                    }
-                    println!("\n{} detection(s)", d.detections.len());
+                    println!("\ntransaction (hex) — broadcast this:");
+                    println!("{}", r.tx_hex);
                 }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockQuorumBindingId(r)) => {
+                println!("quorum binding id: {}", r.binding_id);
+                println!();
+                println!("Give this to whoever holds the quorum seed. They run:");
+                println!("  {}", r.derive_with);
+                println!();
+                println!("Put the key they return in --quorum-pubkey when you build the Lock.");
+                println!("This is not the Lock's id: the Lock's id is a hash over the very key");
+                println!("you are asking them for, so it cannot be what derives it.");
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockEscapePlan(r)) => {
+                println!("{} — {} lane of {}", r.escape, r.lane, r.lock_id);
+                println!("  wait:     {} blocks", r.delay_blocks);
+                println!(
+                    "  nSequence every input must carry: {}",
+                    r.required_sequence
+                );
+                println!("  lane:     {}", r.lane_address);
+                if r.coins.is_empty() {
+                    println!("\n(no coins in this lane)");
+                } else {
+                    println!("\ncoins:");
+                    for c in &r.coins {
+                        if c.blocks_remaining == 0 {
+                            println!(
+                                "  {}:{}  {} sats  ready now ({} confirmations)",
+                                c.txid, c.vout, c.sats, c.confirmations
+                            );
+                        } else {
+                            println!(
+                                "  {}:{}  {} sats  {} more blocks (~{:.1} days)",
+                                c.txid,
+                                c.vout,
+                                c.sats,
+                                c.blocks_remaining,
+                                f64::from(c.blocks_remaining) / 144.0
+                            );
+                        }
+                    }
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockEscapeSigned(r)) => {
+                println!(
+                    "{} signed for the {} lane of {}",
+                    r.escape, r.lane, r.lock_id
+                );
+                println!("\ntransaction (hex) — broadcast this:");
+                println!("{}", r.tx_hex);
+                println!("\npsbt:");
+                println!("{}", r.psbt);
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSignBegun(r)) => {
+                let s = &r.summary;
+                println!("CHECK THIS BEFORE YOU CARRY ANYTHING ANYWHERE");
+                println!(
+                    "  spending  {} sats from {}",
+                    s.input_sats,
+                    s.input_address
+                        .as_deref()
+                        .unwrap_or("(unrenderable script)")
+                );
+                if s.input_count > 1 {
+                    println!(
+                        "  ⚠ this transaction has {} inputs; you are signing input {}",
+                        s.input_count, s.input_index
+                    );
+                }
+                for o in &s.outputs {
+                    println!(
+                        "  paying    {} sats to {}",
+                        o.sats,
+                        o.address.as_deref().unwrap_or("(unrenderable script)")
+                    );
+                }
+                println!("  fee       {} sats", s.fee_sats);
+                println!("\nsession: {}", r.session);
+                println!("our nonce: {}", r.our_nonce);
+                println!("\n--- carry this to the backup device ---");
+                println!("{}", r.device_request);
+                println!(
+                    "--- then: wraith lock sign nonce --session {} --device-nonce <hex>",
+                    r.session
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSignNonced(r)) => {
+                println!("this wallet has signed its share; its nonce is burned.");
+                println!("\n--- carry this to the backup device ---");
+                println!("{}", r.device_request);
+                println!(
+                    "--- then: wraith lock sign complete --session {} --device-partial <hex>",
+                    r.session
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSigned(r)) => {
+                println!("signed. the signature verifies against the lane's output key.");
+                println!("signature: {}", r.signature);
+                println!("\nsigned psbt:");
+                println!("{}", r.psbt);
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockRoundDestination(d)) => {
+                println!("lock:    {}", d.lock_id);
+                println!("lane:    {} ({})", d.label, d.lane);
+                println!("address: {}", d.address);
+                println!("\nfund it with `wraith lock fund`, which runs a round whose");
+                println!("output is this address. Paying it directly also works, and");
+                println!("publishes the link between those coins and the Lock.");
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::LightHistory(h)) => {
@@ -1052,19 +1420,32 @@ mod client {
                     println!("(no transactions)");
                 } else {
                     for t in &h.transactions {
-                        let dir = if t.amount_sats >= 0 { "+" } else { "" };
+                        // An unrecorded amount prints as `?`, never as 0 —
+                        // "the wallet did not note what moved" and "nothing
+                        // moved" are different things to read off a receipt.
+                        let amount = match t.amount_sats {
+                            Some(a) if a >= 0 => format!("+{a}"),
+                            Some(a) => a.to_string(),
+                            None => "?".to_string(),
+                        };
                         let height = t
                             .block_height
                             .map(|h| h.to_string())
-                            .unwrap_or_else(|| "(mempool)".into());
+                            .unwrap_or_else(|| "(unknown)".into());
+                        // Same rule: a node that cannot answer says so,
+                        // rather than reporting a settled payment as pending.
+                        let confs = t
+                            .confirmations
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".into());
                         let memo = t.memo.as_deref().unwrap_or("");
                         println!(
-                            "{}  {dir}{}  {}  height {}  ({} confs){}",
+                            "{}  {}  {}  height {}  ({} confs){}",
                             t.txid,
-                            t.amount_sats,
+                            amount,
                             t.tx_type,
                             height,
-                            t.confirmations,
+                            confs,
                             if memo.is_empty() {
                                 String::new()
                             } else {
@@ -1080,85 +1461,41 @@ mod client {
                 }
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::LightSent(s)) => {
-                println!("payment submitted");
-                println!("  payment_id: {}", s.payment_id);
-                if let Some(tx) = &s.txid {
-                    println!("  txid:       {tx}");
+            Ok(Response::LightDetected(d)) => {
+                if d.detections.is_empty() {
+                    println!("(no silent payments detected)");
                 } else {
-                    println!("  txid:       (L2 — no on-chain txid)");
+                    for x in &d.detections {
+                        let amount = match x.amount_sats {
+                            Some(a) => a.to_string(),
+                            None => "?".into(),
+                        };
+                        let height = match x.block_height {
+                            Some(h) => h.to_string(),
+                            None => "(unconfirmed)".into(),
+                        };
+                        println!(
+                            "{}:{}  {} sats  height {}  k={}",
+                            x.txid, x.vout, amount, height, x.k
+                        );
+                    }
+                    println!("\n{} silent payment(s)", d.detections.len());
                 }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::L1Sent(s)) => {
+                println!("broadcast");
+                println!("  txid:       {}", s.txid);
                 println!("  recipient:  {}", s.recipient);
                 println!("  amount:     {} sats", s.amount_sats);
+                // Stated separately because the sender pays it on top: the
+                // balance drops by amount + fee, not by amount.
                 println!("  fee:        {} sats", s.fee_sats);
-                println!("  mode:       {}", s.mode);
+                println!("  change:     {} sats", s.change_sats);
+                println!("  inputs:     {}", s.input_count);
                 match s.shroud_delay_ms {
                     Some(ms) => println!("  shroud:     held {ms} ms before broadcast"),
                     None => println!("  shroud:     disabled (immediate)"),
-                }
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksPrepared(r)) => {
-                println!("lock prepared");
-                println!("  lock_id:         {}", r.lock_id);
-                println!("  funding address: {}", r.funding_address);
-                println!("  required:        {} sats", r.required_sats);
-                println!();
-                println!(
-                    "Send {} sats to the address above, then run:",
-                    r.required_sats
-                );
-                println!("  wraith locks confirm {} <funding_txid>", r.lock_id);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksConfirmed(r)) => {
-                println!("lock confirmed");
-                println!("  lock_id:      {}", r.lock_id);
-                println!("  funding txid: {}", r.txid);
-                println!("  block height: {}", r.block_height);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksJumped(r)) => {
-                println!("jump initiated");
-                println!("  lock_id:   {}", r.lock_id);
-                match r.jump_txid {
-                    Some(tx) => println!("  jump txid: {tx}"),
-                    None => println!("  jump txid: (queued — not yet broadcast)"),
-                }
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksRecovered(r)) => {
-                println!("✓ unilateral exit broadcast — funds back on L1");
-                println!("  lock_id:        {}", r.lock_id);
-                println!("  broadcast_txid: {}", r.broadcast_txid);
-                println!("  destination:    {}", r.destination_address);
-                println!("  recovered_sats: {}", r.recovered_sats);
-                println!("  fee_sats:       {}", r.fee_sats);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LocksList(r)) => {
-                if r.locks.is_empty() {
-                    println!("(no locks)");
-                } else {
-                    for l in &r.locks {
-                        println!(
-                            "{}  {}  {} / {} sats  ({})",
-                            &l.lock_id[..16.min(l.lock_id.len())],
-                            l.status,
-                            l.balance_sats,
-                            l.capacity_sats,
-                            l.denomination,
-                        );
-                        println!("  funding: {}", l.funding_address);
-                        if let (Some(txid), Some(vout)) = (&l.funding_txid, l.funding_vout) {
-                            println!("  outpoint: {txid}:{vout}");
-                        }
-                    }
-                    println!(
-                        "\n{} locks  total: {} sats",
-                        r.locks.len(),
-                        r.total_locked_sats
-                    );
                 }
                 std::process::ExitCode::SUCCESS
             }
@@ -1180,13 +1517,93 @@ mod client {
                 }
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::NodeEndpointsSet(r)) => {
-                println!("node endpoints updated (preset: {})", r.preset);
-                if !r.ghost_pay_urls.is_empty() {
-                    println!("  ghost-pay: {}", r.ghost_pay_urls.join(", "));
+            Ok(Response::GhostLockLanes(r)) => {
+                println!(
+                    "ghost lock: {} sats settled, {} pending (block {})",
+                    r.total_sats, r.total_pending_sats, r.chain_height
+                );
+                if r.custodial_sats > 0 {
+                    println!(
+                        "  {} sats in Investments — the quorum can move these without you",
+                        r.custodial_sats
+                    );
                 }
-                if !r.gsp_urls.is_empty() {
-                    println!("  gsp:       {}", r.gsp_urls.join(", "));
+                for l in &r.lanes {
+                    let mut flags = String::new();
+                    if l.quorum_can_spend_alone {
+                        flags.push_str("  [custodial]");
+                    }
+                    if !l.round_eligible {
+                        flags.push_str("  [not private]");
+                    }
+                    println!("  {:<12} {} sats{}", l.label, l.balance_sats, flags);
+                    if l.pending_sats > 0 {
+                        println!("               +{} pending", l.pending_sats);
+                    }
+                    println!("               {}", l.address);
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockSaved(r)) => {
+                println!(
+                    "{} {}",
+                    if r.created { "saved" } else { "updated" },
+                    r.lock.label.as_deref().unwrap_or(&r.lock.lock_id)
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockList(r)) => {
+                if r.locks.is_empty() {
+                    println!("(no Ghost Locks)");
+                }
+                for l in &r.locks {
+                    println!(
+                        "{}  {}",
+                        l.lock_id,
+                        l.label.as_deref().unwrap_or("(unnamed)")
+                    );
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockForgotten(r)) => {
+                // Says what it did NOT do: forgetting a definition leaves the
+                // funds exactly where they were.
+                if r.existed {
+                    println!("forgot {} — funds untouched", r.lock_id);
+                } else {
+                    println!("no such lock: {}", r.lock_id);
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::WraithMixRefused(r)) => {
+                println!(
+                    "refused: {} distinct entities across {} seats (floor {})",
+                    r.report.entities, r.report.seats, r.min_entities
+                );
+                for reason in &r.reasons {
+                    println!("  {reason}");
+                }
+                if !r.lowering_the_floor_would_help {
+                    println!("  the coordinator claimed more than its coins support");
+                }
+                std::process::ExitCode::FAILURE
+            }
+            Ok(Response::NodeSet(r)) => {
+                match r.ghostd_url.as_deref() {
+                    Some(u) => {
+                        println!("node set");
+                        println!("  url:  {u}");
+                        println!("  auth: {}", r.auth);
+                        match r.pool_url.as_deref() {
+                            Some(p) => println!("  pool: {p} (coordinator election)"),
+                            None => println!("  pool: (none — mixing needs a coordinator URL)"),
+                        }
+                    }
+                    // Said plainly, because it is a state the wallet cannot
+                    // work in and the user has just chosen it.
+                    None => {
+                        println!("node cleared — chain operations will refuse until one is set")
+                    }
                 }
                 std::process::ExitCode::SUCCESS
             }
@@ -1289,30 +1706,6 @@ mod client {
                 println!("  spend_pubkey: {}", g.spend_public_key_hex);
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::WalletGlyph(g)) => {
-                println!("ghost_id:     {}", g.ghost_id);
-                println!("status:       {}", g.status);
-                println!("bitmap_hash:  {}", g.bitmap_hash);
-                println!("commitment:   {}", g.commitment);
-                if let Some(txid) = &g.funding_txid {
-                    println!("funding_txid: {txid}");
-                }
-                if let Some(at) = g.registered_at {
-                    println!("registered_at:{at}");
-                }
-                println!("pixels:       {} bytes", g.pixels.len());
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::WalletGlyphClaimed(r)) => {
-                println!("status:       {}", r.status);
-                println!("bitmap_hash:  {}", r.bitmap_hash);
-                println!("commitment:   {}", r.commitment);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::WalletGlyphChecked { available }) => {
-                println!("available: {available}");
-                std::process::ExitCode::SUCCESS
-            }
             Ok(Response::WalletShowMnemonic(m)) => {
                 println!("WARNING: anyone with these 24 words owns the wallet.\n");
                 println!("{}\n", m.mnemonic);
@@ -1397,8 +1790,14 @@ mod client {
                 println!("network:      {}", e.network);
                 println!("socket:       {}", e.socket_path);
                 println!("wallets dir:  {}", e.wallets_dir);
-                println!("ghost-pay:    {}", e.ghost_pay_urls.join(", "));
-                println!("gsp:          {}", e.gsp_urls.join(", "));
+                match e.ghostd_url.as_deref() {
+                    Some(u) => println!("node:         {u} (auth: {})", e.ghostd_auth),
+                    None => println!("node:         (none configured)"),
+                }
+                match e.pool_url.as_deref() {
+                    Some(u) => println!("pool:         {u} (coordinator election)"),
+                    None => println!("pool:         (none)"),
+                }
                 if let Some(p) = &e.tor_proxy {
                     println!("tor proxy:    {p}");
                 } else {
@@ -1424,38 +1823,32 @@ mod client {
             }
             Ok(Response::ConnectionStatus(s)) => {
                 println!("network:    {}", s.network);
-                println!(
-                    "ghost-pay:  {}{}",
-                    if s.ghost_pay_reachable {
-                        "reachable"
-                    } else {
-                        "unreachable"
-                    },
-                    s.ghost_pay_version
-                        .as_deref()
-                        .map(|v| format!(" (v{v})"))
-                        .or_else(|| s.ghost_pay_error.as_deref().map(|e| format!(" — {e}")))
-                        .unwrap_or_default()
-                );
-                println!(
-                    "gsp:        {}",
-                    if s.gsp_connected {
-                        "connected"
-                    } else {
-                        s.gsp_phase.as_deref().unwrap_or("disconnected")
-                    }
-                );
+                // "not configured" and "configured but not answering" are
+                // different problems with different fixes, so they get
+                // different words rather than one shared "unreachable".
+                if !s.node_configured {
+                    println!("node:       (none configured)");
+                } else {
+                    println!(
+                        "node:       {}{}",
+                        if s.node_reachable {
+                            "reachable"
+                        } else {
+                            "unreachable"
+                        },
+                        s.node_version
+                            .as_deref()
+                            .map(|v| format!(" ({v})"))
+                            .or_else(|| s.node_error.as_deref().map(|e| format!(" — {e}")))
+                            .unwrap_or_default()
+                    );
+                }
                 match s.chain_height {
                     Some(h) if s.chain_synced => println!("chain:      synced · #{h}"),
                     Some(h) => println!("chain:      syncing · #{h}"),
                     None => println!("chain:      unknown"),
                 }
                 std::process::ExitCode::SUCCESS
-            }
-            // Streaming variants are handled in run_watch() and never reach here.
-            Ok(Response::Watching) | Ok(Response::PaymentDetected(_)) => {
-                eprintln!("wraith: unexpected streaming variant on a one-shot request");
-                std::process::ExitCode::FAILURE
             }
             // PSBT and multisig-descriptor commands (WIP): bespoke human-readable
             // output is not wired up yet, so emit the structured response as JSON —
@@ -1756,69 +2149,81 @@ mod client {
             .read_line(&mut response_line)
             .await
             .map_err(|e| format!("read failed: {e}"))?;
+        // Zero bytes means the daemon closed the connection without answering
+        // — it did not send a malformed reply, it sent nothing. In practice
+        // that is a panicking request handler, whose reason is in wraithd's
+        // log and nowhere else. Saying "malformed response" here sends the
+        // reader looking for a parse bug in a message that was never written.
+        if response_line.trim().is_empty() {
+            return Err(format!(
+                "wraithd closed the connection without responding \
+                 (endpoint {}). The reason will be in the daemon's log — \
+                 a request handler most likely panicked.",
+                wraith_wallet_ipc::endpoint_display()
+            ));
+        }
         let envelope: Envelope<Response> =
             serde_json::from_str(&response_line).map_err(|e| format!("malformed response: {e}"))?;
         Ok(envelope.payload)
     }
 
-    /// `wraith locks prepare-via-wraith` flow. Three IPC calls under
-    /// the hood:
-    ///   1. LocksPrepare(capacity_sats)               → funding_address + lock_id
-    ///   2. WraithMixOneShot(mix_output=funding_addr) → broadcast_txid
-    ///   3. LocksConfirm(lock_id, broadcast_txid)     → block_height
+    /// Private entry: fund one lane of a remembered Lock through a round.
     ///
-    /// Stops at the first error and surfaces it to the user. The
-    /// printed step-by-step trail makes it obvious which phase
-    /// broke if the operator/coordinator misbehaves mid-flight.
+    /// Two calls, in this order for a reason. `GhostLockRoundDestination`
+    /// resolves the lane to an address AND applies the compartment rule, so a
+    /// lane a round must not pay into is refused before a coin is registered
+    /// anywhere. Only then is the round run, with that address as its output.
+    ///
+    /// The address is never taken from the user. The whole property being
+    /// bought here is that the round's output belongs to the Lock; letting a
+    /// caller supply the destination would make "fund my Savings privately"
+    /// and "send my coins to this address" the same command.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_prepare_via_wraith(
+    pub(crate) async fn run_fund_lock(
         json: bool,
-        capacity_sats: u64,
+        lock_id: String,
+        lane: String,
         coordinator: String,
+        coordinator_peers: Vec<String>,
+        socks5_proxy: Option<String>,
         tier: String,
         ghost_id: String,
-        socks5_proxy: Option<String>,
         utxo: String,
         utxo_value: u64,
         utxo_scriptpubkey: String,
         bip86_index: Option<u32>,
+        bip86_scan_max: Option<u32>,
+        min_entities: Option<usize>,
     ) -> std::process::ExitCode {
         let (txid, vout) = match parse_outpoint(&utxo) {
             Ok(v) => v,
-            Err(e) => {
-                return io_err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
-            }
+            Err(e) => return io_err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
         };
 
-        // Phase 1: prepare the lock.
         if !json {
-            println!("[1/3] preparing lock ({capacity_sats} sats)");
+            println!("[1/2] resolving {lane} lane of {lock_id}");
         }
-        let prep = match call(Request::LocksPrepare { capacity_sats }).await {
-            Ok(Response::LocksPrepared(p)) => p,
-            Ok(Response::Error(e)) => {
-                return error_out(json, format!("LocksPrepare: {}", e.message))
-            }
-            Ok(other) => {
-                return error_out(json, format!("LocksPrepare: unexpected response {other:?}"))
-            }
-            Err(e) => return error_out(json, format!("LocksPrepare: {e}")),
+        let dest = match call(Request::GhostLockRoundDestination {
+            lock_id: lock_id.clone(),
+            lane: lane.clone(),
+        })
+        .await
+        {
+            Ok(Response::GhostLockRoundDestination(d)) => d,
+            Ok(Response::Error(e)) => return fund_lock_err(json, e.message),
+            Ok(other) => return fund_lock_err(json, format!("unexpected response {other:?}")),
+            Err(e) => return fund_lock_err(json, e),
         };
         if !json {
-            println!("      lock_id:         {}", prep.lock_id);
-            println!("      funding_address: {}", prep.funding_address);
+            println!("      {} → {}", dest.label, dest.address);
         }
 
-        // Phase 2: run the wraith mix with the lock's funding address
-        // as the mix output. The CoinJoin's denom output IS the
-        // lock's funding output — the on-chain footprint is
-        // indistinguishable from any other Wraith mix.
         if !json {
-            println!("[2/3] running wraith mix → {}", prep.funding_address);
+            println!("[2/2] running round; its output funds the lane");
         }
-        let mix = match call(Request::WraithMixOneShot {
+        let mixed = match call(Request::WraithMixOneShot {
             coordinator_url: coordinator,
-            coordinator_peers: Vec::new(),
+            coordinator_peers,
             socks5_proxy,
             tier_id: tier,
             ghost_id,
@@ -1826,72 +2231,43 @@ mod client {
             utxo_vout: vout,
             utxo_value_sats: utxo_value,
             utxo_scriptpubkey_hex: utxo_scriptpubkey,
-            mix_output_address: prep.funding_address.clone(),
+            mix_output_address: dest.address.clone(),
             bip86_index,
-            bip86_scan_max: None,
+            bip86_scan_max,
+            min_entities,
         })
         .await
         {
             Ok(Response::WraithMixCompleted(m)) => m,
-            Ok(Response::Error(e)) => {
-                return error_out(json, format!("WraithMixOneShot: {}", e.message))
-            }
-            Ok(other) => {
-                return error_out(
-                    json,
-                    format!("WraithMixOneShot: unexpected response {other:?}"),
-                )
-            }
-            Err(e) => return error_out(json, format!("WraithMixOneShot: {e}")),
-        };
-        if !json {
-            println!("      session_id:     {}", mix.session_id);
-            println!("      broadcast_txid: {}", mix.broadcast_txid);
-        }
-
-        // Phase 3: confirm the lock against the broadcast txid.
-        if !json {
-            println!("[3/3] confirming lock funding");
-        }
-        let conf = match call(Request::LocksConfirm {
-            lock_id: prep.lock_id.clone(),
-            funding_txid: mix.broadcast_txid.clone(),
-        })
-        .await
-        {
-            Ok(Response::LocksConfirmed(c)) => c,
-            Ok(Response::Error(e)) => {
-                return error_out(json, format!("LocksConfirm: {}", e.message))
-            }
-            Ok(other) => {
-                return error_out(json, format!("LocksConfirm: unexpected response {other:?}"))
-            }
-            Err(e) => return error_out(json, format!("LocksConfirm: {e}")),
+            Ok(Response::Error(e)) => return fund_lock_err(json, e.message),
+            Ok(other) => return fund_lock_err(json, format!("unexpected response {other:?}")),
+            Err(e) => return fund_lock_err(json, e),
         };
 
         if json {
             let body = serde_json::json!({
-                "lock_id": prep.lock_id,
-                "funding_address": prep.funding_address,
-                "broadcast_txid": mix.broadcast_txid,
-                "block_height": conf.block_height,
-                "session_id": mix.session_id,
+                "lock_id": dest.lock_id,
+                "lane": dest.lane,
+                "address": dest.address,
+                "session_id": mixed.session_id,
+                "broadcast_txid": mixed.broadcast_txid,
+                "mixed_output_tx_index": mixed.mixed_output_tx_index,
             });
             println!("{body}");
         } else {
-            println!();
-            println!("✓ lock funded via Wraith CoinJoin");
-            println!("  lock_id:        {}", prep.lock_id);
-            println!("  broadcast_txid: {}", mix.broadcast_txid);
-            println!("  block_height:   {}", conf.block_height);
-            println!();
-            println!("the chain shows a CoinJoin tx — chain analysts cannot tell");
-            println!("which output became this lock. that's the privacy property.");
+            println!("      txid:   {}", mixed.broadcast_txid);
+            println!("      vout:   {}", mixed.mixed_output_tx_index);
+            println!(
+                "done. {} of {} is funded; the deposit is a round output, not a transfer.",
+                dest.label, dest.lock_id
+            );
+            println!("      it will show as pending until the round transaction confirms.");
         }
         std::process::ExitCode::SUCCESS
     }
 
-    fn error_out(json: bool, msg: String) -> std::process::ExitCode {
+    /// Failure path for `run_fund_lock`, matching the CLI's `--json` contract.
+    fn fund_lock_err(json: bool, msg: String) -> std::process::ExitCode {
         if json {
             let body = serde_json::json!({ "error": { "message": msg } });
             println!("{body}");
@@ -1908,18 +2284,16 @@ mod client {
         let health = call(Request::Health).await;
         let env_resp = call(Request::DaemonEnv).await;
         let wallets = call(Request::WalletList).await;
-        let session = call(Request::GspSessionStatus).await;
+        let node = call(Request::ConnectionStatus).await;
         let balance = call(Request::LightBalance).await;
-        let locks = call(Request::LocksList).await;
 
         if json {
             let body = serde_json::json!({
                 "health":  result_value(&health),
                 "env":     result_value(&env_resp),
                 "wallets": result_value(&wallets),
-                "session": result_value(&session),
+                "node":    result_value(&node),
                 "balance": result_value(&balance),
-                "locks":   result_value(&locks),
             });
             println!("{body}");
             return std::process::ExitCode::SUCCESS;
@@ -1961,7 +2335,22 @@ mod client {
             }
             _ => println!("wallet:   error"),
         }
-        // balance row — only meaningful if we have a session
+        // node row
+        match &node {
+            Ok(Response::ConnectionStatus(s)) if !s.node_configured => {
+                println!("node:     (none — `wraith node set <url> --cookie <path>`)")
+            }
+            Ok(Response::ConnectionStatus(s)) => {
+                let where_ = match s.chain_height {
+                    Some(h) if s.chain_synced => format!("synced · #{h}"),
+                    Some(h) => format!("syncing · #{h}"),
+                    None => "unreachable".to_string(),
+                };
+                println!("node:     {where_}");
+            }
+            _ => println!("node:     unknown"),
+        }
+        // balance row
         match &balance {
             Ok(Response::LightBalance(b)) => {
                 let confirmed = b.confirmed_sats.unwrap_or(0);
@@ -1972,40 +2361,10 @@ mod client {
                     println!("balance:  {confirmed} sat");
                 }
             }
-            Ok(Response::Error(_)) | Err(_) => {
-                println!("balance:  (no session — `wraith gsp auth`)");
-            }
+            // The reason is already on the node row above; repeating it as a
+            // balance of 0 would be worse than saying nothing.
+            Ok(Response::Error(_)) | Err(_) => println!("balance:  (unavailable)"),
             _ => {}
-        }
-        // locks row
-        match &locks {
-            Ok(Response::LocksList(l)) => {
-                println!(
-                    "locks:    {} ({} sat capacity)",
-                    l.locks.len(),
-                    l.total_locked_sats
-                );
-            }
-            Ok(Response::Error(_)) | Err(_) => println!("locks:    (no session)"),
-            _ => {}
-        }
-        // session row
-        match &session {
-            Ok(Response::GspSessionStatus(s)) if s.have_token => {
-                let remaining = s.remaining_secs.unwrap_or(0).max(0);
-                let pretty = if remaining < 60 {
-                    format!("{remaining}s")
-                } else if remaining < 3600 {
-                    format!("{}m {}s", remaining / 60, remaining % 60)
-                } else {
-                    format!("{}h {}m", remaining / 3600, (remaining % 3600) / 60)
-                };
-                let wallet = s.wallet_name.as_deref().unwrap_or("(unknown)");
-                let phase = s.phase.as_deref().unwrap_or("?");
-                println!("session:  {wallet} — {phase} — expires in {pretty}");
-            }
-            Ok(Response::GspSessionStatus(_)) => println!("session:  (none)"),
-            _ => println!("session:  (none)"),
         }
         std::process::ExitCode::SUCCESS
     }
@@ -2016,94 +2375,214 @@ mod client {
             Err(e) => serde_json::json!({"error": e}),
         }
     }
+}
 
-    /// Streaming subscriber for `Request::WatchPayments`. Connects, sends the
-    /// request, expects a `Response::Watching` ack, then prints each
-    /// `Response::PaymentDetected` line until the daemon closes the stream
-    /// (or the user hits Ctrl-C). With `--json`, every line is the raw
-    /// envelope JSON exactly as the daemon emits it.
-    pub(crate) async fn run_watch(json: bool) -> std::process::ExitCode {
-        let stream = match connect_daemon().await {
-            Ok(s) => s,
-            Err(e) => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"error": {"message": format!("connect: {e}")}})
-                    );
-                } else {
-                    eprintln!(
-                        "wraith: could not connect to wraithd at {}: {e}",
-                        wraith_wallet_ipc::endpoint_display()
-                    );
-                }
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        let (reader, mut writer) = stream.split();
-        let req = Envelope::new(1, Request::WatchPayments);
-        let mut line = match serde_json::to_string(&req) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("wraith: serialise: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        line.push('\n');
-        if let Err(e) = writer.write_all(line.as_bytes()).await {
-            eprintln!("wraith: write: {e}");
-            return std::process::ExitCode::FAILURE;
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own validity check: duplicate flags, bad names, conflicting
+    /// shorts. Cheap, and it fails at test time rather than on first run.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every Lock subcommand parses.
+    ///
+    /// This exists because the CLI shipped with four `GhostLock*` response
+    /// renderers and no commands that could produce them — the wallet could
+    /// format a lock list it had no way to ask for, and a help string pointed
+    /// at a `lock-list` command that did not exist. Nothing caught it because
+    /// nothing parsed the tree. This does.
+    #[test]
+    fn every_lock_subcommand_parses() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["wraith", "lock", "list"],
+            vec!["wraith", "lock", "forget", "--lock-id", "abc"],
+            vec![
+                "wraith",
+                "lock",
+                "destination",
+                "--lock-id",
+                "abc",
+                "--lane",
+                "savings",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "save",
+                "--backup-pubkey",
+                "aa",
+                "--heir-pubkey",
+                "bb",
+                "--quorum-pubkey",
+                "cc",
+                "--anchor-height",
+                "1",
+                "--inherit-height",
+                "2",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "lanes",
+                "--backup-pubkey",
+                "aa",
+                "--heir-pubkey",
+                "bb",
+                "--quorum-pubkey",
+                "cc",
+                "--anchor-height",
+                "1",
+                "--inherit-height",
+                "2",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "fund",
+                "--lock-id",
+                "abc",
+                "--lane",
+                "savings",
+                "--coordinator",
+                "http://127.0.0.1:9100",
+                "--tier",
+                "1m_sats",
+                "--ghost-id",
+                "g",
+                "--utxo",
+                "aa:0",
+                "--utxo-value",
+                "1000000",
+                "--utxo-scriptpubkey",
+                "5120aa",
+            ],
+        ];
+        for argv in cases {
+            let joined = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
         }
-        let mut reader = BufReader::new(reader);
-        if !json {
-            eprintln!("wraith: watching for silent-payment detections (Ctrl-C to stop)");
+    }
+
+    /// The quorum-sign command parses.
+    #[test]
+    fn the_quorum_sign_command_parses() {
+        let argv = vec![
+            "wraith",
+            "lock",
+            "quorum-sign",
+            "--lock-id",
+            "a",
+            "--psbt",
+            "cHNidP8=",
+            "--input-index",
+            "0",
+            "--coordinator",
+            "http://127.0.0.1:9100",
+        ];
+        Cli::try_parse_from(&argv).expect("must parse");
+    }
+
+    /// The escape subcommands parse.
+    #[test]
+    fn the_escape_commands_parse() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec![
+                "wraith",
+                "lock",
+                "escape-plan",
+                "--lock-id",
+                "a",
+                "--lane",
+                "spending",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "escape",
+                "--lock-id",
+                "a",
+                "--lane",
+                "investments",
+                "--psbt",
+                "cHNidP8=",
+                "--input-index",
+                "0",
+            ],
+        ];
+        for argv in cases {
+            let joined = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
         }
-        loop {
-            let mut buf = String::new();
-            match reader.read_line(&mut buf).await {
-                Ok(0) => return std::process::ExitCode::SUCCESS,
-                Ok(_) => {
-                    if json {
-                        print!("{buf}");
-                        continue;
-                    }
-                    let env: Envelope<Response> = match serde_json::from_str(&buf) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("wraith: malformed push: {e}; raw={buf}");
-                            continue;
-                        }
-                    };
-                    match env.payload {
-                        Response::Watching => {} // ack — keep waiting
-                        Response::PaymentDetected(d) => {
-                            let height = d
-                                .block_height
-                                .map(|h| h.to_string())
-                                .unwrap_or_else(|| "—".to_string());
-                            let amt = d
-                                .amount_sats
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            println!(
-                                "{} sat  height={}  vout={}  k={}  txid={}",
-                                amt, height, d.vout, d.k, d.txid
-                            );
-                        }
-                        Response::Error(e) => {
-                            eprintln!("wraith: daemon error: {}", e.message);
-                            return std::process::ExitCode::FAILURE;
-                        }
-                        other => {
-                            eprintln!("wraith: unexpected push variant: {other:?}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("wraith: read: {e}");
-                    return std::process::ExitCode::FAILURE;
-                }
-            }
+    }
+
+    /// The three signing steps parse, so the flow cannot ship half-wired.
+    #[test]
+    fn every_sign_step_parses() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec![
+                "wraith",
+                "lock",
+                "sign",
+                "begin",
+                "--lock-id",
+                "a",
+                "--lane",
+                "savings",
+                "--psbt",
+                "cHNidP8=",
+                "--input-index",
+                "0",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "sign",
+                "nonce",
+                "--session",
+                "aa",
+                "--device-nonce",
+                "bb",
+            ],
+            vec![
+                "wraith",
+                "lock",
+                "sign",
+                "complete",
+                "--session",
+                "aa",
+                "--device-partial",
+                "bb",
+            ],
+        ];
+        for argv in cases {
+            let joined = argv.join(" ");
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{joined}` must parse: {e}"));
+        }
+    }
+
+    /// The lane names the CLI documents are the ones the daemon accepts.
+    ///
+    /// Kept as a literal list rather than derived, because the daemon parses
+    /// these from a string: if someone renames a lane on one side only, this
+    /// is the thing that notices.
+    #[test]
+    fn the_documented_lanes_are_the_daemon_s_lanes() {
+        for lane in ["savings", "spending", "investments", "cash"] {
+            let argv = vec![
+                "wraith",
+                "lock",
+                "destination",
+                "--lock-id",
+                "a",
+                "--lane",
+                lane,
+            ];
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("lane `{lane}`: {e}"));
         }
     }
 }

@@ -218,7 +218,9 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
     }
   };
 
-  const fmtAmount = (sats: number) => {
+  // A dash, not a zero — see History.tsx.
+  const fmtAmount = (sats: number | null) => {
+    if (sats === null || sats === undefined) return "—";
     const sign = sats > 0 ? "+" : "";
     return `${sign}${sats.toLocaleString()}`;
   };
@@ -483,9 +485,9 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
                         className="mono"
                         style={{
                           color:
-                            e.amount_sats > 0
+                            (e.amount_sats ?? 0) > 0
                               ? "var(--pass)"
-                              : e.amount_sats < 0
+                              : (e.amount_sats ?? 0) < 0
                                 ? "var(--fail)"
                                 : "var(--fg)",
                         }}

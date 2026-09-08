@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   lightBalance,
   lightL1Utxos,
+  l1Send,
   lightSend,
   psbtBumpFee,
   psbtCreate,
@@ -14,19 +15,18 @@ import {
 import { HelpTip } from "../components/HelpTip";
 import { HELP_TOPICS } from "../lib/help";
 
-/// Send "mode" widening — the daemon exposes exactly one real send
-/// mode (`ghostpay`, the instant L2 ledger transfer). The GUI adds a
-/// second option, `psbt`, which doesn't go through `lightSend` at all:
-/// it builds an unsigned PSBT and lets the user download / sign it
-/// elsewhere. This keeps the mode-card UX consistent without
-/// pretending PSBT is a daemon send mode.
+/// The ways this screen can move money.
 ///
-/// The former `wraith`/`confidential` cards were removed: neither had
-/// a real Send code path (both silently took the plaintext L2 route),
-/// so offering them was a truth-in-advertising defect. Unlinkable L1
-/// spends live in the Mix tab; a shielded confidential L2 transfer is
-/// post-v1 (needs client-side ZK proving the wallet can't yet do).
-type UiSendMode = LightSendMode | "psbt";
+/// `onchain` is an ordinary Bitcoin payment: the daemon builds, signs and
+/// broadcasts it. `psbt` stops at the unsigned transaction for anyone signing
+/// elsewhere — a hardware wallet, cosigners, cold storage. `ghostpay` is the
+/// operator-run L2 ledger transfer, which is on its way out.
+///
+/// The former `wraith`/`confidential` cards were removed: neither had a real
+/// Send code path (both silently took the plaintext L2 route), so offering
+/// them was a truth-in-advertising defect. Unlinkable spends live in the Mix
+/// tab.
+type UiSendMode = LightSendMode | "psbt" | "onchain";
 
 interface SendProps {
   activeWallet: string | null;
@@ -44,17 +44,23 @@ interface ModeOption {
   hint: string;
 }
 
-// Order is load-bearing: Ghost Pay (instant L2) is listed FIRST and is
-// the default mode — it's the path most sends should take. PSBT (L1) is
-// the secondary, advanced path. Keep L2 first so the UI always leads
-// with it.
+// Order is load-bearing: the first card is the default. An ordinary on-chain
+// payment leads, because it depends on nothing but a node — no operator has to
+// be up, and nobody else has to be trusted with the balance.
 const MODES = [
+  {
+    id: "onchain",
+    label: "On-chain payment",
+    badge: "recommended",
+    tagline: "Bitcoin address or Ghost ID · signed and broadcast here.",
+    hint: "An ordinary Bitcoin transaction from your own coins, built, signed and broadcast by your wallet through your node. Nobody else holds the money or has to be online. Paying a Ghost ID sends a silent payment: a fresh output only the recipient can find, though the OP_RETURN that makes that possible is visible, so it hides who was paid rather than that a payment happened. For an unlinkable spend, use the Mix tab (Wraith CoinJoin).",
+  },
   {
     id: "ghostpay",
     label: "Ghost Pay (instant L2)",
-    badge: "recommended",
-    tagline: "Instant · off-chain · no network fee.",
-    hint: "Instant off-chain transfer through the operator. No on-chain tx, no confirmation wait — settles to L1 in batches later. For an unlinkable on-chain spend, use the Mix tab (Wraith CoinJoin).",
+    badge: "legacy",
+    tagline: "Instant · off-chain · relies on the operator.",
+    hint: "Instant off-chain transfer through the operator, who holds the balance. Being retired in favour of on-chain payments and Ghost Locks — prefer the on-chain path.",
   },
   {
     id: "psbt",
@@ -69,7 +75,7 @@ const MODES = [
 // more. The GUI has no unit-test runner — its check is `tsc --noEmit`
 // (the `lint`/`build` scripts) — so this type-level assertion is the
 // stand-in. It fails the build if the set of card ids ever drifts from
-// `UiSendMode` (`ghostpay` | `psbt`): dropping a real mode, or letting
+// `UiSendMode` (`onchain` | `ghostpay` | `psbt`): dropping a real mode, or letting
 // a retired one (`wraith`/`confidential`) back in, both break here.
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
@@ -178,7 +184,7 @@ export function Send({ activeWallet }: SendProps) {
   const [recipient, setRecipient] = useState("");
   const [amount, setAmount] = useState("");
   const [memo, setMemo] = useState("");
-  const [mode, setMode] = useState<UiSendMode>("ghostpay");
+  const [mode, setMode] = useState<UiSendMode>("onchain");
   const [feeRate, setFeeRate] = useState<string>("5");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -215,15 +221,20 @@ export function Send({ activeWallet }: SendProps) {
   // this keeps the invariant explicit and future-proof.
   useEffect(() => {
     if (mode !== "psbt" && !MODES.some((m) => m.id === mode)) {
-      setMode("ghostpay");
+      setMode("onchain");
     }
   }, [mode]);
 
-  // Reload UTXOs whenever we enter PSBT mode (or the wallet changes
-  // while already in PSBT mode). One-shot — coin control is a
-  // pre-spend ritual, not a live dashboard.
+  // Both L1 paths spend the wallet's own coins, so both want a fee rate and
+  // coin control. They differ only in whether the transaction is broadcast at
+  // the end, which is not a reason to configure them differently.
+  const isL1 = mode === "psbt" || mode === "onchain";
+
+  // Reload UTXOs whenever we enter an L1 mode (or the wallet changes while
+  // already in one). One-shot — coin control is a pre-spend ritual, not a
+  // live dashboard.
   useEffect(() => {
-    if (mode !== "psbt" || !activeWallet) return;
+    if (!isL1 || !activeWallet) return;
     let alive = true;
     setUtxosLoading(true);
     setUtxosErr(null);
@@ -391,6 +402,39 @@ export function Send({ activeWallet }: SendProps) {
         );
         pushRecent(activeWallet, recipient.trim());
         setRecents(loadRecents(activeWallet));
+        setConfirming(false);
+      } else if (mode === "onchain") {
+        const fr = Number(feeRate);
+        // Same coin-control rules as the PSBT path above: only forward the
+        // set when the user actually narrowed it.
+        const allKeys = utxos.map((u) => utxoKey(u));
+        const isNarrowed =
+          allKeys.length > 0 &&
+          selectedUtxos.size > 0 &&
+          selectedUtxos.size < allKeys.length;
+        const selected_outpoints: OutpointRef[] | undefined = isNarrowed
+          ? utxos
+              .filter((u) => selectedUtxos.has(utxoKey(u)))
+              .map((u) => ({ txid: u.txid, vout: u.vout }))
+          : undefined;
+        const sent = await l1Send({
+          recipient_address: recipient.trim(),
+          amount_sats: amt,
+          fee_rate_sats_per_vb: Number.isFinite(fr) && fr > 0 ? fr : 5,
+          selected_outpoints,
+          memo: memo.trim() || undefined,
+        });
+        // The fee is stated because the user pays it on top of the amount:
+        // reporting only what the recipient gets understates what left.
+        setSuccess(
+          `Sent ${sent.amount_sats.toLocaleString()} sats to ${recipient.slice(0, 18)}… ` +
+            `(fee ${sent.fee_sats.toLocaleString()} sats) — ${sent.txid.slice(0, 16)}…`,
+        );
+        pushRecent(activeWallet, recipient.trim());
+        setRecents(loadRecents(activeWallet));
+        setRecipient("");
+        setAmount("");
+        setMemo("");
         setConfirming(false);
       } else {
         await lightSend(
@@ -678,7 +722,7 @@ export function Send({ activeWallet }: SendProps) {
               ))}
             </div>
           </div>
-          {mode === "psbt" && (
+          {isL1 && (
             <>
               <div className="col">
                 <label>Fee rate (sats/vB)</label>
@@ -692,8 +736,10 @@ export function Send({ activeWallet }: SendProps) {
                 />
                 <span className="muted" style={{ fontSize: 11 }}>
                   Conservative default 5 sats/vB. Bump for faster
-                  confirmation; the wallet won't broadcast — that's
-                  still your decision.
+                  confirmation.{" "}
+                  {mode === "psbt"
+                    ? "Nothing is broadcast — that's still your decision."
+                    : "This one is broadcast once you confirm."}
                 </span>
               </div>
 

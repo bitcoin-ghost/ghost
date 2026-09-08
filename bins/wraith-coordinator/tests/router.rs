@@ -2397,6 +2397,61 @@ async fn round_tx_full_pipeline_assembles_a_valid_transaction() {
         assert_eq!(p["amount_sats"].as_u64().unwrap(), 100_000);
     }
 
+    // No participant attribution may appear anywhere in the response. The
+    // endpoint is unauthenticated, and combined with prevouts this would be
+    // the complete input-to-output mapping the output shuffle exists to
+    // destroy.
+    let raw = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        !raw.contains("participant_id"),
+        "round-tx leaks participant attribution: {raw}"
+    );
+
+    // prevouts[i] MUST describe tx.input[i]. Inputs are shuffled, so a
+    // positional lookup into the registration-ordered store would pair each
+    // input with someone else's scriptPubKey and amount. BIP-341 commits to
+    // every prevout, so that surfaces as an opaque signature failure rather
+    // than as a lookup error — assert the alignment directly.
+    use bitcoin::consensus::encode::deserialize;
+    let tx_bytes = hex::decode(json["unsigned_tx_hex"].as_str().unwrap()).unwrap();
+    let tx: bitcoin::Transaction = deserialize(&tx_bytes).unwrap();
+    let prevouts = json["prevouts"].as_array().expect("array");
+    assert_eq!(prevouts.len(), tx.input.len(), "one prevout per input");
+
+    let registered: std::collections::HashMap<(String, u32), u64> = state
+        .inputs_store
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|i| {
+            (
+                (
+                    i.inputs[0].txid.trim().to_ascii_lowercase(),
+                    i.inputs[0].vout,
+                ),
+                i.inputs[0].value_sats,
+            )
+        })
+        .collect();
+
+    for (i, txin) in tx.input.iter().enumerate() {
+        let key = (
+            txin.previous_output.txid.to_string().to_ascii_lowercase(),
+            txin.previous_output.vout,
+        );
+        let expected = registered
+            .get(&key)
+            .expect("input is a registered outpoint");
+        assert_eq!(
+            prevouts[i]["value_sats"].as_u64().unwrap(),
+            *expected,
+            "prevouts[{i}] does not describe tx.input[{i}] — sighashes would be wrong"
+        );
+    }
+
     // The session is still in Signing — assembly didn't advance it.
     let snapshot = state.sessions.get(&session_id).expect("present");
     assert!(matches!(
@@ -2549,11 +2604,11 @@ fn find_input_index(state: &CoordinatorState, session_id: &str, ghost_id: &str) 
         .iter()
         .find(|i| i.ghost_id == ghost_id)
         .expect("mine");
-    let target_txid = bitcoin::Txid::from_str(&mine.input.txid).unwrap();
+    let target_txid = bitcoin::Txid::from_str(&mine.inputs[0].txid).unwrap();
     tx.input
         .iter()
         .position(|t| {
-            t.previous_output.txid == target_txid && t.previous_output.vout == mine.input.vout
+            t.previous_output.txid == target_txid && t.previous_output.vout == mine.inputs[0].vout
         })
         .expect("input present") as u32
 }
@@ -3094,4 +3149,554 @@ async fn background_tick_sweeps_expired_signing_sessions_without_a_witness_ping(
         "deadline entry should be removed after sweep"
     );
     run_one_pass(&state); // second pass: no panic, no double-sweep
+}
+
+/// Sweep every GET endpoint reachable in a live session and probe each response
+/// for identity-to-position leakage.
+///
+/// The `/round-tx` leak was found by reading code, not by a test. This is the
+/// net that catches the whole class: a string scan over the serialised body, so
+/// it also catches a field added under a different name, an identity-keyed map,
+/// or anything reaching the wire via `serde(flatten)`.
+///
+/// If a new endpoint is added and not listed here, that is the gap — add it.
+#[tokio::test]
+async fn no_endpoint_leaks_participant_attribution() {
+    use wraith_protocol::privacy::{probe_api_response, BANNED_RESPONSE_FIELDS};
+
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let session_id = make_signing_session(router.clone(), &state).await;
+
+    for (i, addr) in FIVE_SIGNET_ADDRS.iter().enumerate() {
+        let (bn, sg) = run_blind_sig_for(
+            router.clone(),
+            &session_id,
+            &format!("wallet-{i}"),
+            addr.as_bytes().to_vec(),
+        )
+        .await;
+        let resp = router
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/session/{session_id}/outputs"),
+                serde_json::json!({
+                    "address": addr,
+                    "blinded_nonce_point": bn,
+                    "unblinded_signature_scalar": sg,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "outputs #{i}");
+    }
+
+    let endpoints = [
+        "/api/v1/pool/discover".to_string(),
+        format!("/api/v1/session/{session_id}"),
+        format!("/api/v1/session/{session_id}/round-tx"),
+    ];
+
+    for uri in endpoints {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+
+        let violations = probe_api_response(&body);
+        assert!(
+            violations.is_empty(),
+            "{uri} leaks participant attribution {violations:?}\nbody: {body}"
+        );
+    }
+
+    // The probe must be able to fail, or it proves nothing.
+    let planted = format!(r#"{{"outputs":[{{"{}":3}}]}}"#, BANNED_RESPONSE_FIELDS[0]);
+    assert!(
+        !probe_api_response(&planted).is_empty(),
+        "the probe cannot detect the leak it exists for"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Composition rules over the wire
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refused_mixer_does_not_get_a_fresh_round_made_for_it() {
+    // The hole this closes: `Full` and `NotAcceptingParticipants` retry, and a
+    // retry can create a new session. A new session carries a new set of
+    // mixing slots, so retrying a composition refusal would hand the refused
+    // participant exactly the seats the cap just denied.
+    //
+    // Scarcity per round is worth nothing if being turned away spawns a round.
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+
+    let join = |role: serde_json::Value, who: &str| {
+        post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({
+                "tier_id": "100k_sats",
+                "ghost_id": who,
+                "role": role,
+            }),
+        )
+    };
+
+    // Fill the mixing slots (default policy allows 3).
+    for i in 0..3 {
+        let r = router
+            .clone()
+            .oneshot(join(serde_json::json!("mixer"), &format!("m-{i}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "mixer {i} should be seated");
+    }
+    assert_eq!(state.sessions.len(), 1);
+
+    // The fourth is refused, and no second session appears.
+    let r = router
+        .clone()
+        .oneshot(join(serde_json::json!("mixer"), "m-4"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let body = to_bytes(r.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "composition_refused");
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "a refusal must not create a round with fresh mixing slots"
+    );
+
+    // A payer still joins the same session — real traffic is never capped.
+    let r = router
+        .oneshot(join(serde_json::json!("payer"), "p-1"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(state.sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn a_client_that_sends_no_role_is_treated_as_a_payer() {
+    // Payers are the uncapped role, so an older client is never handed a
+    // scarce mixing slot by accident.
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    for i in 0..5 {
+        let r = router
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/session/find_or_create",
+                serde_json::json!({ "tier_id": "100k_sats", "ghost_id": format!("old-{i}") }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "no-role client {i} must join");
+    }
+}
+
+#[tokio::test]
+async fn session_status_reports_entities_not_seats() {
+    // The number a wallet compares its own arithmetic against. Seats and
+    // entities must both be present: the gap between them is what shows a
+    // round was padded, and either number alone hides it.
+    let (router, _state, _broadcaster) = deterministic_router(1_000_000);
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "alice" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sid = json["session"]["session_id"].as_str().unwrap().to_string();
+
+    let r = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = to_bytes(r.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let a = &json["anonymity"];
+    assert!(a.is_object(), "anonymity must be served: {json}");
+    for field in ["seats", "entities", "discounted", "unverified", "payers"] {
+        assert!(a[field].is_number(), "missing {field}: {a}");
+    }
+    // Nobody has registered inputs yet, so there is nothing to count. An empty
+    // round must report zero rather than an optimistic default.
+    assert_eq!(a["entities"], 0, "an empty round is not a private one");
+    assert_eq!(a["seats"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// Derived round placement
+// ---------------------------------------------------------------------------
+
+/// An epoch source pinned to fixed values, so placement is deterministic.
+#[derive(Debug, Clone, Copy)]
+struct FixedEpoch {
+    volume: u64,
+}
+
+impl wraith_coordinator::state::EpochSource for FixedEpoch {
+    fn epoch_context(&self) -> Option<wraith_coordinator::state::EpochContext> {
+        Some(wraith_coordinator::state::EpochContext {
+            epoch: 7,
+            beacon: [11u8; 32],
+            committed_volume: self.volume,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_wallet_that_picks_its_own_round_loses_the_seat() {
+    // The wallet asserts a placement at join that cannot be checked until its
+    // coins arrive, because the derivation needs them. This drives the whole
+    // path to prove the assertion is actually tested there and refused.
+    use wraith_protocol::assignment::{assign, open_rounds_for};
+    use wraith_protocol::signing_ledger::OutPointKey;
+
+    let volume = 200;
+    let rounds = open_rounds_for(volume);
+    assert!(rounds > 1, "fixture needs several open rounds");
+
+    // Where fixture coin 0x00:0 actually belongs, and a round that is not it.
+    let coins = vec![OutPointKey {
+        txid: [0x00u8; 32],
+        vout: 0,
+    }];
+    let truthful = assign(7, &[11u8; 32], &coins, rounds).unwrap();
+    let lie = (truthful + 1) % rounds as u32;
+    assert_ne!(truthful, lie, "the fixture must actually be a lie");
+
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(MockClock::new(1_000_000)),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            None,
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source()))
+        .with_epoch_source(Arc::new(FixedEpoch { volume })),
+    );
+    let router = build_router(state.clone());
+
+    // Enrol enough wallets, all claiming the same (wrong) round.
+    let mut session_id = String::new();
+    for i in 0..MIN_5 {
+        let join = router
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/session/find_or_create",
+                serde_json::json!({
+                    "tier_id": "100k_sats",
+                    "ghost_id": format!("wallet-{i}"),
+                    "round_index": lie,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(join.status(), StatusCode::OK, "join is provisional");
+        let body = to_bytes(join.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session"]["round_index"], lie);
+        session_id = json["session"]["session_id"].as_str().unwrap().to_string();
+    }
+
+    state
+        .sessions
+        .apply_event(wraith_protocol::SessionGossipEvent::StateChanged {
+            session_id: session_id.clone(),
+            new_state: wraith_protocol::LiteSessionState::Locked,
+        })
+        .expect("apply Locked");
+
+    let r = router
+        .oneshot(post_json(
+            &format!("/api/v1/session/{session_id}/inputs"),
+            signed_inputs_body(
+                &session_id,
+                "wallet-0",
+                0,
+                0x00,
+                0,
+                EXACT_INPUT_100K_MIX,
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), StatusCode::CONFLICT, "the lie must be refused");
+    let body = to_bytes(r.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "wrong_round");
+    assert!(
+        json["detail"]
+            .as_str()
+            .unwrap()
+            .contains("derived from the coins"),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn participants_claiming_different_rounds_get_different_sessions() {
+    // Without matching on `round_index`, everyone joins whichever round happens
+    // to be filling and the derivation does nothing at all.
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+
+    for round in [0u32, 1u32] {
+        let r = router
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/session/find_or_create",
+                serde_json::json!({
+                    "tier_id": "100k_sats",
+                    "ghost_id": format!("w-{round}"),
+                    "round_index": round,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "two claimed rounds must be two sessions, not one"
+    );
+}
+
+#[tokio::test]
+async fn a_wallet_that_omits_a_round_index_lands_in_round_zero() {
+    // The single-round case, and the fallback when no beacon is available.
+    let (router, state, _broadcaster) = deterministic_router(1_000_000);
+    let r = router
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "w-none" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = to_bytes(r.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["session"]["round_index"], 0);
+    assert_eq!(state.sessions.len(), 1);
+}
+
+#[test]
+fn the_derivation_places_a_participant_somewhere_it_did_not_choose() {
+    // The property the whole mechanism rests on: with several rounds open, a
+    // participant's placement follows from its coins rather than its preference.
+    use wraith_protocol::assignment::{assign, open_rounds_for};
+    use wraith_protocol::signing_ledger::OutPointKey;
+
+    let volume = 200;
+    let rounds = open_rounds_for(volume);
+    assert!(rounds > 1, "fixture needs several rounds to be meaningful");
+
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..80u8 {
+        let coins = vec![OutPointKey {
+            txid: [i; 32],
+            vout: 0,
+        }];
+        seen.insert(assign(7, &[11u8; 32], &coins, rounds).unwrap());
+    }
+    assert!(
+        seen.len() > 1,
+        "placement must spread across the open rounds, got {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_says_when_placement_is_not_actually_running() {
+    // A silently disabled defence reads as protection. With no epoch source the
+    // fallback must be distinguishable from a healthy single-round epoch.
+    let (router, _state, _b) = deterministic_router(1_000_000);
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "alice" }),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(create.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sid = json["session"]["session_id"].as_str().unwrap().to_string();
+
+    let r = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(r.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let p = &json["placement"];
+    assert_eq!(p["derived"], false, "no epoch source means not derived");
+    assert_eq!(p["fallback_reason"], "no_epoch_source_configured");
+    assert_eq!(p["open_rounds"], 1);
+}
+
+#[tokio::test]
+async fn status_reports_placement_as_running_when_it_is() {
+    // The other half: a configured beacon must read as derived, or the field
+    // would be a constant warning nobody acts on.
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(MockClock::new(1_000_000)),
+            Arc::new(DeterministicSessionIdGenerator::new()),
+            Some(TEST_FEE_ADDRESS.to_string()),
+            None,
+        )
+        .with_utxo_source(Arc::new(fixture_utxo_source()))
+        .with_epoch_source(Arc::new(FixedEpoch { volume: 200 })),
+    );
+    let router = build_router(state.clone());
+
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({ "tier_id": "100k_sats", "ghost_id": "alice" }),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(create.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sid = json["session"]["session_id"].as_str().unwrap().to_string();
+
+    let r = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(r.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let p = &json["placement"];
+    assert_eq!(p["derived"], true);
+    assert!(p["fallback_reason"].is_null());
+    assert!(
+        p["open_rounds"].as_u64().unwrap() > 1,
+        "200 payments should open several rounds: {p}"
+    );
+}
+
+// --- Ghost Lock co-signing ------------------------------------------------
+
+/// A coordinator with no quorum seed says it does not do this, rather than
+/// refusing the spend.
+///
+/// The distinction matters to whoever is holding a transaction that will not
+/// go through: 501 sends them to a different coordinator, 403 sends them to
+/// rewrite their spend. Only one of those helps.
+#[tokio::test]
+async fn cosign_is_not_implemented_without_a_quorum_seed() {
+    let body = serde_json::json!({
+        "binding_id": "binding-abc",
+        "request": {
+            "psbt": "cHNidP8BAAA=",
+            "input_index": 0,
+            "keys": [],
+        }
+    });
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/lock/cosign/nonce")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let raw = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(json["error"], "lock_cosign_not_configured");
+    assert!(
+        json["detail"].as_str().unwrap().contains("quorum seed"),
+        "the reply must say what is missing: {json}"
+    );
+}
+
+/// Round 2 for a session nobody started is a 404, and says why it is safe.
+#[tokio::test]
+async fn cosign_partial_for_an_unknown_session_is_not_found() {
+    let body = serde_json::json!({
+        "session": "ff".repeat(32),
+        "public_nonces": [],
+    });
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/lock/cosign/partial")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Unconfigured takes precedence: this coordinator does not co-sign at all.
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// The routes exist and reject a malformed body rather than 404ing.
+///
+/// A missing route and a bad request look the same to a client that only
+/// checks for failure, and the two call for opposite fixes.
+#[tokio::test]
+async fn the_cosign_routes_are_mounted() {
+    for uri in ["/api/v1/lock/cosign/nonce", "/api/v1/lock/cosign/partial"] {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{ not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{uri} must be mounted"
+        );
+    }
 }

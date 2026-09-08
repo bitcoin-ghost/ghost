@@ -38,6 +38,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace crates
+ghost-lock = { workspace = true }
+zeroize = { workspace = true }
 wraith-protocol = { workspace = true }
 
 # Bitcoin (just needed for Network enum + re-exports)
@@ -82,6 +84,9 @@ hmac = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 # Pull in tower's `util` feature locally so `ServiceExt::oneshot` is in scope

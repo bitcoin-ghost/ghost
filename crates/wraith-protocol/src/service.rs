@@ -126,9 +126,7 @@ impl CoordinatorView {
     /// The coordinator *node* that owns `tier_id`'s sessions this epoch
     /// (`None` when no coordinators are seated).
     pub fn coordinator_node_for_tier(&self, tier_id: &str) -> Option<CoordinatorNodeId> {
-        self.coords
-            .coordinator_for_tier(tier_id, self.coords.epoch)
-            .map(|c| c.node_id)
+        self.coords.coordinator_for_tier(tier_id).map(|c| c.node_id)
     }
 
     /// The endpoint a wallet should connect to for `tier_id`. `None` if no

@@ -7,9 +7,8 @@ import {
   walletRestore,
   checkForUpdate,
   connectionStatus,
-  setNodeEndpoints,
-  OWN_NODE_GHOST_PAY_DEFAULT,
-  OWN_NODE_GSP_DEFAULT,
+  setNode,
+  OWN_NODE_RPC_DEFAULT,
   type DaemonEnvResponse,
   type HealthResponse,
   type WalletEntry,
@@ -63,9 +62,12 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
 
   // Node connection selector.
   const [conn, setConn] = useState<ConnectionStatusResponse | null>(null);
-  const [nodePreset, setNodePreset] = useState<"public" | "custom">("public");
-  const [customPay, setCustomPay] = useState(OWN_NODE_GHOST_PAY_DEFAULT);
-  const [customGsp, setCustomGsp] = useState(OWN_NODE_GSP_DEFAULT);
+  const [nodeUrl, setNodeUrl] = useState(OWN_NODE_RPC_DEFAULT);
+  const [poolUrl, setPoolUrl] = useState("");
+  const [nodeAuth, setNodeAuth] = useState<"cookie" | "userpass">("cookie");
+  const [nodeCookie, setNodeCookie] = useState("");
+  const [nodeUser, setNodeUser] = useState("");
+  const [nodePass, setNodePass] = useState("");
   const [nodeBusy, setNodeBusy] = useState(false);
   const [nodeErr, setNodeErr] = useState<string | null>(null);
   const [nodeSaved, setNodeSaved] = useState(false);
@@ -112,12 +114,13 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
         // overwrite what they're typing.
         setNodeFormInit((done) => {
           if (!done) {
-            const preset = e.node_preset === "custom" ? "custom" : "public";
-            setNodePreset(preset);
-            if (preset === "custom") {
-              if (e.ghost_pay_urls.length) setCustomPay(e.ghost_pay_urls.join(", "));
-              if (e.gsp_urls.length) setCustomGsp(e.gsp_urls.join(", "));
-            }
+            if (e.ghostd_url) setNodeUrl(e.ghostd_url);
+            if (e.pool_url) setPoolUrl(e.pool_url);
+            if (e.ghostd_auth === "userpass") setNodeAuth("userpass");
+            // The cookie path and the password are deliberately not sent back
+            // by the daemon, so there is nothing to seed them with. A blank
+            // field that the user re-fills is better than one pre-filled with
+            // a secret that then lives in the DOM.
           }
           return true;
         });
@@ -144,18 +147,21 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const envLocked = !!env?.ghost_pay_env_override || !!env?.gsp_env_override;
+  const envLocked = !!env?.ghostd_env_override;
 
   const onSaveNode = async () => {
     setNodeBusy(true);
     setNodeErr(null);
     setNodeSaved(false);
     try {
-      if (nodePreset === "custom") {
-        await setNodeEndpoints("custom", customPay.trim(), customGsp.trim());
-      } else {
-        await setNodeEndpoints("public");
-      }
+      await setNode({
+        ghostd_url: nodeUrl.trim() || undefined,
+        cookie_path:
+          nodeAuth === "cookie" ? nodeCookie.trim() || undefined : undefined,
+        user: nodeAuth === "userpass" ? nodeUser.trim() || undefined : undefined,
+        pass: nodeAuth === "userpass" ? nodePass || undefined : undefined,
+        pool_url: poolUrl.trim() || undefined,
+      });
       setNodeSaved(true);
       // Pull the fresh config + reachability straight away so the card
       // reflects the change without waiting for the next 8s poll.
@@ -521,18 +527,17 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
           <ConnectionStatus conn={conn} />
         </div>
         <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
-          Like choosing a server in other wallets: use the public Ghost nodes
-          (works out of the box, no node required) or point the wallet at a
-          node you run yourself. The pills above show whether the current
-          choice is reachable.
+          The wallet reads and writes the chain through a Bitcoin node you
+          run. There is no default: until one is set, chain operations refuse
+          rather than quietly asking somebody else's server what you own.
         </p>
 
         {envLocked ? (
           <div className="card surface" style={{ marginBottom: 12 }}>
             <p style={{ margin: 0, fontSize: 13 }}>
-              The node endpoints are pinned by environment variables (
-              <code>WRAITHD_GHOST_PAY</code> / <code>WRAITHD_GSP</code>). To
-              manage the node from here, unset them and restart wraithd.
+              The node is pinned by an environment variable (
+              <code>WRAITHD_GHOSTD_URL</code>). To manage it from here, unset
+              it and restart wraithd.
             </p>
           </div>
         ) : null}
@@ -541,84 +546,127 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
           disabled={envLocked || nodeBusy}
           style={{ border: 0, padding: 0, margin: 0 }}
         >
-          <label className="radio-row">
+          <div className="col">
+            <label>RPC URL</label>
+            <input
+              className="mono"
+              value={nodeUrl}
+              onChange={(e) => {
+                setNodeUrl(e.target.value);
+                setNodeSaved(false);
+              }}
+              placeholder={OWN_NODE_RPC_DEFAULT}
+            />
+            <span className="muted" style={{ fontSize: 12 }}>
+              <code>http://</code> or <code>https://</code>. Plaintext is fine
+              over loopback; over a network it exposes your addresses and your
+              unbroadcast transactions, so use HTTPS or an SSH tunnel.
+            </span>
+          </div>
+
+          <label className="radio-row" style={{ marginTop: 12 }}>
             <input
               type="radio"
-              name="node-preset"
-              checked={nodePreset === "public"}
+              name="node-auth"
+              checked={nodeAuth === "cookie"}
               onChange={() => {
-                setNodePreset("public");
+                setNodeAuth("cookie");
                 setNodeSaved(false);
               }}
             />
             <span>
-              <strong>Public Ghost nodes</strong>{" "}
+              <strong>Cookie file</strong>{" "}
               <span className="pill mute" style={{ fontSize: 11 }}>
                 recommended
               </span>
               <br />
               <span className="muted" style={{ fontSize: 12 }}>
-                The Bitcoin Ghost fleet at <code>pool.bitcoinghost.org</code>.
-                A fresh install uses this so the wallet just works.
+                The node writes it on start and rotates it. Nothing to type,
+                nothing to leak.
               </span>
             </span>
           </label>
+          {nodeAuth === "cookie" && (
+            <div className="col" style={{ marginTop: 8 }}>
+              <label>Cookie path</label>
+              <input
+                className="mono"
+                value={nodeCookie}
+                onChange={(e) => {
+                  setNodeCookie(e.target.value);
+                  setNodeSaved(false);
+                }}
+                placeholder="~/.ghost/.cookie"
+              />
+            </div>
+          )}
 
           <label className="radio-row" style={{ marginTop: 8 }}>
             <input
               type="radio"
-              name="node-preset"
-              checked={nodePreset === "custom"}
+              name="node-auth"
+              checked={nodeAuth === "userpass"}
               onChange={() => {
-                setNodePreset("custom");
+                setNodeAuth("userpass");
                 setNodeSaved(false);
               }}
             />
             <span>
-              <strong>My own node</strong>
+              <strong>Username and password</strong>
               <br />
               <span className="muted" style={{ fontSize: 12 }}>
-                Point the wallet at a ghost-pay + GSP you run yourself.
+                For a node configured with <code>rpcauth</code>.
               </span>
             </span>
           </label>
-
-          {nodePreset === "custom" && (
-            <div style={{ marginTop: 12 }}>
+          {nodeAuth === "userpass" && (
+            <div style={{ marginTop: 8 }}>
               <div className="col">
-                <label>ghost-pay URL</label>
+                <label>Username</label>
                 <input
                   className="mono"
-                  value={customPay}
+                  value={nodeUser}
                   onChange={(e) => {
-                    setCustomPay(e.target.value);
+                    setNodeUser(e.target.value);
                     setNodeSaved(false);
                   }}
-                  placeholder={OWN_NODE_GHOST_PAY_DEFAULT}
                 />
-                <span className="muted" style={{ fontSize: 12 }}>
-                  <code>http://</code> or <code>https://</code>. Comma-separate
-                  for failover.
-                </span>
               </div>
               <div className="col">
-                <label>GSP URL</label>
+                <label>Password</label>
                 <input
                   className="mono"
-                  value={customGsp}
+                  type="password"
+                  value={nodePass}
                   onChange={(e) => {
-                    setCustomGsp(e.target.value);
+                    setNodePass(e.target.value);
                     setNodeSaved(false);
                   }}
-                  placeholder={OWN_NODE_GSP_DEFAULT}
                 />
-                <span className="muted" style={{ fontSize: 12 }}>
-                  <code>ws://</code> or <code>wss://</code>. Comma-separate for
-                  failover.
-                </span>
               </div>
             </div>
           )}
+
+          <div className="col" style={{ marginTop: 16 }}>
+            <label>Pool URL (optional)</label>
+            <input
+              className="mono"
+              value={poolUrl}
+              onChange={(e) => {
+                setPoolUrl(e.target.value);
+                setNodeSaved(false);
+              }}
+              placeholder="https://pool.example:8443"
+            />
+            <span className="muted" style={{ fontSize: 12 }}>
+              Used only to look up which Wraith coordinator holds a tier's seat
+              this epoch. Leave it blank and mixing needs a coordinator URL each
+              round, which works but never rotates. What comes back is checked
+              against your own node rather than believed; what the pool still
+              learns is that your address asked, so pair this with Tor if that
+              matters to you.
+            </span>
+          </div>
 
           <div className="row" style={{ marginTop: 12 }}>
             <button
@@ -643,10 +691,12 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
         )}
 
         <div className="kv" style={{ marginTop: 12 }}>
-          <div className="k">Active ghost-pay</div>
-          <div className="v mono">{env?.ghost_pay_urls.join(", ") ?? "—"}</div>
-          <div className="k">Active GSP</div>
-          <div className="v mono">{env?.gsp_urls.join(", ") ?? "—"}</div>
+          <div className="k">Active node</div>
+          <div className="v mono">{env?.ghostd_url ?? "(none)"}</div>
+          <div className="k">Auth</div>
+          <div className="v mono">{env?.ghostd_auth ?? "—"}</div>
+          <div className="k">Pool</div>
+          <div className="v mono">{env?.pool_url ?? "(none)"}</div>
           <div className="k">Tor proxy</div>
           <div className="v mono">{env?.tor_proxy ?? "—"}</div>
         </div>

@@ -8,12 +8,10 @@
 //! is fleshed out.
 
 use interprocess::local_socket::traits::tokio::Stream as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, WindowEvent,
+    Manager, WindowEvent,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use wraith_wallet_ipc::{Envelope, Request, Response};
@@ -121,24 +119,6 @@ async fn ensure_daemon() {
     }
 }
 
-/// Coordinates the long-lived watch task so we don't accidentally spawn a
-/// second one if the frontend calls `start_watch()` twice. Frontends that need
-/// per-window subscriptions should manage that themselves; this is a
-/// daemon-wide singleton from the Rust side's perspective.
-struct WatchState {
-    running: AtomicBool,
-}
-
-impl WatchState {
-    fn new() -> Self {
-        Self {
-            running: AtomicBool::new(false),
-        }
-    }
-}
-
-/// Tauri command: ask the daemon for its health and return a JSON-serializable
-/// summary. Used by the frontend to render a "daemon up" badge.
 #[tauri::command]
 async fn daemon_health() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::Health).await?;
@@ -213,11 +193,13 @@ async fn wallet_import(
     name: String,
     mnemonic: String,
     passphrase: String,
+    birth_height: Option<u32>,
 ) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletImport {
         name,
         mnemonic,
         passphrase,
+        birth_height,
     })
     .await?;
     to_value(&resp)
@@ -298,20 +280,22 @@ async fn connection_status() -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
-/// Choose which node the wallet talks to. `preset` is `"public"` (the
-/// bundled Ghost fleet) or `"custom"` (uses `ghost_pay_url` + `gsp_url`).
-/// The daemon rebuilds its clients in place, persists the choice, and drops
-/// any live GSP session so it re-authenticates against the new endpoint.
+/// Point the wallet at a node. Clearing every field clears the node, after
+/// which chain operations refuse until one is set again.
 #[tauri::command]
-async fn set_node_endpoints(
-    preset: String,
-    ghost_pay_url: Option<String>,
-    gsp_url: Option<String>,
+async fn set_node(
+    ghostd_url: Option<String>,
+    cookie_path: Option<String>,
+    user: Option<String>,
+    pass: Option<String>,
+    pool_url: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::SetNodeEndpoints {
-        preset,
-        ghost_pay_url,
-        gsp_url,
+    let resp = call_daemon(Request::SetNode {
+        ghostd_url,
+        cookie_path,
+        user,
+        pass,
+        pool_url,
     })
     .await?;
     to_value(&resp)
@@ -324,122 +308,42 @@ async fn wallet_ghost_id() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn wallet_glyph(ghost_id: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletGlyph { ghost_id }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn wallet_glyph_claim(
-    ghost_id: String,
-    pixels: Vec<u8>,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletGlyphClaim { ghost_id, pixels }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn wallet_glyph_check(pixels: Vec<u8>) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletGlyphCheck { pixels }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
 async fn wallet_auth_info() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletAuthInfo).await?;
     to_value(&resp)
 }
 
+/// Build, sign and broadcast an ordinary on-chain payment in one call.
 #[tauri::command]
-async fn gsp_register_scan_key() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::GspRegisterScanKey).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn gsp_session_status() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::GspSessionStatus).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn gsp_auth() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::GspAuth).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn locks_list() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksList).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn locks_prepare(capacity_sats: u64) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksPrepare { capacity_sats }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn locks_confirm(lock_id: String, funding_txid: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksConfirm {
-        lock_id,
-        funding_txid,
-    })
-    .await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn locks_jump(
-    lock_id: String,
-    target_address: String,
-    priority: String,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksJump {
-        lock_id,
-        target_address,
-        priority,
-    })
-    .await?;
-    to_value(&resp)
-}
-
-/// Unilateral exit. Builds + signs + broadcasts a recovery spend
-/// using the wallet's own recovery secret, after confirming the
-/// timelock has matured. Talks straight to the configured ghostd —
-/// no GSP, no operator cooperation.
-#[tauri::command]
-async fn locks_recover(
-    lock_id: String,
-    destination_address: String,
-    fee_sats: u64,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LocksRecover {
-        lock_id,
-        destination_address,
-        fee_sats,
-    })
-    .await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn light_send(
-    recipient: String,
+#[allow(clippy::too_many_arguments)]
+async fn l1_send(
+    recipient_address: String,
     amount_sats: u64,
-    mode: String,
+    fee_rate_sats_per_vb: Option<u64>,
+    change_index: Option<u32>,
+    bip86_scan_max: Option<u32>,
+    selected_outpoints: Option<Vec<wraith_wallet_ipc::OutpointRef>>,
     memo: Option<String>,
     shroud_max_ms: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LightSend {
-        recipient,
+    let resp = call_daemon(Request::L1Send {
+        recipient_address,
         amount_sats,
-        mode,
+        fee_rate_sats_per_vb: fee_rate_sats_per_vb.unwrap_or(5),
+        change_index,
+        bip86_scan_max: bip86_scan_max.unwrap_or(32),
+        selected_outpoints: selected_outpoints.unwrap_or_default(),
         memo,
         shroud_max_ms,
     })
     .await?;
+    to_value(&resp)
+}
+
+/// Silent payments the block scanner has found.
+#[tauri::command]
+async fn light_detected() -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::LightDetected).await?;
     to_value(&resp)
 }
 
@@ -513,6 +417,7 @@ async fn wraith_mix_run(
     mix_output_address: String,
     bip86_index: Option<u32>,
     bip86_scan_max: Option<u32>,
+    min_entities: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WraithMixOneShot {
         coordinator_url,
@@ -527,6 +432,160 @@ async fn wraith_mix_run(
         mix_output_address,
         bip86_index,
         bip86_scan_max,
+        min_entities,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Derive a Ghost Lock's four lanes and report their balances.
+///
+/// Remember a Ghost Lock's definition. Only public keys and two heights.
+#[tauri::command]
+async fn ghost_lock_save(
+    label: Option<String>,
+    backup_pubkey: String,
+    heir_pubkey: String,
+    quorum_pubkey: String,
+    anchor_height: u32,
+    inherit_height: u32,
+    bip86_index: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSave {
+        label,
+        backup_pubkey,
+        heir_pubkey,
+        quorum_pubkey,
+        anchor_height,
+        inherit_height,
+        bip86_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Every remembered Lock.
+#[tauri::command]
+async fn ghost_lock_list() -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockList).await?;
+    to_value(&resp)
+}
+
+/// Forget a Lock's definition. Does not touch the funds.
+#[tauri::command]
+async fn ghost_lock_forget(lock_id: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockForget { lock_id }).await?;
+    to_value(&resp)
+}
+
+/// What leaving alone needs, and whether the coins are old enough.
+#[tauri::command]
+async fn ghost_lock_escape_plan(
+    lock_id: String,
+    lane: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockEscapePlan { lock_id, lane }).await?;
+    to_value(&resp)
+}
+
+/// Sign a lane's escape leaf with the owner's key.
+#[tauri::command]
+async fn ghost_lock_escape_sign(
+    lock_id: String,
+    lane: String,
+    psbt: String,
+    input_index: u32,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockEscapeSign {
+        lock_id,
+        lane,
+        psbt,
+        input_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Round 1 of an air-gapped key-path spend.
+#[tauri::command]
+async fn ghost_lock_sign_begin(
+    lock_id: String,
+    lane: String,
+    psbt: String,
+    input_index: u32,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSignBegin {
+        lock_id,
+        lane,
+        psbt,
+        input_index,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Round 1 reply from the device. The daemon signs its own share here.
+#[tauri::command]
+async fn ghost_lock_sign_nonce(
+    session: String,
+    device_nonce: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSignNonce {
+        session,
+        device_nonce,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Round 2 reply from the device. Completes the spend.
+#[tauri::command]
+async fn ghost_lock_sign_complete(
+    session: String,
+    device_partial: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockSignComplete {
+        session,
+        device_partial,
+    })
+    .await?;
+    to_value(&resp)
+}
+
+/// Where a round should pay to fund one lane privately.
+///
+/// Asks the daemon rather than reusing the address the lanes view already
+/// holds. The daemon applies the compartment rule — Cash is refused, because
+/// a round would buy unlinkability a public-by-design lane discards on arrival
+/// — and a rule enforced only in the client is enforced only for clients that
+/// ask nicely.
+#[tauri::command]
+async fn ghost_lock_round_destination(
+    lock_id: String,
+    lane: String,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockRoundDestination { lock_id, lane }).await?;
+    to_value(&resp)
+}
+
+/// The MuSig2 aggregates are derived by the daemon from the individual keys —
+/// BIP-327 aggregation is deterministic, so no ceremony is involved.
+#[tauri::command]
+async fn ghost_lock_lanes(
+    backup_pubkey: String,
+    heir_pubkey: String,
+    quorum_pubkey: String,
+    inherit_height: u32,
+    anchor_height: u32,
+    bip86_index: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::GhostLockLanes {
+        backup_pubkey,
+        heir_pubkey,
+        quorum_pubkey,
+        inherit_height,
+        anchor_height,
+        bip86_index,
     })
     .await?;
     to_value(&resp)
@@ -675,80 +734,6 @@ async fn multisig_descriptor_delete(name: String) -> Result<serde_json::Value, S
     to_value(&resp)
 }
 
-/// Start the daemon watch subscription if it isn't already running.
-/// Forwards each `PaymentDetected` push to the frontend as a Tauri event
-/// named `wraith://payment-detected`. Idempotent — safe to call from
-/// multiple windows.
-#[tauri::command]
-async fn start_watch(
-    app: AppHandle,
-    state: tauri::State<'_, Arc<WatchState>>,
-) -> Result<(), String> {
-    if state
-        .running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Ok(()); // already running
-    }
-    let app = app.clone();
-    let state = state.inner().clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_watch_loop(&app).await {
-            // Surface the failure to the frontend so it can show a banner.
-            let _ = app.emit("wraith://watch-error", serde_json::json!({ "message": e }));
-        }
-        state.running.store(false, Ordering::SeqCst);
-    });
-    Ok(())
-}
-
-async fn run_watch_loop(app: &AppHandle) -> Result<(), String> {
-    let stream = connect_daemon()
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    let (reader, mut writer) = stream.split();
-    let mut line = serde_json::to_string(&Envelope::new(1, Request::WatchPayments))
-        .map_err(|e| format!("serialise: {e}"))?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| format!("write: {e}"))?;
-    let mut reader = BufReader::new(reader);
-    loop {
-        let mut buf = String::new();
-        match reader.read_line(&mut buf).await {
-            Ok(0) => return Ok(()), // daemon closed
-            Ok(_) => {
-                let env: Envelope<Response> = match serde_json::from_str(&buf) {
-                    Ok(e) => e,
-                    Err(_) => continue, // skip bad lines, keep stream alive
-                };
-                match env.payload {
-                    Response::Watching => {}
-                    Response::PaymentDetected(d) => {
-                        let _ = app.emit(
-                            "wraith://payment-detected",
-                            serde_json::json!({
-                                "txid": d.txid,
-                                "block_height": d.block_height,
-                                "vout": d.vout,
-                                "amount_sats": d.amount_sats,
-                                "k": d.k,
-                                "received_at": d.received_at,
-                            }),
-                        );
-                    }
-                    Response::Error(e) => return Err(e.message),
-                    _ => {}
-                }
-            }
-            Err(e) => return Err(format!("read: {e}")),
-        }
-    }
-}
-
 /// Send a request to the running wraithd daemon over its local IPC endpoint.
 /// Returns the parsed [`Response`] payload (without the JSON-RPC envelope).
 async fn call_daemon(request: Request) -> Result<Response, String> {
@@ -789,7 +774,6 @@ pub fn run() {
         )
         .init();
     tauri::Builder::default()
-        .manage(Arc::new(WatchState::new()))
         .setup(|app| {
             // Make sure a daemon is up. On a packaged install `wraithd` ships
             // as a Tauri sidecar next to this binary; spawn it if nothing is
@@ -871,7 +855,6 @@ pub fn run() {
             daemon_env,
             chain_status,
             connection_status,
-            set_node_endpoints,
             wallet_list,
             wallet_status,
             wallet_unlock,
@@ -887,25 +870,26 @@ pub fn run() {
             light_balance,
             light_receive,
             light_history,
-            light_send,
+            l1_send,
+            light_detected,
+            set_node,
             light_utxos,
             light_l1_utxos,
             wraith_coordinator_discover,
             wraith_resolve_coordinator,
             wraith_mix_run,
+            ghost_lock_lanes,
+            ghost_lock_save,
+            ghost_lock_list,
+            ghost_lock_forget,
+            ghost_lock_round_destination,
+            ghost_lock_escape_plan,
+            ghost_lock_escape_sign,
+            ghost_lock_sign_begin,
+            ghost_lock_sign_nonce,
+            ghost_lock_sign_complete,
             wallet_ghost_id,
-            wallet_glyph,
-            wallet_glyph_claim,
-            wallet_glyph_check,
             wallet_auth_info,
-            gsp_register_scan_key,
-            gsp_session_status,
-            gsp_auth,
-            locks_list,
-            locks_prepare,
-            locks_confirm,
-            locks_jump,
-            locks_recover,
             psbt_inspect,
             psbt_sign,
             psbt_create,
@@ -917,7 +901,6 @@ pub fn run() {
             multisig_descriptor_list,
             multisig_descriptor_addresses,
             multisig_descriptor_delete,
-            start_watch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running wraith-wallet-gui");

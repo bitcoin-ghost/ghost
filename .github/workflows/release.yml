@@ -80,7 +80,7 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 10
         env:
-          # ghost-pool/ghost-pay (Rust) need libsqlite3 + capnproto (the SV2
+          # ghost-pool (Rust) needs libsqlite3 + capnproto (the SV2
           # stratum-core dep). The Linux job ALSO builds ghostd (the C++ Bitcoin
           # Core daemon) below, which needs the standard Core build deps: a
           # compiler + CMake + pkgconf, libevent, boost, and libzmq. WITH_ZMQ is
@@ -138,23 +138,20 @@ jobs:
       # release artifacts here.
       - name: Build
         run: |
-          # CRITICAL: BOTH ghost-pool AND ghost-pay must be built with their own
-          # zk-production feature so the released binaries can run on mainnet.
-          # Without it, is_production_mode() is false and the binary aborts at
-          # startup ("MAINNET SECURITY: ZK consensus on mainnet requires trusted
-          # setup parameters"), so every curl|bash install crash-loops. ghost-pay
-          # has a SEPARATE `zk-production` feature (ghost-zkp/zk-production) — it is
-          # NOT enabled transitively by ghost-pool/zk-production, so it must be
-          # listed explicitly. zk-production is a compile-time flag with no
-          # build-time artefacts (params load at runtime), so this is safe.
+          # CRITICAL: ghost-pool must be built with its zk-production feature so
+          # the released binary can run on mainnet. Without it,
+          # is_production_mode() is false and the binary aborts at startup
+          # ("MAINNET SECURITY: ZK consensus on mainnet requires trusted setup
+          # parameters"), so every curl|bash install crash-loops. zk-production
+          # is a compile-time flag with no build-time artefacts (params load at
+          # runtime), so this is safe.
           cargo build --release --target ${{ matrix.target }} \
-            --features ghost-pool/zk-production,ghost-pay/zk-production \
-            -p ghost-pool -p ghost-cli -p ghost-pay -p ghost-gsp-bin \
+            --features ghost-pool/zk-production \
+            -p ghost-pool -p ghost-cli \
             -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
 
-      # Build ghostd (the C++ Bitcoin Core daemon) so all THREE node binaries
-      # (ghost-pool + ghost-pay + ghostd) ship in ONE signed release at ONE
-      # version and can never drift apart. Linux only — the pool/elder fleet is
+      # Build ghostd (the C++ Bitcoin Core daemon) so the node binaries ship in
+      # ONE signed release at ONE version and can never drift apart. Linux only — the pool/elder fleet is
       # Linux, and a Bitcoin Core build is neither needed nor attempted on the
       # macOS targets.
       #
@@ -203,7 +200,7 @@ jobs:
           mkdir -p dist
 
           # Copy binaries (check actual names from target directory)
-          for bin in ghost-pool ghost-cli ghost-pay ghost-gsp translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
+          for bin in ghost-pool ghost-cli translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
             if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi
@@ -211,8 +208,8 @@ jobs:
 
           # ghostd (C++) is built only on the Linux target (step above). Stage it
           # into the SAME dist/ so it lands inside the linux tarball alongside
-          # ghost-pool + ghost-pay and is covered — with zero extra signing logic
-          # — by the existing SHA256SUMS + GPG signature over the tarball.
+          # ghost-pool and is covered — with zero extra signing logic — by the
+          # existing SHA256SUMS + GPG signature over the tarball.
           if [ -f "ghost-core/build/bin/ghostd" ]; then
             cp "ghost-core/build/bin/ghostd" dist/
           fi

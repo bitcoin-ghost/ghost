@@ -8,9 +8,8 @@
 #                                $GHOSTD_RPC_USER + $GHOSTD_RPC_PASSWORD.
 #                                bitcoind is RPC-compatible and works
 #                                interchangeably here.
-#   • ghost-pay                — :8800, REST API
-#   • ghost-gsp                — :8900, REST + WS (--insecure-http for dev)
-#   • wraithd                  — local Unix socket
+#   • wraith-coordinator       — :9100, the Mix screen's default
+#   • wraithd                  — local Unix socket, pointed at ghostd
 #
 # Logs land in /tmp/wraith-stack/<service>.log.
 # Run again to restart: idempotent — kills the previous instance first.
@@ -24,27 +23,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."  && pwd)"
 LOG_DIR="${WRAITH_STACK_LOG_DIR:-/tmp/wraith-stack}"
-GHOST_PAY_DATA="${WRAITH_STACK_GHOST_PAY_DIR:-/tmp/wraith-stack/ghost-pay}"
-GSP_DATA="${WRAITH_STACK_GSP_DIR:-/tmp/wraith-stack/gsp}"
 WALLETS_DIR="${WRAITH_STACK_WALLETS_DIR:-/tmp/wraith-stack/wallets}"
 
 GHOSTD_RPC_URL="${GHOSTD_RPC_URL:-http://127.0.0.1:38335}"
 GHOSTD_RPC_USER="${GHOSTD_RPC_USER:-local}"
 GHOSTD_RPC_PASSWORD="${GHOSTD_RPC_PASSWORD:-localtest}"
 
-mkdir -p "$LOG_DIR" "$GHOST_PAY_DATA" "$GSP_DATA" "$WALLETS_DIR"
-
-# Shared X-Internal-Auth secret. ghost-pay accepts it as the
-# authenticated-route bypass; ghost-gsp uses it when proxying to
-# ghost-pay; wraithd uses it for the L1 UTXO scanner endpoint.
-# Persist across `up` invocations in the same stack so restarts
-# don't break already-authenticated connections.
-SECRET_FILE="$LOG_DIR/internal-secret"
-if [[ ! -f "$SECRET_FILE" ]]; then
-    openssl rand -base64 32 > "$SECRET_FILE"
-fi
-INTERNAL_SECRET="$(cat "$SECRET_FILE")"
-export INTERNAL_SECRET
+mkdir -p "$LOG_DIR" "$WALLETS_DIR"
 
 action="${1:-up}"
 
@@ -72,47 +57,13 @@ stop_one() {
   pkill -x "$name" 2>/dev/null || true
 }
 
-start_ghost_pay() {
-  stop_one ghost-pay
-  echo "starting ghost-pay → $LOG_DIR/ghost-pay.log"
-  # ghost-pay reads BITCOIN_RPC_{USER,PASSWORD} from env (upstream
-  # Bitcoin Core convention — ghostd is RPC-compatible).
-  # GHOST_PAY_INTERNAL_SECRET is the X-Internal-Auth bypass secret
-  # shared with ghost-gsp and wraithd.
-  BITCOIN_RPC_USER="$GHOSTD_RPC_USER" \
-  BITCOIN_RPC_PASSWORD="$GHOSTD_RPC_PASSWORD" \
-  GHOST_PAY_API_SECRET="$(openssl rand -base64 32)" \
-  GHOST_PAY_INTERNAL_SECRET="$INTERNAL_SECRET" \
-    "$ROOT/target/debug/ghost-pay" \
-      --bitcoin-rpc "$GHOSTD_RPC_URL" \
-      --network signet \
-      --api-listen 127.0.0.1:8800 \
-      --data-dir "$GHOST_PAY_DATA" \
-      > "$LOG_DIR/ghost-pay.log" 2>&1 &
-  echo $! > "$LOG_DIR/ghost-pay.pid"
-}
-
-start_ghost_gsp() {
-  stop_one ghost-gsp
-  echo "starting ghost-gsp → $LOG_DIR/ghost-gsp.log"
-  GHOST_PAY_INTERNAL_SECRET="$INTERNAL_SECRET" \
-    "$ROOT/target/debug/ghost-gsp" \
-      --network signet \
-      --listen 127.0.0.1:8900 \
-      --pay-node-url http://127.0.0.1:8800 \
-      --data-dir "$GSP_DATA" \
-      --insecure-http \
-      > "$LOG_DIR/ghost-gsp.log" 2>&1 &
-  echo $! > "$LOG_DIR/ghost-gsp.pid"
-}
-
 start_wraithd() {
   stop_one wraithd
   echo "starting wraithd → $LOG_DIR/wraithd.log"
   WRAITHD_WALLETS_DIR="$WALLETS_DIR" \
-  WRAITHD_GSP=ws://127.0.0.1:8900/ws/v1 \
-  WRAITHD_GHOST_PAY=http://127.0.0.1:8800 \
-  WRAITHD_GHOST_PAY_INTERNAL_AUTH="$INTERNAL_SECRET" \
+  WRAITHD_GHOSTD_URL="$GHOSTD_RPC_URL" \
+  WRAITHD_GHOSTD_USER="$GHOSTD_RPC_USER" \
+  WRAITHD_GHOSTD_PASS="$GHOSTD_RPC_PASSWORD" \
   WRAITHD_WRAITH_COORDINATOR=http://127.0.0.1:9100 \
     "$ROOT/target/debug/wraithd" \
       > "$LOG_DIR/wraithd.log" 2>&1 &
@@ -143,7 +94,7 @@ start_wraith_coordinator() {
 }
 
 status() {
-  for svc in ghost-pay ghost-gsp wraith-coordinator wraithd; do
+  for svc in wraith-coordinator wraithd; do
     pidfile="$LOG_DIR/$svc.pid"
     if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
       echo "  ok    $svc (pid $(cat "$pidfile"))"
@@ -161,10 +112,6 @@ case "$action" in
       echo "       set GHOSTD_RPC_URL / _USER / _PASSWORD env if elsewhere."
       exit 1
     fi
-    start_ghost_pay
-    sleep 2
-    start_ghost_gsp
-    sleep 2
     start_wraith_coordinator
     sleep 1
     start_wraithd
@@ -178,8 +125,6 @@ case "$action" in
   down)
     stop_one wraithd
     stop_one wraith-coordinator
-    stop_one ghost-gsp
-    stop_one ghost-pay
     echo "stack down"
     ;;
   status)

@@ -113,28 +113,18 @@ pub(crate) fn default_l1_scan_max_index() -> u32 {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
     Health,
-    /// One-shot connectivity + health summary (daemon + ghost-pay + ghost-gsp + session).
+    /// One-shot connectivity + health summary for the daemon and its node.
     Doctor,
     ChainStatus,
-    GspPing,
-    /// Register the active wallet's auth identity with the configured GSP and create
-    /// a session. Idempotent — already-registered wallets proceed straight to session.
-    GspAuth,
-    /// Inspect the daemon's stored GSP session token + persistent connection state.
-    GspSessionStatus,
     /// One-shot connectivity snapshot for the GUI's persistent status bar:
-    /// network, ghost-pay reachability, GSP websocket state, and chain
-    /// sync/height — composed server-side so the frontend makes a single
-    /// call and never sits on a forever-"connecting" spinner. Unlike
-    /// `ChainStatus`, this never errors for an unreachable backend; an
-    /// unreachable ghost-pay is reported as `ghost_pay_reachable = false`.
+    /// network, node reachability, and chain sync/height — composed
+    /// server-side so the frontend makes a single call and never sits on a
+    /// forever-"connecting" spinner. Unlike `ChainStatus`, this never errors
+    /// for an unreachable node; that is reported as a field.
     ConnectionStatus,
-    /// Register the active wallet's BIP-352 scan public key with the GSP so the
-    /// server can detect incoming silent payments on its behalf.
-    GspRegisterScanKey,
-    /// Read the active wallet's last-known on-chain balance from the persistent session.
+    /// The active wallet's on-chain balance.
     LightBalance,
-    /// List the active wallet's UTXOs via the persistent GSP session.
+    /// List the active wallet's UTXOs.
     LightUtxos {
         /// Minimum number of confirmations. Default 1.
         min_confirmations: u32,
@@ -147,6 +137,166 @@ pub enum Request {
     /// each matching UTXO tagged with the BIP86 index that produced
     /// its address — drop straight into Wraith mix's `bip86_index`
     /// field to skip the daemon-side scan.
+    /// Derive a Ghost Lock's four lanes and report their balances.
+    ///
+    /// # The aggregates are derived, not supplied
+    ///
+    /// Savings spends by a MuSig2 aggregate of owner and backup; Spending by an
+    /// aggregate of owner and quorum. Both are computed here from the individual
+    /// public keys: BIP-327 key aggregation is deterministic, so no ceremony and
+    /// no other party being online is required.
+    ///
+    /// Interaction is needed only to **sign** a key-path spend — nonce exchange
+    /// and partial signatures — which is a separate piece of work.
+    ///
+    /// Deriving rather than accepting them also removes a class of error: a
+    /// pasted aggregate that does not match its parts would build a Lock whose
+    /// key path nobody can satisfy, and nothing would notice until a spend
+    /// failed.
+    /// Remember a Ghost Lock's definition.
+    ///
+    /// `lock_id` is derived from the fields, so saving the same Lock twice
+    /// updates one record rather than making a second. Only public keys and two
+    /// heights are stored — the owner's key stays in the keystore.
+    GhostLockSave {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        backup_pubkey: String,
+        heir_pubkey: String,
+        quorum_pubkey: String,
+        anchor_height: u32,
+        inherit_height: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bip86_index: Option<u32>,
+    },
+    /// Every remembered Lock.
+    GhostLockList,
+    /// Forget a Lock's definition.
+    ///
+    /// Removes the record, not the Lock. The lanes stay spendable by anyone
+    /// holding the keys.
+    GhostLockForget {
+        lock_id: String,
+    },
+    GhostLockLanes {
+        /// Backup device's x-only key, hex.
+        backup_pubkey: String,
+        /// Heir's x-only key, hex.
+        heir_pubkey: String,
+        /// Wraith quorum's x-only key, hex.
+        quorum_pubkey: String,
+        /// Absolute height the inheritance leaf matures at.
+        inherit_height: u32,
+        /// Height the Lock is anchored at — normally the current tip.
+        anchor_height: u32,
+        /// BIP86 index for the owner key. Defaults to 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bip86_index: Option<u32>,
+    },
+    /// Spend a Spending lane with the quorum, over HTTP.
+    ///
+    /// One call, not three: both MuSig2 rounds happen here because the
+    /// counterparty is a service rather than a person carrying payloads.
+    GhostLockQuorumSign {
+        lock_id: String,
+        /// Must be `spending` — the only lane the quorum co-signs.
+        lane: String,
+        /// The spend, base64 PSBT.
+        psbt: String,
+        input_index: u32,
+        /// Base URL of the coordinator to ask.
+        coordinator_url: String,
+    },
+    /// What an escape spend needs, and whether the coins are old enough yet.
+    ///
+    /// Asked before building the transaction, because the input's `nSequence`
+    /// is dictated by the leaf's delay and a wrong one is rejected as
+    /// non-final. The wallet knows the number; the caller should not have to.
+    GhostLockEscapePlan {
+        /// `lock_id` from [`Request::GhostLockList`].
+        lock_id: String,
+        /// `savings`, `spending` or `investments`. Cash has no leaves.
+        lane: String,
+    },
+    /// The id a quorum derives this Lock's co-signing key from.
+    ///
+    /// Asked BEFORE the Lock is built, because it has to be. The quorum's key
+    /// goes into the Lock, and it is derived from this id — so the id cannot
+    /// depend on the key, and `lock_id` does. Hand this to whoever holds the
+    /// quorum seed, put the key they return in the Lock, and the Lock then
+    /// carries the key the coordinator will actually sign with.
+    GhostLockQuorumBindingId {
+        backup_pubkey: String,
+        heir_pubkey: String,
+        anchor_height: u32,
+        inherit_height: u32,
+        /// BIP86 index for the owner key. Defaults to 0, and must match the
+        /// index the Lock is built at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bip86_index: Option<u32>,
+    },
+    /// Sign a lane's escape leaf with the owner's key — leaving alone.
+    ///
+    /// Needs no quorum, no backup device and no ceremony: a key, a delay and a
+    /// transaction. This is the path that stops a silent quorum from being the
+    /// end of the money.
+    GhostLockEscapeSign {
+        lock_id: String,
+        lane: String,
+        /// The spend, base64 PSBT. Its input must carry the `nSequence`
+        /// [`Request::GhostLockEscapePlan`] reported.
+        psbt: String,
+        input_index: u32,
+    },
+    /// Round 1 of an air-gapped key-path spend: review the spend and commit a
+    /// nonce.
+    ///
+    /// Returns what to carry to the backup device. The daemon holds its own
+    /// secret nonce until [`Request::GhostLockSignNonce`], and never longer:
+    /// the owner's partial signature is produced the moment both nonces are
+    /// known, so no secret nonce is held while somebody walks to the device a
+    /// second time.
+    GhostLockSignBegin {
+        /// `lock_id` from [`Request::GhostLockList`].
+        lock_id: String,
+        /// Lane being spent: `savings`, `spending` or `investments`.
+        lane: String,
+        /// The unsigned spend, base64 PSBT.
+        psbt: String,
+        /// Which input belongs to the lane.
+        input_index: u32,
+    },
+    /// Round 1 reply from the device: its public nonce.
+    ///
+    /// The daemon signs its own partial here, burning its nonce durably first.
+    GhostLockSignNonce {
+        /// Session from [`Response::GhostLockSignBegun`].
+        session: String,
+        /// The device's public nonce, hex.
+        device_nonce: String,
+    },
+    /// Round 2 reply from the device: its partial signature. Completes the
+    /// spend.
+    GhostLockSignComplete {
+        /// Session from [`Response::GhostLockSignBegun`].
+        session: String,
+        /// The device's partial signature, hex.
+        device_partial: String,
+    },
+    /// Resolve the address a Wraith round should pay into to fund one lane of
+    /// a remembered Lock — private entry.
+    ///
+    /// The lane is named, not the address, and the daemon derives it. A caller
+    /// cannot pass an address of its own choosing here, so "fund this lane
+    /// privately" cannot silently become "pay this stranger", and the
+    /// compartment rule is applied somewhere a CLI cannot skip it.
+    GhostLockRoundDestination {
+        /// `lock_id` from [`Request::GhostLockList`].
+        lock_id: String,
+        /// Lane to fund: `savings`, `spending`, `cash` or `investments`.
+        /// `cash` is refused — see `ghost_lock::check_round_destination`.
+        lane: String,
+    },
     LightL1Utxos {
         /// Highest BIP86 index to derive. Daemon scans 0..this.
         /// Capped server-side at 1024 (ghost-pay's scantxoutset
@@ -162,32 +312,52 @@ pub enum Request {
         limit: u32,
         offset: u32,
     },
-    /// List BIP-352 silent-payment detections accumulated in the persistent
-    /// session's local scanner since auth.
-    LightDetected,
     /// Read-only snapshot of the daemon's configured environment — the URLs
     /// it talks to, the network it's bound to, where it stores wallets.
     /// Useful for diagnostics + the GUI's settings panel.
     DaemonEnv,
-    /// Choose which node the wallet talks to, at runtime, and persist the
-    /// choice to `node.json` in the wallet data dir so it survives a restart.
+    /// Silent payments the block scanner has found.
     ///
-    /// * `preset = "public"` — apply the bundled public-fleet preset. The
-    ///   `ghost_pay_url` / `gsp_url` fields are ignored.
-    /// * `preset = "custom"` — use `ghost_pay_url` + `gsp_url` (each may be a
-    ///   comma-separated failover list). Both are required and validated for
-    ///   the correct scheme (`http(s)://` for ghost-pay, `ws(s)://` for GSP).
+    /// These do not appear in the UTXO list: a silent payment lands on a key
+    /// derived from the sender's ephemeral key and this wallet's Ghost ID, not
+    /// on any address the wallet published, so a scan of derived addresses
+    /// cannot see it. Each entry carries the derivation index that makes the
+    /// coin spendable.
+    LightDetected,
+    /// Point the wallet at a node, at runtime, and persist the choice to
+    /// `node.json` in the wallet data dir so it survives a restart.
     ///
-    /// The daemon rebuilds its ghost-pay + GSP clients in place and drops any
-    /// live GSP session so it re-authenticates against the new endpoint — no
-    /// restart needed. Refused while `WRAITHD_GHOST_PAY` / `WRAITHD_GSP` pin
-    /// the endpoints (env vars keep power-user precedence).
-    SetNodeEndpoints {
-        preset: String,
+    /// Every field is optional; sending all of them empty clears the node,
+    /// which leaves the wallet unable to read or write the chain until one is
+    /// set again. `cookie_path` is preferred over `user`/`pass`: a cookie
+    /// rotates with the node and is never typed anywhere.
+    ///
+    /// The daemon rebuilds its chain client in place — no restart needed.
+    /// Refused while `WRAITHD_GHOSTD_URL` pins the node (env vars keep
+    /// power-user precedence).
+    SetNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        ghost_pay_url: Option<String>,
+        ghostd_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        gsp_url: Option<String>,
+        cookie_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pass: Option<String>,
+        /// A Ghost pool node, used only to read the coordinator election.
+        ///
+        /// Optional and separate from the wallet's own node: it answers "which
+        /// coordinator holds this tier's seat this epoch", which is pool
+        /// consensus state and not something a Bitcoin node knows. Leave it
+        /// unset and mixing falls back to a coordinator URL supplied per
+        /// round.
+        ///
+        /// What is read from it is verified rather than believed — the draw is
+        /// recomputed and its beacon pinned to the wallet's own node — so a
+        /// lying pool cannot name itself every seat. What it still sees is
+        /// that this IP asked; route it through Tor if that matters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_url: Option<String>,
     },
     /// Phase 15: ask the daemon to fetch a release manifest from
     /// `manifest_url` (or the daemon-configured default if `None`),
@@ -198,68 +368,36 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manifest_url: Option<String>,
     },
-    /// Stream future BIP-352 silent-payment detections from the persistent
-    /// session as they arrive. The daemon keeps the connection open and emits
-    /// `Response::PaymentDetected` envelopes (id=0) until the client closes
-    /// the socket. The initial reply on the request's own id is an
-    /// acknowledgement (`Response::Watching`).
-    WatchPayments,
-    /// List the active wallet's Ghost Locks via the persistent GSP session.
-    LocksList,
-    /// Ask GSP to prepare a new ghost lock for the active wallet.
-    /// Server returns a funding address and required-sats; client funds it externally.
-    LocksPrepare {
-        capacity_sats: u64,
-    },
-    /// Confirm that a previously-prepared lock has been funded on-chain.
-    LocksConfirm {
-        lock_id: String,
-        funding_txid: String,
-    },
-    /// Initiate a jump (key rotation) for an existing lock.
-    /// Priority is one of: "normal" (default), "high", "urgent".
-    LocksJump {
-        lock_id: String,
-        target_address: String,
-        priority: String,
-    },
-    /// **Unilateral exit** — spend a Ghost Lock via the timelock
-    /// recovery branch, with no operator cooperation. Daemon talks
-    /// directly to the user-configured bitcoind, builds + signs +
-    /// broadcasts the spend tx using the wallet's own
-    /// recovery_secret. Works even if ghost-pay and ghost-gsp are
-    /// permanently down. The maturation precondition (current
-    /// height >= creation_height + recovery_blocks) is enforced
-    /// before signing — bitcoin would reject the spend anyway, but
-    /// surfacing it here gives a friendly error instead of a
-    /// cryptic mempool rejection.
-    LocksRecover {
-        lock_id: String,
-        /// Wallet-controlled L1 destination for the recovered funds.
-        destination_address: String,
-        /// Mining fee in sats. Subtracted from the lock's value.
-        /// Caller responsible for picking a sane number; daemon
-        /// refuses fee >= prev_value_sats.
-        fee_sats: u64,
-    },
-    /// Prepare + sign + submit an L2 payment.
-    /// Mode is `ghostpay` (the instant L2 ledger transfer); it is the
-    /// only accepted value and the default. The legacy `wraith` and
-    /// `confidential` values are rejected — unlinkable L1 spends go
-    /// through the Mix flow, not Send.
+    /// Pay someone on-chain: build, sign and broadcast, in one call.
     ///
-    /// `shroud_max_ms` overrides the daemon's default outbound-broadcast
-    /// shroud window for *this one* payment.
+    /// The three steps already exist as `PsbtCreate`, `PsbtSign` and
+    /// `PsbtBroadcast`, and they stay — a user who wants to inspect the
+    /// transaction before it leaves, or sign it somewhere else, should be able
+    /// to. This is the ordinary path, where being asked to shepherd a payment
+    /// through three round trips is not a feature.
     ///
-    /// * `None` (default) — use the daemon-wide setting from `WRAITHD_SHROUD_MAX_MS`.
-    /// * `Some(0)` — bypass shroud, broadcast immediately. Use only when
-    ///   latency matters more than origin privacy.
-    /// * `Some(n)` — pick a uniform random delay in `[0, n]` ms.
-    LightSend {
-        recipient: String,
+    /// It is deliberately a separate verb rather than a flag on `PsbtCreate`:
+    /// building a transaction moves no money and broadcasting one cannot be
+    /// undone, and a request that sometimes does the second is a request whose
+    /// consequences depend on a field somebody might not set.
+    L1Send {
+        recipient_address: String,
         amount_sats: u64,
-        mode: String,
+        #[serde(default = "default_fee_rate")]
+        fee_rate_sats_per_vb: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change_index: Option<u32>,
+        #[serde(default = "default_l1_scan_max_index")]
+        bip86_scan_max: u32,
+        /// Coin control, as `PsbtCreate`: empty means "pick for me".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        selected_outpoints: Vec<OutpointRef>,
+        /// Kept locally in the wallet's history. It is never put on-chain and
+        /// never leaves the machine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         memo: Option<String>,
+        /// Hold the broadcast for a random delay in `[0, n]` ms, as
+        /// `LightSend`. `None` uses the daemon default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shroud_max_ms: Option<u64>,
     },
@@ -283,6 +421,19 @@ pub enum Request {
         name: String,
         mnemonic: String,
         passphrase: String,
+        /// The chain height this seed was first used at, if known.
+        ///
+        /// The block scanner reads forward from here to rebuild the wallet's
+        /// history. Omit it and scanning starts at the tip, so the restored
+        /// wallet's past is absent from its history — its coins are all still
+        /// found, because the balance and UTXO list scan the whole UTXO set,
+        /// but what it *did* before the restore is not.
+        ///
+        /// Guessing low is safe and slow: every block from here is read, at
+        /// roughly a hundred and fifty a minute. Guessing high silently loses
+        /// history, so when in doubt name a height before the seed existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birth_height: Option<u32>,
     },
     /// Unlock a named wallet by reading from disk + decrypting. Becomes active.
     WalletUnlock {
@@ -313,27 +464,10 @@ pub enum Request {
     WalletDerive {
         path: String,
     },
-    /// Show the GSP auth identity (wallet_id + x-only auth pubkey) of the active wallet.
+    /// Show the wallet's identity: its wallet ID and x-only auth pubkey.
     WalletAuthInfo,
     /// Show the active wallet's BIP-352 Ghost ID (silent payment receive identity).
     WalletGhostId,
-    /// Fetch the registered Ghost Glyph for `ghost_id` from ghost-pay.
-    WalletGlyph {
-        ghost_id: String,
-    },
-    /// Claim a designed Ghost Glyph for `ghost_id`. `pixels` is a
-    /// 256-byte palette-index bitmap (values 0..25). Authenticated
-    /// against ghost-pay via the internal-auth shared secret.
-    WalletGlyphClaim {
-        ghost_id: String,
-        pixels: Vec<u8>,
-    },
-    /// Check whether a glyph bitmap is unclaimed. The daemon computes
-    /// the bitmap hash from `pixels` and queries ghost-pay's
-    /// availability endpoint.
-    WalletGlyphCheck {
-        pixels: Vec<u8>,
-    },
     /// Export the active wallet's extended public key at `path`,
     /// formatted for use as a BIP-380 descriptor key fragment.
     /// `mainnet=true` emits xpub, `mainnet=false` emits tpub.
@@ -433,6 +567,10 @@ pub enum Request {
         utxo_value_sats: u64,
         utxo_scriptpubkey_hex: String,
         mix_output_address: String,
+        /// Smallest anonymity set, in distinct entities, worth signing into.
+        /// `None` uses the wallet's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_entities: Option<usize>,
     },
     /// Phase 5b companion to [`Request::WraithMixPrepare`]. Submits
     /// the supplied witness for the previously-prepared session and
@@ -498,6 +636,14 @@ pub enum Request {
         /// Bound on the BIP86 scan. Default 1024.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bip86_scan_max: Option<u32>,
+        /// Smallest anonymity set, in distinct entities, worth signing into.
+        ///
+        /// `None` uses the wallet's default. A caller supplying a lower value
+        /// is accepting a smaller set deliberately — which is why the wallet
+        /// asks for the number rather than a "proceed anyway" flag: stating a
+        /// floor is a decision, dismissing a dialog is a reflex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_entities: Option<usize>,
     },
     /// Decode a PSBT and return a per-input / per-output summary.
     /// Pure function — does not touch any wallet state, so unlike
@@ -639,37 +785,29 @@ pub enum Response {
     Doctor(DoctorResponse),
     ChainStatus(ChainStatusResponse),
     ConnectionStatus(ConnectionStatusResponse),
-    GspPing(GspPingResponse),
-    GspAuth(GspAuthResponse),
-    GspSessionStatus(GspSessionStatusResponse),
-    GspScanKeyRegistered {
-        wallet_id: String,
-        scan_pubkey_hex: String,
-    },
     LightBalance(LightBalanceResponse),
     LightUtxos(LightUtxosResponse),
     LightL1Utxos(LightL1UtxosResponse),
+    GhostLockLanes(GhostLockLanesResponse),
+    GhostLockRoundDestination(GhostLockRoundDestinationResponse),
+    GhostLockQuorumSigned(GhostLockQuorumSignedResponse),
+    GhostLockEscapePlan(GhostLockEscapePlanResponse),
+    GhostLockEscapeSigned(GhostLockEscapeSignedResponse),
+    GhostLockSignBegun(GhostLockSignBegunResponse),
+    GhostLockSignNonced(GhostLockSignNoncedResponse),
+    GhostLockSigned(GhostLockSignedResponse),
+    GhostLockSaved(GhostLockSavedResponse),
+    GhostLockQuorumBindingId(GhostLockQuorumBindingIdResponse),
+    GhostLockList(GhostLockListResponse),
+    GhostLockForgotten(GhostLockForgottenResponse),
     LightHistory(LightHistoryResponse),
     LightDetected(LightDetectedResponse),
     DaemonEnv(DaemonEnvResponse),
-    /// Reply to [`Request::SetNodeEndpoints`] — the endpoint config now in
-    /// force after the change was applied + persisted.
-    NodeEndpointsSet(NodeEndpointsResponse),
+    /// Reply to [`Request::SetNode`] — the node config now in force after the
+    /// change was applied and persisted.
+    NodeSet(NodeResponse),
     CheckForUpdate(CheckForUpdateResponse),
-    /// Acknowledgement of a `Request::WatchPayments`. Subsequent
-    /// `PaymentDetected` envelopes (id=0) on the same connection are pushes,
-    /// not replies.
-    Watching,
-    /// Unsolicited push: a new BIP-352 detection. Daemon sends with `id=0`.
-    PaymentDetected(DetectedPaymentEntry),
-    LocksList(LocksListResponse),
-    LocksPrepared(LocksPreparedResponse),
-    LocksConfirmed(LocksConfirmedResponse),
-    LocksJumped(LocksJumpedResponse),
-    /// Successful response to [`Request::LocksRecover`]. The
-    /// recovery tx has been built, signed, and accepted by bitcoind.
-    LocksRecovered(LocksRecoveredResponse),
-    LightSent(LightSentResponse),
+    L1Sent(L1SendResponse),
     WalletCreate(WalletCreateResponse),
     /// Reply to `Request::WalletImport`. We don't echo the mnemonic back —
     /// the caller already has it.
@@ -694,11 +832,6 @@ pub enum Response {
     WalletDerive(WalletDeriveResponse),
     WalletAuthInfo(WalletAuthInfoResponse),
     WalletGhostId(WalletGhostIdResponse),
-    WalletGlyph(GlyphInfo),
-    WalletGlyphClaimed(GlyphClaimResult),
-    WalletGlyphChecked {
-        available: bool,
-    },
     WalletXpub(WalletXpubResponse),
     MultisigDescriptorInspected(MultisigDescriptorInspected),
     MultisigDescriptorSaved(MultisigDescriptorSaved),
@@ -735,6 +868,13 @@ pub enum Response {
     /// Reply to [`Request::WraithMixSubmit`]. Carries the broadcast
     /// txid and the index of the wallet's mixed output.
     WraithMixCompleted(WraithMixCompletedResponse),
+    /// The wallet inspected the round and refused to sign it.
+    ///
+    /// Structured rather than an error string, because the wallet has to *show*
+    /// what it found: the entity count, what was discounted, and whether the
+    /// coordinator over-claimed. A refusal rendered as a sentence gives the user
+    /// nothing to decide with.
+    WraithMixRefused(WraithMixRefusedResponse),
     PsbtInspected(PsbtInspectResponse),
     PsbtSigned(PsbtSignResponse),
     PsbtCreated(PsbtCreateResponse),
@@ -977,14 +1117,11 @@ pub struct DoctorResponse {
 pub struct ChainStatusResponse {
     pub backend_version: String,
     pub network: String,
-    pub has_keys: bool,
-    pub lock_count: u64,
-    pub active_sessions: u64,
-    /// Latest verified-block height from the operator's bitcoind.
+    /// Latest verified-block height the node reports.
     #[serde(default)]
     pub chain_height: Option<u64>,
-    /// Highest header bitcoind has seen. Equals chain_height when
-    /// synced, exceeds it during IBD.
+    /// Highest header the node has seen. Equals `chain_height` when synced,
+    /// exceeds it during initial block download.
     #[serde(default)]
     pub chain_headers: Option<u64>,
     /// Bitcoin Core's verification progress (0..1). 1.0 ≈ synced.
@@ -993,12 +1130,6 @@ pub struct ChainStatusResponse {
     /// Bitcoin Core's IBD flag.
     #[serde(default)]
     pub chain_initial_block_download: Option<bool>,
-    /// L2 chain tip — latest finalized ghost-pay block height.
-    #[serde(default)]
-    pub l2_height: Option<u64>,
-    /// Current L2 epoch.
-    #[serde(default)]
-    pub l2_epoch: Option<u64>,
 }
 
 /// Consolidated connectivity snapshot for the GUI's persistent status
@@ -1013,69 +1144,27 @@ pub struct ConnectionStatusResponse {
     /// Network the daemon is bound to ("mainnet"/"signet"/"testnet"/"regtest").
     /// Always known — read from the daemon config, never the backend.
     pub network: String,
-    /// Whether the configured ghost-pay backend answered its status probe.
-    pub ghost_pay_reachable: bool,
-    /// ghost-pay's reported version, when it was reachable.
+    /// Whether a node is configured at all. False means the wallet has no
+    /// chain backend, which is a different state from one that is configured
+    /// and unreachable — and the fix is different too.
+    pub node_configured: bool,
+    /// Whether the configured node answered its status probe.
+    pub node_reachable: bool,
+    /// The node's reported backend, when it was reachable.
     #[serde(default)]
-    pub ghost_pay_version: Option<String>,
-    /// Probe error, populated only when ghost-pay was unreachable.
+    pub node_version: Option<String>,
+    /// Probe error, populated only when the node was unreachable.
     #[serde(default)]
-    pub ghost_pay_error: Option<String>,
-    /// Whether the daemon holds a GSP session token for the active wallet.
-    pub gsp_have_token: bool,
-    /// True when the GSP websocket is live and authenticated.
-    pub gsp_connected: bool,
-    /// GSP session phase ("disconnected"/"connecting"/"authenticating"/
-    /// "authenticated"/"backoff"), or `None` when there is no session.
-    #[serde(default)]
-    pub gsp_phase: Option<String>,
-    /// L1 verified block height (`None` if bitcoind was unreachable from
-    /// ghost-pay, or ghost-pay itself was unreachable).
+    pub node_error: Option<String>,
+    /// Verified block height (`None` if the node was unreachable).
     #[serde(default)]
     pub chain_height: Option<u64>,
-    /// Highest L1 header ghost-pay's bitcoind has seen.
+    /// Highest header the node has seen.
     #[serde(default)]
     pub chain_headers: Option<u64>,
-    /// True when L1 is fully synced: blocks ≥ headers (or headers
-    /// unknown) AND bitcoind is not in initial block download.
+    /// True when the chain is fully synced: blocks ≥ headers (or headers
+    /// unknown) AND the node is not in initial block download.
     pub chain_synced: bool,
-    /// L2 chain tip — latest finalized ghost-pay block height.
-    #[serde(default)]
-    pub l2_height: Option<u64>,
-}
-
-/// GSP WebSocket connectivity probe result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GspPingResponse {
-    pub server_time: i64,
-    pub round_trip_ms: Option<i64>,
-}
-
-/// Result of `GspAuth` (register-if-needed + create-session).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GspAuthResponse {
-    pub wallet_id: String,
-    /// Whether the register call returned "already registered".
-    pub already_registered: bool,
-    /// Truncated JWT (first 12 chars) for visibility — full token stays in the daemon.
-    pub token_prefix: String,
-    pub expires_at: i64,
-}
-
-/// Snapshot of the daemon's stored GSP session token + live connection state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GspSessionStatusResponse {
-    pub have_token: bool,
-    /// Wallet name the token belongs to (the wallet that was active at `gsp_auth` time).
-    pub wallet_name: Option<String>,
-    pub wallet_id: Option<String>,
-    pub expires_at: Option<i64>,
-    pub remaining_secs: Option<i64>,
-    /// One of: "disconnected", "connecting", "authenticating", "authenticated", "backoff".
-    pub phase: Option<String>,
-    /// Number of successful WS connects (1 = first connect, >1 = reconnects).
-    pub connect_count: Option<u64>,
-    pub last_error: Option<String>,
 }
 
 /// Active-wallet balance snapshot. `None` fields mean "no data yet"
@@ -1139,10 +1228,17 @@ pub struct LightHistoryEntry {
     pub block_height: Option<u32>,
     pub timestamp: i64,
     /// Net satoshi change (positive = received, negative = sent).
-    pub amount_sats: i64,
+    ///
+    /// `None` means the wallet has no record of the amount, which is not the
+    /// same as zero. A locked wallet can relay a finished transaction without
+    /// being able to tell which of its outputs were its own.
+    pub amount_sats: Option<i64>,
     pub fee_sats: Option<u64>,
     pub tx_type: String,
-    pub confirmations: u32,
+    /// `None` when the backend cannot say (a node without `txindex` cannot
+    /// look up a confirmed transaction it does not hold). Distinct from
+    /// `Some(0)`, which means "seen, not yet mined".
+    pub confirmations: Option<u32>,
     pub memo: Option<String>,
 }
 
@@ -1150,82 +1246,6 @@ pub struct LightHistoryEntry {
 pub struct LightHistoryResponse {
     pub transactions: Vec<LightHistoryEntry>,
     pub total_count: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetectedPaymentEntry {
-    pub txid: String,
-    pub block_height: Option<u32>,
-    pub vout: u32,
-    pub amount_sats: Option<u64>,
-    pub k: u32,
-    pub received_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LightDetectedResponse {
-    pub detections: Vec<DetectedPaymentEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LockEntry {
-    pub lock_id: String,
-    pub status: String,
-    pub capacity_sats: u64,
-    pub balance_sats: u64,
-    pub denomination: String,
-    pub timelock_tier: String,
-    pub funding_address: String,
-    pub funding_txid: Option<String>,
-    pub funding_vout: Option<u32>,
-    pub creation_height: u32,
-    /// Absolute block height at which the lock's timelock matures and
-    /// the wallet's unilateral recovery branch becomes spendable
-    /// (`creation_height + recovery_blocks` per the lock's
-    /// `timelock_tier`). Sourced from the operator-reported
-    /// `recovery_height` on the GSP lock record.
-    pub recovery_height: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksListResponse {
-    pub locks: Vec<LockEntry>,
-    pub total_locked_sats: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksPreparedResponse {
-    pub lock_id: String,
-    pub funding_address: String,
-    pub required_sats: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksConfirmedResponse {
-    pub lock_id: String,
-    pub txid: String,
-    pub block_height: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksJumpedResponse {
-    pub lock_id: String,
-    /// Jump transaction id, if the server broadcast it.
-    pub jump_txid: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocksRecoveredResponse {
-    pub lock_id: String,
-    /// Txid bitcoind accepted into the mempool. Once it confirms,
-    /// the lock's funds are back in the wallet's L1 control.
-    pub broadcast_txid: String,
-    /// Where the recovered funds went.
-    pub destination_address: String,
-    /// How much went to the destination (lock value minus fee).
-    pub recovered_sats: u64,
-    /// Mining fee paid.
-    pub fee_sats: u64,
 }
 
 /// One binary entry in a release manifest. Mirrors the JSON shape produced
@@ -1275,23 +1295,20 @@ pub struct CheckForUpdateResponse {
 /// that wraithd reads at startup, plus a couple of derived fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonEnvResponse {
-    /// Comma-separated list of ghost-pay URLs in failover order.
-    pub ghost_pay_urls: Vec<String>,
-    /// Comma-separated list of GSP WebSocket URLs in failover order.
-    pub gsp_urls: Vec<String>,
-    /// Which node preset is active: `public` (bundled fleet) or `custom`
-    /// (user-supplied URLs). Drives the settings UI's radio selection.
-    /// Defaults to `custom` for older daemons that don't send it.
-    #[serde(default = "default_node_preset")]
-    pub node_preset: String,
-    /// True when `WRAITHD_GHOST_PAY` pins the ghost-pay URL at boot. The UI
-    /// shows the endpoint read-only and the daemon refuses `SetNodeEndpoints`
-    /// while this holds (env-var power-user precedence).
+    /// The node the wallet reads and writes the chain through. `None` when
+    /// none is configured, in which case chain operations refuse.
     #[serde(default)]
-    pub ghost_pay_env_override: bool,
-    /// True when `WRAITHD_GSP` pins the GSP URL at boot.
+    pub ghostd_url: Option<String>,
+    /// How the wallet authenticates to it: `cookie`, `userpass`, or `none`.
     #[serde(default)]
-    pub gsp_env_override: bool,
+    pub ghostd_auth: String,
+    /// True when `WRAITHD_GHOSTD_URL` pins the node at boot. The UI shows it
+    /// read-only and the daemon refuses `SetNode` while this holds.
+    #[serde(default)]
+    pub ghostd_env_override: bool,
+    /// The pool consulted for the coordinator election, if any.
+    #[serde(default)]
+    pub pool_url: Option<String>,
     /// Network the daemon is bound to: `mainnet` / `signet` / `testnet` / `regtest`.
     pub network: String,
     /// Absolute path to the encrypted-keystore directory.
@@ -1320,37 +1337,65 @@ pub struct DaemonEnvResponse {
     pub kiosk_mode: bool,
 }
 
-/// Back-compat default for `DaemonEnvResponse::node_preset` when talking to an
-/// older daemon that predates node selection.
-pub(crate) fn default_node_preset() -> String {
-    "custom".to_string()
+/// One silent payment the scanner found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedPaymentEntry {
+    pub txid: String,
+    pub vout: u32,
+    /// `None` when the amount could not be read from the output.
+    pub amount_sats: Option<u64>,
+    /// The block it arrived in. `None` if it was seen before confirmation.
+    pub block_height: Option<u32>,
+    /// The sender's derivation index. Without this the coin cannot be spent —
+    /// it is what re-derives the key that opens the output.
+    pub k: u32,
+    /// Unix seconds the wallet detected it. Not when it was paid: the scanner
+    /// may be reading a block days old.
+    pub received_at: i64,
 }
 
-/// Result of [`Request::SetNodeEndpoints`] — the endpoint config now in force.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeEndpointsResponse {
-    /// `public` or `custom`.
-    pub preset: String,
-    /// ghost-pay URLs now active, in failover order.
-    pub ghost_pay_urls: Vec<String>,
-    /// GSP WebSocket URLs now active, in failover order.
-    pub gsp_urls: Vec<String>,
+pub struct LightDetectedResponse {
+    pub detections: Vec<DetectedPaymentEntry>,
 }
 
-/// Result of `LightSend` (PreparePayment + sign + SubmitSignedPayment).
+/// Result of [`Request::SetNode`] — the node config now in force.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LightSentResponse {
-    pub payment_id: String,
-    /// On-chain txid if the server broadcast the transaction. May be `None`
-    /// for L2 payments that don't surface as a chain tx (e.g. ghostpay mode).
-    pub txid: Option<String>,
+pub struct NodeResponse {
+    /// The node URL now active, or `None` when the wallet has no node.
+    pub ghostd_url: Option<String>,
+    /// The pool consulted for the coordinator election, if any.
+    #[serde(default)]
+    pub pool_url: Option<String>,
+    /// How the wallet authenticates: `cookie`, `userpass`, or `none`.
+    ///
+    /// Never the credential itself. A settings screen needs to show which
+    /// scheme is in use; it has no business receiving the secret back.
+    pub auth: String,
+    /// True when the environment pins the node, in which case the settings
+    /// screen shows it read-only and `SetNode` refuses.
+    pub env_pinned: bool,
+}
+
+/// The outcome of an [`Request::L1Send`].
+///
+/// Every figure here is measured from the transaction that was actually
+/// broadcast, not from what was asked for: coin selection decides the inputs,
+/// and the fee follows from their size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L1SendResponse {
+    pub txid: String,
     pub recipient: String,
+    /// What the recipient receives.
     pub amount_sats: u64,
+    /// The miner fee, on top of `amount_sats`.
     pub fee_sats: u64,
-    pub mode: String,
-    /// Actual milliseconds the wallet held the signed payment before
-    /// submitting to ghost-pay (Phase 9 Shroud relay). `None` when shroud
-    /// was disabled (max=0) for this send.
+    /// What returned to the wallet as change. `0` when the selection landed
+    /// exactly, or when the change would have been dust.
+    pub change_sats: u64,
+    pub input_count: u32,
+    /// Milliseconds the wallet held the signed transaction before broadcasting
+    /// it. `None` when the shroud was disabled for this send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shroud_delay_ms: Option<u64>,
 }
@@ -1456,34 +1501,6 @@ pub struct WalletShowMnemonicResponse {
     pub mnemonic: String,
 }
 
-/// The wallet's registered Ghost Glyph — a 16x16, 26-colour bitmap
-/// bound to its Ghost ID. Mirrors ghost-pay's `GlyphInfoResponse`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlyphInfo {
-    pub ghost_id: String,
-    /// 256 palette indices (0..25), row-major.
-    pub pixels: Vec<u8>,
-    /// SHA256("GhostGlyphBitmap/v1" || pixels), hex — uniqueness key.
-    pub bitmap_hash: String,
-    /// SHA256("GhostGlyph/v1" || pixels || ghost_id), hex — binding.
-    pub commitment: String,
-    /// Wraith deposit txid that funded the lock (None while pending).
-    pub funding_txid: Option<String>,
-    /// Unix timestamp the lock was funded (None while pending).
-    pub registered_at: Option<u64>,
-    /// One of: "none" / "pending" / "registered".
-    pub status: String,
-}
-
-/// Result of claiming a Ghost Glyph. Mirrors ghost-pay's
-/// `GlyphClaimResponse`. The glyph stays `pending` until its lock funds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlyphClaimResult {
-    pub commitment: String,
-    pub bitmap_hash: String,
-    pub status: String,
-}
-
 /// One cosigner row inside a parsed descriptor — what
 /// `MultisigDescriptorInspect` surfaces per key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1582,6 +1599,253 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// The wallet's own count of a round, as shown to the user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnonymitySetReport {
+    /// Seats in the round — what a naive mixer would call the set.
+    pub seats: usize,
+    /// Distinct entities. **This is the anonymity set.**
+    pub entities: usize,
+    /// Seats that collapsed into another entity.
+    pub discounted: usize,
+    /// Entities distinct only because no linkage was found.
+    pub unverified: usize,
+    /// Real payers among the entities.
+    pub payers: usize,
+}
+
+/// Why a round was refused, and what the wallet counted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WraithMixRefusedResponse {
+    pub session_id: String,
+    /// Counted by the wallet from the chain, never taken from the coordinator.
+    pub report: AnonymitySetReport,
+    /// Every reason, not just the first — a user deciding between retrying and
+    /// walking away needs the whole picture.
+    pub reasons: Vec<String>,
+    /// The floor that was applied.
+    pub min_entities: usize,
+    /// Whether lowering the floor could make this round acceptable.
+    ///
+    /// True for a thin round: it is honest, just small, and accepting a smaller
+    /// set is a decision the user is entitled to make.
+    ///
+    /// **False for an over-claim.** That is not a size problem — the
+    /// coordinator stated a figure the chain does not support, and there is no
+    /// floor at which that becomes acceptable.
+    pub lowering_the_floor_would_help: bool,
+}
+
+/// A remembered Lock definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockRecord {
+    pub lock_id: String,
+    pub label: Option<String>,
+    pub backup_pubkey: String,
+    pub heir_pubkey: String,
+    pub quorum_pubkey: String,
+    pub anchor_height: u32,
+    pub inherit_height: u32,
+    pub bip86_index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockSavedResponse {
+    pub lock: GhostLockRecord,
+    /// False when this updated an existing record — the same keys are the same
+    /// Lock, so re-entering them is a rename rather than a second Lock.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockListResponse {
+    pub locks: Vec<GhostLockRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockForgottenResponse {
+    pub lock_id: String,
+    /// False when there was nothing to forget.
+    pub existed: bool,
+}
+
+/// One lane of a Ghost Lock, as shown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockLane {
+    pub kind: String,
+    pub label: String,
+    pub address: String,
+    /// Confirmed — what has settled.
+    pub balance_sats: u64,
+    /// Unconfirmed, reported separately. Never added to `balance_sats`: money
+    /// that can still vanish must not read as settled.
+    pub pending_sats: u64,
+    /// **True only for Investments.** The quorum can move this lane's funds
+    /// without the owner. Carried per lane so every client shows the same
+    /// warning rather than inferring it from the lane's name.
+    pub quorum_can_spend_alone: bool,
+    /// Whether these coins may enter a Wraith round. False for Cash.
+    pub round_eligible: bool,
+}
+
+/// One output of a spend, as a person reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockSpendOutput {
+    /// Address, or `None` for a script with no address form — shown as such
+    /// rather than omitted, because an unrenderable output is the one worth
+    /// noticing.
+    pub address: Option<String>,
+    /// Value of this output.
+    pub sats: u64,
+}
+
+/// What the spend does, for the owner to check before anything is signed.
+///
+/// The daemon derives this from the same transaction it derives the sighash
+/// from, so the figures shown and the thing signed cannot diverge.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockSpendSummary {
+    pub input_index: u32,
+    pub input_sats: u64,
+    /// The lane being spent from.
+    pub input_address: Option<String>,
+    pub outputs: Vec<LockSpendOutput>,
+    pub fee_sats: u64,
+    /// Total inputs in the transaction. More than one means this spend
+    /// combines coins.
+    pub input_count: usize,
+}
+
+/// A Spending spend the quorum co-signed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockQuorumSignedResponse {
+    pub lock_id: String,
+    /// The aggregated signature, hex. Verified during aggregation.
+    pub signature: String,
+    /// The PSBT with the key-path signature attached, base64.
+    pub psbt: String,
+    /// The finished transaction, hex.
+    pub tx_hex: String,
+    /// What the quorum understood it was signing. Compare it with what you
+    /// meant: the two are derived from the same PSBT, so a mismatch means one
+    /// side read a different transaction.
+    pub quorum_saw_input_sats: u64,
+    pub quorum_saw_fee_sats: u64,
+}
+
+/// One coin sitting in a lane, and whether its escape has matured.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EscapeCoin {
+    pub txid: String,
+    pub vout: u32,
+    pub sats: u64,
+    pub confirmations: u32,
+    /// Blocks still to wait. Zero means it can be spent now.
+    pub blocks_remaining: u32,
+}
+
+/// What an escape spend needs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockEscapePlanResponse {
+    pub lock_id: String,
+    pub lane: String,
+    /// Which escape this is, in words.
+    pub escape: String,
+    /// The wait, in blocks.
+    pub delay_blocks: u32,
+    /// The `nSequence` every spending input must carry. A different value is
+    /// rejected by the network as non-final.
+    pub required_sequence: u32,
+    /// The lane's address — where the coins are.
+    pub lane_address: String,
+    /// Coins in the lane, with how much longer each must wait.
+    pub coins: Vec<EscapeCoin>,
+}
+
+/// A signed escape spend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockEscapeSignedResponse {
+    pub lock_id: String,
+    pub lane: String,
+    pub escape: String,
+    /// The PSBT with the script-path witness attached, base64.
+    pub psbt: String,
+    /// The finished transaction, hex — ready to broadcast.
+    pub tx_hex: String,
+}
+
+/// Round 1 result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockSignBegunResponse {
+    /// Identifies this attempt. Pass it back on the next two calls.
+    pub session: String,
+    /// What the spend does. Check it before carrying anything anywhere.
+    pub summary: LockSpendSummary,
+    /// Carry this to the backup device: a JSON `SigningRequest`. It contains
+    /// the whole PSBT, so the device recomputes the sighash rather than being
+    /// told it.
+    pub device_request: String,
+    /// This wallet's own public nonce, hex.
+    pub our_nonce: String,
+}
+
+/// Round 1 acknowledged; round 2 payload ready.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockSignNoncedResponse {
+    pub session: String,
+    /// Carry this to the device: a JSON `PartialRequest`.
+    pub device_request: String,
+}
+
+/// The finished signature.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockSignedResponse {
+    pub session: String,
+    /// The aggregated Schnorr signature, hex. Verified during aggregation, so
+    /// a value here is one that checks out against the lane's output key.
+    pub signature: String,
+    /// The PSBT with the key-path signature attached, base64.
+    pub psbt: String,
+}
+
+/// The id a quorum derives a Lock's co-signing key from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockQuorumBindingIdResponse {
+    /// Hand this to the quorum operator.
+    pub binding_id: String,
+    /// What to run with it, so the key is derived rather than typed.
+    pub derive_with: String,
+}
+
+/// Where a round should pay to fund one lane privately.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockRoundDestinationResponse {
+    pub lock_id: String,
+    /// The lane, echoed back so a caller cannot mistake which one it asked for.
+    pub lane: String,
+    /// Human label for that lane.
+    pub label: String,
+    /// The address a round must pay into. This is the lane itself — funding it
+    /// is the round's output, so the deposit has the on-chain footprint of any
+    /// other round output rather than a transfer from a known wallet.
+    pub address: String,
+}
+
+/// A Ghost Lock's four lanes and its totals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhostLockLanesResponse {
+    pub lanes: Vec<GhostLockLane>,
+    /// The whole Lock, confirmed — what a person means by "how much have I got".
+    pub total_sats: u64,
+    /// Unconfirmed across every lane. Beside the total, never inside it.
+    pub total_pending_sats: u64,
+    /// Of that, how much the quorum could move without the owner. Reported
+    /// beside the total rather than folded into it.
+    pub custodial_sats: u64,
+    /// Chain height the balances were read at.
+    pub chain_height: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
     pub jsonrpc: String,
@@ -1627,6 +1891,7 @@ mod tests {
                 passphrase: "p".repeat(32),
             },
             Request::WalletImport {
+                birth_height: Some(900_000),
                 name: "restored".into(),
                 mnemonic: "abandon ".repeat(11) + "about",
                 passphrase: "long-enough-passphrase".into(),
@@ -1644,27 +1909,35 @@ mod tests {
                 offset: 0,
             },
             Request::LightReceive { index: 0 },
-            Request::LightSend {
-                recipient: "bc1qxyz".into(),
+            Request::LightDetected,
+            Request::L1Send {
+                recipient_address: "bc1qxyz".into(),
                 amount_sats: 100_000,
-                shroud_max_ms: None,
-                mode: "onchain".into(),
+                fee_rate_sats_per_vb: 5,
+                change_index: None,
+                bip86_scan_max: 32,
+                selected_outpoints: Vec::new(),
                 memo: Some("test".into()),
+                shroud_max_ms: None,
             },
-            Request::LocksList,
-            Request::LocksPrepare {
-                capacity_sats: 1_000_000,
+            Request::GhostLockRoundDestination {
+                lock_id: "abc123".into(),
+                lane: "savings".into(),
             },
             Request::DaemonEnv,
-            Request::SetNodeEndpoints {
-                preset: "public".into(),
-                ghost_pay_url: None,
-                gsp_url: None,
+            Request::SetNode {
+                ghostd_url: None,
+                cookie_path: None,
+                user: None,
+                pass: None,
+                pool_url: None,
             },
-            Request::SetNodeEndpoints {
-                preset: "custom".into(),
-                ghost_pay_url: Some("http://127.0.0.1:8800".into()),
-                gsp_url: Some("ws://127.0.0.1:8900/ws/v1".into()),
+            Request::SetNode {
+                ghostd_url: Some("http://127.0.0.1:8332".into()),
+                cookie_path: Some("/home/test/.ghost/.cookie".into()),
+                user: None,
+                pass: None,
+                pool_url: Some("https://pool.example:8443".into()),
             },
             Request::CheckForUpdate { manifest_url: None },
             Request::CheckForUpdate {
@@ -1705,6 +1978,48 @@ mod tests {
         }
     }
 
+    /// `None` must survive the wire as `None`.
+    ///
+    /// The bug this pins was a fabricated `0` where the wallet did not know a
+    /// figure. A serialiser that defaulted the absent case back to a number
+    /// would restore the lie without touching the code that fixed it — and a
+    /// zero in a money column reads as a fact, not as a gap.
+    #[test]
+    fn an_unknown_history_amount_stays_unknown_across_the_wire() {
+        let entry = LightHistoryEntry {
+            txid: "aa".into(),
+            block_height: None,
+            timestamp: 1,
+            amount_sats: None,
+            fee_sats: None,
+            tx_type: "send".into(),
+            confirmations: None,
+            memo: None,
+        };
+        let wire = serde_json::to_string(&Envelope::new(
+            1,
+            Response::LightHistory(LightHistoryResponse {
+                transactions: vec![entry],
+                total_count: 1,
+            }),
+        ))
+        .unwrap();
+        let back: Envelope<Response> = serde_json::from_str(&wire).unwrap();
+        match back.payload {
+            Response::LightHistory(r) => {
+                assert!(
+                    r.transactions[0].amount_sats.is_none(),
+                    "an unrecorded amount must not come back as a number"
+                );
+                assert!(
+                    r.transactions[0].confirmations.is_none(),
+                    "an unanswerable confirmation count must not come back as zero"
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn envelope_response_round_trip() {
         let cases = vec![
@@ -1720,11 +2035,10 @@ mod tests {
                 path: "/tmp/restored.json".into(),
             },
             Response::DaemonEnv(DaemonEnvResponse {
-                ghost_pay_urls: vec!["http://127.0.0.1:8800".into()],
-                gsp_urls: vec!["ws://127.0.0.1:8900/ws/v1".into()],
-                node_preset: "custom".into(),
-                ghost_pay_env_override: false,
-                gsp_env_override: false,
+                ghostd_url: Some("http://127.0.0.1:8332".into()),
+                ghostd_auth: "cookie".into(),
+                ghostd_env_override: false,
+                pool_url: None,
                 network: "signet".into(),
                 wallets_dir: "/home/test/.wraith/wallets".into(),
                 tor_proxy: None,
@@ -1734,10 +2048,11 @@ mod tests {
                 update_manifest_url: None,
                 kiosk_mode: false,
             }),
-            Response::NodeEndpointsSet(NodeEndpointsResponse {
-                preset: "public".into(),
-                ghost_pay_urls: vec!["https://pool.bitcoinghost.org:8800".into()],
-                gsp_urls: vec!["wss://pool.bitcoinghost.org:8900/ws/v1".into()],
+            Response::NodeSet(NodeResponse {
+                ghostd_url: Some("http://127.0.0.1:8332".into()),
+                pool_url: None,
+                auth: "cookie".into(),
+                env_pinned: false,
             }),
             Response::WalletList(WalletListResponse {
                 wallets: vec![WalletListEntry {
@@ -1750,31 +2065,36 @@ mod tests {
             }),
             Response::ConnectionStatus(ConnectionStatusResponse {
                 network: "mainnet".into(),
-                ghost_pay_reachable: true,
-                ghost_pay_version: Some("0.9.1".into()),
-                ghost_pay_error: None,
-                gsp_have_token: true,
-                gsp_connected: true,
-                gsp_phase: Some("authenticated".into()),
+                node_configured: true,
+                node_reachable: true,
+                node_version: Some("ghostd".into()),
+                node_error: None,
                 chain_height: Some(880_000),
                 chain_headers: Some(880_000),
                 chain_synced: true,
-                l2_height: Some(1234),
             }),
-            // Unreachable-backend shape — the fields the header renders
-            // when nothing is configured on a user's laptop.
+            // Configured but unreachable — the node is set and not answering.
             Response::ConnectionStatus(ConnectionStatusResponse {
                 network: "mainnet".into(),
-                ghost_pay_reachable: false,
-                ghost_pay_version: None,
-                ghost_pay_error: Some("connection refused".into()),
-                gsp_have_token: false,
-                gsp_connected: false,
-                gsp_phase: None,
+                node_configured: true,
+                node_reachable: false,
+                node_version: None,
+                node_error: Some("connection refused".into()),
                 chain_height: None,
                 chain_headers: None,
                 chain_synced: false,
-                l2_height: None,
+            }),
+            // Not configured at all — a different problem with a different
+            // fix, and the header must be able to tell them apart.
+            Response::ConnectionStatus(ConnectionStatusResponse {
+                network: "mainnet".into(),
+                node_configured: false,
+                node_reachable: false,
+                node_version: None,
+                node_error: None,
+                chain_height: None,
+                chain_headers: None,
+                chain_synced: false,
             }),
         ];
         for resp in cases {

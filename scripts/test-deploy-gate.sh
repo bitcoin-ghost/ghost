@@ -205,62 +205,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5b. PRODUCTION-ONLY binaries (#759): ghost-pay and ghost-gsp are installed only on vm1-vm4,
-#     all of which are PRODUCTION nodes. The canary soak is not merely skipped for them, it is
-#     UNSATISFIABLE — so the gate could only ever refuse, and they had no enforced path at all.
-#     The first production node deployed stands in as the canary. These cases pin that the
-#     relaxation is NARROW: still a real 60m soak, still no vouching for yourself, still gone
-#     the moment a canary actually carries the unit.
+# 5b. PRODUCTION-ONLY binaries (#759/#808): the list must stay EMPTY.
+#
+#     The relaxation lets the FIRST production node deployed stand in as the canary for a
+#     binary no canary carries. It was built for ghost-pay and ghost-gsp, both now retired,
+#     and the cases that exercised it went with them — there is no binary left to drive it.
+#
+#     So this asserts the only thing still checkable: that nothing claims the relaxation.
+#     Adding a name to PRODUCTION_ONLY_BINARIES weakens the soak gate for it, and would do so
+#     with no test covering the weakened path — which is how #808 shipped a refusal whose
+#     named remedy was inert. Failing here is the prompt to restore those cases first.
 # ---------------------------------------------------------------------------
 rm -f "$TMP/state"/soaked-*
 
-# The FIRST node must be able to deploy — otherwise the relaxation is decorative and the
-# binaries stay undeployable, which is how #808 shipped: it made a production soak count and
-# made the clock start, but left nothing able to start it, because the remedy its refusal
-# named (`--canary`) is inert.
-out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
-check_absent "the FIRST production node is not refused for want of a soak" \
-    "has not soaked" "$out"
-check "and it says this node becomes the canary for the build" \
-    "FIRST node for this build and becomes its canary" "$out"
-
-# A soak on ANOTHER production node is what this relaxation exists to accept.
-printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
-    > "$TMP/state/soaked-$SHA-ghost-vm2-ghost-gsp"
-out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
-check_absent "a 2h soak on another PRODUCTION node satisfies the soak gate" \
-    "has not soaked" "$out"
-check "and it says a production node stood in as canary" \
-    "no canary carries ghost-gsp.service" "$out"
-
-# The bootstrap applies ONLY while no other production node has a record. Once one exists but
-# is too young, the next node waits — otherwise every node would bootstrap itself and the soak
-# would never bind at all.
-rm -f "$TMP/state"/soaked-*
-printf '%s %s\n' "$(( $(date +%s) - 300 ))" "" \
-    > "$TMP/state/soaked-$SHA-ghost-vm2-ghost-gsp"
-out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
-check "once another production node holds a young soak, the next node WAITS" \
-    "ghost-gsp @ .* has not soaked" "$out"
-check_absent "and it does not bootstrap itself past that wait" \
-    "becomes its canary" "$out"
-
-# ...but a node must not vouch for ITSELF. That would make the soak vacuous.
-rm -f "$TMP/state"/soaked-*
-printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
-    > "$TMP/state/soaked-$SHA-ghost-vm1-ghost-gsp"
-out="$(GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
-check "a node's own soak record does NOT satisfy its own deploy" \
-    "ghost-gsp @ .* has not soaked" "$out"
-
-# The relaxation must EXPIRE the moment a canary carries the unit, or a waiver outlives its
-# reason. Same 2h soak on another production node, but now a canary has ghost-gsp installed.
-rm -f "$TMP/state"/soaked-*
-printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
-    > "$TMP/state/soaked-$SHA-ghost-vm2-ghost-gsp"
-out="$(STUB_CANARY_CARRIES=1 GHOST_DEPLOY_SSH="$REPO_ROOT/scripts/ssh-stub.sh" run_gate ghost-vm1 ghost-gsp)"
-check "once a canary carries the unit, the production stand-in is refused" \
-    "reason for treating a production node as its canary is gone" "$out"
+listed="$(sed -n 's/^PRODUCTION_ONLY_BINARIES="\(.*\)"$/\1/p' "$REPO_ROOT/scripts/deploy-node.sh")"
+if [ -z "$listed" ]; then
+    printf "  [ok ] no binary claims the production-node canary relaxation\n"
+    pass=$((pass+1))
+else
+    printf "  [BAD] PRODUCTION_ONLY_BINARIES lists '%s' with no test covering the relaxed path\n" "$listed"
+    fail=$((fail+1))
+fi
 
 # CONTROL: none of this may touch a share-path binary. pool_sv2 must still demand a CANARY.
 rm -f "$TMP/state"/soaked-*

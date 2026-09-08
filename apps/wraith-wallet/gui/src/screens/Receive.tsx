@@ -2,15 +2,14 @@ import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import {
   lightReceive,
-  onPaymentDetected,
-  startWatch,
+  watchForPayments,
   walletGhostId,
   type DetectedPayment,
 } from "../lib/tauri";
 
 interface ReceiveProps {
-  /// Bumped by App on every PaymentDetected push so we can light up
-  /// the "received" badge without subscribing twice.
+  /// Bumped by App whenever a coin arrives, so the "received" badge lights up
+  /// without this screen subscribing twice.
   paymentTick?: number;
 }
 
@@ -51,25 +50,11 @@ export function Receive({ paymentTick: _ }: ReceiveProps = {}) {
     refresh();
   }, [index]);
 
-  // Local listener for the BIP-352 detection push so we can flash
-  // a "received" pill on this screen specifically.
+  // Watch for a coin landing while this screen is open, so the "received"
+  // pill flashes here specifically. Polled more often than the app-wide
+  // watcher: somebody is standing in front of this screen waiting.
   useEffect(() => {
-    let alive = true;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        unlisten = await onPaymentDetected((p) => {
-          if (alive) setLatestDetect(p);
-        });
-        await startWatch();
-      } catch {
-        /* the App-level listener still reports header errors */
-      }
-    })();
-    return () => {
-      alive = false;
-      if (unlisten) unlisten();
-    };
+    return watchForPayments((p) => setLatestDetect(p), { intervalMs: 5_000 });
   }, []);
 
   const copy = async (text: string, tag: "ghost" | "address") => {

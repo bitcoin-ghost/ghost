@@ -9,7 +9,6 @@
 // look is `apps/wraith-wallet/ipc/src/lib.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // ----- Response shape helpers --------------------------------------------
 
@@ -103,17 +102,16 @@ export async function daemonDoctor(): Promise<DoctorResponse> {
 
 export interface DaemonEnvResponse {
   network: string;
-  ghost_pay_urls: string[];
-  gsp_urls: string[];
-  /// Active node preset: "public" (bundled Ghost fleet) or "custom"
-  /// (user-supplied URLs). Drives the settings radio. Older daemons omit
-  /// it — treat absence as "custom".
-  node_preset?: string;
-  /// True when WRAITHD_GHOST_PAY / WRAITHD_GSP pin the endpoints at boot.
-  /// The node selector is shown read-only and the daemon refuses changes
-  /// while either holds (env-var power-user precedence).
-  ghost_pay_env_override?: boolean;
-  gsp_env_override?: boolean;
+  /// The node the wallet reads and writes the chain through. `null` when
+  /// none is configured, in which case chain operations refuse.
+  ghostd_url: string | null;
+  /// "cookie" | "userpass" | "none" — never the credential itself.
+  ghostd_auth: string;
+  /// True when WRAITHD_GHOSTD_URL pins the node at boot. The selector is
+  /// shown read-only and the daemon refuses changes while it holds.
+  ghostd_env_override?: boolean;
+  /// A Ghost pool node, consulted only for the coordinator election.
+  pool_url?: string | null;
   socket_path: string;
   wallets_dir: string;
   /// Optional Tor SOCKS5 URL the daemon routes outbound REST through.
@@ -137,41 +135,48 @@ export async function daemonEnv(): Promise<DaemonEnvResponse> {
   return unwrap<DaemonEnvResponse>(resp).payload;
 }
 
-/// Localhost defaults for the "my own node" preset — pre-filled into the
-/// custom fields for someone running their own ghost-pay + GSP.
-export const OWN_NODE_GHOST_PAY_DEFAULT = "http://127.0.0.1:8800";
-export const OWN_NODE_GSP_DEFAULT = "ws://127.0.0.1:8900/ws/v1";
+/// Localhost default for someone running their own node.
+export const OWN_NODE_RPC_DEFAULT = "http://127.0.0.1:8332";
 
-export interface NodeEndpointsResult {
-  preset: string;
-  ghost_pay_urls: string[];
-  gsp_urls: string[];
+export interface NodeResult {
+  ghostd_url: string | null;
+  pool_url?: string | null;
+  /** "cookie" | "userpass" | "none" — never the credential itself. */
+  auth: string;
+  env_pinned: boolean;
 }
 
-/// Pick which node the wallet talks to. `preset` is `"public"` (bundled
-/// fleet) or `"custom"` (uses the URL args, each of which may be a
-/// comma-separated failover list). The daemon rebuilds its ghost-pay + GSP
-/// clients in place, persists the choice to `node.json`, and drops any live
-/// GSP session so it re-authenticates against the new endpoint — no restart.
-export async function setNodeEndpoints(
-  preset: "public" | "custom",
-  ghost_pay_url?: string,
-  gsp_url?: string,
-): Promise<NodeEndpointsResult> {
-  const resp = await invoke("set_node_endpoints", {
-    preset,
-    ghostPayUrl: ghost_pay_url,
-    gspUrl: gsp_url,
+/// Point the wallet at your node.
+///
+/// Passing nothing clears it, after which the wallet refuses chain
+/// operations — deliberately, rather than falling back to somebody else's
+/// node and reading your balance over their shoulder.
+export async function setNode(args: {
+  ghostd_url?: string;
+  cookie_path?: string;
+  user?: string;
+  pass?: string;
+  /**
+   * A Ghost pool node, consulted only for the Wraith coordinator election.
+   * Optional — without it, mixing needs a coordinator URL per round and never
+   * rotates. What comes back is verified against your own node; what the pool
+   * learns is that your IP asked.
+   */
+  pool_url?: string;
+}): Promise<NodeResult> {
+  const resp = await invoke("set_node", {
+    ghostdUrl: args.ghostd_url,
+    cookiePath: args.cookie_path,
+    user: args.user,
+    pass: args.pass,
+    poolUrl: args.pool_url,
   });
-  return unwrap<NodeEndpointsResult>(resp).payload;
+  return unwrap<NodeResult>(resp).payload;
 }
 
 export interface ChainStatusResponse {
   backend_version: string;
   network: string;
-  has_keys: boolean;
-  lock_count: number;
-  active_sessions: number;
   /// L1 verified block height. `null` if bitcoind was unreachable
   /// from ghost-pay at status time.
   chain_height: number | null;
@@ -201,16 +206,16 @@ export async function chainStatus(): Promise<ChainStatusResponse> {
 /// local ghost-pay/GSP.
 export interface ConnectionStatusResponse {
   network: string;
-  ghost_pay_reachable: boolean;
-  ghost_pay_version: string | null;
-  ghost_pay_error: string | null;
-  gsp_have_token: boolean;
-  gsp_connected: boolean;
-  gsp_phase: string | null;
+  /// Whether a node is set at all. Distinct from `node_reachable`: not
+  /// configured and configured-but-silent are different problems with
+  /// different fixes, and the header must not merge them.
+  node_configured: boolean;
+  node_reachable: boolean;
+  node_version: string | null;
+  node_error: string | null;
   chain_height: number | null;
   chain_headers: number | null;
   chain_synced: boolean;
-  l2_height: number | null;
 }
 
 export async function connectionStatus(): Promise<ConnectionStatusResponse> {
@@ -317,12 +322,25 @@ export async function walletCreate(
   return unwrap<WalletCreateResult>(resp).payload;
 }
 
+/// Restore a wallet from its 24 words.
+///
+/// `birthHeight` is the chain height the seed was first used at. The block
+/// scanner reads forward from there to rebuild the history; without it,
+/// scanning starts at the tip and nothing this seed did before now appears —
+/// the coins are all still found, but what they did is not. Guessing low is
+/// safe and slow; guessing high loses history silently.
 export async function walletImport(
   name: string,
   mnemonic: string,
   passphrase: string,
+  birthHeight?: number,
 ): Promise<{ name: string; path: string }> {
-  const resp = await invoke("wallet_import", { name, mnemonic, passphrase });
+  const resp = await invoke("wallet_import", {
+    name,
+    mnemonic,
+    passphrase,
+    birthHeight,
+  });
   return unwrap<{ name: string; path: string }>(resp).payload;
 }
 
@@ -433,63 +451,10 @@ export async function walletGhostId(): Promise<{
   }>(resp).payload;
 }
 
-// ----- Ghost Glyph -------------------------------------------------------
-
-export interface GlyphInfo {
-  ghost_id: string;
-  /// 256 palette indices (0..25), row-major.
-  pixels: number[];
-  /// SHA256("GhostGlyphBitmap/v1" || pixels), hex — uniqueness key.
-  bitmap_hash: string;
-  /// SHA256("GhostGlyph/v1" || pixels || ghost_id), hex — binding.
-  commitment: string;
-  /// Wraith deposit txid that funded the lock (null while pending).
-  funding_txid: string | null;
-  /// Unix timestamp the lock was funded (null while pending).
-  registered_at: number | null;
-  /// One of: "none" / "pending" / "registered".
-  status: string;
-}
-
-export interface GlyphClaimResult {
-  commitment: string;
-  bitmap_hash: string;
-  status: string;
-}
-
-/// Fetch the registered Ghost Glyph for `ghostId`. Throws if the
-/// daemon returns an error (e.g. ghost-pay 404 — no glyph yet); the
-/// caller treats that as "not yet designed".
-export async function getGlyph(ghostId: string): Promise<GlyphInfo> {
-  const resp = await invoke("wallet_glyph", { ghostId });
-  return unwrap<GlyphInfo>(resp).payload;
-}
-
-/// Claim a designed glyph. `pixels` is a 256-length array of palette
-/// indices (0..25). Authenticated at the daemon via internal-auth.
-export async function claimGlyph(
-  ghostId: string,
-  pixels: number[],
-): Promise<GlyphClaimResult> {
-  const resp = await invoke("wallet_glyph_claim", { ghostId, pixels });
-  return unwrap<GlyphClaimResult>(resp).payload;
-}
-
-/// Check whether the bitmap formed by `pixels` is unclaimed. The
-/// daemon computes the bitmap hash and queries ghost-pay.
-export async function checkGlyph(
-  pixels: number[],
-): Promise<{ available: boolean }> {
-  const resp = await invoke("wallet_glyph_check", { pixels });
-  return unwrap<{ available: boolean }>(resp).payload;
-}
-
-// ----- Light wallet (L2) -------------------------------------------------
+// ----- Wallet balance, coins and history ---------------------------------
 
 export interface LightBalanceResponse {
-  /// On-chain confirmed balance, in sats. `null` when no
-  /// BalanceUpdate has arrived yet (session not authenticated, or
-  /// first update not received).
+  /// Confirmed on-chain balance, in sats. `null` when it could not be read.
   confirmed_sats: number | null;
   unconfirmed_sats: number | null;
   /// Sats currently inside an active Ghost Lock and therefore
@@ -508,10 +473,12 @@ export interface LightHistoryEntry {
   txid: string;
   block_height: number | null;
   timestamp: number;
-  amount_sats: number;
+  /** null = the wallet has no record of the amount; not the same as zero. */
+  amount_sats: number | null;
   fee_sats: number | null;
   tx_type: string;
-  confirmations: number;
+  /** null = the backend cannot say; not the same as zero confirmations. */
+  confirmations: number | null;
   memo: string | null;
 }
 
@@ -564,6 +531,51 @@ export async function lightSend(
   // caller's success branch runs and the UI falsely reports "Sent". unwrap()
   // throws on result:"error" so Send.tsx's catch surfaces the real failure.
   return unwrap(resp).payload;
+}
+
+export interface L1SendResponse {
+  txid: string;
+  recipient: string;
+  amount_sats: number;
+  fee_sats: number;
+  change_sats: number;
+  input_count: number;
+  shroud_delay_ms?: number | null;
+}
+
+/// Build, sign and broadcast an on-chain payment in one call.
+///
+/// `recipient_address` takes a Bitcoin address, or a Ghost ID for a silent
+/// payment — which pays a fresh taproot output only the recipient can find,
+/// announced by an OP_RETURN carrying the ephemeral key. That hides who was
+/// paid, not that a payment happened.
+///
+/// The PSBT verbs remain for anyone who wants to look at the transaction
+/// before it leaves; this is the ordinary path.
+export async function l1Send(args: {
+  recipient_address: string;
+  amount_sats: number;
+  fee_rate_sats_per_vb?: number;
+  change_index?: number;
+  bip86_scan_max?: number;
+  selected_outpoints?: OutpointRef[];
+  memo?: string;
+  shroud_max_ms?: number;
+}): Promise<L1SendResponse> {
+  const resp = await invoke("l1_send", {
+    recipientAddress: args.recipient_address,
+    amountSats: args.amount_sats,
+    feeRateSatsPerVb: args.fee_rate_sats_per_vb,
+    changeIndex: args.change_index,
+    bip86ScanMax: args.bip86_scan_max,
+    selectedOutpoints: args.selected_outpoints,
+    memo: args.memo,
+    shroudMaxMs: args.shroud_max_ms,
+  });
+  // Must unwrap: a rejected send serializes as { result: "error", message },
+  // which `invoke` RESOLVES. Without this the caller's success branch runs and
+  // the UI reports "Sent" for a payment that never left.
+  return unwrap<L1SendResponse>(resp).payload;
 }
 
 export interface LightUtxoEntry {
@@ -700,14 +712,48 @@ export interface WraithMixRunArgs {
   mix_output_address: string;
   bip86_index?: number;
   bip86_scan_max?: number;
+  /// Smallest anonymity set, in distinct entities, worth signing into.
+  /// Omitted uses the wallet's default. Supplying a lower value is how a user
+  /// accepts a smaller set — a stated number rather than a dismissed dialog.
+  min_entities?: number;
 }
+
+/// The wallet's own count of a round. Derived from the chain by the wallet,
+/// never taken from the coordinator.
+export interface AnonymitySetReport {
+  seats: number;
+  entities: number;
+  discounted: number;
+  unverified: number;
+  payers: number;
+}
+
+/// The wallet inspected the round and refused to sign it.
+export interface WraithMixRefused {
+  session_id: string;
+  report: AnonymitySetReport;
+  reasons: string[];
+  min_entities: number;
+  /// Whether accepting a smaller set could make this round signable.
+  ///
+  /// False for an over-claim: the coordinator stated a figure the chain does
+  /// not support, and no floor makes that acceptable. The UI must not offer to
+  /// lower one in that case.
+  lowering_the_floor_would_help: boolean;
+}
+
+/// A mix either completed or was refused. The refusal is not an error — it is
+/// the wallet doing its job, and it carries what the user needs to decide.
+export type WraithMixResult =
+  | { kind: "completed"; value: WraithMixCompleted }
+  | { kind: "refused"; value: WraithMixRefused };
 
 /// One-shot Wraith Lite CoinJoin. Daemon enrols, signs the
 /// taproot key-path witness using the active wallet's BIP86
 /// keystore, and drives the round to broadcast.
 export async function wraithMixRun(
   args: WraithMixRunArgs,
-): Promise<WraithMixCompleted> {
+): Promise<WraithMixResult> {
   const resp = await invoke("wraith_mix_run", {
     coordinatorUrl: args.coordinator_url,
     coordinatorPeers: args.coordinator_peers ?? [],
@@ -721,32 +767,285 @@ export async function wraithMixRun(
     mixOutputAddress: args.mix_output_address,
     bip86Index: args.bip86_index,
     bip86ScanMax: args.bip86_scan_max,
+    minEntities: args.min_entities,
   });
-  return unwrap<WraithMixCompleted>(resp).payload;
+  // The daemon distinguishes the two by response variant. A refusal arriving
+  // as a thrown error would lose the report, which is the only part the user
+  // can act on.
+  const payload = unwrap<Record<string, unknown>>(resp).payload;
+  if (payload && typeof payload === "object" && "reasons" in payload) {
+    return { kind: "refused", value: payload as unknown as WraithMixRefused };
+  }
+  return { kind: "completed", value: payload as unknown as WraithMixCompleted };
 }
 
-// ----- GSP ---------------------------------------------------------------
+// ----- Ghost Lock lanes ---------------------------------------------------
 
-export async function gspAuth(): Promise<unknown> {
-  const resp = await invoke("gsp_auth");
-  return unwrap(resp).payload;
+/// One lane of a Ghost Lock.
+export interface GhostLockLane {
+  kind: string;
+  label: string;
+  address: string;
+  /// Confirmed — what has settled.
+  balance_sats: number;
+  /// Unconfirmed. Shown beside the settled figure, never added to it.
+  pending_sats: number;
+  /// True only for Investments: the quorum can move these funds without you.
+  quorum_can_spend_alone: boolean;
+  /// False for Cash — those coins are already public, so a round gains nothing.
+  round_eligible: boolean;
 }
 
-export interface GspSessionStatus {
-  have_token: boolean;
-  wallet_name: string | null;
-  wallet_id: string | null;
-  expires_at: number | null;
-  remaining_secs: number | null;
-  /// "disconnected" / "connecting" / "authenticating" / "authenticated" / "backoff"
-  phase: string | null;
-  connect_count: number | null;
-  last_error: string | null;
+export interface GhostLockLanes {
+  lanes: GhostLockLane[];
+  total_sats: number;
+  total_pending_sats: number;
+  /// Of the settled total, how much the quorum could move without you.
+  custodial_sats: number;
+  chain_height: number;
 }
 
-export async function gspSessionStatus(): Promise<GspSessionStatus> {
-  const resp = await invoke("gsp_session_status");
-  return unwrap<GspSessionStatus>(resp).payload;
+export interface GhostLockLanesArgs {
+  backup_pubkey: string;
+  heir_pubkey: string;
+  quorum_pubkey: string;
+  inherit_height: number;
+  anchor_height: number;
+  bip86_index?: number;
+}
+
+/// A remembered Lock definition.
+export interface GhostLockRecord {
+  lock_id: string;
+  label: string | null;
+  backup_pubkey: string;
+  heir_pubkey: string;
+  quorum_pubkey: string;
+  anchor_height: number;
+  inherit_height: number;
+  bip86_index: number;
+}
+
+/// Remember a Lock. Saving the same keys twice updates one record — the id is
+/// derived from the fields, so re-entering them is a rename, not a duplicate.
+export async function ghostLockSave(args: {
+  label?: string;
+  backup_pubkey: string;
+  heir_pubkey: string;
+  quorum_pubkey: string;
+  anchor_height: number;
+  inherit_height: number;
+  bip86_index?: number;
+}): Promise<{ lock: GhostLockRecord; created: boolean }> {
+  const resp = await invoke("ghost_lock_save", {
+    label: args.label,
+    backupPubkey: args.backup_pubkey,
+    heirPubkey: args.heir_pubkey,
+    quorumPubkey: args.quorum_pubkey,
+    anchorHeight: args.anchor_height,
+    inheritHeight: args.inherit_height,
+    bip86Index: args.bip86_index,
+  });
+  return unwrap<{ lock: GhostLockRecord; created: boolean }>(resp).payload;
+}
+
+export async function ghostLockList(): Promise<GhostLockRecord[]> {
+  const resp = await invoke("ghost_lock_list");
+  return unwrap<{ locks: GhostLockRecord[] }>(resp).payload.locks;
+}
+
+/// Forget a definition. The funds are untouched — the lanes stay spendable by
+/// anyone holding the keys.
+export async function ghostLockForget(
+  lockId: string,
+): Promise<{ lock_id: string; existed: boolean }> {
+  const resp = await invoke("ghost_lock_forget", { lockId });
+  return unwrap<{ lock_id: string; existed: boolean }>(resp).payload;
+}
+
+/// Derive a Ghost Lock's four lanes and read their balances.
+///
+/// The MuSig2 aggregates are derived by the daemon from these three keys.
+/// BIP-327 key aggregation is deterministic, so no ceremony is needed to build a
+/// Lock; interaction is required only to sign a key-path spend.
+export async function ghostLockLanes(
+  args: GhostLockLanesArgs,
+): Promise<GhostLockLanes> {
+  const resp = await invoke("ghost_lock_lanes", {
+    backupPubkey: args.backup_pubkey,
+    heirPubkey: args.heir_pubkey,
+    quorumPubkey: args.quorum_pubkey,
+    inheritHeight: args.inherit_height,
+    anchorHeight: args.anchor_height,
+    bip86Index: args.bip86_index,
+  });
+  return unwrap<GhostLockLanes>(resp).payload;
+}
+
+/// Where a round should pay to fund one lane privately.
+export interface GhostLockRoundDestination {
+  lock_id: string;
+  /// The lane, echoed back so a caller cannot mistake which one it asked for.
+  lane: string;
+  label: string;
+  /// The address a round must pay into — the lane itself.
+  address: string;
+}
+
+/// Ask where a round should pay to fund one lane — private entry.
+///
+/// Two ways to put money in a lane, and they are not equivalent:
+///
+/// - **Directly.** Simple, works today, and publishes the link between coins
+///   you are known to control and this Lock, permanently.
+/// - **Through a round.** The round's output IS the lane, so on-chain the
+///   deposit looks like any other round output and nothing ties it to you.
+///
+/// Cash is refused by the daemon: it is public by design, so a round would buy
+/// unlinkability the lane discards the moment the coin lands.
+export async function ghostLockRoundDestination(
+  lockId: string,
+  lane: string,
+): Promise<GhostLockRoundDestination> {
+  const resp = await invoke("ghost_lock_round_destination", { lockId, lane });
+  return unwrap<GhostLockRoundDestination>(resp).payload;
+}
+
+/// A coin in a lane, and whether its escape has matured.
+export interface EscapeCoin {
+  txid: string;
+  vout: number;
+  sats: number;
+  confirmations: number;
+  /// Blocks still to wait. Zero means spendable now.
+  blocks_remaining: number;
+}
+
+/// What an escape spend needs.
+export interface GhostLockEscapePlan {
+  lock_id: string;
+  lane: string;
+  escape: string;
+  delay_blocks: number;
+  /// Every spending input must carry this nSequence. A different value is
+  /// rejected by the network as non-final.
+  required_sequence: number;
+  lane_address: string;
+  coins: EscapeCoin[];
+}
+
+export interface GhostLockEscapeSigned {
+  lock_id: string;
+  lane: string;
+  escape: string;
+  psbt: string;
+  /// The finished transaction, ready to broadcast.
+  tx_hex: string;
+}
+
+/// Ask what leaving alone needs, before building the transaction.
+export async function ghostLockEscapePlan(
+  lockId: string,
+  lane: string,
+): Promise<GhostLockEscapePlan> {
+  const resp = await invoke("ghost_lock_escape_plan", { lockId, lane });
+  return unwrap<GhostLockEscapePlan>(resp).payload;
+}
+
+/// Sign a lane's escape leaf. No quorum, no device, no ceremony.
+export async function ghostLockEscapeSign(args: {
+  lockId: string;
+  lane: string;
+  psbt: string;
+  inputIndex: number;
+}): Promise<GhostLockEscapeSigned> {
+  const resp = await invoke("ghost_lock_escape_sign", {
+    lockId: args.lockId,
+    lane: args.lane,
+    psbt: args.psbt,
+    inputIndex: args.inputIndex,
+  });
+  return unwrap<GhostLockEscapeSigned>(resp).payload;
+}
+
+/// One output of a spend, as a person reads it.
+export interface LockSpendOutput {
+  address: string | null;
+  sats: number;
+}
+
+/// What a spend does. Derived by the daemon from the same transaction it
+/// derives the sighash from, so the figures shown and the thing signed cannot
+/// diverge.
+export interface LockSpendSummary {
+  input_index: number;
+  input_sats: number;
+  input_address: string | null;
+  outputs: LockSpendOutput[];
+  fee_sats: number;
+  input_count: number;
+}
+
+export interface GhostLockSignBegun {
+  session: string;
+  summary: LockSpendSummary;
+  /// JSON to carry to the offline device. Contains the whole PSBT, so the
+  /// device recomputes the sighash rather than being told it.
+  device_request: string;
+  our_nonce: string;
+}
+
+export interface GhostLockSignNonced {
+  session: string;
+  device_request: string;
+}
+
+export interface GhostLockSigned {
+  session: string;
+  signature: string;
+  psbt: string;
+}
+
+/// Round 1: review the spend and commit this wallet's nonce.
+export async function ghostLockSignBegin(args: {
+  lockId: string;
+  lane: string;
+  psbt: string;
+  inputIndex: number;
+}): Promise<GhostLockSignBegun> {
+  const resp = await invoke("ghost_lock_sign_begin", {
+    lockId: args.lockId,
+    lane: args.lane,
+    psbt: args.psbt,
+    inputIndex: args.inputIndex,
+  });
+  return unwrap<GhostLockSignBegun>(resp).payload;
+}
+
+/// Round 1 reply. The daemon signs its own share here, burning its nonce
+/// durably first — so no secret nonce is held while you carry the second
+/// payload to the device.
+export async function ghostLockSignNonce(
+  session: string,
+  deviceNonce: string,
+): Promise<GhostLockSignNonced> {
+  const resp = await invoke("ghost_lock_sign_nonce", {
+    session,
+    deviceNonce,
+  });
+  return unwrap<GhostLockSignNonced>(resp).payload;
+}
+
+/// Round 2 reply. Completes the spend.
+export async function ghostLockSignComplete(
+  session: string,
+  devicePartial: string,
+): Promise<GhostLockSigned> {
+  const resp = await invoke("ghost_lock_sign_complete", {
+    session,
+    devicePartial,
+  });
+  return unwrap<GhostLockSigned>(resp).payload;
 }
 
 // ----- Locks -------------------------------------------------------------
@@ -756,138 +1055,18 @@ export async function gspSessionStatus(): Promise<GspSessionStatus> {
 // runtime — previously `state`/`created_at`/`recovery_height` (none of which exist
 // on the wire) left the State pill blank and the Confirm/Recover buttons (gated on
 // `state`) permanently unreachable.
-export interface LockEntry {
-  lock_id: string;
-  status: string;
-  capacity_sats: number;
-  balance_sats: number;
-  denomination: string;
-  timelock_tier: string;
-  funding_address: string;
-  funding_txid?: string;
-  funding_vout?: number;
-  /// Block height the lock was created at.
-  creation_height: number;
-  /// Absolute block height the timelock matures at — after this the wallet's
-  /// unilateral recovery branch is spendable (creation_height + recovery_blocks).
-  recovery_height: number;
-}
 
-export interface LocksListResponse {
-  locks: LockEntry[];
-}
 
-/// Wire-format lock entry — matches `wraith_wallet_ipc::LockEntry`
-/// exactly. Field names differ from the frontend's `LockEntry`
-/// (`status` vs `state`), so `locksList` adapts. Reading the wire
-/// shape straight through left `state` undefined, which silently
-/// suppressed every per-row action (Confirm / Recover / Rotate),
-/// since those gate on `state`.
-interface WireLockEntry {
-  lock_id: string;
-  status: string;
-  capacity_sats: number;
-  balance_sats: number;
-  denomination: string;
-  timelock_tier: string;
-  funding_address: string;
-  funding_txid: string | null;
-  funding_vout: number | null;
-  creation_height: number;
-  recovery_height: number;
-}
 
-interface WireLocksListResponse {
-  locks: WireLockEntry[];
-  total_locked_sats: number;
-}
 
-export async function locksList(): Promise<LocksListResponse> {
-  const resp = await invoke("locks_list");
-  const raw = unwrap<WireLocksListResponse>(resp).payload;
-  const locks: LockEntry[] = (raw.locks ?? []).map((w) => ({
-    lock_id: w.lock_id,
-    capacity_sats: w.capacity_sats,
-    balance_sats: w.balance_sats,
-    denomination: w.denomination,
-    timelock_tier: w.timelock_tier,
-    status: w.status,
-    funding_address: w.funding_address,
-    funding_txid: w.funding_txid ?? undefined,
-    funding_vout: w.funding_vout ?? undefined,
-    creation_height: w.creation_height,
-    recovery_height: w.recovery_height,
-  }));
-  return { locks };
-}
 
-export type LockJumpPriority = "normal" | "high" | "urgent";
 
-export interface LocksJumpedResult {
-  lock_id: string;
-  /// Jump (key-rotation) transaction id, when the operator broadcast
-  /// it. `null` while the rotation is queued.
-  jump_txid: string | null;
-}
 
-/// Rotate a lock's custody key ("jump"): the operator re-derives the
-/// cooperative key to `target_address`, severing any prior key
-/// exposure while keeping the funds inside the lock. `priority`
-/// trades fee for queue position.
-export async function locksJump(
-  lock_id: string,
-  target_address: string,
-  priority: LockJumpPriority = "normal",
-): Promise<LocksJumpedResult> {
-  const resp = await invoke("locks_jump", {
-    lockId: lock_id,
-    targetAddress: target_address,
-    priority,
-  });
-  return unwrap<LocksJumpedResult>(resp).payload;
-}
 
-export interface LocksPreparedResponse {
-  lock_id: string;
-  funding_address: string;
-  required_sats: number;
-}
 
-export async function locksPrepare(
-  capacity_sats: number,
-): Promise<LocksPreparedResponse> {
-  const resp = await invoke("locks_prepare", { capacitySats: capacity_sats });
-  return unwrap<LocksPreparedResponse>(resp).payload;
-}
 
-export async function locksConfirm(
-  lock_id: string,
-  funding_txid: string,
-): Promise<unknown> {
-  const resp = await invoke("locks_confirm", { lockId: lock_id, fundingTxid: funding_txid });
-  return unwrap(resp).payload;
-}
 
-export interface LocksRecoveredResult {
-  lock_id: string;
-  broadcast_txid: string;
-  destination: string;
-  recovered_sats: number;
-  fee_sats: number;
-}
 
-export async function locksRecover(
-  lock_id: string,
-  destination_address: string,
-  fee_sats: number,
-): Promise<LocksRecoveredResult> {
-  const resp = await invoke("locks_recover", {
-    lockId: lock_id,
-    destinationAddress: destination_address,
-    feeSats: fee_sats,
-  });
-  return unwrap<LocksRecoveredResult>(resp).payload;
-}
 
 // ----- PSBT --------------------------------------------------------------
 
@@ -1141,49 +1320,107 @@ export async function multisigDescriptorDelete(name: string): Promise<{
   return unwrap<{ removed: boolean }>(resp).payload;
 }
 
-// ----- Live BIP-352 receive notifications --------------------------------
-
-/// Start the daemon push-watch subscription. The Tauri side keeps a
-/// long-lived IPC connection and forwards each `PaymentDetected`
-/// frame to the frontend as a `wraith://payment-detected` event.
-/// Idempotent — the Rust side's atomic guard makes repeat calls a
-/// no-op, so the safest pattern is to call it once on app mount and
-/// once more on any reconnect.
-export async function startWatch(): Promise<void> {
-  await invoke("start_watch");
-}
-
-export interface DetectedPayment {
+export interface DetectedPaymentEntry {
   txid: string;
-  block_height: number | null;
   vout: number;
-  amount_sats: number;
+  amount_sats: number | null;
+  block_height: number | null;
+  /** The sender's derivation index — what makes the coin spendable. */
   k: number;
   received_at: number;
 }
 
-/// Subscribe to live payment detections. Returns an unlisten fn —
-/// call it from the effect's cleanup. Pair with `startWatch()` once
-/// at app boot.
-export async function onPaymentDetected(
+/// Silent payments the block scanner has found.
+///
+/// These are absent from `lightUtxos`: a silent payment lands on a key derived
+/// from the sender's ephemeral key and this wallet's Ghost ID, not on an
+/// address the wallet published, so a scan of derived addresses cannot see it.
+export async function lightDetected(): Promise<DetectedPaymentEntry[]> {
+  const resp = await invoke("light_detected");
+  return unwrap<{ detections: DetectedPaymentEntry[] }>(resp).payload.detections;
+}
+
+// ----- Noticing money arriving -------------------------------------------
+
+/// One coin the wallet did not have last time it looked.
+export interface DetectedPayment {
+  txid: string;
+  vout: number;
+  amount_sats: number;
+  confirmations: number;
+  /// When the wallet noticed, unix epoch seconds. Not when it was paid —
+  /// polling cannot know that, and pretending otherwise would put a wrong
+  /// timestamp on a receipt.
+  noticed_at: number;
+}
+
+/// Watch for coins arriving, by asking the node.
+///
+/// # Why polling
+///
+/// This used to be a push: the operator's GSP scanned the chain on the
+/// wallet's behalf and told it what had landed. That is gone with the rest of
+/// L2, and it was never free — it meant handing somebody a scan key and
+/// trusting them with the answer.
+///
+/// So the wallet asks its own node instead, on an interval, and reports coins
+/// it had not seen before. The cost is latency: a payment shows up within one
+/// poll rather than the instant it is relayed. The gain is that nobody else
+/// has to know the wallet is watching.
+///
+/// The first poll establishes the baseline and reports nothing — otherwise
+/// every coin already in the wallet would arrive as a notification the moment
+/// a screen opened.
+///
+/// Returns a function that stops the watch; call it from an effect's cleanup.
+export function watchForPayments(
   cb: (p: DetectedPayment) => void,
-): Promise<UnlistenFn> {
-  return listen<DetectedPayment>("wraith://payment-detected", (event) => {
-    cb(event.payload);
-  });
-}
+  opts: { intervalMs?: number; scanMaxIndex?: number } = {},
+): () => void {
+  const intervalMs = opts.intervalMs ?? 15_000;
+  const scanMaxIndex = opts.scanMaxIndex ?? 32;
+  let stopped = false;
+  // `null` until the first successful poll, which is what distinguishes
+  // "nothing seen yet" from "nothing there" — an empty Set on a failed first
+  // poll would announce the whole wallet on the second.
+  let seen: Set<string> | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
 
-export interface WatchError {
-  message: string;
-}
+  const key = (u: { txid: string; vout: number }) => `${u.txid}:${u.vout}`;
 
-/// Subscribe to watch-loop terminal errors (daemon socket closed,
-/// IPC parse failure, etc.). The Tauri side restarts the loop on
-/// `startWatch()` next time the GUI calls it.
-export async function onWatchError(
-  cb: (e: WatchError) => void,
-): Promise<UnlistenFn> {
-  return listen<WatchError>("wraith://watch-error", (event) => {
-    cb(event.payload);
-  });
+  const tick = async () => {
+    try {
+      // Zero confirmations: a payment in the mempool is the one the user is
+      // standing there waiting for.
+      const r = await lightL1Utxos(scanMaxIndex, 0);
+      const now = new Set(r.utxos.map(key));
+      if (seen === null) {
+        seen = now;
+      } else {
+        for (const u of r.utxos) {
+          if (!seen.has(key(u))) {
+            cb({
+              txid: u.txid,
+              vout: u.vout,
+              amount_sats: u.amount_sats,
+              confirmations: u.confirmations,
+              noticed_at: Math.floor(Date.now() / 1000),
+            });
+          }
+        }
+        seen = now;
+      }
+    } catch {
+      // An unreachable node is not a reason to stop watching, and it is
+      // reported by the status header already. Keep the baseline: dropping it
+      // would replay every coin as new when the node comes back.
+    }
+    if (!stopped) timer = setTimeout(tick, intervalMs);
+  };
+  void tick();
+
+  return () => {
+    stopped = true;
+    if (timer !== undefined) clearTimeout(timer);
+  };
 }

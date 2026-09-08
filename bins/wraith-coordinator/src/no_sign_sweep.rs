@@ -71,23 +71,28 @@ pub fn execute_no_sign_sweep(state: &CoordinatorState, session_id: &str) -> NoSi
         signed: present.len() as u32,
         ..Default::default()
     };
+    // Every rung a non-signer brought is banned, not just the first. Banning
+    // one of a ladder participant's coins leaves the others free to disrupt the
+    // next round at no cost, which is the cooldown doing nothing.
     for entry in &absent {
-        match crate::utxo_source::parse_outpoint(&entry.input.txid, entry.input.vout) {
-            Ok(outpoint) => {
-                state.bans.ban(outpoint, now);
-                summary.banned += 1;
-            }
-            // Unreachable in practice: `/inputs` parses the outpoint
-            // before accepting the record. Logged rather than fatal — one
-            // unparseable record must not stop the rest of the sweep.
-            Err(detail) => {
-                warn!(
-                    %session_id,
-                    ghost_id = %entry.ghost_id,
-                    %detail,
-                    "could not ban a non-signer's outpoint",
-                );
-                summary.unbannable += 1;
+        for rung in &entry.inputs {
+            match crate::utxo_source::parse_outpoint(&rung.txid, rung.vout) {
+                Ok(outpoint) => {
+                    state.bans.ban(outpoint, now);
+                    summary.banned += 1;
+                }
+                // Unreachable in practice: `/inputs` parses the outpoint
+                // before accepting the record. Logged rather than fatal — one
+                // unparseable record must not stop the rest of the sweep.
+                Err(detail) => {
+                    warn!(
+                        %session_id,
+                        ghost_id = %entry.ghost_id,
+                        %detail,
+                        "could not ban a non-signer's outpoint",
+                    );
+                    summary.unbannable += 1;
+                }
             }
         }
     }

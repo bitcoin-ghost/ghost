@@ -1,0 +1,15 @@
+[package]
+name = "ghost-entropy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional user-supplied entropy, mixed into a new seed (spec E-1)"
+
+# Two crates need this and it belongs to neither: the wallet, which creates
+# keystores, and the offline signer, which creates a backup device's seed. It
+# lives on its own so the signer can have it without linking the wallet.
+[dependencies]
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }

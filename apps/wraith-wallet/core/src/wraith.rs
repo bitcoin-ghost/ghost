@@ -62,6 +62,60 @@ pub enum WraithClientError {
     Coordinator { status: u16, detail: String },
     #[error("response body did not match expected shape: {0}")]
     Shape(String),
+    /// This coin is already committed to a different round.
+    ///
+    /// Signing it again would double-spend it: one of the two rounds dies at
+    /// broadcast, and every other participant in that round loses it through no
+    /// fault of their own — and has their coin put in cooldown for it.
+    #[error("this coin is already committed to round {existing}; signing it into another would double-spend it and kill a round for everyone else in it")]
+    CoinAlreadyCommitted {
+        /// The round it is already committed to.
+        existing: String,
+    },
+
+    /// A signature was produced under a sighash that does not commit to what
+    /// was inspected, so the inspection would have been void.
+    #[error("input {input_index} was signed with a {len}-byte signature; BIP-341 SIGHASH_DEFAULT is 64 bytes, and anything longer carries a sighash flag that lets the round be edited after inspection")]
+    UnsafeSighash {
+        /// Which input.
+        input_index: usize,
+        /// Signature length produced.
+        len: usize,
+    },
+
+    /// The round failed inspection, so nothing was signed.
+    ///
+    /// Carries every reason rather than the first: a wallet deciding between
+    /// retrying and walking away needs the whole picture, and a thin round is a
+    /// different decision from a coordinator that misreported.
+    #[error("refused to sign the round: {}", .reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    RefusedRound {
+        /// Everything wrong with it.
+        reasons: Vec<wraith_protocol::pre_sign::RefuseToSign>,
+        /// What this wallet counted for itself.
+        report: wraith_protocol::anonymity_set::SetReport,
+    },
+    /// The round has too few seats to reach this wallet's floor, seen while
+    /// it could still be left without cost.
+    ///
+    /// Deliberately not a [`Self::RefusedRound`]: that carries this wallet's
+    /// own recount of an assembled transaction, and this carries a seat count
+    /// taken before any transaction exists.
+    ///
+    /// Seats, not entities, because entities are counted from committed inputs
+    /// and are therefore zero until somebody commits. Seats bound entities
+    /// from above, so too few seats proves the floor is unreachable; enough
+    /// seats proves nothing, and the real check still runs at `inspect`.
+    ///
+    /// Checking here rather than at `inspect` is the whole point. Refusing
+    /// after `/inputs` leaves the wallet a non-signer, and the sweep bans its
+    /// outpoint for a cooldown — punishing the wallet for enforcing its own
+    /// privacy policy.
+    #[error(
+        "round has {seats} seats, too few to reach this wallet's floor of \
+         {min_entities} entities; left before committing the coin"
+    )]
+    RoundTooSmallToJoin { seats: usize, min_entities: usize },
     #[error("hex decode: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error("bitcoin consensus encode: {0}")]
@@ -100,6 +154,55 @@ pub struct MixRequest {
     /// output. Must NOT be linkable to the wallet's input UTXO —
     /// fresh address recommended.
     pub mix_output_address: String,
+    /// Smallest anonymity set, in **distinct entities**, worth signing into.
+    ///
+    /// Entities rather than seats: a round of fifty where one party supplied
+    /// forty-nine is a set of two, and a floor counted in seats passes exactly
+    /// the round it exists to catch.
+    ///
+    /// A starting parameter, not a measurement. `DEFAULT_MIN_ENTITIES` is twice
+    /// the protocol's round minimum, which is reachable at modest volume and
+    /// gives an observer a one-in-ten guess. It should be revised against
+    /// measured round volume rather than left as received wisdom.
+    pub min_entities: usize,
+}
+
+/// Default anonymity floor, in distinct entities.
+///
+/// `MIN_ROUND_PARTICIPANTS` is 5, but that is the smallest round the *protocol*
+/// will assemble, not a sensible privacy default — one in five is barely
+/// privacy. Unmeasured; revise against real volume.
+pub const DEFAULT_MIN_ENTITIES: usize = 10;
+
+/// Reject a witness whose signature was made under a sighash that does not
+/// commit to the whole round.
+///
+/// A BIP-341 key-path signature is 64 bytes under `SIGHASH_DEFAULT`. Every other
+/// type appends its flag byte, making 65. So the length answers the question
+/// without trusting the signer to report honestly — which matters precisely for
+/// the signers most likely to differ: hardware wallets and remote signing
+/// services.
+///
+/// An empty witness is refused too. A signature that is not there cannot have
+/// committed to anything.
+pub fn check_witness_sighash(
+    witness: &Witness,
+    input_index: usize,
+) -> Result<(), WraithClientError> {
+    let sig = witness
+        .iter()
+        .next()
+        .ok_or(WraithClientError::UnsafeSighash {
+            input_index,
+            len: 0,
+        })?;
+    if sig.len() != 64 {
+        return Err(WraithClientError::UnsafeSighash {
+            input_index,
+            len: sig.len(),
+        });
+    }
+    Ok(())
 }
 
 /// The result of a successful mix.
@@ -178,6 +281,146 @@ pub struct PreparedMix {
     /// Wallet identity — kept for the /witness POST; not used by
     /// the caller.
     pub ghost_id: String,
+    /// The anonymity floor this mix was requested with, carried so the
+    /// split sign-then-submit path can apply the same check as `execute_mix`.
+    pub min_entities: usize,
+    /// The value the wallet's own output must carry.
+    pub expected_output_sats: u64,
+    /// The scriptPubKey the wallet's own output must pay.
+    pub expected_output_script: bitcoin::ScriptBuf,
+}
+
+/// Proof that a round was inspected and its coin committed, before signing.
+///
+/// # Why this is a type rather than a call somewhere
+///
+/// The checks kept existing and not running. `pre_sign` was written and nothing
+/// called it; `Verified::authorise` likewise; `SigningLedger` likewise. Each
+/// time the fix was to add a call at the one place that seemed to matter, and
+/// each time a second path — the split `prepare_mix` / `submit_witness` API the
+/// daemon actually uses — went round it.
+///
+/// So this is not a call to remember. `submit_witness` will not accept anything
+/// else, and only [`PreparedMix::inspect`] mints one. Forgetting is a
+/// compile error.
+/// Owned rather than borrowing, because the split API spans two IPC calls: the
+/// daemon prepares a round in one request and submits the witness in another,
+/// so the proof has to be storable between them.
+#[derive(Debug, Clone)]
+pub struct InspectedMix {
+    prepared: PreparedMix,
+    /// What this wallet counted for itself, kept so a caller can show it.
+    pub report: wraith_protocol::anonymity_set::SetReport,
+}
+
+impl InspectedMix {
+    /// The round that was inspected.
+    pub fn prepared(&self) -> &PreparedMix {
+        &self.prepared
+    }
+}
+
+impl PreparedMix {
+    /// Inspect the round before signing it.
+    ///
+    /// **This is what stops the wallet signing whatever it is handed.** Until it
+    /// existed, `execute_mix` went straight from `/round-tx` to `sign` — no
+    /// check that the wallet's own input was present, that its own output
+    /// existed for the right amount, that the fee was sane, or that the
+    /// anonymity set was worth anything.
+    ///
+    /// The recount is done here from the transaction and its prevouts rather
+    /// than taken from the coordinator, because a coordinator can lie about the
+    /// set but not about the chain.
+    pub fn inspect<L>(
+        &self,
+        ledger: &mut wraith_protocol::signing_ledger::SigningLedger<L>,
+    ) -> Result<InspectedMix, WraithClientError>
+    where
+        L: wraith_protocol::signing_ledger::SignatureStore,
+    {
+        use wraith_protocol::client_session::Joined;
+        use wraith_protocol::pre_sign::Expectation;
+
+        let scripts: Vec<Vec<u8>> = self
+            .prevouts
+            .iter()
+            .map(|p| hex::decode(p.scriptpubkey_hex.trim()).unwrap_or_default())
+            .collect();
+
+        let total_input_sats = self
+            .prevouts
+            .iter()
+            .fold(0u64, |acc, p| acc.saturating_add(p.value_sats));
+
+        let mine = self.unsigned_tx.input[self.input_index].previous_output;
+        let want = Expectation {
+            my_input: (mine.txid, mine.vout),
+            my_output_script: self.expected_output_script.clone(),
+            my_output_sats: self.expected_output_sats,
+            total_input_sats,
+            // The coordinator's own arithmetic bounds this; a round paying more
+            // to miners than its inputs allow cannot assemble at all.
+            max_fee_sats: total_input_sats,
+            min_set: self.min_entities,
+            set_report: None,
+            claimed_set: None,
+        };
+
+        let report = wraith_protocol::anonymity_set::recount_from_inputs(
+            &self
+                .unsigned_tx
+                .input
+                .iter()
+                .zip(scripts.iter())
+                .map(|(txin, script)| wraith_protocol::clustering::CoinFacts {
+                    outpoint: wraith_protocol::signing_ledger::OutPointKey {
+                        txid: {
+                            use bitcoin::hashes::Hash;
+                            txin.previous_output.txid.to_byte_array()
+                        },
+                        vout: txin.previous_output.vout,
+                    },
+                    script_pubkey: script.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        if let Err(reasons) = Joined::new(want).verify_response(&self.unsigned_tx, &scripts, None) {
+            return Err(WraithClientError::RefusedRound { reasons, report });
+        }
+
+        // Commit the coin to THIS round, before any signature exists.
+        //
+        // Recorded first, deliberately: a crash between signing and recording is
+        // the window the once-per-coin rule closes, and an unrecorded signature
+        // is the one replayed into a second round after a restart.
+        {
+            use bitcoin::hashes::Hash as _;
+            let mine = self.unsigned_tx.input[self.input_index].previous_output;
+            let coin = wraith_protocol::signing_ledger::OutPointKey::new(
+                mine.txid.to_byte_array(),
+                mine.vout,
+            );
+            let round_txid = self.unsigned_tx.compute_txid();
+            ledger
+                .authorise(coin, round_txid.to_byte_array())
+                .map_err(|e| match e {
+                    wraith_protocol::signing_ledger::LedgerError::Conflict { existing_txid } => {
+                        let mut disp = existing_txid;
+                        disp.reverse();
+                        WraithClientError::CoinAlreadyCommitted {
+                            existing: hex::encode(disp),
+                        }
+                    }
+                })?;
+        }
+
+        Ok(InspectedMix {
+            prepared: self.clone(),
+            report,
+        })
+    }
 }
 
 /// One input prevout reference. Mirrors the coordinator's wire-format
@@ -332,18 +575,24 @@ impl WraithSessionClient {
     /// remote signer service) or when the caller wants to inspect
     /// `prepared.unsigned_tx` before signing — e.g. the
     /// daemon-integrated CLI.
-    pub async fn execute_mix<S, P, PFut>(
+    pub async fn execute_mix<S, P, PFut, L>(
         &self,
         request: MixRequest,
         mut signer: S,
         prove_ownership: P,
+        ledger: &mut wraith_protocol::signing_ledger::SigningLedger<L>,
     ) -> Result<MixOutcome, WraithClientError>
     where
         S: WitnessSigner,
         P: FnMut(&str) -> PFut,
         PFut: std::future::Future<Output = Result<String, WraithClientError>>,
+        L: wraith_protocol::signing_ledger::SignatureStore,
     {
         let prepared = self.prepare_mix(request, prove_ownership).await?;
+        // Inspect before signing. A signature is the only irreversible step in
+        // this protocol, so it is the one that has to be earned. The token this
+        // returns is what `submit_witness` requires, so neither path can skip it.
+        let inspected = prepared.inspect(ledger)?;
         let witness = signer
             .sign(
                 &prepared.unsigned_tx,
@@ -357,7 +606,7 @@ impl WraithSessionClient {
                     detail: other.to_string(),
                 },
             })?;
-        self.submit_witness(&prepared, witness).await
+        self.submit_witness(&inspected, witness).await
     }
 
     /// Drive the protocol from /find_or_create through /round-tx.
@@ -400,7 +649,38 @@ impl WraithSessionClient {
         //     until quorum forms (or the fill window expires). Bounded
         //     poll loop with backoff; gives up after the round's fill
         //     window plus a safety margin.
-        self.wait_for_locked(&session_id).await?;
+        let locked = self.wait_for_locked(&session_id).await?;
+
+        // 2c. Leave now if the round cannot possibly meet the floor.
+        //
+        //     This is the last moment leaving is free. `/inputs` below commits
+        //     the outpoint to this round, and a wallet that then declines to
+        //     sign is swept as a non-signer and has that outpoint banned for a
+        //     cooldown. The protocol assembles at five and this wallet's floor
+        //     defaults to ten, so landing in a legal round below the floor is
+        //     an ordinary event rather than an attack — and must not cost the
+        //     coin.
+        //
+        //     Judged on SEATS, which is all that exists yet. The entity count
+        //     is derived from committed inputs, so before anyone commits it is
+        //     zero and says nothing. Seats bound entities from above —
+        //     clustering only ever collapses seats together, never splits one
+        //     — so `seats < floor` proves the floor is unreachable, while
+        //     `seats >= floor` proves nothing and is left to `inspect`, which
+        //     recounts from the chain once the transaction exists.
+        let seats = locked.session.slots_filled as usize;
+        if seats < request.min_entities {
+            debug!(
+                %session_id,
+                seats,
+                min_entities = request.min_entities,
+                "round cannot reach this wallet's anonymity floor; leaving before committing"
+            );
+            return Err(WraithClientError::RoundTooSmallToJoin {
+                seats,
+                min_entities: request.min_entities,
+            });
+        }
 
         // 3. Commit UTXO. The 5th /inputs auto-advances the round to
         //    Signing on the coordinator side. Earlier submitters
@@ -534,6 +814,14 @@ impl WraithSessionClient {
             })
             .collect();
 
+        // What the wallet's own output must be, read from the transaction the
+        // coordinator served but at the index the wallet located itself. The
+        // check that follows compares the round against this, so it has to come
+        // from `locate_mix_output_index` rather than from anything the
+        // coordinator asserted about which output is ours.
+        let expected_output_script = tx.output[mixed_output_tx_index].script_pubkey.clone();
+        let expected_output_sats = tx.output[mixed_output_tx_index].value.to_sat();
+
         Ok(PreparedMix {
             session_id,
             unsigned_tx: tx,
@@ -542,6 +830,9 @@ impl WraithSessionClient {
             prevouts,
             mixed_output_tx_index,
             ghost_id: request.ghost_id,
+            min_entities: request.min_entities,
+            expected_output_sats,
+            expected_output_script,
         })
     }
 
@@ -550,9 +841,17 @@ impl WraithSessionClient {
     /// Complete before returning. Returns the broadcast txid.
     pub async fn submit_witness(
         &self,
-        prepared: &PreparedMix,
+        inspected: &InspectedMix,
         witness: Witness,
     ) -> Result<MixOutcome, WraithClientError> {
+        let prepared = inspected.prepared();
+
+        // Inspection is only worth something if the signature commits to what
+        // was inspected. Checked here rather than in `execute_mix` alone,
+        // because the split API goes straight to this method and previously
+        // skipped it entirely.
+        check_witness_sighash(&witness, prepared.input_index)?;
+
         let witness_hex = bitcoin::consensus::encode::serialize_hex(&witness);
         let session_id = &prepared.session_id;
 
@@ -701,14 +1000,20 @@ impl WraithSessionClient {
     /// caller forever. Polls every 250ms — frequent enough to ride
     /// the manual state-flip in tests, sparse enough to avoid
     /// hammering a real coordinator.
-    async fn wait_for_locked(&self, session_id: &str) -> Result<(), WraithClientError> {
+    /// Block until the round is joinable, and hand back the status that said
+    /// so — the caller needs its headcount, and re-fetching would be a second
+    /// round-trip for a figure already in hand.
+    async fn wait_for_locked(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionStatusResponse, WraithClientError> {
         let deadline = std::time::Instant::now() + Duration::from_secs(360);
         loop {
             let status: SessionStatusResponse = self
                 .get_json(&format!("/api/v1/session/{session_id}"))
                 .await?;
             match status.session.state.as_str() {
-                "locked" | "signing" => return Ok(()),
+                "locked" | "signing" => return Ok(status),
                 "failed" => {
                     return Err(WraithClientError::Coordinator {
                         status: 410,

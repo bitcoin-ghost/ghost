@@ -12,10 +12,10 @@
 Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
 (`ghostd`) and a decentralised mining pool (`ghost-pool`). Nodes form a
 peer-to-peer mesh, reach BFT consensus on payouts, and are rewarded for the
-infrastructure they actually provide — full-node storage, mining, L2 payments,
-and mempool filtering — through a verified-capability share system. It also
-includes an L2 payments layer (`ghost-pay`) and a CoinJoin privacy protocol
-(Wraith). No separate token, no altcoin — it settles in Bitcoin.
+infrastructure they actually provide — full-node storage, mining, and mempool
+filtering — through a verified-capability share system. It also includes a
+self-custody wallet with Ghost Locks and a CoinJoin privacy protocol (Wraith).
+No separate token, no altcoin — it settles in Bitcoin.
 
 - **Website:** <https://bitcoinghost.org>
 - **Documentation:** <https://bitcoinghost.org/docs/>
@@ -27,8 +27,9 @@ includes an L2 payments layer (`ghost-pay`) and a CoinJoin privacy protocol
 |-----------|------|-------------|
 | `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
 | `ghost-pool` | `bins/ghost-pool/` | Decentralised mining pool node. Runs the P2P consensus mesh, tracks shares, and computes coinbase payouts. |
-| `ghost-pay` | `bins/ghost-pay/` | L2 payment service with off-chain transfers proven by zero-knowledge proofs. |
-| Wraith | `crates/wraith-protocol/` | Blind-signature CoinJoin mixing at L2 entry. |
+| Ghost Lock | `crates/ghost-lock/` | Four-lane Taproot accounts with escape, inheritance and quorum co-signing. |
+| Wraith wallet | `apps/wraith-wallet/` | Self-custody wallet — daemon, CLI and desktop app — talking to your own node. |
+| Wraith | `crates/wraith-protocol/` | Blind-signature CoinJoin mixing. |
 | Light wallet | `bins/ghost-cli/`, `crates/ghost-light-wallet/` | CLI/TUI wallet with BIP-352 Silent Payments. |
 | SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. |
 
@@ -45,7 +46,7 @@ challenge-response probes issued by random peers every five minutes.
 | Capability | Shares | Verification |
 |------------|:------:|--------------|
 | Archive node | +5 | Peers request arbitrary historical blocks. |
-| Ghost Pay | +4 | Random L2 state-lookup challenges. |
+| Ghost Pay | +4 | Random L2 state-lookup challenges. **Being retired** — the service is no longer built or installed, so new nodes cannot claim it. Removing it from the weighting is a consensus change and lands with its own height gate. |
 | Public mining | +3 | Peers probe the Stratum port for accessibility. |
 | Reaper | +2 | Mempool policy classification challenges. |
 | Elder | +1 | Contributed to the MPC ceremony (first 101 nodes; permanent). |
@@ -99,7 +100,7 @@ should be paid to:
 curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
 ```
 
-Run `sudo bash -s -- --help` to see options such as `--archive`, `--ghost-pay`,
+Run `sudo bash -s -- --help` to see options such as `--archive`, `--wraith`,
 `--mining-mode`, and `--sync`. Full setup guidance is at
 <https://bitcoinghost.org/docs/>.
 
@@ -132,7 +133,7 @@ Requirements:
 ```sh
 git clone https://github.com/bitcoin-ghost/ghost.git
 cd ghost
-cargo build --release            # builds the Rust workspace (ghost-pool, ghost-pay, wallets, ...)
+cargo build --release            # builds the Rust workspace (ghost-pool, wallets, ...)
 ```
 
 `ghost-core` has its own build; see [`ghost-core/INSTALL.md`](ghost-core/INSTALL.md).

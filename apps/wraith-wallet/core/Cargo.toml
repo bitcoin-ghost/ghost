@@ -8,7 +8,8 @@ repository.workspace = true
 
 [dependencies]
 wraith-protocol = { workspace = true }
-ghost-locks = { workspace = true }
+ghost-entropy = { workspace = true }
+ghost-lock = { workspace = true }
 aes-gcm = { workspace = true }
 # Local override to pull in reqwest's SOCKS5 feature for the
 # Tor-routed /outputs client. Workspace-default reqwest doesn't
@@ -20,8 +21,6 @@ bip32 = { workspace = true }
 bip39 = { workspace = true }
 bitcoin = { workspace = true }
 bip322 = { workspace = true }
-futures-util = { workspace = true }
-ghost-gsp-proto = { workspace = true }
 ghost-keys = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
@@ -38,9 +37,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
-tokio-socks = "0.5"
-url = "2"
 tracing = { workspace = true }
 zeroize = { workspace = true }
 

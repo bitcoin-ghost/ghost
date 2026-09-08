@@ -35,7 +35,9 @@ members = [
     "crates/ghost-verification",
     # Ghost Pay L2
     "crates/ghost-keys",
-    "crates/ghost-locks",
+    "crates/ghost-lock",
+    "bins/ghost-lock-signer",
+    "crates/ghost-entropy",
     "crates/wraith-protocol",
     "crates/ghost-reconciliation",
     # ZK-BFT Infrastructure
@@ -46,14 +48,10 @@ members = [
     # Visual Identity
     "crates/ghost-glyph",
     # GSP
-    "crates/ghost-gsp-proto",
-    "crates/ghost-gsp",
     # Node Binaries
     "bins/ghost-pool",
     "bins/ghost-stats",
-    "bins/ghost-pay",
     "bins/ghost-cli",
-    "bins/ghost-gsp",
     # Wraith coordinator (Wraith Lite v1, single-round atomic CoinJoin)
     "bins/wraith-coordinator",
     # Decentralised mining-discovery shim (miner-side; verifies the signed node-list checkpoint)
@@ -111,7 +109,8 @@ ghost-pool = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 # Ghost Pay L2 crates
 ghost-keys = { path = "crates/ghost-keys" }
-ghost-locks = { path = "crates/ghost-locks" }
+ghost-entropy = { path = "crates/ghost-entropy" }
+ghost-lock = { path = "crates/ghost-lock" }
 wraith-protocol = { path = "crates/wraith-protocol" }
 wraith-coordinator = { path = "bins/wraith-coordinator" }
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
@@ -120,8 +119,6 @@ ghost-zkp = { path = "crates/ghost-zkp" }
 ghost-mpc = { path = "crates/ghost-mpc" }
 ghost-glyph = { path = "crates/ghost-glyph" }
 # GSP crates
-ghost-gsp-proto = { path = "crates/ghost-gsp-proto" }
-ghost-gsp = { path = "crates/ghost-gsp" }
 # Mobile Apps
 ghost-tap-core = { path = "apps/ghost-tap/core" }
 # Wraith Wallet
@@ -263,10 +260,8 @@ ghost-policy = { workspace = true }
 ghost-consensus = { workspace = true, features = ["test-utils", "zk-consensus"] }
 ghost-pool = { workspace = true }
 ghost-keys = { workspace = true }
-ghost-locks = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }
-ghost-gsp-proto = { workspace = true }
 ghost-zkp = { workspace = true }
 
 # Test dependencies

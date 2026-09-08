@@ -1,0 +1,541 @@
+//! A Ghost Lock as the wallet holds it: four lanes and one balance.
+//!
+//! `crates/ghost-lock` builds the Taproot output for a single lane. This turns
+//! four of them into the thing a person has — one account, four compartments,
+//! and a total.
+//!
+//! # Not `ghost-locks`
+//!
+//! `ghost-locks` (plural) is Ghost Pay's P2WSH lock. It used to back `LockEntry`
+//! and the wallet's Locks screen; Phase 0 demolition removed that, and the wallet
+//! no longer depends on the crate at all. The crate itself stays in the workspace
+//! because `bins/ghost-pay` — a shipped fleet binary — still builds on it.
+//!
+//! The demolition was safe to do because nobody ever created one of the old
+//! locks: the `ghost_locks` table held zero rows on every fleet node, checked
+//! against a control query that saw 22,562 shares in the same database. There
+//! was nothing to migrate and nothing to strand.
+//!
+//! # The lanes are not interchangeable, and the wallet must not pretend they are
+//!
+//! Each lane makes a different promise, and the difference is the point of
+//! having four:
+//!
+//! | Lane | Normal spend | If the quorum goes silent | Private? |
+//! |---|---|---|---|
+//! | Savings | you + backup | you alone, after ~14 months | yes |
+//! | Spending | you + quorum | you alone, after ~7 days | yes |
+//! | Cash | you alone | n/a — no quorum involved | **no** |
+//! | Investments | **quorum alone** | you recall, after ~14 days | yes |
+//!
+//! **Investments is the exception and the wallet has to say so.** It is the one
+//! lane where the quorum can move funds without the owner — that is what lets an
+//! LP supply liquidity on demand while the owner is offline, and it is a
+//! genuinely different risk from the other three. A balance screen that shows
+//! four numbers in the same weight misrepresents it.
+
+use bitcoin::secp256k1::{Secp256k1, Verification};
+use bitcoin::{Network, XOnlyPublicKey};
+
+use ghost_lock::{CashPolicy, InvestmentsPolicy, Lane, LockError, SavingsPolicy, SpendingPolicy};
+
+/// Which compartment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneKind {
+    Savings,
+    Spending,
+    Cash,
+    Investments,
+}
+
+impl LaneKind {
+    /// Every lane, in the order a person reads them: coldest first.
+    pub const ALL: [LaneKind; 4] = [
+        LaneKind::Savings,
+        LaneKind::Spending,
+        LaneKind::Cash,
+        LaneKind::Investments,
+    ];
+
+    /// The name a user sees.
+    pub fn label(self) -> &'static str {
+        match self {
+            LaneKind::Savings => "Savings",
+            LaneKind::Spending => "Spending",
+            LaneKind::Cash => "Cash",
+            LaneKind::Investments => "Investments",
+        }
+    }
+
+    /// Whether the quorum can move this lane's funds **without** the owner.
+    ///
+    /// True only for Investments. A UI that does not surface this shows a
+    /// custodial balance beside three non-custodial ones and lets the reader
+    /// assume they are alike.
+    pub fn quorum_can_spend_alone(self) -> bool {
+        matches!(self, LaneKind::Investments)
+    }
+
+    /// Which compartment this lane's coins belong to.
+    ///
+    /// The single place the lane-to-compartment mapping lives. Everything that
+    /// needs a compartment rule goes through here rather than re-matching on
+    /// `LaneKind`, so adding a lane cannot leave one rule behind.
+    pub fn compartment(self) -> ghost_lock::Compartment {
+        match self {
+            LaneKind::Cash => ghost_lock::Compartment::Cash,
+            LaneKind::Savings | LaneKind::Spending | LaneKind::Investments => {
+                ghost_lock::Compartment::Private
+            }
+        }
+    }
+
+    /// Whether coins here can enter a Wraith round as an INPUT.
+    ///
+    /// False for Cash: it is already public, so mixing it gains nothing and
+    /// re-links whatever it is mixed with. Derived from
+    /// `ghost_lock::check_round_eligible` rather than restated, so the rule has
+    /// one definition and a UI reading this flag cannot drift from the
+    /// enforcement.
+    pub fn round_eligible(self) -> bool {
+        ghost_lock::check_round_eligible(self.compartment()).is_ok()
+    }
+
+    /// Whether a Wraith round may pay OUT to this lane — i.e. whether the lane
+    /// can be funded privately.
+    ///
+    /// A different rule from [`Self::round_eligible`], refusing Cash for a
+    /// different reason. See `ghost_lock::check_round_destination`.
+    pub fn round_destination_eligible(self) -> bool {
+        ghost_lock::check_round_destination(self.compartment()).is_ok()
+    }
+}
+
+/// The keys a Lock is built from.
+#[derive(Debug, Clone, Copy)]
+pub struct LockKeys {
+    /// Owner's key.
+    pub owner: XOnlyPublicKey,
+    /// Backup device's key.
+    pub backup: XOnlyPublicKey,
+    /// Heir's key, for the inheritance leaf.
+    pub heir: XOnlyPublicKey,
+    /// MuSig2 aggregate of owner and backup, for the Savings key path.
+    pub owner_backup_aggregate: XOnlyPublicKey,
+    /// MuSig2 aggregate of owner and quorum, for the Spending key path.
+    pub owner_quorum_aggregate: XOnlyPublicKey,
+    /// The Wraith quorum's key.
+    pub quorum: XOnlyPublicKey,
+}
+
+/// One built lane: its address and what it promises.
+#[derive(Debug, Clone)]
+pub struct BuiltLane {
+    pub kind: LaneKind,
+    pub lane: Lane,
+}
+
+/// A Ghost Lock: four lanes under one set of keys.
+#[derive(Debug, Clone)]
+pub struct GhostLockAccount {
+    pub lanes: Vec<BuiltLane>,
+}
+
+impl GhostLockAccount {
+    /// Build all four lanes.
+    ///
+    /// All four or none: a Lock missing a lane is not a Lock, and returning a
+    /// partial one would leave the wallet showing three compartments while
+    /// funds could still arrive at the fourth's address.
+    pub fn build<C: Verification>(
+        secp: &Secp256k1<C>,
+        keys: &LockKeys,
+        network: Network,
+        anchor_height: u32,
+        inherit_height: u32,
+    ) -> Result<Self, LockError> {
+        let savings = SavingsPolicy {
+            aggregate: keys.owner_backup_aggregate,
+            owner: keys.owner,
+            backup: keys.backup,
+            heir: keys.heir,
+            inherit_height,
+        }
+        .build(secp, anchor_height, network)?;
+
+        let spending = SpendingPolicy {
+            aggregate: keys.owner_quorum_aggregate,
+            owner: keys.owner,
+        }
+        .build(secp, network)?;
+
+        let cash = CashPolicy { owner: keys.owner }.build(secp, network)?;
+
+        let investments = InvestmentsPolicy {
+            quorum: keys.quorum,
+            owner: keys.owner,
+        }
+        .build(secp, network)?;
+
+        Ok(Self {
+            lanes: vec![
+                BuiltLane {
+                    kind: LaneKind::Savings,
+                    lane: savings,
+                },
+                BuiltLane {
+                    kind: LaneKind::Spending,
+                    lane: spending,
+                },
+                BuiltLane {
+                    kind: LaneKind::Cash,
+                    lane: cash,
+                },
+                BuiltLane {
+                    kind: LaneKind::Investments,
+                    lane: investments,
+                },
+            ],
+        })
+    }
+
+    /// The lane of a given kind.
+    pub fn lane(&self, kind: LaneKind) -> Option<&BuiltLane> {
+        self.lanes.iter().find(|l| l.kind == kind)
+    }
+}
+
+/// A lane's balance, as shown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaneBalance {
+    pub kind: LaneKind,
+    pub label: String,
+    pub address: String,
+    /// Confirmed. What has settled and can be relied on.
+    pub balance_sats: u64,
+    /// Unconfirmed, and reported **separately rather than added**.
+    ///
+    /// A user who has just funded a lane needs to see it arriving, or the
+    /// wallet looks broken for a block. But folding it into the balance would
+    /// show money that can still vanish as though it were settled, which is the
+    /// more expensive mistake of the two.
+    pub pending_sats: u64,
+    /// True only for Investments. Carried per lane rather than left for the UI
+    /// to infer, so every client shows the same warning.
+    pub quorum_can_spend_alone: bool,
+    /// Whether these coins may enter a round.
+    pub round_eligible: bool,
+}
+
+/// Every lane's balance, plus the combined total.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockBalances {
+    pub lanes: Vec<LaneBalance>,
+    /// The whole Lock, confirmed. What a person means by "how much have I got".
+    pub total_sats: u64,
+    /// Unconfirmed across every lane. Beside the total, never inside it.
+    pub total_pending_sats: u64,
+    /// Of the total, how much the quorum could move without the owner.
+    ///
+    /// Reported alongside the total rather than folded into it: a single figure
+    /// that silently mixes custodial and non-custodial funds tells the reader
+    /// less than two figures do.
+    pub custodial_sats: u64,
+}
+
+/// One scanned coin, already attributed to a lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneCoin {
+    pub kind: LaneKind,
+    pub sats: u64,
+    /// Zero means it is still in the mempool.
+    pub confirmations: u32,
+}
+
+/// Sum a Lock's lanes, keeping confirmed and pending apart.
+///
+/// Saturating, because a total shown to a person must never wrap into a small
+/// number. Where arithmetic actually moves coins the checked form is used
+/// instead.
+///
+/// The custodial figure counts **confirmed** funds only: it answers "how much
+/// of my settled money can somebody else move", and unconfirmed coins are not
+/// yet anybody's to move.
+pub fn balances(account: &GhostLockAccount, coins: &[LaneCoin]) -> LockBalances {
+    let mut lanes = Vec::with_capacity(account.lanes.len());
+    let mut total: u64 = 0;
+    let mut pending_total: u64 = 0;
+    let mut custodial: u64 = 0;
+
+    for built in &account.lanes {
+        let mut settled: u64 = 0;
+        let mut pending: u64 = 0;
+        for c in coins.iter().filter(|c| c.kind == built.kind) {
+            if c.confirmations == 0 {
+                pending = pending.saturating_add(c.sats);
+            } else {
+                settled = settled.saturating_add(c.sats);
+            }
+        }
+        total = total.saturating_add(settled);
+        pending_total = pending_total.saturating_add(pending);
+        if built.kind.quorum_can_spend_alone() {
+            custodial = custodial.saturating_add(settled);
+        }
+        lanes.push(LaneBalance {
+            kind: built.kind,
+            label: built.kind.label().to_string(),
+            address: built.lane.address.to_string(),
+            balance_sats: settled,
+            pending_sats: pending,
+            quorum_can_spend_alone: built.kind.quorum_can_spend_alone(),
+            round_eligible: built.kind.round_eligible(),
+        });
+    }
+
+    LockBalances {
+        lanes,
+        total_sats: total,
+        total_pending_sats: pending_total,
+        custodial_sats: custodial,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+
+    fn key(b: u8) -> XOnlyPublicKey {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[b.max(1); 32]).unwrap();
+        Keypair::from_secret_key(&secp, &sk).x_only_public_key().0
+    }
+
+    fn keys() -> LockKeys {
+        LockKeys {
+            owner: key(1),
+            backup: key(2),
+            heir: key(3),
+            owner_backup_aggregate: key(4),
+            owner_quorum_aggregate: key(5),
+            quorum: key(6),
+        }
+    }
+
+    fn settled(kind: LaneKind, sats: u64) -> LaneCoin {
+        LaneCoin {
+            kind,
+            sats,
+            confirmations: 1,
+        }
+    }
+
+    fn pending(kind: LaneKind, sats: u64) -> LaneCoin {
+        LaneCoin {
+            kind,
+            sats,
+            confirmations: 0,
+        }
+    }
+
+    fn account() -> GhostLockAccount {
+        let secp = Secp256k1::verification_only();
+        // Anchor at the current tip; inheritance well beyond it.
+        GhostLockAccount::build(&secp, &keys(), Network::Regtest, 900_000, 1_000_000).unwrap()
+    }
+
+    #[test]
+    fn a_lock_has_all_four_lanes_at_distinct_addresses() {
+        // Compartments that share an address are not compartments.
+        let a = account();
+        assert_eq!(a.lanes.len(), 4);
+        let mut addrs: Vec<String> = a.lanes.iter().map(|l| l.lane.address.to_string()).collect();
+        addrs.sort();
+        addrs.dedup();
+        assert_eq!(addrs.len(), 4, "each lane needs its own address");
+    }
+
+    #[test]
+    fn only_investments_is_custodial() {
+        // The lane where the quorum spends alone. A UI that misses this shows a
+        // custodial balance beside three non-custodial ones.
+        for k in LaneKind::ALL {
+            assert_eq!(
+                k.quorum_can_spend_alone(),
+                k == LaneKind::Investments,
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cash_is_the_only_lane_barred_from_rounds() {
+        for k in LaneKind::ALL {
+            assert_eq!(k.round_eligible(), k != LaneKind::Cash, "{k:?}");
+        }
+    }
+
+    /// Private entry: a round may pay into the three private lanes and must
+    /// not pay into Cash. Distinct from `round_eligible`, which is about a
+    /// coin leaving a lane INTO a round.
+    #[test]
+    fn a_round_may_fund_every_lane_except_cash() {
+        for k in LaneKind::ALL {
+            assert_eq!(
+                k.round_destination_eligible(),
+                k != LaneKind::Cash,
+                "{k:?} destination eligibility"
+            );
+        }
+    }
+
+    /// The two rules agree today and are still two rules. If someone collapses
+    /// them, this keeps the reason visible: they refuse Cash for different
+    /// reasons and would diverge the moment either changes.
+    #[test]
+    fn the_input_rule_and_the_destination_rule_are_separate() {
+        let cash = LaneKind::Cash.compartment();
+        assert_ne!(
+            ghost_lock::check_round_eligible(cash).unwrap_err(),
+            ghost_lock::check_round_destination(cash).unwrap_err(),
+        );
+    }
+
+    /// Every lane maps to exactly one compartment, and only Cash is public.
+    #[test]
+    fn only_cash_is_the_public_compartment() {
+        for k in LaneKind::ALL {
+            let expected = if k == LaneKind::Cash {
+                ghost_lock::Compartment::Cash
+            } else {
+                ghost_lock::Compartment::Private
+            };
+            assert_eq!(k.compartment(), expected, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn the_total_is_every_lane_including_cash() {
+        // "How much have I got" means all of it. Excluding Cash because it is
+        // not private would answer a different question than the one asked.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Savings, 1_000_000),
+                settled(LaneKind::Spending, 200_000),
+                settled(LaneKind::Cash, 50_000),
+                settled(LaneKind::Investments, 40_000),
+            ],
+        );
+        assert_eq!(b.total_sats, 1_290_000);
+        assert_eq!(b.lanes.len(), 4);
+    }
+
+    #[test]
+    fn the_custodial_share_is_reported_separately() {
+        // Folding it into the total would tell the reader less: they could not
+        // see how much of their money somebody else can move.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Savings, 1_000_000),
+                settled(LaneKind::Investments, 40_000),
+            ],
+        );
+        assert_eq!(b.total_sats, 1_040_000);
+        assert_eq!(b.custodial_sats, 40_000);
+    }
+
+    #[test]
+    fn a_lane_with_no_coins_is_still_listed() {
+        // An empty lane must not vanish: it has an address funds can arrive at,
+        // and a person needs to see it exists.
+        let a = account();
+        let b = balances(&a, &[settled(LaneKind::Spending, 5)]);
+        assert_eq!(b.lanes.len(), 4);
+        assert_eq!(b.total_sats, 5);
+        for l in &b.lanes {
+            assert!(!l.address.is_empty());
+        }
+    }
+
+    #[test]
+    fn several_utxos_in_one_lane_sum() {
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Cash, 1_000),
+                settled(LaneKind::Cash, 2_000),
+                settled(LaneKind::Cash, 3_000),
+            ],
+        );
+        assert_eq!(b.total_sats, 6_000);
+    }
+
+    #[test]
+    fn the_total_saturates_rather_than_wrapping() {
+        // A balance shown to a person must never wrap into a small number.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Savings, u64::MAX),
+                settled(LaneKind::Spending, u64::MAX),
+            ],
+        );
+        assert_eq!(b.total_sats, u64::MAX);
+    }
+
+    #[test]
+    fn pending_is_reported_beside_settled_never_added_to_it() {
+        // A user who has just funded a lane must see it arriving, or the wallet
+        // looks broken for a block. Folding it in would show money that can
+        // still vanish as though it had settled — the more expensive mistake.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Savings, 1_000_000),
+                pending(LaneKind::Savings, 250_000),
+            ],
+        );
+        assert_eq!(b.total_sats, 1_000_000, "settled must exclude pending");
+        assert_eq!(b.total_pending_sats, 250_000);
+        let sav = b
+            .lanes
+            .iter()
+            .find(|l| l.kind == LaneKind::Savings)
+            .unwrap();
+        assert_eq!(sav.balance_sats, 1_000_000);
+        assert_eq!(sav.pending_sats, 250_000);
+    }
+
+    #[test]
+    fn the_custodial_figure_counts_settled_funds_only() {
+        // It answers "how much of my settled money can somebody else move".
+        // Unconfirmed coins are not yet anybody's to move.
+        let a = account();
+        let b = balances(
+            &a,
+            &[
+                settled(LaneKind::Investments, 40_000),
+                pending(LaneKind::Investments, 999_000),
+            ],
+        );
+        assert_eq!(b.custodial_sats, 40_000);
+        assert_eq!(b.total_pending_sats, 999_000);
+    }
+
+    #[test]
+    fn lanes_are_ordered_coldest_first() {
+        // The order a person reads them in, and the order risk increases.
+        let a = account();
+        let kinds: Vec<LaneKind> = a.lanes.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, LaneKind::ALL.to_vec());
+    }
+}

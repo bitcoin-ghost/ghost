@@ -22,12 +22,9 @@
 //! cargo test --test integration consensus_voting
 //! cargo test --test integration buds_classification
 //! cargo test --test integration security
-//! cargo test --test integration ghost_pay
 //! cargo test --test integration round_management
 //! cargo test --test integration edge_cases
-//! cargo test --test integration ghost_lock_types
 //! cargo test --test integration settlement_reconciliation
-//! cargo test --test integration gsp_payment_messages
 //! cargo test --test integration l2_nullifier_route
 //! ```
 
@@ -41,10 +38,6 @@ pub mod discovery_security;
 pub mod e2e;
 pub mod edge_cases;
 pub mod fund_safety;
-pub mod ghost_lock_types;
-pub mod ghost_pay;
-pub mod gsp;
-pub mod gsp_payment_messages;
 pub mod helpers;
 pub mod historical_bugs;
 pub mod hypothetical_bugs;
