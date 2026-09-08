@@ -300,7 +300,35 @@ sleep 2
 # All CLI calls go through this one wraithd. --no-spawn so we fail loud
 # if the daemon died instead of silently auto-spawning a fresh one with
 # different env.
-WRAITH() { WRAITHD_SOCKET="$WRAITH_SOCK" "$BIN/wraith" --no-spawn "$@"; }
+# Run the CLI, and on failure say what it said.
+#
+# Nearly every call site is `X=$(WRAITH ...)`, and under `set -e` a non-zero
+# exit aborts AT THE ASSIGNMENT — so the captured output, which is where the
+# daemon's reason lives, is discarded unread. A coordinator refusing with "this
+# coordinator is on standby and does not co-sign Locks" looked from here like
+# an unexplained exit 1.
+#
+# stdout and stderr stay separate so a warning can never corrupt JSON a caller
+# is about to parse; both are dumped only when the call fails.
+WRAITH() {
+    local out err rc
+    err=$(mktemp "${DATADIR:-/tmp}/wraith-err.XXXXXX")
+    out=$(WRAITHD_SOCKET="$WRAITH_SOCK" "$BIN/wraith" --no-spawn "$@" 2>"$err")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        {
+            echo "[wraith $* exited $rc]"
+            echo "--- stdout ---"
+            echo "$out"
+            echo "--- stderr ---"
+            cat "$err"
+        } >&2
+    else
+        printf '%s\n' "$out"
+    fi
+    rm -f "$err"
+    return "$rc"
+}
 
 # ============================================================================
 # FLOW 1: create a BIP-39 wallet
