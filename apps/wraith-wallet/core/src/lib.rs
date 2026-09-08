@@ -8,6 +8,7 @@ pub mod block_scan;
 pub mod candidate_scan;
 pub mod chain;
 pub mod descriptor;
+pub mod detection_store;
 pub mod ghost_lock_account;
 pub mod ghost_lock_store;
 pub mod ghostd;

@@ -336,6 +336,13 @@ async fn l1_send(
     to_value(&resp)
 }
 
+/// Silent payments the block scanner has found.
+#[tauri::command]
+async fn light_detected() -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::LightDetected).await?;
+    to_value(&resp)
+}
+
 #[tauri::command]
 async fn light_utxos(min_confirmations: Option<u32>) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::LightUtxos {
@@ -860,6 +867,7 @@ pub fn run() {
             light_receive,
             light_history,
             l1_send,
+            light_detected,
             set_node,
             light_utxos,
             light_l1_utxos,

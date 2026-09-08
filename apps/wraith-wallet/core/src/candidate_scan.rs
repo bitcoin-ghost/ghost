@@ -36,7 +36,7 @@ pub struct CandidateOutput {
 }
 
 /// One BIP-352 silent-payment detection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DetectedPayment {
     pub txid: String,
     pub block_height: Option<u32>,
@@ -101,7 +101,21 @@ pub fn scan_candidate(
     // belongs to exactly one curve point with a defined parity).
     for parity in [0x02u8, 0x03u8] {
         let mut scan_inputs: Vec<(PublicKey, Option<u64>)> = Vec::with_capacity(decoded.len());
-        for d in &decoded {
+        // Which `decoded` entry each scan input came from.
+        //
+        // ⚠ These indices are NOT the same, and assuming they were is a bug
+        // this code shipped with. Not every 32-byte value on a taproot-shaped
+        // output is a valid curve x-coordinate — an ordinary output whose key
+        // the wallet has no reason to recognise may be no point at all — and
+        // each one skipped shifts every later entry down by one. The scanner
+        // then reports a hit at a slice index that maps to a DIFFERENT output:
+        // the wrong vout, the wrong amount, and a coin the wallet later cannot
+        // spend because the key it derived belongs elsewhere.
+        //
+        // The old comment called the skip a parse failure that "should never
+        // happen". It happens whenever a transaction pays anyone else.
+        let mut origin: Vec<usize> = Vec::with_capacity(decoded.len());
+        for (i, d) in decoded.iter().enumerate() {
             let mut sec1 = [0u8; 33];
             sec1[0] = parity;
             sec1[1..].copy_from_slice(&d.xonly);
@@ -113,14 +127,16 @@ pub fn scan_candidate(
                 }
             };
             scan_inputs.push((pk, d.amount));
+            origin.push(i);
         }
         let scanned = detector.scan_transaction(&ephemeral, &scan_inputs);
         for s in scanned {
-            // Map the scanner's slice-index back to our on-chain vout.
-            // Note: the slice index can drift if any inputs were skipped above;
-            // we only skip on parse failure which should never happen for valid
-            // x-only bytes, so this is safe in practice.
-            let d = match decoded.get(s.output_index as usize) {
+            // Map the scanner's slice index back to the on-chain output it
+            // actually came from, through the origins recorded above.
+            let d = match origin
+                .get(s.output_index as usize)
+                .and_then(|i| decoded.get(*i))
+            {
                 Some(d) => d,
                 None => continue,
             };
@@ -201,6 +217,69 @@ mod tests {
         assert_eq!(det.vout, 7);
         assert_eq!(det.block_height, Some(123_456));
         assert_eq!(det.txid, txid);
+    }
+
+    /// A hit must be attributed to the output it actually came from.
+    ///
+    /// Pins the index-drift bug: an output whose 32 bytes are not a valid
+    /// curve x-coordinate is skipped when building the scan inputs, so the
+    /// scanner's slice indices stop matching the candidate list. Before the
+    /// fix this reported the *decoy's* vout and amount, which means a wallet
+    /// crediting itself with the wrong coin and deriving a spend key for an
+    /// output that was never its own.
+    #[test]
+    fn a_hit_is_attributed_to_the_output_it_came_from() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use ghost_keys::{derive_payment_address_v2, derive_shared_secret};
+        use rand::RngCore;
+
+        let receiver = GhostKeys::generate();
+        let secp = Secp256k1::new();
+        let mut eph_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut eph_bytes);
+        let eph_secret = SecretKey::from_slice(&eph_bytes).unwrap();
+        let ephemeral_pub = PublicKey::from_secret_key(&secp, &eph_secret);
+        let shared = derive_shared_secret(&eph_secret, receiver.scan_pubkey());
+        let (output_pubkey, _) =
+            derive_payment_address_v2(receiver.spend_pubkey(), &shared, 0).unwrap();
+        let ours_xonly = hex::encode(&output_pubkey.serialize()[1..]);
+
+        // 0xcc repeated is not a point on the curve under either parity, so
+        // both attempts to build a scan input from it are skipped.
+        let off_curve = "cc".repeat(32);
+        assert!(
+            PublicKey::from_slice(&hex::decode(format!("02{off_curve}")).unwrap()).is_err(),
+            "the decoy must really be off-curve, or this proves nothing"
+        );
+
+        let outputs = vec![
+            CandidateOutput {
+                output_pubkey: off_curve,
+                amount_sats: Some(25_000_000),
+                vout: 1,
+            },
+            CandidateOutput {
+                output_pubkey: ours_xonly,
+                amount_sats: Some(50_000_000),
+                vout: 2,
+            },
+        ];
+
+        let found = scan_candidate(
+            &receiver,
+            &hex::encode(ephemeral_pub.serialize()),
+            &outputs,
+            "feed",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].vout, 2,
+            "the payment is at vout 2, not the decoy's 1"
+        );
+        assert_eq!(found[0].amount_sats, Some(50_000_000));
     }
 
     #[test]

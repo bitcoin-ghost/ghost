@@ -1291,6 +1291,26 @@ export async function multisigDescriptorDelete(name: string): Promise<{
   return unwrap<{ removed: boolean }>(resp).payload;
 }
 
+export interface DetectedPaymentEntry {
+  txid: string;
+  vout: number;
+  amount_sats: number | null;
+  block_height: number | null;
+  /** The sender's derivation index — what makes the coin spendable. */
+  k: number;
+  received_at: number;
+}
+
+/// Silent payments the block scanner has found.
+///
+/// These are absent from `lightUtxos`: a silent payment lands on a key derived
+/// from the sender's ephemeral key and this wallet's Ghost ID, not on an
+/// address the wallet published, so a scan of derived addresses cannot see it.
+export async function lightDetected(): Promise<DetectedPaymentEntry[]> {
+  const resp = await invoke("light_detected");
+  return unwrap<{ detections: DetectedPaymentEntry[] }>(resp).payload.detections;
+}
+
 // ----- Noticing money arriving -------------------------------------------
 
 /// One coin the wallet did not have last time it looked.

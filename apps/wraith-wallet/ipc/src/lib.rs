@@ -299,6 +299,14 @@ pub enum Request {
     /// it talks to, the network it's bound to, where it stores wallets.
     /// Useful for diagnostics + the GUI's settings panel.
     DaemonEnv,
+    /// Silent payments the block scanner has found.
+    ///
+    /// These do not appear in the UTXO list: a silent payment lands on a key
+    /// derived from the sender's ephemeral key and this wallet's Ghost ID, not
+    /// on any address the wallet published, so a scan of derived addresses
+    /// cannot see it. Each entry carries the derivation index that makes the
+    /// coin spendable.
+    LightDetected,
     /// Point the wallet at a node, at runtime, and persist the choice to
     /// `node.json` in the wallet data dir so it survives a restart.
     ///
@@ -748,6 +756,7 @@ pub enum Response {
     GhostLockList(GhostLockListResponse),
     GhostLockForgotten(GhostLockForgottenResponse),
     LightHistory(LightHistoryResponse),
+    LightDetected(LightDetectedResponse),
     DaemonEnv(DaemonEnvResponse),
     /// Reply to [`Request::SetNode`] — the node config now in force after the
     /// change was applied and persisted.
@@ -1278,6 +1287,28 @@ pub struct DaemonEnvResponse {
     /// mode".
     #[serde(default)]
     pub kiosk_mode: bool,
+}
+
+/// One silent payment the scanner found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedPaymentEntry {
+    pub txid: String,
+    pub vout: u32,
+    /// `None` when the amount could not be read from the output.
+    pub amount_sats: Option<u64>,
+    /// The block it arrived in. `None` if it was seen before confirmation.
+    pub block_height: Option<u32>,
+    /// The sender's derivation index. Without this the coin cannot be spent —
+    /// it is what re-derives the key that opens the output.
+    pub k: u32,
+    /// Unix seconds the wallet detected it. Not when it was paid: the scanner
+    /// may be reading a block days old.
+    pub received_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightDetectedResponse {
+    pub detections: Vec<DetectedPaymentEntry>,
 }
 
 /// Result of [`Request::SetNode`] — the node config now in force.
@@ -1817,6 +1848,7 @@ mod tests {
                 offset: 0,
             },
             Request::LightReceive { index: 0 },
+            Request::LightDetected,
             Request::L1Send {
                 recipient_address: "bc1qxyz".into(),
                 amount_sats: 100_000,

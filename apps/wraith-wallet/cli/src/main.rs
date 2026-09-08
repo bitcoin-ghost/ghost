@@ -494,6 +494,12 @@ enum LightCommand {
         #[arg(short = 'c', long, default_value_t = 0)]
         min_confirmations: u32,
     },
+    /// Show silent payments the block scanner has found.
+    ///
+    /// These do not show up in `utxos`: a silent payment lands on a key
+    /// derived from the sender's ephemeral key and this wallet's Ghost ID,
+    /// not on an address the wallet published.
+    Detected,
     /// Show the active wallet's transaction history.
     History {
         /// Maximum number of transactions to return.
@@ -758,6 +764,7 @@ mod client {
                     scan_max_index,
                     min_confirmations,
                 },
+                LightCommand::Detected => Request::LightDetected,
                 LightCommand::History { limit, offset } => Request::LightHistory { limit, offset },
                 LightCommand::Pay {
                     recipient_address,
@@ -1344,6 +1351,28 @@ mod client {
                         h.transactions.len(),
                         h.total_count
                     );
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::LightDetected(d)) => {
+                if d.detections.is_empty() {
+                    println!("(no silent payments detected)");
+                } else {
+                    for x in &d.detections {
+                        let amount = match x.amount_sats {
+                            Some(a) => a.to_string(),
+                            None => "?".into(),
+                        };
+                        let height = match x.block_height {
+                            Some(h) => h.to_string(),
+                            None => "(unconfirmed)".into(),
+                        };
+                        println!(
+                            "{}:{}  {} sats  height {}  k={}",
+                            x.txid, x.vout, amount, height, x.k
+                        );
+                    }
+                    println!("\n{} silent payment(s)", d.detections.len());
                 }
                 std::process::ExitCode::SUCCESS
             }

@@ -53,19 +53,20 @@ mod server {
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
         AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
-        DaemonEnvResponse, DoctorCheck, DoctorResponse, Envelope, ErrorResponse, EscapeCoin,
-        GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse, GhostLockForgottenResponse,
-        GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
+        DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
+        ErrorResponse, EscapeCoin, GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse,
+        GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
         GhostLockQuorumSignedResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
         GhostLockSavedResponse, GhostLockSignBegunResponse, GhostLockSignNoncedResponse,
-        GhostLockSignedResponse, HealthResponse, LightBalanceResponse, LightHistoryEntry,
-        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
-        LightUtxoEntry, LightUtxosResponse, LockSpendOutput, LockSpendSummary, NodeResponse,
-        PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse,
-        PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
-        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
-        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
-        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        GhostLockSignedResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
+        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
+        LightReceiveResponse, LightUtxoEntry, LightUtxosResponse, LockSpendOutput,
+        LockSpendSummary, NodeResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse,
+        PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse,
+        ReleaseManifest, Request, Response, SignerInfoIpc, WalletAuthInfoResponse,
+        WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry,
+        WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
+        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -185,6 +186,18 @@ mod server {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("history.json");
         wraith_wallet_core::history_store::HistoryStore::open(path)
+    }
+
+    /// Open the store of silent payments the scanner has found.
+    fn detection_store_for(
+        state: &DaemonState,
+    ) -> std::io::Result<wraith_wallet_core::detection_store::DetectionStore> {
+        let path = state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("detections.json");
+        wraith_wallet_core::detection_store::DetectionStore::open(path)
     }
 
     /// Open the block scanner's bookmark.
@@ -2188,6 +2201,14 @@ mod server {
         let Some(ours) = own_script_pubkeys(state).await else {
             return Ok(0);
         };
+        // The Ghost ID's scan and spend keys. A silent payment lands on a key
+        // derived from these rather than on any address the wallet published,
+        // so `ours` above cannot find one.
+        let ghost_keys = with_active_wallet(state, |_, ks| {
+            ks.ghost_keys().map_err(|e| format!("ghost keys: {e}"))
+        })
+        .await
+        .ok();
         let Some(rpc) = state.build_ghostd_rpc().await else {
             return Ok(0);
         };
@@ -2264,6 +2285,57 @@ mod server {
                     .map_err(|e| format!("join: {e}"))?
                     .map_err(|e| format!("getblock {height}: {e}"))?
             };
+            // Silent payments first: a detection is also money arriving, and
+            // recording it as history below keeps one story rather than two.
+            if let Some(keys) = ghost_keys.as_ref() {
+                let mut found = Vec::new();
+                for (txid, ephemeral, outputs) in
+                    wraith_wallet_core::block_scan::candidates_in_block(&block)
+                {
+                    match wraith_wallet_core::candidate_scan::scan_candidate(
+                        keys,
+                        &ephemeral,
+                        &outputs,
+                        &txid,
+                        Some(height),
+                    ) {
+                        Ok(hits) => found.extend(hits),
+                        // A malformed announcement is somebody else's problem,
+                        // not a reason to stop scanning the chain.
+                        Err(e) => tracing::debug!(txid = %txid, error = %e, "candidate skipped"),
+                    }
+                }
+                if !found.is_empty() {
+                    let mut detections =
+                        detection_store_for(state).map_err(|e| format!("detections: {e}"))?;
+                    let credited: i64 = found
+                        .iter()
+                        .filter_map(|d| d.amount_sats)
+                        .fold(0i64, |a, v| a.saturating_add(v as i64));
+                    let txid = found[0].txid.clone();
+                    let n = detections
+                        .record_all(found)
+                        .map_err(|e| format!("detections write: {e}"))?;
+                    if n > 0 {
+                        tracing::info!(height, coins = n, "silent payment detected");
+                        history
+                            .record(wraith_wallet_core::history_store::HistoryEntry {
+                                txid,
+                                at: block.time,
+                                block_height: Some(height),
+                                amount_sats: Some(credited),
+                                // The sender paid the fee; the receiver of a
+                                // silent payment has no way to know what it was
+                                // and no reason to be charged for it on paper.
+                                fee_sats: None,
+                                kind: "receive".to_string(),
+                                memo: None,
+                            })
+                            .map_err(|e| format!("history write: {e}"))?;
+                    }
+                }
+            }
+
             for m in wraith_wallet_core::block_scan::scan_block(&block, &ours) {
                 history
                     .record(wraith_wallet_core::history_store::HistoryEntry {
@@ -3917,6 +3989,25 @@ mod server {
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
+            Request::LightDetected => match detection_store_for(state) {
+                Err(e) => Response::Error(ErrorResponse {
+                    message: format!("detections: {e}"),
+                }),
+                Ok(store) => Response::LightDetected(LightDetectedResponse {
+                    detections: store
+                        .list()
+                        .into_iter()
+                        .map(|d| DetectedPaymentEntry {
+                            txid: d.txid,
+                            vout: d.vout,
+                            amount_sats: d.amount_sats,
+                            block_height: d.block_height,
+                            k: d.k,
+                            received_at: d.received_at,
+                        })
+                        .collect(),
+                }),
+            },
             Request::LightHistory { limit, offset } => {
                 return Envelope::new(id, l1_history(state, limit, offset).await)
             }

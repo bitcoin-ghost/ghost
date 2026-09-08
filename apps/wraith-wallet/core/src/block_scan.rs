@@ -14,7 +14,8 @@
 
 use std::collections::HashSet;
 
-use crate::ghostd::VerboseBlock;
+use crate::candidate_scan::CandidateOutput;
+use crate::ghostd::{BlockTx, VerboseBlock};
 
 /// What one transaction in a block did to the wallet.
 ///
@@ -130,6 +131,79 @@ pub fn scan_block(block: &VerboseBlock, ours: &HashSet<Vec<u8>>) -> Vec<WalletMo
         });
     }
     out
+}
+
+/// The scriptPubKey of a Ghost silent-payment announcement:
+/// `OP_RETURN PUSH33 <compressed pubkey>`.
+const OP_RETURN: u8 = 0x6a;
+const PUSH33: u8 = 0x21;
+const ANNOUNCE_LEN: usize = 35;
+
+/// The scriptPubKey of a taproot output: `OP_1 PUSH32 <x-only key>`.
+const OP_1: u8 = 0x51;
+const PUSH32: u8 = 0x20;
+const P2TR_LEN: usize = 34;
+
+/// Pull a silent-payment candidate out of one transaction.
+///
+/// Returns the sender's ephemeral pubkey (hex, compressed) and every taproot
+/// output that could be the payment, ready for
+/// [`crate::candidate_scan::scan_candidate`]. `None` when the transaction
+/// carries no announcement, which is almost all of them.
+///
+/// # The format
+///
+/// A Ghost silent payment announces itself with an `OP_RETURN` output holding
+/// exactly one 33-byte compressed pubkey, and pays a taproot output derived
+/// from it and the receiver's Ghost ID. Both halves are matched on the exact
+/// script shape rather than by parsing: an `OP_RETURN` of some other length is
+/// somebody else's data, and treating it as a pubkey would feed noise to the
+/// scanner on every block.
+///
+/// Only the FIRST announcement is taken. A transaction carrying two is not a
+/// payment with a spare key, it is malformed — and picking one at random would
+/// make detection depend on output ordering.
+pub fn candidate_in(tx: &BlockTx) -> Option<(String, Vec<CandidateOutput>)> {
+    let mut ephemeral: Option<String> = None;
+    let mut outputs = Vec::new();
+
+    for v in &tx.vout {
+        let Ok(spk) = hex::decode(&v.script_pubkey.hex) else {
+            continue;
+        };
+        if spk.len() == ANNOUNCE_LEN && spk[0] == OP_RETURN && spk[1] == PUSH33 {
+            if ephemeral.is_none() {
+                ephemeral = Some(hex::encode(&spk[2..ANNOUNCE_LEN]));
+            }
+            continue;
+        }
+        if spk.len() == P2TR_LEN && spk[0] == OP_1 && spk[1] == PUSH32 {
+            outputs.push(CandidateOutput {
+                // x-only, as it appears on chain. The scanner tries both
+                // parities, because a taproot output does not record which.
+                output_pubkey: hex::encode(&spk[2..P2TR_LEN]),
+                amount_sats: Some(v.value_sats()),
+                vout: v.n,
+            });
+        }
+    }
+
+    // An announcement with nothing to pay into is not a candidate. Scanning it
+    // would cost an ECDH per block for a transaction that cannot match.
+    let ephemeral = ephemeral?;
+    if outputs.is_empty() {
+        return None;
+    }
+    Some((ephemeral, outputs))
+}
+
+/// Every silent-payment candidate in a block, with its txid.
+pub fn candidates_in_block(block: &VerboseBlock) -> Vec<(String, String, Vec<CandidateOutput>)> {
+    block
+        .tx
+        .iter()
+        .filter_map(|tx| candidate_in(tx).map(|(e, o)| (tx.txid.clone(), e, o)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -265,6 +339,199 @@ mod tests {
         let m = &scan_block(&b, &ours_set(&[0xaa]))[0];
         assert_eq!(m.spent_sats, 100_000_000, "the input we could see was ours");
         assert_eq!(m.fee_sats, None, "a partial fee is a wrong fee");
+    }
+
+    fn announce_hex(tag: u8) -> String {
+        // 6a 21 <33 bytes>. The leading 0x02 keeps it a plausible compressed
+        // key; the extractor does not validate the curve point, the scanner
+        // does.
+        let mut v = vec![0x6a, 0x21, 0x02];
+        v.extend_from_slice(&[tag; 32]);
+        hex::encode(v)
+    }
+
+    fn tx_with_scripts(txid: &str, scripts: &[(u32, f64, String)]) -> crate::ghostd::BlockTx {
+        let vout: Vec<serde_json::Value> = scripts
+            .iter()
+            .map(|(n, value, hex)| {
+                serde_json::json!({ "n": n, "value": value, "scriptPubKey": { "hex": hex } })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({ "txid": txid, "vin": [], "vout": vout }))
+            .expect("tx fixture")
+    }
+
+    /// The shape the sender writes: one announcement, one taproot output.
+    #[test]
+    fn an_announcement_and_a_taproot_output_make_a_candidate() {
+        let tx = tx_with_scripts(
+            "aa",
+            &[
+                (0, 0.0, announce_hex(0x11)),
+                (1, 0.5, spk_hex(0xaa)),
+                (2, 0.4, "76a914".to_string() + &"00".repeat(20) + "88ac"),
+            ],
+        );
+        let (eph, outs) = candidate_in(&tx).expect("a candidate");
+        assert_eq!(eph.len(), 66, "33 bytes, compressed");
+        assert_eq!(outs.len(), 1, "only the taproot output is a candidate");
+        assert_eq!(outs[0].vout, 1);
+        assert_eq!(outs[0].amount_sats, Some(50_000_000));
+        assert_eq!(outs[0].output_pubkey.len(), 64, "x-only, 32 bytes");
+    }
+
+    /// Almost every transaction on the chain is not a silent payment, and
+    /// running an ECDH over each one would make scanning cost real money.
+    #[test]
+    fn a_transaction_without_an_announcement_is_not_a_candidate() {
+        let tx = tx_with_scripts("aa", &[(0, 0.5, spk_hex(0xaa))]);
+        assert!(candidate_in(&tx).is_none());
+    }
+
+    /// An OP_RETURN of the wrong length is somebody else's data. Treating it
+    /// as a pubkey would feed noise to the scanner on every block.
+    #[test]
+    fn an_op_return_of_another_length_is_not_an_announcement() {
+        let tx = tx_with_scripts(
+            "aa",
+            &[
+                (0, 0.0, "6a0b68656c6c6f20776f726c64".into()),
+                (1, 0.5, spk_hex(0xaa)),
+            ],
+        );
+        assert!(candidate_in(&tx).is_none());
+    }
+
+    /// An announcement paying nothing into taproot cannot match anything.
+    #[test]
+    fn an_announcement_with_no_taproot_output_is_not_a_candidate() {
+        let tx = tx_with_scripts(
+            "aa",
+            &[
+                (0, 0.0, announce_hex(0x11)),
+                (1, 0.5, "76a914".to_string() + &"00".repeat(20) + "88ac"),
+            ],
+        );
+        assert!(candidate_in(&tx).is_none());
+    }
+
+    /// Two announcements is malformed, not a payment with a spare key. Taking
+    /// the first makes detection independent of output ordering.
+    #[test]
+    fn a_second_announcement_is_ignored_rather_than_replacing_the_first() {
+        let tx = tx_with_scripts(
+            "aa",
+            &[
+                (0, 0.0, announce_hex(0x11)),
+                (1, 0.0, announce_hex(0x22)),
+                (2, 0.5, spk_hex(0xaa)),
+            ],
+        );
+        let (eph, _) = candidate_in(&tx).expect("a candidate");
+        assert_eq!(eph, announce_hex(0x11)[4..], "the first announcement wins");
+    }
+
+    /// The two halves must fit: what a sender writes into a block is what the
+    /// scanner finds.
+    ///
+    /// This is the assumption the whole silent-payment path rests on. The
+    /// announcement format was recovered from the retired operator service, so
+    /// a test that only exercised the extractor against fixtures I wrote would
+    /// prove I am consistent with myself. Here the sender is real
+    /// `ghost-keys` — ECDH, the v2 address derivation, the taproot x-only
+    /// truncation — and the receiver is the real scanner. Nothing in between
+    /// is hand-written except the block encoding, which is the thing under
+    /// test.
+    #[test]
+    fn a_real_silent_payment_survives_the_round_trip_through_a_block() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use ghost_keys::{derive_payment_address_v2, derive_shared_secret, GhostKeys};
+        use rand::RngCore;
+
+        let receiver = GhostKeys::generate();
+
+        // Sender: a one-shot ephemeral key, ECDH against the receiver's
+        // published scan key, then the output key at k = 0.
+        let secp = Secp256k1::new();
+        let mut eph = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut eph);
+        let eph_secret = SecretKey::from_slice(&eph).expect("nonzero scalar");
+        let eph_pub = PublicKey::from_secret_key(&secp, &eph_secret);
+        let shared = derive_shared_secret(&eph_secret, receiver.scan_pubkey());
+        let (output_pubkey, _) =
+            derive_payment_address_v2(receiver.spend_pubkey(), &shared, 0).expect("derive");
+
+        // On chain: the announcement, and the payment as a taproot output —
+        // which keeps only the x-coordinate.
+        let mut announce = vec![0x6a, 0x21];
+        announce.extend_from_slice(&eph_pub.serialize());
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&output_pubkey.serialize()[1..]);
+
+        let tx = tx_with_scripts(
+            "feed",
+            &[
+                (0, 0.0, hex::encode(&announce)),
+                // A decoy taproot output that is not ours, so the scanner has
+                // to pick rather than accept whatever it is handed.
+                (1, 0.25, spk_hex(0xcc)),
+                (2, 0.5, hex::encode(&p2tr)),
+            ],
+        );
+
+        let (eph_hex, outs) = candidate_in(&tx).expect("the announcement is found");
+        let found = crate::candidate_scan::scan_candidate(
+            &receiver,
+            &eph_hex,
+            &outs,
+            "feed",
+            Some(900_000),
+        )
+        .expect("scan runs");
+
+        assert_eq!(found.len(), 1, "exactly the one output that was ours");
+        assert_eq!(found[0].vout, 2, "and at the right output index");
+        assert_eq!(found[0].amount_sats, Some(50_000_000));
+        assert_eq!(found[0].k, 0);
+        assert_eq!(found[0].block_height, Some(900_000));
+    }
+
+    /// The same payment addressed to somebody else must not match, or the
+    /// test above would pass for a scanner that accepted anything.
+    #[test]
+    fn a_silent_payment_to_a_stranger_is_not_detected() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use ghost_keys::{derive_payment_address_v2, derive_shared_secret, GhostKeys};
+        use rand::RngCore;
+
+        let us = GhostKeys::generate();
+        let them = GhostKeys::generate();
+
+        let secp = Secp256k1::new();
+        let mut eph = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut eph);
+        let eph_secret = SecretKey::from_slice(&eph).unwrap();
+        let eph_pub = PublicKey::from_secret_key(&secp, &eph_secret);
+        let shared = derive_shared_secret(&eph_secret, them.scan_pubkey());
+        let (output_pubkey, _) =
+            derive_payment_address_v2(them.spend_pubkey(), &shared, 0).unwrap();
+
+        let mut announce = vec![0x6a, 0x21];
+        announce.extend_from_slice(&eph_pub.serialize());
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&output_pubkey.serialize()[1..]);
+
+        let tx = tx_with_scripts(
+            "feed",
+            &[
+                (0, 0.0, hex::encode(&announce)),
+                (1, 0.5, hex::encode(&p2tr)),
+            ],
+        );
+        let (eph_hex, outs) = candidate_in(&tx).expect("announcement present");
+        let found =
+            crate::candidate_scan::scan_candidate(&us, &eph_hex, &outs, "feed", None).unwrap();
+        assert!(found.is_empty(), "not ours, got {found:?}");
     }
 
     /// BTC→sats must round, not truncate, on both sides of the ledger.
