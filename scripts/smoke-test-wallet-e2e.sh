@@ -213,10 +213,35 @@ BCLI="$GHOST_CLI ${GHOSTD_NET[0]} -datadir=$GHOSTD_DIR -rpcuser=demo -rpcpasswor
 # chain silently fails to advance and the first symptom is "Insufficient funds"
 # somewhere far away.
 mine() {
-    local want="$1" got
-    got=$($BCLI -rpcwallet=demo generatetoaddress "$want" "$DEMO_ADDR" 1000000000 | jq 'length')
-    [ "$got" = "$want" ] \
-        || fail "asked for $want blocks on $NETWORK, mined $got — the chain did not advance"
+    local want="$1" start target now next stalled=0
+    start=$($BCLI getblockcount)
+    target=$((start + want))
+    now=$start
+    # Loop to a target HEIGHT rather than trusting one call, because `maxtries`
+    # is a budget for the whole call and not per block: on signet one billion
+    # tries buys about 200 blocks, and the call then returns the blocks it did
+    # find with exit 0. Asking once and believing the answer is how a run ends
+    # up 800 blocks short and reports it as "Insufficient funds" much later.
+    local chunk
+    while [ "$now" -lt "$target" ]; do
+        # In bounded chunks, and tolerating a failed call. A single request for
+        # a thousand signet blocks grinds for longer than the RPC timeout, and
+        # under `set -e` that non-zero exit kills the run outright — no message,
+        # just the cleanup trap, which reads like the script simply stopped.
+        chunk=$((target - now))
+        [ "$chunk" -gt 50 ] && chunk=50
+        $BCLI -rpcwallet=demo generatetoaddress "$chunk" "$DEMO_ADDR" 500000000 \
+            >/dev/null 2>&1 || true
+        next=$($BCLI getblockcount)
+        if [ "$next" -le "$now" ]; then
+            stalled=$((stalled + 1))
+            [ "$stalled" -ge 20 ] \
+                && fail "mining stalled at height $next on $NETWORK, wanted $target"
+        else
+            stalled=0
+        fi
+        now=$next
+    done
 }
 $BCLI -named createwallet wallet_name=demo descriptors=true >/dev/null 2>&1 || true
 $BCLI loadwallet demo >/dev/null 2>&1 || true
