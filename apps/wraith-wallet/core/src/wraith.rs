@@ -95,6 +95,27 @@ pub enum WraithClientError {
         /// What this wallet counted for itself.
         report: wraith_protocol::anonymity_set::SetReport,
     },
+    /// The round has too few seats to reach this wallet's floor, seen while
+    /// it could still be left without cost.
+    ///
+    /// Deliberately not a [`Self::RefusedRound`]: that carries this wallet's
+    /// own recount of an assembled transaction, and this carries a seat count
+    /// taken before any transaction exists.
+    ///
+    /// Seats, not entities, because entities are counted from committed inputs
+    /// and are therefore zero until somebody commits. Seats bound entities
+    /// from above, so too few seats proves the floor is unreachable; enough
+    /// seats proves nothing, and the real check still runs at `inspect`.
+    ///
+    /// Checking here rather than at `inspect` is the whole point. Refusing
+    /// after `/inputs` leaves the wallet a non-signer, and the sweep bans its
+    /// outpoint for a cooldown — punishing the wallet for enforcing its own
+    /// privacy policy.
+    #[error(
+        "round has {seats} seats, too few to reach this wallet's floor of \
+         {min_entities} entities; left before committing the coin"
+    )]
+    RoundTooSmallToJoin { seats: usize, min_entities: usize },
     #[error("hex decode: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error("bitcoin consensus encode: {0}")]
@@ -628,7 +649,38 @@ impl WraithSessionClient {
         //     until quorum forms (or the fill window expires). Bounded
         //     poll loop with backoff; gives up after the round's fill
         //     window plus a safety margin.
-        self.wait_for_locked(&session_id).await?;
+        let locked = self.wait_for_locked(&session_id).await?;
+
+        // 2c. Leave now if the round cannot possibly meet the floor.
+        //
+        //     This is the last moment leaving is free. `/inputs` below commits
+        //     the outpoint to this round, and a wallet that then declines to
+        //     sign is swept as a non-signer and has that outpoint banned for a
+        //     cooldown. The protocol assembles at five and this wallet's floor
+        //     defaults to ten, so landing in a legal round below the floor is
+        //     an ordinary event rather than an attack — and must not cost the
+        //     coin.
+        //
+        //     Judged on SEATS, which is all that exists yet. The entity count
+        //     is derived from committed inputs, so before anyone commits it is
+        //     zero and says nothing. Seats bound entities from above —
+        //     clustering only ever collapses seats together, never splits one
+        //     — so `seats < floor` proves the floor is unreachable, while
+        //     `seats >= floor` proves nothing and is left to `inspect`, which
+        //     recounts from the chain once the transaction exists.
+        let seats = locked.session.slots_filled as usize;
+        if seats < request.min_entities {
+            debug!(
+                %session_id,
+                seats,
+                min_entities = request.min_entities,
+                "round cannot reach this wallet's anonymity floor; leaving before committing"
+            );
+            return Err(WraithClientError::RoundTooSmallToJoin {
+                seats,
+                min_entities: request.min_entities,
+            });
+        }
 
         // 3. Commit UTXO. The 5th /inputs auto-advances the round to
         //    Signing on the coordinator side. Earlier submitters
@@ -948,14 +1000,20 @@ impl WraithSessionClient {
     /// caller forever. Polls every 250ms — frequent enough to ride
     /// the manual state-flip in tests, sparse enough to avoid
     /// hammering a real coordinator.
-    async fn wait_for_locked(&self, session_id: &str) -> Result<(), WraithClientError> {
+    /// Block until the round is joinable, and hand back the status that said
+    /// so — the caller needs its headcount, and re-fetching would be a second
+    /// round-trip for a figure already in hand.
+    async fn wait_for_locked(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionStatusResponse, WraithClientError> {
         let deadline = std::time::Instant::now() + Duration::from_secs(360);
         loop {
             let status: SessionStatusResponse = self
                 .get_json(&format!("/api/v1/session/{session_id}"))
                 .await?;
             match status.session.state.as_str() {
-                "locked" | "signing" => return Ok(()),
+                "locked" | "signing" => return Ok(status),
                 "failed" => {
                     return Err(WraithClientError::Coordinator {
                         status: 410,

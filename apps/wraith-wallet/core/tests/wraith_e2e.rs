@@ -272,6 +272,123 @@ async fn wait_for_quorum(state: &CoordinatorState) -> String {
     }
 }
 
+/// A round below the wallet's floor is left BEFORE the coin is committed.
+///
+/// The protocol assembles rounds at five participants; this wallet's default
+/// floor is ten. Landing in a legal round that is too small is therefore
+/// ordinary, and it must be free to walk away from.
+///
+/// It was not. The floor was only checked by `inspect`, which runs on the
+/// assembled transaction — long after `/inputs` has committed the outpoint to
+/// the round. A wallet that then declined to sign was swept as a non-signer
+/// and had its own outpoint banned for a cooldown: punished for enforcing its
+/// own privacy policy.
+///
+/// The assertion that matters is the second one. An error alone would still be
+/// satisfied by refusing too late, so this checks the coordinator's input
+/// store is empty — that the coin was never handed over.
+#[tokio::test]
+async fn a_round_below_the_floor_is_left_before_the_coin_is_committed() {
+    let stub_broadcaster = StubBroadcaster::new();
+    let state = Arc::new(
+        CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(wraith_protocol::SystemClock),
+            Arc::new(wraith_protocol::RandomSessionIdGenerator),
+            Some(signet_addr(99)),
+            Some(Arc::new(stub_broadcaster.clone()) as Arc<dyn Broadcaster>),
+        )
+        .with_utxo_source(Arc::new(participant_utxos())),
+    );
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("axum serve");
+    });
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    // Five wallets enrol — a legal round, and exactly the size the protocol
+    // is allowed to assemble.
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let base_url = base_url.clone();
+        handles.push(tokio::spawn(async move {
+            let client = WraithSessionClient::new(base_url, Network::Signet);
+            let req = MixRequest {
+                // Ten: the wallet's real default, and twice what this round
+                // can hold.
+                min_entities: 10,
+                tier_id: TIER_ID.into(),
+                ghost_id: format!("wallet-{i}"),
+                utxo: ParticipantUtxo {
+                    txid: "11".repeat(32),
+                    vout: i as u32,
+                    value_sats: SEAT_PRICE,
+                    scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
+                },
+                mix_output_address: participant_address(i as u8 + 10).to_string(),
+            };
+            let prove = move |challenge: &str| {
+                let challenge = challenge.to_string();
+                async move {
+                    let txid = "11".repeat(32);
+                    let sid = challenge.lines().nth(1).unwrap_or_default().to_string();
+                    Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
+                }
+            };
+            client.prepare_mix(req, prove).await
+        }));
+    }
+
+    // Drive the round to Locked, the point at which the headcount is knowable.
+    let session_id = wait_for_quorum(&state).await;
+    state
+        .sessions
+        .apply_event(SessionGossipEvent::StateChanged {
+            session_id: session_id.clone(),
+            new_state: LiteSessionState::Locked,
+        })
+        .expect("apply Locked");
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let outcome = h.await.expect("wallet task");
+        match outcome {
+            Err(WraithClientError::RoundTooSmallToJoin {
+                seats,
+                min_entities,
+            }) => {
+                assert_eq!(min_entities, 10, "wallet {i} reported the wrong floor");
+                assert_eq!(
+                    seats, N,
+                    "wallet {i} should have seen all {N} enrolled seats, saw {seats} — \
+                     a count that is zero before anyone commits would make this test \
+                     pass for the wrong reason"
+                );
+            }
+            other => panic!("wallet {i} should have left the round early, got {other:?}"),
+        }
+    }
+
+    // The point of leaving early: nothing was committed, so nothing can be
+    // swept as a non-signer.
+    let committed = state
+        .inputs_store
+        .lock()
+        .expect("inputs_store")
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        committed.is_empty(),
+        "{} coins were committed to a round every wallet refused; each is now \
+         exposed to the non-signer sweep",
+        committed.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SOCKS5 proxy wiring (B: Tor anonymity for /outputs)
 // ---------------------------------------------------------------------------
