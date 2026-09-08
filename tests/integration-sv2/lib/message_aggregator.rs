@@ -6,16 +6,70 @@ use stratum_apps::{
 
 use crate::types::MsgType;
 
-/// The intercepted-message queue: message type, the message itself, and any TLV extension
-/// fields that rode along with it.
+/// One intercepted message: its type, the message, and any TLV extension fields that rode along.
+type QueuedMessage = (MsgType, AnyMessage<'static>, Option<Vec<Tlv>>);
+
+/// The intercepted-message queue, plus a count of how many of each message type it holds.
 ///
-/// Named rather than repeated so the accessors can return it without each needing its own
-/// `#[allow(clippy::type_complexity)]`.
-type MessageQueue = Arc<Mutex<VecDeque<(MsgType, AnyMessage<'static>, Option<Vec<Tlv>>)>>>;
+/// ⛔ The counts exist because this queue is UNBOUNDED and, in practice, large. A sniffer sitting
+/// in front of a mining channel accumulates every share the miner submits — a test that waits
+/// without draining reached **131,783** queued messages in 66 seconds (#849). At that size an
+/// O(n) lookup is not a constant factor, it is the difference between a test passing and a test
+/// reporting a message it can see as absent:
+///
+///   * `has_message_type` scanned the whole deque. `Sniffer::wait_for_message_type` guards that
+///     scan with a 1-second timeout and maps expiry to `false`, so once the scan exceeded a
+///     second, a message that WAS queued reported as "not present" — indistinguishably from
+///     genuinely absent. The test then failed saying the message never went upstream, which was
+///     untrue.
+///   * `next_message_with_tlvs` and `has_message_type_with_remove` CLONED the entire deque on
+///     every call, to pop one element or drop a prefix. Called in a loop, as those tests do,
+///     that is O(n²) in the queue length.
+///
+/// Message types are `u8`, so a 256-slot array indexes them exactly and needs no hashing. It is
+/// maintained under the same lock as the deque — every push increments and every removal
+/// decrements — so the two can never disagree.
+struct Queued {
+    deque: VecDeque<QueuedMessage>,
+    counts: [usize; 256],
+}
+
+impl Queued {
+    fn new() -> Self {
+        Self {
+            deque: VecDeque::new(),
+            counts: [0; 256],
+        }
+    }
+
+    fn push(&mut self, msg: QueuedMessage) {
+        self.counts[msg.0 as usize] += 1;
+        self.deque.push_back(msg);
+    }
+
+    fn pop(&mut self) -> Option<QueuedMessage> {
+        let msg = self.deque.pop_front()?;
+        // Saturating rather than plain subtraction: an underflow here would mean the count and the
+        // deque had already diverged, and panicking in a test harness helper hides the real bug.
+        let slot = &mut self.counts[msg.0 as usize];
+        *slot = slot.saturating_sub(1);
+        Some(msg)
+    }
+}
+
+type MessageQueue = Arc<Mutex<Queued>>;
 
 #[derive(Debug, Clone)]
 pub struct MessagesAggregator {
     messages: MessageQueue,
+}
+
+impl std::fmt::Debug for Queued {
+    // The messages themselves are large and the counts are 256 mostly-zero slots; neither is
+    // useful in a panic message. Report what a reader actually wants: how much is queued.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Queued({} messages)", self.deque.len())
+    }
 }
 
 impl Default for MessagesAggregator {
@@ -28,7 +82,7 @@ impl MessagesAggregator {
     /// Creates a new [`MessagesAggregator`].
     pub fn new() -> Self {
         Self {
-            messages: Arc::new(Mutex::new(VecDeque::new())),
+            messages: Arc::new(Mutex::new(Queued::new())),
         }
     }
 
@@ -45,7 +99,7 @@ impl MessagesAggregator {
         tlv_fields: Option<Vec<Tlv>>,
     ) {
         self.messages
-            .safe_lock(|messages| messages.push_back((msg_type, message, tlv_fields)))
+            .safe_lock(|q| q.push((msg_type, message, tlv_fields)))
             .unwrap();
     }
 
@@ -57,48 +111,47 @@ impl MessagesAggregator {
 
     /// Returns false if the queue is empty, true otherwise.
     pub fn is_empty(&self) -> bool {
-        self.messages
-            .safe_lock(|messages| messages.is_empty())
-            .unwrap()
+        self.messages.safe_lock(|q| q.deque.is_empty()).unwrap()
     }
 
     /// Clears all messages from the queue.
     pub fn clear(&self) {
         self.messages
-            .safe_lock(|messages| messages.clear())
+            .safe_lock(|q| {
+                q.deque.clear();
+                q.counts = [0; 256];
+            })
             .unwrap();
     }
 
-    /// returns true if contains message_type
+    /// Returns true if the queue contains a message of this type.
+    ///
+    /// O(1) — a counter lookup, not a scan. See [`Queued`] for why that matters here.
     pub fn has_message_type(&self, message_type: u8) -> bool {
-        let has_message: bool = self
-            .messages
-            .safe_lock(|messages| {
-                for (t, _, _) in messages.iter() {
-                    if *t == message_type {
-                        return true; // Exit early with `true`
-                    }
-                }
-                false // Default value if no match is found
-            })
-            .unwrap();
-        has_message
+        self.messages
+            .safe_lock(|q| q.counts[message_type as usize] > 0)
+            .unwrap()
     }
 
     /// returns true if contains message_type and removes messages from the queue
     /// until the first message of type message_type.
     pub fn has_message_type_with_remove(&self, message_type: u8) -> bool {
         self.messages
-            .safe_lock(|messages| {
-                let mut cloned_messages = messages.clone();
-                for (pos, (t, _, _)) in cloned_messages.iter().enumerate() {
-                    if *t == message_type {
-                        let drained = cloned_messages.drain(pos + 1..).collect();
-                        *messages = drained;
-                        return true;
-                    }
+            .safe_lock(|q| {
+                if q.counts[message_type as usize] == 0 {
+                    // O(1) rejection: without this the miss case still walked the whole queue.
+                    return false;
                 }
-                false
+                let pos = match q.deque.iter().position(|(t, _, _)| *t == message_type) {
+                    Some(pos) => pos,
+                    None => return false,
+                };
+                // Drop everything up to and including the match, in place. This used to clone the
+                // whole deque and reassign it.
+                for _ in 0..=pos {
+                    q.pop();
+                }
+                true
             })
             .unwrap()
     }
@@ -116,21 +169,7 @@ impl MessagesAggregator {
     /// with its TLV fields in the queue.
     ///
     /// The returned message is removed from the queue.
-    pub fn next_message_with_tlvs(
-        &self,
-    ) -> Option<(MsgType, AnyMessage<'static>, Option<Vec<Tlv>>)> {
-        let is_state = self
-            .messages
-            .safe_lock(|messages| {
-                let mut cloned = messages.clone();
-                if let Some((msg_type, msg, tlv_fields)) = cloned.pop_front() {
-                    *messages = cloned;
-                    Some((msg_type, msg, tlv_fields))
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        is_state
+    pub fn next_message_with_tlvs(&self) -> Option<QueuedMessage> {
+        self.messages.safe_lock(|q| q.pop()).unwrap()
     }
 }
