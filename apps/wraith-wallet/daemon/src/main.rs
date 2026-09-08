@@ -1049,15 +1049,38 @@ mod server {
             tokio::spawn(idle_lock_task(state.clone()));
         }
 
-        // Unix-domain sockets leave a filesystem entry; clear any stale one
-        // and ensure the parent dir exists before binding. Windows named
-        // pipes have no such artefact, so this housekeeping is unix-only.
+        // Unix-domain sockets leave a filesystem entry; clear a stale one and
+        // ensure the parent dir exists before binding. Windows named pipes have
+        // no such artefact, so this housekeeping is unix-only.
+        //
+        // The entry is only stale if nothing answers on it. This used to remove
+        // it unconditionally, which let a second daemon take the endpoint away
+        // from a running one. Both then served the same wallets directory with
+        // their own in-process locks, which is precisely the arrangement the
+        // store locks cannot protect: every read-modify-write race they exist
+        // to stop comes back across the process boundary, and the first daemon
+        // is left holding a listener nothing will ever connect to.
         #[cfg(unix)]
         {
             if socket_path.exists() {
+                let live = match wraith_wallet_ipc::endpoint_name() {
+                    Ok(name) => IpcStream::connect(name).await.is_ok(),
+                    Err(_) => false,
+                };
+                if live {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "another wraithd is already listening on {} and serving this \
+                             wallets directory. Two daemons on one directory corrupt each \
+                             other's stores. Stop the running one first.",
+                            socket_path.display()
+                        ),
+                    ));
+                }
                 tracing::warn!(
                     path = %socket_path.display(),
-                    "stale socket file present, removing"
+                    "stale socket file present (nothing answered on it), removing"
                 );
                 fs::remove_file(&socket_path)?;
             }
