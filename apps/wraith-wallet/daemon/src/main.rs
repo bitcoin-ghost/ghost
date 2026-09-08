@@ -2992,6 +2992,20 @@ mod server {
         state: &Arc<DaemonState>,
         scriptpubkey_hex: &str,
     ) -> Option<ghost_lock::Compartment> {
+        lane_of_script(state, scriptpubkey_hex)
+            .await
+            .map(|(_, kind)| kind.compartment())
+    }
+
+    /// Which Lock and lane a coin sits in, if any.
+    ///
+    /// The lane matters and not just the compartment: two coins in different
+    /// lanes of one Lock are in the same compartment, and spending them
+    /// together still collapses the separation the lanes exist to create.
+    async fn lane_of_script(
+        state: &Arc<DaemonState>,
+        scriptpubkey_hex: &str,
+    ) -> Option<(String, wraith_wallet_core::ghost_lock_account::LaneKind)> {
         let want = scriptpubkey_hex.trim();
         let ids: Vec<String> = {
             let store = ghost_lock_store_for(state).ok()?;
@@ -3004,11 +3018,91 @@ mod server {
             for built in &account.lanes {
                 let spk = hex::encode(built.lane.address.script_pubkey().as_bytes());
                 if spk.eq_ignore_ascii_case(want) {
-                    return Some(built.kind.compartment());
+                    return Some((id, built.kind));
                 }
             }
         }
         None
+    }
+
+    /// Refuse a Lock spend that reaches outside the lane being signed.
+    ///
+    /// `check_spend_together` states the Cash boundary. This states the
+    /// stricter rule the lanes actually need, and it rests on the same
+    /// sentence that rule is built on: spending two coins together proves they
+    /// share an owner. That is true of any two coins, not only of a Cash coin
+    /// beside a private one.
+    ///
+    /// A transaction spending a Savings coin beside a Spending coin collapses
+    /// two lanes into one, even though both are `Compartment::Private`. Beside
+    /// an ordinary account-1'-less wallet coin it ties the lane to the public
+    /// wallet. Neither is caught by the compartment rule, and both are exactly
+    /// the linkage the Lock exists to prevent.
+    ///
+    /// So every input must sit in the same lane of the same Lock as the one
+    /// being signed. An input whose previous output the PSBT does not carry is
+    /// refused too: it cannot be shown to be in the lane, and for a rule about
+    /// what a signature reveals, unproven is not good enough.
+    async fn refuse_if_spend_leaves_the_lane(
+        state: &Arc<DaemonState>,
+        psbt: &bitcoin::psbt::Psbt,
+        lock_id: &str,
+        lane: wraith_wallet_core::ghost_lock_account::LaneKind,
+    ) -> Option<String> {
+        for i in 0..psbt.inputs.len() {
+            let Some(txout) = psbt_input_value(psbt, i) else {
+                return Some(format!(
+                    "input {i} carries no previous output, so it cannot be shown to be \
+                     in the {lane:?} lane; refusing rather than signing a transaction \
+                     whose other inputs are unknown"
+                ));
+            };
+            let spk = hex::encode(txout.script_pubkey.as_bytes());
+            match lane_of_script(state, &spk).await {
+                Some((id, kind)) if id == lock_id && kind == lane => {}
+                Some((id, kind)) => {
+                    return Some(format!(
+                        "input {i} is in the {kind:?} lane of Lock {id}, not the {lane:?} \
+                         lane of Lock {lock_id}; spending them together proves one owner \
+                         and collapses the separation the lanes exist to create"
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "input {i} is not in any remembered Lock lane; spending it \
+                         alongside a {lane:?} coin ties that lane to the rest of the \
+                         wallet"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Every check a Lock spend must pass before a signature exists.
+    ///
+    /// One place, because there are three handlers that sign an input of a
+    /// PSBT the caller supplied — quorum co-sign, escape spend, and the
+    /// air-gapped key-path spend — and a rule applied to two of them is a rule
+    /// with a way around it.
+    async fn refuse_unsafe_lock_spend(
+        state: &Arc<DaemonState>,
+        psbt_str: &str,
+        lock_id: &str,
+        lane: &str,
+    ) -> Option<String> {
+        let kind = match parse_lane(lane) {
+            Ok(k) => k,
+            Err(e) => return Some(e),
+        };
+        let parsed = match wraith_wallet_core::psbt::decode_psbt(psbt_str) {
+            Ok((p, _)) => p,
+            Err(e) => return Some(format!("decode psbt: {e}")),
+        };
+        if let Some(reason) = refuse_if_spend_links_compartments(state, &parsed).await {
+            return Some(reason);
+        }
+        refuse_if_spend_leaves_the_lane(state, &parsed, lock_id, kind).await
     }
 
     /// Refuse a spend that would link two compartments.
@@ -3597,29 +3691,16 @@ mod server {
                 coordinator_url,
             } => {
                 use wraith_wallet_core::ghost_lock_account::LaneKind;
-                // Rule 3, before any signature exists: the PSBT came from the
-                // caller, so its other inputs are the caller's choice.
-                match wraith_wallet_core::psbt::decode_psbt(&psbt) {
-                    Ok((parsed, _)) => {
-                        if let Some(reason) =
-                            refuse_if_spend_links_compartments(state, &parsed).await
-                        {
-                            return Envelope::new(
-                                id,
-                                Response::Error(ErrorResponse {
-                                    message: format!("refused the spend: {reason}"),
-                                }),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("decode psbt: {e}"),
-                            }),
-                        )
-                    }
+                // The PSBT came from the caller, so its other inputs are the
+                // caller's choice. Judge them before a signature exists.
+                if let Some(reason) = refuse_unsafe_lock_spend(state, &psbt, &lock_id, &lane).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the spend: {reason}"),
+                        }),
+                    );
                 }
                 let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
                     Ok(v) => v,
@@ -3857,6 +3938,17 @@ mod server {
                 psbt,
                 input_index,
             } => {
+                // Same guard as the other two signing paths: an escape spend
+                // is still a signature over a transaction the caller built.
+                if let Some(reason) = refuse_unsafe_lock_spend(state, &psbt, &lock_id, &lane).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the spend: {reason}"),
+                        }),
+                    );
+                }
                 let (account, kind, record, escape) =
                     match lock_escape_for(state, &lock_id, &lane).await {
                         Ok(v) => v,
@@ -3976,29 +4068,16 @@ mod server {
                 psbt,
                 input_index,
             } => {
-                // Rule 3, before any signature exists: the PSBT came from the
-                // caller, so its other inputs are the caller's choice.
-                match wraith_wallet_core::psbt::decode_psbt(&psbt) {
-                    Ok((parsed, _)) => {
-                        if let Some(reason) =
-                            refuse_if_spend_links_compartments(state, &parsed).await
-                        {
-                            return Envelope::new(
-                                id,
-                                Response::Error(ErrorResponse {
-                                    message: format!("refused the spend: {reason}"),
-                                }),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        return Envelope::new(
-                            id,
-                            Response::Error(ErrorResponse {
-                                message: format!("decode psbt: {e}"),
-                            }),
-                        )
-                    }
+                // The PSBT came from the caller, so its other inputs are the
+                // caller's choice. Judge them before a signature exists.
+                if let Some(reason) = refuse_unsafe_lock_spend(state, &psbt, &lock_id, &lane).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the spend: {reason}"),
+                        }),
+                    );
                 }
                 let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
                     Ok(v) => v,
@@ -6492,17 +6571,24 @@ mod server {
             }
         }
 
-        /// A spend that links two compartments is refused before signing.
+        /// A Lock spend may not reach outside the lane being signed.
         ///
-        /// Compartment rule 3 — `check_spend_together` — had no callers at all
-        /// outside its own tests. That mattered because the Lock signing
-        /// handlers sign one input of a PSBT the CALLER supplies, so the
-        /// caller picks the other inputs. Handing the wallet a transaction
-        /// that spends a Cash coin beside a Savings coin got a signature, and
-        /// the resulting transaction publishes the link between two lanes the
-        /// Lock exists to keep apart.
+        /// Three signing handlers — quorum co-sign, escape, and the air-gapped
+        /// key-path spend — sign one input of a PSBT the CALLER built, so the
+        /// caller chooses the other inputs. Nothing checked them.
+        ///
+        /// `check_spend_together` (compartment rule 3) had no callers at all
+        /// outside its own tests, and even called it only covers the Cash
+        /// boundary. It says nothing about a Savings coin spent beside a
+        /// Spending coin — both are `Compartment::Private` — or beside an
+        /// ordinary wallet coin. Both prove one owner and collapse exactly the
+        /// separation the lanes exist to create.
+        ///
+        /// The last case is the one that keeps this honest: two coins in the
+        /// SAME lane must still be spendable together, or the rule has just
+        /// broken ordinary use.
         #[tokio::test]
-        async fn a_spend_that_links_two_compartments_is_refused() {
+        async fn a_lock_spend_may_not_reach_outside_its_lane() {
             use bitcoin::{absolute::LockTime, transaction::Version, OutPoint, TxIn, TxOut};
 
             let dir = tempfile::tempdir().unwrap();
@@ -6528,35 +6614,36 @@ mod server {
                 let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
                 hex::encode(xk.serialize())
             };
-            let lock_args = |id: u64, save: bool| {
-                let req = if save {
-                    Request::GhostLockSave {
-                        label: Some("rule3".into()),
-                        backup_pubkey: xonly(0x11),
-                        heir_pubkey: xonly(0x22),
-                        quorum_pubkey: xonly(0x33),
-                        anchor_height: 900_000,
-                        inherit_height: 950_000,
-                        bip86_index: None,
-                    }
-                } else {
-                    Request::GhostLockLanes {
-                        backup_pubkey: xonly(0x11),
-                        heir_pubkey: xonly(0x22),
-                        quorum_pubkey: xonly(0x33),
-                        anchor_height: 900_000,
-                        inherit_height: 950_000,
-                        bip86_index: None,
-                    }
-                };
-                serde_json::to_string(&Envelope::new(id, req)).unwrap()
-            };
-
-            let lock_id = match super::dispatch(&lock_args(1, true), &state).await.payload {
+            let save = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockSave {
+                    label: Some("lane-rule".into()),
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            let lock_id = match super::dispatch(&save, &state).await.payload {
                 Response::GhostLockSaved(r) => r.lock.lock_id,
                 other => panic!("could not remember a Lock: {other:?}"),
             };
-            let addr_of = match super::dispatch(&lock_args(2, false), &state).await.payload {
+            let lanes = serde_json::to_string(&Envelope::new(
+                2,
+                Request::GhostLockLanes {
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            let addr_of = match super::dispatch(&lanes, &state).await.payload {
                 Response::GhostLockLanes(r) => r
                     .lanes
                     .iter()
@@ -6564,62 +6651,107 @@ mod server {
                     .collect::<std::collections::HashMap<_, _>>(),
                 other => panic!("expected lanes, got {other:?}"),
             };
-            let spk_of = |kind: &str| {
-                addr_of
-                    .get(kind)
-                    .unwrap_or_else(|| panic!("no {kind} lane"))
-                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
-                    .expect("lane address")
+            let to_spk = |a: &str| {
+                a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                    .expect("address")
                     .assume_checked()
                     .script_pubkey()
             };
-
-            // A transaction the caller built: one Savings input (the one the
-            // wallet is being asked to sign) and one Cash input alongside it.
-            let input = |vout: u32| TxIn {
-                previous_output: OutPoint {
-                    txid: "11".repeat(32).parse().unwrap(),
-                    vout,
-                },
-                ..Default::default()
+            let spk_of = |kind: &str| {
+                to_spk(
+                    addr_of
+                        .get(kind)
+                        .unwrap_or_else(|| panic!("no {kind} lane")),
+                )
             };
-            let tx = bitcoin::Transaction {
-                version: Version(2),
-                lock_time: LockTime::ZERO,
-                input: vec![input(0), input(1)],
-                output: vec![TxOut {
-                    value: bitcoin::Amount::from_sat(150_000),
-                    script_pubkey: spk_of("investments"),
-                }],
-            };
-            let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).expect("psbt");
-            psbt.inputs[0].witness_utxo = Some(TxOut {
-                value: bitcoin::Amount::from_sat(100_000),
-                script_pubkey: spk_of("savings"),
-            });
-            psbt.inputs[1].witness_utxo = Some(TxOut {
-                value: bitcoin::Amount::from_sat(60_000),
-                script_pubkey: spk_of("cash"),
-            });
 
-            let line = serde_json::to_string(&Envelope::new(
-                3,
-                Request::GhostLockSignBegin {
-                    lock_id,
-                    lane: "savings".into(),
-                    psbt: hex::encode(psbt.serialize()),
-                    input_index: 0,
-                },
-            ))
-            .unwrap();
-            match super::dispatch(&line, &state).await.payload {
-                Response::Error(e) => assert!(
-                    e.message.contains("refused the spend"),
-                    "a spend linking Cash to a private lane must be refused by rule 3, \
-                     got: {}",
+            // The wallet's own ordinary receive address — in no lane at all.
+            let loose =
+                serde_json::to_string(&Envelope::new(3, Request::LightReceive { index: 0 }))
+                    .unwrap();
+            let loose_spk = match super::dispatch(&loose, &state).await.payload {
+                Response::LightReceive(r) => to_spk(&r.address),
+                other => panic!("expected a receive address, got {other:?}"),
+            };
+
+            let build = |second: bitcoin::ScriptBuf| {
+                let input = |vout: u32| TxIn {
+                    previous_output: OutPoint {
+                        txid: "11".repeat(32).parse().unwrap(),
+                        vout,
+                    },
+                    ..Default::default()
+                };
+                let tx = bitcoin::Transaction {
+                    version: Version(2),
+                    lock_time: LockTime::ZERO,
+                    input: vec![input(0), input(1)],
+                    output: vec![TxOut {
+                        value: bitcoin::Amount::from_sat(150_000),
+                        script_pubkey: spk_of("investments"),
+                    }],
+                };
+                let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).expect("psbt");
+                psbt.inputs[0].witness_utxo = Some(TxOut {
+                    value: bitcoin::Amount::from_sat(100_000),
+                    script_pubkey: spk_of("savings"),
+                });
+                psbt.inputs[1].witness_utxo = Some(TxOut {
+                    value: bitcoin::Amount::from_sat(60_000),
+                    script_pubkey: second,
+                });
+                // base64: the review step downstream accepts only that form,
+                // so the case that must be ALLOWED has to reach it.
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+            };
+
+            let sign_req = |id: u64, psbt: String| {
+                serde_json::to_string(&Envelope::new(
+                    id,
+                    Request::GhostLockSignBegin {
+                        lock_id: lock_id.clone(),
+                        lane: "savings".into(),
+                        psbt,
+                        input_index: 0,
+                    },
+                ))
+                .unwrap()
+            };
+
+            // Every one of these, spent beside a Savings coin, is linkage.
+            for (label, second) in [
+                ("a Cash coin", spk_of("cash")),
+                ("another lane of the same Lock", spk_of("spending")),
+                ("the wallet's own receive address", loose_spk),
+            ] {
+                match super::dispatch(&sign_req(10, build(second)), &state)
+                    .await
+                    .payload
+                {
+                    Response::Error(e) => assert!(
+                        e.message.contains("refused the spend"),
+                        "spending a Savings coin beside {label} must be refused, got: {}",
+                        e.message
+                    ),
+                    other => panic!("the wallet agreed to link Savings to {label}: {other:?}"),
+                }
+            }
+
+            // And the rule must not have broken ordinary use: two coins in the
+            // same lane still belong in one transaction.
+            // Reaching the signing machinery at all is a pass: it got past the
+            // rule. Only a refusal BY the rule is a failure.
+            if let Response::Error(e) =
+                super::dispatch(&sign_req(20, build(spk_of("savings"))), &state)
+                    .await
+                    .payload
+            {
+                assert!(
+                    !e.message.contains("refused the spend"),
+                    "two coins in the SAME lane must still be spendable together, got: {}",
                     e.message
-                ),
-                other => panic!("the wallet agreed to link two compartments: {other:?}"),
+                );
             }
         }
 
