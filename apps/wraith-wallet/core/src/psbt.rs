@@ -245,6 +245,43 @@ pub fn find_bip86_index_for_script(
     Ok(None)
 }
 
+/// The derivation path of the key that owns `target`, if any.
+///
+/// Walks the plain receive chain first, then the Lock owner chain.
+///
+/// Two families, not one, because a **Cash lane is a bare key-path output for
+/// a Lock owner key** — and its whole design is that it "spends with your key
+/// alone, as an ordinary single-sig input". Lock owner keys live on account
+/// `1'` so a Lock coin is never the same coin as a loose one, which means a
+/// signer that walks only the receive chain cannot sign Cash at all and those
+/// coins are stranded.
+///
+/// The other three lanes are unaffected: their outputs commit to a script tree
+/// and an aggregate internal key, so they never match a bare key-path address
+/// derived here.
+pub fn find_owned_key_path(
+    keystore: &Keystore,
+    network: Network,
+    target: &ScriptBuf,
+    scan_max: u32,
+) -> Result<Option<String>, PsbtError> {
+    for idx in 0..=scan_max {
+        let addr = light::receive_address(keystore, idx, network)
+            .map_err(|e| PsbtError::Light(e.to_string()))?;
+        if &addr.script_pubkey() == target {
+            return Ok(Some(light::receive_path(idx)));
+        }
+    }
+    for idx in 0..=scan_max {
+        let addr = light::lock_owner_address(keystore, idx, network)
+            .map_err(|e| PsbtError::Light(e.to_string()))?;
+        if &addr.script_pubkey() == target {
+            return Ok(Some(light::lock_owner_path(idx)));
+        }
+    }
+    Ok(None)
+}
+
 /// Sign every input of `psbt` that the wallet owns at a BIP86
 /// receive index ≤ `scan_max`. Returns the indices we actually
 /// signed (callers want this for the "signed N of M" UX).
@@ -419,14 +456,15 @@ pub fn sign_owned_inputs(
             continue;
         }
 
-        // Find the BIP86 index, if any, that derives to this spk.
-        let idx = match find_bip86_index_for_script(keystore, network, target_spk, scan_max)? {
-            Some(idx) => idx,
+        // Find the path, if any, that derives to this spk. Covers the plain
+        // receive chain and the Lock owner chain, the latter because a Cash
+        // lane output is a bare key-path output for a Lock owner key.
+        let path = match find_owned_key_path(keystore, network, target_spk, scan_max)? {
+            Some(p) => p,
             None => continue,
         };
 
         // Derive the signing key.
-        let path = format!("m/86'/{}'/0'/0/{}", light::GHOST_COIN_TYPE, idx);
         let xprv = keystore.derive_xprv(&path)?;
         let priv_bytes = xprv.private_key().to_bytes();
         let sk = SecretKey::from_slice(&priv_bytes)

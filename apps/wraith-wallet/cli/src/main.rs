@@ -68,6 +68,16 @@ enum Command {
         #[command(subcommand)]
         sub: MixCommand,
     },
+    /// Sign a PSBT with the active wallet.
+    ///
+    /// Signs every input the keystore owns and leaves the rest alone. Covers
+    /// the plain receive chain and Lock owner keys, so a Cash lane coin —
+    /// which spends with the owner's key alone — signs here like any other
+    /// single-sig input.
+    Psbt {
+        #[command(subcommand)]
+        sub: PsbtCommand,
+    },
     /// Ghost Lock: one account, four compartments.
     ///
     /// Savings needs your backup device; Spending co-signs with the Wraith
@@ -221,6 +231,19 @@ enum MixCommand {
         bip86_index: Option<u32>,
         /// Maximum BIP86 index to scan for a key matching the input
         /// scriptPubKey. Default 1024 (daemon-side).
+        #[arg(long)]
+        bip86_scan_max: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PsbtCommand {
+    /// Sign every input the active wallet owns.
+    Sign {
+        /// The PSBT, base64 or hex.
+        #[arg(long)]
+        psbt: String,
+        /// Bound on the derivation search per input.
         #[arg(long)]
         bip86_scan_max: Option<u32>,
     },
@@ -698,7 +721,7 @@ mod client {
 
     use crate::{
         ChainCommand, Command, LightCommand, LockCommand, LockSignCommand, MixCommand, NodeCommand,
-        UpdateCommand, WalletCommand,
+        PsbtCommand, UpdateCommand, WalletCommand,
     };
 
     pub async fn run(command: Command, json: bool, no_spawn: bool) -> std::process::ExitCode {
@@ -898,6 +921,15 @@ mod client {
                 WalletCommand::Restore { name, from } => Request::WalletRestore {
                     name,
                     from_path: from,
+                },
+            },
+            Command::Psbt { sub } => match sub {
+                PsbtCommand::Sign {
+                    psbt,
+                    bip86_scan_max,
+                } => Request::PsbtSign {
+                    psbt,
+                    bip86_scan_max,
                 },
             },
             Command::Lock { sub } => match sub {

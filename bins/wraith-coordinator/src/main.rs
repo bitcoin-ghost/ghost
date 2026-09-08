@@ -409,11 +409,24 @@ async fn main() -> Result<()> {
                 ),
             }
 
-            let defaulted = cli.lock_ledger_dir.is_none();
-            let dir = cli
-                .lock_ledger_dir
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            // Required, not defaulted. These ledgers are the once-per-coin
+            // record for co-signing, and that module is explicit that a
+            // forgetful ledger is worse than none: it reports a guarantee it
+            // has stopped providing. Defaulting to the working directory means
+            // a coordinator relaunched from elsewhere silently starts with an
+            // empty one and co-signs a coin it has already co-signed.
+            //
+            // Free to require: Lock co-signing could not work at all until the
+            // quorum key's derivation was un-cycled, so no deployment can
+            // depend on the old default.
+            let Some(dir) = cli.lock_ledger_dir.clone() else {
+                anyhow::bail!(
+                    "--lock-seed-file needs --lock-ledger-dir. The co-signing ledgers record \
+                     which coins this quorum has already signed for, and a coordinator that \
+                     starts with an empty one will sign a coin twice. Point it at durable \
+                     storage that outlives the process, not at the working directory."
+                );
+            };
             // Always report where the ledgers actually landed, resolved.
             //
             // These hold the once-per-coin record for Lock co-signing, and
@@ -424,17 +437,10 @@ async fn main() -> Result<()> {
             // co-sign a coin it has already co-signed. Saying the absolute
             // path out loud is the difference between that being visible and
             // being discovered later.
+            // Report where they landed, resolved, so the path in the log is
+            // the path on disk rather than whatever was typed.
             let resolved = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-            if defaulted {
-                warn!(
-                    dir = %resolved.display(),
-                    "no --lock-ledger-dir: Lock co-signing ledgers go in the WORKING \
-                     DIRECTORY. Starting this coordinator from elsewhere gives it an empty \
-                     double-signing ledger. Pass --lock-ledger-dir to pin them."
-                );
-            } else {
-                info!(dir = %resolved.display(), "Lock co-signing ledgers");
-            }
+            info!(dir = %resolved.display(), "Lock co-signing ledgers");
             let cosign =
                 wraith_coordinator::LockCosignState::open(&dir, phrase, passphrase, policy, role)
                     .map_err(|e| anyhow::anyhow!("Lock co-sign ledgers in {dir:?}: {e}"))?;

@@ -3457,10 +3457,9 @@ mod server {
     ///
     /// A Lock coin and a loose coin are now different coins.
     fn lock_owner_path(index: u32) -> String {
-        format!(
-            "m/86'/{}'/1'/0/{index}",
-            wraith_wallet_core::light::GHOST_COIN_TYPE
-        )
+        // One definition, in `light`, because the ordinary PSBT signer has to
+        // walk this same family to sign a Cash lane input.
+        wraith_wallet_core::light::lock_owner_path(index)
     }
 
     /// The owner's signing key for a Lock, from the active keystore.

@@ -1020,6 +1020,50 @@ Q_LEFT=$(WRAITH --json lock lanes "${Q_ARGS[@]}" \
 pass "the spending lane emptied by its fast path, not by waiting 1,008 blocks"
 
 # ============================================================================
+# FLOW 13: spend the Cash lane — the lane that signs as ordinary single-sig
+#   Every other flow funds Cash and leaves it there, and that hid a real
+#   regression. Cash is a bare key-path output for the Lock OWNER key, and
+#   owner keys moved to account 1' so a Lock coin is never a loose coin. The
+#   ordinary PSBT signer walks the receive chain — account 0' — so it could no
+#   longer derive the key for a Cash output, and Cash coins were unspendable.
+#
+#   There is no ceremony here on purpose: Cash spends with the owner's key
+#   alone. That is exactly why nothing else exercises it.
+# ============================================================================
+step "FLOW 13 — spend the Cash lane (owner key alone, no ceremony)"
+
+CASH_ADDR=$(echo "$LANES_AFTER" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "cash") | .address][0] // empty')
+[ -n "$CASH_ADDR" ] || fail "no cash-lane address"
+
+CASH_FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$CASH_ADDR" 0.0015)
+mine 1
+CASH_VOUT=$($BCLI getrawtransaction "$CASH_FUND_TXID" 1 \
+    | jq -r --arg a "$CASH_ADDR" '.vout[] | select(.scriptPubKey.address == $a) | .n')
+[ -n "$CASH_VOUT" ] || fail "the funding tx has no output at the cash lane"
+
+CASH_DEST=$(WRAITH --json light receive --index 503 | jq -r '.LightReceive.address // .address')
+CASH_PSBT=$($BCLI utxoupdatepsbt "$($BCLI createpsbt \
+    "[{\"txid\":\"$CASH_FUND_TXID\",\"vout\":$CASH_VOUT}]" \
+    "[{\"$CASH_DEST\":0.00148}]")")
+
+# The ordinary signer, not a Lock path. If it cannot find the key, it signs
+# nothing and says so — which is precisely the regression this flow catches.
+CASH_SIGNED=$(WRAITH --json psbt sign --psbt "$CASH_PSBT")
+CASH_OUT=$(echo "$CASH_SIGNED" | jq -r '.PsbtSigned.psbt // .psbt // empty')
+[ -n "$CASH_OUT" ] || { echo "$CASH_SIGNED" >&2; fail "the wallet could not sign its own Cash coin"; }
+
+CASH_FINAL=$($BCLI finalizepsbt "$CASH_OUT")
+echo "$CASH_FINAL" | jq -e '.complete == true' >/dev/null \
+    || { echo "$CASH_FINAL" >&2; fail "the Cash spend did not finalise — the signer produced nothing usable"; }
+CASH_TXID=$($BCLI sendrawtransaction "$(echo "$CASH_FINAL" | jq -r '.hex')") \
+    || fail "the node refused the Cash spend"
+mine 1
+[ "$($BCLI getrawtransaction "$CASH_TXID" 1 | jq -r '.confirmations // 0')" -ge 1 ] \
+    || fail "Cash spend $CASH_TXID did not confirm"
+pass "Cash lane spent with the owner's key alone (tx $CASH_TXID)"
+
+# ============================================================================
 echo
 echo "================================================================"
 echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
@@ -1036,4 +1080,5 @@ echo "  9. single-round Wraith mix         ok  ($FIRST_TXID)"
 echo " 10. Ghost Lock escape spend         ok  ($ESC_TXID)"
 echo " 11. air-gapped Savings spend        ok  ($AIR_TXID)"
 echo " 12. quorum co-signed spend          ok  ($Q_TXID)"
+echo " 13. Cash lane spend                 ok  ($CASH_TXID)"
 echo "================================================================"
