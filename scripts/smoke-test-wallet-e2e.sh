@@ -17,26 +17,24 @@
 #   5.  fund the receive address on regtest      (ghost-cli sendtoaddress)
 #   6.  scan L1 + see the funded UTXO             (wraith light l1-utxos)
 #   7.  Ghost Lock prepare + on-chain fund + confirm
-#                                                (wraith locks prepare / confirm)
+#                                                (wraith lock save / lanes)
 #   8.  on-chain payment                         (wraith light pay)
 #   9.  single-round Wraith mix → on-chain CoinJoin
 #                                                (wraith mix run, 5 enrolments)
 #
-# A note on the two "send"-shaped flows (steps 7-9):
-#   * The wallet's `light send` command is an L2 ledger transfer — it
-#     produces NO on-chain txid by design (settlement is deferred to
-#     reconciliation / a confidential-transfer proof). We exercise it
-#     and assert the ledger row, but it is not an L1 broadcast.
-#   * The real on-chain transactions the wallet DIRECTS are (a) the
-#     Ghost Lock funding tx and (b) the Wraith mix CoinJoin. Both land
-#     on the regtest chain and we assert their shape. That is the
-#     honest "on-chain send" coverage for this wallet.
+# A note on the "send"-shaped flows (steps 7-9):
+#   Every one of them now lands on the regtest chain: the Ghost Lock
+#   funding tx, the `light pay` payment, and the Wraith mix CoinJoin.
+#   The L2 ledger transfer that used to sit at step 8 is gone with
+#   Ghost Pay — it produced no txid by design, so it was the one flow
+#   here whose success the chain could not confirm.
 #
 # A note on "single-round" mix:
 #   The Wraith Lite mix is single-round — one transaction, one signing
 #   window, no two-phase commit (crates/wraith-protocol/src/single_round.rs).
-#   But every tier has min_participants = 5 (tier.rs), so a round can't
-#   lock+broadcast with fewer. We therefore enrol 5 ghost_ids on one
+#   But a wallet refuses to sign a set below DEFAULT_MIN_ENTITIES (10), so
+#   a round at the protocol's own minimum of 5 locks and is then refused.
+#   We therefore enrol 10 ghost_ids on one
 #   wraithd — the same single-machine mechanic the in-process
 #   wraith_e2e.rs integration test uses. "single-round" refers to the
 #   protocol shape, not the participant count.
@@ -68,9 +66,21 @@ DATADIR="$(mktemp -d -t wraith-smoke-e2e.XXXXXX)"
 SAVED_LOGS_DIR="${SAVED_LOGS_DIR:-/tmp/wraith-smoke-e2e-logs}"
 mkdir -p "$SAVED_LOGS_DIR"
 
-# Number of mix participants. min_participants is 5 universally
-# (wraith-protocol tier.rs) — a round won't lock below this.
-N=5
+# Number of mix participants.
+#
+# TEN, not the protocol's five. `min_participants` is 5 (wraith-protocol
+# tier.rs) — the smallest round the protocol will ASSEMBLE — but a wallet
+# refuses to sign a set below `DEFAULT_MIN_ENTITIES`, which is 10, on the
+# grounds that one-in-five is barely privacy. So a five-participant round
+# locks and is then refused by every wallet running the defaults:
+#
+#   "5 distinct entities across 5 seats is below the floor of 10 —
+#    the set is not worth signing"
+#
+# Enrolling five therefore tested the refusal, not the CoinJoin. Ten is the
+# smallest round a default-configured wallet will actually sign, which is what
+# a user experiences, and it stays under the 100k tier's cap of 20.
+N=10
 
 COORD_PID=""
 WRAITHD_PID=""
@@ -282,32 +292,80 @@ SCAN_SATS=$(echo "$SCAN_JSON" \
 pass "wallet's own L1 scanner sees the 1,000,000-sat UTXO"
 
 # ============================================================================
-# FLOW 7: Ghost Lock prepare + on-chain fund + confirm
-#   This is the wallet directing a REAL on-chain transaction: the lock
-#   funding tx lands on the regtest chain and the wallet confirms it.
+# FLOW 7: Ghost Lock — save a definition, derive its lanes, fund one on-chain
+#
+#   The old shape of this flow (`locks prepare` / `locks confirm`) was
+#   operator-mediated: ghost-pay registered the Lock and the wallet told it
+#   when the funding landed. Both commands are gone with it, and a Lock is
+#   now purely local — a definition the wallet remembers, from which the four
+#   lane addresses are re-derived every time.
+#
+#   So what is worth asserting changed too. There is no operator to confirm
+#   anything; the chain confirms it. Fund a lane address and check the
+#   wallet's own scanner finds the coin at the address it derived.
 # ============================================================================
-step "FLOW 7 — Ghost Lock prepare → on-chain fund → confirm"
-PREP_OUT=$(WRAITH locks prepare 100000)
-echo "$PREP_OUT"
-LOCK_ID=$(echo "$PREP_OUT" | grep -m1 'lock_id:' | awk '{print $NF}')
-LOCK_ADDR=$(echo "$PREP_OUT" | grep -m1 'funding address:' | awk '{print $NF}')
-[ -n "$LOCK_ID" ] && [ -n "$LOCK_ADDR" ] || fail "locks prepare returned no lock_id / funding address"
+step "FLOW 7 — Ghost Lock: save, derive lanes, fund one on-chain"
+TIP_H=$($BCLI getblockcount)
+# Stand-in keys for the backup device, the heir and the quorum. This flow is
+# about deriving and funding a lane, not about signing with any of them — but
+# they must be REAL x-only public keys.
+#
+# `openssl rand -hex 32` will not do: 32 random bytes are a valid curve
+# x-coordinate only about half the time, so a fixture built that way fails
+# roughly every other run. Deriving from the wallet gives points that are
+# valid by construction; the compressed key's leading parity byte is dropped
+# to get the x-only form.
+xonly_at() {
+    local pk
+    pk=$(WRAITH --json wallet derive "$1" | jq -r '.WalletDerive.public_key_hex // .public_key_hex')
+    [ ${#pk} -eq 66 ] || fail "derive $1 returned '$pk', expected a 33-byte compressed key"
+    echo "${pk:2}"
+}
+BACKUP_PK=$(xonly_at "m/86'/1'/0'/0/101")
+HEIR_PK=$(xonly_at "m/86'/1'/0'/0/102")
+QUORUM_PK=$(xonly_at "m/86'/1'/0'/0/103")
+LOCK_ARGS=(--backup-pubkey "$BACKUP_PK" --heir-pubkey "$HEIR_PK" --quorum-pubkey "$QUORUM_PK"
+           --anchor-height "$TIP_H" --inherit-height "$((TIP_H + 52560))")
 
-LOCK_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$LOCK_ADDR" 0.001)
-[ -n "$LOCK_TXID" ] || fail "lock funding sendtoaddress returned no txid"
+SAVE_JSON=$(WRAITH --json lock save --label smoke "${LOCK_ARGS[@]}")
+echo "$SAVE_JSON" | jq '.'
+LOCK_ID=$(echo "$SAVE_JSON" | jq -r '.GhostLockSaved.lock.lock_id // .lock.lock_id // empty')
+[ -n "$LOCK_ID" ] || fail "lock save returned no lock_id"
+
+LANES_JSON=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}")
+echo "$LANES_JSON" | jq '.'
+# Cash is the lane that is the owner's alone, so it needs no cosigner to be
+# funded or later spent — the right one to exercise with money on a smoke test.
+LANE_ADDR=$(echo "$LANES_JSON" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "cash") | .address][0] // empty')
+[ -n "$LANE_ADDR" ] || fail "lock lanes returned no cash-lane address"
+# What the lane holds BEFORE this flow adds to it.
+#
+# Not asserted as zero: Cash is the plain BIP86 output for the owner key —
+# deliberately indistinguishable from an ordinary single-sig wallet — so the
+# receive address funded in FLOW 5 IS this lane. Asserting an absolute total
+# here would encode that coincidence and break the moment the flows above
+# changed. The delta is what this flow is responsible for.
+LANE_BEFORE=$(echo "$LANES_JSON" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "cash") | .balance_sats] | add // 0')
+
+LOCK_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$LANE_ADDR" 0.001)
+[ -n "$LOCK_TXID" ] || fail "lane funding sendtoaddress returned no txid"
 $BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
-CONFIRM_OUT=$(WRAITH locks confirm "$LOCK_ID" "$LOCK_TXID")
-echo "$CONFIRM_OUT"
-# The confirm response echoes back the same lock_id + the funding txid
-# we supplied — that round-trip IS the success assertion (the operator
-# accepted the confirmation and recorded the funding outpoint).
-echo "$CONFIRM_OUT" | grep -q "lock confirmed"            || fail "locks confirm did not succeed"
-echo "$CONFIRM_OUT" | grep -q "lock_id:      $LOCK_ID"    || fail "confirm echoed a different lock_id"
-echo "$CONFIRM_OUT" | grep -q "funding txid: $LOCK_TXID"  || fail "confirm echoed a different funding txid"
-# `locks list` is local store state, shown for visibility.
-echo "locks list (informational):"
-WRAITH locks list || true
-pass "Ghost Lock $LOCK_ID funded on-chain (tx $LOCK_TXID) and confirmed"
+# The node holds it — a txid the wallet reported would not prove that.
+$BCLI getrawtransaction "$LOCK_TXID" >/dev/null \
+    || fail "the node does not know the lane funding tx $LOCK_TXID"
+
+# And the lane now shows the coin. This is the assertion the operator used to
+# make on the wallet's behalf, made against the chain instead.
+LANES_AFTER=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}")
+LANE_AFTER=$(echo "$LANES_AFTER" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "cash") | .balance_sats] | add // 0')
+[ "$((LANE_AFTER - LANE_BEFORE))" = "100000" ] \
+    || fail "cash lane moved by $((LANE_AFTER - LANE_BEFORE)) sats, expected 100000 (before $LANE_BEFORE, after $LANE_AFTER)"
+echo "lock list (informational):"
+WRAITH lock list || true
+pass "Ghost Lock $LOCK_ID: cash lane funded on-chain (tx $LOCK_TXID) and seen by the wallet"
 
 # ============================================================================
 # FLOW 8: on-chain payment — the wallet's `light pay` command
@@ -334,7 +392,7 @@ pass "paid 5000 sats on-chain (tx $PAY_TXID) and recorded it locally"
 # ============================================================================
 # FLOW 9: single-round Wraith mix → on-chain CoinJoin
 #   One round, one tx, one signing window (single_round.rs). 5 ghost_ids
-#   enrol on this one wraithd (min_participants = 5). The coordinator
+#   enrol on this one wraithd (ten clears the wallet's floor). The coordinator
 #   broadcasts the assembled tx to ghostd for real.
 # ============================================================================
 step "FLOW 9 — single-round Wraith mix ($N participants → one CoinJoin tx)"
@@ -471,6 +529,19 @@ for i in $(seq 0 $((N-1))); do
     [ "$found" -eq 1 ] || fail "participant $i mix-output appears $found times, expected 1"
 done
 pass "every participant's mix-output landed at its declared address"
+
+# The once-per-coin ledger must hold a row per participant. This is a strictly
+# stronger check than "no participant failed": `record` rewrites the whole
+# table from the snapshot taken when the store was opened, so concurrent mixes
+# that raced could each persist a table missing the others' coins. Every flow
+# above would still be green, and the wallet would have quietly lost the
+# authorisations that stop a coin entering a second round.
+LEDGER="$DATADIR/wraith-signed-coins.json"
+[ -f "$LEDGER" ] || fail "no signing ledger at $LEDGER"
+LEDGER_ROWS=$(jq 'length' < "$LEDGER")
+[ "$LEDGER_ROWS" -eq "$N" ] \
+    || fail "signing ledger holds $LEDGER_ROWS rows, expected $N — concurrent mixes lost authorisations"
+pass "signing ledger recorded all $N coins (no lost authorisations)"
 
 # ============================================================================
 echo

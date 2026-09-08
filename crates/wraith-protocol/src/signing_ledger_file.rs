@@ -23,6 +23,19 @@
 //! is fsynced before the call returns. Write-temp, fsync, rename, fsync-dir is
 //! the sequence that survives power loss on the filesystems this runs on;
 //! skipping the directory fsync leaves the rename itself unpersisted.
+//!
+//! # Concurrency
+//!
+//! Each write stages through a path private to it, so concurrent writers on
+//! one ledger file cannot truncate or unlink each other's staging file.
+//!
+//! That is the limit of what this type guarantees. `record` rewrites the whole
+//! table from the snapshot [`FileSignatureStore::open`] read, so two stores
+//! opened on the same path before either wrote will each persist a table
+//! missing the other's row — a lost authorisation, which is precisely the
+//! failure the once-per-coin rule exists to prevent. **A caller that opens a
+//! store per operation must serialise open-through-record itself**, so the
+//! read-modify-write is atomic. `wraithd` does this with a daemon-wide lock.
 
 use std::collections::HashMap;
 use std::fs;
@@ -30,6 +43,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::signing_ledger::{OutPointKey, SignatureStore};
+
+/// Distinguishes the staging files of two writes racing on one ledger path.
+/// Paired with the pid so separate processes cannot collide either.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// File-backed [`SignatureStore`]. Safe for production use.
 #[derive(Debug)]
@@ -104,15 +121,31 @@ impl FileSignatureStore {
             .collect();
         let body = serde_json::to_vec_pretty(&rows)?;
 
-        let tmp = self.path.with_extension("tmp");
-        {
+        // A staging path unique to this write. A fixed `.tmp` sibling is
+        // shared by every concurrent writer on the same ledger: two flushes
+        // racing on it truncate each other's contents, and the loser's rename
+        // fails with ENOENT once the winner has already moved the file away —
+        // which `record` turns into a panic, taking down the caller. Making
+        // the staging file private to one write removes both races.
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}.{seq}", std::process::id()));
+
+        let staged = (|| -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&body)?;
             // Contents before the rename, or the rename can land pointing at an
             // empty file.
             f.sync_all()?;
+            drop(f);
+            fs::rename(&tmp, &self.path)
+        })();
+        if staged.is_err() {
+            // Don't leave the staging file behind for a failed write.
+            let _ = fs::remove_file(&tmp);
         }
-        fs::rename(&tmp, &self.path)?;
+        staged?;
 
         // The rename itself is metadata and needs its own sync, or a power loss
         // here leaves the old file in place and the authorisation lost.
@@ -249,5 +282,56 @@ mod tests {
             l.authorise(OutPointKey::new([1u8; 32], 1), [9; 32]),
             Ok(Decision::Sign)
         );
+    }
+
+    /// Concurrent writers on one ledger path must not destroy each other.
+    ///
+    /// This is a regression test for a real failure: `flush` staged every
+    /// write through a single fixed `.tmp` sibling, so racing writers
+    /// truncated each other's staging file and the loser's rename failed with
+    /// `ENOENT` — which `record` turns into a panic. Ten concurrent mixes in
+    /// one wallet daemon reproduced it every run.
+    ///
+    /// Lost updates are *not* asserted against here: this layer does not
+    /// promise them (see the module docs). What it promises is that no writer
+    /// panics and the file is always parseable afterwards.
+    #[test]
+    fn concurrent_writers_neither_panic_nor_corrupt_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "wraith-ledger-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("signed-coins.json");
+
+        let threads: Vec<_> = (0..10u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut store = FileSignatureStore::open(&path).expect("open");
+                    store.record(coin(i), [i; 32]);
+                })
+            })
+            .collect();
+        for (i, t) in threads.into_iter().enumerate() {
+            t.join().unwrap_or_else(|_| {
+                panic!("writer {i} panicked — the ledger write is not race-safe")
+            });
+        }
+
+        // Whatever survived, the file must still parse. A store that refuses
+        // to open here would strand the wallet: `open` treats a malformed
+        // ledger as fatal rather than starting empty.
+        let reopened = FileSignatureStore::open(&path).expect("ledger is parseable after the race");
+        assert!(
+            !reopened.entries.is_empty(),
+            "every concurrent write was lost"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

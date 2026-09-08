@@ -307,6 +307,44 @@ mod server {
         ghost_lock::nonce_ledger_file::FileNonceLedger::open(path)
     }
 
+    /// Outcome of the pre-sign check against the once-per-coin ledger.
+    enum LedgerCheck {
+        Passed(Box<wraith_wallet_core::wraith::InspectedMix>),
+        /// The ledger file itself could not be opened. Distinct from a
+        /// refusal: nothing was judged, so nothing can be concluded.
+        Unavailable(std::io::Error),
+        /// The round was inspected and refused.
+        Refused(Box<wraith_wallet_core::wraith::WraithClientError>),
+    }
+
+    /// Inspect a prepared round with the signing ledger held exclusively.
+    ///
+    /// The lock is what makes check-then-record atomic. `signing_ledger_for`
+    /// opens a fresh store that snapshots the file, and `record` rewrites the
+    /// whole table from that snapshot, so two mixes that both opened before
+    /// either wrote would each persist a table missing the other's coin. The
+    /// wallet would then permit a coin into a second round — the one thing the
+    /// ledger exists to refuse. A round's participants routinely share one
+    /// daemon, so this is the ordinary path, not a corner.
+    ///
+    /// The guard dies with this function, before any signing or network work.
+    /// Holding it across a round's round-trips would deadlock a round whose
+    /// participants all share this daemon.
+    async fn check_against_ledger(
+        state: &Arc<DaemonState>,
+        prepared: &wraith_wallet_core::wraith::PreparedMix,
+    ) -> LedgerCheck {
+        let _guard = state.signing_ledger_lock.lock().await;
+        let mut ledger = match signing_ledger_for(state) {
+            Ok(l) => l,
+            Err(e) => return LedgerCheck::Unavailable(e),
+        };
+        match prepared.inspect(&mut ledger) {
+            Ok(i) => LedgerCheck::Passed(Box::new(i)),
+            Err(e) => LedgerCheck::Refused(Box::new(e)),
+        }
+    }
+
     fn signing_ledger_for(
         state: &Arc<DaemonState>,
     ) -> std::io::Result<
@@ -440,6 +478,19 @@ mod server {
         /// manifest fetch). Reuses rustls so we don't pull in a second TLS
         /// implementation.
         http: reqwest::Client,
+        /// Serialises the once-per-coin signing ledger's read-modify-write.
+        ///
+        /// `signing_ledger_for` opens a fresh store per request, and `record`
+        /// rewrites the whole table from the snapshot that `open` read. Two
+        /// mixes that both opened before either wrote would each persist a
+        /// table missing the other's coin — dropping an authorisation the
+        /// double-sign guard depends on. Ten concurrent mixes through one
+        /// daemon is the ordinary shape of a round, not a corner case.
+        ///
+        /// Held across open-inspect-record and nothing else. Holding it for
+        /// the round's network round-trips would deadlock a round whose
+        /// participants all share one daemon.
+        signing_ledger_lock: tokio::sync::Mutex<()>,
     }
 
     fn default_wallets_dir() -> PathBuf {
@@ -903,6 +954,7 @@ mod server {
             shroud_max_ms,
             update_manifest_url,
             http,
+            signing_ledger_lock: tokio::sync::Mutex::new(()),
             wraith_mixes: RwLock::new(HashMap::new()),
             lock_signings: RwLock::new(HashMap::new()),
             ghostd: RwLock::new(ghostd),
@@ -3250,6 +3302,31 @@ mod server {
                 bip86_index,
             } => {
                 use wraith_wallet_core::ghost_lock_store::StoredLock;
+                // Refuse a key that cannot build a lane, HERE, rather than at
+                // the first operation that needs one.
+                //
+                // Saving is where a person hands over a key they pasted from
+                // somewhere, and it was the one place that never checked. A
+                // malformed pubkey stored happily, reported `created: true`,
+                // and then every `lanes`, `destination`, `escape` and spend on
+                // that Lock failed — with the failure landing far from the
+                // typo that caused it, on a Lock the wallet says it has.
+                let mut bad: Option<String> = None;
+                for (what, key) in [
+                    ("backup_pubkey", &backup_pubkey),
+                    ("heir_pubkey", &heir_pubkey),
+                    ("quorum_pubkey", &quorum_pubkey),
+                ] {
+                    if let Err(e) =
+                        <bitcoin::XOnlyPublicKey as std::str::FromStr>::from_str(key.trim())
+                    {
+                        bad = Some(format!("{what} is not an x-only public key: {e}"));
+                        break;
+                    }
+                }
+                if let Some(message) = bad {
+                    return Envelope::new(id, Response::Error(ErrorResponse { message }));
+                }
                 let lock = StoredLock::new(
                     label,
                     backup_pubkey,
@@ -4066,21 +4143,31 @@ mod server {
                     }
                 };
 
-                // Attribute each UTXO to its lane by address.
+                // Attribute each UTXO to its lane by scriptPubKey.
+                //
+                // ⚠ NOT by address, which is what this did and why every lane
+                // read as empty. `scantxoutset` returns scripts, not addresses
+                // — it normalises `addr(<bech32>)` into `rawtr(<spk-hex>)` on
+                // the way out — so `GhostdChainClient` leaves `address` as
+                // `None` rather than inventing a form bitcoind did not send.
+                // Matching on it therefore skipped every coin, and a Lock
+                // holding real money reported zero in all four compartments.
+                //
+                // The script is the canonical thing both sides agree on, and
+                // it is what the L1 UTXO listing already matches on.
+                let lane_spk: Vec<(usize, String)> = account
+                    .lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (i, hex::encode(l.lane.address.script_pubkey().as_bytes())))
+                    .collect();
                 let mut per_lane: Vec<wraith_wallet_core::ghost_lock_account::LaneCoin> =
                     Vec::new();
                 for u in &scan.utxos {
-                    // A UTXO the scanner could not attribute to an address is
-                    // skipped rather than guessed at. Guessing would put
-                    // somebody's coins in the wrong compartment, and the
-                    // compartments are the point.
-                    let Some(addr) = u.address.as_deref() else {
-                        continue;
-                    };
-                    if let Some(b) = account
-                        .lanes
+                    if let Some(b) = lane_spk
                         .iter()
-                        .find(|l| l.lane.address.to_string() == addr)
+                        .find(|(_, spk)| spk.eq_ignore_ascii_case(&u.scriptpubkey_hex))
+                        .and_then(|(i, _)| account.lanes.get(*i))
                     {
                         per_lane.push(wraith_wallet_core::ghost_lock_account::LaneCoin {
                             kind: b.kind,
@@ -4963,43 +5050,42 @@ mod server {
                         // handed a transaction to sign. Checking later would
                         // mean the wallet had already produced a signature over
                         // a round it never verified.
-                        match signing_ledger_for(state) {
-                            Err(e) => Response::Error(ErrorResponse {
+                        match check_against_ledger(state, &prepared).await {
+                            LedgerCheck::Unavailable(e) => Response::Error(ErrorResponse {
                                 message: format!("signing ledger unavailable: {e}"),
                             }),
-                            Ok(mut ledger) => match prepared.inspect(&mut ledger) {
-                                Err(e) => match refusal_response(
-                                    prepared.session_id.clone(),
-                                    min_entities.unwrap_or(
-                                        wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES,
-                                    ),
-                                    &e,
-                                ) {
-                                    Some(r) => Response::WraithMixRefused(r),
-                                    None => Response::Error(ErrorResponse {
-                                        message: format!("refused the round: {e}"),
-                                    }),
-                                },
-                                Ok(inspected) => {
-                                    let p = inspected.prepared();
-                                    let resp = WraithMixPreparedResponse {
-                                        session_id: p.session_id.clone(),
-                                        unsigned_tx_hex: bitcoin::consensus::encode::serialize_hex(
-                                            &p.unsigned_tx,
-                                        ),
-                                        input_index: p.input_index as u32,
-                                        prev_amount_sats: p.prev_amount_sats,
-                                        mixed_output_tx_index: p.mixed_output_tx_index as u32,
-                                    };
-                                    let sid = p.session_id.clone();
-                                    state
-                                        .wraith_mixes
-                                        .write()
-                                        .await
-                                        .insert(sid, StoredWraithMix { inspected, client });
-                                    Response::WraithMixPrepared(resp)
-                                }
+                            LedgerCheck::Refused(e) => match refusal_response(
+                                prepared.session_id.clone(),
+                                min_entities
+                                    .unwrap_or(wraith_wallet_core::wraith::DEFAULT_MIN_ENTITIES),
+                                &e,
+                            ) {
+                                Some(r) => Response::WraithMixRefused(r),
+                                None => Response::Error(ErrorResponse {
+                                    message: format!("refused the round: {e}"),
+                                }),
                             },
+                            LedgerCheck::Passed(inspected) => {
+                                let p = inspected.prepared();
+                                let resp = WraithMixPreparedResponse {
+                                    session_id: p.session_id.clone(),
+                                    unsigned_tx_hex: bitcoin::consensus::encode::serialize_hex(
+                                        &p.unsigned_tx,
+                                    ),
+                                    input_index: p.input_index as u32,
+                                    prev_amount_sats: p.prev_amount_sats,
+                                    mixed_output_tx_index: p.mixed_output_tx_index as u32,
+                                };
+                                let sid = p.session_id.clone();
+                                state.wraith_mixes.write().await.insert(
+                                    sid,
+                                    StoredWraithMix {
+                                        inspected: *inspected,
+                                        client,
+                                    },
+                                );
+                                Response::WraithMixPrepared(resp)
+                            }
                         }
                     }
                     Err(e) => Response::Error(ErrorResponse {
@@ -5230,9 +5316,9 @@ mod server {
                 // previously went from `/round-tx` straight to the keystore —
                 // no check that the wallet's own input and output were in the
                 // round, no anonymity floor, and no commitment of the coin.
-                let mut ledger = match signing_ledger_for(state) {
-                    Ok(l) => l,
-                    Err(e) => {
+                let inspected = match check_against_ledger(state, &prepared).await {
+                    LedgerCheck::Passed(i) => *i,
+                    LedgerCheck::Unavailable(e) => {
                         return Envelope::new(
                             id,
                             Response::Error(ErrorResponse {
@@ -5240,10 +5326,7 @@ mod server {
                             }),
                         );
                     }
-                };
-                let inspected = match prepared.inspect(&mut ledger) {
-                    Ok(i) => i,
-                    Err(e) => {
+                    LedgerCheck::Refused(e) => {
                         let resp = match refusal_response(
                             prepared.session_id.clone(),
                             min_entities
@@ -5701,6 +5784,188 @@ mod server {
             assert_eq!(net, None);
         }
 
+        /// A chain stub returning one UTXO at a given script, with `address`
+        /// left `None` — exactly what `scantxoutset` gives back.
+        struct SpkChain {
+            spk_hex: String,
+            sats: u64,
+        }
+
+        #[async_trait::async_trait]
+        impl ChainClient for SpkChain {
+            async fn status(
+                &self,
+            ) -> Result<wraith_wallet_core::chain::ChainStatus, wraith_wallet_core::chain::ChainError>
+            {
+                Err(wraith_wallet_core::chain::ChainError::Backend(
+                    "stub".into(),
+                ))
+            }
+            async fn scan_utxos(
+                &self,
+                _addresses: &[String],
+                _min_confirmations: u32,
+            ) -> Result<
+                wraith_wallet_core::chain::ScanUtxosResponse,
+                wraith_wallet_core::chain::ChainError,
+            > {
+                Ok(wraith_wallet_core::chain::ScanUtxosResponse {
+                    utxos: vec![wraith_wallet_core::chain::ScannedL1Utxo {
+                        txid: "aa".repeat(32),
+                        vout: 0,
+                        amount_sats: self.sats,
+                        scriptpubkey_hex: self.spk_hex.clone(),
+                        // The whole point: the node does not send an address.
+                        address: None,
+                        confirmations: 3,
+                        height: 900_000,
+                    }],
+                    total_sats: self.sats,
+                    chain_height: 900_002,
+                })
+            }
+        }
+
+        /// A Lock that cannot derive lanes must not save.
+        ///
+        /// Saving is where somebody pastes a key, and it was the one place
+        /// that never checked one. A malformed pubkey stored happily and
+        /// reported `created: true`; every later operation on that Lock then
+        /// failed, far from the typo, on a Lock the wallet claimed to have.
+        #[tokio::test]
+        async fn a_lock_with_a_malformed_key_is_refused_at_save() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            // 32 bytes that are not a curve point — what `openssl rand -hex 32`
+            // gives you about half the time.
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockSave {
+                    label: Some("broken".into()),
+                    backup_pubkey: "11".repeat(32),
+                    heir_pubkey: "22".repeat(32),
+                    quorum_pubkey: "33".repeat(32),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&req, &state).await.payload {
+                Response::Error(e) => assert!(
+                    e.message.contains("x-only public key"),
+                    "the error must name what is wrong: {}",
+                    e.message
+                ),
+                other => panic!("a malformed key must not save, got {other:?}"),
+            }
+            assert!(
+                ghost_lock_store_for(&state).unwrap().list().is_empty(),
+                "and nothing may be persisted"
+            );
+        }
+
+        /// A funded lane must not read as empty.
+        ///
+        /// Lane coins were attributed by matching the scan's `address` field
+        /// against the lane's address. `scantxoutset` does not return
+        /// addresses — it normalises `addr(<bech32>)` into `rawtr(<spk-hex>)`
+        /// — so the chain client leaves that field `None` rather than
+        /// inventing one, every coin was skipped, and a Lock holding real
+        /// money reported zero in all four compartments.
+        ///
+        /// Worth driving the real handler because the failure is silent and
+        /// reads as a fact: "0 sats" looks like an empty lane, not like a
+        /// lookup that matched nothing. A test that only checked the fixture's
+        /// shape would have passed against the broken code.
+        #[tokio::test]
+        async fn a_funded_lane_is_attributed_by_script_not_address() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            // A real keystore, because the lanes are derived from the owner's
+            // key and a stub cannot stand in for it.
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+            state
+                .wallets
+                .write()
+                .await
+                .insert("harness".to_string(), ks);
+
+            // Real x-only keys — 32 arbitrary bytes are not a curve point, and
+            // the handler rightly refuses them.
+            let xonly = |seed: u8| {
+                use bitcoin::secp256k1::{Secp256k1, SecretKey};
+                let sk = SecretKey::from_slice(&[seed; 32]).expect("nonzero scalar");
+                let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
+                hex::encode(xk.serialize())
+            };
+            let lanes_req = |id: u64| {
+                serde_json::to_string(&Envelope::new(
+                    id,
+                    Request::GhostLockLanes {
+                        backup_pubkey: xonly(0x11),
+                        heir_pubkey: xonly(0x22),
+                        quorum_pubkey: xonly(0x33),
+                        anchor_height: 900_000,
+                        inherit_height: 950_000,
+                        bip86_index: None,
+                    },
+                ))
+                .unwrap()
+            };
+
+            // First pass: nothing on chain, so learn the lane addresses.
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: "51".to_string() + "20" + &"ff".repeat(32),
+                sats: 0,
+            });
+            let cash_addr = match super::dispatch(&lanes_req(1), &state).await.payload {
+                Response::GhostLockLanes(r) => r
+                    .lanes
+                    .iter()
+                    .find(|l| l.kind == "cash")
+                    .map(|l| l.address.clone())
+                    .expect("a cash lane"),
+                other => panic!("expected lanes, got {other:?}"),
+            };
+
+            // Now put a coin at exactly that lane's script — reporting it the
+            // way the node does, with no address field.
+            let spk = cash_addr
+                .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                .unwrap()
+                .assume_checked()
+                .script_pubkey();
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: hex::encode(spk.as_bytes()),
+                sats: 1_000_000,
+            });
+
+            match super::dispatch(&lanes_req(2), &state).await.payload {
+                Response::GhostLockLanes(r) => {
+                    let cash = r.lanes.iter().find(|l| l.kind == "cash").unwrap();
+                    assert_eq!(
+                        cash.balance_sats, 1_000_000,
+                        "the funded lane must show its coin, not zero"
+                    );
+                    let others: u64 = r
+                        .lanes
+                        .iter()
+                        .filter(|l| l.kind != "cash")
+                        .map(|l| l.balance_sats)
+                        .sum();
+                    assert_eq!(others, 0, "and the coin must land in ONE compartment");
+                }
+                other => panic!("expected lanes, got {other:?}"),
+            }
+        }
+
         /// A chain stub that answers with a fixed tip, so confirmation
         /// arithmetic can be tested without a node.
         struct TipChain(u64);
@@ -5977,6 +6242,7 @@ mod server {
                 idle_lock_secs: 0,
                 shroud_max_ms: 0,
                 update_manifest_url: None,
+                signing_ledger_lock: tokio::sync::Mutex::new(()),
                 http: reqwest::Client::new(),
                 wraith_mixes: RwLock::new(HashMap::new()),
                 lock_signings: RwLock::new(HashMap::new()),

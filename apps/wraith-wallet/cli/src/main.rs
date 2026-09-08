@@ -2074,6 +2074,19 @@ mod client {
             .read_line(&mut response_line)
             .await
             .map_err(|e| format!("read failed: {e}"))?;
+        // Zero bytes means the daemon closed the connection without answering
+        // — it did not send a malformed reply, it sent nothing. In practice
+        // that is a panicking request handler, whose reason is in wraithd's
+        // log and nowhere else. Saying "malformed response" here sends the
+        // reader looking for a parse bug in a message that was never written.
+        if response_line.trim().is_empty() {
+            return Err(format!(
+                "wraithd closed the connection without responding \
+                 (endpoint {}). The reason will be in the daemon's log — \
+                 a request handler most likely panicked.",
+                wraith_wallet_ipc::endpoint_display()
+            ));
+        }
         let envelope: Envelope<Response> =
             serde_json::from_str(&response_line).map_err(|e| format!("malformed response: {e}"))?;
         Ok(envelope.payload)
