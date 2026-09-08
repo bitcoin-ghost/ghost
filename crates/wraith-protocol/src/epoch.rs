@@ -39,6 +39,40 @@ pub const fn epoch_for_height(height: u64) -> u64 {
     height / EPOCH_BLOCKS
 }
 
+/// How far behind the tip a question about QUALIFICATION must be asked.
+///
+/// One epoch. The number is not the interesting part — the reasoning is, because a smaller
+/// value looks prudent and is not.
+///
+/// Qualification is 95% uptime over a seven-day window plus at least ten peer challenges,
+/// assembled from a verification ledger that reconciles over days. A lag of a few blocks is
+/// therefore cosmetic: at the boundary instant honest nodes still hold different views — a
+/// peer that just crossed the uptime threshold, a ban that has not propagated, a challenge
+/// result in flight — and each of those flips one node's answer and not another's.
+///
+/// Whether that matters depends entirely on what the answer is used FOR:
+///
+/// * The payout checkpoint uses the qualified set to decide who VOTES. One node's extra
+///   member moves the denominator, the supermajority still carries, and nothing breaks. Six
+///   blocks has been fine there for exactly that reason.
+/// * The mesh node-list checkpoint uses it to decide what is voted ON. It is an input to the
+///   derived list, so one node's extra member produces a different root, votes reject, and no
+///   checkpoint finalises at all — silently, which is the failure #625 is about.
+///
+/// So the same imprecision is harmless in one place and fatal in the other, and the second
+/// needs the inputs to have stopped moving before it asks.
+///
+/// This is a parameter, not a proof. It trades freshness — a node qualifying today waits
+/// until the epoch after next — for agreement, and the trade is the right way round: a roster
+/// that is out of date merely elects the wrong people, while rosters that DISAGREE elect two
+/// sets of people and split the coordinator layer.
+pub const SNAPSHOT_LAG_BLOCKS: u64 = EPOCH_BLOCKS;
+
+/// The height to read qualification from when electing for `epoch`.
+pub const fn lagged_snapshot_height(epoch: u64) -> u64 {
+    snapshot_height_for_epoch(epoch).saturating_sub(SNAPSHOT_LAG_BLOCKS)
+}
+
 /// The chain height whose state freezes epoch `E`'s roster and beacon-anchor: the
 /// last block of epoch `E-1`. Epoch 0 snapshots at height 0.
 pub const fn snapshot_height_for_epoch(epoch: u64) -> u64 {

@@ -59,6 +59,9 @@ pub mod payout_checkpoint;
 
 /// Mesh node-list checkpoint finalisation (signed public-mining node set for
 /// decentralised mining discovery). Dormant until `MESH_NODE_LIST_CHECKPOINT_HEIGHT`.
+///
+/// The anchor it pins is `tip - MESH_CHECKPOINT_LAG_BLOCKS`, not `tip - 6` like the payout
+/// checkpoint beside it. See [`MESH_CHECKPOINT_LAG_BLOCKS`].
 pub mod mesh_node_checkpoint;
 
 /// Chain reorganization detection and recovery.
@@ -730,6 +733,35 @@ pub const MESH_ADVERT_SV2_PORT: u16 = 34255;
 /// store and refills from this cadence. Ten minutes bounds how long a restarted node leaves
 /// the fleet unable to reach full coverage, while costing a few hundred bytes per node.
 pub const MESH_ADVERT_REPUBLISH_SECS: u64 = 600;
+
+/// How far behind the tip the mesh node-list checkpoint pins its anchor.
+///
+/// ⚠ NOT the payout checkpoint's six blocks, and the difference is the point.
+///
+/// Both read the ratified qualified set at their anchor. The payout checkpoint uses it to
+/// decide who VOTES, so a node whose view differs by one member only moves the denominator
+/// and the supermajority still carries — six blocks has been fine there for years. This
+/// checkpoint uses it to decide what is voted ON: the qualified set is an input to the
+/// derived node list and coordinator roster, so one node's extra member yields a different
+/// root, its vote is a reject, and with exact-set agreement no checkpoint finalises at all —
+/// silently, which is the failure mode #625 exists to avoid.
+///
+/// Qualification reconciles over days, so six blocks would have been cosmetic here: the
+/// feature would have looked correct, passed its tests, and produced nothing forever once
+/// armed. One epoch is the distance at which the inputs have stopped moving.
+pub const MESH_CHECKPOINT_LAG_BLOCKS: u64 = wraith_protocol::SNAPSHOT_LAG_BLOCKS;
+
+/// Lowering the lag below what qualification needs must not compile.
+///
+/// A runtime test would be the weaker guard, because the failure it protects against is
+/// invisible at runtime: too short a lag does not error, it just never finalises anything.
+/// Refusing to build is the only signal proportionate to a feature that would otherwise look
+/// correct and produce nothing forever.
+const _: () = assert!(
+    MESH_CHECKPOINT_LAG_BLOCKS >= wraith_protocol::EPOCH_BLOCKS,
+    "the mesh checkpoint anchor must lag at least one epoch — qualification reconciles over \
+     days, and this checkpoint needs exact-set agreement on a list derived from it"
+);
 
 pub const MESH_NODE_LIST_CHECKPOINT_HEIGHT: u64 = u64::MAX;
 

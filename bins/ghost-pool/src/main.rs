@@ -4695,7 +4695,7 @@ async fn main() -> Result<()> {
         let mgr = Arc::clone(&mesh_node_checkpoint_mgr);
         let rpc_c = Arc::clone(&rpc);
         tokio::spawn(async move {
-            const LAG: u64 = 6;
+            const LAG: u64 = ghost_pool::MESH_CHECKPOINT_LAG_BLOCKS;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
