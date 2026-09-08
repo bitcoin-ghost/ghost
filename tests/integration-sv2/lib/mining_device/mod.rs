@@ -303,8 +303,19 @@ fn open_channel(
 ) -> OpenStandardMiningChannel<'static> {
     let user_identity = device_id.unwrap_or_default().try_into().unwrap();
     let id: u32 = 10;
-    info!("Measuring CPU hashrate");
-    let measured_total_hs = measure_hashrate(5, handicap);
+    let measured_total_hs = match std::env::var(NOMINAL_HS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(fixed) => {
+            info!("{NOMINAL_HS_ENV} set — skipping the CPU hashrate probe, using {fixed} H/s");
+            fixed
+        }
+        None => {
+            info!("Measuring CPU hashrate ({PROBE_HASHES_PER_WORKER} hashes/worker)");
+            measure_hashrate(PROBE_HASHES_PER_WORKER, handicap)
+        }
+    };
     let measured_total_mhs = measured_total_hs / 1_000_000.0;
     info!(
         "Measured CPU hashrate ≈ {} MH/s",
@@ -364,10 +375,22 @@ impl Device {
                 sender: notify_changes_to_mining_thread,
             },
         };
-        let open_channel = MiningDeviceMessages::Mining(Mining::OpenStandardMiningChannel(
-            open_channel(user_id, nominal_hashrate_multiplier, handicap),
-        ));
-        let frame: StdFrame = open_channel.try_into().unwrap();
+        // ⛔ On the BLOCKING pool, not the executor. `open_channel` runs the hashrate probe, which
+        // joins OS threads and returns only when they finish. Called inline it blocks the calling
+        // task, and `#[tokio::test]` is a CURRENT-THREAD runtime — so it stalls every other task
+        // AND tokio's timer, which is why `sv2_mining_device` hung past a 15-minute CI step
+        // timeout instead of failing on the sniffer's 60s deadline (#849). Same starvation shape
+        // as the aggregated translator case fixed in #855.
+        let open_channel_msg = tokio::task::spawn_blocking(move || {
+            MiningDeviceMessages::Mining(Mining::OpenStandardMiningChannel(open_channel(
+                user_id,
+                nominal_hashrate_multiplier,
+                handicap,
+            )))
+        })
+        .await
+        .expect("hashrate probe task panicked");
+        let frame: StdFrame = open_channel_msg.try_into().unwrap();
         self_.sender.send(frame.into()).await.unwrap();
         let self_mutex = std::sync::Arc::new(Mutex::new(self_));
         let cloned = self_mutex.clone();
@@ -869,7 +892,31 @@ fn format_mhs(val_mhs: f64) -> String {
 }
 
 // returns hashrate by running all worker threads in parallel for the given duration
-fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
+/// Hashes each probe worker performs. Fixed WORK, not a fixed duration (#849).
+///
+/// The probe used to hash for a wall-clock window, which made its cost depend on the machine
+/// rather than on the job: on a shared CI runner the same 5 seconds bought far fewer hashes, and
+/// the caller was blocked for the whole window regardless. A fixed count makes the work identical
+/// everywhere and bounds the time by the machine's speed instead of pinning it.
+///
+/// 250k double-SHA256 per worker is ~0.25s on a normal core and still ~1s on a slow shared one —
+/// enough to measure, short enough that no runner is waiting on an arbitrary constant.
+const PROBE_HASHES_PER_WORKER: u64 = 250_000;
+
+/// Skip the probe and use this hashrate (H/s) directly.
+///
+/// The probe is a measurement of the HOST, so a test that asserts on anything downstream of
+/// `nominal_hash_rate` is asserting on the machine. Setting this makes the mining device fully
+/// deterministic.
+const NOMINAL_HS_ENV: &str = "SV2_MINING_DEVICE_NOMINAL_HS";
+
+/// Measures hashrate over a fixed number of hashes per worker, returning hashes/second.
+///
+/// ⚠ `handicap` is accepted for symmetry with `Miner::new` but does NOT slow this loop — the
+/// handicap sleep lives in the mining thread (`start_mining_threads`), not here. So the figure
+/// this returns is un-handicapped throughput, which is what the previous timed version measured
+/// too; noted rather than changed, because changing it would move the reported nominal hashrate.
+fn measure_hashrate(hashes_per_worker: u64, handicap: u32) -> f64 {
     use std::sync::Barrier;
 
     // Prepare a random header template to hash
@@ -890,7 +937,6 @@ fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
         nonce: 0,
     };
 
-    let duration = Duration::from_secs(duration_secs);
     let p = worker_count() as usize;
     let barrier = Arc::new(Barrier::new(p + 1)); // +1 for coordinator
 
@@ -911,24 +957,27 @@ fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
         handles.push(std::thread::spawn(move || {
             // Synchronize start across threads
             barrier.wait();
-            let start = Instant::now();
-            let mut hashes: u64 = 0;
-            while start.elapsed() < duration {
+            for _ in 0..hashes_per_worker {
                 miner.next_share();
-                hashes += 1;
             }
-            hashes
+            hashes_per_worker
         }));
     }
 
-    // Release all workers simultaneously
+    // Release all workers simultaneously, and time from that release — the workers now all do the
+    // SAME work, so the wall clock is the measured quantity rather than the budget.
     barrier.wait();
+    let start = Instant::now();
     let mut total_hashes: u64 = 0;
     for h in handles {
         total_hashes += h.join().unwrap_or(0);
     }
-    // Each thread ran for approximately `duration`, so total hashes per second is total/duration
-    (total_hashes as f64) / (duration_secs as f64)
+    let elapsed = start.elapsed().as_secs_f64();
+    if elapsed <= 0.0 {
+        // Cannot divide by zero, and a probe that appears instantaneous has measured nothing.
+        return 0.0;
+    }
+    (total_hashes as f64) / elapsed
 }
 fn generate_random_32_byte_array() -> [u8; 32] {
     let mut rng = thread_rng();
