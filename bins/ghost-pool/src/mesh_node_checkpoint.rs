@@ -43,7 +43,8 @@ use ghost_common::error::GhostResult;
 use ghost_common::identity::{verify_signature, NodeIdentity};
 use ghost_common::types::NodeId;
 use ghost_consensus::{
-    derive_mesh_node_list, mesh_advert_set_root, mesh_node_list_root, mesh_signer_set_root,
+    coordinator_roster_from_adverts, derive_coordinator_roster, derive_mesh_node_list,
+    mesh_advert_set_root, mesh_coordinator_roster_root, mesh_node_list_root, mesh_signer_set_root,
     MeshEndpointAdvert, MeshNodeEntry, MeshNodeListCheckpointMessage,
     MeshNodeListCheckpointSyncEntry, MeshNodeListCheckpointSyncRequest,
     MeshNodeListCheckpointSyncResponse, MeshNodeListCheckpointVoteMessage, MessageEnvelope,
@@ -235,12 +236,15 @@ impl AdvertStore {
 /// `seq` is the current unix time in seconds rather than a counter: it is monotonic across
 /// restarts without persisting anything, which matters because the store is in memory. A node
 /// that re-homes and restarts still supersedes its own earlier advert.
+#[allow(clippy::too_many_arguments)]
 pub fn build_self_advert(
     identity: &NodeIdentity,
     host: &str,
     sv1_port: u16,
     sv2_port: u16,
     public_mining: bool,
+    coordinator: bool,
+    coordinator_endpoint: &str,
     seq: u64,
 ) -> MeshEndpointAdvert {
     let mut a = MeshEndpointAdvert {
@@ -249,6 +253,8 @@ pub fn build_self_advert(
         sv1_port,
         sv2_port,
         public_mining,
+        coordinator,
+        coordinator_endpoint: coordinator_endpoint.to_string(),
         seq,
         signature: [0u8; 64],
     };
@@ -266,6 +272,15 @@ fn adverts_to_json(adverts: &[MeshEndpointAdvert]) -> String {
 /// The inverse. An unparseable blob yields an EMPTY set rather than a panic, which the
 /// callers treat as "cannot re-derive" — they fall back to the signature checks rather than
 /// silently accepting a list nobody can reproduce.
+/// Recover the adopted adverts from a stored checkpoint, for callers outside this module.
+///
+/// The HTTP endpoint that serves a finalised checkpoint needs them: two of the roots inside
+/// `checkpoint_hash` are pure functions of the adverts and are not stored, so a served blob
+/// that cannot recover them is one whose signatures nobody can check.
+pub fn adverts_from_json_public(json: &str) -> Vec<MeshEndpointAdvert> {
+    adverts_from_json(json)
+}
+
 fn adverts_from_json(json: &str) -> Vec<MeshEndpointAdvert> {
     serde_json::from_str(json).unwrap_or_default()
 }
@@ -497,6 +512,24 @@ impl MeshNodeListCheckpointManager {
         };
         let list_root = mesh_node_list_root(&nodes);
         let advert_root = mesh_advert_set_root(&adverts);
+        // Same adverts, second filter. A coordinator roster derived here rather than read
+        // from mesh state is what lets a wallet be told who is eligible instead of asked to
+        // believe whoever answered.
+        let coordinator_roster = match derive_coordinator_roster(&qualified, &adverts) {
+            Ok(r) => r,
+            Err(reason) => {
+                // Unreachable in practice — the node list derived from the same inputs a
+                // moment ago — but a silent empty roster would read as "nobody coordinates"
+                // and quietly disable mixing fleet-wide.
+                warn!(
+                    height,
+                    ?reason,
+                    "mesh node checkpoint: coordinator roster does not derive — not proposing"
+                );
+                return;
+            }
+        };
+        let coordinator_roster_root = mesh_coordinator_roster_root(&coordinator_roster);
 
         // Cadence: only checkpoint when the set changed. If the latest finalised checkpoint
         // already commits this exact list, re-affirm silently rather than mint a duplicate.
@@ -518,6 +551,8 @@ impl MeshNodeListCheckpointManager {
             adverts,
             advert_root,
             list_root,
+            coordinator_roster,
+            coordinator_roster_root,
             signer_set_delta,
             signer_set_root,
             active_node_count: voters.len() as u32,
@@ -603,11 +638,21 @@ impl MeshNodeListCheckpointManager {
                 .proposal = Some(msg);
             return Ok(());
         };
-        // A derivation failure is a REJECT, not an abstain: unlike a missing local view, it is
-        // a property of the proposal's own bytes, so every honest node reaches it identically.
-        let approve = match derive_mesh_node_list(&qualified, &msg.adverts) {
-            Ok(local) => mesh_node_list_root(&local) == msg.list_root,
-            Err(reason) => {
+        // BOTH roots, or the roster would be attested by a supermajority that never checked
+        // it — a signature over something nobody re-derived is the shape of the bug the node
+        // list already avoids.
+        let approve = match (
+            derive_mesh_node_list(&qualified, &msg.adverts),
+            derive_coordinator_roster(&qualified, &msg.adverts),
+        ) {
+            (Ok(local_nodes), Ok(local_roster)) => {
+                mesh_node_list_root(&local_nodes) == msg.list_root
+                    && mesh_coordinator_roster_root(&local_roster) == msg.coordinator_roster_root
+            }
+            // A derivation failure is a REJECT, not an abstain: unlike a missing local view,
+            // it is a property of the proposal's own bytes, so every honest node reaches it
+            // identically.
+            (Err(reason), _) | (_, Err(reason)) => {
                 warn!(
                     height = msg.height,
                     ?reason,
@@ -829,6 +874,15 @@ impl MeshNodeListCheckpointManager {
                 adverts: adverts_from_json(&r.adverts_json),
                 advert_root: mesh_advert_set_root(&adverts_from_json(&r.adverts_json)),
                 list_root: r.list_root,
+                // Recomputed from the adverts, like `advert_root` beside it: both are inside
+                // `checkpoint_hash`, so a served checkpoint that cannot reproduce them is one
+                // whose proposer signature can never be re-verified.
+                coordinator_roster: coordinator_roster_from_adverts(&adverts_from_json(
+                    &r.adverts_json,
+                )),
+                coordinator_roster_root: mesh_coordinator_roster_root(
+                    &coordinator_roster_from_adverts(&adverts_from_json(&r.adverts_json)),
+                ),
                 signer_set_delta: SignerSetDelta {
                     added: r.signer_set_delta.0,
                     removed: r.signer_set_delta.1,
@@ -908,6 +962,13 @@ impl MeshNodeListCheckpointManager {
                 Ok(local) if mesh_node_list_root(&local) == entry.list_root => {}
                 _ => return false,
             }
+            // And the roster, for the same reason: a peer serving a valid signature over one
+            // roster and a different roster beside it is exactly what re-derivation catches.
+            match derive_coordinator_roster(&qualified, &entry.adverts) {
+                Ok(local)
+                    if mesh_coordinator_roster_root(&local) == entry.coordinator_roster_root => {}
+                _ => return false,
+            }
         }
         // Reconstruct the checkpoint hash and verify the proposer's signature over it.
         let msg = MeshNodeListCheckpointMessage {
@@ -917,6 +978,8 @@ impl MeshNodeListCheckpointManager {
             adverts: entry.adverts.clone(),
             advert_root: entry.advert_root,
             list_root: entry.list_root,
+            coordinator_roster: entry.coordinator_roster.clone(),
+            coordinator_roster_root: entry.coordinator_roster_root,
             signer_set_delta: entry.signer_set_delta.clone(),
             signer_set_root: entry.signer_set_root,
             active_node_count: entry.active_node_count,
@@ -1074,7 +1137,7 @@ mod tests {
 
     /// A node's own signed advert, as production builds it.
     fn signed_advert(id: &NodeIdentity, host: &str, public_mining: bool) -> MeshEndpointAdvert {
-        build_self_advert(id, host, 3333, 34255, public_mining, 1)
+        build_self_advert(id, host, 3333, 34255, public_mining, false, "", 1)
     }
 
     /// Every elder advertises itself. This is the ordinary case: the qualified set and the
@@ -1082,7 +1145,18 @@ mod tests {
     fn adverts_for(ids: &[Arc<NodeIdentity>]) -> Vec<MeshEndpointAdvert> {
         ids.iter()
             .enumerate()
-            .map(|(i, id)| signed_advert(id, &format!("203.0.113.{}", i + 1), true))
+            .map(|(i, id)| {
+                let mut a = signed_advert(id, &format!("203.0.113.{}", i + 1), true);
+                // Every other node also coordinates, so the roster is a strict subset of the
+                // node list rather than a copy of it — a test where the two coincide would
+                // pass for a proposer that published the wrong one.
+                if i % 2 == 0 {
+                    a.coordinator = true;
+                    a.coordinator_endpoint = format!("203.0.113.{}:9100", i + 1);
+                    a.signature = id.sign(&a.signing_bytes());
+                }
+                a
+            })
             .collect()
     }
 
@@ -1225,6 +1299,113 @@ mod tests {
             db.get_latest_mesh_node_list_checkpoint().unwrap().is_none(),
             "dormant manager finalises nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn the_finalised_checkpoint_carries_a_roster_every_voter_re_derived() {
+        // A real cluster: the proposer builds the roster, every other node re-derives it, and
+        // the finalised checkpoint only exists because they agreed. That agreement is the
+        // whole property — a roster the fleet did not converge on is one a wallet cannot be
+        // told to trust.
+        let (nodes, _elders, adverts) = build(4, &[Hold::All; 4]);
+        for n in &nodes {
+            n.mgr.maybe_propose(H, CUTOFF).await;
+        }
+        gossip_until_quiet(&nodes).await;
+
+        let expected = coordinator_roster_from_adverts(&adverts);
+        assert_eq!(expected.len(), 2, "half the fixture coordinates");
+        let expected_root = mesh_coordinator_roster_root(&expected);
+
+        for n in &nodes {
+            let rec =
+                n.db.get_latest_mesh_node_list_checkpoint()
+                    .unwrap()
+                    .expect("every node finalised");
+            let stored = coordinator_roster_from_adverts(&adverts_from_json(&rec.adverts_json));
+            assert_eq!(
+                mesh_coordinator_roster_root(&stored),
+                expected_root,
+                "every node's checkpoint must render the same roster"
+            );
+            assert!(
+                stored.len() < storage_to_entries(&rec.nodes).len(),
+                "the roster must be a strict subset, or this proves nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_served_checkpoint_reconstructs_the_hash_its_proposer_signed() {
+        // The property the public endpoint exists to provide, and the one it did not have:
+        // a shim reconstructs `checkpoint_hash` from the blob and checks every signature
+        // against it. Two of the committed roots — `advert_root` and
+        // `coordinator_roster_root` — are not stored, because both are pure functions of the
+        // adopted adverts. If a served blob cannot recompute them, no signature on it can be
+        // checked, and the endpoint served exactly that shape until now.
+        //
+        // Nothing caught it because the endpoint 404s below the gate, so the first exercise
+        // of the code would have been the day someone armed it.
+        let (nodes, _elders, _adverts) = build(4, &[Hold::All; 4]);
+        for n in &nodes {
+            n.mgr.maybe_propose(H, CUTOFF).await;
+        }
+        gossip_until_quiet(&nodes).await;
+
+        let rec = nodes[0]
+            .db
+            .get_latest_mesh_node_list_checkpoint()
+            .unwrap()
+            .expect("finalised");
+
+        // Exactly what the HTTP handler recomputes when it serves this record.
+        let served_adverts = adverts_from_json(&rec.adverts_json);
+        assert!(
+            !served_adverts.is_empty(),
+            "a served blob without adverts can never be verified"
+        );
+        let roster = coordinator_roster_from_adverts(&served_adverts);
+        let msg = MeshNodeListCheckpointMessage {
+            height: rec.height,
+            cutoff_ts: rec.cutoff_ts,
+            nodes: storage_to_entries(&rec.nodes),
+            adverts: served_adverts.clone(),
+            advert_root: mesh_advert_set_root(&served_adverts),
+            list_root: rec.list_root,
+            coordinator_roster: roster.clone(),
+            coordinator_roster_root: mesh_coordinator_roster_root(&roster),
+            signer_set_delta: SignerSetDelta {
+                added: rec.signer_set_delta.0.clone(),
+                removed: rec.signer_set_delta.1.clone(),
+            },
+            signer_set_root: rec.signer_set_root,
+            active_node_count: rec.active_node_count,
+            proposer: decode_node_id(&rec.proposer_id).unwrap(),
+            proposer_signature: vec_to_sig(&rec.proposer_signature).unwrap(),
+            timestamp: 0,
+        };
+
+        let hash = msg.checkpoint_hash();
+        assert!(
+            verify_signature(&msg.proposer, &hash, &msg.proposer_signature).unwrap_or(false),
+            "the proposer signature must verify against the hash a served blob rebuilds"
+        );
+        // And the approvals, which is what a shim actually counts.
+        for (voter, sig) in &rec.approvals {
+            let vote = MeshNodeListCheckpointVoteMessage {
+                height: rec.height,
+                checkpoint_hash: hash,
+                voter: *voter,
+                approve: true,
+                signature: [0u8; 64],
+                timestamp: 0,
+            };
+            let sig64 = vec_to_sig(sig).expect("64-byte signature");
+            assert!(
+                verify_signature(voter, &vote.signing_message(), &sig64).unwrap_or(false),
+                "an approval must verify against that same hash"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1394,7 +1575,12 @@ mod tests {
             .expect("finalised");
 
         // Reconstruct the sync entry a peer would serve from that record.
+        let synced_adverts = adverts_from_json(&rec.adverts_json);
         let synced = MeshNodeListCheckpointSyncEntry {
+            coordinator_roster: coordinator_roster_from_adverts(&synced_adverts),
+            coordinator_roster_root: mesh_coordinator_roster_root(
+                &coordinator_roster_from_adverts(&synced_adverts),
+            ),
             height: rec.height,
             cutoff_ts: rec.cutoff_ts,
             nodes: storage_to_entries(&rec.nodes),
