@@ -1989,6 +1989,22 @@ pub struct MeshEndpointAdvert {
     /// carried with `false` and filtered out deterministically. Selective omission by a
     /// proposer is then detectable, because a short list fails the coverage check.
     pub public_mining: bool,
+    /// Whether this node runs a Wraith mixing coordinator.
+    ///
+    /// Carried for the same reason as `public_mining`, and filtered the same way — a node
+    /// that does not coordinate is carried with `false`, so a proposer cannot quietly drop
+    /// candidates it would rather not draw against.
+    ///
+    /// `#[serde(default)]` so adverts from nodes on pre-coordinator builds still
+    /// deserialize, reading as "does not coordinate" — which is what they are saying.
+    #[serde(default)]
+    pub coordinator: bool,
+    /// Where a wallet reaches this node's coordinator: `host:port`, or an `.onion`.
+    ///
+    /// Separate from `host` + the stratum ports because it is a different service on a
+    /// different port, and a node may run one without the other.
+    #[serde(default)]
+    pub coordinator_endpoint: String,
     /// Monotonic per node. A higher `seq` supersedes.
     pub seq: u64,
     /// The subject's signature over [`MeshEndpointAdvert::signing_bytes`].
@@ -2002,7 +2018,19 @@ impl MeshEndpointAdvert {
     ///
     /// The signature is NOT covered, for the obvious reason.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(64 + self.host.len());
+        let mut v = self.signing_bytes_v1();
+        v[..b"MeshEndpointAdvert/v1".len()].copy_from_slice(b"MeshEndpointAdvert/v2");
+        v.push(u8::from(self.coordinator));
+        let cb = self.coordinator_endpoint.as_bytes();
+        v.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+        v.extend_from_slice(cb);
+        v
+    }
+
+    /// The pre-coordinator signing bytes, kept so adverts signed by nodes that predate
+    /// the coordinator fields still verify during a fleet roll.
+    fn signing_bytes_v1(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(96 + self.host.len() + self.coordinator_endpoint.len());
         v.extend_from_slice(b"MeshEndpointAdvert/v1");
         v.extend_from_slice(&self.node_id);
         let hb = self.host.as_bytes();
@@ -2019,13 +2047,27 @@ impl MeshEndpointAdvert {
     ///
     /// Fail-closed on a verification error, the same sense as
     /// `ShareProof::has_valid_bound_signature`: an error is not a valid signature.
+    /// Whether the subject really signed this advert.
+    ///
+    /// Two accepted spellings, because adverts are gossiped continuously and a fleet rolls
+    /// one node at a time: a node that has not yet updated keeps signing the v1 bytes, and
+    /// refusing those would fail the checkpoint's coverage check for the whole roll.
+    ///
+    /// ⚠ The fallback is deliberately NARROW. A v1 signature is accepted only for an advert
+    /// that makes no coordinator claim. Otherwise a signature produced before the coordinator
+    /// fields existed — over bytes that could not mention them — would authorise a claim its
+    /// signer never made, and anyone replaying an old advert could enrol a node as a
+    /// coordinator against its will.
     pub fn is_self_signed(&self) -> bool {
-        ghost_common::identity::verify_signature(
-            &self.node_id,
-            &self.signing_bytes(),
-            &self.signature,
-        )
-        .unwrap_or(false)
+        let verify = |bytes: Vec<u8>| {
+            ghost_common::identity::verify_signature(&self.node_id, &bytes, &self.signature)
+                .unwrap_or(false)
+        };
+        if verify(self.signing_bytes()) {
+            return true;
+        }
+        let claims_nothing_new = !self.coordinator && self.coordinator_endpoint.is_empty();
+        claims_nothing_new && verify(self.signing_bytes_v1())
     }
 
     /// The rendered directory entry, once membership and signature have been established.
@@ -2074,6 +2116,101 @@ pub fn derive_mesh_node_list(
     qualified: &[NodeId],
     adverts: &[MeshEndpointAdvert],
 ) -> Result<Vec<MeshNodeEntry>, MeshListRejection> {
+    // `best_adverts` is a BTreeMap, so this is already ordered by node_id.
+    Ok(best_adverts(qualified, adverts)?
+        .values()
+        .filter(|a| a.public_mining)
+        .map(|a| a.to_entry())
+        .collect())
+}
+
+/// The coordinator roster: who a wallet may be sent to for a Wraith round.
+///
+/// **The same derivation as [`derive_mesh_node_list`], filtered differently.** That is the
+/// entire point of it living here. ghost-pool's live coordinator election builds its roster
+/// from mesh state — its own comment calls that "the defect this value exposes rather than
+/// repairs" — so two nodes can legitimately disagree about who was eligible. Everything a
+/// roster needs to stop being node-local is already true of this derivation: membership from
+/// the ratified qualified set, endpoints from adverts each signed by their own subject, no
+/// clock and no peer table, and coverage total so a proposer that drops a candidate it would
+/// rather not draw against produces a list that fails the coverage check.
+///
+/// A node claiming `coordinator` with no endpoint is filtered out rather than rejected. It
+/// cannot be dialled, so it is not in the roster; and one node's malformed advert should not
+/// deny the whole fleet a checkpoint. Whether that failed claim should cost it anything is a
+/// question for the capability that scores it, not for the list of who can be reached.
+pub fn derive_coordinator_roster(
+    qualified: &[NodeId],
+    adverts: &[MeshEndpointAdvert],
+) -> Result<Vec<CoordinatorRosterEntry>, MeshListRejection> {
+    let best = best_adverts(qualified, adverts)?;
+    let winning: Vec<MeshEndpointAdvert> = best.values().map(|a| (*a).clone()).collect();
+    Ok(coordinator_roster_from_adverts(&winning))
+}
+
+/// The roster a set of already-settled adverts renders to.
+///
+/// The filter half of [`derive_coordinator_roster`], without the membership checks — for
+/// callers that have the winning adverts already and are re-deriving a root rather than
+/// deciding membership: a node serving a finalised checkpoint back over sync, and a shim
+/// verifying one it was handed. Both would otherwise spell the filter themselves, and a
+/// second spelling of "who is in the roster" is how a proposer and its verifier drift apart.
+///
+/// It does NOT establish coverage, so it must not be used to decide a proposal. Use
+/// [`derive_coordinator_roster`] for that.
+pub fn coordinator_roster_from_adverts(
+    adverts: &[MeshEndpointAdvert],
+) -> Vec<CoordinatorRosterEntry> {
+    let mut v: Vec<CoordinatorRosterEntry> = adverts
+        .iter()
+        .filter(|a| a.coordinator && !a.coordinator_endpoint.is_empty())
+        .map(|a| CoordinatorRosterEntry {
+            node_id: a.node_id,
+            endpoint: a.coordinator_endpoint.clone(),
+        })
+        .collect();
+    v.sort_by_key(|e| e.node_id);
+    v
+}
+
+/// One node a wallet may be sent to for a Wraith round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorRosterEntry {
+    /// Node identity = Ed25519 public key, so anything it signs is verifiable with no key
+    /// distribution — the same property the node list relies on.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub node_id: NodeId,
+    /// `host:port`, or an `.onion`.
+    pub endpoint: String,
+}
+
+/// Canonical root over a coordinator roster, so it is bound inside `checkpoint_hash` and
+/// attested by the same supermajority as the node list.
+pub fn mesh_coordinator_roster_root(roster: &[CoordinatorRosterEntry]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&CoordinatorRosterEntry> = roster.iter().collect();
+    sorted.sort_by_key(|e| e.node_id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"MeshCoordinatorRoster/v1");
+    hasher.update((sorted.len() as u32).to_le_bytes());
+    for e in sorted {
+        hasher.update(e.node_id);
+        let eb = e.endpoint.as_bytes();
+        hasher.update((eb.len() as u32).to_le_bytes());
+        hasher.update(eb);
+    }
+    hasher.finalize().into()
+}
+
+/// The winning advert per qualified node: signature-checked, deduplicated and coverage-checked.
+///
+/// **One spelling, several callers.** Both derived lists come from this, so a proposer and
+/// its voters cannot disagree about membership while agreeing about the filter — and a
+/// second spelling is how they would drift apart.
+fn best_adverts<'a>(
+    qualified: &[NodeId],
+    adverts: &'a [MeshEndpointAdvert],
+) -> Result<std::collections::BTreeMap<NodeId, &'a MeshEndpointAdvert>, MeshListRejection> {
     use std::collections::BTreeMap;
 
     let qualified_set: std::collections::BTreeSet<NodeId> = qualified.iter().copied().collect();
@@ -2124,12 +2261,7 @@ pub fn derive_mesh_node_list(
         }
     }
 
-    // `best` is a BTreeMap, so this is already ordered by node_id.
-    Ok(best
-        .values()
-        .filter(|a| a.public_mining)
-        .map(|a| a.to_entry())
-        .collect())
+    Ok(best)
 }
 
 /// Canonical root over the ADVERTS a checkpoint adopts.
@@ -2231,6 +2363,19 @@ pub struct MeshNodeListCheckpointMessage {
     /// `mesh_node_list_root(nodes)` — binds the list inside `checkpoint_hash`.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub list_root: [u8; 32],
+    /// The coordinator roster as of `cutoff_ts` — the nodes a wallet may be sent to for a
+    /// Wraith round, derived from `adverts` by keeping those that advertise a coordinator
+    /// endpoint.
+    #[serde(default)]
+    pub coordinator_roster: Vec<CoordinatorRosterEntry>,
+    /// `mesh_coordinator_roster_root(coordinator_roster)` — binds the roster inside
+    /// `checkpoint_hash`, so it is attested by the same supermajority as the node list.
+    ///
+    /// Without this the roster would be a list served alongside a signed document rather
+    /// than part of one, which is the difference between a wallet checking who is eligible
+    /// and a wallet believing whoever answered.
+    #[serde(with = "ghost_common::serde_hex::bytes32", default)]
+    pub coordinator_roster_root: [u8; 32],
     /// Signer-set change vs the previous checkpoint (the signed forward chain).
     #[serde(default)]
     pub signer_set_delta: SignerSetDelta,
@@ -2259,13 +2404,16 @@ impl MeshNodeListCheckpointMessage {
         let mut hasher = Sha256::new();
         // v2: `advert_root` joined the commitment when the node set moved from each node's
         // local liveness view to the ratified qualified set plus signed endpoints (#625).
+        // v3: `coordinator_roster_root` joined it, so the roster a wallet draws its
+        // coordinator from is attested rather than merely served beside something attested.
         // Bumped freely: the gate is `u64::MAX` and no checkpoint has ever finalised, so
         // there is no chain of prior hashes to stay compatible with.
-        hasher.update(b"MeshNodeListCheckpoint/v2");
+        hasher.update(b"MeshNodeListCheckpoint/v3");
         hasher.update(self.height.to_le_bytes());
         hasher.update(self.cutoff_ts.to_le_bytes());
         hasher.update(self.list_root);
         hasher.update(self.advert_root);
+        hasher.update(self.coordinator_roster_root);
         hasher.update(self.signer_set_root);
         hasher.update(self.active_node_count.to_le_bytes());
         hasher.update(self.proposer);
@@ -2332,6 +2480,13 @@ pub struct MeshNodeListCheckpointSyncEntry {
     /// `mesh_node_list_root(nodes)`.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub list_root: [u8; 32],
+    /// The coordinator roster as of `cutoff_ts`.
+    #[serde(default)]
+    pub coordinator_roster: Vec<CoordinatorRosterEntry>,
+    /// `mesh_coordinator_roster_root(coordinator_roster)`. Part of `checkpoint_hash`, so it
+    /// must survive sync or the proposer signature cannot be reconstructed.
+    #[serde(with = "ghost_common::serde_hex::bytes32", default)]
+    pub coordinator_roster_root: [u8; 32],
     /// Signer-set change vs the previous checkpoint.
     #[serde(default)]
     pub signer_set_delta: SignerSetDelta,
@@ -2932,11 +3087,159 @@ mod tests {
             sv1_port: 3333,
             sv2_port: 34255,
             public_mining,
+            coordinator: false,
+            coordinator_endpoint: String::new(),
             seq,
             signature: [0u8; 64],
         };
         a.signature = id.sign(&a.signing_bytes());
         a
+    }
+
+    /// An advert that also offers coordination.
+    fn coordinator_advert_for(
+        id: &ghost_common::identity::NodeIdentity,
+        host: &str,
+        endpoint: &str,
+        seq: u64,
+    ) -> MeshEndpointAdvert {
+        let mut a = advert_for(id, host, true, seq);
+        a.coordinator = true;
+        a.coordinator_endpoint = endpoint.to_string();
+        a.signature = id.sign(&a.signing_bytes());
+        a
+    }
+
+    /// The coordinator roster is derived, not served.
+    ///
+    /// Same ratified set, same adverts, same answer — the property the live-mesh roster
+    /// cannot offer, and the reason a wallet can be told who is eligible rather than asked
+    /// to believe it.
+    #[test]
+    fn the_coordinator_roster_is_derived_from_the_qualified_set_and_the_adverts() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let c = ghost_common::identity::NodeIdentity::generate();
+        let qualified = vec![a.node_id(), b.node_id(), c.node_id()];
+        let adverts = vec![
+            coordinator_advert_for(&a, "a.example", "a.example:9100", 1),
+            // Mines but does not coordinate.
+            advert_for(&b, "b.example", true, 1),
+            coordinator_advert_for(&c, "c.example", "c.onion:9100", 1),
+        ];
+
+        let roster = derive_coordinator_roster(&qualified, &adverts).expect("derives");
+        assert_eq!(roster.len(), 2, "only the two coordinators");
+        assert!(roster.iter().any(|e| e.endpoint == "a.example:9100"));
+        assert!(roster.iter().any(|e| e.endpoint == "c.onion:9100"));
+        assert!(
+            !roster.iter().any(|e| e.node_id == b.node_id()),
+            "a miner that does not coordinate is not in the roster"
+        );
+
+        // And the node list is unaffected by any of it.
+        let nodes = derive_mesh_node_list(&qualified, &adverts).expect("derives");
+        assert_eq!(nodes.len(), 3, "all three offer public mining");
+    }
+
+    /// Arrival order must not change the roster, for the same reason it must not change the
+    /// node list: an exact-set agreement that depends on ordering never converges.
+    #[test]
+    fn the_roster_is_identical_whatever_order_the_adverts_arrive_in() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let qualified = vec![a.node_id(), b.node_id()];
+        let one = vec![
+            coordinator_advert_for(&a, "a.example", "a:9100", 1),
+            coordinator_advert_for(&b, "b.example", "b:9100", 1),
+        ];
+        let other = vec![one[1].clone(), one[0].clone()];
+        assert_eq!(
+            mesh_coordinator_roster_root(&derive_coordinator_roster(&qualified, &one).unwrap()),
+            mesh_coordinator_roster_root(&derive_coordinator_roster(&qualified, &other).unwrap()),
+        );
+    }
+
+    /// A proposer cannot quietly drop a coordinator it would rather not draw against.
+    ///
+    /// This is the attack the wallet had no defence against while the roster came from
+    /// whoever answered: omit some honest candidates and the remaining draw is entirely
+    /// self-consistent. Total coverage makes the short list fail instead.
+    #[test]
+    fn omitting_a_coordinator_fails_coverage_rather_than_shrinking_the_roster() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let qualified = vec![a.node_id(), b.node_id()];
+        let only_a = vec![coordinator_advert_for(&a, "a.example", "a:9100", 1)];
+        assert!(matches!(
+            derive_coordinator_roster(&qualified, &only_a),
+            Err(MeshListRejection::MissingAdvert { .. })
+        ));
+    }
+
+    /// A node claiming coordination with nowhere to be reached is not in the roster, and
+    /// does not take the checkpoint down with it.
+    #[test]
+    fn a_coordinator_claim_without_an_endpoint_is_filtered_not_fatal() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let b = ghost_common::identity::NodeIdentity::generate();
+        let qualified = vec![a.node_id(), b.node_id()];
+        let mut broken = advert_for(&a, "a.example", true, 1);
+        broken.coordinator = true;
+        broken.coordinator_endpoint = String::new();
+        broken.signature = a.sign(&broken.signing_bytes());
+
+        let adverts = vec![broken, coordinator_advert_for(&b, "b.example", "b:9100", 1)];
+        let roster = derive_coordinator_roster(&qualified, &adverts).expect("still derives");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].node_id, b.node_id());
+    }
+
+    /// A node still running a pre-coordinator build keeps verifying, and reads as not a
+    /// coordinator — which is exactly what it is saying.
+    ///
+    /// Without this the whole fleet would have to update before any checkpoint could pass
+    /// its coverage check, turning a rolling upgrade into a flag day.
+    #[test]
+    fn an_advert_signed_before_the_coordinator_fields_still_verifies() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let mut old = advert_for(&a, "a.example", true, 1);
+        // Sign the way a node without the coordinator fields would have.
+        old.signature = a.sign(&old.signing_bytes_v1());
+        assert!(old.is_self_signed(), "a v1 signature must still verify");
+        assert!(!old.coordinator);
+    }
+
+    /// ⚠ The narrow half of that fallback, and the reason it is narrow.
+    ///
+    /// A signature made before the coordinator fields existed was made over bytes that could
+    /// not mention them. Accepting it for an advert that DOES claim coordination would let
+    /// anyone replay an old advert with the flag flipped and enrol a node as a coordinator
+    /// against its will — and, once the capability pays, collect for it.
+    #[test]
+    fn an_old_signature_cannot_authorise_a_coordinator_claim() {
+        let a = ghost_common::identity::NodeIdentity::generate();
+        let mut forged = advert_for(&a, "a.example", true, 1);
+        forged.signature = a.sign(&forged.signing_bytes_v1());
+        assert!(forged.is_self_signed(), "valid before the claim is added");
+
+        forged.coordinator = true;
+        forged.coordinator_endpoint = "attacker:9100".to_string();
+        assert!(
+            !forged.is_self_signed(),
+            "a v1 signature must not authorise a claim it could not have covered"
+        );
+    }
+
+    /// The roster is inside the checkpoint hash, so every approval attests it. If it were
+    /// only served alongside, a supermajority would be signing the node list while the
+    /// roster travelled unattested beside it.
+    #[test]
+    fn the_checkpoint_hash_covers_the_coordinator_roster() {
+        let mut cp = sample_mesh_checkpoint();
+        let before = cp.checkpoint_hash();
+        cp.coordinator_roster_root = [7u8; 32];
+        assert_ne!(before, cp.checkpoint_hash());
     }
 
     /// THE property #625 is about. Three nodes deriving from the same ratified set and the
@@ -3621,6 +3924,8 @@ mod tests {
             height: 959_400,
             cutoff_ts: 1_760_000_000,
             list_root: mesh_node_list_root(&nodes),
+            coordinator_roster: vec![],
+            coordinator_roster_root: mesh_coordinator_roster_root(&[]),
             nodes,
             // This fixture predates signed adverts and exercises the hash/serde shape, not
             // the derivation; the derivation has its own tests above.

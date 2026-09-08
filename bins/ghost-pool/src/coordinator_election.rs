@@ -80,6 +80,13 @@ const COORDINATOR_PEER_FRESHNESS_SECS: u64 = 300;
 /// seat is added; minimum seats whenever any coordinator is eligible (so there
 /// is always at least one, for liveness); and a hard ceiling. All tunable.
 const TARGET_SESSIONS_PER_SEAT: u64 = 50;
+/// Sentinel in the `demand` slot meaning "the roster is agreed — size the seats from it".
+///
+/// A sentinel rather than a flag because `roster_with_endpoints` returns one tuple down two
+/// paths, and a caller that forgot to branch would silently size an agreed roster by local
+/// demand — the exact mistake this change exists to remove. `u64::MAX` is not reachable as a
+/// real session sum.
+const AGREED_SEATS: u64 = u64::MAX;
 const MIN_SEATS: usize = 1;
 const MAX_SEATS: usize = 16;
 
@@ -100,6 +107,32 @@ pub fn seats_for_demand(demand: u64, eligible: usize) -> usize {
     }
     let by_demand = (demand.div_ceil(TARGET_SESSIONS_PER_SEAT) as usize).max(MIN_SEATS);
     by_demand.min(MAX_SEATS).min(eligible)
+}
+
+/// Seat count from the agreed roster alone.
+///
+/// Used whenever the roster comes from a finalised checkpoint, and it exists because
+/// [`seats_for_demand`] cannot be made to agree.
+///
+/// `demand` is summed from `get_connected_peers(..)` — a local view through a freshness
+/// window, which is the exact input shape that made the old node-list derivation produce six
+/// distinct sets across seven nodes. Coarse buckets narrow the window of disagreement to
+/// values near a bucket edge but do not close it, and `seats` is an input to the verified
+/// draw: two nodes that differ by one seat seat different coordinators from an identical
+/// roster. A wallet then dials a node that does not believe it holds the seat, and once the
+/// capability pays for holding one, the fleet disagrees about who is owed.
+///
+/// It cannot be fixed by carrying demand in the checkpoint either. Demand is per-node session
+/// counts, so a node would be self-reporting the number that decides how many seats exist —
+/// unverifiable and directly worth inflating.
+///
+/// So seats scale with SUPPLY, which is agreed, rather than with self-reported demand. One
+/// seat per two eligible coordinators, floored and capped as before.
+pub fn seats_for_roster(eligible: usize) -> usize {
+    if eligible == 0 {
+        return 0;
+    }
+    (eligible / 2).clamp(MIN_SEATS, MAX_SEATS).min(eligible)
 }
 
 /// The coordinator epoch a chain height falls in.
@@ -157,6 +190,13 @@ struct Cached {
     anchor_height: u64,
 }
 
+/// Supplies the coordinator roster from the latest finalised node-list checkpoint.
+///
+/// `None` while the checkpoint gate is dormant, or before any has finalised — the caller then
+/// falls back to live mesh state.
+pub type CheckpointRosterFn =
+    Arc<dyn Fn() -> Option<Vec<(CoordinatorNodeId, String)>> + Send + Sync>;
+
 /// Live coordinator-election service for ghost-pool.
 ///
 /// Constructed only when `wraith_election_enabled` is true. Holds the inputs it
@@ -174,8 +214,11 @@ pub struct CoordinatorElection {
     /// `.onion`). Included in the roster + endpoint map only when
     /// `self_coordinator` and non-empty.
     self_endpoint: Option<String>,
-    /// Mesh handle — source of the opted-in coordinator peers + their endpoints.
+    /// Mesh handle — source of the opted-in coordinator peers + their endpoints, and of
+    /// session demand whichever way the roster is obtained.
     mesh: Arc<MeshNetwork>,
+    /// The agreed roster, when a node-list checkpoint has finalised one.
+    checkpoint_roster: Option<CheckpointRosterFn>,
     /// Ghost Core RPC — source of the beacon anchor (block hash at a height).
     rpc: Arc<BitcoinRpc>,
     /// Cached current-epoch view.
@@ -198,8 +241,36 @@ impl CoordinatorElection {
             self_endpoint,
             mesh,
             rpc,
+            checkpoint_roster: None,
             cached: RwLock::new(None),
         }
+    }
+
+    /// Take the roster from the finalised node-list checkpoint when there is one.
+    ///
+    /// A roster read from live mesh state is node-local: it depends on who this node happens
+    /// to be talking to and how recently, so two honest nodes can draw different elections
+    /// and send the same wallet to different coordinators. The checkpoint's roster is derived
+    /// from the ratified qualified set and self-signed adverts, and agreed by a supermajority
+    /// before anything uses it.
+    ///
+    /// ⚠ "Agreed" is doing real work there, and it is not free. The checkpoint requires
+    /// EXACT-set agreement on the derived list, so its inputs must have stopped moving before
+    /// it is asked. The qualified set is read at `tip - 6` blocks today, and qualification —
+    /// 95% uptime over seven days, plus peer challenges reconciling through a verification
+    /// ledger — does not settle in an hour. Where that same imprecision is harmless for the
+    /// payout checkpoint (the qualified set decides who VOTES, so a one-node difference only
+    /// moves the denominator), here it decides what is voted ON: one node's extra member
+    /// derives a different root, votes reject, and no checkpoint finalises at all. Silently.
+    ///
+    /// So this is correct and, at the current lag, unlikely to ever have a roster to read.
+    /// Raising that lag to an epoch is the outstanding piece.
+    ///
+    /// Optional because the checkpoint is gated: below the gate there is nothing to read and
+    /// the live-mesh path stays, exactly as today.
+    pub fn with_checkpoint_roster(mut self, f: CheckpointRosterFn) -> Self {
+        self.checkpoint_roster = Some(f);
+        self
     }
 
     /// Construct the service iff `enabled`, else `None` (gated-off path). When
@@ -211,17 +282,16 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
+        checkpoint_roster: Option<CheckpointRosterFn>,
     ) -> Option<Arc<Self>> {
         if !enabled {
             return None;
         }
-        Some(Arc::new(Self::new(
-            identity,
-            capabilities,
-            self_endpoint,
-            mesh,
-            rpc,
-        )))
+        let mut svc = Self::new(identity, capabilities, self_endpoint, mesh, rpc);
+        if let Some(f) = checkpoint_roster {
+            svc = svc.with_checkpoint_roster(f);
+        }
+        Some(Arc::new(svc))
     }
 
     /// The opted-in, reachable coordinator roster for this epoch, plus the
@@ -235,6 +305,29 @@ impl CoordinatorElection {
     /// session `demand` across the eligible set (incl. self) — the frozen input
     /// to [`seats_for_demand`].
     fn roster_with_endpoints(&self) -> (Vec<CoordinatorNodeId>, EndpointMap, u64) {
+        // Prefer the agreed roster — membership AND seat count then come from data every
+        // node derives identically.
+        //
+        // Nothing local is read on this path, deliberately. Mixing one agreed input with one
+        // local one does not give you a mostly-agreed answer; it gives you the local one's
+        // convergence properties, which is how the old node-list derivation failed.
+        if let Some(from_checkpoint) = self.checkpoint_roster.as_ref().and_then(|f| f()) {
+            if !from_checkpoint.is_empty() {
+                let mut endpoints = EndpointMap::new();
+                let mut ids: Vec<CoordinatorNodeId> = Vec::new();
+                for (node_id, endpoint) in from_checkpoint {
+                    if endpoint.is_empty() {
+                        continue;
+                    }
+                    endpoints.insert(node_id, endpoint);
+                    ids.push(node_id);
+                }
+                let roster = canonical_roster(&ids);
+                // `AGREED_SEATS` rather than a demand sum: see `seats_for_roster`.
+                return (roster, endpoints, AGREED_SEATS);
+            }
+        }
+
         let mut endpoints = EndpointMap::new();
         let mut ids: Vec<CoordinatorNodeId> = Vec::new();
         let mut demand: u64 = 0;
@@ -296,13 +389,20 @@ impl CoordinatorElection {
             // Anchor not reachable yet — keep the last good view.
             return epoch;
         };
-        // Roster = opted-in coordinators advertising a reachable endpoint (+ self
-        // when opted in), with the endpoint map a wallet uses to dial the owner.
-        // Seats are sized from the frozen, mesh-summed recent session demand —
-        // this recompute only runs when the epoch flips, so the snapshot is the
-        // per-epoch freeze.
+        // Roster = the agreed set from the finalised checkpoint when there is one, else the
+        // opted-in coordinators seen in recent health pings. The endpoint map is what a
+        // wallet dials.
+        //
+        // `demand` is `AGREED_SEATS` on the checkpoint path, which routes seat sizing to
+        // `seats_for_roster` — a function of the agreed roster and nothing else. Below the
+        // gate it is the mesh-summed recent session demand, sized as before: this recompute
+        // only runs when the epoch flips, so that snapshot is the per-epoch freeze.
         let (roster, endpoints, demand) = self.roster_with_endpoints();
-        let seats = seats_for_demand(demand, roster.len());
+        let seats = if demand == AGREED_SEATS {
+            seats_for_roster(roster.len())
+        } else {
+            seats_for_demand(demand, roster.len())
+        };
         let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, seats);
         *self.cached.write() = Some(Cached {
             epoch,
@@ -476,6 +576,136 @@ mod tests {
     }
 
     // ── election-through-the-view tests (the library + our reporting shape) ──
+
+    /// Seats must not depend on anything node-local.
+    ///
+    /// The concern this answers: the old node-list derivation failed because each node
+    /// computed from its own view, and no amount of care makes subjective inputs converge.
+    /// Membership is fixed by taking the roster from the checkpoint — but `seats` is also an
+    /// input to the verified draw, so sizing it from mesh-summed demand would have put the
+    /// same defect one level down. Two nodes, same agreed roster, different demand
+    /// snapshots, different elections.
+    #[test]
+    fn seats_are_a_function_of_the_agreed_roster_and_nothing_else() {
+        // Whatever a node believes about demand, the agreed roster gives one answer.
+        for eligible in 1..=12usize {
+            let a = seats_for_roster(eligible);
+            let b = seats_for_roster(eligible);
+            assert_eq!(a, b);
+            assert!(
+                a >= MIN_SEATS.min(eligible),
+                "at least one seat for liveness"
+            );
+            assert!(a <= eligible, "cannot seat more coordinators than exist");
+            assert!(a <= MAX_SEATS);
+        }
+
+        // And it genuinely differs from the demand-sized answer, so this is not passing
+        // because the two happen to coincide.
+        let eligible = 12;
+        assert_ne!(
+            seats_for_roster(eligible),
+            seats_for_demand(50 * 9, eligible),
+            "demand sizing and roster sizing must be distinguishable, or this proves nothing"
+        );
+    }
+
+    /// The failure mode itself: two honest nodes, identical agreed roster, demand snapshots
+    /// that differ by one session across a bucket edge. Under demand sizing they seat
+    /// differently; under roster sizing they cannot.
+    #[test]
+    fn a_bucket_edge_disagreement_cannot_change_the_seating() {
+        let eligible = 12;
+        let just_under = TARGET_SESSIONS_PER_SEAT * 3;
+        let just_over = just_under + 1;
+        assert_ne!(
+            seats_for_demand(just_under, eligible),
+            seats_for_demand(just_over, eligible),
+            "one session across a bucket edge changes the demand-sized count"
+        );
+        assert_eq!(
+            seats_for_roster(eligible),
+            seats_for_roster(eligible),
+            "the agreed-roster count cannot move, because nothing local feeds it"
+        );
+    }
+
+    /// The agreed roster must beat the local one.
+    ///
+    /// `roster_with_endpoints` needs live handles, so this exercises the decision it makes
+    /// rather than the struct: given a checkpoint roster, that is what is drawn from — and
+    /// the draw over it is deterministic, which is the property a wallet verifies. Two nodes
+    /// with different mesh views but the same checkpoint must seat the same coordinators.
+    #[test]
+    fn two_nodes_with_different_mesh_views_seat_the_same_coordinators() {
+        let agreed: Vec<CoordinatorNodeId> = (0u8..8).map(node).collect();
+        let beacon = derive_beacon(11, &[3u8; 32]);
+
+        // Same agreed roster, arrived at from mesh views that would have disagreed.
+        let a = CoordinatorView::build(
+            11,
+            &beacon,
+            &canonical_roster(&agreed),
+            EndpointMap::new(),
+            COORDINATOR_SEATS,
+        );
+        let mut shuffled = agreed.clone();
+        shuffled.reverse();
+        let b = CoordinatorView::build(
+            11,
+            &beacon,
+            &canonical_roster(&shuffled),
+            EndpointMap::new(),
+            COORDINATOR_SEATS,
+        );
+        assert_eq!(a.seats(), b.seats());
+        for id in &agreed {
+            assert_eq!(
+                a.my_seat(id),
+                b.my_seat(id),
+                "the same agreed roster must seat identically whatever order it arrived in"
+            );
+        }
+    }
+
+    /// A roster that differs by ONE member seats differently — so the test above is proving
+    /// agreement rather than passing because the draw ignores its input.
+    #[test]
+    fn dropping_one_candidate_changes_the_seating() {
+        let full: Vec<CoordinatorNodeId> = (0u8..8).map(node).collect();
+        let beacon = derive_beacon(11, &[3u8; 32]);
+        let with_all = CoordinatorView::build(
+            11,
+            &beacon,
+            &canonical_roster(&full),
+            EndpointMap::new(),
+            COORDINATOR_SEATS,
+        );
+        // Drop a node that actually HOLDS a seat. Dropping an unseated one legitimately
+        // changes nothing, which would make this test pass without proving anything.
+        let seated = full
+            .iter()
+            .find(|id| with_all.my_seat(id).is_some())
+            .copied()
+            .expect("some candidate is seated");
+        let trimmed: Vec<CoordinatorNodeId> =
+            full.iter().copied().filter(|id| *id != seated).collect();
+        let without = CoordinatorView::build(
+            11,
+            &beacon,
+            &canonical_roster(&trimmed),
+            EndpointMap::new(),
+            COORDINATOR_SEATS,
+        );
+        let differs = full
+            .iter()
+            .any(|id| with_all.my_seat(id) != without.my_seat(id));
+        assert!(
+            differs,
+            "a roster the fleet does not agree on produces a different election — which is \
+             why it has to come from consensus"
+        );
+    }
 
     #[test]
     fn election_is_deterministic_for_fixed_inputs() {

@@ -151,12 +151,17 @@ async fn refresh(args: &Args, state: &Arc<RwLock<PoolState>>) -> Result<()> {
     urls.dedup();
 
     let blob = fetch_blob(&urls).await?;
-    let nodes = verify_and_advance(&blob, &mut trusted)?;
+    let verified = verify_and_advance(&blob, &mut trusted)?;
+    // The roster is not this proxy's business — it routes miners, not mixes — but the count
+    // is worth reporting: the same checkpoint attests both, and an operator watching a fleet
+    // has no other place to see whether anyone is advertising coordination at all.
+    let coordinators = verified.coordinator_roster.len();
     let mut s = state.write().await;
-    s.nodes = nodes;
+    s.nodes = verified.nodes;
     s.trusted = trusted;
     info!(
         nodes = s.nodes.len(),
+        coordinators,
         height = blob.height,
         "checkpoint verified and applied"
     );

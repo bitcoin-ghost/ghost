@@ -4629,6 +4629,18 @@ async fn main() -> Result<()> {
         let id = Arc::clone(&identity);
         let addr = config.network.public_address.clone();
         let public = is_public_mining;
+        // Advertise a coordinator endpoint ONLY when opted in, matching the health-ping
+        // capability beside it — otherwise a stray config value would enrol this node in the
+        // coordinator roster, and a wallet would be sent to something that does not answer.
+        let coordinator_endpoint = if config.coordinator.coordinator_enabled {
+            config
+                .coordinator
+                .advertised_endpoint
+                .clone()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         tokio::spawn(async move {
             let Some(raw) = addr.as_deref().filter(|a| !a.is_empty()) else {
                 warn!(
@@ -4643,6 +4655,8 @@ async fn main() -> Result<()> {
                 ghost_pool::MESH_ADVERT_SV1_PORT,
                 ghost_pool::MESH_ADVERT_SV2_PORT,
                 public,
+                !coordinator_endpoint.is_empty(),
+                &coordinator_endpoint,
                 chrono::Utc::now().timestamp().max(0) as u64,
             );
             // Seed our own before anything is sent: a single-node fleet must still be able to
@@ -7693,12 +7707,29 @@ async fn main() -> Result<()> {
                 })
             })
             .collect();
+        // ⚠ EVERYTHING inside `checkpoint_hash` must be here, or a shim cannot reconstruct
+        // the hash and therefore cannot check a single signature. `advert_root` and
+        // `coordinator_roster_root` are committed but not stored — both are pure functions of
+        // the adopted adverts — so they are recomputed here from `adverts_json`, the same way
+        // the sync path recomputes them.
+        //
+        // This served a blob without `adverts` or `advert_root` until now, which no shim could
+        // have verified. Nothing noticed because the endpoint 404s below the gate, so the
+        // first exercise of it would have been the day it was armed.
+        let adverts = ghost_pool::mesh_node_checkpoint::adverts_from_json_public(&rec.adverts_json);
+        let advert_root = ghost_consensus::mesh_advert_set_root(&adverts);
+        let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
+        let roster_root = ghost_consensus::mesh_coordinator_roster_root(&roster);
         Some(serde_json::json!({
-            "version": "MeshNodeListCheckpoint/v1",
+            "version": "MeshNodeListCheckpoint/v3",
             "height": rec.height,
             "cutoff_ts": rec.cutoff_ts,
             "nodes": nodes,
+            "adverts": adverts,
+            "advert_root": hex::encode(advert_root),
             "list_root": hex::encode(rec.list_root),
+            "coordinator_roster": roster,
+            "coordinator_roster_root": hex::encode(roster_root),
             "signer_set_root": hex::encode(rec.signer_set_root),
             "signer_set_delta": {
                 "added": rec.signer_set_delta.0.iter().map(hex::encode).collect::<Vec<_>>(),
@@ -7873,6 +7904,28 @@ async fn main() -> Result<()> {
         config.coordinator.advertised_endpoint.clone(),
         Arc::clone(&mesh),
         Arc::clone(&rpc),
+        // The agreed roster, when the node-list checkpoint has finalised one. Returns `None`
+        // below the gate, and the election keeps its live-mesh roster — so arming the
+        // checkpoint is what moves the election off node-local state, in one step, fleet-wide.
+        {
+            let db = Arc::clone(&db);
+            Some(Arc::new(move || {
+                let rec = db.get_latest_mesh_node_list_checkpoint().ok().flatten()?;
+                let adverts =
+                    ghost_pool::mesh_node_checkpoint::adverts_from_json_public(&rec.adverts_json);
+                let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
+                if roster.is_empty() {
+                    return None;
+                }
+                Some(
+                    roster
+                        .into_iter()
+                        .map(|e| (e.node_id, e.endpoint))
+                        .collect::<Vec<_>>(),
+                )
+            })
+                as ghost_pool::coordinator_election::CheckpointRosterFn)
+        },
     );
     {
         let coord_for_api = coordinator_election.clone();
