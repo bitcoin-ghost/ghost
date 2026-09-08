@@ -31,6 +31,7 @@
 
 #![deny(unreachable_pub)]
 
+pub mod atomic_file;
 pub mod batch_two_phase;
 pub mod circuit_breaker;
 pub mod clock;
