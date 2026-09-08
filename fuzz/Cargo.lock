@@ -1875,6 +1875,7 @@ dependencies = [
  "bip32",
  "bip39",
  "bitcoin",
+ "ghost-common",
  "ghost-entropy",
  "hex",
  "musig2",
