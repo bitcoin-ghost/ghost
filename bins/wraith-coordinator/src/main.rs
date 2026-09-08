@@ -409,10 +409,32 @@ async fn main() -> Result<()> {
                 ),
             }
 
+            let defaulted = cli.lock_ledger_dir.is_none();
             let dir = cli
                 .lock_ledger_dir
                 .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
+            // Always report where the ledgers actually landed, resolved.
+            //
+            // These hold the once-per-coin record for Lock co-signing, and
+            // that module is explicit that a forgetful ledger is worse than
+            // none: it reports a guarantee it has stopped providing. Defaulting
+            // to the working directory means a coordinator relaunched from
+            // somewhere else silently starts with an empty one and will
+            // co-sign a coin it has already co-signed. Saying the absolute
+            // path out loud is the difference between that being visible and
+            // being discovered later.
+            let resolved = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if defaulted {
+                warn!(
+                    dir = %resolved.display(),
+                    "no --lock-ledger-dir: Lock co-signing ledgers go in the WORKING \
+                     DIRECTORY. Starting this coordinator from elsewhere gives it an empty \
+                     double-signing ledger. Pass --lock-ledger-dir to pin them."
+                );
+            } else {
+                info!(dir = %resolved.display(), "Lock co-signing ledgers");
+            }
             let cosign =
                 wraith_coordinator::LockCosignState::open(&dir, phrase, passphrase, policy, role)
                     .map_err(|e| anyhow::anyhow!("Lock co-sign ledgers in {dir:?}: {e}"))?;
