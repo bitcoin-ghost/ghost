@@ -1452,15 +1452,38 @@ mod server {
         }
 
         // 4. Build the unsigned PSBT.
-        let (psbt, meta) = psbt_mod::create_psbt(
-            &available,
+        //
+        // A Ghost ID is paid differently from an address: the money goes to a
+        // taproot output derived per-payment, and an OP_RETURN alongside it
+        // carries the ephemeral key the recipient needs to find it. Routed on
+        // the recipient's form rather than on a flag, so the caller cannot ask
+        // for one and get the other.
+        let (psbt, meta) = if wraith_wallet_core::silent_payment::looks_like_ghost_id(
             recipient_address,
-            amount_sats,
-            &change_addr,
             network,
-            fee_rate_sats_per_vb,
-        )
-        .map_err(|e| format!("create_psbt: {e}"))?;
+        ) {
+            let pay = wraith_wallet_core::silent_payment::build(recipient_address, network, 0)
+                .map_err(|e| format!("silent payment: {e}"))?;
+            psbt_mod::create_psbt_to_scripts(
+                &available,
+                pay.output_script,
+                amount_sats,
+                std::slice::from_ref(&pay.announcement_script),
+                &change_addr,
+                fee_rate_sats_per_vb,
+            )
+            .map_err(|e| format!("create_psbt: {e}"))?
+        } else {
+            psbt_mod::create_psbt(
+                &available,
+                recipient_address,
+                amount_sats,
+                &change_addr,
+                network,
+                fee_rate_sats_per_vb,
+            )
+            .map_err(|e| format!("create_psbt: {e}"))?
+        };
 
         let encoded = psbt_mod::encode_psbt(&psbt, psbt_mod::PsbtEncoding::Base64);
         Ok(wraith_wallet_ipc::PsbtCreateResponse {

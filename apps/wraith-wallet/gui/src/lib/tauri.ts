@@ -534,6 +534,11 @@ export interface L1SendResponse {
 
 /// Build, sign and broadcast an on-chain payment in one call.
 ///
+/// `recipient_address` takes a Bitcoin address, or a Ghost ID for a silent
+/// payment — which pays a fresh taproot output only the recipient can find,
+/// announced by an OP_RETURN carrying the ephemeral key. That hides who was
+/// paid, not that a payment happened.
+///
 /// The PSBT verbs remain for anyone who wants to look at the transaction
 /// before it leaves; this is the ordinary path.
 export async function l1Send(args: {

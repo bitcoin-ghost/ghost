@@ -573,6 +573,43 @@ pub fn create_psbt(
             tx_network: format!("{network:?}"),
             addr_network: format!("{e}"),
         })?;
+    create_psbt_to_scripts(
+        available,
+        recipient.script_pubkey(),
+        amount_sats,
+        &[],
+        change_address,
+        fee_rate_sats_per_vb,
+    )
+}
+
+/// Build a PSBT paying a raw scriptPubKey, plus any zero-value outputs.
+///
+/// [`create_psbt`] is this with an address parsed for you and no extras. The
+/// extras exist for a silent payment, which is two outputs that only work as a
+/// pair: the taproot output carrying the money, and an `OP_RETURN` carrying
+/// the sender's ephemeral key. Without the announcement the recipient cannot
+/// find the coin at all, so it is not an optional decoration — it is part of
+/// the payment, and it has to be funded and fee-estimated as such.
+pub fn create_psbt_to_scripts(
+    available: &[AvailableUtxo],
+    recipient_spk: ScriptBuf,
+    amount_sats: u64,
+    extra_outputs: &[ScriptBuf],
+    change_address: &Address,
+    fee_rate_sats_per_vb: u64,
+) -> Result<(Psbt, CreateMeta), CreateError> {
+    if available.is_empty() {
+        return Err(CreateError::NoUtxos);
+    }
+    // Bytes the extra outputs add to the transaction: 8 for the value, 1 for
+    // the script length, then the script. Counted before selection, because a
+    // fee estimate that ignores them under-funds the transaction and the node
+    // rejects it — after the wallet has already told the user it sent.
+    let extra_vbytes: u64 = extra_outputs
+        .iter()
+        .map(|s| 9 + s.as_bytes().len() as u64)
+        .sum();
     const DUST: u64 = 330;
     if amount_sats <= DUST {
         return Err(CreateError::Dust {
@@ -587,7 +624,6 @@ pub fn create_psbt(
     let mut sorted: Vec<&AvailableUtxo> = available.iter().collect();
     sorted.sort_by_key(|u| std::cmp::Reverse(u.value_sats));
 
-    let recipient_spk = recipient.script_pubkey();
     let change_spk = change_address.script_pubkey();
 
     // Iteratively grow the input set; on each step recompute the
@@ -610,7 +646,7 @@ pub fn create_psbt(
         total_in = total_in.saturating_add(u.value_sats);
         let n_inputs = selected.len() as u64;
         // Two outputs first; if no-change-needed we drop one below.
-        let est_vbytes = 11 + n_inputs * 58 + 2 * 31;
+        let est_vbytes = 11 + n_inputs * 58 + 2 * 31 + extra_vbytes;
         fee = est_vbytes.saturating_mul(fee_rate_sats_per_vb);
         if total_in >= amount_sats.saturating_add(fee) {
             // Cover possible — try to lift to no-change form if
@@ -618,7 +654,7 @@ pub fn create_psbt(
             let residual = total_in - amount_sats - fee;
             if residual <= DUST {
                 // Drop the change output: residual rolls into fee.
-                let est_no_change = 11 + n_inputs * 58 + 31;
+                let est_no_change = 11 + n_inputs * 58 + 31 + extra_vbytes;
                 let fee_no_change = est_no_change.saturating_mul(fee_rate_sats_per_vb);
                 if total_in >= amount_sats.saturating_add(fee_no_change) {
                     fee = total_in - amount_sats; // entire residual = fee
@@ -666,11 +702,17 @@ pub fn create_psbt(
             witness: Witness::new(),
         });
     }
-    let mut tx_outputs: Vec<TxOut> = Vec::with_capacity(2);
+    let mut tx_outputs: Vec<TxOut> = Vec::with_capacity(2 + extra_outputs.len());
     tx_outputs.push(TxOut {
         value: Amount::from_sat(amount_sats),
         script_pubkey: recipient_spk.clone(),
     });
+    for extra in extra_outputs {
+        tx_outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: extra.clone(),
+        });
+    }
     if needed_change_output {
         tx_outputs.push(TxOut {
             value: Amount::from_sat(change_value),

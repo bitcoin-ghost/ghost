@@ -52,8 +52,8 @@ const MODES = [
     id: "onchain",
     label: "On-chain payment",
     badge: "recommended",
-    tagline: "Bitcoin · signed and broadcast here · you pay the miner fee.",
-    hint: "An ordinary Bitcoin transaction from your own coins, built, signed and broadcast by your wallet through your node. Nobody else holds the money or has to be online. For an unlinkable spend, use the Mix tab (Wraith CoinJoin).",
+    tagline: "Bitcoin address or Ghost ID · signed and broadcast here.",
+    hint: "An ordinary Bitcoin transaction from your own coins, built, signed and broadcast by your wallet through your node. Nobody else holds the money or has to be online. Paying a Ghost ID sends a silent payment: a fresh output only the recipient can find, though the OP_RETURN that makes that possible is visible, so it hides who was paid rather than that a payment happened. For an unlinkable spend, use the Mix tab (Wraith CoinJoin).",
   },
   {
     id: "ghostpay",

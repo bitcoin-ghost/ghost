@@ -514,7 +514,12 @@ enum LightCommand {
     /// This spends the wallet's own coins through the configured node. No
     /// operator is involved and nobody else has to be online.
     Pay {
-        /// Recipient Bitcoin address.
+        /// Recipient: a Bitcoin address, or a Ghost ID for a silent payment.
+        ///
+        /// A Ghost ID pays a fresh taproot output only the recipient can
+        /// find, announced by an OP_RETURN carrying the ephemeral key. That
+        /// hides *who* was paid, not *that* a payment happened — the
+        /// OP_RETURN is visible to anyone looking.
         recipient_address: String,
         /// Amount in satoshis. The miner fee is charged on top.
         amount_sats: u64,
