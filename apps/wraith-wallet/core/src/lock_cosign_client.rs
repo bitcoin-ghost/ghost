@@ -51,7 +51,7 @@ pub enum CosignError {
 
 #[derive(Serialize)]
 struct NonceBody<'a> {
-    lock_id: &'a str,
+    binding_id: &'a str,
     request: &'a SigningRequest,
 }
 
@@ -102,7 +102,7 @@ pub struct QuorumView {
 pub async fn cosign_with_quorum<L: NonceLedger>(
     http: &reqwest::Client,
     coordinator_url: &str,
-    lock_id: &str,
+    binding_id: &str,
     request: &SigningRequest,
     owner_key: &bitcoin::secp256k1::SecretKey,
     keys: &[bitcoin::XOnlyPublicKey],
@@ -115,7 +115,10 @@ pub async fn cosign_with_quorum<L: NonceLedger>(
     // Round 1, quorum side.
     let resp = http
         .post(format!("{base}/api/v1/lock/cosign/nonce"))
-        .json(&NonceBody { lock_id, request })
+        .json(&NonceBody {
+            binding_id,
+            request,
+        })
         .send()
         .await
         .map_err(|e| CosignError::Transport(e.to_string()))?;

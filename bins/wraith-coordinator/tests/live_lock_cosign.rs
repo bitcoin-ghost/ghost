@@ -181,12 +181,12 @@ fn request_for(
 async fn a_running_coordinator_co_signs_a_spending_lane() {
     let secp = Secp256k1::new();
     let dir = tempfile::tempdir().unwrap();
-    let lock_id = "live-cosign-lock";
+    let binding_id = "live-cosign-binding";
 
     // The operator's setup: a seed, and the key it derives for this Lock.
     let phrase = ghost_lock::backup_key::new_phrase(None).unwrap();
     let seed_file = write_seed(dir.path(), &phrase);
-    let quorum_pub = ghost_lock::backup_key::quorum_public_key(&phrase, "", lock_id).unwrap();
+    let quorum_pub = ghost_lock::backup_key::quorum_public_key(&phrase, "", binding_id).unwrap();
 
     let owner = SecretKey::from_slice(&[77u8; 32]).unwrap();
     let lane = lane_for(&owner, quorum_pub);
@@ -198,7 +198,7 @@ async fn a_running_coordinator_co_signs_a_spending_lane() {
     // Round 1.
     let r = http
         .post(format!("{}/api/v1/lock/cosign/nonce", co.base))
-        .json(&serde_json::json!({ "lock_id": lock_id, "request": req }))
+        .json(&serde_json::json!({ "binding_id": binding_id, "request": req }))
         .send()
         .await
         .unwrap();
@@ -267,10 +267,10 @@ async fn a_running_coordinator_co_signs_a_spending_lane() {
 #[tokio::test]
 async fn a_running_coordinator_enforces_its_ceiling_flag() {
     let dir = tempfile::tempdir().unwrap();
-    let lock_id = "live-ceiling-lock";
+    let binding_id = "live-ceiling-binding";
     let phrase = ghost_lock::backup_key::new_phrase(None).unwrap();
     let seed_file = write_seed(dir.path(), &phrase);
-    let quorum_pub = ghost_lock::backup_key::quorum_public_key(&phrase, "", lock_id).unwrap();
+    let quorum_pub = ghost_lock::backup_key::quorum_public_key(&phrase, "", binding_id).unwrap();
 
     let owner = SecretKey::from_slice(&[78u8; 32]).unwrap();
     let lane = lane_for(&owner, quorum_pub);
@@ -280,7 +280,7 @@ async fn a_running_coordinator_enforces_its_ceiling_flag() {
     let co = start(dir.path(), &seed_file, "active").await;
     let r = reqwest::Client::new()
         .post(format!("{}/api/v1/lock/cosign/nonce", co.base))
-        .json(&serde_json::json!({ "lock_id": lock_id, "request": req }))
+        .json(&serde_json::json!({ "binding_id": binding_id, "request": req }))
         .send()
         .await
         .unwrap();
@@ -298,10 +298,10 @@ async fn a_running_coordinator_enforces_its_ceiling_flag() {
 #[tokio::test]
 async fn a_running_standby_refuses() {
     let dir = tempfile::tempdir().unwrap();
-    let lock_id = "live-standby-lock";
+    let binding_id = "live-standby-binding";
     let phrase = ghost_lock::backup_key::new_phrase(None).unwrap();
     let seed_file = write_seed(dir.path(), &phrase);
-    let quorum_pub = ghost_lock::backup_key::quorum_public_key(&phrase, "", lock_id).unwrap();
+    let quorum_pub = ghost_lock::backup_key::quorum_public_key(&phrase, "", binding_id).unwrap();
 
     let owner = SecretKey::from_slice(&[79u8; 32]).unwrap();
     let lane = lane_for(&owner, quorum_pub);
@@ -310,7 +310,7 @@ async fn a_running_standby_refuses() {
     let co = start(dir.path(), &seed_file, "standby").await;
     let r = reqwest::Client::new()
         .post(format!("{}/api/v1/lock/cosign/nonce", co.base))
-        .json(&serde_json::json!({ "lock_id": lock_id, "request": req }))
+        .json(&serde_json::json!({ "binding_id": binding_id, "request": req }))
         .send()
         .await
         .unwrap();

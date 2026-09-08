@@ -218,6 +218,23 @@ pub enum Request {
         /// `savings`, `spending` or `investments`. Cash has no leaves.
         lane: String,
     },
+    /// The id a quorum derives this Lock's co-signing key from.
+    ///
+    /// Asked BEFORE the Lock is built, because it has to be. The quorum's key
+    /// goes into the Lock, and it is derived from this id — so the id cannot
+    /// depend on the key, and `lock_id` does. Hand this to whoever holds the
+    /// quorum seed, put the key they return in the Lock, and the Lock then
+    /// carries the key the coordinator will actually sign with.
+    GhostLockQuorumBindingId {
+        backup_pubkey: String,
+        heir_pubkey: String,
+        anchor_height: u32,
+        inherit_height: u32,
+        /// BIP86 index for the owner key. Defaults to 0, and must match the
+        /// index the Lock is built at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bip86_index: Option<u32>,
+    },
     /// Sign a lane's escape leaf with the owner's key — leaving alone.
     ///
     /// Needs no quorum, no backup device and no ceremony: a key, a delay and a
@@ -780,6 +797,7 @@ pub enum Response {
     GhostLockSignNonced(GhostLockSignNoncedResponse),
     GhostLockSigned(GhostLockSignedResponse),
     GhostLockSaved(GhostLockSavedResponse),
+    GhostLockQuorumBindingId(GhostLockQuorumBindingIdResponse),
     GhostLockList(GhostLockListResponse),
     GhostLockForgotten(GhostLockForgottenResponse),
     LightHistory(LightHistoryResponse),
@@ -1788,6 +1806,15 @@ pub struct GhostLockSignedResponse {
     pub signature: String,
     /// The PSBT with the key-path signature attached, base64.
     pub psbt: String,
+}
+
+/// The id a quorum derives a Lock's co-signing key from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GhostLockQuorumBindingIdResponse {
+    /// Hand this to the quorum operator.
+    pub binding_id: String,
+    /// What to run with it, so the key is derived rather than typed.
+    pub derive_with: String,
 }
 
 /// Where a round should pay to fund one lane privately.

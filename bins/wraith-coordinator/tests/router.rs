@@ -3625,7 +3625,7 @@ async fn status_reports_placement_as_running_when_it_is() {
 #[tokio::test]
 async fn cosign_is_not_implemented_without_a_quorum_seed() {
     let body = serde_json::json!({
-        "lock_id": "lock-abc",
+        "binding_id": "binding-abc",
         "request": {
             "psbt": "cHNidP8BAAA=",
             "input_index": 0,

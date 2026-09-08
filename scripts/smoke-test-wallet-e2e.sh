@@ -887,6 +887,110 @@ AIR_LEFT=$(WRAITH --json lock lanes "${AIR_ARGS[@]}" \
 pass "the savings lane is empty — owner and backup device moved the coin together"
 
 # ============================================================================
+# FLOW 12: quorum co-signed Spending spend — the lane's fast path, on chain
+#   The Spending key path is MuSig2(owner, quorum). It could not work at all:
+#   `lock_id` is a hash OVER the quorum key, while the quorum derives its key
+#   FROM the id it is handed, so each needed the other first and no Lock could
+#   carry the key the coordinator would sign with. The lane was reachable only
+#   through its escape leaf, 1,008 blocks later.
+#
+#   The quorum now derives from a BINDING id: the same Lock minus the quorum
+#   key. This flow is the proof — it builds the key the way an operator does,
+#   BEFORE the Lock exists, and then spends with it.
+# ============================================================================
+step "FLOW 12 — quorum co-signed Spending spend (owner + coordinator quorum)"
+
+QSEED="$DATADIR/quorum-seed.txt"
+"$BIN/ghost-lock-signer" generate --out "$QSEED" --index 0 >"$DATADIR/quorum-gen.out" 2>&1 \
+    || { cat "$DATADIR/quorum-gen.out" >&2; fail "could not create a quorum seed"; }
+
+# The id must be obtainable BEFORE the Lock is built. That is the whole point.
+QBIND=$(WRAITH --json lock quorum-id \
+    --backup-pubkey "$DEV_PK" --heir-pubkey "$HEIR_PK" \
+    --anchor-height "$TIP_H" --inherit-height "$((TIP_H + 52560))" \
+    | jq -r '.GhostLockQuorumBindingId.binding_id // .binding_id // empty')
+[ -n "$QBIND" ] || fail "could not obtain a quorum binding id"
+
+QUORUM_DERIVED=$("$BIN/ghost-lock-signer" quorum-pubkey --seed "$QSEED" --lock-id "$QBIND" 2>&1 \
+    | grep -oE '[0-9a-f]{64}' | head -1)
+[ ${#QUORUM_DERIVED} -eq 64 ] || fail "quorum-pubkey returned '$QUORUM_DERIVED'"
+
+Q_ARGS=(--backup-pubkey "$DEV_PK" --heir-pubkey "$HEIR_PK" --quorum-pubkey "$QUORUM_DERIVED"
+        --anchor-height "$TIP_H" --inherit-height "$((TIP_H + 52560))")
+Q_SAVE=$(WRAITH --json lock save --label quorum "${Q_ARGS[@]}")
+Q_LOCK_ID=$(echo "$Q_SAVE" | jq -r '.GhostLockSaved.lock.lock_id // .lock.lock_id // empty')
+[ -n "$Q_LOCK_ID" ] || { echo "$Q_SAVE" >&2; fail "could not remember the quorum Lock"; }
+[ "$Q_LOCK_ID" != "$QBIND" ] \
+    || fail "the binding id and the lock id are the same value — the cycle is still there"
+pass "derived the quorum key from a binding id before the Lock existed"
+
+# A coordinator that actually holds the quorum seed.
+step "restarting the coordinator with a quorum seed"
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+"$BIN/wraith-coordinator" \
+    --listen 127.0.0.1:9100 \
+    --network "$NETWORK" \
+    --fee-address "$FEE_ADDR" \
+    --fill-window-secs 30 \
+    --ghostd-url "$GHOSTD_RPC_URL" \
+    --ghostd-user demo \
+    --ghostd-pass demo \
+    --lock-seed-file "$QSEED" \
+    --lock-cosign-role active \
+    >"$DATADIR/coordinator-quorum.log" 2>&1 &
+COORD_PID=$!
+sleep 3
+if grep -q "does not co-sign Ghost Locks" "$DATADIR/coordinator-quorum.log"; then
+    fail "the coordinator did not pick up its quorum seed"
+fi
+# Co-signing defaults to standby — an operator has to turn it on, and only one
+# coordinator may be active. A standby refuses, which reads as a signing bug if
+# you are not expecting it.
+if grep -q "on STANDBY" "$DATADIR/coordinator-quorum.log"; then
+    fail "the coordinator is on standby and will refuse to co-sign"
+fi
+
+Q_SPEND_ADDR=$(WRAITH --json lock lanes "${Q_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "spending") | .address][0] // empty')
+[ -n "$Q_SPEND_ADDR" ] || fail "no spending-lane address on the quorum Lock"
+
+Q_FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$Q_SPEND_ADDR" 0.0025)
+mine 1
+Q_VOUT=$($BCLI getrawtransaction "$Q_FUND_TXID" 1 \
+    | jq -r --arg a "$Q_SPEND_ADDR" '.vout[] | select(.scriptPubKey.address == $a) | .n')
+[ -n "$Q_VOUT" ] || fail "the funding tx has no output at the spending lane"
+
+# Key-path spend, so no timelock and no sequence requirement: this is the fast
+# path the lane exists to have.
+Q_DEST=$(WRAITH --json light receive --index 502 | jq -r '.LightReceive.address // .address')
+Q_PSBT=$($BCLI utxoupdatepsbt "$($BCLI createpsbt \
+    "[{\"txid\":\"$Q_FUND_TXID\",\"vout\":$Q_VOUT}]" \
+    "[{\"$Q_DEST\":0.00248}]")")
+
+Q_SIGNED=$(WRAITH --json lock quorum-sign \
+    --lock-id "$Q_LOCK_ID" --lane spending --psbt "$Q_PSBT" --input-index 0 \
+    --coordinator "$COORD_URL")
+Q_PSBT_OUT=$(echo "$Q_SIGNED" | jq -r '.GhostLockQuorumSigned.psbt // .psbt // empty')
+[ -n "$Q_PSBT_OUT" ] || { echo "$Q_SIGNED" >&2; fail "the quorum co-sign produced no signed PSBT"; }
+pass "owner and quorum aggregated a signature without any timelock"
+
+Q_FINAL=$($BCLI finalizepsbt "$Q_PSBT_OUT")
+echo "$Q_FINAL" | jq -e '.complete == true' >/dev/null \
+    || { echo "$Q_FINAL" >&2; fail "the node could not finalise the quorum spend"; }
+Q_TXID=$($BCLI sendrawtransaction "$(echo "$Q_FINAL" | jq -r '.hex')") \
+    || fail "the node refused the quorum co-signed spend"
+mine 1
+[ "$($BCLI getrawtransaction "$Q_TXID" 1 | jq -r '.confirmations // 0')" -ge 1 ] \
+    || fail "quorum spend $Q_TXID did not confirm"
+pass "quorum co-signed Spending spend confirmed on chain (tx $Q_TXID)"
+
+Q_LEFT=$(WRAITH --json lock lanes "${Q_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "spending") | .balance_sats] | add // 0')
+[ "$Q_LEFT" = "0" ] || fail "the spending lane still holds $Q_LEFT sats after the quorum spend"
+pass "the spending lane emptied by its fast path, not by waiting 1,008 blocks"
+
+# ============================================================================
 echo
 echo "================================================================"
 echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
@@ -902,4 +1006,5 @@ echo "  8. on-chain payment (light pay)    ok  ($PAY_TXID)"
 echo "  9. single-round Wraith mix         ok  ($FIRST_TXID)"
 echo " 10. Ghost Lock escape spend         ok  ($ESC_TXID)"
 echo " 11. air-gapped Savings spend        ok  ($AIR_TXID)"
+echo " 12. quorum co-signed spend          ok  ($Q_TXID)"
 echo "================================================================"

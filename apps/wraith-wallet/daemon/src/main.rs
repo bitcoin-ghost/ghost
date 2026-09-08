@@ -56,17 +56,17 @@ mod server {
         DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
         ErrorResponse, EscapeCoin, GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse,
         GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
-        GhostLockQuorumSignedResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
-        GhostLockSavedResponse, GhostLockSignBegunResponse, GhostLockSignNoncedResponse,
-        GhostLockSignedResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
-        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
-        LightReceiveResponse, LightUtxoEntry, LightUtxosResponse, LockSpendOutput,
-        LockSpendSummary, NodeResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse,
-        PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse,
-        ReleaseManifest, Request, Response, SignerInfoIpc, WalletAuthInfoResponse,
-        WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry,
-        WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
-        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        GhostLockQuorumBindingIdResponse, GhostLockQuorumSignedResponse, GhostLockRecord,
+        GhostLockRoundDestinationResponse, GhostLockSavedResponse, GhostLockSignBegunResponse,
+        GhostLockSignNoncedResponse, GhostLockSignedResponse, HealthResponse, LightBalanceResponse,
+        LightDetectedResponse, LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry,
+        LightL1UtxosResponse, LightReceiveResponse, LightUtxoEntry, LightUtxosResponse,
+        LockSpendOutput, LockSpendSummary, NodeResponse, PsbtBroadcastResponse,
+        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
+        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
+        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
+        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
@@ -3805,10 +3805,16 @@ mod server {
                     }
                 };
 
+                // The BINDING id, not the lock id. The quorum derives its key
+                // from what it is handed, and the lock id is a hash over that
+                // very key — so handing it the lock id asks for a key that
+                // could not have been in the Lock. See
+                // `StoredLock::quorum_binding_id`.
+                let binding_id = record.binding_id();
                 let (sig, view) = match wraith_wallet_core::lock_cosign_client::cosign_with_quorum(
                     &state.http,
                     &coordinator_url,
-                    &lock_id,
+                    &binding_id,
                     &request,
                     &owner_sk,
                     &keys,
@@ -4457,6 +4463,46 @@ mod server {
                     locks: store.list().iter().map(lock_record).collect(),
                 }),
             },
+            Request::GhostLockQuorumBindingId {
+                backup_pubkey,
+                heir_pubkey,
+                anchor_height,
+                inherit_height,
+                bip86_index,
+            } => {
+                // Validate the keys here rather than hashing whatever arrives.
+                // A binding id built from a typo is a co-signing key nobody can
+                // produce, and the failure would surface much later as a Lock
+                // whose quorum simply never matches.
+                let mut bad = None;
+                for (name, k) in [
+                    ("backup_pubkey", &backup_pubkey),
+                    ("heir_pubkey", &heir_pubkey),
+                ] {
+                    if <bitcoin::XOnlyPublicKey as std::str::FromStr>::from_str(k.trim()).is_err() {
+                        bad = Some(format!("{name} is not an x-only public key"));
+                        break;
+                    }
+                }
+                if let Some(message) = bad {
+                    return Envelope::new(id, Response::Error(ErrorResponse { message }));
+                }
+                let idx = bip86_index.unwrap_or(0);
+                let binding_id =
+                    wraith_wallet_core::ghost_lock_store::StoredLock::quorum_binding_id(
+                        &backup_pubkey,
+                        &heir_pubkey,
+                        anchor_height,
+                        inherit_height,
+                        idx,
+                    );
+                Response::GhostLockQuorumBindingId(GhostLockQuorumBindingIdResponse {
+                    derive_with: format!(
+                        "ghost-lock-signer quorum-pubkey --seed <quorum-seed> --lock-id {binding_id}"
+                    ),
+                    binding_id,
+                })
+            }
             Request::GhostLockForget { lock_id } => {
                 let lock_store_lock = store_lock(state, &ghost_lock_store_path(state));
                 let _lock_store_guard = lock_store_lock.lock().await;

@@ -42,7 +42,15 @@ fn err(status: StatusCode, error: &'static str, detail: String) -> axum::respons
 #[derive(Deserialize)]
 pub struct NonceRequest {
     /// Which Lock, so the quorum derives the right key for it.
-    pub lock_id: String,
+    ///
+    /// The Lock's **binding id**, not its `lock_id`. A `lock_id` is a hash
+    /// over the Lock's `quorum_pubkey`, and the key derived here is what goes
+    /// into that field — so deriving from a `lock_id` would need the key and
+    /// the id each to exist before the other, and no wallet-built Lock could
+    /// ever carry the key this quorum goes on to sign with. The binding id
+    /// commits to the same Lock minus the quorum key, which is the part that
+    /// has to be known first.
+    pub binding_id: String,
     /// The spend, as the owner's wallet built it.
     pub request: SigningRequest,
 }
@@ -107,7 +115,7 @@ pub async fn post_nonce(
     let quorum_key = match ghost_lock::backup_key::quorum_secret_key(
         &cfg.seed_phrase,
         &cfg.seed_passphrase,
-        &body.lock_id,
+        &body.binding_id,
     ) {
         Ok(k) => k,
         Err(e) => {
@@ -138,8 +146,8 @@ pub async fn post_nonce(
         return err(
             StatusCode::BAD_REQUEST,
             "not_our_lock",
-            "this quorum's key for that lock_id is not among the request's co-signers; \
-             either the lock_id is wrong or this Lock names a different quorum"
+            "this quorum's key for that binding_id is not among the request's co-signers; \
+             either the binding_id is wrong or this Lock names a different quorum"
                 .into(),
         );
     }

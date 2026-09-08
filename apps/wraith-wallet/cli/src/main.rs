@@ -297,6 +297,25 @@ enum LockCommand {
     /// The quorum may refuse — a ceiling, a spending window, or a coin it has
     /// already signed for. That is what makes it a second factor rather than a
     /// rubber stamp, and the refusal says which rule applied.
+    /// The id a quorum derives this Lock's co-signing key from.
+    ///
+    /// Run this BEFORE building the Lock. Hand the id to whoever holds the
+    /// quorum seed, and put the key they return in `--quorum-pubkey`. The id
+    /// cannot be the Lock's own id, because the Lock's id is a hash over the
+    /// quorum key you are asking them to produce.
+    QuorumId {
+        #[arg(long)]
+        backup_pubkey: String,
+        #[arg(long)]
+        heir_pubkey: String,
+        #[arg(long)]
+        anchor_height: u32,
+        #[arg(long)]
+        inherit_height: u32,
+        /// Must match the index the Lock is built at.
+        #[arg(long)]
+        bip86_index: Option<u32>,
+    },
     QuorumSign {
         #[arg(long)]
         lock_id: String,
@@ -932,6 +951,19 @@ mod client {
                     input_index,
                     coordinator_url: coordinator,
                 },
+                LockCommand::QuorumId {
+                    backup_pubkey,
+                    heir_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                } => Request::GhostLockQuorumBindingId {
+                    backup_pubkey,
+                    heir_pubkey,
+                    anchor_height,
+                    inherit_height,
+                    bip86_index,
+                },
                 LockCommand::EscapePlan { lock_id, lane } => {
                     Request::GhostLockEscapePlan { lock_id, lane }
                 }
@@ -1235,6 +1267,17 @@ mod client {
                     println!("\ntransaction (hex) — broadcast this:");
                     println!("{}", r.tx_hex);
                 }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::GhostLockQuorumBindingId(r)) => {
+                println!("quorum binding id: {}", r.binding_id);
+                println!();
+                println!("Give this to whoever holds the quorum seed. They run:");
+                println!("  {}", r.derive_with);
+                println!();
+                println!("Put the key they return in --quorum-pubkey when you build the Lock.");
+                println!("This is not the Lock's id: the Lock's id is a hash over the very key");
+                println!("you are asking them for, so it cannot be what derives it.");
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::GhostLockEscapePlan(r)) => {

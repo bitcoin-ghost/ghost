@@ -31,6 +31,10 @@ use bitcoin::hashes::{sha256, Hash};
 
 /// Domain tag for the Lock id. Versioned.
 const LOCK_ID_TAG: &str = "ghost-lock/id/v1";
+/// Domain tag for the quorum binding id. Distinct from [`LOCK_ID_TAG`] so the
+/// two identifiers can never collide, and so neither can be passed where the
+/// other is expected without the difference showing.
+const QUORUM_BINDING_TAG: &str = "ghost-lock/quorum-binding/v1";
 
 /// A stored Lock definition.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -50,6 +54,48 @@ pub struct StoredLock {
 }
 
 impl StoredLock {
+    /// The id a quorum derives its key for this Lock from.
+    ///
+    /// # Why this is not `lock_id`
+    ///
+    /// It cannot be. `lock_id` is a hash **over** `quorum_pubkey`, and the
+    /// quorum's key is derived **from** the id it is given — so using
+    /// `lock_id` needs each of the two to exist before the other. A Lock built
+    /// by the wallet could never carry the key the coordinator would go on to
+    /// sign with, and the Spending lane's co-signed path was unreachable: the
+    /// lane could only be emptied through its escape leaf, 1,008 blocks later.
+    ///
+    /// This commits to everything `lock_id` does except the quorum key, which
+    /// is exactly the part that has to be known first. Two Locks that differ in
+    /// any other field still get different quorum keys, so the per-Lock
+    /// separation the derivation exists for is unchanged. Two that differ
+    /// *only* in quorum key would share a binding id — and cannot exist, since
+    /// that key is the derivation's own output.
+    ///
+    /// Note this is a public identifier handed to a coordinator. It is a hash
+    /// of public keys and heights, and reveals nothing the Lock's addresses do
+    /// not already.
+    pub fn quorum_binding_id(
+        backup: &str,
+        heir: &str,
+        anchor_height: u32,
+        inherit_height: u32,
+        bip86_index: u32,
+    ) -> String {
+        let mut h = sha256::Hash::engine();
+        use bitcoin::hashes::HashEngine;
+        h.input(QUORUM_BINDING_TAG.as_bytes());
+        for k in [backup, heir] {
+            let k = k.trim().to_ascii_lowercase();
+            h.input(&(k.len() as u64).to_be_bytes());
+            h.input(k.as_bytes());
+        }
+        h.input(&anchor_height.to_be_bytes());
+        h.input(&inherit_height.to_be_bytes());
+        h.input(&bip86_index.to_be_bytes());
+        hex::encode(&sha256::Hash::from_engine(h).to_byte_array()[..16])
+    }
+
     /// The id a Lock with these parameters always has.
     ///
     /// Derived from every field that changes the resulting addresses — and from
@@ -75,6 +121,17 @@ impl StoredLock {
         h.input(&inherit_height.to_be_bytes());
         h.input(&bip86_index.to_be_bytes());
         hex::encode(&sha256::Hash::from_engine(h).to_byte_array()[..16])
+    }
+
+    /// This Lock's quorum binding id. See [`Self::quorum_binding_id`].
+    pub fn binding_id(&self) -> String {
+        Self::quorum_binding_id(
+            &self.backup_pubkey,
+            &self.heir_pubkey,
+            self.anchor_height,
+            self.inherit_height,
+            self.bip86_index,
+        )
     }
 
     /// Build a record, computing its id.
@@ -315,5 +372,96 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = GhostLockStore::open(dir.path().join("new.json")).unwrap();
         assert!(s.list().is_empty());
+    }
+
+    /// A Lock can carry the very key the coordinator will sign with.
+    ///
+    /// This is the property the whole co-signed Spending path rests on, and it
+    /// did not hold. `lock_id` is a hash over `quorum_pubkey` while the
+    /// quorum's key derives from the id it is handed, so each needed the other
+    /// first: whatever key went into a Lock, the coordinator would derive a
+    /// different one for that Lock's id and the signature could never
+    /// aggregate. The lane was reachable only through its escape leaf.
+    ///
+    /// Deriving from the binding id — everything except the quorum key —
+    /// closes the loop, and this test is that closure: build the key the way
+    /// an operator does, put it in a Lock, then re-derive it the way the
+    /// coordinator does from that finished Lock.
+    #[test]
+    fn a_lock_carries_the_key_the_quorum_will_sign_with() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon about";
+        let backup = "11".repeat(32);
+        let heir = "22".repeat(32);
+        let (anchor, inherit, index) = (900_000u32, 950_000u32, 0u32);
+
+        // What the operator does before the Lock exists.
+        let binding = StoredLock::quorum_binding_id(&backup, &heir, anchor, inherit, index);
+        let quorum =
+            ghost_lock::backup_key::quorum_public_key(phrase, "", &binding).expect("quorum key");
+        let quorum_hex = hex::encode(quorum.serialize());
+
+        // The Lock, now complete.
+        let record = StoredLock::new(
+            None,
+            backup,
+            heir,
+            quorum_hex.clone(),
+            anchor,
+            inherit,
+            index,
+        );
+
+        // What the coordinator does when asked to co-sign it.
+        let rederived = ghost_lock::backup_key::quorum_public_key(phrase, "", &record.binding_id())
+            .expect("re-derive");
+        assert_eq!(
+            hex::encode(rederived.serialize()),
+            record.quorum_pubkey,
+            "the Lock does not carry the key the quorum will sign with"
+        );
+
+        // And the binding id is not the lock id: passing one where the other
+        // belongs must not silently work.
+        assert_ne!(
+            record.binding_id(),
+            record.lock_id,
+            "binding id and lock id must be distinguishable"
+        );
+    }
+
+    /// The binding id separates Locks the way the lock id does.
+    ///
+    /// Dropping the quorum key from the hash must not collapse distinct Locks
+    /// onto one quorum key — that would hand two Locks the same co-signer key.
+    #[test]
+    fn distinct_locks_get_distinct_binding_ids() {
+        let b = "11".repeat(32);
+        let h = "22".repeat(32);
+        let base = StoredLock::quorum_binding_id(&b, &h, 900_000, 950_000, 0);
+        for (label, other) in [
+            (
+                "backup",
+                StoredLock::quorum_binding_id(&"33".repeat(32), &h, 900_000, 950_000, 0),
+            ),
+            (
+                "heir",
+                StoredLock::quorum_binding_id(&b, &"44".repeat(32), 900_000, 950_000, 0),
+            ),
+            (
+                "anchor",
+                StoredLock::quorum_binding_id(&b, &h, 900_001, 950_000, 0),
+            ),
+            (
+                "inherit",
+                StoredLock::quorum_binding_id(&b, &h, 900_000, 950_001, 0),
+            ),
+            (
+                "index",
+                StoredLock::quorum_binding_id(&b, &h, 900_000, 950_000, 1),
+            ),
+        ] {
+            assert_ne!(base, other, "Locks differing in {label} share a binding id");
+        }
     }
 }
