@@ -60,6 +60,11 @@
 
 set -euo pipefail
 
+# Name the failure. `set -e` aborts without a word, and the cleanup trap below
+# then prints its normal shutdown line — so an aborted run reads exactly like a
+# finished one. Three signet runs died in the mining loop before this existed.
+trap 'st=$?; echo "ABORTED: line $LINENO: \"$BASH_COMMAND\" exited $st" >&2' ERR
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${WRAITH_BIN_DIR:-$REPO/target/debug}"
 DATADIR="$(mktemp -d -t wraith-smoke-e2e.XXXXXX)"
@@ -212,9 +217,25 @@ BCLI="$GHOST_CLI ${GHOSTD_NET[0]} -datadir=$GHOSTD_DIR -rpcuser=demo -rpcpasswor
 # It does not error when it does: it returns an empty array and exit 0, so the
 # chain silently fails to advance and the first symptom is "Insufficient funds"
 # somewhere far away.
+# The node's height, or -1 if it could not be read.
+#
+# A bare `h=$(cli getblockcount)` is fatal under `set -e` the moment the node is
+# too busy to answer, and an empty result is worse: the next `[ "$h" -lt ... ]`
+# fails with "integer expression expected" and takes the run down with it. A
+# mining loop that hammers RPC for half an hour will meet that eventually.
+height() {
+    local h
+    h=$($BCLI getblockcount 2>/dev/null || true)
+    case "$h" in
+        ''|*[!0-9]*) echo -1 ;;
+        *) echo "$h" ;;
+    esac
+}
+
 mine() {
     local want="$1" start target now next stalled=0
-    start=$($BCLI getblockcount)
+    start=$(height)
+    if [ "$start" -lt 0 ]; then fail "cannot read the chain height on $NETWORK"; fi
     target=$((start + want))
     now=$start
     # Loop to a target HEIGHT rather than trusting one call, because `maxtries`
@@ -229,14 +250,19 @@ mine() {
         # under `set -e` that non-zero exit kills the run outright — no message,
         # just the cleanup trap, which reads like the script simply stopped.
         chunk=$((target - now))
-        [ "$chunk" -gt 50 ] && chunk=50
+        if [ "$chunk" -gt 50 ]; then chunk=50; fi
         $BCLI -rpcwallet=demo generatetoaddress "$chunk" "$DEMO_ADDR" 500000000 \
             >/dev/null 2>&1 || true
-        next=$($BCLI getblockcount)
+        next=$(height)
         if [ "$next" -le "$now" ]; then
             stalled=$((stalled + 1))
-            [ "$stalled" -ge 20 ] \
-                && fail "mining stalled at height $next on $NETWORK, wanted $target"
+            # A full `if` rather than `[ ... ] && fail`. Under `set -e` a
+            # trailing test that comes out FALSE is the branch's exit status,
+            # so the guard against a stalled chain was itself killing the run —
+            # silently, on the first chunk that happened to find no block.
+            if [ "$stalled" -ge 20 ]; then
+                fail "mining stalled at height $next on $NETWORK, wanted $target"
+            fi
         else
             stalled=0
         fi
@@ -662,6 +688,17 @@ pass "escape-plan reports the coin is not spendable yet ($EARLY_REMAINING blocks
 # Age it past the exit delay.
 step "mining past the Spending lane's 1,008-block exit delay"
 mine 1010
+
+# Mining a thousand signet blocks takes about twenty-five minutes, and the
+# daemon's idle auto-lock fires long before that — exactly as it would for a
+# user actually waiting out a seven-day exit delay. Unlocking again is part of
+# the flow, not a workaround for it, so assert it works rather than papering
+# over it.
+WRAITH wallet unlock smoke <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+WRAITH wallet status | grep -q "unlocked: yes" \
+    || fail "the wallet did not unlock after the idle auto-lock; an escape spend after a \
+long delay is unreachable"
+pass "wallet unlocked again after the idle auto-lock"
 
 PLAN=$(WRAITH --json lock escape-plan --lock-id "$LOCK_ID" --lane spending)
 REQ_SEQ=$(echo "$PLAN" | jq -r '.GhostLockEscapePlan.required_sequence // .required_sequence')
