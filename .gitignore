@@ -114,3 +114,9 @@ docker/regtest-cluster/bin/
 # were committed by accident in 8b77fb352 because the tests populate this directory and a
 # `git add -A` swept it in. They are build products, not source: the harness fetches them.
 tests/integration-sv2/template-provider/
+
+# Coordinator Lock co-signing state. `--lock-ledger-dir` defaults to the
+# working directory, so running a coordinator from the repo root drops these
+# here. They are runtime state and must never be committed.
+lock-cosigned-coins.json
+lock-cosign-spends.json

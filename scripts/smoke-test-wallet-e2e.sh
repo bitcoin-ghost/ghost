@@ -938,6 +938,7 @@ wait "$COORD_PID" 2>/dev/null || true
     --ghostd-pass demo \
     --lock-seed-file "$QSEED" \
     --lock-cosign-role active \
+    --lock-ledger-dir "$DATADIR" \
     >"$DATADIR/coordinator-quorum.log" 2>&1 &
 COORD_PID=$!
 sleep 3
