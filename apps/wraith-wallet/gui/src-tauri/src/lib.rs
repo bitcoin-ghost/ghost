@@ -288,12 +288,14 @@ async fn set_node(
     cookie_path: Option<String>,
     user: Option<String>,
     pass: Option<String>,
+    pool_url: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::SetNode {
         ghostd_url,
         cookie_path,
         user,
         pass,
+        pool_url,
     })
     .await?;
     to_value(&resp)

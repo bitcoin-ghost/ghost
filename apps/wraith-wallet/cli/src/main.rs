@@ -458,6 +458,16 @@ enum NodeCommand {
         user: Option<String>,
         #[arg(long, requires = "user")]
         pass: Option<String>,
+        /// A Ghost pool node, consulted only for the Wraith coordinator
+        /// election — which coordinator holds a tier's seat this epoch.
+        ///
+        /// Optional. Without it, mixing needs a coordinator URL supplied per
+        /// round, which works but never rotates. What comes back is verified
+        /// against your own node rather than believed; what the pool still
+        /// learns is that your IP asked, so route it through Tor if that
+        /// matters.
+        #[arg(long, value_name = "URL")]
+        pool_url: Option<String>,
     },
     /// Forget the node. The wallet will refuse chain operations until one is
     /// set again — which is the point: it will not quietly use somebody
@@ -756,17 +766,20 @@ mod client {
                     cookie,
                     user,
                     pass,
+                    pool_url,
                 } => Request::SetNode {
                     ghostd_url: Some(url),
                     cookie_path: cookie,
                     user,
                     pass,
+                    pool_url,
                 },
                 NodeCommand::Clear => Request::SetNode {
                     ghostd_url: None,
                     cookie_path: None,
                     user: None,
                     pass: None,
+                    pool_url: None,
                 },
             },
             Command::Light { sub } => match sub {
@@ -1506,6 +1519,10 @@ mod client {
                         println!("node set");
                         println!("  url:  {u}");
                         println!("  auth: {}", r.auth);
+                        match r.pool_url.as_deref() {
+                            Some(p) => println!("  pool: {p} (coordinator election)"),
+                            None => println!("  pool: (none — mixing needs a coordinator URL)"),
+                        }
                     }
                     // Said plainly, because it is a state the wallet cannot
                     // work in and the user has just chosen it.
@@ -1701,6 +1718,10 @@ mod client {
                 match e.ghostd_url.as_deref() {
                     Some(u) => println!("node:         {u} (auth: {})", e.ghostd_auth),
                     None => println!("node:         (none configured)"),
+                }
+                match e.pool_url.as_deref() {
+                    Some(u) => println!("pool:         {u} (coordinator election)"),
+                    None => println!("pool:         (none)"),
                 }
                 if let Some(p) = &e.tor_proxy {
                     println!("tor proxy:    {p}");

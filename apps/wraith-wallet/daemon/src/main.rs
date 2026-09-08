@@ -73,6 +73,8 @@ mod server {
     /// Optional override for the on-disk node config path. Defaults to
     /// `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
     const NODE_CONFIG_ENV: &str = "WRAITHD_NODE_CONFIG";
+    /// Optional pool node consulted for the coordinator election.
+    const POOL_URL_ENV: &str = "WRAITHD_POOL_URL";
     /// Optional default wraith-coordinator URL. When set, the
     /// `Doctor` check probes its `/api/v1/pool/discover` endpoint
     /// for liveness. Mixes still use the per-call URL the wallet
@@ -421,6 +423,16 @@ mod server {
         /// settings screen can change it without a restart. Also pins the
         /// election beacon to the chain; with no node that check is skipped.
         ghostd: RwLock<GhostdSettings>,
+        /// A Ghost pool node, consulted only for the coordinator election.
+        pool_url: RwLock<Option<String>>,
+        /// The last verified election, with the epoch it was drawn for.
+        ///
+        /// Cached for the whole epoch — 144 blocks, about a day — so the
+        /// number of times the wallet asks a pool anything stops tracking the
+        /// number of times it mixes. Without that, a pool watching request
+        /// timing learns when its askers are about to mix even though it
+        /// learns nothing from the request itself.
+        election_cache: RwLock<Option<(u64, serde_json::Value)>>,
         /// True when the environment pinned the node at boot. While it is set
         /// the settings are power-user-owned and `SetNode` refuses.
         ghostd_env_override: bool,
@@ -495,6 +507,9 @@ mod server {
     struct NodeConfig {
         #[serde(default)]
         ghostd: GhostdSettings,
+        /// A Ghost pool node, consulted only for the coordinator election.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_url: Option<String>,
     }
 
     /// Resolve where the node-selection config lives. `WRAITHD_NODE_CONFIG`
@@ -610,34 +625,45 @@ mod server {
         /// restart would silently revert. Refuses while the environment pins
         /// the node — a power user who set `WRAITHD_GHOSTD_URL` did not mean
         /// for a settings screen to overrule it.
-        async fn set_node(&self, next: GhostdSettings) -> Result<NodeResponse, String> {
+        async fn set_node(
+            &self,
+            next: GhostdSettings,
+            pool_url: Option<String>,
+        ) -> Result<NodeResponse, String> {
             if self.ghostd_env_override {
                 return Err("the node is pinned by environment variables \
                      (WRAITHD_GHOSTD_URL and friends); unset them to manage the \
                      node from the wallet"
                     .to_string());
             }
-            if let Some(url) = next.url.as_deref() {
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err(format!(
-                        "node URL must start with http:// or https:// (got '{url}')"
-                    ));
+            for (what, url) in [("node", next.url.as_deref()), ("pool", pool_url.as_deref())] {
+                if let Some(url) = url {
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(format!(
+                            "{what} URL must start with http:// or https:// (got '{url}')"
+                        ));
+                    }
                 }
             }
             save_node_config(
                 &self.node_config_path,
                 &NodeConfig {
                     ghostd: next.clone(),
+                    pool_url: pool_url.clone(),
                 },
             )
             .map_err(|e| format!("persist node.json: {e}"))?;
             *self.ghostd.write().await = next.clone();
+            *self.pool_url.write().await = pool_url.clone();
+            // A different pool, or none, invalidates what the last one said.
+            *self.election_cache.write().await = None;
             let chain = self.build_chain().await;
             self.clients.write().await.chain = chain;
             tracing::info!(url = ?next.url, auth = next.auth_kind(), "node updated at runtime");
             let auth = next.auth_kind().to_string();
             Ok(NodeResponse {
                 ghostd_url: next.url,
+                pool_url,
                 // The credential itself never crosses the IPC. Which *kind*
                 // is in use is what a settings screen needs to show.
                 auth,
@@ -801,13 +827,16 @@ mod server {
         // points at somebody else's node on a fresh install is a wallet whose
         // owner never chose who gets to see their addresses.
         let ghostd_env_override = ghostd_env.url.is_some();
+        let persisted = load_node_config(&node_config_path);
         let ghostd = if ghostd_env_override {
             ghostd_env
         } else {
-            load_node_config(&node_config_path)
-                .map(|c| c.ghostd)
-                .unwrap_or_default()
+            persisted.clone().map(|c| c.ghostd).unwrap_or_default()
         };
+        let pool_url = std::env::var(POOL_URL_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| persisted.and_then(|c| c.pool_url));
         tracing::info!(
             node = ?ghostd.url,
             auth = ghostd.auth_kind(),
@@ -878,6 +907,8 @@ mod server {
             lock_signings: RwLock::new(HashMap::new()),
             ghostd: RwLock::new(ghostd),
             ghostd_env_override,
+            pool_url: RwLock::new(pool_url),
+            election_cache: RwLock::new(None),
         });
         state.clients.write().await.chain = state.build_chain().await;
 
@@ -2505,6 +2536,129 @@ mod server {
         (p.height == height).then(|| p.hash.clone())
     }
 
+    /// The coordinator election for the current epoch, verified.
+    ///
+    /// # Where it comes from, and what that costs
+    ///
+    /// A pool node publishes the draw at `/api/v1/pool/coordinator`. The
+    /// wallet used to reach that through Ghost Pay, precisely so it never
+    /// spoke to the pool itself; with the operator gone the choice is between
+    /// asking a pool directly and not rotating coordinators at all. A single
+    /// hard-coded coordinator URL defeats the point of the election, which
+    /// exists so coordination moves across the qualified set instead of
+    /// settling on whoever the wallet was shipped pointing at.
+    ///
+    /// So it asks, and pays for it in two ways that are worth naming:
+    ///
+    /// * The pool learns this IP asked. Route it through Tor if that matters —
+    ///   the proxy is used when one is configured.
+    /// * The pool could learn *when* somebody is about to mix, if the ask
+    ///   happened per mix. It does not: the result is cached for the whole
+    ///   epoch (144 blocks, about a day), so the number of asks stops tracking
+    ///   the number of mixes.
+    ///
+    /// # What is checked
+    ///
+    /// The draw is recomputed from the beacon and roster published beside it,
+    /// and the beacon is re-derived from the anchor block's hash **as the
+    /// wallet's own node reports it**. A pool that names itself every seat is
+    /// refused (#697).
+    ///
+    /// ⚠ The roster is still trusted. The published seat list must follow from
+    /// the roster, but nothing here proves the roster is the real qualified
+    /// set — a pool that omits honest candidates produces a self-consistent
+    /// election over a subset it prefers. Closing that needs the qualified set
+    /// to come from consensus, and it cannot come from the mesh node-list
+    /// checkpoint: that one carries *public-mining* nodes and their stratum
+    /// ports, while this draws from *coordinator*-opted-in nodes. ghost-pool
+    /// builds the coordinator roster from live mesh state and says so —
+    /// "the roster comes from live mesh state, which is the defect this value
+    /// exposes rather than repairs" — so two nodes can legitimately disagree,
+    /// and `roster_commitment` exists to make that visible. A trustless roster
+    /// needs its own BFT-finalised checkpoint on the pool side, with a height
+    /// gate and a fleet roll. Until then this is chain-anchored, not
+    /// trustless, and the difference is the roster.
+    async fn verified_election(state: &Arc<DaemonState>) -> Option<serde_json::Value> {
+        let pool_url = state.pool_url.read().await.clone()?;
+
+        // Which epoch we are in, from our own node. Asking the pool would let
+        // it choose which epoch it answers for.
+        let tip = current_tip(state).await?;
+        let epoch = wraith_protocol::epoch_for_height(tip as u64);
+
+        if let Some((cached_epoch, view)) = state.election_cache.read().await.as_ref() {
+            if *cached_epoch == epoch {
+                return Some(view.clone());
+            }
+        }
+
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+        if let Some(proxy) = state.tor_proxy.as_deref() {
+            match reqwest::Proxy::all(proxy) {
+                Ok(p) => builder = builder.proxy(p),
+                // Refusing rather than falling back to a direct request: the
+                // user asked for Tor, and quietly revealing their IP instead
+                // is the one outcome they were trying to avoid.
+                Err(e) => {
+                    tracing::warn!(error = %e, "tor proxy unusable; not asking the pool");
+                    return None;
+                }
+            }
+        }
+        let client = builder.build().ok()?;
+        let url = format!("{}/api/v1/pool/coordinator", pool_url.trim_end_matches('/'));
+        let election: serde_json::Value = match client.get(&url).send().await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "election view was not JSON");
+                    return None;
+                }
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "could not reach the pool for the election");
+                return None;
+            }
+        };
+
+        if election.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+            tracing::debug!("the pool has coordinator elections turned off");
+            return None;
+        }
+
+        // Pin the beacon to the chain. Verifying the draw against the beacon
+        // published beside it only proves internal consistency; the anchor
+        // block's hash is a fact the pool does not get to state.
+        let (anchor_height, _) = crate::coordinator_resolve::beacon_anchor_expectation(&election)?;
+        let rpc = state.build_ghostd_rpc().await?;
+        let anchor_hash = tokio::task::spawn_blocking(move || rpc.get_block_hash(anchor_height))
+            .await
+            .ok()?
+            .ok()?;
+        if !crate::coordinator_resolve::beacon_matches_chain(&election, &anchor_hash) {
+            tracing::warn!(
+                anchor_height,
+                "the published election beacon does not follow from the anchor block — \
+                 refusing the election"
+            );
+            return None;
+        }
+
+        // A draw over one candidate is not a draw. Said plainly, because a
+        // wallet that mixes through a single-node "election" has the privacy
+        // of not mixing at all and no way to tell (#708).
+        if election.get("degraded").and_then(|v| v.as_bool()) == Some(true) {
+            tracing::warn!(
+                roster_size = election.get("roster_size").and_then(|v| v.as_u64()),
+                "the coordinator election is degraded — too few candidates for the draw \
+                 to mean anything"
+            );
+        }
+
+        *state.election_cache.write().await = Some((epoch, election.clone()));
+        Some(election)
+    }
+
     /// Derive a Lock's four lanes from the supplied keys plus the active
     /// wallet's owner key.
     ///
@@ -4074,6 +4228,7 @@ mod server {
                     ghostd_url: ghostd.url.clone(),
                     ghostd_auth: ghostd.auth_kind().to_string(),
                     ghostd_env_override: state.ghostd_env_override,
+                    pool_url: state.pool_url.read().await.clone(),
                     network,
                     wallets_dir: state.wallets_dir.display().to_string(),
                     tor_proxy: state.tor_proxy.clone(),
@@ -4089,13 +4244,17 @@ mod server {
                 cookie_path,
                 user,
                 pass,
+                pool_url,
             } => match state
-                .set_node(GhostdSettings {
-                    url: ghostd_url,
-                    cookie_path: cookie_path.map(PathBuf::from),
-                    user,
-                    pass,
-                })
+                .set_node(
+                    GhostdSettings {
+                        url: ghostd_url,
+                        cookie_path: cookie_path.map(PathBuf::from),
+                        user,
+                        pass,
+                    },
+                    pool_url,
+                )
                 .await
             {
                 Ok(applied) => Response::NodeSet(applied),
@@ -4951,27 +5110,19 @@ mod server {
                     }),
                 }
             }
-            Request::WraithResolveCoordinator { tier_id: _ } => {
-                // Coordinator discovery went with Ghost Pay. It worked by
-                // asking the operator for the pool's election view, precisely
-                // so the wallet never had to talk to the pool API itself and
-                // reveal that it was about to mix.
-                //
-                // Reinstating it by calling the pool directly would trade the
-                // privacy the indirection existed to buy, so it is not done
-                // here. The replacement is the signed node-list checkpoint,
-                // which is verifiable rather than merely relayed; until that
-                // lands the caller falls back to a coordinator URL the user
-                // supplies, which is why this reports "no answer" rather than
-                // an error.
-                tracing::debug!(
-                    "resolve coordinator: no discovery source — configure a \
-                     coordinator URL for the round"
-                );
-                Response::WraithCoordinatorResolved {
-                    endpoint: None,
-                    epoch: None,
-                }
+            Request::WraithResolveCoordinator { tier_id } => {
+                // A verified election, or no answer. "No answer" is not a
+                // failure here: the caller falls back to a coordinator URL the
+                // user supplied, which is a worse answer than a verified
+                // election and a better one than obeying an unverifiable claim
+                // about who is in charge.
+                let (endpoint, epoch) = match verified_election(state).await {
+                    Some(election) => {
+                        crate::coordinator_resolve::resolve_from_election(&election, &tier_id)
+                    }
+                    None => (None, None),
+                };
+                Response::WraithCoordinatorResolved { endpoint, epoch }
             }
             Request::WraithMixOneShot {
                 coordinator_url,
@@ -5831,6 +5982,8 @@ mod server {
                 lock_signings: RwLock::new(HashMap::new()),
                 ghostd: RwLock::new(GhostdSettings::default()),
                 ghostd_env_override: false,
+                pool_url: RwLock::new(None),
+                election_cache: RwLock::new(None),
             })
         }
 
@@ -6127,6 +6280,7 @@ mod server {
                     cookie_path: Some("/home/test/.ghost/.cookie".into()),
                     user: None,
                     pass: None,
+                    pool_url: None,
                 },
             ))
             .unwrap();
@@ -6163,6 +6317,101 @@ mod server {
             }
         }
 
+        /// The pool is optional, and its absence is silence rather than an
+        /// error: mixing still works with a coordinator URL supplied per
+        /// round, it just never rotates.
+        #[tokio::test]
+        async fn no_pool_configured_means_no_election_and_no_network_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            assert!(state.pool_url.read().await.is_none());
+            // Returns without touching the chain stub, which would error.
+            assert!(verified_election(&state).await.is_none());
+        }
+
+        /// The pool URL is persisted and reported back, so a settings screen
+        /// can show what is in force after a restart.
+        #[tokio::test]
+        async fn a_pool_url_is_persisted_and_surfaced() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::SetNode {
+                    ghostd_url: Some("http://127.0.0.1:8332".into()),
+                    cookie_path: None,
+                    user: None,
+                    pass: None,
+                    pool_url: Some("https://pool.example:8443".into()),
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&req, &state).await.payload {
+                Response::NodeSet(r) => {
+                    assert_eq!(r.pool_url.as_deref(), Some("https://pool.example:8443"))
+                }
+                other => panic!("expected NodeSet, got {other:?}"),
+            }
+            let persisted = super::load_node_config(&state.node_config_path).unwrap();
+            assert_eq!(
+                persisted.pool_url.as_deref(),
+                Some("https://pool.example:8443")
+            );
+
+            let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
+            match super::dispatch(&env, &state).await.payload {
+                Response::DaemonEnv(e) => {
+                    assert_eq!(e.pool_url.as_deref(), Some("https://pool.example:8443"))
+                }
+                other => panic!("expected DaemonEnv, got {other:?}"),
+            }
+        }
+
+        /// Changing the pool must drop what the last one said.
+        ///
+        /// The election is cached for a whole epoch — about a day — so a stale
+        /// entry would keep sending rounds to the previous pool's seat long
+        /// after the user pointed the wallet somewhere else.
+        #[tokio::test]
+        async fn changing_the_pool_invalidates_the_cached_election() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            *state.election_cache.write().await = Some((7, serde_json::json!({ "enabled": true })));
+
+            state
+                .set_node(
+                    GhostdSettings {
+                        url: Some("http://127.0.0.1:8332".into()),
+                        ..Default::default()
+                    },
+                    Some("https://other.example:8443".into()),
+                )
+                .await
+                .expect("set node");
+
+            assert!(
+                state.election_cache.read().await.is_none(),
+                "a cached election must not outlive the pool that served it"
+            );
+        }
+
+        /// A malformed pool URL is refused, and nothing is persisted — the
+        /// same rule the node URL follows.
+        #[tokio::test]
+        async fn a_pool_url_with_the_wrong_scheme_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let err = state
+                .set_node(GhostdSettings::default(), Some("ws://pool.example".into()))
+                .await
+                .expect_err("must refuse");
+            assert!(err.contains("pool URL"), "got: {err}");
+            assert!(
+                !state.node_config_path.exists(),
+                "a rejected change must not write node.json"
+            );
+        }
+
         /// The RPC password must never come back out over the IPC.
         ///
         /// A settings screen needs to know *how* the wallet authenticates, and
@@ -6179,6 +6428,7 @@ mod server {
                     cookie_path: None,
                     user: Some("ghost".into()),
                     pass: Some("hunter2-the-secret".into()),
+                    pool_url: None,
                 },
             ))
             .unwrap();
@@ -6210,6 +6460,7 @@ mod server {
                     cookie_path: None,
                     user: None,
                     pass: None,
+                    pool_url: None,
                 },
             ))
             .unwrap();
@@ -6235,7 +6486,7 @@ mod server {
             let mut state = test_state_in(dir.path().to_path_buf());
             Arc::get_mut(&mut state).unwrap().ghostd_env_override = true;
             let err = state
-                .set_node(GhostdSettings::default())
+                .set_node(GhostdSettings::default(), None)
                 .await
                 .expect_err("must refuse while env override is active");
             assert!(

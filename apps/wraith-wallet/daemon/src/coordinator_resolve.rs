@@ -2,22 +2,22 @@
 //! published election view — so a wallet can mix without being handed a
 //! coordinator URL.
 //!
-//! # Currently unreachable, deliberately kept
+//! # Where the election comes from now
 //!
-//! Nothing calls this today. The wallet used to obtain the election JSON
-//! *through ghost-pay*, precisely so it never had to talk to the pool API
-//! itself and reveal that it was about to mix; ghost-pay is gone, and calling
-//! the pool directly would spend the privacy that indirection existed to buy.
-//! The replacement is the signed node-list checkpoint, which is verifiable
-//! rather than merely relayed.
+//! The wallet used to obtain it *through ghost-pay*, so it never spoke to the
+//! pool itself. With the operator gone it asks a pool node directly, over Tor
+//! when one is configured, and caches the answer for the whole epoch so the
+//! number of asks stops tracking the number of mixes. See
+//! `verified_election` in the daemon for that side.
 //!
-//! What is kept here is the half that was hard and is still correct: an
+//! What lives here is the half that makes asking safe enough to do: an
 //! election is *recomputed* before it is used, so a relayed view cannot lie
 //! about who was seated, and the beacon is pinned to a real block hash rather
-//! than taken on the publisher's word (#697). Deleting that and re-deriving it
-//! alongside a new transport is how a verification step quietly becomes a
-//! trust-the-server step. The tests below still hold it to that.
-#![allow(dead_code)]
+//! than taken on the publisher's word (#697).
+//!
+//! ⚠ The roster remains a trusted input, and no amount of care here changes
+//! that — see `verified_election` for why the mesh node-list checkpoint does
+//! not close it and what would.
 
 use wraith_protocol::sortition::{
     shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,

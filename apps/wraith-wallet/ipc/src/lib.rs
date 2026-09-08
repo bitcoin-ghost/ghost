@@ -327,6 +327,20 @@ pub enum Request {
         user: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pass: Option<String>,
+        /// A Ghost pool node, used only to read the coordinator election.
+        ///
+        /// Optional and separate from the wallet's own node: it answers "which
+        /// coordinator holds this tier's seat this epoch", which is pool
+        /// consensus state and not something a Bitcoin node knows. Leave it
+        /// unset and mixing falls back to a coordinator URL supplied per
+        /// round.
+        ///
+        /// What is read from it is verified rather than believed — the draw is
+        /// recomputed and its beacon pinned to the wallet's own node — so a
+        /// lying pool cannot name itself every seat. What it still sees is
+        /// that this IP asked; route it through Tor if that matters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_url: Option<String>,
     },
     /// Phase 15: ask the daemon to fetch a release manifest from
     /// `manifest_url` (or the daemon-configured default if `None`),
@@ -1274,6 +1288,9 @@ pub struct DaemonEnvResponse {
     /// read-only and the daemon refuses `SetNode` while this holds.
     #[serde(default)]
     pub ghostd_env_override: bool,
+    /// The pool consulted for the coordinator election, if any.
+    #[serde(default)]
+    pub pool_url: Option<String>,
     /// Network the daemon is bound to: `mainnet` / `signet` / `testnet` / `regtest`.
     pub network: String,
     /// Absolute path to the encrypted-keystore directory.
@@ -1329,6 +1346,9 @@ pub struct LightDetectedResponse {
 pub struct NodeResponse {
     /// The node URL now active, or `None` when the wallet has no node.
     pub ghostd_url: Option<String>,
+    /// The pool consulted for the coordinator election, if any.
+    #[serde(default)]
+    pub pool_url: Option<String>,
     /// How the wallet authenticates: `cookie`, `userpass`, or `none`.
     ///
     /// Never the credential itself. A settings screen needs to show which
@@ -1883,12 +1903,14 @@ mod tests {
                 cookie_path: None,
                 user: None,
                 pass: None,
+                pool_url: None,
             },
             Request::SetNode {
                 ghostd_url: Some("http://127.0.0.1:8332".into()),
                 cookie_path: Some("/home/test/.ghost/.cookie".into()),
                 user: None,
                 pass: None,
+                pool_url: Some("https://pool.example:8443".into()),
             },
             Request::CheckForUpdate { manifest_url: None },
             Request::CheckForUpdate {
@@ -1989,6 +2011,7 @@ mod tests {
                 ghostd_url: Some("http://127.0.0.1:8332".into()),
                 ghostd_auth: "cookie".into(),
                 ghostd_env_override: false,
+                pool_url: None,
                 network: "signet".into(),
                 wallets_dir: "/home/test/.wraith/wallets".into(),
                 tor_proxy: None,
@@ -2000,6 +2023,7 @@ mod tests {
             }),
             Response::NodeSet(NodeResponse {
                 ghostd_url: Some("http://127.0.0.1:8332".into()),
+                pool_url: None,
                 auth: "cookie".into(),
                 env_pinned: false,
             }),

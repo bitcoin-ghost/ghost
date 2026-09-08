@@ -63,6 +63,7 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
   // Node connection selector.
   const [conn, setConn] = useState<ConnectionStatusResponse | null>(null);
   const [nodeUrl, setNodeUrl] = useState(OWN_NODE_RPC_DEFAULT);
+  const [poolUrl, setPoolUrl] = useState("");
   const [nodeAuth, setNodeAuth] = useState<"cookie" | "userpass">("cookie");
   const [nodeCookie, setNodeCookie] = useState("");
   const [nodeUser, setNodeUser] = useState("");
@@ -114,6 +115,7 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
         setNodeFormInit((done) => {
           if (!done) {
             if (e.ghostd_url) setNodeUrl(e.ghostd_url);
+            if (e.pool_url) setPoolUrl(e.pool_url);
             if (e.ghostd_auth === "userpass") setNodeAuth("userpass");
             // The cookie path and the password are deliberately not sent back
             // by the daemon, so there is nothing to seed them with. A blank
@@ -158,6 +160,7 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
           nodeAuth === "cookie" ? nodeCookie.trim() || undefined : undefined,
         user: nodeAuth === "userpass" ? nodeUser.trim() || undefined : undefined,
         pass: nodeAuth === "userpass" ? nodePass || undefined : undefined,
+        pool_url: poolUrl.trim() || undefined,
       });
       setNodeSaved(true);
       // Pull the fresh config + reachability straight away so the card
@@ -644,6 +647,27 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
             </div>
           )}
 
+          <div className="col" style={{ marginTop: 16 }}>
+            <label>Pool URL (optional)</label>
+            <input
+              className="mono"
+              value={poolUrl}
+              onChange={(e) => {
+                setPoolUrl(e.target.value);
+                setNodeSaved(false);
+              }}
+              placeholder="https://pool.example:8443"
+            />
+            <span className="muted" style={{ fontSize: 12 }}>
+              Used only to look up which Wraith coordinator holds a tier's seat
+              this epoch. Leave it blank and mixing needs a coordinator URL each
+              round, which works but never rotates. What comes back is checked
+              against your own node rather than believed; what the pool still
+              learns is that your address asked, so pair this with Tor if that
+              matters to you.
+            </span>
+          </div>
+
           <div className="row" style={{ marginTop: 12 }}>
             <button
               className="btn-primary"
@@ -671,6 +695,8 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour
           <div className="v mono">{env?.ghostd_url ?? "(none)"}</div>
           <div className="k">Auth</div>
           <div className="v mono">{env?.ghostd_auth ?? "—"}</div>
+          <div className="k">Pool</div>
+          <div className="v mono">{env?.pool_url ?? "(none)"}</div>
           <div className="k">Tor proxy</div>
           <div className="v mono">{env?.tor_proxy ?? "—"}</div>
         </div>

@@ -110,6 +110,8 @@ export interface DaemonEnvResponse {
   /// True when WRAITHD_GHOSTD_URL pins the node at boot. The selector is
   /// shown read-only and the daemon refuses changes while it holds.
   ghostd_env_override?: boolean;
+  /// A Ghost pool node, consulted only for the coordinator election.
+  pool_url?: string | null;
   socket_path: string;
   wallets_dir: string;
   /// Optional Tor SOCKS5 URL the daemon routes outbound REST through.
@@ -138,6 +140,7 @@ export const OWN_NODE_RPC_DEFAULT = "http://127.0.0.1:8332";
 
 export interface NodeResult {
   ghostd_url: string | null;
+  pool_url?: string | null;
   /** "cookie" | "userpass" | "none" — never the credential itself. */
   auth: string;
   env_pinned: boolean;
@@ -153,12 +156,20 @@ export async function setNode(args: {
   cookie_path?: string;
   user?: string;
   pass?: string;
+  /**
+   * A Ghost pool node, consulted only for the Wraith coordinator election.
+   * Optional — without it, mixing needs a coordinator URL per round and never
+   * rotates. What comes back is verified against your own node; what the pool
+   * learns is that your IP asked.
+   */
+  pool_url?: string;
 }): Promise<NodeResult> {
   const resp = await invoke("set_node", {
     ghostdUrl: args.ghostd_url,
     cookiePath: args.cookie_path,
     user: args.user,
     pass: args.pass,
+    poolUrl: args.pool_url,
   });
   return unwrap<NodeResult>(resp).payload;
 }
