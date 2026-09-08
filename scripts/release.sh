@@ -78,8 +78,19 @@ features_for() {
     esac
 }
 
+# Addressed explicitly because the publish path uses `gh api`, which — unlike `gh release` — does
+# not infer the repo from the checkout, and must keep working from a release worktree.
+GH_REPO="${GHOST_GH_REPO:-bitcoin-ghost/ghost}"
+
 CANARY_NODES="ghost-vm5 ghost-vm6 ghost-vm7 ghost-vm8"
-PRODUCTION_NODES="ghost-vm1 ghost-vm2 ghost-vm3 ghost-vm4"
+# ⛔ ghost-vm1 is GENESIS and goes LAST. Two things depend on this order, not one:
+#   * the obvious one — the riskiest node is rolled once the others have proven the binary;
+#   * `deploy-node.sh` makes the FIRST production node the lone canary for ghost-pay/ghost-gsp
+#     (no canary carries those services), so whoever leads this list soaks an unsoaked binary
+#     alone for SOAK_MINUTES. With vm1 first that was genesis, for 62 minutes (#856).
+# This is the ONLY production ordering in the file. It used to be stated here and again in the
+# ghostd loop, and the two drifted: the ghostd loop was right, this list was backwards.
+PRODUCTION_NODES="ghost-vm4 ghost-vm3 ghost-vm2 ghost-vm1"
 SOAK_MINUTES="${SOAK_MINUTES:-62}"
 
 STATE_DIR="${GHOST_RELEASE_STATE:-$HOME/.ghost-deploy/release}"
@@ -416,8 +427,10 @@ phase_node() {
 CMake was not reconfigured, so it read the old workspace version"
     info "ghostd $got built"
 
-    # Canaries first, then production with vm1 LAST: it is the genesis node.
-    for n in ghost-vm8 ghost-vm7 ghost-vm6 ghost-vm5 ghost-vm4 ghost-vm3 ghost-vm2 ghost-vm1; do
+    # Canaries first, then production with vm1 LAST: it is the genesis node. Derived from the two
+    # constants rather than spelled out again — this loop had the order right while
+    # PRODUCTION_NODES had it backwards, and nothing could notice because they were separate (#856).
+    for n in $CANARY_NODES $PRODUCTION_NODES; do
         roll_ghostd "$n" "$bin" || die "ghostd roll stopped at $n"
     done
     info "ghostd rolled to the fleet"
@@ -499,17 +512,38 @@ phase_tag() {
         git tag -a "$TAG" "$sha" -m "$TAG" || die "tag failed"
         git push -q origin "$TAG" || die "tag push failed"
     fi
-    if gh release view "$TAG" >/dev/null 2>&1; then
-        info "release $TAG already published"
-    else
+    # ⛔ `gh release view` SUCCEEDS for a draft, and release.yml creates the release as a draft.
+    # So "a release exists" is not "it is published" — conflating them meant this phase never
+    # attempted a publish at all, printed success, and left v1.11.38 a draft while the whole fleet
+    # ran it (#857).
+    if ! gh release view "$TAG" >/dev/null 2>&1; then
         gh release create "$TAG" --title "$TAG" --generate-notes >/dev/null \
             || die "gh release create failed"
     fi
-    # Verify the OUTCOME: a published release that is not `latest` is the failure this had before.
-    local latest
-    latest=$(gh release list --limit 1 2>/dev/null | awk '{print $1}')
-    [ "$latest" = "$TAG" ] || echo "  WARN: newest release is '$latest', not $TAG" >&2
-    info "published $TAG"
+
+    local rel_id
+    rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
+                --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
+    [ -n "$rel_id" ] || die "no release found for $TAG to publish"
+
+    if [ "$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)" = "true" ]; then
+        # NOT `gh release edit --draft=false`: that is a no-op in the installed gh — it prints
+        # ` view` and exits 0 without changing anything, which is what made this look published.
+        # ⛔ `tag_name` MUST be sent: PATCHing without it DETACHES the release from its tag
+        # (v1.11.24 became `untagged-…` that way).
+        gh api -X PATCH "repos/$GH_REPO/releases/$rel_id" \
+            -f tag_name="$TAG" -f name="$TAG" -F draft=false -F make_latest=true >/dev/null \
+            || die "publish PATCH failed for $TAG"
+    fi
+
+    # Read the OUTCOME back rather than trusting the call's exit code. The publish path's whole
+    # failure mode is succeeding while changing nothing, so an unverified publish is not a publish.
+    local draft tagged
+    draft=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)
+    tagged=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .tag_name 2>/dev/null)
+    [ "$draft" = "false" ] || die "$TAG is STILL a draft after publishing — see #857"
+    [ "$tagged" = "$TAG" ] || die "$TAG detached from its tag (now '$tagged') — re-PATCH with tag_name"
+    info "published $TAG (verified: draft=false, tag=$tagged)"
 }
 
 # ---------------------------------------------------------------- driver
