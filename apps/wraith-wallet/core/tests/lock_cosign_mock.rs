@@ -46,8 +46,12 @@ type Shared = Arc<Mutex<Quorum>>;
 
 #[derive(serde::Deserialize)]
 struct NonceReq {
+    /// The Lock's BINDING id, not its `lock_id`. Deserialised by name so this
+    /// mock fails loudly if the wallet ever goes back to sending the lock id —
+    /// which cannot work, because a lock id is a hash over the very quorum key
+    /// this request asks to be derived.
     #[allow(dead_code)]
-    lock_id: String,
+    binding_id: String,
     request: SigningRequest,
 }
 
@@ -226,7 +230,7 @@ async fn the_wallet_gets_a_signature_the_lane_accepts() {
     let (sig, view) = cosign_with_quorum(
         &reqwest::Client::new(),
         &url,
-        "lock-abc",
+        "binding-abc",
         &req,
         &owner,
         &keys,
@@ -273,7 +277,7 @@ async fn a_refusal_carries_its_reason() {
     let err = cosign_with_quorum(
         &reqwest::Client::new(),
         &url,
-        "lock-abc",
+        "binding-abc",
         &req,
         &owner,
         &keys,
@@ -323,7 +327,7 @@ async fn a_refusal_costs_the_wallet_no_nonce() {
         assert!(cosign_with_quorum(
             &reqwest::Client::new(),
             &url,
-            "lock-abc",
+            "binding-abc",
             &req,
             &owner,
             &keys,
@@ -351,7 +355,7 @@ async fn a_refusal_costs_the_wallet_no_nonce() {
     assert!(cosign_with_quorum(
         &reqwest::Client::new(),
         &url2,
-        "lock-abc",
+        "binding-abc",
         &small,
         &owner2,
         &keys2,
@@ -376,7 +380,7 @@ async fn a_standby_quorum_is_reported_as_a_refusal_not_a_crash() {
     let err = cosign_with_quorum(
         &reqwest::Client::new(),
         &url,
-        "lock-abc",
+        "binding-abc",
         &req,
         &owner,
         &keys,
