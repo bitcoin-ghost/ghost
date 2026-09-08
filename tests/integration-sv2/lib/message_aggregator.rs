@@ -12,24 +12,28 @@ type QueuedMessage = (MsgType, AnyMessage<'static>, Option<Vec<Tlv>>);
 /// The intercepted-message queue, plus a count of how many of each message type it holds.
 ///
 /// ⛔ The counts exist because this queue is UNBOUNDED and, in practice, large. A sniffer sitting
-/// in front of a mining channel accumulates every share the miner submits — a test that waits
-/// without draining reached **131,783** queued messages in 66 seconds (#849). At that size an
-/// O(n) lookup is not a constant factor, it is the difference between a test passing and a test
-/// reporting a message it can see as absent:
+/// in front of a mining channel accumulates every share the miner submits — measured at
+/// **109,097** queued messages in 70 seconds, because the SV1 miner submits ~1,500 shares/second
+/// and nothing drains what the test does not read (#849).
 ///
-///   * `has_message_type` scanned the whole deque. `Sniffer::wait_for_message_type` guards that
-///     scan with a 1-second timeout and maps expiry to `false`, so once the scan exceeded a
-///     second, a message that WAS queued reported as "not present" — indistinguishably from
-///     genuinely absent. The test then failed saying the message never went upstream, which was
-///     untrue.
-///   * `next_message_with_tlvs` and `has_message_type_with_remove` CLONED the entire deque on
-///     every call, to pop one element or drop a prefix. Called in a loop, as those tests do,
-///     that is O(n²) in the queue length.
+/// At that size the accessors were quadratic:
+///
+///   * `next_message_with_tlvs` CLONED the entire deque — every message and its TLVs — to pop the
+///     front element, then assigned the clone back. Called in a loop, popping k messages copied
+///     O(n) each time.
+///   * `has_message_type_with_remove` likewise cloned the whole deque to drop a prefix.
+///   * `has_message_type` scanned linearly, including for misses.
+///
+/// ⚠ This is a cost fix, NOT a correctness fix. I first believed the O(n) scan was why
+/// `translator_integration`'s two failing tests reported a message as absent, and verified that it
+/// is not: with these counters in place both still fail, and sniffer throughput moved only from 80
+/// to 102 messages per run. The message those tests wait for is not in the queue at all. Do not
+/// cite this type as the fix for that.
 ///
 /// Message types are `u8`, so a 256-slot array indexes them exactly and needs no hashing. It is
 /// maintained under the same lock as the deque — every push increments and every removal
 /// decrements — so the two can never disagree.
-struct Queued {
+pub(crate) struct Queued {
     deque: VecDeque<QueuedMessage>,
     counts: [usize; 256],
 }
