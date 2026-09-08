@@ -2856,10 +2856,7 @@ mod server {
         let idx = bip86_index.unwrap_or(0);
         let network = state.network;
         let owner = with_active_wallet(state, move |_, ks| {
-            let path = format!(
-                "m/86'/{}'/0'/0/{idx}",
-                wraith_wallet_core::light::GHOST_COIN_TYPE
-            );
+            let path = lock_owner_path(idx);
             let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
             let secp = Secp256k1::new();
             let sk = bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
@@ -2945,6 +2942,21 @@ mod server {
         String,
     > {
         let kind = parse_lane(lane)?;
+        let (account, record) = lock_account_for(state, lock_id).await?;
+        Ok((account, kind, record))
+    }
+
+    /// Rebuild one remembered Lock's four lanes.
+    async fn lock_account_for(
+        state: &Arc<DaemonState>,
+        lock_id: &str,
+    ) -> Result<
+        (
+            wraith_wallet_core::ghost_lock_account::GhostLockAccount,
+            wraith_wallet_core::ghost_lock_store::StoredLock,
+        ),
+        String,
+    > {
         let record = {
             let store = ghost_lock_store_for(state).map_err(|e| format!("lock store: {e}"))?;
             store
@@ -2962,7 +2974,97 @@ mod server {
             Some(record.bip86_index),
         )
         .await?;
-        Ok((account, kind, record))
+        Ok((account, record))
+    }
+
+    /// Which compartment a coin belongs to, across every remembered Lock.
+    ///
+    /// `None` when the script matches no lane of any Lock — a loose wallet
+    /// coin, which the compartment rules do not speak about.
+    ///
+    /// A Lock whose lanes cannot be rebuilt right now (wallet locked, record
+    /// malformed) is skipped rather than reported as "not a lane". Treating an
+    /// unknown as a refusal would block ordinary mixing whenever a Lock is
+    /// unreadable, and treating it as Private would be a claim we cannot
+    /// support; skipping keeps this a best-effort classifier, with the
+    /// authoritative recount still ahead at `inspect`.
+    async fn compartment_of_script(
+        state: &Arc<DaemonState>,
+        scriptpubkey_hex: &str,
+    ) -> Option<ghost_lock::Compartment> {
+        let want = scriptpubkey_hex.trim();
+        let ids: Vec<String> = {
+            let store = ghost_lock_store_for(state).ok()?;
+            store.list().iter().map(|l| l.lock_id.clone()).collect()
+        };
+        for id in ids {
+            let Ok((account, _)) = lock_account_for(state, &id).await else {
+                continue;
+            };
+            for built in &account.lanes {
+                let spk = hex::encode(built.lane.address.script_pubkey().as_bytes());
+                if spk.eq_ignore_ascii_case(want) {
+                    return Some(built.kind.compartment());
+                }
+            }
+        }
+        None
+    }
+
+    /// Refuse a spend that would link two compartments.
+    ///
+    /// Rule 3 of `ghost_lock::compartment`, which had no callers at all
+    /// outside its own tests. It is reachable here because the Lock signing
+    /// handlers sign one input of a PSBT the **caller** built — so the caller
+    /// chooses the other inputs. A transaction spending a Cash coin alongside
+    /// a private-lane coin publishes the link between them, undoing the
+    /// separation the lanes exist to create, in a transaction this wallet
+    /// signed itself.
+    ///
+    /// Inputs that belong to no Lock lane are not counted. The rule is stated
+    /// over compartments, and a loose wallet coin is not in one. That leaves a
+    /// real gap — spending a Savings coin beside an ordinary account-0' coin
+    /// still links Savings to the public wallet — but closing it means
+    /// deciding that non-Lock coins are Cash-like, which is a policy choice
+    /// this function is not the place to make silently.
+    async fn refuse_if_spend_links_compartments(
+        state: &Arc<DaemonState>,
+        psbt: &bitcoin::psbt::Psbt,
+    ) -> Option<String> {
+        let mut compartments = Vec::new();
+        for i in 0..psbt.inputs.len() {
+            let Some(txout) = psbt_input_value(psbt, i) else {
+                continue;
+            };
+            let spk = hex::encode(txout.script_pubkey.as_bytes());
+            if let Some(c) = compartment_of_script(state, &spk).await {
+                compartments.push(c);
+            }
+        }
+        ghost_lock::check_spend_together(&compartments)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// Refuse a coin the compartment rule keeps out of rounds.
+    ///
+    /// Rule 1 of `ghost_lock::compartment`, which until now was computed only
+    /// to colour a lane in the UI and never actually enforced. A Cash coin is
+    /// public by design, and mixing one re-links the strangers it is mixed
+    /// with — their problem, not the owner's, which is why the wallet must not
+    /// leave it to the user.
+    ///
+    /// Enforceable only since Lock keys moved off the plain wallet's account:
+    /// while the Cash lane was the wallet's own receive address, this would
+    /// have refused every ordinary coin.
+    async fn refuse_if_not_round_eligible(
+        state: &Arc<DaemonState>,
+        scriptpubkey_hex: &str,
+    ) -> Option<String> {
+        let compartment = compartment_of_script(state, scriptpubkey_hex).await?;
+        ghost_lock::check_round_eligible(compartment)
+            .err()
+            .map(|e| e.to_string())
     }
 
     /// Every receive address the wallet would use, up to `scan_max`.
@@ -3246,16 +3348,34 @@ mod server {
         }
     }
 
+    /// Derivation path for a Ghost Lock's owner key.
+    ///
+    /// Account `1'`, deliberately not the account the plain wallet receives and
+    /// spends on.
+    ///
+    /// These keys used to share account `0'` with `light receive`, and the Cash
+    /// lane is a bare key-path output for the owner key — so the Cash lane came
+    /// out byte-identical to the wallet's receive address at the same index.
+    /// One coin then appeared in both the wallet's balance and the Lock's
+    /// total, and the compartment rule that a Cash coin must never enter a
+    /// round could not be enforced without refusing every ordinary coin along
+    /// with it.
+    ///
+    /// A Lock coin and a loose coin are now different coins.
+    fn lock_owner_path(index: u32) -> String {
+        format!(
+            "m/86'/{}'/1'/0/{index}",
+            wraith_wallet_core::light::GHOST_COIN_TYPE
+        )
+    }
+
     /// The owner's signing key for a Lock, from the active keystore.
     async fn lock_owner_seckey(
         state: &Arc<DaemonState>,
         bip86_index: u32,
     ) -> Result<bitcoin::secp256k1::SecretKey, String> {
         with_active_wallet(state, move |_, ks| {
-            let path = format!(
-                "m/86'/{}'/0'/0/{bip86_index}",
-                wraith_wallet_core::light::GHOST_COIN_TYPE
-            );
+            let path = lock_owner_path(bip86_index);
             let xprv = ks.derive_xprv(&path).map_err(|e| format!("derive: {e}"))?;
             bitcoin::secp256k1::SecretKey::from_slice(&xprv.private_key().to_bytes())
                 .map_err(|e| format!("owner key: {e}"))
@@ -3477,6 +3597,30 @@ mod server {
                 coordinator_url,
             } => {
                 use wraith_wallet_core::ghost_lock_account::LaneKind;
+                // Rule 3, before any signature exists: the PSBT came from the
+                // caller, so its other inputs are the caller's choice.
+                match wraith_wallet_core::psbt::decode_psbt(&psbt) {
+                    Ok((parsed, _)) => {
+                        if let Some(reason) =
+                            refuse_if_spend_links_compartments(state, &parsed).await
+                        {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!("refused the spend: {reason}"),
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("decode psbt: {e}"),
+                            }),
+                        )
+                    }
+                }
                 let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
                     Ok(v) => v,
                     Err(message) => {
@@ -3832,6 +3976,30 @@ mod server {
                 psbt,
                 input_index,
             } => {
+                // Rule 3, before any signature exists: the PSBT came from the
+                // caller, so its other inputs are the caller's choice.
+                match wraith_wallet_core::psbt::decode_psbt(&psbt) {
+                    Ok((parsed, _)) => {
+                        if let Some(reason) =
+                            refuse_if_spend_links_compartments(state, &parsed).await
+                        {
+                            return Envelope::new(
+                                id,
+                                Response::Error(ErrorResponse {
+                                    message: format!("refused the spend: {reason}"),
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("decode psbt: {e}"),
+                            }),
+                        )
+                    }
+                }
                 let (account, kind, record) = match lock_lane_for(state, &lock_id, &lane).await {
                     Ok(v) => v,
                     Err(message) => {
@@ -5135,6 +5303,21 @@ mod server {
                         );
                     }
                 };
+                // Compartment rule 1, before the coin is offered to anyone.
+                // A Cash coin is public by design; mixing one re-links the
+                // strangers it is mixed with, which is their problem rather
+                // than the owner's — so the wallet refuses it rather than
+                // leaving the choice to whoever typed the command.
+                if let Some(reason) =
+                    refuse_if_not_round_eligible(state, &utxo_scriptpubkey_hex).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the round: {reason}"),
+                        }),
+                    );
+                }
                 // Same reason: `req` takes the scriptPubKey, and the
                 // ownership proof needs it to find the key that owns it.
                 let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
@@ -5391,6 +5574,21 @@ mod server {
                         );
                     }
                 };
+                // Compartment rule 1, before the coin is offered to anyone.
+                // A Cash coin is public by design; mixing one re-links the
+                // strangers it is mixed with, which is their problem rather
+                // than the owner's — so the wallet refuses it rather than
+                // leaving the choice to whoever typed the command.
+                if let Some(reason) =
+                    refuse_if_not_round_eligible(state, &utxo_scriptpubkey_hex).await
+                {
+                    return Envelope::new(
+                        id,
+                        Response::Error(ErrorResponse {
+                            message: format!("refused the round: {reason}"),
+                        }),
+                    );
+                }
                 // Same reason: `req` takes the scriptPubKey, and the
                 // ownership proof needs it to find the key that owns it.
                 let utxo_scriptpubkey_hex_for_proof = utxo_scriptpubkey_hex.clone();
@@ -6146,6 +6344,283 @@ mod server {
                 "history lost entries: {} of {WRITERS} survived",
                 store.len()
             );
+        }
+
+        /// A Cash coin is refused from a round; a private-lane coin is not.
+        ///
+        /// Compartment rule 1 — "a Cash coin must never enter a round" — was
+        /// written, tested inside `ghost-lock`, and never called. The only
+        /// caller of `check_round_eligible` computed a flag for the UI to
+        /// colour a lane with. Nothing stopped the coin.
+        ///
+        /// It could not be enforced before, either: Lock owner keys shared
+        /// account 0' with the plain wallet, so the Cash lane WAS the wallet's
+        /// receive address and refusing Cash would have refused every ordinary
+        /// coin. Keys moved to account 1', which is what makes this checkable.
+        ///
+        /// Driven through `dispatch` with an unreachable coordinator on
+        /// purpose: the refusal must come from the compartment rule, not from
+        /// a failed connection, which also proves the check runs before the
+        /// coin is offered to anybody.
+        #[tokio::test]
+        async fn a_cash_coin_is_refused_from_a_round_and_a_private_one_is_not() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+            state
+                .wallets
+                .write()
+                .await
+                .insert("harness".to_string(), ks);
+
+            let xonly = |seed: u8| {
+                use bitcoin::secp256k1::{Secp256k1, SecretKey};
+                let sk = SecretKey::from_slice(&[seed; 32]).expect("nonzero scalar");
+                let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
+                hex::encode(xk.serialize())
+            };
+
+            // Remember a Lock, so its lanes are classifiable.
+            let save = serde_json::to_string(&Envelope::new(
+                1,
+                Request::GhostLockSave {
+                    label: Some("compartment-test".into()),
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&save, &state).await.payload {
+                Response::GhostLockSaved(_) => {}
+                other => panic!("could not remember a Lock: {other:?}"),
+            }
+
+            // Lane derivation reports balances, so it needs a chain that can
+            // scan. Nothing is funded; only the addresses matter here.
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: "51".to_string() + "20" + &"ff".repeat(32),
+                sats: 0,
+            });
+
+            let lanes = serde_json::to_string(&Envelope::new(
+                2,
+                Request::GhostLockLanes {
+                    backup_pubkey: xonly(0x11),
+                    heir_pubkey: xonly(0x22),
+                    quorum_pubkey: xonly(0x33),
+                    anchor_height: 900_000,
+                    inherit_height: 950_000,
+                    bip86_index: None,
+                },
+            ))
+            .unwrap();
+            let addr_of = match super::dispatch(&lanes, &state).await.payload {
+                Response::GhostLockLanes(r) => r
+                    .lanes
+                    .iter()
+                    .map(|l| (l.kind.clone(), l.address.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                other => panic!("expected lanes, got {other:?}"),
+            };
+            let spk_of = |kind: &str| {
+                let a = addr_of
+                    .get(kind)
+                    .unwrap_or_else(|| panic!("no {kind} lane"));
+                let addr = a
+                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                    .expect("lane address")
+                    .assume_checked();
+                hex::encode(addr.script_pubkey().as_bytes())
+            };
+
+            let mix_req = |id: u64, spk: String| {
+                serde_json::to_string(&Envelope::new(
+                    id,
+                    Request::WraithMixPrepare {
+                        // Deliberately unreachable: a compartment refusal must
+                        // not depend on a coordinator being there.
+                        coordinator_url: "http://127.0.0.1:1".into(),
+                        socks5_proxy: None,
+                        coordinator_peers: vec![],
+                        tier_id: "100k_sats".into(),
+                        ghost_id: "compartment-test".into(),
+                        utxo_txid: "11".repeat(32),
+                        utxo_vout: 0,
+                        utxo_value_sats: 100_000,
+                        utxo_scriptpubkey_hex: spk,
+                        mix_output_address: addr_of.get("savings").expect("savings lane").clone(),
+                        min_entities: Some(1),
+                    },
+                ))
+                .unwrap()
+            };
+
+            // Cash: refused, and by the compartment rule.
+            match super::dispatch(&mix_req(3, spk_of("cash")), &state)
+                .await
+                .payload
+            {
+                Response::Error(e) => assert!(
+                    e.message.contains("Cash") || e.message.contains("cash"),
+                    "a Cash coin must be refused by the compartment rule, got: {}",
+                    e.message
+                ),
+                other => panic!("a Cash coin entered a round: {other:?}"),
+            }
+
+            // Savings: gets past the compartment gate. It still fails, because
+            // the coordinator does not exist — which is the point: the failure
+            // must be the connection, not the rule.
+            match super::dispatch(&mix_req(4, spk_of("savings")), &state)
+                .await
+                .payload
+            {
+                Response::Error(e) => assert!(
+                    !e.message.contains("Cash") && !e.message.contains("cash"),
+                    "a private-lane coin was refused by the Cash rule: {}",
+                    e.message
+                ),
+                other => panic!("unexpected success against a dead coordinator: {other:?}"),
+            }
+        }
+
+        /// A spend that links two compartments is refused before signing.
+        ///
+        /// Compartment rule 3 — `check_spend_together` — had no callers at all
+        /// outside its own tests. That mattered because the Lock signing
+        /// handlers sign one input of a PSBT the CALLER supplies, so the
+        /// caller picks the other inputs. Handing the wallet a transaction
+        /// that spends a Cash coin beside a Savings coin got a signature, and
+        /// the resulting transaction publishes the link between two lanes the
+        /// Lock exists to keep apart.
+        #[tokio::test]
+        async fn a_spend_that_links_two_compartments_is_refused() {
+            use bitcoin::{absolute::LockTime, transaction::Version, OutPoint, TxIn, TxOut};
+
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+            state
+                .wallets
+                .write()
+                .await
+                .insert("harness".to_string(), ks);
+            state.clients.write().await.chain = Arc::new(SpkChain {
+                spk_hex: "51".to_string() + "20" + &"ff".repeat(32),
+                sats: 0,
+            });
+
+            let xonly = |seed: u8| {
+                use bitcoin::secp256k1::{Secp256k1, SecretKey};
+                let sk = SecretKey::from_slice(&[seed; 32]).expect("nonzero scalar");
+                let (xk, _) = sk.x_only_public_key(&Secp256k1::new());
+                hex::encode(xk.serialize())
+            };
+            let lock_args = |id: u64, save: bool| {
+                let req = if save {
+                    Request::GhostLockSave {
+                        label: Some("rule3".into()),
+                        backup_pubkey: xonly(0x11),
+                        heir_pubkey: xonly(0x22),
+                        quorum_pubkey: xonly(0x33),
+                        anchor_height: 900_000,
+                        inherit_height: 950_000,
+                        bip86_index: None,
+                    }
+                } else {
+                    Request::GhostLockLanes {
+                        backup_pubkey: xonly(0x11),
+                        heir_pubkey: xonly(0x22),
+                        quorum_pubkey: xonly(0x33),
+                        anchor_height: 900_000,
+                        inherit_height: 950_000,
+                        bip86_index: None,
+                    }
+                };
+                serde_json::to_string(&Envelope::new(id, req)).unwrap()
+            };
+
+            let lock_id = match super::dispatch(&lock_args(1, true), &state).await.payload {
+                Response::GhostLockSaved(r) => r.lock.lock_id,
+                other => panic!("could not remember a Lock: {other:?}"),
+            };
+            let addr_of = match super::dispatch(&lock_args(2, false), &state).await.payload {
+                Response::GhostLockLanes(r) => r
+                    .lanes
+                    .iter()
+                    .map(|l| (l.kind.clone(), l.address.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                other => panic!("expected lanes, got {other:?}"),
+            };
+            let spk_of = |kind: &str| {
+                addr_of
+                    .get(kind)
+                    .unwrap_or_else(|| panic!("no {kind} lane"))
+                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                    .expect("lane address")
+                    .assume_checked()
+                    .script_pubkey()
+            };
+
+            // A transaction the caller built: one Savings input (the one the
+            // wallet is being asked to sign) and one Cash input alongside it.
+            let input = |vout: u32| TxIn {
+                previous_output: OutPoint {
+                    txid: "11".repeat(32).parse().unwrap(),
+                    vout,
+                },
+                ..Default::default()
+            };
+            let tx = bitcoin::Transaction {
+                version: Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![input(0), input(1)],
+                output: vec![TxOut {
+                    value: bitcoin::Amount::from_sat(150_000),
+                    script_pubkey: spk_of("investments"),
+                }],
+            };
+            let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).expect("psbt");
+            psbt.inputs[0].witness_utxo = Some(TxOut {
+                value: bitcoin::Amount::from_sat(100_000),
+                script_pubkey: spk_of("savings"),
+            });
+            psbt.inputs[1].witness_utxo = Some(TxOut {
+                value: bitcoin::Amount::from_sat(60_000),
+                script_pubkey: spk_of("cash"),
+            });
+
+            let line = serde_json::to_string(&Envelope::new(
+                3,
+                Request::GhostLockSignBegin {
+                    lock_id,
+                    lane: "savings".into(),
+                    psbt: hex::encode(psbt.serialize()),
+                    input_index: 0,
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&line, &state).await.payload {
+                Response::Error(e) => assert!(
+                    e.message.contains("refused the spend"),
+                    "a spend linking Cash to a private lane must be refused by rule 3, \
+                     got: {}",
+                    e.message
+                ),
+                other => panic!("the wallet agreed to link two compartments: {other:?}"),
+            }
         }
 
         /// A chain stub that answers with a fixed tip, so confirmation

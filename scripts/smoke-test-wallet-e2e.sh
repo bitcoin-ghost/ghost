@@ -349,6 +349,21 @@ LANE_ADDR=$(echo "$LANES_JSON" \
 LANE_BEFORE=$(echo "$LANES_JSON" \
     | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "cash") | .balance_sats] | add // 0')
 
+# A Lock coin and a loose coin must be different coins.
+#
+# Lock owner keys live on account 1'; the plain wallet receives on account 0'.
+# They used to share an account, and because Cash is a bare key-path output for
+# the owner key, the Cash lane came out byte-identical to the wallet's receive
+# address — so the same coin was reported by both the wallet balance and the
+# Lock total, and "a Cash coin must never enter a round" could not be enforced
+# without refusing every ordinary coin too.
+[ "$LANE_ADDR" != "$RECV_ADDR" ] \
+    || fail "cash lane address is the wallet's own receive address ($LANE_ADDR) — the Lock shares a key space with the plain wallet"
+[ "$LANE_BEFORE" = "0" ] \
+    || fail "a freshly derived cash lane already holds $LANE_BEFORE sats, so it is not a separate key space"
+pass "the Lock's lanes are a separate key space from the wallet's receive addresses"
+
+
 LOCK_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$LANE_ADDR" 0.001)
 [ -n "$LOCK_TXID" ] || fail "lane funding sendtoaddress returned no txid"
 $BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
