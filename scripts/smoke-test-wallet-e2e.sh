@@ -131,9 +131,39 @@ fi
 command -v jq      >/dev/null 2>&1 || fail "jq not found on PATH"
 command -v openssl >/dev/null 2>&1 || fail "openssl not found on PATH"
 
+# ---- network ----------------------------------------------------------------
+# Regtest by default; SMOKE_NETWORK=signet runs the same flows on a PRIVATE
+# signet.
+#
+# Private, not the public one, and the distinction is the point. Public signet
+# blocks arrive when somebody else mines them, so a run that needs 1,010 blocks
+# to age a Spending lane past its exit delay would take a week. A signet of our
+# own with a trivial block challenge keeps `generatetoaddress` while still
+# putting every guard, address prefix and network check on the signet path
+# rather than the regtest one — which is the half regtest never exercises.
+NETWORK="${SMOKE_NETWORK:-regtest}"
+case "$NETWORK" in
+    regtest)
+        GHOSTD_NET=(-regtest)
+        GHOSTD_PORT=18443
+        GHOSTD_P2P_PORT=18444
+        ADDR_PREFIX="bcrt1p"
+        ;;
+    signet)
+        # OP_TRUE: any block satisfies the challenge, so this node can mine its
+        # own chain. Nothing else about signet changes.
+        GHOSTD_NET=(-signet -signetchallenge=51)
+        GHOSTD_PORT=38332
+        GHOSTD_P2P_PORT=38333
+        ADDR_PREFIX="tb1p"
+        ;;
+    *)
+        fail "SMOKE_NETWORK must be 'regtest' or 'signet', got '$NETWORK'"
+        ;;
+esac
+
 # ---- topology ---------------------------------------------------------------
 GHOSTD_DIR="$DATADIR/ghostd"
-GHOSTD_PORT=18443
 GHOSTD_RPC_URL="http://127.0.0.1:${GHOSTD_PORT}/"
 mkdir -p "$GHOSTD_DIR"
 
@@ -153,31 +183,46 @@ port_busy() {
         netstat -ltn 2>/dev/null | grep -qE "[:.]$1[[:space:]]"
     fi
 }
-for p in "$GHOSTD_PORT" 18444 8800 8900 9100; do
+for p in "$GHOSTD_PORT" "$GHOSTD_P2P_PORT" 8800 8900 9100; do
     if port_busy "$p"; then
-        fail "port $p is already in use — a stale stack or another regtest node is running. \
+        fail "port $p is already in use — a stale stack or another node is running. \
 Stop it (pkill -9 ghostd wraithd; pkill -9 -f wraith-coordina) and retry."
     fi
 done
 
 # ---- ghostd -----------------------------------------------------------------
-step "starting ghostd regtest ($GHOSTD)"
-"$GHOSTD" -regtest \
+step "starting ghostd $NETWORK ($GHOSTD)"
+"$GHOSTD" "${GHOSTD_NET[@]}" \
     -datadir="$GHOSTD_DIR" \
     -rpcuser=demo -rpcpassword=demo \
     -rpcport=$GHOSTD_PORT \
-    -port=18444 \
+    -port=$GHOSTD_P2P_PORT \
     -fallbackfee=0.0001 \
     -daemon \
     -txindex
 GHOSTD_UP=1
 sleep 2
-BCLI="$GHOST_CLI -regtest -datadir=$GHOSTD_DIR -rpcuser=demo -rpcpassword=demo"
+BCLI="$GHOST_CLI ${GHOSTD_NET[0]} -datadir=$GHOSTD_DIR -rpcuser=demo -rpcpassword=demo"
+
+# Mine N blocks to the node's own wallet.
+#
+# `maxtries` is the whole reason this is a function. Regtest blocks are free,
+# but a private signet keeps real proof-of-work — only the block SIGNATURE is
+# trivial — and Core's default of 1,000,000 tries gives up before finding one.
+# It does not error when it does: it returns an empty array and exit 0, so the
+# chain silently fails to advance and the first symptom is "Insufficient funds"
+# somewhere far away.
+mine() {
+    local want="$1" got
+    got=$($BCLI -rpcwallet=demo generatetoaddress "$want" "$DEMO_ADDR" 1000000000 | jq 'length')
+    [ "$got" = "$want" ] \
+        || fail "asked for $want blocks on $NETWORK, mined $got — the chain did not advance"
+}
 $BCLI -named createwallet wallet_name=demo descriptors=true >/dev/null 2>&1 || true
 $BCLI loadwallet demo >/dev/null 2>&1 || true
 DEMO_ADDR=$($BCLI -rpcwallet=demo getnewaddress)
-$BCLI -rpcwallet=demo generatetoaddress 101 "$DEMO_ADDR" >/dev/null
-echo "regtest funded — balance: $($BCLI -rpcwallet=demo getbalance) BTC"
+mine 101
+echo "$NETWORK funded — balance: $($BCLI -rpcwallet=demo getbalance) BTC"
 
 # ---- shared secrets ---------------------------------------------------------
 
@@ -188,7 +233,7 @@ echo "regtest funded — balance: $($BCLI -rpcwallet=demo getbalance) BTC"
 # lock-recovery / scan paths, mirroring regtest-recovery-demo.sh.
 step "starting wraithd"
 WRAITHD_SOCKET="$WRAITH_SOCK" \
-WRAITHD_NETWORK=regtest \
+WRAITHD_NETWORK="$NETWORK" \
 WRAITHD_GHOSTD_URL="$GHOSTD_RPC_URL" \
 WRAITHD_GHOSTD_USER=demo \
 WRAITHD_GHOSTD_PASS=demo \
@@ -246,14 +291,14 @@ RECV_JSON=$(WRAITH --json light receive --index 0)
 RECV_ADDR=$(echo "$RECV_JSON" | jq -r '.LightReceive.address // .address')
 RECV_NET=$(echo "$RECV_JSON" | jq -r '.LightReceive.network // .network')
 [ -n "$RECV_ADDR" ] && [ "$RECV_ADDR" != "null" ] || fail "no receive address derived"
-[ "$RECV_NET" = "regtest" ] || fail "receive address network is '$RECV_NET', expected regtest"
+[ "$RECV_NET" = "$NETWORK" ] || fail "receive address network is '$RECV_NET', expected $NETWORK"
 # Regtest taproot addresses are bcrt1p…; assert the prefix so we know
 # we didn't accidentally get a mainnet / signet address.
 case "$RECV_ADDR" in
-    bcrt1p*) ;;
-    *) fail "receive address '$RECV_ADDR' is not a regtest taproot (bcrt1p…) address" ;;
+    "$ADDR_PREFIX"*) ;;
+    *) fail "receive address '$RECV_ADDR' is not a $NETWORK taproot ($ADDR_PREFIX…) address" ;;
 esac
-pass "derived regtest taproot receive address $RECV_ADDR"
+pass "derived $NETWORK taproot receive address $RECV_ADDR"
 
 # ============================================================================
 # FLOW 4: check the light balance (pre-funding)
@@ -267,12 +312,12 @@ echo "$BAL_OUT"
 pass "light balance query returned"
 
 # ============================================================================
-# FLOW 5: fund the receive address on regtest
+# FLOW 5: fund the receive address on the chain under test
 # ============================================================================
-step "FLOW 5 — fund the receive address (regtest)"
+step "FLOW 5 — fund the receive address ($NETWORK)"
 FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$RECV_ADDR" 0.01)
-[ -n "$FUND_TXID" ] || fail "regtest sendtoaddress returned no txid"
-$BCLI -rpcwallet=demo generatetoaddress 6 "$DEMO_ADDR" >/dev/null
+[ -n "$FUND_TXID" ] || fail "$NETWORK sendtoaddress returned no txid"
+mine 6
 echo "funded $RECV_ADDR with 0.01 BTC — txid $FUND_TXID (6 confs)"
 pass "receive address funded on-chain"
 
@@ -366,7 +411,7 @@ pass "the Lock's lanes are a separate key space from the wallet's receive addres
 
 LOCK_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$LANE_ADDR" 0.001)
 [ -n "$LOCK_TXID" ] || fail "lane funding sendtoaddress returned no txid"
-$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+mine 1
 # The node holds it — a txid the wallet reported would not prove that.
 $BCLI getrawtransaction "$LOCK_TXID" >/dev/null \
     || fail "the node does not know the lane funding tx $LOCK_TXID"
@@ -437,7 +482,7 @@ done
 step "starting wraith-coordinator (real broadcast, no bonds)"
 "$BIN/wraith-coordinator" \
     --listen 127.0.0.1:9100 \
-    --network regtest \
+    --network "$NETWORK" \
     --fee-address "$FEE_ADDR" \
     --fill-window-secs 30 \
     --ghostd-url "$GHOSTD_RPC_URL" \
@@ -466,7 +511,7 @@ step "funding $N mix-input UTXOs at exactly $SEAT_PRICE sats each"
 for i in $(seq 0 $((N-1))); do
     FUND_TXIDS[$i]=$($BCLI -rpcwallet=demo sendtoaddress "${INPUT_ADDRS[$i]}" "$SEAT_PRICE_BTC")
 done
-$BCLI -rpcwallet=demo generatetoaddress 6 "$DEMO_ADDR" >/dev/null
+mine 6
 
 # Resolve each funded UTXO's vout + scriptPubKey via the wallet scanner.
 step "scanning L1 for the $N mix-input UTXOs"
@@ -525,7 +570,7 @@ done
 pass "all $N participants share one broadcast tx ($FIRST_TXID)"
 
 # Mine + verify the tx shape on chain.
-$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+mine 1
 TX=$($BCLI getrawtransaction "$FIRST_TXID" 1)
 N_INPUTS=$(echo "$TX" | jq '.vin | length')
 N_OUTPUTS=$(echo "$TX" | jq '.vout | length')
@@ -578,7 +623,7 @@ SPEND_ADDR=$(echo "$LANES_AFTER" \
 
 ESC_FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$SPEND_ADDR" 0.002)
 [ -n "$ESC_FUND_TXID" ] || fail "could not fund the spending lane"
-$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+mine 1
 
 # Before the delay, the wallet must say so rather than hand over a signature.
 PLAN_EARLY=$(WRAITH --json lock escape-plan --lock-id "$LOCK_ID" --lane spending)
@@ -591,7 +636,7 @@ pass "escape-plan reports the coin is not spendable yet ($EARLY_REMAINING blocks
 
 # Age it past the exit delay.
 step "mining past the Spending lane's 1,008-block exit delay"
-$BCLI -rpcwallet=demo generatetoaddress 1010 "$DEMO_ADDR" >/dev/null
+mine 1010
 
 PLAN=$(WRAITH --json lock escape-plan --lock-id "$LOCK_ID" --lane spending)
 REQ_SEQ=$(echo "$PLAN" | jq -r '.GhostLockEscapePlan.required_sequence // .required_sequence')
@@ -626,7 +671,7 @@ ESC_TX=$(echo "$ESC_SIGNED" | jq -r '.GhostLockEscapeSigned.tx_hex // .tx_hex //
 # CSV are all rejected here and nowhere earlier.
 ESC_TXID=$($BCLI sendrawtransaction "$ESC_TX") \
     || fail "the node refused the escape spend — the script path does not work on chain"
-$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+mine 1
 
 ESC_CONF=$($BCLI getrawtransaction "$ESC_TXID" 1 | jq -r '.confirmations // 0')
 [ "$ESC_CONF" -ge 1 ] || fail "escape spend $ESC_TXID did not confirm"
@@ -678,7 +723,7 @@ AIR_SAV_ADDR=$(echo "$AIR_LANES" \
 [ -n "$AIR_SAV_ADDR" ] || fail "no savings-lane address for the air-gapped Lock"
 
 AIR_FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$AIR_SAV_ADDR" 0.003)
-$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+mine 1
 AIR_VOUT=$($BCLI getrawtransaction "$AIR_FUND_TXID" 1 \
     | jq -r --arg a "$AIR_SAV_ADDR" '.vout[] | select(.scriptPubKey.address == $a) | .n')
 [ -n "$AIR_VOUT" ] || fail "the funding tx has no output at the savings lane"
@@ -707,7 +752,7 @@ rm -f "$DEV_IN" "$DEV_OUT"; mkfifo "$DEV_IN"; : > "$DEV_OUT"
     --request "$DATADIR/dev-request.json" \
     --seed "$DEV_SEED" \
     --ledger "$DEV_LEDGER" \
-    --network regtest \
+    --network "$NETWORK" \
     --no-confirm \
     <"$DEV_IN" >"$DEV_OUT" 2>&1 &
 DEV_PID=$!
@@ -769,7 +814,7 @@ AIR_TX=$(echo "$AIR_FINAL" | jq -r '.hex')
 
 AIR_TXID=$($BCLI sendrawtransaction "$AIR_TX") \
     || fail "the node refused the air-gapped spend — the MuSig2 key path does not work on chain"
-$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+mine 1
 AIR_CONF=$($BCLI getrawtransaction "$AIR_TXID" 1 | jq -r '.confirmations // 0')
 [ "$AIR_CONF" -ge 1 ] || fail "air-gapped spend $AIR_TXID did not confirm"
 pass "air-gapped Savings spend confirmed on chain (tx $AIR_TXID)"
@@ -782,13 +827,13 @@ pass "the savings lane is empty — owner and backup device moved the coin toget
 # ============================================================================
 echo
 echo "================================================================"
-echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN"
+echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
 echo "================================================================"
 echo "  1. BIP-39 wallet create            ok"
 echo "  2. select active wallet            ok"
 echo "  3. derive receive address          ok  ($RECV_ADDR)"
 echo "  4. light balance                   ok"
-echo "  5. regtest fund                    ok  ($FUND_TXID)"
+echo "  5. $NETWORK fund$(printf '%*s' $((21 - ${#NETWORK})) '')ok  ($FUND_TXID)"
 echo "  6. L1 scan sees own UTXO           ok  (1,000,000 sats)"
 echo "  7. Ghost Lock prepare/fund/confirm ok  ($LOCK_ID)"
 echo "  8. on-chain payment (light pay)    ok  ($PAY_TXID)"
