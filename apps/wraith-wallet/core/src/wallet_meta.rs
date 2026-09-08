@@ -7,7 +7,6 @@
 //! reads twenty years of blocks to find a wallet that is usually a week old.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Per-wallet facts that are not secret and not derivable from the seed.
@@ -43,29 +42,8 @@ pub fn load(path: impl AsRef<Path>) -> WalletMeta {
 pub fn save(path: impl AsRef<Path>, meta: &WalletMeta) -> std::io::Result<()> {
     let path: PathBuf = path.as_ref().to_path_buf();
     let body = serde_json::to_vec_pretty(meta).map_err(std::io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = fs::metadata(&tmp)?.permissions();
-        perm.set_mode(0o600);
-        fs::set_permissions(&tmp, perm)?;
-    }
-    fs::rename(&tmp, &path)?;
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
-    Ok(())
+    // 0o600: the birth height dates the wallet.
+    ghost_lock::atomic_file::write_atomic(&path, &body, Some(0o600))
 }
 
 #[cfg(test)]

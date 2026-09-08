@@ -26,8 +26,9 @@
 //!
 //! # Concurrency
 //!
-//! Each write stages through a path private to it, so concurrent writers on
-//! one ledger file cannot truncate or unlink each other's staging file.
+//! Writes go through [`ghost_lock::atomic_file`], which stages each one
+//! through a path private to it, so concurrent writers on one ledger file
+//! cannot truncate or unlink each other's staging file.
 //!
 //! That is the limit of what this type guarantees. `record` rewrites the whole
 //! table from the snapshot [`FileSignatureStore::open`] read, so two stores
@@ -39,14 +40,9 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::signing_ledger::{OutPointKey, SignatureStore};
-
-/// Distinguishes the staging files of two writes racing on one ledger path.
-/// Paired with the pid so separate processes cannot collide either.
-static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// File-backed [`SignatureStore`]. Safe for production use.
 #[derive(Debug)]
@@ -120,41 +116,8 @@ impl FileSignatureStore {
             })
             .collect();
         let body = serde_json::to_vec_pretty(&rows)?;
-
-        // A staging path unique to this write. A fixed `.tmp` sibling is
-        // shared by every concurrent writer on the same ledger: two flushes
-        // racing on it truncate each other's contents, and the loser's rename
-        // fails with ENOENT once the winner has already moved the file away —
-        // which `record` turns into a panic, taking down the caller. Making
-        // the staging file private to one write removes both races.
-        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}.{seq}", std::process::id()));
-
-        let staged = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&body)?;
-            // Contents before the rename, or the rename can land pointing at an
-            // empty file.
-            f.sync_all()?;
-            drop(f);
-            fs::rename(&tmp, &self.path)
-        })();
-        if staged.is_err() {
-            // Don't leave the staging file behind for a failed write.
-            let _ = fs::remove_file(&tmp);
-        }
-        staged?;
-
-        // The rename itself is metadata and needs its own sync, or a power loss
-        // here leaves the old file in place and the authorisation lost.
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
-        Ok(())
+        // 0o600: the ledger names every coin this wallet has authorised.
+        ghost_lock::atomic_file::write_atomic(&self.path, &body, Some(0o600))
     }
 }
 

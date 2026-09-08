@@ -25,7 +25,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bitcoin::hashes::{sha256, Hash};
@@ -186,20 +185,8 @@ impl GhostLockStore {
     fn flush(&self) -> std::io::Result<()> {
         let list: Vec<&StoredLock> = self.locks.values().collect();
         let body = serde_json::to_vec_pretty(&list)?;
-
-        let tmp = self.path.with_extension("tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
-        Ok(())
+        // 0o600: a stored Lock lays out the owner's whole account structure.
+        ghost_lock::atomic_file::write_atomic(&self.path, &body, Some(0o600))
     }
 }
 

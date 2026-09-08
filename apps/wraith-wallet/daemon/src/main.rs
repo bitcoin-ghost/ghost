@@ -166,12 +166,16 @@ mod server {
     fn ghost_lock_store_for(
         state: &Arc<DaemonState>,
     ) -> std::io::Result<wraith_wallet_core::ghost_lock_store::GhostLockStore> {
-        let path = state
+        wraith_wallet_core::ghost_lock_store::GhostLockStore::open(ghost_lock_store_path(state))
+    }
+
+    /// Where remembered Ghost Locks live.
+    fn ghost_lock_store_path(state: &Arc<DaemonState>) -> PathBuf {
+        state
             .node_config_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("ghost-locks.json");
-        wraith_wallet_core::ghost_lock_store::GhostLockStore::open(path)
+            .join("ghost-locks.json")
     }
 
     /// Where one wallet's own records live: `<wallets_dir>/<name>/`.
@@ -206,20 +210,35 @@ mod server {
     async fn history_store_for(
         state: &Arc<DaemonState>,
     ) -> Result<wraith_wallet_core::history_store::HistoryStore, String> {
+        wraith_wallet_core::history_store::HistoryStore::open(wallet_history_path(state).await?)
+            .map_err(|e| format!("history store: {e}"))
+    }
+
+    /// Where the active wallet's history lives. One definition, so the lock
+    /// keys on exactly the path the store opens.
+    async fn wallet_history_path(state: &Arc<DaemonState>) -> Result<PathBuf, String> {
         let name = active_wallet_name(state).await?;
-        wraith_wallet_core::history_store::HistoryStore::open(
-            wallet_data_dir(state, &name).join("history.json"),
-        )
-        .map_err(|e| format!("history store: {e}"))
+        Ok(wallet_data_dir(state, &name).join("history.json"))
+    }
+
+    /// Where the active wallet's silent-payment detections live.
+    async fn wallet_detections_path(state: &Arc<DaemonState>) -> Result<PathBuf, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wallet_data_dir(state, &name).join("detections.json"))
+    }
+
+    /// Where the active wallet's scan bookmark lives.
+    async fn wallet_scan_state_path(state: &Arc<DaemonState>) -> Result<PathBuf, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wallet_data_dir(state, &name).join("scan-state.json"))
     }
 
     /// Open the active wallet's store of silent payments the scanner found.
     async fn detection_store_for(
         state: &Arc<DaemonState>,
     ) -> Result<wraith_wallet_core::detection_store::DetectionStore, String> {
-        let name = active_wallet_name(state).await?;
         wraith_wallet_core::detection_store::DetectionStore::open(
-            wallet_data_dir(state, &name).join("detections.json"),
+            wallet_detections_path(state).await?,
         )
         .map_err(|e| format!("detections: {e}"))
     }
@@ -266,11 +285,8 @@ mod server {
     async fn scan_state_for(
         state: &Arc<DaemonState>,
     ) -> Result<wraith_wallet_core::scan_state::ScanState, String> {
-        let name = active_wallet_name(state).await?;
-        wraith_wallet_core::scan_state::ScanState::open(
-            wallet_data_dir(state, &name).join("scan-state.json"),
-        )
-        .map_err(|e| format!("scan state: {e}"))
+        wraith_wallet_core::scan_state::ScanState::open(wallet_scan_state_path(state).await?)
+            .map_err(|e| format!("scan state: {e}"))
     }
 
     fn lock_record(l: &wraith_wallet_core::ghost_lock_store::StoredLock) -> GhostLockRecord {
@@ -299,12 +315,54 @@ mod server {
     fn ghost_lock_nonce_ledger_for(
         state: &Arc<DaemonState>,
     ) -> std::io::Result<ghost_lock::nonce_ledger_file::FileNonceLedger> {
-        let path = state
-            .node_config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("ghost-lock-nonces.json");
-        ghost_lock::nonce_ledger_file::FileNonceLedger::open(path)
+        ghost_lock::nonce_ledger_file::FileNonceLedger::open(nonce_ledger_path(state))
+    }
+
+    /// The write lock for one store file.
+    ///
+    /// Hold it across open-modify-write on that path, and release it before
+    /// any unrelated await. See `DaemonState::store_locks`.
+    fn store_lock(state: &Arc<DaemonState>, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = state
+            .store_locks
+            .lock()
+            // A poisoned registry is still a usable map of `Arc`s, and
+            // refusing to hand out locks because an unrelated request panicked
+            // would take the whole daemon down with it.
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::clone(map.entry(path.to_path_buf()).or_default())
+    }
+
+    /// Write one entry into the active wallet's history, under its lock.
+    ///
+    /// Opens, records and flushes inside the critical section. The scanner and
+    /// a concurrent payment both write this file; `record` merges on txid, but
+    /// only against what was on disk when the store was opened, so the open has
+    /// to be inside the lock too.
+    async fn record_history(
+        state: &Arc<DaemonState>,
+        entry: wraith_wallet_core::history_store::HistoryEntry,
+    ) -> Result<(), String> {
+        let path = wallet_history_path(state).await?;
+        let lock = store_lock(state, &path);
+        let _guard = lock.lock().await;
+        let mut store = history_store_for(state).await?;
+        store.record(entry).map_err(|e| format!("history: {e}"))
+    }
+
+    /// Record silent-payment detections under the detections lock, returning
+    /// how many were new.
+    async fn record_detections(
+        state: &Arc<DaemonState>,
+        found: Vec<wraith_wallet_core::candidate_scan::DetectedPayment>,
+    ) -> Result<usize, String> {
+        let path = wallet_detections_path(state).await?;
+        let lock = store_lock(state, &path);
+        let _guard = lock.lock().await;
+        let mut store = detection_store_for(state).await?;
+        store
+            .record_all(found)
+            .map_err(|e| format!("detections write: {e}"))
     }
 
     /// Outcome of the pre-sign check against the once-per-coin ledger.
@@ -334,7 +392,9 @@ mod server {
         state: &Arc<DaemonState>,
         prepared: &wraith_wallet_core::wraith::PreparedMix,
     ) -> LedgerCheck {
-        let _guard = state.signing_ledger_lock.lock().await;
+        let path = signing_ledger_path(state);
+        let lock = store_lock(state, &path);
+        let _guard = lock.lock().await;
         let mut ledger = match signing_ledger_for(state) {
             Ok(l) => l,
             Err(e) => return LedgerCheck::Unavailable(e),
@@ -352,14 +412,30 @@ mod server {
             wraith_wallet_core::signing_ledger_file::FileSignatureStore,
         >,
     > {
-        let path = state
+        Ok(wraith_protocol::signing_ledger::SigningLedger::new(
+            wraith_wallet_core::signing_ledger_file::FileSignatureStore::open(
+                signing_ledger_path(state),
+            )?,
+        ))
+    }
+
+    /// Where the once-per-coin ledger lives. Daemon-wide rather than
+    /// per-wallet: the keys are outpoints, which no two wallets share.
+    fn signing_ledger_path(state: &Arc<DaemonState>) -> PathBuf {
+        state
             .node_config_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("wraith-signed-coins.json");
-        Ok(wraith_protocol::signing_ledger::SigningLedger::new(
-            wraith_wallet_core::signing_ledger_file::FileSignatureStore::open(path)?,
-        ))
+            .join("wraith-signed-coins.json")
+    }
+
+    /// Where the MuSig2 nonce-burn ledger lives.
+    fn nonce_ledger_path(state: &Arc<DaemonState>) -> PathBuf {
+        state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("ghost-lock-nonces.json")
     }
 
     /// One air-gapped Lock signing, between rounds.
@@ -478,19 +554,25 @@ mod server {
         /// manifest fetch). Reuses rustls so we don't pull in a second TLS
         /// implementation.
         http: reqwest::Client,
-        /// Serialises the once-per-coin signing ledger's read-modify-write.
+        /// Serialises read-modify-write on each store file, keyed by path.
         ///
-        /// `signing_ledger_for` opens a fresh store per request, and `record`
-        /// rewrites the whole table from the snapshot that `open` read. Two
-        /// mixes that both opened before either wrote would each persist a
-        /// table missing the other's coin — dropping an authorisation the
-        /// double-sign guard depends on. Ten concurrent mixes through one
-        /// daemon is the ordinary shape of a round, not a corner case.
+        /// Every store in this daemon is opened per request, read wholly into
+        /// memory, and persisted by rewriting the whole file. Two requests that
+        /// open the same file before either writes each persist a copy missing
+        /// the other's change — a lost update, and for the signing and nonce
+        /// ledgers a lost safety record. Keyed by path so two wallets, or two
+        /// different stores, never wait on each other.
         ///
-        /// Held across open-inspect-record and nothing else. Holding it for
-        /// the round's network round-trips would deadlock a round whose
-        /// participants all share one daemon.
-        signing_ledger_lock: tokio::sync::Mutex<()>,
+        /// Callers take the lock around open-modify-write and nothing more. A
+        /// store must not be held across unrelated `await`s: the block scanner
+        /// does RPC round-trips between writes, and holding history open across
+        /// a whole batch is what let a concurrent payment be erased by the
+        /// scanner's stale snapshot.
+        ///
+        /// The registry mutex is only ever held long enough to clone an `Arc`,
+        /// never across an await, and a poisoned registry is still a usable
+        /// map — so it recovers rather than cascading.
+        store_locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     }
 
     fn default_wallets_dir() -> PathBuf {
@@ -590,22 +672,15 @@ mod server {
         }
     }
 
-    /// Persist `node.json` atomically (temp-file + rename) with 0600 perms on
-    /// unix. It can hold an RPC password, so owner-only is not optional.
+    /// Persist `node.json` atomically, 0600 on unix. It can hold an RPC
+    /// password, so owner-only is not optional.
+    ///
+    /// This previously staged with a plain `fs::write` and no fsync of either
+    /// the file or its directory, so a power loss could lose a saved node
+    /// endpoint that `SetNode` had already reported as stored.
     fn save_node_config(path: &std::path::Path, cfg: &NodeConfig) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(cfg).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(&tmp, path)?;
-        Ok(())
+        ghost_lock::atomic_file::write_atomic(path, json.as_bytes(), Some(0o600))
     }
 
     impl DaemonState {
@@ -954,7 +1029,7 @@ mod server {
             shroud_max_ms,
             update_manifest_url,
             http,
-            signing_ledger_lock: tokio::sync::Mutex::new(()),
+            store_locks: std::sync::Mutex::new(HashMap::new()),
             wraith_mixes: RwLock::new(HashMap::new()),
             lock_signings: RwLock::new(HashMap::new()),
             ghostd: RwLock::new(ghostd),
@@ -1778,9 +1853,9 @@ mod server {
             },
             None => (None, None),
         };
-        let mut store = history_store_for(state).await?;
-        store
-            .record(wraith_wallet_core::history_store::HistoryEntry {
+        record_history(
+            state,
+            wraith_wallet_core::history_store::HistoryEntry {
                 txid: txid.to_string(),
                 at: now_unix_secs() as i64,
                 // Unconfirmed until the scanner sees it mined.
@@ -1789,8 +1864,9 @@ mod server {
                 fee_sats,
                 kind: kind.to_string(),
                 memo,
-            })
-            .map_err(|e| format!("history write: {e}"))
+            },
+        )
+        .await
     }
 
     /// The value backing one PSBT input, from whichever UTXO field carries it.
@@ -2463,10 +2539,15 @@ mod server {
                 }
             }
             let restart = fork.unwrap_or(floor);
-            let mut history = history_store_for(state).await?;
-            let n = history
-                .unconfirm_from(restart + 1)
-                .map_err(|e| format!("history: {e}"))?;
+            let n = {
+                let hpath = wallet_history_path(state).await?;
+                let hlock = store_lock(state, &hpath);
+                let _hguard = hlock.lock().await;
+                let mut history = history_store_for(state).await?;
+                history
+                    .unconfirm_from(restart + 1)
+                    .map_err(|e| format!("history: {e}"))?
+            };
             tracing::warn!(
                 was = point.height,
                 restart_from = restart,
@@ -2480,7 +2561,12 @@ mod server {
             return Ok(0);
         }
         let end = tip.min(from + SCAN_BATCH_BLOCKS);
-        let mut history = history_store_for(state).await?;
+        // History is opened per write, not held across the batch. Each
+        // iteration below awaits several RPC round-trips, and a store held
+        // open across them keeps a snapshot that predates any payment made
+        // meanwhile — flushing it erases that payment. `record` merges on
+        // txid, so re-opening per write is also what makes the merge see
+        // what the other writer left.
         for height in (from + 1)..=end {
             let hash = block_hash_at(&rpc, height).await?;
             let block = {
@@ -2512,19 +2598,17 @@ mod server {
                     }
                 }
                 if !found.is_empty() {
-                    let mut detections = detection_store_for(state).await?;
                     let credited: i64 = found
                         .iter()
                         .filter_map(|d| d.amount_sats)
                         .fold(0i64, |a, v| a.saturating_add(v as i64));
                     let txid = found[0].txid.clone();
-                    let n = detections
-                        .record_all(found)
-                        .map_err(|e| format!("detections write: {e}"))?;
+                    let n = record_detections(state, found).await?;
                     if n > 0 {
                         tracing::info!(height, coins = n, "silent payment detected");
-                        history
-                            .record(wraith_wallet_core::history_store::HistoryEntry {
+                        record_history(
+                            state,
+                            wraith_wallet_core::history_store::HistoryEntry {
                                 txid,
                                 at: block.time,
                                 block_height: Some(height),
@@ -2535,15 +2619,17 @@ mod server {
                                 fee_sats: None,
                                 kind: "receive".to_string(),
                                 memo: None,
-                            })
-                            .map_err(|e| format!("history write: {e}"))?;
+                            },
+                        )
+                        .await?;
                     }
                 }
             }
 
             for m in wraith_wallet_core::block_scan::scan_block(&block, &ours) {
-                history
-                    .record(wraith_wallet_core::history_store::HistoryEntry {
+                record_history(
+                    state,
+                    wraith_wallet_core::history_store::HistoryEntry {
                         amount_sats: Some(m.net_sats()),
                         txid: m.txid,
                         at: m.time,
@@ -2553,8 +2639,9 @@ mod server {
                         // The scanner cannot see a memo. `record` merges, so
                         // `None` here leaves any memo already recorded alone.
                         memo: None,
-                    })
-                    .map_err(|e| format!("history write: {e}"))?;
+                    },
+                )
+                .await?;
             }
             // Advanced per block, not per batch: an interrupted catch-up
             // resumes where it stopped instead of re-reading from the start.
@@ -3336,6 +3423,11 @@ mod server {
                     inherit_height,
                     bip86_index.unwrap_or(0),
                 );
+                // Open-modify-write under the store's lock: `put` rewrites
+                // the whole file from the snapshot `open` read, so a
+                // concurrent save would otherwise drop one of the two locks.
+                let lock_store_lock = store_lock(state, &ghost_lock_store_path(state));
+                let _lock_store_guard = lock_store_lock.lock().await;
                 match ghost_lock_store_for(state) {
                     Err(e) => Response::Error(ErrorResponse {
                         message: format!("lock store: {e}"),
@@ -3446,6 +3538,13 @@ mod server {
                     );
                 }
 
+                // Under the nonce ledger's lock for as long as the ledger is
+                // alive. A MuSig2 secret nonce used twice publishes the
+                // signer's key, and the burn is only durable if the record
+                // that survives is written from a table that already contains
+                // every other burn — which means opening inside the lock.
+                let nonce_lock = store_lock(state, &nonce_ledger_path(state));
+                let _nonce_guard = nonce_lock.lock().await;
                 let mut ledger = match ghost_lock_nonce_ledger_for(state) {
                     Ok(l) => l,
                     Err(e) => {
@@ -3874,6 +3973,13 @@ mod server {
                 // Sign now, while both nonces are known. After this the daemon
                 // holds no secret nonce, so none is sitting in memory while the
                 // second payload is carried to the device.
+                // Under the nonce ledger's lock for as long as the ledger is
+                // alive. A MuSig2 secret nonce used twice publishes the
+                // signer's key, and the burn is only durable if the record
+                // that survives is written from a table that already contains
+                // every other burn — which means opening inside the lock.
+                let nonce_lock = store_lock(state, &nonce_ledger_path(state));
+                let _nonce_guard = nonce_lock.lock().await;
                 let mut ledger = match ghost_lock_nonce_ledger_for(state) {
                     Ok(l) => l,
                     Err(e) => {
@@ -4081,20 +4187,24 @@ mod server {
                     locks: store.list().iter().map(lock_record).collect(),
                 }),
             },
-            Request::GhostLockForget { lock_id } => match ghost_lock_store_for(state) {
-                Err(e) => Response::Error(ErrorResponse {
-                    message: format!("lock store: {e}"),
-                }),
-                Ok(mut store) => match store.remove(&lock_id) {
+            Request::GhostLockForget { lock_id } => {
+                let lock_store_lock = store_lock(state, &ghost_lock_store_path(state));
+                let _lock_store_guard = lock_store_lock.lock().await;
+                match ghost_lock_store_for(state) {
                     Err(e) => Response::Error(ErrorResponse {
-                        message: format!("forget lock: {e}"),
+                        message: format!("lock store: {e}"),
                     }),
-                    Ok(existed) => Response::GhostLockForgotten(GhostLockForgottenResponse {
-                        lock_id,
-                        existed,
-                    }),
-                },
-            },
+                    Ok(mut store) => match store.remove(&lock_id) {
+                        Err(e) => Response::Error(ErrorResponse {
+                            message: format!("forget lock: {e}"),
+                        }),
+                        Ok(existed) => Response::GhostLockForgotten(GhostLockForgottenResponse {
+                            lock_id,
+                            existed,
+                        }),
+                    },
+                }
+            }
             Request::GhostLockLanes {
                 backup_pubkey,
                 heir_pubkey,
@@ -5966,6 +6076,55 @@ mod server {
             }
         }
 
+        /// Concurrent history writers must not erase each other.
+        ///
+        /// The block scanner and an outgoing payment both write this file.
+        /// `record` merges — but only against the snapshot taken when the
+        /// store was opened, so without a lock around open-modify-write
+        /// whoever flushes last persists a table missing everything the other
+        /// recorded meanwhile. The scanner used to hold one store open across
+        /// a whole batch of block fetches, which made that window seconds
+        /// wide and a payment made during a catch-up scan simply vanished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_history_writers_do_not_erase_each_other() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            const WRITERS: usize = 24;
+            let mut tasks = Vec::with_capacity(WRITERS);
+            for i in 0..WRITERS {
+                let state = Arc::clone(&state);
+                tasks.push(tokio::spawn(async move {
+                    record_history(
+                        &state,
+                        wraith_wallet_core::history_store::HistoryEntry {
+                            txid: format!("tx-{i:04}"),
+                            at: 1_700_000_000 + i as i64,
+                            block_height: None,
+                            amount_sats: Some(1_000 + i as i64),
+                            fee_sats: None,
+                            kind: "send".into(),
+                            memo: None,
+                        },
+                    )
+                    .await
+                }));
+            }
+            for (i, t) in tasks.into_iter().enumerate() {
+                t.await
+                    .unwrap_or_else(|e| panic!("writer {i} panicked: {e}"))
+                    .unwrap_or_else(|e| panic!("writer {i} failed: {e}"));
+            }
+
+            let store = history_store_for(&state).await.unwrap();
+            assert_eq!(
+                store.len(),
+                WRITERS,
+                "history lost entries: {} of {WRITERS} survived",
+                store.len()
+            );
+        }
+
         /// A chain stub that answers with a fixed tip, so confirmation
         /// arithmetic can be tested without a node.
         struct TipChain(u64);
@@ -6242,7 +6401,7 @@ mod server {
                 idle_lock_secs: 0,
                 shroud_max_ms: 0,
                 update_manifest_url: None,
-                signing_ledger_lock: tokio::sync::Mutex::new(()),
+                store_locks: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::new(),
                 wraith_mixes: RwLock::new(HashMap::new()),
                 lock_signings: RwLock::new(HashMap::new()),

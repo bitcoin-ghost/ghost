@@ -21,7 +21,6 @@
 //! diagnostic `cat` into a data change.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::lock_cosign::SpendLog;
@@ -88,29 +87,8 @@ impl FileSpendLog {
 
     fn flush(&self) -> std::io::Result<()> {
         let body = serde_json::to_vec_pretty(&self.entries).map_err(std::io::Error::other)?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = fs::metadata(&tmp)?.permissions();
-            perm.set_mode(0o600);
-            fs::set_permissions(&tmp, perm)?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
-        Ok(())
+        // 0o600: the log is a record of what the owner has spent and when.
+        ghost_lock::atomic_file::write_atomic(&self.path, &body, Some(0o600))
     }
 }
 
