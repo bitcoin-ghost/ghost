@@ -1,25 +1,41 @@
-//! Chain client — talks to the wallet's configured ghost-pay backend.
+//! Chain client — how the wallet reads and writes the chain.
 //!
-//! Phase 1: a single REST client over HTTPS. Transport layer (clearnet vs. Tor) and
-//! GSP WebSocket subscriptions land in subsequent commits.
-
-mod ghost_pay;
+//! One implementation: the owner's own node, over `ghostd`'s RPC. The
+//! operator-hosted backend it used to share this trait with went with the rest
+//! of L2 — a self-custody wallet that can reach a node has no business asking
+//! somebody else where its money is.
 
 use async_trait::async_trait;
 
 pub mod ghostd_chain;
-pub use ghost_pay::{GhostPayClient, ScanUtxosResponse, ScannedL1Utxo};
 pub use ghostd_chain::GhostdChainClient;
+
+/// One unspent output found by a scan.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ScannedL1Utxo {
+    pub txid: String,
+    pub vout: u32,
+    pub amount_sats: u64,
+    pub scriptpubkey_hex: String,
+    pub address: Option<String>,
+    pub confirmations: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ScanUtxosResponse {
+    pub utxos: Vec<ScannedL1Utxo>,
+    pub total_sats: u64,
+    /// The tip the scan was taken against. Confirmations elsewhere in the
+    /// response are relative to this, not to whatever the tip is now.
+    pub chain_height: u32,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainStatus {
     pub backend_version: String,
     pub network: String,
-    pub has_keys: bool,
-    pub lock_count: u64,
-    pub active_sessions: u64,
-    /// Latest verified-block height from the operator's bitcoind.
-    /// `None` when ghost-pay couldn't reach bitcoind in time.
+    /// Latest verified-block height the node reports.
     pub chain_height: Option<u64>,
     /// Highest header bitcoind has seen — equals `chain_height`
     /// when synced, exceeds it during initial block download.
@@ -29,10 +45,6 @@ pub struct ChainStatus {
     /// Bitcoin Core's IBD flag — true while still syncing the
     /// initial chain history. Once false, the node is at tip.
     pub chain_initial_block_download: Option<bool>,
-    /// L2 chain tip — latest finalized ghost-pay block height.
-    pub l2_height: Option<u64>,
-    /// Current L2 epoch (`l2_height / L2_EPOCH_BLOCKS`).
-    pub l2_epoch: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,4 +95,44 @@ pub trait ChainClient: Send + Sync {
     async fn tx_confirmations(&self, _txid: &str) -> Result<Option<u32>, ChainError> {
         Ok(None)
     }
+}
+
+/// The chain client for a wallet with no node configured.
+///
+/// Every call fails, with the same sentence saying what to do about it. This
+/// exists so that state is impossible to mistake for a working wallet: the
+/// alternative — quietly routing to somebody else's node — is how a
+/// self-custody wallet ends up asking a stranger what it owns.
+#[derive(Debug, Default)]
+pub struct NoChain;
+
+impl NoChain {
+    fn refuse<T>() -> Result<T, ChainError> {
+        Err(ChainError::Backend(
+            "no node configured — the wallet reads and writes the chain through \
+             your own ghostd. Set it in Settings, or with WRAITHD_GHOSTD_URL \
+             (plus WRAITHD_GHOSTD_COOKIE, or _USER and _PASS)."
+                .into(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ChainClient for NoChain {
+    async fn status(&self) -> Result<ChainStatus, ChainError> {
+        Self::refuse()
+    }
+    async fn scan_utxos(
+        &self,
+        _addresses: &[String],
+        _min_confirmations: u32,
+    ) -> Result<ScanUtxosResponse, ChainError> {
+        Self::refuse()
+    }
+    async fn broadcast_tx(&self, _tx_hex: &str) -> Result<String, ChainError> {
+        Self::refuse()
+    }
+    // `tx_confirmations` keeps the trait default: "cannot say" is already the
+    // honest answer here, and it lets a history render with unknown depth
+    // instead of failing outright.
 }

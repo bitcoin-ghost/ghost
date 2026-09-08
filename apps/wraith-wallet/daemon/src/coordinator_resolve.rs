@@ -1,13 +1,23 @@
-//! Resolve which seated Wraith coordinator owns a wallet's mix, from the node's
+//! Resolve which seated Wraith coordinator owns a wallet's mix, from a
 //! published election view — so a wallet can mix without being handed a
 //! coordinator URL.
 //!
-//! Inc 5 of `tasks/plan_coordinator_activation.md` — the daemon-side plumbing.
-//! The wallet obtains the election JSON **through ghost-pay** (never the node's
-//! pool API directly; wallet hard rule, `apps/wraith-wallet/CLAUDE.md`) via
-//! `GhostPayClient::coordinator_election`, then resolves the owning seat here.
-//! The `WraithResolveCoordinator` IPC request exposes it; the GUI "use the
-//! network-elected coordinator" toggle that calls it is the deferred next task.
+//! # Currently unreachable, deliberately kept
+//!
+//! Nothing calls this today. The wallet used to obtain the election JSON
+//! *through ghost-pay*, precisely so it never had to talk to the pool API
+//! itself and reveal that it was about to mix; ghost-pay is gone, and calling
+//! the pool directly would spend the privacy that indirection existed to buy.
+//! The replacement is the signed node-list checkpoint, which is verifiable
+//! rather than merely relayed.
+//!
+//! What is kept here is the half that was hard and is still correct: an
+//! election is *recomputed* before it is used, so a relayed view cannot lie
+//! about who was seated, and the beacon is pinned to a real block hash rather
+//! than taken on the publisher's word (#697). Deleting that and re-deriving it
+//! alongside a new transport is how a verification step quietly becomes a
+//! trust-the-server step. The tests below still hold it to that.
+#![allow(dead_code)]
 
 use wraith_protocol::sortition::{
     shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,

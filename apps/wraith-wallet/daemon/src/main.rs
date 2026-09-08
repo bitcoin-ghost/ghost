@@ -36,68 +36,42 @@ mod server {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use ghost_gsp_proto::{PaymentMode, SessionToken};
     use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
     use interprocess::local_socket::ListenerOptions;
     use secrecy::SecretString;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::RwLock;
 
-    /// Full-duplex IPC stream (splits into [`IpcRecvHalf`] + [`IpcSendHalf`]).
+    /// Full-duplex IPC stream (splits into a read half and [`IpcSendHalf`]).
     type IpcStream = interprocess::local_socket::tokio::Stream;
-    /// Read half of a connection — feeds the newline-delimited request reader.
-    type IpcRecvHalf = interprocess::local_socket::tokio::RecvHalf;
     /// Write half of a connection — carries JSON responses / pushes.
     type IpcSendHalf = interprocess::local_socket::tokio::SendHalf;
     use wraith_wallet_core::auth;
     use wraith_wallet_core::chain::ChainClient;
-    use wraith_wallet_core::gsp::GspClient;
-    use wraith_wallet_core::gsp::{
-        spawn_session_with_bech32, GspError, SessionHandle, SessionPhase, SessionStatus,
-    };
     use wraith_wallet_core::keystore::{Keystore, KeystoreError};
     use wraith_wallet_core::light;
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
         AnonymitySetReport, ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse,
-        DaemonEnvResponse, DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope,
-        ErrorResponse, EscapeCoin, GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse,
-        GhostLockForgottenResponse, GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
+        DaemonEnvResponse, DoctorCheck, DoctorResponse, Envelope, ErrorResponse, EscapeCoin,
+        GhostLockEscapePlanResponse, GhostLockEscapeSignedResponse, GhostLockForgottenResponse,
+        GhostLockLane, GhostLockLanesResponse, GhostLockListResponse,
         GhostLockQuorumSignedResponse, GhostLockRecord, GhostLockRoundDestinationResponse,
         GhostLockSavedResponse, GhostLockSignBegunResponse, GhostLockSignNoncedResponse,
-        GhostLockSignedResponse, GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse,
-        GspSessionStatusResponse, HealthResponse, LightBalanceResponse, LightDetectedResponse,
-        LightHistoryEntry, LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse,
-        LightReceiveResponse, LightSentResponse, LightUtxoEntry, LightUtxosResponse,
-        LockSpendOutput, LockSpendSummary, NodeEndpointsResponse, PsbtBroadcastResponse,
-        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
-        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        GhostLockSignedResponse, HealthResponse, LightBalanceResponse, LightHistoryEntry,
+        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
+        LightUtxoEntry, LightUtxosResponse, LockSpendOutput, LockSpendSummary, NodeResponse,
+        PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse,
+        PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
         WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
         WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
         WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse, WraithMixRefusedResponse,
     };
 
-    /// Bundled public preset — the Bitcoin Ghost fleet, reachable without
-    /// running your own node. `pool.bitcoinghost.org` round-robins the four
-    /// fleet IPs; ghost-pay serves TLS on :8800 and GSP on :8900. A brand-new
-    /// install defaults here so the wallet works out of the box.
-    const PUBLIC_GHOST_PAY: &str = "https://pool.bitcoinghost.org:8800";
-    const PUBLIC_GSP: &str = "wss://pool.bitcoinghost.org:8900/ws/v1";
-    /// Node-selection preset labels. Persisted in `node.json` and surfaced via
-    /// `DaemonEnv.node_preset` so the settings UI knows which radio is active.
-    const PRESET_PUBLIC: &str = "public";
-    const PRESET_CUSTOM: &str = "custom";
-    /// Optional override for the on-disk node-selection config path. Defaults
-    /// to `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
+    /// Optional override for the on-disk node config path. Defaults to
+    /// `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
     const NODE_CONFIG_ENV: &str = "WRAITHD_NODE_CONFIG";
-    const GHOST_PAY_ENV: &str = "WRAITHD_GHOST_PAY";
-    /// Optional shared secret for ghost-pay's `X-Internal-Auth`
-    /// bypass. When set, the wallet can call ghost-pay's
-    /// authenticated routes (e.g. `/api/v1/utxos/scan`) without
-    /// HMAC. Required for the L1 UTXO scanner; other routes work
-    /// without it.
-    const GHOST_PAY_INTERNAL_AUTH_ENV: &str = "WRAITHD_GHOST_PAY_INTERNAL_AUTH";
     /// Optional default wraith-coordinator URL. When set, the
     /// `Doctor` check probes its `/api/v1/pool/discover` endpoint
     /// for liveness. Mixes still use the per-call URL the wallet
@@ -111,7 +85,6 @@ mod server {
     /// restarts. Used for retail/POS deployments where untrusted
     /// staff at the till should only be able to take payments.
     const KIOSK_MODE_ENV: &str = "WRAITHD_KIOSK_MODE";
-    const GSP_ENV: &str = "WRAITHD_GSP";
     const WALLETS_DIR_ENV: &str = "WRAITHD_WALLETS_DIR";
     const NETWORK_ENV: &str = "WRAITHD_NETWORK";
     /// Optional SOCKS5 proxy (e.g. `socks5h://127.0.0.1:9050` for Tor).
@@ -142,21 +115,6 @@ mod server {
     /// Unset → no auto-update channel is configured; per-call URLs still work.
     const UPDATE_MANIFEST_ENV: &str = "WRAITHD_UPDATE_MANIFEST_URL";
 
-    /// A `SessionToken` paired with the wallet name that produced it AND a live
-    /// `SessionHandle` running the persistent authenticated WebSocket. Dropping
-    /// the `StoredSession` aborts the session task (via `SessionHandle::Drop`).
-    struct StoredSession {
-        wallet_name: String,
-        token: SessionToken,
-        handle: SessionHandle,
-    }
-
-    /// In-flight Wraith Lite mix between `WraithMixPrepare` and
-    /// `WraithMixSubmit`. Holds the prepared round + the client that
-    /// produced it (so /witness submission re-uses the same HTTP
-    /// client / proxy config without rebuilding it). Caller is
-    /// expected to submit promptly — the coordinator's no-sign
-    /// deadline is ticking.
     /// Turn a refusal into something the wallet can render.
     ///
     /// A refusal shown as a sentence gives the user nothing to decide with. The
@@ -242,13 +200,12 @@ mod server {
         }
     }
 
-    /// Open the durable once-per-coin ledger.
+    /// The wallet's own MuSig2 nonce ledger.
     ///
     /// Lives beside `node.json` in the wallet's data directory. Opened per
     /// operation rather than held: the file is small, the write is the
     /// expensive part either way, and a fresh read means a second process
     /// touching the same wallet cannot be missed.
-    /// The wallet's own MuSig2 nonce ledger.
     ///
     /// Separate file from the round signing ledger: they answer different
     /// questions (has this coin been signed for / has this nonce been used)
@@ -302,6 +259,11 @@ mod server {
         our_partial: Option<[u8; 32]>,
     }
 
+    /// In-flight Wraith Lite mix between `WraithMixPrepare` and
+    /// `WraithMixSubmit`. Holds the prepared round + the client that produced
+    /// it, so witness submission re-uses the same HTTP client and proxy config
+    /// without rebuilding it. The caller is expected to submit promptly — the
+    /// coordinator's no-sign deadline is ticking.
     struct StoredWraithMix {
         /// The **inspected** round. Not a `PreparedMix`: `submit_witness` will
         /// not accept anything else, so a round cannot reach the wire without
@@ -310,21 +272,12 @@ mod server {
         client: Arc<wraith_wallet_core::wraith::WraithSessionClient>,
     }
 
-    /// The live node clients + their configured URLs, held together so a
-    /// runtime endpoint change (`SetNodeEndpoints`) swaps all of them
-    /// atomically under one write lock. Read paths clone the `Arc`s out and
-    /// release the lock immediately, so a slow ghost-pay/GSP call never blocks
-    /// a config change and vice-versa.
+    /// The live chain client, held behind a lock so a runtime endpoint change
+    /// swaps it without a restart. Read paths clone the `Arc` out and release
+    /// the lock immediately, so a slow node call never blocks a config change
+    /// and vice-versa.
     struct NodeClients {
         chain: Arc<dyn ChainClient>,
-        gsp: Arc<GspClient>,
-        /// Ghost-pay base URLs in failover order — surfaced via DaemonEnv.
-        ghost_pay_urls: Vec<String>,
-        /// GSP WS URLs in failover order — passed to spawn_session at gsp_auth time.
-        gsp_urls: Vec<String>,
-        /// Which node preset is active: `public` or `custom`. Drives the
-        /// settings UI's radio selection.
-        preset: String,
     }
 
     struct DaemonState {
@@ -332,18 +285,9 @@ mod server {
         /// The active node clients + endpoint config. Swapped wholesale by
         /// `SetNodeEndpoints` without a daemon restart.
         clients: RwLock<NodeClients>,
-        /// True when `WRAITHD_GHOST_PAY` / `WRAITHD_GSP` pinned the endpoints at
-        /// boot. While either is set the URLs are power-user-owned: the UI shows
-        /// them read-only and `SetNodeEndpoints` refuses to change them.
-        ghost_pay_env_override: bool,
-        gsp_env_override: bool,
         /// Absolute path to the persisted node-selection config (`node.json`).
         node_config_path: PathBuf,
-        /// Optional ghost-pay `X-Internal-Auth` secret, kept so a runtime
-        /// endpoint swap can rebuild the chain client with the same auth.
-        ghost_pay_internal_auth: Option<String>,
-        /// Optional SOCKS5 proxy for both REST and WS (e.g. socks5h://127.0.0.1:9050).
-        /// Threaded into spawn_session so the persistent WS routes through Tor too.
+        /// Optional SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050).
         tor_proxy: Option<String>,
         /// Optional default wraith-coordinator URL — used by Doctor
         /// to probe coordinator liveness in the dev stack. None
@@ -358,7 +302,6 @@ mod server {
         wallets_dir: PathBuf,
         wallets: RwLock<HashMap<String, Keystore>>,
         active: RwLock<Option<String>>,
-        session: RwLock<Option<StoredSession>>,
         network: bitcoin::Network,
         /// Human-readable IPC endpoint (Unix socket path, or Windows
         /// `\\.\pipe\...` name). Surfaced via DaemonEnv for diagnostics.
@@ -390,17 +333,16 @@ mod server {
         /// retryable because the nonce ledger keys on the nonce rather than the
         /// message.
         lock_signings: RwLock<HashMap<String, PendingLockSign>>,
-        /// Optional bitcoind RPC URL. Used to pin the election beacon to
-        /// the chain; None disables that check.
-        ghostd_url: Option<String>,
-        /// Cookie file path (preferred) OR explicit user/pass for
-        /// bitcoind RPC auth. At most one of these branches is set.
-        ghostd_cookie_path: Option<PathBuf>,
-        ghostd_user: Option<String>,
-        ghostd_pass: Option<String>,
-        /// HTTP client used for daemon-side fetches outside the GSP/ghost-pay
-        /// stack (currently just the manifest fetch). Reuses rustls so we
-        /// don't pull in a second TLS implementation.
+        /// Where the node is and how to reach it. Behind a lock so the
+        /// settings screen can change it without a restart. Also pins the
+        /// election beacon to the chain; with no node that check is skipped.
+        ghostd: RwLock<GhostdSettings>,
+        /// True when the environment pinned the node at boot. While it is set
+        /// the settings are power-user-owned and `SetNode` refuses.
+        ghostd_env_override: bool,
+        /// HTTP client used for daemon-side fetches (currently just the
+        /// manifest fetch). Reuses rustls so we don't pull in a second TLS
+        /// implementation.
         http: reqwest::Client,
     }
 
@@ -427,34 +369,48 @@ mod server {
 
     /// Construct a fresh concrete `GhostPayClient` for the glyph
     /// routes. `state.chain` is a `dyn ChainClient` trait object, so
-    /// it can't expose the inherent glyph methods — rebuild from the
-    /// daemon's configured ghost-pay URLs + proxy, attaching the
-    /// internal-auth secret (claim is an authenticated route).
-    async fn build_ghost_pay_client(
-        state: &DaemonState,
-    ) -> Result<wraith_wallet_core::chain::GhostPayClient, String> {
-        let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-            state.ghost_pay_urls().await,
-            state.tor_proxy.as_deref(),
-        )
-        .map_err(|e| format!("ghost-pay client: {e}"))?;
-        if let Some(secret) = state.ghost_pay_internal_auth.as_ref() {
-            if !secret.is_empty() {
-                c = c.with_internal_secret(secret.clone());
-            }
-        }
-        Ok(c)
+    /// Where the wallet's node is, and how to authenticate to it.
+    ///
+    /// All four may be absent: a fresh install has no node, and the wallet
+    /// says so rather than borrowing somebody else's.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct GhostdSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Path to the node's `.cookie`. Preferred over user/pass: it rotates
+        /// with the node and is never typed anywhere.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cookie_path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pass: Option<String>,
     }
 
-    /// Node-selection config persisted to `node.json`. Loaded at boot and
-    /// rewritten whenever the user picks a node via `SetNodeEndpoints`. Absent
-    /// on a fresh install — the daemon then falls back to the public preset.
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    impl GhostdSettings {
+        /// How the wallet authenticates, as one word, for display.
+        ///
+        /// Never the credential itself — this is what goes back over the IPC
+        /// and into the settings screen.
+        fn auth_kind(&self) -> &'static str {
+            if self.cookie_path.is_some() {
+                "cookie"
+            } else if self.user.is_some() || self.pass.is_some() {
+                "userpass"
+            } else {
+                "none"
+            }
+        }
+    }
+
+    /// Node config persisted to `node.json`. Loaded at boot and rewritten
+    /// whenever the user points the wallet at a node. Absent on a fresh
+    /// install, in which case the wallet has no chain backend until one is
+    /// configured.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct NodeConfig {
-        /// `public` or `custom`.
-        preset: String,
-        ghost_pay_urls: Vec<String>,
-        gsp_urls: Vec<String>,
+        #[serde(default)]
+        ghostd: GhostdSettings,
     }
 
     /// Resolve where the node-selection config lives. `WRAITHD_NODE_CONFIG`
@@ -471,8 +427,8 @@ mod server {
     }
 
     /// Read `node.json`. Absent or malformed → `None` (a corrupt file must not
-    /// wedge the daemon; it falls back to the public preset and the next save
-    /// overwrites it).
+    /// wedge the daemon; it starts with no node and the next save overwrites
+    /// it).
     fn load_node_config(path: &std::path::Path) -> Option<NodeConfig> {
         let raw = fs::read_to_string(path).ok()?;
         match serde_json::from_str::<NodeConfig>(&raw) {
@@ -485,8 +441,7 @@ mod server {
     }
 
     /// Persist `node.json` atomically (temp-file + rename) with 0600 perms on
-    /// unix — the file only lists endpoint URLs, but it lives in the wallet
-    /// data dir so we keep it user-private like the keystores.
+    /// unix. It can hold an RPC password, so owner-only is not optional.
     fn save_node_config(path: &std::path::Path, cfg: &NodeConfig) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -503,85 +458,39 @@ mod server {
         Ok(())
     }
 
-    /// Validate + parse a custom node's ghost-pay and GSP URL strings (each may
-    /// be a comma-separated failover list). Rejects empty input and the wrong
-    /// scheme so a typo can't silently leave the wallet pointed at nothing.
-    fn validate_custom_endpoints(
-        pay_raw: &str,
-        gsp_raw: &str,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        let pay = wraith_wallet_core::chain::GhostPayClient::parse_urls(pay_raw);
-        let gsp = wraith_wallet_core::gsp::GspClient::parse_urls(gsp_raw);
-        if pay.is_empty() {
-            return Err("a ghost-pay URL is required for a custom node".to_string());
-        }
-        if gsp.is_empty() {
-            return Err("a GSP URL is required for a custom node".to_string());
-        }
-        for u in &pay {
-            if !(u.starts_with("http://") || u.starts_with("https://")) {
-                return Err(format!(
-                    "ghost-pay URL must start with http:// or https:// — got '{u}'"
-                ));
-            }
-        }
-        for u in &gsp {
-            if !(u.starts_with("ws://") || u.starts_with("wss://")) {
-                return Err(format!(
-                    "GSP URL must start with ws:// or wss:// — got '{u}'"
-                ));
-            }
-        }
-        Ok((pay, gsp))
-    }
-
     impl DaemonState {
         async fn chain(&self) -> Arc<dyn ChainClient> {
             self.clients.read().await.chain.clone()
         }
-        async fn gsp(&self) -> Arc<GspClient> {
-            self.clients.read().await.gsp.clone()
+
+        /// The node settings currently in force.
+        async fn ghostd(&self) -> GhostdSettings {
+            self.ghostd.read().await.clone()
         }
-        async fn ghost_pay_urls(&self) -> Vec<String> {
-            self.clients.read().await.ghost_pay_urls.clone()
-        }
-        async fn gsp_urls(&self) -> Vec<String> {
-            self.clients.read().await.gsp_urls.clone()
-        }
-        /// Build a fresh ghost-pay chain client for `urls`, reusing the daemon's
-        /// tor proxy + internal-auth secret.
-        /// Build the chain backend.
+
+        /// Build the chain backend from the node settings.
         ///
-        /// **The owner's own node wins when it is configured.** Ghost Pay is
-        /// being removed — Ghost Wallet is self-custody on ordinary Bitcoin
-        /// infrastructure — so a wallet that can reach a node should never be
-        /// asking an operator where its money is. Ghost Pay remains only as
-        /// the fallback for a wallet with no node yet, and goes with the rest
-        /// of L2.
-        fn build_chain(&self, urls: Vec<String>) -> Result<Arc<dyn ChainClient>, String> {
-            if let Some(rpc) = self.build_ghostd_rpc() {
-                tracing::info!("chain backend: the wallet's own node");
-                return Ok(Arc::new(wraith_wallet_core::chain::GhostdChainClient::new(
-                    rpc,
-                    self.network.to_string(),
-                )));
-            }
-            tracing::warn!(
-                "chain backend: ghost-pay — no ghostd configured, so balances and \
-                 broadcasts go through an operator. Set GHOSTD_URL; this fallback goes \
-                 with the rest of L2."
-            );
-            let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                urls,
-                self.tor_proxy.as_deref(),
-            )
-            .map_err(|e| format!("ghost-pay client: {e}"))?;
-            if let Some(secret) = self.ghost_pay_internal_auth.as_ref() {
-                if !secret.is_empty() {
-                    c = c.with_internal_secret(secret.clone());
+        /// No node means `NoChain`, whose every call refuses with a sentence
+        /// saying what to configure. Falling back to somebody else's server
+        /// would be the alternative, and a self-custody wallet quietly asking
+        /// a stranger what it owns is exactly what this is for.
+        async fn build_chain(&self) -> Arc<dyn ChainClient> {
+            match self.build_ghostd_rpc().await {
+                Some(rpc) => {
+                    tracing::info!("chain backend: the wallet's own node");
+                    Arc::new(wraith_wallet_core::chain::GhostdChainClient::new(
+                        rpc,
+                        self.network.to_string(),
+                    ))
+                }
+                None => {
+                    tracing::warn!(
+                        "chain backend: none — no node is configured, so balances, \
+                         scans and broadcasts will all refuse until one is"
+                    );
+                    Arc::new(wraith_wallet_core::chain::NoChain)
                 }
             }
-            Ok(Arc::new(c))
         }
 
         /// An RPC connection to the owner's node, if one is configured.
@@ -589,13 +498,14 @@ mod server {
         /// Shared with the election-beacon check rather than built twice: two
         /// constructions of the same connection drift, and the one that drifts
         /// is always the one nobody is looking at.
-        fn build_ghostd_rpc(&self) -> Option<wraith_wallet_core::ghostd::GhostdRpc> {
+        async fn build_ghostd_rpc(&self) -> Option<wraith_wallet_core::ghostd::GhostdRpc> {
             use wraith_wallet_core::ghostd::GhostdRpc;
-            let url = self.ghostd_url.as_deref()?;
+            let cfg = self.ghostd().await;
+            let url = cfg.url.as_deref()?;
             match (
-                self.ghostd_cookie_path.as_ref(),
-                self.ghostd_user.as_deref(),
-                self.ghostd_pass.as_deref(),
+                cfg.cookie_path.as_ref(),
+                cfg.user.as_deref(),
+                cfg.pass.as_deref(),
             ) {
                 (Some(cookie), _, _) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
                     Ok(r) => Some(r),
@@ -609,81 +519,45 @@ mod server {
             }
         }
 
-        /// Apply a node selection at runtime: rebuild the ghost-pay + GSP
-        /// clients, persist the choice to `node.json`, and drop any live GSP
-        /// session so it re-authenticates against the new endpoint. Refuses
-        /// while an env-var override pins the endpoints (power-user precedence).
-        async fn set_node_endpoints(
-            &self,
-            preset: &str,
-            ghost_pay_url: Option<String>,
-            gsp_url: Option<String>,
-        ) -> Result<NodeEndpointsResponse, String> {
-            if self.ghost_pay_env_override || self.gsp_env_override {
-                return Err("node endpoints are pinned by environment variables \
-                     (WRAITHD_GHOST_PAY / WRAITHD_GSP); unset them to manage the \
+        /// Point the wallet at a node, at runtime.
+        ///
+        /// Persists first, then swaps: if the disk write fails the daemon
+        /// keeps running on the old settings rather than on a config a
+        /// restart would silently revert. Refuses while the environment pins
+        /// the node — a power user who set `WRAITHD_GHOSTD_URL` did not mean
+        /// for a settings screen to overrule it.
+        async fn set_node(&self, next: GhostdSettings) -> Result<NodeResponse, String> {
+            if self.ghostd_env_override {
+                return Err("the node is pinned by environment variables \
+                     (WRAITHD_GHOSTD_URL and friends); unset them to manage the \
                      node from the wallet"
                     .to_string());
             }
-            let (ghost_pay_urls, gsp_urls, preset_label) = match preset {
-                PRESET_PUBLIC => (
-                    vec![PUBLIC_GHOST_PAY.to_string()],
-                    vec![PUBLIC_GSP.to_string()],
-                    PRESET_PUBLIC.to_string(),
-                ),
-                PRESET_CUSTOM => {
-                    let (pay, gsp) = validate_custom_endpoints(
-                        ghost_pay_url.as_deref().unwrap_or(""),
-                        gsp_url.as_deref().unwrap_or(""),
-                    )?;
-                    (pay, gsp, PRESET_CUSTOM.to_string())
-                }
-                other => {
+            if let Some(url) = next.url.as_deref() {
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return Err(format!(
-                        "unknown node preset '{other}' (expected 'public' or 'custom')"
-                    ))
+                        "node URL must start with http:// or https:// (got '{url}')"
+                    ));
                 }
-            };
-            // Build the replacements before touching anything — if either fails
-            // we leave the running config untouched.
-            let chain = self.build_chain(ghost_pay_urls.clone())?;
-            let gsp = Arc::new(
-                wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
-                    gsp_urls.clone(),
-                    self.tor_proxy.as_deref(),
-                )
-                .map_err(|e| format!("gsp client: {e}"))?,
-            );
-            // Persist first: if the disk write fails we refuse rather than run
-            // on a config a restart would silently revert.
-            let cfg = NodeConfig {
-                preset: preset_label.clone(),
-                ghost_pay_urls: ghost_pay_urls.clone(),
-                gsp_urls: gsp_urls.clone(),
-            };
-            save_node_config(&self.node_config_path, &cfg)
-                .map_err(|e| format!("persist node.json: {e}"))?;
-            {
-                let mut w = self.clients.write().await;
-                w.chain = chain;
-                w.gsp = gsp;
-                w.ghost_pay_urls = ghost_pay_urls.clone();
-                w.gsp_urls = gsp_urls.clone();
-                w.preset = preset_label.clone();
             }
-            // Old session points at the old GSP URL; drop it so the header's
-            // auto-auth re-establishes one against the new endpoint.
-            *self.session.write().await = None;
-            tracing::info!(
-                preset = %preset_label,
-                ghost_pay = ?ghost_pay_urls,
-                gsp = ?gsp_urls,
-                "node endpoints updated at runtime",
-            );
-            Ok(NodeEndpointsResponse {
-                preset: preset_label,
-                ghost_pay_urls,
-                gsp_urls,
+            save_node_config(
+                &self.node_config_path,
+                &NodeConfig {
+                    ghostd: next.clone(),
+                },
+            )
+            .map_err(|e| format!("persist node.json: {e}"))?;
+            *self.ghostd.write().await = next.clone();
+            let chain = self.build_chain().await;
+            self.clients.write().await.chain = chain;
+            tracing::info!(url = ?next.url, auth = next.auth_kind(), "node updated at runtime");
+            let auth = next.auth_kind().to_string();
+            Ok(NodeResponse {
+                ghostd_url: next.url,
+                // The credential itself never crosses the IPC. Which *kind*
+                // is in use is what a settings screen needs to show.
+                auth,
+                env_pinned: false,
             })
         }
     }
@@ -693,14 +567,6 @@ mod server {
     /// pixels)). Must stay byte-for-byte identical to
     /// `GhostGlyph::compute_bitmap_hash` or `check` queries the
     /// wrong key.
-    fn glyph_bitmap_hash_hex(pixels: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"GhostGlyphBitmap/v1");
-        hasher.update(pixels);
-        hex::encode(hasher.finalize())
-    }
-
     fn parse_network(s: &str) -> Option<bitcoin::Network> {
         match s.trim().to_ascii_lowercase().as_str() {
             "mainnet" | "bitcoin" => Some(bitcoin::Network::Bitcoin),
@@ -740,44 +606,6 @@ mod server {
     /// operator's election is not made dishonest by the wallet's own bitcoind
     /// being down, and treating it as such would hand anyone who can knock
     /// out a wallet's node the power to force it onto a manual coordinator.
-    fn beacon_pinned_to_chain(state: &DaemonState, election: &serde_json::Value) -> bool {
-        use wraith_wallet_core::ghostd::GhostdRpc;
-
-        let Some((anchor_height, _)) =
-            crate::coordinator_resolve::beacon_anchor_expectation(election)
-        else {
-            // No beacon published at all — `election_is_honest` refuses this
-            // on its own, so there is nothing to add here.
-            return true;
-        };
-        let Some(url) = state.ghostd_url.as_deref() else {
-            tracing::debug!("no bitcoind configured; election beacon not pinned to the chain");
-            return true;
-        };
-        let rpc = match (
-            state.ghostd_cookie_path.as_ref(),
-            state.ghostd_user.as_deref(),
-            state.ghostd_pass.as_deref(),
-        ) {
-            (Some(cookie), None, None) => match GhostdRpc::from_cookie(url, cookie.as_path()) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(error = %e, "bitcoind auth unusable; beacon not pinned");
-                    return true;
-                }
-            },
-            (None, Some(u), Some(p)) => GhostdRpc::new(url, u, p),
-            _ => return true,
-        };
-        match rpc.get_block_hash(anchor_height) {
-            Ok(hash) => crate::coordinator_resolve::beacon_matches_chain(election, &hash),
-            Err(e) => {
-                tracing::debug!(error = %e, anchor_height, "anchor block unreachable; beacon not pinned");
-                true
-            }
-        }
-    }
-
     fn validate_wallet_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("wallet name must not be empty".into());
@@ -860,13 +688,19 @@ mod server {
         };
         let endpoint_display = wraith_wallet_ipc::endpoint_display();
         let tor_proxy = std::env::var(TOR_PROXY_ENV).ok();
-        let ghostd_url = std::env::var(GHOSTD_URL_ENV).ok();
-        let ghostd_cookie_path = std::env::var(GHOSTD_COOKIE_ENV).ok().map(PathBuf::from);
-        let ghostd_user = std::env::var(GHOSTD_USER_ENV).ok();
-        let ghostd_pass = std::env::var(GHOSTD_PASS_ENV).ok();
-        let ghost_pay_internal_auth = std::env::var(GHOST_PAY_INTERNAL_AUTH_ENV)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let ghostd_env = GhostdSettings {
+            url: std::env::var(GHOSTD_URL_ENV).ok().filter(|s| !s.is_empty()),
+            cookie_path: std::env::var(GHOSTD_COOKIE_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            user: std::env::var(GHOSTD_USER_ENV)
+                .ok()
+                .filter(|s| !s.is_empty()),
+            pass: std::env::var(GHOSTD_PASS_ENV)
+                .ok()
+                .filter(|s| !s.is_empty()),
+        };
         let wallets_dir = default_wallets_dir();
         let node_config_path = node_config_path(&wallets_dir);
         let network = std::env::var(NETWORK_ENV)
@@ -874,76 +708,38 @@ mod server {
             .and_then(|s| parse_network(&s))
             .unwrap_or(bitcoin::Network::Bitcoin);
 
-        // Endpoint resolution precedence, per field:
-        //   1. WRAITHD_GHOST_PAY / WRAITHD_GSP env var (power-user override)
+        // Node resolution, in order:
+        //   1. the environment (power-user override, pins the settings screen)
         //   2. persisted node.json (the choice made in the wallet UI)
-        //   3. bundled public preset (so a fresh install works out of the box)
-        // Both env vars still accept a comma-separated failover list.
-        let persisted = load_node_config(&node_config_path);
-        let ghost_pay_env = std::env::var(GHOST_PAY_ENV).ok().filter(|s| !s.is_empty());
-        let gsp_env = std::env::var(GSP_ENV).ok().filter(|s| !s.is_empty());
-        let ghost_pay_env_override = ghost_pay_env.is_some();
-        let gsp_env_override = gsp_env.is_some();
-        // A persisted `public` preset is symbolic — it always resolves to the
-        // *current* bundled fleet URLs, so a client that once picked "public"
-        // follows the fleet if these constants change in a later release.
-        let persisted_is_public = persisted.as_ref().map(|c| c.preset == PRESET_PUBLIC);
-        let ghost_pay_urls = if let Some(raw) = ghost_pay_env {
-            wraith_wallet_core::chain::GhostPayClient::parse_urls(&raw)
-        } else if persisted_is_public == Some(false) {
-            persisted.as_ref().unwrap().ghost_pay_urls.clone()
+        //   3. nothing — the wallet has no chain backend and says so
+        //
+        // There is deliberately no bundled default. A wallet that silently
+        // points at somebody else's node on a fresh install is a wallet whose
+        // owner never chose who gets to see their addresses.
+        let ghostd_env_override = ghostd_env.url.is_some();
+        let ghostd = if ghostd_env_override {
+            ghostd_env
         } else {
-            vec![PUBLIC_GHOST_PAY.to_string()]
-        };
-        let gsp_urls = if let Some(raw) = gsp_env {
-            wraith_wallet_core::gsp::GspClient::parse_urls(&raw)
-        } else if persisted_is_public == Some(false) {
-            persisted.as_ref().unwrap().gsp_urls.clone()
-        } else {
-            vec![PUBLIC_GSP.to_string()]
-        };
-        // Preset label for the settings UI: a persisted choice wins; otherwise
-        // an env override reads as `custom`, and a clean fresh install reads as
-        // `public` (the bundled default it just fell back to).
-        let node_preset = if let Some(cfg) = persisted.as_ref() {
-            cfg.preset.clone()
-        } else if ghost_pay_env_override || gsp_env_override {
-            PRESET_CUSTOM.to_string()
-        } else {
-            PRESET_PUBLIC.to_string()
+            load_node_config(&node_config_path)
+                .map(|c| c.ghostd)
+                .unwrap_or_default()
         };
         tracing::info!(
-            preset = %node_preset,
-            ghost_pay = ?ghost_pay_urls,
-            gsp = ?gsp_urls,
+            node = ?ghostd.url,
+            auth = ghostd.auth_kind(),
             wallets_dir = %wallets_dir.display(),
             network = ?network,
             tor_proxy = ?tor_proxy,
-            ghost_pay_env_override,
-            gsp_env_override,
-            "node endpoints + wallets dir + network configured",
+            ghostd_env_override,
+            "node + wallets dir + network configured",
         );
-
-        let chain: Arc<dyn ChainClient> = {
-            let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                ghost_pay_urls.clone(),
-                tor_proxy.as_deref(),
-            )
-            .map_err(|e| std::io::Error::other(format!("ghost-pay client: {e}")))?;
-            if let Some(secret) = ghost_pay_internal_auth.as_ref() {
-                if !secret.is_empty() {
-                    c = c.with_internal_secret(secret.clone());
-                }
-            }
-            Arc::new(c)
-        };
-        let gsp = Arc::new(
-            wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
-                gsp_urls.clone(),
-                tor_proxy.as_deref(),
-            )
-            .map_err(|e| std::io::Error::other(format!("gsp client: {e}")))?,
-        );
+        if ghostd.url.is_none() {
+            tracing::warn!(
+                "no node configured — set one in Settings or via \
+                 WRAITHD_GHOSTD_URL; until then the wallet cannot read or \
+                 write the chain"
+            );
+        }
 
         let idle_lock_secs = std::env::var(IDLE_LOCK_ENV)
             .ok()
@@ -975,24 +771,18 @@ mod server {
         }
         let state = Arc::new(DaemonState {
             started: Instant::now(),
+            // Placeholder: the real backend is built from `ghostd` just
+            // below, once the state exists to build it from.
             clients: RwLock::new(NodeClients {
-                chain,
-                gsp,
-                ghost_pay_urls,
-                gsp_urls,
-                preset: node_preset,
+                chain: Arc::new(wraith_wallet_core::chain::NoChain),
             }),
-            ghost_pay_env_override,
-            gsp_env_override,
             node_config_path,
-            ghost_pay_internal_auth,
             tor_proxy: tor_proxy.clone(),
             wraith_coordinator_url,
             kiosk_mode,
             wallets_dir,
             wallets: RwLock::new(HashMap::new()),
             active: RwLock::new(None),
-            session: RwLock::new(None),
             network,
             endpoint_display: endpoint_display.clone(),
             last_activity: std::sync::atomic::AtomicU64::new(now_unix_secs()),
@@ -1002,11 +792,10 @@ mod server {
             http,
             wraith_mixes: RwLock::new(HashMap::new()),
             lock_signings: RwLock::new(HashMap::new()),
-            ghostd_url,
-            ghostd_cookie_path,
-            ghostd_user,
-            ghostd_pass,
+            ghostd: RwLock::new(ghostd),
+            ghostd_env_override,
         });
+        state.clients.write().await.chain = state.build_chain().await;
 
         // Auto-lock task. Wakes every 30 s. If idle_lock_secs is 0 the task
         // exits immediately — no overhead when the feature is disabled.
@@ -1071,8 +860,6 @@ mod server {
             }
         }
 
-        // Drop the active GSP session (SessionHandle::Drop aborts the task).
-        *state.session.write().await = None;
         // Wallets clear on drop (zeroized).
         state.wallets.write().await.clear();
         // Remove the socket so the next startup doesn't see a stale file.
@@ -1124,20 +911,6 @@ mod server {
         let (reader, mut writer) = stream.split();
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            // Streaming subscriptions short-circuit the request/response cycle:
-            // we ack on the original id, then keep writing pushes (id=0) until
-            // the client drops. After the stream ends the connection is done —
-            // we don't try to read more requests on the same connection.
-            if let Ok(env) = serde_json::from_str::<Envelope<Request>>(&line) {
-                if matches!(env.payload, Request::WatchPayments) {
-                    let ack: Envelope<Response> = Envelope::new(env.id, Response::Watching);
-                    if !write_envelope(&mut writer, &ack).await {
-                        return;
-                    }
-                    run_watch_payments(writer, lines, state.clone()).await;
-                    return;
-                }
-            }
             let response = dispatch(&line, &state).await;
             if !write_envelope(&mut writer, &response).await {
                 return;
@@ -1165,305 +938,14 @@ mod server {
     /// payment-detection broadcast and forwards each event as a push envelope
     /// (id=0). Exits when the client disconnects, the active session is
     /// rotated out, or the broadcast channel is closed.
-    async fn run_watch_payments(
-        mut writer: IpcSendHalf,
-        mut lines: tokio::io::Lines<BufReader<IpcRecvHalf>>,
-        state: Arc<DaemonState>,
-    ) {
-        let mut rx = match state.session.read().await.as_ref() {
-            Some(s) => s.handle.subscribe_payments(),
-            None => {
-                let err: Envelope<Response> = Envelope::new(
-                    0,
-                    Response::Error(ErrorResponse {
-                        message: "no active session; call gsp_auth first".to_string(),
-                    }),
-                );
-                let _ = write_envelope(&mut writer, &err).await;
-                return;
-            }
-        };
-        loop {
-            tokio::select! {
-                read = lines.next_line() => {
-                    // The client closed (or sent another request — we don't accept
-                    // anything else on a watch connection; just hang up).
-                    match read {
-                        Ok(Some(_)) => return,
-                        _ => return,
-                    }
-                }
-                event = rx.recv() => {
-                    match event {
-                        Ok(d) => {
-                            let push: Envelope<Response> = Envelope::new(
-                                0,
-                                Response::PaymentDetected(DetectedPaymentEntry {
-                                    txid: d.txid,
-                                    block_height: d.block_height,
-                                    vout: d.vout,
-                                    amount_sats: d.amount_sats,
-                                    k: d.k,
-                                    received_at: d.received_at,
-                                }),
-                            );
-                            if !write_envelope(&mut writer, &push).await {
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "watch_payments lagged; client should resync via light_detected");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            // Session was rotated out — close the watch.
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// `GspAuth` orchestration: register-if-needed + session. Stores the resulting
     /// `SessionToken` in `state.session` so subsequent commits can use it to open
     /// a persistent authenticated WebSocket.
-    async fn gsp_auth(state: &Arc<DaemonState>) -> Result<GspAuthResponse, String> {
-        // 1. Get the auth keypair + active wallet name.
-        let (active_name, kp) = {
-            let active = state
-                .active
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| "no active wallet".to_string())?;
-            let wallets = state.wallets.read().await;
-            let ks = wallets
-                .get(&active)
-                .ok_or_else(|| format!("active wallet '{active}' is not unlocked"))?;
-            let kp = auth::auth_keypair(ks).map_err(|e| format!("auth keypair: {e}"))?;
-            (active, kp)
-        };
-        let wallet_id = auth::wallet_id_hex(&kp);
-
-        // 2. Register (idempotent — treat "already registered" server errors as success).
-        let gsp = state.gsp().await;
-        let register_proof =
-            auth::make_proof(&kp, "register").map_err(|e| format!("register proof: {e}"))?;
-        let already_registered = match gsp.register(register_proof, None).await {
-            Ok(_) => false,
-            Err(GspError::Server(msg)) if msg.to_ascii_lowercase().contains("already") => true,
-            Err(e) => return Err(format!("register: {e}")),
-        };
-
-        // 3. Generate session_nonce + sign session proof + create session.
-        use rand::RngCore;
-        let mut nonce_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let session_nonce = hex::encode(nonce_bytes);
-
-        let session_proof =
-            auth::make_proof(&kp, "session").map_err(|e| format!("session proof: {e}"))?;
-        let token = gsp
-            .create_session(session_proof, Some(session_nonce))
-            .await
-            .map_err(|e| format!("session: {e}"))?;
-
-        let token_prefix: String = token.token.chars().take(12).collect();
-        let expires_at = token.expires_at;
-        let jwt_for_session = token.token.clone();
-
-        // Derive ghost keys for client-side BIP-352 detection. Best-effort:
-        // failure here just means the session won't auto-scan; auth still works.
-        let scan_keys = {
-            let wallets = state.wallets.read().await;
-            wallets
-                .get(&active_name)
-                .and_then(|ks| ks.ghost_keys().ok())
-        };
-
-        // Compute the wallet's network-correct bech32 ghost-id once
-        // up front. The session forwards it with each
-        // GetTransactions so ghost-pay can match recipient-side
-        // rows. `GhostKeys::ghost_id().to_string()` would emit the
-        // mainnet HRP — wrong for regtest/signet/testnet.
-        let ghost_id_bech32 = scan_keys.as_ref().and_then(|gk| {
-            gk.ghost_id()
-                .encode_for_network(ghost_network_from_bitcoin(state.network))
-                .ok()
-        });
-
-        // 4. Stash the token + spawn a persistent authenticated session task.
-        //    Replacing an existing slot drops the old SessionHandle, which aborts
-        //    its task before the new one starts.
-        let handle = spawn_session_with_bech32(
-            state.gsp_urls().await,
-            jwt_for_session,
-            scan_keys,
-            ghost_id_bech32,
-            state.tor_proxy.clone(),
-        );
-        *state.session.write().await = Some(StoredSession {
-            wallet_name: active_name,
-            token,
-            handle,
-        });
-
-        Ok(GspAuthResponse {
-            wallet_id,
-            already_registered,
-            token_prefix,
-            expires_at,
-        })
-    }
-
-    fn parse_payment_mode(s: &str) -> Result<PaymentMode, String> {
-        // Send only exposes the instant L2 ledger transfer (`ghostpay`).
-        // The `wraith` and `confidential` modes were retired here because
-        // they never had a real code path in Send — both silently took the
-        // plaintext L2 ledger route, so advertising them was a
-        // truth-in-advertising defect. Unlinkable L1 spends live in the Mix
-        // tab (Wraith CoinJoin); a shielded confidential L2 transfer needs
-        // client-side ZK proving the wallet-core cannot yet produce, so it
-        // is not offered rather than faked. Both are rejected below instead
-        // of silently accepted — a rejected send can never leak as a
-        // plaintext one.
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "ghostpay" | "ghost-pay" | "ghost_pay" => Ok(PaymentMode::GhostPay),
-            "wraith" => Err(
-                "payment mode 'wraith' is not available from Send — unlinkable L1 spends go \
-                 through the Mix tab (Wraith CoinJoin)"
-                    .to_string(),
-            ),
-            "confidential" => Err(
-                "payment mode 'confidential' is not available: shielded L2 transfers require \
-                 client-side ZK proving that is not yet supported"
-                    .to_string(),
-            ),
-            other => Err(format!("unknown payment mode '{other}' (try ghostpay)")),
-        }
-    }
-
     /// `LightSend` orchestration: PreparePayment → sign sighash with auth key → SubmitSignedPayment.
     /// Mirrors `ghost-light-wallet::payments::send::sign_and_submit` so wire format matches.
-    async fn light_send(
-        state: &Arc<DaemonState>,
-        recipient: String,
-        amount_sats: u64,
-        mode_str: String,
-        memo: Option<String>,
-        shroud_override_ms: Option<u64>,
-    ) -> Result<LightSentResponse, String> {
-        // The `mode` field on the IPC is parsed and validated. Only
-        // `ghostpay` (the instant L2 ledger transfer) is accepted; the
-        // retired `wraith`/`confidential` modes are rejected here so a
-        // stale caller can never fall through to a plaintext send it
-        // did not intend (see `parse_payment_mode`).
-        let mode = parse_payment_mode(&mode_str)?;
-        let mode_label = format!("{mode}");
-
-        let session = state.session.read().await;
-        let session = session
-            .as_ref()
-            .ok_or_else(|| "no GSP session — run `wraith gsp auth` first".to_string())?;
-
-        // Auth keypair from the active wallet (must match session's wallet).
-        let kp = {
-            let wallets = state.wallets.read().await;
-            let ks = wallets.get(&session.wallet_name).ok_or_else(|| {
-                format!(
-                    "wallet '{}' (the session's wallet) is not unlocked",
-                    session.wallet_name
-                )
-            })?;
-            wraith_wallet_core::auth::auth_keypair(ks).map_err(|e| format!("auth keypair: {e}"))?
-        };
-
-        // Phase 9 Shroud: hold the request for a uniform random delay
-        // in [0, max] before sending. For L2 ledger ops there's no P2P
-        // broadcast to correlate against, but a network observer with
-        // both wallet→ghost-pay HTTP and ghost-pay→peer ledger update
-        // vantage points could still correlate "user typed send" with
-        // "ledger updated" — the shroud breaks that timing seam.
-        let max_ms = shroud_override_ms.unwrap_or(state.shroud_max_ms);
-        let shroud_delay_ms = shroud_pick_delay(max_ms);
-        if let Some(chosen) = shroud_delay_ms {
-            tracing::debug!(
-                shroud_max_ms = max_ms,
-                chosen_ms = chosen,
-                "shroud relay: holding L2 send before submit"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(chosen)).await;
-        }
-
-        // Fresh per-call auth proof and a single SendL2Payment.
-        // Replaces the prepare/sign/submit dance — L2 transfers are
-        // session-authenticated ledger ops, not Bitcoin txs requiring
-        // per-payment sighash signatures.
-        let proof = wraith_wallet_core::auth::make_proof(&kp, "send_l2_payment")
-            .map_err(|e| format!("send_l2_payment proof: {e}"))?;
-
-        let result = session
-            .handle
-            .send_l2_payment(recipient.clone(), amount_sats, proof, memo.clone())
-            .await
-            .map_err(|e| format!("SendL2Payment: {e}"))?;
-
-        Ok(LightSentResponse {
-            payment_id: result.payment_id,
-            // L2 transfers are off-chain ledger ops — there's no
-            // bitcoin txid until the eventual settlement step
-            // (reconciliation or confidential-transfer ZK proof).
-            txid: None,
-            recipient,
-            amount_sats: result.amount_sats,
-            // `PaymentSent` carries no fee, so the wallet does not know what
-            // this cost. Reporting `0` claimed it was free, which is a
-            // stronger and possibly false statement — ghost-pay does account
-            // for L2 fees operator-side. `None` says what is true.
-            fee_sats: None,
-            mode: mode_label,
-            shroud_delay_ms,
-        })
-    }
-
     /// Send `RegisterScanKey` over the persistent session: derives the wallet's
     /// BIP-352 scan pubkey, signs a `register_scan_key` proof, and delegates to
     /// the session task. Returns (wallet_id, scan_pubkey_hex) on success.
-    async fn gsp_register_scan_key(state: &Arc<DaemonState>) -> Result<(String, String), String> {
-        let session = state.session.read().await;
-        let session = session
-            .as_ref()
-            .ok_or_else(|| "no GSP session — run `wraith gsp auth` first".to_string())?;
-
-        // Derive scan pubkey + auth keypair from the session's wallet.
-        let (scan_pubkey_hex, kp) = {
-            let wallets = state.wallets.read().await;
-            let ks = wallets.get(&session.wallet_name).ok_or_else(|| {
-                format!(
-                    "wallet '{}' (the session's wallet) is not unlocked",
-                    session.wallet_name
-                )
-            })?;
-            let gk = ks.ghost_keys().map_err(|e| format!("ghost-keys: {e}"))?;
-            let scan_hex = hex::encode(gk.scan_pubkey().serialize());
-            let kp = wraith_wallet_core::auth::auth_keypair(ks)
-                .map_err(|e| format!("auth keypair: {e}"))?;
-            (scan_hex, kp)
-        };
-
-        let proof = wraith_wallet_core::auth::make_proof(&kp, "register_scan_key")
-            .map_err(|e| format!("register_scan_key proof: {e}"))?;
-        let wallet_id = wraith_wallet_core::auth::wallet_id_hex(&kp);
-
-        session
-            .handle
-            .register_scan_key(scan_pubkey_hex.clone(), proof)
-            .await
-            .map_err(|e| format!("RegisterScanKey: {e}"))?;
-
-        Ok((wallet_id, scan_pubkey_hex))
-    }
-
     /// Run all connectivity / liveness checks and return a summary.
     async fn doctor_run(state: &Arc<DaemonState>) -> DoctorResponse {
         let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -1480,50 +962,40 @@ mod server {
             ),
         });
 
-        // 2. ghost-pay /api/v1/status round-trip + latency.
+        // 2. The node: reachability, sync, and round-trip.
         let t0 = std::time::Instant::now();
+        let configured = state.ghostd().await.url.is_some();
         match state.chain().await.status().await {
             Ok(s) => {
                 let rtt = t0.elapsed().as_millis();
+                let height = match s.chain_height {
+                    Some(h) => h.to_string(),
+                    None => "unknown".into(),
+                };
                 checks.push(DoctorCheck {
-                    name: "ghost-pay".into(),
+                    name: "node".into(),
                     status: "pass".into(),
                     detail: format!(
-                        "v{} ({}) — locks={}, sessions={} — round-trip {rtt}ms",
-                        s.backend_version, s.network, s.lock_count, s.active_sessions
+                        "{} ({}) — height {height} — round-trip {rtt}ms",
+                        s.backend_version, s.network
                     ),
                 });
             }
+            // No node configured is a setup step, not a failure: it does not
+            // fail the run, because there is nothing broken to fix — only
+            // something not yet chosen.
+            Err(e) if !configured => checks.push(DoctorCheck {
+                name: "node".into(),
+                status: "skip".into(),
+                detail: format!("{e}"),
+            }),
             Err(e) => {
                 all_pass = false;
                 let rtt = t0.elapsed().as_millis();
                 checks.push(DoctorCheck {
-                    name: "ghost-pay".into(),
+                    name: "node".into(),
                     status: "fail".into(),
                     detail: format!("{e} (after {rtt}ms)"),
-                });
-            }
-        }
-
-        // 3. GSP ping round-trip.
-        match state.gsp().await.ping().await {
-            Ok(p) => {
-                let detail = match p.round_trip_ms {
-                    Some(rtt) => format!("server_time {} — round-trip {}ms", p.server_time, rtt),
-                    None => format!("server_time {}", p.server_time),
-                };
-                checks.push(DoctorCheck {
-                    name: "ghost-gsp".into(),
-                    status: "pass".into(),
-                    detail,
-                });
-            }
-            Err(e) => {
-                all_pass = false;
-                checks.push(DoctorCheck {
-                    name: "ghost-gsp".into(),
-                    status: "fail".into(),
-                    detail: format!("{e}"),
                 });
             }
         }
@@ -1540,35 +1012,6 @@ mod server {
                     name: "active wallet".into(),
                     status: "skip".into(),
                     detail: "no wallet selected — `wraith wallet unlock <name>`".into(),
-                });
-            }
-        }
-
-        // 5. Session — present?
-        match state.session.read().await.as_ref() {
-            None => checks.push(DoctorCheck {
-                name: "gsp session".into(),
-                status: "skip".into(),
-                detail: "no session — `wraith gsp auth`".into(),
-            }),
-            Some(s) => {
-                let snap = s.handle.snapshot().await;
-                let phase = phase_label(snap.phase);
-                let status = if matches!(snap.phase, SessionPhase::Authenticated) {
-                    "pass".to_string()
-                } else {
-                    all_pass = false;
-                    "fail".to_string()
-                };
-                checks.push(DoctorCheck {
-                    name: "gsp session".into(),
-                    status,
-                    detail: format!(
-                        "{} (connects: {}, expires in {}s)",
-                        phase,
-                        snap.connect_count,
-                        s.token.remaining_secs()
-                    ),
                 });
             }
         }
@@ -1610,11 +1053,9 @@ mod server {
         // checks here aren't run on signet / testnet / regtest because the
         // privacy-and-integrity stakes don't apply to test networks.
         if state.network == bitcoin::Network::Bitcoin {
-            let ghost_pay_urls = state.ghost_pay_urls().await;
-            let gsp_urls = state.gsp_urls().await;
+            let node = state.ghostd().await;
             mainnet_readiness_checks(
-                &ghost_pay_urls,
-                &gsp_urls,
+                node.url.as_deref(),
                 state.tor_proxy.as_deref(),
                 &mut checks,
                 &mut all_pass,
@@ -1641,106 +1082,64 @@ mod server {
         matches!(host, "127.0.0.1" | "::1" | "localhost")
     }
 
-    /// Phase: mainnet-only doctor checks. Flags plaintext non-loopback
-    /// URLs (real privacy hole on real bitcoin) and the absence of a Tor
-    /// proxy (advisory — Tor is opt-in by design, but worth surfacing so
-    /// the user knows they're publishing their IP to ghost-pay/GSP).
+    /// Extra rows emitted only on mainnet, where the stakes are real.
+    ///
+    /// Test networks are excluded deliberately: a plaintext regtest node is
+    /// not a privacy problem, and failing on it would train people to ignore
+    /// the row that matters.
     fn mainnet_readiness_checks(
-        ghost_pay_urls: &[String],
-        gsp_urls: &[String],
+        node_url: Option<&str>,
         tor_proxy: Option<&str>,
         checks: &mut Vec<DoctorCheck>,
         all_pass: &mut bool,
     ) {
-        let plaintext_pay: Vec<&String> = ghost_pay_urls
-            .iter()
-            .filter(|u| u.starts_with("http://") && !is_loopback_url(u))
-            .collect();
-        let plaintext_gsp: Vec<&String> = gsp_urls
-            .iter()
-            .filter(|u| u.starts_with("ws://") && !is_loopback_url(u))
-            .collect();
-
-        // Plaintext ghost-pay row. Fail = wallet→ghost-pay traffic is
-        // visible to anyone on the path; an observer can correlate
-        // submissions with broadcasts.
-        if plaintext_pay.is_empty() {
-            checks.push(DoctorCheck {
-                name: "mainnet/ghost-pay tls".into(),
+        // Plaintext RPC row. The node connection carries the wallet's
+        // addresses and its transactions before they are broadcast; in the
+        // clear, anyone on the path learns both. Loopback is exempt — the
+        // traffic never leaves the machine, and TLS there is CPU burned for
+        // no privacy gain.
+        match node_url {
+            None => checks.push(DoctorCheck {
+                name: "mainnet/node tls".into(),
+                status: "skip".into(),
+                detail: "no node configured".into(),
+            }),
+            Some(u) if u.starts_with("http://") && !is_loopback_url(u) => {
+                *all_pass = false;
+                checks.push(DoctorCheck {
+                    name: "mainnet/node tls".into(),
+                    status: "fail".into(),
+                    detail: format!(
+                        "{u} is plaintext and not loopback — your addresses and \
+                         unbroadcast transactions are visible to anyone on the path. \
+                         use https://, or reach the node over loopback or an SSH tunnel."
+                    ),
+                });
+            }
+            Some(_) => checks.push(DoctorCheck {
+                name: "mainnet/node tls".into(),
                 status: "pass".into(),
-                detail: "all ghost-pay endpoints use https or are loopback-bound".into(),
-            });
-        } else {
-            *all_pass = false;
-            checks.push(DoctorCheck {
-                name: "mainnet/ghost-pay tls".into(),
-                status: "fail".into(),
-                detail: format!(
-                    "{} non-TLS endpoint(s): {}. switch to https:// or run ghost-pay on \
-                     loopback.",
-                    plaintext_pay.len(),
-                    plaintext_pay
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
+                detail: "the node is reached over https or loopback".into(),
+            }),
         }
 
-        // Plaintext GSP row. Same threat: ws:// leaks the wallet's
-        // existence + auth identity to anyone on the path.
-        if plaintext_gsp.is_empty() {
-            checks.push(DoctorCheck {
-                name: "mainnet/gsp tls".into(),
-                status: "pass".into(),
-                detail: "all gsp endpoints use wss or are loopback-bound".into(),
-            });
-        } else {
-            *all_pass = false;
-            checks.push(DoctorCheck {
-                name: "mainnet/gsp tls".into(),
-                status: "fail".into(),
-                detail: format!(
-                    "{} non-TLS endpoint(s): {}. switch to wss:// or run GSP on loopback.",
-                    plaintext_gsp.len(),
-                    plaintext_gsp
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
-
-        // Tor row. Advisory only — Tor is opt-in by design, and forcing
-        // it would break legitimate setups (e.g. an operator running
-        // their own ghost-pay on a private network). "skip" rather than
-        // "fail" so all_pass isn't lowered.
-        if tor_proxy.is_none() {
-            checks.push(DoctorCheck {
+        // Tor row. Advisory only — Tor is opt-in by design, and forcing it
+        // would break legitimate setups (a node on a private network, say).
+        // "skip" rather than "fail" so all_pass isn't lowered.
+        match tor_proxy {
+            None => checks.push(DoctorCheck {
                 name: "mainnet/tor".into(),
                 status: "skip".into(),
-                detail: "WRAITHD_TOR_PROXY unset — your IP is visible to ghost-pay and GSP. \
-                         set e.g. socks5h://127.0.0.1:9050 to route through Tor."
+                detail: "WRAITHD_TOR_PROXY unset — your IP is visible to anything the \
+                         wallet talks to. set e.g. socks5h://127.0.0.1:9050 to route \
+                         through Tor."
                     .into(),
-            });
-        } else {
-            checks.push(DoctorCheck {
+            }),
+            Some(p) => checks.push(DoctorCheck {
                 name: "mainnet/tor".into(),
                 status: "pass".into(),
-                detail: format!("routing through {}", tor_proxy.unwrap_or("?")),
-            });
-        }
-    }
-
-    fn phase_label(p: SessionPhase) -> &'static str {
-        match p {
-            SessionPhase::Disconnected => "disconnected",
-            SessionPhase::Connecting => "connecting",
-            SessionPhase::Authenticating => "authenticating",
-            SessionPhase::Authenticated => "authenticated",
-            SessionPhase::Backoff => "backoff",
+                detail: format!("routing through {p}"),
+            }),
         }
     }
 
@@ -2673,15 +2072,11 @@ mod server {
     }
 
     /// Returns true iff this request counts as user-facing activity for the
-    /// idle-lock timer. Diagnostics (Health, Doctor, DaemonEnv) and the watch
-    /// stream itself don't reset the timer — they're either too quiet to
-    /// indicate a present user, or they're held open continuously and would
-    /// defeat the feature.
+    /// idle-lock timer. Diagnostics (Health, Doctor, DaemonEnv) don't reset
+    /// it — they are too quiet to indicate a present user, and a status bar
+    /// polling every few seconds would defeat the feature outright.
     fn is_activity(req: &Request) -> bool {
-        !matches!(
-            req,
-            Request::Health | Request::Doctor | Request::DaemonEnv | Request::WatchPayments
-        )
+        !matches!(req, Request::Health | Request::Doctor | Request::DaemonEnv)
     }
 
     /// Background task that locks every unlocked wallet after
@@ -2723,8 +2118,6 @@ mod server {
             }
             drop(wallets);
             *state.active.write().await = None;
-            // Active GSP session belonged to one of those wallets; drop it.
-            *state.session.write().await = None;
         }
     }
 
@@ -2923,6 +2316,44 @@ mod server {
             }
         }
         Ok((confirmed, unconfirmed, scan.chain_height))
+    }
+
+    /// The wallet's spendable outputs, from the node.
+    ///
+    /// Shares its derivation and scan with [`l1_balance`], so the balance and
+    /// the coin list can never disagree about which coins exist — they are two
+    /// readings of one answer, not two questions asked separately.
+    async fn l1_utxo_entries(
+        state: &Arc<DaemonState>,
+        scan_max: u32,
+        min_confirmations: u32,
+    ) -> Result<(Vec<LightUtxoEntry>, u64), String> {
+        let pairs = derived_receive_addresses(state, scan_max).await?;
+        let addresses: Vec<String> = pairs.into_iter().map(|(_, a, _)| a).collect();
+        let scan = state
+            .chain()
+            .await
+            .scan_utxos(&addresses, min_confirmations)
+            .await
+            .map_err(|e| format!("scan: {e}"))?;
+        let mut total = 0u64;
+        let mut out = Vec::with_capacity(scan.utxos.len());
+        for u in scan.utxos {
+            total = total.saturating_add(u.amount_sats);
+            out.push(LightUtxoEntry {
+                txid: u.txid,
+                vout: u.vout,
+                amount_sats: u.amount_sats,
+                confirmations: u.confirmations,
+                // Every address the wallet derives is BIP86 taproot; the scan
+                // only looked at those, so anything it returned is one.
+                script_type: "p2tr".to_string(),
+                // The scan filtered on confirmations already, and these are
+                // the wallet's own single-key outputs.
+                spendable: true,
+            });
+        }
+        Ok((out, total))
     }
 
     /// Transaction history from the wallet's own record, confirmed against the
@@ -3182,203 +2613,82 @@ mod server {
                 Ok(s) => Response::ChainStatus(ChainStatusResponse {
                     backend_version: s.backend_version,
                     network: s.network,
-                    has_keys: s.has_keys,
-                    lock_count: s.lock_count,
-                    active_sessions: s.active_sessions,
                     chain_height: s.chain_height,
                     chain_headers: s.chain_headers,
                     chain_verification_progress: s.chain_verification_progress,
                     chain_initial_block_download: s.chain_initial_block_download,
-                    l2_height: s.l2_height,
-                    l2_epoch: s.l2_epoch,
                 }),
                 Err(e) => Response::Error(ErrorResponse {
                     message: format!("chain: {e}"),
                 }),
             },
-            Request::GspPing => match state.gsp().await.ping().await {
-                Ok(p) => Response::GspPing(GspPingResponse {
-                    server_time: p.server_time,
-                    round_trip_ms: p.round_trip_ms,
-                }),
-                Err(e) => Response::Error(ErrorResponse {
-                    message: format!("gsp: {e}"),
-                }),
-            },
-            Request::GspAuth => match gsp_auth(state).await {
-                Ok(r) => Response::GspAuth(r),
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::GspRegisterScanKey => match gsp_register_scan_key(state).await {
-                Ok((wallet_id, scan_pubkey_hex)) => Response::GspScanKeyRegistered {
-                    wallet_id,
-                    scan_pubkey_hex,
-                },
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::GspSessionStatus => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    Some(s) => {
-                        let snap: SessionStatus = s.handle.snapshot().await;
-                        Response::GspSessionStatus(GspSessionStatusResponse {
-                            have_token: true,
-                            wallet_name: Some(s.wallet_name.clone()),
-                            wallet_id: Some(s.token.wallet_id.0.clone()),
-                            expires_at: Some(s.token.expires_at),
-                            remaining_secs: Some(s.token.remaining_secs()),
-                            phase: Some(phase_label(snap.phase).to_string()),
-                            connect_count: Some(snap.connect_count),
-                            last_error: snap.last_error,
-                        })
-                    }
-                    None => Response::GspSessionStatus(GspSessionStatusResponse {
-                        have_token: false,
-                        wallet_name: None,
-                        wallet_id: None,
-                        expires_at: None,
-                        remaining_secs: None,
-                        phase: None,
-                        connect_count: None,
-                        last_error: None,
-                    }),
-                }
-            }
             Request::ConnectionStatus => {
-                // One probe answers "is ghost-pay reachable" AND supplies the
-                // chain fields. On error we report unreachable rather than
-                // surfacing a Response::Error — the whole point is a header
+                // One probe answers "is the node reachable" AND supplies the
+                // chain fields. An unreachable node is reported as a field
+                // rather than as an error: the point of this call is a header
                 // that says "unreachable" instead of spinning forever.
-                let (
-                    ghost_pay_reachable,
-                    ghost_pay_version,
-                    ghost_pay_error,
-                    chain_height,
-                    chain_headers,
-                    chain_ibd,
-                    l2_height,
-                ) = match state.chain().await.status().await {
-                    Ok(s) => (
-                        true,
-                        Some(s.backend_version),
-                        None,
-                        s.chain_height,
-                        s.chain_headers,
-                        s.chain_initial_block_download,
-                        s.l2_height,
-                    ),
-                    Err(e) => (false, None, Some(format!("{e}")), None, None, None, None),
-                };
+                let node_configured = state.ghostd().await.url.is_some();
+                let (node_reachable, node_version, node_error, chain_height, chain_headers, ibd) =
+                    match state.chain().await.status().await {
+                        Ok(s) => (
+                            true,
+                            Some(s.backend_version),
+                            None,
+                            s.chain_height,
+                            s.chain_headers,
+                            s.chain_initial_block_download,
+                        ),
+                        // With no node configured there is nothing to be
+                        // unreachable, and `NoChain`'s refusal is a setup
+                        // instruction rather than a probe failure — so it is
+                        // not reported as one.
+                        Err(e) => (
+                            false,
+                            None,
+                            node_configured.then(|| format!("{e}")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    };
                 // Same rule the GUI's SyncIndicator uses: verified height has
-                // caught the header tip (or headers unknown) AND bitcoind is
+                // caught the header tip (or headers unknown) AND the node is
                 // out of initial block download.
-                let chain_synced = ghost_pay_reachable
+                let chain_synced = node_reachable
                     && chain_height.is_some()
                     && chain_headers.is_none_or(|h| chain_height.unwrap_or(0) >= h)
-                    && chain_ibd == Some(false);
-                let (gsp_have_token, gsp_phase) = {
-                    let guard = state.session.read().await;
-                    match guard.as_ref() {
-                        Some(s) => {
-                            let snap = s.handle.snapshot().await;
-                            (true, Some(phase_label(snap.phase).to_string()))
-                        }
-                        None => (false, None),
-                    }
-                };
-                let gsp_connected = gsp_phase.as_deref() == Some("authenticated");
+                    && ibd == Some(false);
                 Response::ConnectionStatus(ConnectionStatusResponse {
                     network: network_label(state.network).to_string(),
-                    ghost_pay_reachable,
-                    ghost_pay_version,
-                    ghost_pay_error,
-                    gsp_have_token,
-                    gsp_connected,
-                    gsp_phase,
+                    node_configured,
+                    node_reachable,
+                    node_version,
+                    node_error,
                     chain_height,
                     chain_headers,
                     chain_synced,
-                    l2_height,
                 })
             }
-            Request::LightBalance => {
-                // On-chain first. This is the wallet's own money seen with its
-                // own eyes; the L2 ledger below is the operator's view of it
-                // and goes when Ghost Pay does.
-                if state.ghostd_url.is_some() {
-                    return match l1_balance(state, 1024).await {
-                        Ok((confirmed, unconfirmed, _height)) => Envelope::new(
-                            id,
-                            Response::LightBalance(LightBalanceResponse {
-                                confirmed_sats: Some(confirmed),
-                                unconfirmed_sats: Some(unconfirmed),
-                                // An operator-side concept with no on-chain
-                                // meaning. `None` says "not applicable" rather
-                                // than claiming nothing is locked.
-                                locked_sats: None,
-                                received_at: Some(now_unix_secs() as i64),
-                            }),
-                        ),
-                        Err(message) => {
-                            Envelope::new(id, Response::Error(ErrorResponse { message }))
-                        }
-                    };
+            Request::LightBalance => match l1_balance(state, 1024).await {
+                Ok((confirmed, unconfirmed, _height)) => {
+                    Response::LightBalance(LightBalanceResponse {
+                        confirmed_sats: Some(confirmed),
+                        unconfirmed_sats: Some(unconfirmed),
+                        // An operator-side concept with no on-chain meaning.
+                        // `None` says "not applicable" rather than claiming
+                        // nothing is locked.
+                        locked_sats: None,
+                        received_at: Some(now_unix_secs() as i64),
+                    })
                 }
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no chain backend and no GSP session — set GHOSTD_URL, or \
-                                  run `wraith gsp auth`"
-                            .to_string(),
-                    }),
-                    Some(s) => {
-                        let snap = s.handle.snapshot().await;
-                        match snap.last_balance {
-                            None => Response::LightBalance(LightBalanceResponse {
-                                confirmed_sats: None,
-                                unconfirmed_sats: None,
-                                locked_sats: None,
-                                received_at: None,
-                            }),
-                            Some(b) => Response::LightBalance(LightBalanceResponse {
-                                confirmed_sats: Some(b.confirmed_sats),
-                                unconfirmed_sats: Some(b.unconfirmed_sats),
-                                locked_sats: Some(b.locked_sats),
-                                received_at: Some(b.received_at),
-                            }),
-                        }
-                    }
-                }
-            }
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
             Request::LightUtxos { min_confirmations } => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
-                    }),
-                    Some(s) => match s.handle.get_utxos(min_confirmations).await {
-                        Ok(result) => {
-                            let utxos = result
-                                .utxos
-                                .into_iter()
-                                .map(|u| LightUtxoEntry {
-                                    txid: u.txid,
-                                    vout: u.vout,
-                                    amount_sats: u.amount_sats,
-                                    confirmations: u.confirmations,
-                                    script_type: u.script_type,
-                                    spendable: u.spendable,
-                                })
-                                .collect();
-                            Response::LightUtxos(LightUtxosResponse {
-                                utxos,
-                                total_sats: result.total_sats,
-                            })
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("light utxos: {e}"),
-                        }),
-                    },
+                match l1_utxo_entries(state, 1024, min_confirmations).await {
+                    Ok((utxos, total_sats)) => {
+                        Response::LightUtxos(LightUtxosResponse { utxos, total_sats })
+                    }
+                    Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
             Request::GhostLockSave {
@@ -4355,38 +3665,6 @@ mod server {
                     scanned_max_index: scan_max,
                 })
             }
-            Request::LightDetected => {
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
-                    }),
-                    Some(s) => {
-                        let snap = s.handle.snapshot().await;
-                        let detections = snap
-                            .detections
-                            .into_iter()
-                            .map(|d| DetectedPaymentEntry {
-                                txid: d.txid,
-                                block_height: d.block_height,
-                                vout: d.vout,
-                                amount_sats: d.amount_sats,
-                                k: d.k,
-                                received_at: d.received_at,
-                            })
-                            .collect();
-                        Response::LightDetected(LightDetectedResponse { detections })
-                    }
-                }
-            }
-            // Streaming subscription. handle_connection intercepts this before
-            // dispatch; reaching the dispatcher means the connection wasn't
-            // running our normal IPC loop. Fail loudly so misuse is obvious.
-            Request::WatchPayments => Response::Error(ErrorResponse {
-                message: "watch_payments must be sent on a fresh connection — \
-                          handled in handle_connection, not dispatch"
-                    .to_string(),
-            }),
             Request::DaemonEnv => {
                 let network = match state.network {
                     bitcoin::Network::Bitcoin => "mainnet",
@@ -4396,13 +3674,11 @@ mod server {
                     _ => "unknown",
                 }
                 .to_string();
-                let clients = state.clients.read().await;
+                let ghostd = state.ghostd().await;
                 Response::DaemonEnv(DaemonEnvResponse {
-                    ghost_pay_urls: clients.ghost_pay_urls.clone(),
-                    gsp_urls: clients.gsp_urls.clone(),
-                    node_preset: clients.preset.clone(),
-                    ghost_pay_env_override: state.ghost_pay_env_override,
-                    gsp_env_override: state.gsp_env_override,
+                    ghostd_url: ghostd.url.clone(),
+                    ghostd_auth: ghostd.auth_kind().to_string(),
+                    ghostd_env_override: state.ghostd_env_override,
                     network,
                     wallets_dir: state.wallets_dir.display().to_string(),
                     tor_proxy: state.tor_proxy.clone(),
@@ -4413,15 +3689,21 @@ mod server {
                     kiosk_mode: state.kiosk_mode,
                 })
             }
-            Request::SetNodeEndpoints {
-                preset,
-                ghost_pay_url,
-                gsp_url,
+            Request::SetNode {
+                ghostd_url,
+                cookie_path,
+                user,
+                pass,
             } => match state
-                .set_node_endpoints(&preset, ghost_pay_url, gsp_url)
+                .set_node(GhostdSettings {
+                    url: ghostd_url,
+                    cookie_path: cookie_path.map(PathBuf::from),
+                    user,
+                    pass,
+                })
                 .await
             {
-                Ok(applied) => Response::NodeEndpointsSet(applied),
+                Ok(applied) => Response::NodeSet(applied),
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
             Request::CheckForUpdate { manifest_url } => {
@@ -4431,54 +3713,8 @@ mod server {
                 }
             }
             Request::LightHistory { limit, offset } => {
-                // The wallet's own record first. It is authoritative for what
-                // this wallet sent, and it is the only source once the
-                // operator-hosted ledger is gone.
-                if state.ghostd_url.is_some() {
-                    return Envelope::new(id, l1_history(state, limit, offset).await);
-                }
-                let guard = state.session.read().await;
-                match guard.as_ref() {
-                    None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
-                    }),
-                    Some(s) => match s.handle.get_transactions(limit, offset).await {
-                        Ok(result) => {
-                            let transactions = result
-                                .transactions
-                                .into_iter()
-                                .map(|t| LightHistoryEntry {
-                                    txid: t.txid,
-                                    block_height: t.block_height,
-                                    timestamp: t.timestamp,
-                                    amount_sats: Some(t.amount_sats),
-                                    fee_sats: t.fee_sats,
-                                    tx_type: t.tx_type,
-                                    confirmations: Some(t.confirmations),
-                                    memo: t.memo,
-                                })
-                                .collect();
-                            Response::LightHistory(LightHistoryResponse {
-                                transactions,
-                                total_count: result.total_count,
-                            })
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("light history: {e}"),
-                        }),
-                    },
-                }
+                return Envelope::new(id, l1_history(state, limit, offset).await)
             }
-            Request::LightSend {
-                recipient,
-                amount_sats,
-                mode,
-                memo,
-                shroud_max_ms,
-            } => match light_send(state, recipient, amount_sats, mode, memo, shroud_max_ms).await {
-                Ok(r) => Response::LightSent(r),
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
             Request::L1Send {
                 recipient_address,
                 amount_sats,
@@ -4674,11 +3910,6 @@ mod server {
                     if active.as_deref() == Some(target.as_str()) {
                         *active = None;
                     }
-                    // Drop any GSP session bound to the wallet we just locked.
-                    let mut session = state.session.write().await;
-                    if session.as_ref().is_some_and(|s| s.wallet_name == target) {
-                        *session = None;
-                    }
                     Response::WalletLocked { name: target }
                 }
             }
@@ -4710,10 +3941,6 @@ mod server {
                         let mut active = state.active.write().await;
                         if active.as_deref() == Some(name.as_str()) {
                             *active = None;
-                        }
-                        let mut session = state.session.write().await;
-                        if session.as_ref().is_some_and(|s| s.wallet_name == name) {
-                            *session = None;
                         }
                         Response::WalletDeleted { name }
                     }
@@ -4770,11 +3997,6 @@ mod server {
                     })
                 } else {
                     *state.active.write().await = Some(name.clone());
-                    // Drop any GSP session that belongs to a different wallet.
-                    let mut session = state.session.write().await;
-                    if session.as_ref().is_some_and(|s| s.wallet_name != name) {
-                        *session = None;
-                    }
                     Response::WalletSelected { name }
                 }
             }
@@ -4886,54 +4108,6 @@ mod server {
                         scan_public_key_hex: scan,
                         spend_public_key_hex: spend,
                     }),
-                    Err(message) => Response::Error(ErrorResponse { message }),
-                }
-            }
-            Request::WalletGlyph { ghost_id } => match build_ghost_pay_client(state).await {
-                Ok(client) => match client.get_glyph(&ghost_id).await {
-                    Ok(v) => match serde_json::from_value::<GlyphInfo>(v) {
-                        Ok(info) => Response::WalletGlyph(info),
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph parse: {e}"),
-                        }),
-                    },
-                    Err(e) => Response::Error(ErrorResponse {
-                        message: format!("glyph: {e}"),
-                    }),
-                },
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::WalletGlyphCheck { pixels } => match build_ghost_pay_client(state).await {
-                Ok(client) => {
-                    let bitmap_hash_hex = glyph_bitmap_hash_hex(&pixels);
-                    match client.check_glyph(&bitmap_hash_hex).await {
-                        Ok(v) => {
-                            let available = v
-                                .get("available")
-                                .and_then(|b| b.as_bool())
-                                .unwrap_or(false);
-                            Response::WalletGlyphChecked { available }
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph check: {e}"),
-                        }),
-                    }
-                }
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
-            Request::WalletGlyphClaim { ghost_id, pixels } => {
-                match build_ghost_pay_client(state).await {
-                    Ok(client) => match client.claim_glyph(&ghost_id, &pixels).await {
-                        Ok(v) => match serde_json::from_value::<GlyphClaimResult>(v) {
-                            Ok(r) => Response::WalletGlyphClaimed(r),
-                            Err(e) => Response::Error(ErrorResponse {
-                                message: format!("glyph claim parse: {e}"),
-                            }),
-                        },
-                        Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph claim: {e}"),
-                        }),
-                    },
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
@@ -5351,46 +4525,27 @@ mod server {
                     }),
                 }
             }
-            Request::WraithResolveCoordinator { tier_id } => {
-                // Fetch the node's election view THROUGH ghost-pay (wallet hard
-                // rule: never the pool API directly), then resolve the seat that
-                // owns this tier. Any failure → (None, None) so the caller falls
-                // back to a manually-configured coordinator URL.
-                let (endpoint, epoch) =
-                    match wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                        state.ghost_pay_urls().await,
-                        None,
-                    ) {
-                        Ok(client) => match client.coordinator_election().await {
-                            Ok(election) => {
-                                // Pin the beacon to the chain if this wallet has
-                                // its own node. Verifying the draw against the
-                                // beacon published beside it only proves internal
-                                // consistency; the block hash is a fact the
-                                // operator does not get to state (#697).
-                                if !beacon_pinned_to_chain(state, &election) {
-                                    tracing::warn!(
-                                        "resolve coordinator: published beacon does not match \
-                                         the anchor block; refusing the election"
-                                    );
-                                    (None, election.get("epoch").and_then(|e| e.as_u64()))
-                                } else {
-                                    crate::coordinator_resolve::resolve_from_election(
-                                        &election, &tier_id,
-                                    )
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "resolve coordinator: election fetch failed");
-                                (None, None)
-                            }
-                        },
-                        Err(e) => {
-                            tracing::debug!(error = %e, "resolve coordinator: ghost-pay client build failed");
-                            (None, None)
-                        }
-                    };
-                Response::WraithCoordinatorResolved { endpoint, epoch }
+            Request::WraithResolveCoordinator { tier_id: _ } => {
+                // Coordinator discovery went with Ghost Pay. It worked by
+                // asking the operator for the pool's election view, precisely
+                // so the wallet never had to talk to the pool API itself and
+                // reveal that it was about to mix.
+                //
+                // Reinstating it by calling the pool directly would trade the
+                // privacy the indirection existed to buy, so it is not done
+                // here. The replacement is the signed node-list checkpoint,
+                // which is verifiable rather than merely relayed; until that
+                // lands the caller falls back to a coordinator URL the user
+                // supplies, which is why this reports "no answer" rather than
+                // an error.
+                tracing::debug!(
+                    "resolve coordinator: no discovery source — configure a \
+                     coordinator URL for the round"
+                );
+                Response::WraithCoordinatorResolved {
+                    endpoint: None,
+                    epoch: None,
+                }
             }
             Request::WraithMixOneShot {
                 coordinator_url,
@@ -5866,56 +5021,9 @@ mod server {
             panic!("did not see both 0 and 1 across 1000 samples");
         }
 
-        // ---- payment-mode gating -------------------------------------
-        //
-        // Send exposes exactly one real mode (`ghostpay`). The former
-        // `wraith`/`confidential` modes were cosmetic — they parsed into
-        // a label but took the same plaintext L2 ledger path — so they
-        // are now refused. These tests lock that in: a retired mode must
-        // never resolve into an accepted send.
-
-        #[test]
-        fn parse_payment_mode_accepts_ghostpay_aliases_and_default() {
-            for s in [
-                "",
-                "ghostpay",
-                "GhostPay",
-                "ghost-pay",
-                "ghost_pay",
-                "  ghostpay  ",
-            ] {
-                assert!(
-                    matches!(super::parse_payment_mode(s), Ok(PaymentMode::GhostPay)),
-                    "{s:?} should resolve to GhostPay"
-                );
-            }
-        }
-
-        #[test]
-        fn parse_payment_mode_rejects_retired_modes() {
-            for s in ["wraith", "Wraith", "confidential", "CONFIDENTIAL"] {
-                let err = super::parse_payment_mode(s)
-                    .expect_err(&format!("retired mode {s:?} must be rejected"));
-                assert!(
-                    err.contains("not available"),
-                    "{s:?} rejection should explain it is unavailable; got: {err}"
-                );
-            }
-        }
-
-        #[test]
-        fn parse_payment_mode_rejects_unknown() {
-            let err =
-                super::parse_payment_mode("banana").expect_err("an unknown mode must be rejected");
-            assert!(
-                err.contains("unknown payment mode"),
-                "unexpected error text: {err}"
-            );
-        }
-
-        /// Minimal `ChainClient` stub — `light_send` never touches the
-        /// chain (its gating happens before any I/O), so a status-only
-        /// error stub is all we need to satisfy the `DaemonState` field.
+        /// Minimal `ChainClient` stub. The handlers exercised here refuse
+        /// before any I/O, so a status-only error stub is all the
+        /// `DaemonState` field needs.
         struct RejectChain;
 
         #[async_trait::async_trait]
@@ -6097,22 +5205,14 @@ mod server {
                 started: Instant::now(),
                 clients: RwLock::new(NodeClients {
                     chain: Arc::new(RejectChain),
-                    gsp: Arc::new(GspClient::new("ws://127.0.0.1:0")),
-                    ghost_pay_urls: vec!["http://127.0.0.1:0".to_string()],
-                    gsp_urls: vec!["ws://127.0.0.1:0".to_string()],
-                    preset: PRESET_CUSTOM.to_string(),
                 }),
-                ghost_pay_env_override: false,
-                gsp_env_override: false,
                 node_config_path,
-                ghost_pay_internal_auth: None,
                 tor_proxy: None,
                 wraith_coordinator_url: None,
                 kiosk_mode: false,
                 wallets_dir,
                 wallets: RwLock::new(HashMap::new()),
                 active: RwLock::new(None),
-                session: RwLock::new(None),
                 network: bitcoin::Network::Regtest,
                 endpoint_display: std::env::temp_dir()
                     .join("wraithd-modegate-test.sock")
@@ -6125,10 +5225,8 @@ mod server {
                 http: reqwest::Client::new(),
                 wraith_mixes: RwLock::new(HashMap::new()),
                 lock_signings: RwLock::new(HashMap::new()),
-                ghostd_url: None,
-                ghostd_cookie_path: None,
-                ghostd_user: None,
-                ghostd_pass: None,
+                ghostd: RwLock::new(GhostdSettings::default()),
+                ghostd_env_override: false,
             })
         }
 
@@ -6308,60 +5406,6 @@ mod server {
         }
 
         #[tokio::test]
-        async fn light_send_refuses_retired_modes_before_any_send() {
-            let state = test_state();
-            for mode in ["wraith", "confidential"] {
-                let err = super::light_send(
-                    &state,
-                    "tghost1qexample".into(),
-                    1000,
-                    mode.into(),
-                    None,
-                    Some(0),
-                )
-                .await
-                .expect_err("a retired mode must be refused, never silently sent");
-                // Must fail at the mode gate — NOT by reaching the session
-                // step. If it reached the session it would return the
-                // "no GSP session" error, which would mean the mode was
-                // (wrongly) accepted as sendable.
-                assert!(
-                    !err.contains("no GSP session"),
-                    "mode `{mode}` must be rejected at the gate before the send path; got: {err}"
-                );
-                assert!(
-                    err.contains("not available"),
-                    "mode `{mode}` rejection should explain it is unavailable; got: {err}"
-                );
-            }
-        }
-
-        #[tokio::test]
-        async fn light_send_accepts_ghostpay_past_the_mode_gate() {
-            // ghostpay (and the empty default) must pass the mode gate.
-            // With no session configured the send can't complete, but it
-            // must advance to the session step — proven by the
-            // "no GSP session" error rather than a mode-rejection error.
-            let state = test_state();
-            for mode in ["ghostpay", ""] {
-                let err = super::light_send(
-                    &state,
-                    "tghost1qexample".into(),
-                    1000,
-                    mode.into(),
-                    None,
-                    Some(0),
-                )
-                .await
-                .expect_err("no session is configured in this unit test");
-                assert!(
-                    err.contains("no GSP session"),
-                    "ghostpay must clear the mode gate and reach the session step; got: {err}"
-                );
-            }
-        }
-
-        #[tokio::test]
         async fn wallet_delete_removes_keystore_and_forgets_active() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
@@ -6431,11 +5475,11 @@ mod server {
 
         #[tokio::test]
         async fn connection_status_reports_unreachable_without_erroring() {
-            // With the RejectChain stub (ghost-pay unreachable) and no GSP
-            // session, ConnectionStatus must still return a structured
-            // snapshot — NOT a Response::Error. This is what lets the header
-            // render a clear "unreachable" state instead of a perpetual
-            // "connecting…" spinner on a laptop with no local endpoints.
+            // With the RejectChain stub standing in for an unreachable node,
+            // ConnectionStatus must still return a structured snapshot — NOT
+            // a Response::Error. That is what lets the header render a clear
+            // "unreachable" state instead of a perpetual "connecting…"
+            // spinner on a laptop with nothing running locally.
             let state = test_state();
             let req = serde_json::to_string(&Envelope::new(1, Request::ConnectionStatus)).unwrap();
             let resp = super::dispatch(&req, &state).await;
@@ -6445,113 +5489,123 @@ mod server {
                         s.network, "regtest",
                         "network is read from config, not the backend"
                     );
+                    assert!(!s.node_reachable, "the stub must read as unreachable");
                     assert!(
-                        !s.ghost_pay_reachable,
-                        "RejectChain stub must read as unreachable"
+                        !s.node_configured,
+                        "this harness has no node set, and that is a different \
+                         state from one that is set and not answering"
                     );
                     assert!(
-                        s.ghost_pay_error.is_some(),
-                        "an unreachable backend should carry an error hint"
+                        s.node_error.is_none(),
+                        "with no node configured there is nothing to have failed — \
+                         reporting a probe error would send the user hunting for a \
+                         fault instead of a setting"
                     );
-                    assert!(s.ghost_pay_version.is_none());
-                    assert!(!s.gsp_have_token, "no session configured in this test");
-                    assert!(!s.gsp_connected);
-                    assert!(s.gsp_phase.is_none());
-                    assert!(
-                        !s.chain_synced,
-                        "cannot be synced while ghost-pay is unreachable"
-                    );
+                    assert!(s.node_version.is_none());
+                    assert!(!s.chain_synced, "cannot be synced with no node");
                     assert!(s.chain_height.is_none());
                 }
                 other => panic!("expected ConnectionStatus, got {other:?}"),
             }
         }
 
-        /// SetNodeEndpoints must: apply the new URLs at runtime, persist them to
-        /// node.json, and have DaemonEnv reflect the change — all without a
-        /// restart.
+        /// `SetNode` must apply at runtime, persist to node.json, and be
+        /// reflected by `DaemonEnv` — all without a restart.
         #[tokio::test]
-        async fn set_node_endpoints_applies_persists_and_surfaces() {
+        async fn set_node_applies_persists_and_surfaces() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
 
-            // Switch to a custom node.
             let req = serde_json::to_string(&Envelope::new(
                 1,
-                Request::SetNodeEndpoints {
-                    preset: "custom".into(),
-                    ghost_pay_url: Some("https://pay.example.com:8800".into()),
-                    gsp_url: Some("wss://gsp.example.com:8900/ws/v1".into()),
+                Request::SetNode {
+                    ghostd_url: Some("https://node.example.com:8332".into()),
+                    cookie_path: Some("/home/test/.ghost/.cookie".into()),
+                    user: None,
+                    pass: None,
                 },
             ))
             .unwrap();
             match super::dispatch(&req, &state).await.payload {
-                Response::NodeEndpointsSet(r) => {
-                    assert_eq!(r.preset, "custom");
-                    assert_eq!(r.ghost_pay_urls, vec!["https://pay.example.com:8800"]);
-                    assert_eq!(r.gsp_urls, vec!["wss://gsp.example.com:8900/ws/v1"]);
+                Response::NodeSet(r) => {
+                    assert_eq!(
+                        r.ghostd_url.as_deref(),
+                        Some("https://node.example.com:8332")
+                    );
+                    assert_eq!(r.auth, "cookie");
+                    assert!(!r.env_pinned);
                 }
-                other => panic!("expected NodeEndpointsSet, got {other:?}"),
+                other => panic!("expected NodeSet, got {other:?}"),
             }
 
-            // Persisted to node.json, and reloadable.
             let persisted =
                 super::load_node_config(&state.node_config_path).expect("node.json written");
-            assert_eq!(persisted.preset, "custom");
             assert_eq!(
-                persisted.ghost_pay_urls,
-                vec!["https://pay.example.com:8800"]
+                persisted.ghostd.url.as_deref(),
+                Some("https://node.example.com:8332")
             );
 
-            // Live state reflects it via the accessors + DaemonEnv.
-            assert_eq!(
-                state.ghost_pay_urls().await,
-                vec!["https://pay.example.com:8800".to_string()]
-            );
             let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
             match super::dispatch(&env, &state).await.payload {
                 Response::DaemonEnv(e) => {
-                    assert_eq!(e.node_preset, "custom");
-                    assert_eq!(e.gsp_urls, vec!["wss://gsp.example.com:8900/ws/v1"]);
-                    assert!(!e.ghost_pay_env_override);
+                    assert_eq!(
+                        e.ghostd_url.as_deref(),
+                        Some("https://node.example.com:8332")
+                    );
+                    assert_eq!(e.ghostd_auth, "cookie");
+                    assert!(!e.ghostd_env_override);
                 }
                 other => panic!("expected DaemonEnv, got {other:?}"),
             }
-
-            // Switching to the public preset ignores the URL fields and applies
-            // the bundled fleet endpoints.
-            let pub_req = serde_json::to_string(&Envelope::new(
-                3,
-                Request::SetNodeEndpoints {
-                    preset: "public".into(),
-                    ghost_pay_url: None,
-                    gsp_url: None,
-                },
-            ))
-            .unwrap();
-            match super::dispatch(&pub_req, &state).await.payload {
-                Response::NodeEndpointsSet(r) => {
-                    assert_eq!(r.preset, "public");
-                    assert_eq!(r.ghost_pay_urls, vec![super::PUBLIC_GHOST_PAY.to_string()]);
-                    assert_eq!(r.gsp_urls, vec![super::PUBLIC_GSP.to_string()]);
-                }
-                other => panic!("expected NodeEndpointsSet, got {other:?}"),
-            }
         }
 
-        /// A custom node with a wrong-scheme URL is rejected, and nothing is
-        /// persisted — a typo must never silently point the wallet at nothing.
+        /// The RPC password must never come back out over the IPC.
+        ///
+        /// A settings screen needs to know *how* the wallet authenticates, and
+        /// nothing more. Echoing the secret back would put it in every log,
+        /// screenshot and bug report that captured an IPC trace.
         #[tokio::test]
-        async fn set_node_endpoints_rejects_bad_scheme() {
+        async fn the_node_password_never_crosses_the_ipc() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
             let req = serde_json::to_string(&Envelope::new(
                 1,
-                Request::SetNodeEndpoints {
-                    preset: "custom".into(),
-                    // ws:// where http(s):// is required for ghost-pay.
-                    ghost_pay_url: Some("ws://pay.example.com:8800".into()),
-                    gsp_url: Some("wss://gsp.example.com:8900/ws/v1".into()),
+                Request::SetNode {
+                    ghostd_url: Some("http://127.0.0.1:8332".into()),
+                    cookie_path: None,
+                    user: Some("ghost".into()),
+                    pass: Some("hunter2-the-secret".into()),
+                },
+            ))
+            .unwrap();
+            let reply = super::dispatch(&req, &state).await;
+            let wire = serde_json::to_string(&reply).unwrap();
+            assert!(
+                !wire.contains("hunter2-the-secret"),
+                "the password must not appear in the reply: {wire}"
+            );
+            let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
+            let wire = serde_json::to_string(&super::dispatch(&env, &state).await).unwrap();
+            assert!(
+                !wire.contains("hunter2-the-secret"),
+                "the password must not appear in DaemonEnv either: {wire}"
+            );
+        }
+
+        /// A wrong-scheme URL is rejected, and nothing is persisted — a typo
+        /// must never silently point the wallet at nothing.
+        #[tokio::test]
+        async fn set_node_rejects_bad_scheme() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::SetNode {
+                    // ws:// where http(s):// is required for an RPC endpoint.
+                    ghostd_url: Some("ws://node.example.com:8332".into()),
+                    cookie_path: None,
+                    user: None,
+                    pass: None,
                 },
             ))
             .unwrap();
@@ -6569,16 +5623,15 @@ mod server {
             );
         }
 
-        /// While an env-var override pins the endpoints, SetNodeEndpoints is
-        /// refused — env vars keep power-user precedence.
+        /// While the environment pins the node, `SetNode` is refused — env
+        /// vars keep power-user precedence.
         #[tokio::test]
-        async fn set_node_endpoints_refused_under_env_override() {
+        async fn set_node_refused_under_env_override() {
             let dir = tempfile::tempdir().unwrap();
             let mut state = test_state_in(dir.path().to_path_buf());
-            // Simulate a boot with WRAITHD_GHOST_PAY set.
-            Arc::get_mut(&mut state).unwrap().ghost_pay_env_override = true;
+            Arc::get_mut(&mut state).unwrap().ghostd_env_override = true;
             let err = state
-                .set_node_endpoints("public", None, None)
+                .set_node(GhostdSettings::default())
                 .await
                 .expect_err("must refuse while env override is active");
             assert!(

@@ -9,7 +9,6 @@
 // look is `apps/wraith-wallet/ipc/src/lib.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // ----- Response shape helpers --------------------------------------------
 
@@ -103,17 +102,14 @@ export async function daemonDoctor(): Promise<DoctorResponse> {
 
 export interface DaemonEnvResponse {
   network: string;
-  ghost_pay_urls: string[];
-  gsp_urls: string[];
-  /// Active node preset: "public" (bundled Ghost fleet) or "custom"
-  /// (user-supplied URLs). Drives the settings radio. Older daemons omit
-  /// it — treat absence as "custom".
-  node_preset?: string;
-  /// True when WRAITHD_GHOST_PAY / WRAITHD_GSP pin the endpoints at boot.
-  /// The node selector is shown read-only and the daemon refuses changes
-  /// while either holds (env-var power-user precedence).
-  ghost_pay_env_override?: boolean;
-  gsp_env_override?: boolean;
+  /// The node the wallet reads and writes the chain through. `null` when
+  /// none is configured, in which case chain operations refuse.
+  ghostd_url: string | null;
+  /// "cookie" | "userpass" | "none" — never the credential itself.
+  ghostd_auth: string;
+  /// True when WRAITHD_GHOSTD_URL pins the node at boot. The selector is
+  /// shown read-only and the daemon refuses changes while it holds.
+  ghostd_env_override?: boolean;
   socket_path: string;
   wallets_dir: string;
   /// Optional Tor SOCKS5 URL the daemon routes outbound REST through.
@@ -137,41 +133,39 @@ export async function daemonEnv(): Promise<DaemonEnvResponse> {
   return unwrap<DaemonEnvResponse>(resp).payload;
 }
 
-/// Localhost defaults for the "my own node" preset — pre-filled into the
-/// custom fields for someone running their own ghost-pay + GSP.
-export const OWN_NODE_GHOST_PAY_DEFAULT = "http://127.0.0.1:8800";
-export const OWN_NODE_GSP_DEFAULT = "ws://127.0.0.1:8900/ws/v1";
+/// Localhost default for someone running their own node.
+export const OWN_NODE_RPC_DEFAULT = "http://127.0.0.1:8332";
 
-export interface NodeEndpointsResult {
-  preset: string;
-  ghost_pay_urls: string[];
-  gsp_urls: string[];
+export interface NodeResult {
+  ghostd_url: string | null;
+  /** "cookie" | "userpass" | "none" — never the credential itself. */
+  auth: string;
+  env_pinned: boolean;
 }
 
-/// Pick which node the wallet talks to. `preset` is `"public"` (bundled
-/// fleet) or `"custom"` (uses the URL args, each of which may be a
-/// comma-separated failover list). The daemon rebuilds its ghost-pay + GSP
-/// clients in place, persists the choice to `node.json`, and drops any live
-/// GSP session so it re-authenticates against the new endpoint — no restart.
-export async function setNodeEndpoints(
-  preset: "public" | "custom",
-  ghost_pay_url?: string,
-  gsp_url?: string,
-): Promise<NodeEndpointsResult> {
-  const resp = await invoke("set_node_endpoints", {
-    preset,
-    ghostPayUrl: ghost_pay_url,
-    gspUrl: gsp_url,
+/// Point the wallet at your node.
+///
+/// Passing nothing clears it, after which the wallet refuses chain
+/// operations — deliberately, rather than falling back to somebody else's
+/// node and reading your balance over their shoulder.
+export async function setNode(args: {
+  ghostd_url?: string;
+  cookie_path?: string;
+  user?: string;
+  pass?: string;
+}): Promise<NodeResult> {
+  const resp = await invoke("set_node", {
+    ghostdUrl: args.ghostd_url,
+    cookiePath: args.cookie_path,
+    user: args.user,
+    pass: args.pass,
   });
-  return unwrap<NodeEndpointsResult>(resp).payload;
+  return unwrap<NodeResult>(resp).payload;
 }
 
 export interface ChainStatusResponse {
   backend_version: string;
   network: string;
-  has_keys: boolean;
-  lock_count: number;
-  active_sessions: number;
   /// L1 verified block height. `null` if bitcoind was unreachable
   /// from ghost-pay at status time.
   chain_height: number | null;
@@ -201,16 +195,16 @@ export async function chainStatus(): Promise<ChainStatusResponse> {
 /// local ghost-pay/GSP.
 export interface ConnectionStatusResponse {
   network: string;
-  ghost_pay_reachable: boolean;
-  ghost_pay_version: string | null;
-  ghost_pay_error: string | null;
-  gsp_have_token: boolean;
-  gsp_connected: boolean;
-  gsp_phase: string | null;
+  /// Whether a node is set at all. Distinct from `node_reachable`: not
+  /// configured and configured-but-silent are different problems with
+  /// different fixes, and the header must not merge them.
+  node_configured: boolean;
+  node_reachable: boolean;
+  node_version: string | null;
+  node_error: string | null;
   chain_height: number | null;
   chain_headers: number | null;
   chain_synced: boolean;
-  l2_height: number | null;
 }
 
 export async function connectionStatus(): Promise<ConnectionStatusResponse> {
@@ -433,63 +427,10 @@ export async function walletGhostId(): Promise<{
   }>(resp).payload;
 }
 
-// ----- Ghost Glyph -------------------------------------------------------
-
-export interface GlyphInfo {
-  ghost_id: string;
-  /// 256 palette indices (0..25), row-major.
-  pixels: number[];
-  /// SHA256("GhostGlyphBitmap/v1" || pixels), hex — uniqueness key.
-  bitmap_hash: string;
-  /// SHA256("GhostGlyph/v1" || pixels || ghost_id), hex — binding.
-  commitment: string;
-  /// Wraith deposit txid that funded the lock (null while pending).
-  funding_txid: string | null;
-  /// Unix timestamp the lock was funded (null while pending).
-  registered_at: number | null;
-  /// One of: "none" / "pending" / "registered".
-  status: string;
-}
-
-export interface GlyphClaimResult {
-  commitment: string;
-  bitmap_hash: string;
-  status: string;
-}
-
-/// Fetch the registered Ghost Glyph for `ghostId`. Throws if the
-/// daemon returns an error (e.g. ghost-pay 404 — no glyph yet); the
-/// caller treats that as "not yet designed".
-export async function getGlyph(ghostId: string): Promise<GlyphInfo> {
-  const resp = await invoke("wallet_glyph", { ghostId });
-  return unwrap<GlyphInfo>(resp).payload;
-}
-
-/// Claim a designed glyph. `pixels` is a 256-length array of palette
-/// indices (0..25). Authenticated at the daemon via internal-auth.
-export async function claimGlyph(
-  ghostId: string,
-  pixels: number[],
-): Promise<GlyphClaimResult> {
-  const resp = await invoke("wallet_glyph_claim", { ghostId, pixels });
-  return unwrap<GlyphClaimResult>(resp).payload;
-}
-
-/// Check whether the bitmap formed by `pixels` is unclaimed. The
-/// daemon computes the bitmap hash and queries ghost-pay.
-export async function checkGlyph(
-  pixels: number[],
-): Promise<{ available: boolean }> {
-  const resp = await invoke("wallet_glyph_check", { pixels });
-  return unwrap<{ available: boolean }>(resp).payload;
-}
-
-// ----- Light wallet (L2) -------------------------------------------------
+// ----- Wallet balance, coins and history ---------------------------------
 
 export interface LightBalanceResponse {
-  /// On-chain confirmed balance, in sats. `null` when no
-  /// BalanceUpdate has arrived yet (session not authenticated, or
-  /// first update not received).
+  /// Confirmed on-chain balance, in sats. `null` when it could not be read.
   confirmed_sats: number | null;
   unconfirmed_sats: number | null;
   /// Sats currently inside an active Ghost Lock and therefore
@@ -1078,30 +1019,6 @@ export async function ghostLockSignComplete(
   return unwrap<GhostLockSigned>(resp).payload;
 }
 
-// ----- GSP ---------------------------------------------------------------
-
-export async function gspAuth(): Promise<unknown> {
-  const resp = await invoke("gsp_auth");
-  return unwrap(resp).payload;
-}
-
-export interface GspSessionStatus {
-  have_token: boolean;
-  wallet_name: string | null;
-  wallet_id: string | null;
-  expires_at: number | null;
-  remaining_secs: number | null;
-  /// "disconnected" / "connecting" / "authenticating" / "authenticated" / "backoff"
-  phase: string | null;
-  connect_count: number | null;
-  last_error: string | null;
-}
-
-export async function gspSessionStatus(): Promise<GspSessionStatus> {
-  const resp = await invoke("gsp_session_status");
-  return unwrap<GspSessionStatus>(resp).payload;
-}
-
 // ----- Locks -------------------------------------------------------------
 
 // Must match the wire `LockEntry` in ipc/src/lib.rs exactly. The fields are read
@@ -1374,49 +1291,87 @@ export async function multisigDescriptorDelete(name: string): Promise<{
   return unwrap<{ removed: boolean }>(resp).payload;
 }
 
-// ----- Live BIP-352 receive notifications --------------------------------
+// ----- Noticing money arriving -------------------------------------------
 
-/// Start the daemon push-watch subscription. The Tauri side keeps a
-/// long-lived IPC connection and forwards each `PaymentDetected`
-/// frame to the frontend as a `wraith://payment-detected` event.
-/// Idempotent — the Rust side's atomic guard makes repeat calls a
-/// no-op, so the safest pattern is to call it once on app mount and
-/// once more on any reconnect.
-export async function startWatch(): Promise<void> {
-  await invoke("start_watch");
-}
-
+/// One coin the wallet did not have last time it looked.
 export interface DetectedPayment {
   txid: string;
-  block_height: number | null;
   vout: number;
   amount_sats: number;
-  k: number;
-  received_at: number;
+  confirmations: number;
+  /// When the wallet noticed, unix epoch seconds. Not when it was paid —
+  /// polling cannot know that, and pretending otherwise would put a wrong
+  /// timestamp on a receipt.
+  noticed_at: number;
 }
 
-/// Subscribe to live payment detections. Returns an unlisten fn —
-/// call it from the effect's cleanup. Pair with `startWatch()` once
-/// at app boot.
-export async function onPaymentDetected(
+/// Watch for coins arriving, by asking the node.
+///
+/// # Why polling
+///
+/// This used to be a push: the operator's GSP scanned the chain on the
+/// wallet's behalf and told it what had landed. That is gone with the rest of
+/// L2, and it was never free — it meant handing somebody a scan key and
+/// trusting them with the answer.
+///
+/// So the wallet asks its own node instead, on an interval, and reports coins
+/// it had not seen before. The cost is latency: a payment shows up within one
+/// poll rather than the instant it is relayed. The gain is that nobody else
+/// has to know the wallet is watching.
+///
+/// The first poll establishes the baseline and reports nothing — otherwise
+/// every coin already in the wallet would arrive as a notification the moment
+/// a screen opened.
+///
+/// Returns a function that stops the watch; call it from an effect's cleanup.
+export function watchForPayments(
   cb: (p: DetectedPayment) => void,
-): Promise<UnlistenFn> {
-  return listen<DetectedPayment>("wraith://payment-detected", (event) => {
-    cb(event.payload);
-  });
-}
+  opts: { intervalMs?: number; scanMaxIndex?: number } = {},
+): () => void {
+  const intervalMs = opts.intervalMs ?? 15_000;
+  const scanMaxIndex = opts.scanMaxIndex ?? 32;
+  let stopped = false;
+  // `null` until the first successful poll, which is what distinguishes
+  // "nothing seen yet" from "nothing there" — an empty Set on a failed first
+  // poll would announce the whole wallet on the second.
+  let seen: Set<string> | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
 
-export interface WatchError {
-  message: string;
-}
+  const key = (u: { txid: string; vout: number }) => `${u.txid}:${u.vout}`;
 
-/// Subscribe to watch-loop terminal errors (daemon socket closed,
-/// IPC parse failure, etc.). The Tauri side restarts the loop on
-/// `startWatch()` next time the GUI calls it.
-export async function onWatchError(
-  cb: (e: WatchError) => void,
-): Promise<UnlistenFn> {
-  return listen<WatchError>("wraith://watch-error", (event) => {
-    cb(event.payload);
-  });
+  const tick = async () => {
+    try {
+      // Zero confirmations: a payment in the mempool is the one the user is
+      // standing there waiting for.
+      const r = await lightL1Utxos(scanMaxIndex, 0);
+      const now = new Set(r.utxos.map(key));
+      if (seen === null) {
+        seen = now;
+      } else {
+        for (const u of r.utxos) {
+          if (!seen.has(key(u))) {
+            cb({
+              txid: u.txid,
+              vout: u.vout,
+              amount_sats: u.amount_sats,
+              confirmations: u.confirmations,
+              noticed_at: Math.floor(Date.now() / 1000),
+            });
+          }
+        }
+        seen = now;
+      }
+    } catch {
+      // An unreachable node is not a reason to stop watching, and it is
+      // reported by the status header already. Keep the baseline: dropping it
+      // would replay every coin as new when the node comes back.
+    }
+    if (!stopped) timer = setTimeout(tick, intervalMs);
+  };
+  void tick();
+
+  return () => {
+    stopped = true;
+    if (timer !== undefined) clearTimeout(timer);
+  };
 }

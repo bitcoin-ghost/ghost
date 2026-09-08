@@ -26,7 +26,7 @@ struct Cli {
 enum Command {
     /// Round-trip a health request to wraithd.
     Health,
-    /// One-shot summary of daemon + ghost-pay + ghost-gsp + active wallet + session.
+    /// One-shot summary: daemon, node, active wallet and balance.
     Doctor,
     /// Print the daemon's configured environment (URLs, network, paths).
     Env,
@@ -39,10 +39,10 @@ enum Command {
         #[command(subcommand)]
         sub: ChainCommand,
     },
-    /// GSP WebSocket commands.
-    Gsp {
+    /// Point the wallet at your node.
+    Node {
         #[command(subcommand)]
-        sub: GspCommand,
+        sub: NodeCommand,
     },
     /// Wallet (keystore) commands.
     Wallet {
@@ -443,16 +443,26 @@ enum ChainCommand {
 }
 
 #[derive(Subcommand)]
-enum GspCommand {
-    /// Open a WebSocket to GSP, send Ping, wait for Pong.
-    Ping,
-    /// Register the active wallet with GSP (idempotent) and create a session.
-    Auth,
-    /// Show the daemon's stored GSP session token.
-    SessionStatus,
-    /// Register the active wallet's BIP-352 scan public key with the GSP so the
-    /// server can detect incoming silent payments on its behalf.
-    RegisterScanKey,
+enum NodeCommand {
+    /// Set the node the wallet reads and writes the chain through.
+    ///
+    /// A cookie is preferred over a username and password: it rotates with
+    /// the node and never has to be typed anywhere.
+    Set {
+        /// RPC URL, e.g. http://127.0.0.1:8332.
+        url: String,
+        /// Path to the node's `.cookie` file.
+        #[arg(long, conflicts_with_all = ["user", "pass"])]
+        cookie: Option<String>,
+        #[arg(long, requires = "pass")]
+        user: Option<String>,
+        #[arg(long, requires = "user")]
+        pass: Option<String>,
+    },
+    /// Forget the node. The wallet will refuse chain operations until one is
+    /// set again — which is the point: it will not quietly use somebody
+    /// else's.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -470,8 +480,8 @@ enum LightCommand {
         #[arg(short = 'c', long, default_value_t = 1)]
         min_confirmations: u32,
     },
-    /// Scan ghost-pay's bitcoind for unspent L1 outputs at the
-    /// active wallet's BIP86 receive addresses 0..`scan_max_index`.
+    /// Scan the node for unspent outputs at the active wallet's BIP86
+    /// receive addresses 0..`scan_max_index`.
     /// Each row comes back tagged with the BIP86 derivation index
     /// that produced its address — drop straight into a Wraith mix
     /// request to skip the daemon-side address scan.
@@ -484,12 +494,6 @@ enum LightCommand {
         #[arg(short = 'c', long, default_value_t = 0)]
         min_confirmations: u32,
     },
-    /// Show BIP-352 silent-payment matches detected by the persistent
-    /// session's local scanner since `wraith gsp auth` ran.
-    Detected,
-    /// Stream BIP-352 detections live as they arrive. Holds the connection
-    /// open and prints each detection on a new line. Ctrl-C to exit.
-    Watch,
     /// Show the active wallet's transaction history.
     History {
         /// Maximum number of transactions to return.
@@ -498,29 +502,6 @@ enum LightCommand {
         /// Pagination offset.
         #[arg(short, long, default_value_t = 0)]
         offset: u32,
-    },
-    /// Send an instant L2 payment. Mode is `ghostpay` (the only accepted
-    /// value; default). For unlinkable L1 spends use the Mix flow instead.
-    Send {
-        /// Recipient: a Bitcoin address or a Ghost ID.
-        recipient: String,
-        /// Amount in satoshis.
-        amount_sats: u64,
-        /// Payment mode. Only `ghostpay` (instant L2) is supported.
-        #[arg(long, default_value = "ghostpay")]
-        mode: String,
-        /// Optional memo, included with the payment metadata.
-        #[arg(long)]
-        memo: Option<String>,
-        /// Skip the wallet's outbound-broadcast shroud delay for this send.
-        /// Equivalent to --shroud-max-ms=0. Use only when latency matters
-        /// more than origin-timing privacy.
-        #[arg(long, conflicts_with = "shroud_max_ms")]
-        immediate: bool,
-        /// Override the daemon's default shroud window (ms) for this send.
-        /// `0` disables; `n` picks a uniform random delay in `[0, n]`.
-        #[arg(long, value_name = "MS")]
-        shroud_max_ms: Option<u64>,
     },
     /// Pay someone on-chain: build, sign and broadcast in one step.
     ///
@@ -663,7 +644,7 @@ mod client {
     }
 
     use crate::{
-        ChainCommand, Command, GspCommand, LightCommand, LockCommand, LockSignCommand, MixCommand,
+        ChainCommand, Command, LightCommand, LockCommand, LockSignCommand, MixCommand, NodeCommand,
         UpdateCommand, WalletCommand,
     };
 
@@ -683,15 +664,6 @@ mod client {
                 }
                 return std::process::ExitCode::FAILURE;
             }
-        }
-
-        // Streaming subcommand: handed off to its own code path so we don't
-        // try to render it as a single Response.
-        if let Command::Light {
-            sub: LightCommand::Watch,
-        } = &command
-        {
-            return run_watch(json).await;
         }
 
         // Multi-call: private entry chains the lane lookup and the round so
@@ -754,11 +726,24 @@ mod client {
             Command::Chain { sub } => match sub {
                 ChainCommand::Status => Request::ChainStatus,
             },
-            Command::Gsp { sub } => match sub {
-                GspCommand::Ping => Request::GspPing,
-                GspCommand::Auth => Request::GspAuth,
-                GspCommand::SessionStatus => Request::GspSessionStatus,
-                GspCommand::RegisterScanKey => Request::GspRegisterScanKey,
+            Command::Node { sub } => match sub {
+                NodeCommand::Set {
+                    url,
+                    cookie,
+                    user,
+                    pass,
+                } => Request::SetNode {
+                    ghostd_url: Some(url),
+                    cookie_path: cookie,
+                    user,
+                    pass,
+                },
+                NodeCommand::Clear => Request::SetNode {
+                    ghostd_url: None,
+                    cookie_path: None,
+                    user: None,
+                    pass: None,
+                },
             },
             Command::Light { sub } => match sub {
                 LightCommand::Receive { index } => Request::LightReceive { index },
@@ -774,22 +759,6 @@ mod client {
                     min_confirmations,
                 },
                 LightCommand::History { limit, offset } => Request::LightHistory { limit, offset },
-                LightCommand::Detected => Request::LightDetected,
-                LightCommand::Watch => unreachable!("Watch handled above"),
-                LightCommand::Send {
-                    recipient,
-                    amount_sats,
-                    mode,
-                    memo,
-                    immediate,
-                    shroud_max_ms,
-                } => Request::LightSend {
-                    recipient,
-                    amount_sats,
-                    mode,
-                    memo,
-                    shroud_max_ms: if immediate { Some(0) } else { shroud_max_ms },
-                },
                 LightCommand::Pay {
                     recipient_address,
                     amount_sats,
@@ -1152,68 +1121,13 @@ mod client {
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::ChainStatus(s)) => {
-                println!("ghost-pay {} ({})", s.backend_version, s.network);
-                println!(
-                    "  keys: {}   locks: {}   active sessions: {}",
-                    if s.has_keys { "yes" } else { "no" },
-                    s.lock_count,
-                    s.active_sessions,
-                );
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspPing(p)) => {
-                match p.round_trip_ms {
-                    Some(rtt) => println!(
-                        "gsp ok — server_time {} — round-trip {}ms",
-                        p.server_time, rtt
-                    ),
-                    None => println!("gsp ok — server_time {}", p.server_time),
-                }
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspAuth(a)) => {
-                if a.already_registered {
-                    println!("(already registered) — session created");
-                } else {
-                    println!("registered + session created");
-                }
-                println!("  wallet_id:    {}", a.wallet_id);
-                println!("  token (prefix): {}...", a.token_prefix);
-                println!("  expires_at:   {}", a.expires_at);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspScanKeyRegistered {
-                wallet_id,
-                scan_pubkey_hex,
-            }) => {
-                println!("scan key registered with GSP");
-                println!("  wallet_id:   {wallet_id}");
-                println!("  scan_pubkey: {scan_pubkey_hex}");
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::GspSessionStatus(s)) => {
-                if !s.have_token {
-                    println!("(no session — run `wraith gsp auth`)");
-                } else {
-                    println!("session active");
-                    if let Some(n) = s.wallet_name {
-                        println!("  wallet:        {n}");
+                println!("{} ({})", s.backend_version, s.network);
+                match (s.chain_height, s.chain_headers) {
+                    (Some(h), Some(t)) if h < t => {
+                        println!("  height: {h} of {t} (syncing)")
                     }
-                    if let Some(id) = s.wallet_id {
-                        println!("  wallet_id:     {id}");
-                    }
-                    if let Some(p) = s.phase {
-                        let cnt = s.connect_count.unwrap_or(0);
-                        println!("  ws phase:      {p} (connects: {cnt})");
-                    }
-                    if let Some(err) = s.last_error {
-                        println!("  last error:    {err}");
-                    }
-                    if let Some(rem) = s.remaining_secs {
-                        let hours = rem / 3600;
-                        let mins = (rem % 3600) / 60;
-                        println!("  expires in:    {hours}h {mins}m ({rem}s)");
-                    }
+                    (Some(h), _) => println!("  height: {h}"),
+                    (None, _) => println!("  height: unknown"),
                 }
                 std::process::ExitCode::SUCCESS
             }
@@ -1387,29 +1301,6 @@ mod client {
                 println!("publishes the link between those coins and the Lock.");
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::LightDetected(d)) => {
-                if d.detections.is_empty() {
-                    println!("(no detections — server scanner may not be wired yet,");
-                    println!(" or no incoming silent payments since auth)");
-                } else {
-                    for det in &d.detections {
-                        let amt = det
-                            .amount_sats
-                            .map(|a| format!("{a} sats"))
-                            .unwrap_or_else(|| "?".into());
-                        let height = det
-                            .block_height
-                            .map(|h| h.to_string())
-                            .unwrap_or_else(|| "(mempool)".into());
-                        println!(
-                            "{}:{}  {amt}  k={}  height {height}",
-                            det.txid, det.vout, det.k
-                        );
-                    }
-                    println!("\n{} detection(s)", d.detections.len());
-                }
-                std::process::ExitCode::SUCCESS
-            }
             Ok(Response::LightHistory(h)) => {
                 if h.transactions.is_empty() {
                     println!("(no transactions)");
@@ -1466,29 +1357,6 @@ mod client {
                 println!("  fee:        {} sats", s.fee_sats);
                 println!("  change:     {} sats", s.change_sats);
                 println!("  inputs:     {}", s.input_count);
-                match s.shroud_delay_ms {
-                    Some(ms) => println!("  shroud:     held {ms} ms before broadcast"),
-                    None => println!("  shroud:     disabled (immediate)"),
-                }
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::LightSent(s)) => {
-                println!("payment submitted");
-                println!("  payment_id: {}", s.payment_id);
-                if let Some(tx) = &s.txid {
-                    println!("  txid:       {tx}");
-                } else {
-                    println!("  txid:       (L2 — no on-chain txid)");
-                }
-                println!("  recipient:  {}", s.recipient);
-                println!("  amount:     {} sats", s.amount_sats);
-                match s.fee_sats {
-                    Some(f) => println!("  fee:        {f} sats"),
-                    // Not "0 sats": the wallet is not told, and printing a
-                    // number it did not receive would be inventing one.
-                    None => println!("  fee:        (not reported by the server)"),
-                }
-                println!("  mode:       {}", s.mode);
                 match s.shroud_delay_ms {
                     Some(ms) => println!("  shroud:     held {ms} ms before broadcast"),
                     None => println!("  shroud:     disabled (immediate)"),
@@ -1584,13 +1452,18 @@ mod client {
                 }
                 std::process::ExitCode::FAILURE
             }
-            Ok(Response::NodeEndpointsSet(r)) => {
-                println!("node endpoints updated (preset: {})", r.preset);
-                if !r.ghost_pay_urls.is_empty() {
-                    println!("  ghost-pay: {}", r.ghost_pay_urls.join(", "));
-                }
-                if !r.gsp_urls.is_empty() {
-                    println!("  gsp:       {}", r.gsp_urls.join(", "));
+            Ok(Response::NodeSet(r)) => {
+                match r.ghostd_url.as_deref() {
+                    Some(u) => {
+                        println!("node set");
+                        println!("  url:  {u}");
+                        println!("  auth: {}", r.auth);
+                    }
+                    // Said plainly, because it is a state the wallet cannot
+                    // work in and the user has just chosen it.
+                    None => {
+                        println!("node cleared — chain operations will refuse until one is set")
+                    }
                 }
                 std::process::ExitCode::SUCCESS
             }
@@ -1693,30 +1566,6 @@ mod client {
                 println!("  spend_pubkey: {}", g.spend_public_key_hex);
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::WalletGlyph(g)) => {
-                println!("ghost_id:     {}", g.ghost_id);
-                println!("status:       {}", g.status);
-                println!("bitmap_hash:  {}", g.bitmap_hash);
-                println!("commitment:   {}", g.commitment);
-                if let Some(txid) = &g.funding_txid {
-                    println!("funding_txid: {txid}");
-                }
-                if let Some(at) = g.registered_at {
-                    println!("registered_at:{at}");
-                }
-                println!("pixels:       {} bytes", g.pixels.len());
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::WalletGlyphClaimed(r)) => {
-                println!("status:       {}", r.status);
-                println!("bitmap_hash:  {}", r.bitmap_hash);
-                println!("commitment:   {}", r.commitment);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(Response::WalletGlyphChecked { available }) => {
-                println!("available: {available}");
-                std::process::ExitCode::SUCCESS
-            }
             Ok(Response::WalletShowMnemonic(m)) => {
                 println!("WARNING: anyone with these 24 words owns the wallet.\n");
                 println!("{}\n", m.mnemonic);
@@ -1801,8 +1650,10 @@ mod client {
                 println!("network:      {}", e.network);
                 println!("socket:       {}", e.socket_path);
                 println!("wallets dir:  {}", e.wallets_dir);
-                println!("ghost-pay:    {}", e.ghost_pay_urls.join(", "));
-                println!("gsp:          {}", e.gsp_urls.join(", "));
+                match e.ghostd_url.as_deref() {
+                    Some(u) => println!("node:         {u} (auth: {})", e.ghostd_auth),
+                    None => println!("node:         (none configured)"),
+                }
                 if let Some(p) = &e.tor_proxy {
                     println!("tor proxy:    {p}");
                 } else {
@@ -1828,38 +1679,32 @@ mod client {
             }
             Ok(Response::ConnectionStatus(s)) => {
                 println!("network:    {}", s.network);
-                println!(
-                    "ghost-pay:  {}{}",
-                    if s.ghost_pay_reachable {
-                        "reachable"
-                    } else {
-                        "unreachable"
-                    },
-                    s.ghost_pay_version
-                        .as_deref()
-                        .map(|v| format!(" (v{v})"))
-                        .or_else(|| s.ghost_pay_error.as_deref().map(|e| format!(" — {e}")))
-                        .unwrap_or_default()
-                );
-                println!(
-                    "gsp:        {}",
-                    if s.gsp_connected {
-                        "connected"
-                    } else {
-                        s.gsp_phase.as_deref().unwrap_or("disconnected")
-                    }
-                );
+                // "not configured" and "configured but not answering" are
+                // different problems with different fixes, so they get
+                // different words rather than one shared "unreachable".
+                if !s.node_configured {
+                    println!("node:       (none configured)");
+                } else {
+                    println!(
+                        "node:       {}{}",
+                        if s.node_reachable {
+                            "reachable"
+                        } else {
+                            "unreachable"
+                        },
+                        s.node_version
+                            .as_deref()
+                            .map(|v| format!(" ({v})"))
+                            .or_else(|| s.node_error.as_deref().map(|e| format!(" — {e}")))
+                            .unwrap_or_default()
+                    );
+                }
                 match s.chain_height {
                     Some(h) if s.chain_synced => println!("chain:      synced · #{h}"),
                     Some(h) => println!("chain:      syncing · #{h}"),
                     None => println!("chain:      unknown"),
                 }
                 std::process::ExitCode::SUCCESS
-            }
-            // Streaming variants are handled in run_watch() and never reach here.
-            Ok(Response::Watching) | Ok(Response::PaymentDetected(_)) => {
-                eprintln!("wraith: unexpected streaming variant on a one-shot request");
-                std::process::ExitCode::FAILURE
             }
             // PSBT and multisig-descriptor commands (WIP): bespoke human-readable
             // output is not wired up yet, so emit the structured response as JSON —
@@ -2282,7 +2127,7 @@ mod client {
         let health = call(Request::Health).await;
         let env_resp = call(Request::DaemonEnv).await;
         let wallets = call(Request::WalletList).await;
-        let session = call(Request::GspSessionStatus).await;
+        let node = call(Request::ConnectionStatus).await;
         let balance = call(Request::LightBalance).await;
 
         if json {
@@ -2290,7 +2135,7 @@ mod client {
                 "health":  result_value(&health),
                 "env":     result_value(&env_resp),
                 "wallets": result_value(&wallets),
-                "session": result_value(&session),
+                "node":    result_value(&node),
                 "balance": result_value(&balance),
             });
             println!("{body}");
@@ -2333,7 +2178,22 @@ mod client {
             }
             _ => println!("wallet:   error"),
         }
-        // balance row — only meaningful if we have a session
+        // node row
+        match &node {
+            Ok(Response::ConnectionStatus(s)) if !s.node_configured => {
+                println!("node:     (none — `wraith node set <url> --cookie <path>`)")
+            }
+            Ok(Response::ConnectionStatus(s)) => {
+                let where_ = match s.chain_height {
+                    Some(h) if s.chain_synced => format!("synced · #{h}"),
+                    Some(h) => format!("syncing · #{h}"),
+                    None => "unreachable".to_string(),
+                };
+                println!("node:     {where_}");
+            }
+            _ => println!("node:     unknown"),
+        }
+        // balance row
         match &balance {
             Ok(Response::LightBalance(b)) => {
                 let confirmed = b.confirmed_sats.unwrap_or(0);
@@ -2344,28 +2204,10 @@ mod client {
                     println!("balance:  {confirmed} sat");
                 }
             }
-            Ok(Response::Error(_)) | Err(_) => {
-                println!("balance:  (no session — `wraith gsp auth`)");
-            }
+            // The reason is already on the node row above; repeating it as a
+            // balance of 0 would be worse than saying nothing.
+            Ok(Response::Error(_)) | Err(_) => println!("balance:  (unavailable)"),
             _ => {}
-        }
-        // session row
-        match &session {
-            Ok(Response::GspSessionStatus(s)) if s.have_token => {
-                let remaining = s.remaining_secs.unwrap_or(0).max(0);
-                let pretty = if remaining < 60 {
-                    format!("{remaining}s")
-                } else if remaining < 3600 {
-                    format!("{}m {}s", remaining / 60, remaining % 60)
-                } else {
-                    format!("{}h {}m", remaining / 3600, (remaining % 3600) / 60)
-                };
-                let wallet = s.wallet_name.as_deref().unwrap_or("(unknown)");
-                let phase = s.phase.as_deref().unwrap_or("?");
-                println!("session:  {wallet} — {phase} — expires in {pretty}");
-            }
-            Ok(Response::GspSessionStatus(_)) => println!("session:  (none)"),
-            _ => println!("session:  (none)"),
         }
         std::process::ExitCode::SUCCESS
     }
@@ -2374,96 +2216,6 @@ mod client {
         match r {
             Ok(resp) => serde_json::to_value(resp).unwrap_or(serde_json::Value::Null),
             Err(e) => serde_json::json!({"error": e}),
-        }
-    }
-
-    /// Streaming subscriber for `Request::WatchPayments`. Connects, sends the
-    /// request, expects a `Response::Watching` ack, then prints each
-    /// `Response::PaymentDetected` line until the daemon closes the stream
-    /// (or the user hits Ctrl-C). With `--json`, every line is the raw
-    /// envelope JSON exactly as the daemon emits it.
-    pub(crate) async fn run_watch(json: bool) -> std::process::ExitCode {
-        let stream = match connect_daemon().await {
-            Ok(s) => s,
-            Err(e) => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"error": {"message": format!("connect: {e}")}})
-                    );
-                } else {
-                    eprintln!(
-                        "wraith: could not connect to wraithd at {}: {e}",
-                        wraith_wallet_ipc::endpoint_display()
-                    );
-                }
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        let (reader, mut writer) = stream.split();
-        let req = Envelope::new(1, Request::WatchPayments);
-        let mut line = match serde_json::to_string(&req) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("wraith: serialise: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        line.push('\n');
-        if let Err(e) = writer.write_all(line.as_bytes()).await {
-            eprintln!("wraith: write: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-        let mut reader = BufReader::new(reader);
-        if !json {
-            eprintln!("wraith: watching for silent-payment detections (Ctrl-C to stop)");
-        }
-        loop {
-            let mut buf = String::new();
-            match reader.read_line(&mut buf).await {
-                Ok(0) => return std::process::ExitCode::SUCCESS,
-                Ok(_) => {
-                    if json {
-                        print!("{buf}");
-                        continue;
-                    }
-                    let env: Envelope<Response> = match serde_json::from_str(&buf) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("wraith: malformed push: {e}; raw={buf}");
-                            continue;
-                        }
-                    };
-                    match env.payload {
-                        Response::Watching => {} // ack — keep waiting
-                        Response::PaymentDetected(d) => {
-                            let height = d
-                                .block_height
-                                .map(|h| h.to_string())
-                                .unwrap_or_else(|| "—".to_string());
-                            let amt = d
-                                .amount_sats
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            println!(
-                                "{} sat  height={}  vout={}  k={}  txid={}",
-                                amt, height, d.vout, d.k, d.txid
-                            );
-                        }
-                        Response::Error(e) => {
-                            eprintln!("wraith: daemon error: {}", e.message);
-                            return std::process::ExitCode::FAILURE;
-                        }
-                        other => {
-                            eprintln!("wraith: unexpected push variant: {other:?}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("wraith: read: {e}");
-                    return std::process::ExitCode::FAILURE;
-                }
-            }
         }
     }
 }

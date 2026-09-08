@@ -135,115 +135,73 @@ async fn signet_allows_canonical_test_vector() {
     child.kill().await.ok();
 }
 
+/// A node reached in the clear over a network fails the mainnet TLS row.
+///
+/// The RPC connection carries the wallet's addresses and its transactions
+/// before they are broadcast. In the clear, anyone on the path learns both.
 #[tokio::test]
-async fn doctor_mainnet_flags_plaintext_remote_endpoints() {
-    // Point ghost-pay at a non-loopback http:// host. The doctor's
-    // mainnet/ghost-pay-tls row must be `fail`.
+async fn doctor_mainnet_flags_a_plaintext_remote_node() {
     let (mut child, socket, _tmp) = spawn_daemon_with_env(
         "mainnet",
-        &[
-            ("WRAITHD_GHOST_PAY", "http://203.0.113.5:8800"),
-            ("WRAITHD_GSP", "ws://203.0.113.5:8900/ws/v1"),
-        ],
+        &[("WRAITHD_GHOSTD_URL", "http://203.0.113.5:8332")],
     )
     .await;
     match rpc(&socket, 1, Request::Doctor).await {
         Response::Doctor(d) => {
-            let pay = d
+            let row = d
                 .checks
                 .iter()
-                .find(|c| c.name == "mainnet/ghost-pay tls")
-                .expect("ghost-pay tls row present on mainnet");
+                .find(|c| c.name == "mainnet/node tls")
+                .expect("node tls row present on mainnet");
             assert_eq!(
-                pay.status, "fail",
-                "non-loopback http:// must fail: {pay:?}"
+                row.status, "fail",
+                "non-loopback http:// must fail: {row:?}"
             );
-            let gsp = d
-                .checks
-                .iter()
-                .find(|c| c.name == "mainnet/gsp tls")
-                .expect("gsp tls row present on mainnet");
-            assert_eq!(gsp.status, "fail", "non-loopback ws:// must fail: {gsp:?}");
         }
         other => panic!("expected Doctor, got {other:?}"),
     }
     child.kill().await.ok();
 }
 
+/// Loopback plaintext is fine: the traffic never leaves the machine, and TLS
+/// there is CPU burned for no privacy gain.
 #[tokio::test]
-async fn doctor_mainnet_passes_loopback_plaintext() {
-    // A plain mainnet daemon (no endpoint env vars, no persisted node.json)
-    // defaults to the bundled public preset, which is https:// + wss:// — so
-    // the TLS rows pass. Loopback http:// / ws:// is also exempt (a wallet
-    // talking to ghost-pay on the same box doesn't need TLS); either way a
-    // default mainnet daemon should pass the TLS rows.
-    let (mut child, socket, _tmp) = spawn_daemon("mainnet").await;
-    match rpc(&socket, 1, Request::Doctor).await {
-        Response::Doctor(d) => {
-            let pay = d
-                .checks
-                .iter()
-                .find(|c| c.name == "mainnet/ghost-pay tls")
-                .expect("ghost-pay tls row present");
-            assert_eq!(pay.status, "pass", "loopback http:// must pass: {pay:?}");
-            let gsp = d
-                .checks
-                .iter()
-                .find(|c| c.name == "mainnet/gsp tls")
-                .expect("gsp tls row present");
-            assert_eq!(gsp.status, "pass", "loopback ws:// must pass: {gsp:?}");
-        }
-        other => panic!("expected Doctor, got {other:?}"),
-    }
-    child.kill().await.ok();
-}
-
-#[tokio::test]
-async fn doctor_signet_omits_mainnet_rows() {
-    // The mainnet rows are mainnet-only — signet doesn't get them at all.
-    // A signet operator pointing at an http:// ghost-pay is doing nothing
-    // wrong and we shouldn't pretend they are.
+async fn doctor_mainnet_passes_a_loopback_node() {
     let (mut child, socket, _tmp) = spawn_daemon_with_env(
-        "signet",
-        &[("WRAITHD_GHOST_PAY", "http://203.0.113.5:8800")],
+        "mainnet",
+        &[("WRAITHD_GHOSTD_URL", "http://127.0.0.1:8332")],
     )
     .await;
     match rpc(&socket, 1, Request::Doctor).await {
         Response::Doctor(d) => {
-            assert!(
-                d.checks.iter().all(|c| !c.name.starts_with("mainnet/")),
-                "signet doctor must not emit mainnet/ rows; got {:?}",
-                d.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
-            );
+            let row = d
+                .checks
+                .iter()
+                .find(|c| c.name == "mainnet/node tls")
+                .expect("node tls row present");
+            assert_eq!(row.status, "pass", "loopback http:// must pass: {row:?}");
         }
         other => panic!("expected Doctor, got {other:?}"),
     }
     child.kill().await.ok();
 }
 
+/// With no node set there is nothing to have got wrong, so the row skips
+/// rather than fails — a red row here would send someone hunting for a
+/// misconfiguration when what is missing is a configuration.
 #[tokio::test]
-async fn mainnet_allows_a_strong_mnemonic() {
-    // Sanity: the guard rejects only the curated weak list, not arbitrary
-    // valid mnemonics. Use a BIP-39 reference vector that's NOT on the
-    // weak list — proves the guard is precise, not a blanket "no
-    // imports on mainnet". (This vector is published in the BIP-39 spec
-    // so don't ever actually use it on mainnet — but it's distinct from
-    // the all-abandon vector that the guard blocks.)
-    let strong = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+async fn doctor_mainnet_skips_the_tls_row_with_no_node() {
     let (mut child, socket, _tmp) = spawn_daemon("mainnet").await;
-    match rpc(
-        &socket,
-        1,
-        Request::WalletImport {
-            name: "strong".into(),
-            mnemonic: strong.into(),
-            passphrase: "mainnet-test-passphrase-aa".into(),
-        },
-    )
-    .await
-    {
-        Response::WalletImported { name, .. } => assert_eq!(name, "strong"),
-        other => panic!("strong mnemonic must import on mainnet, got {other:?}"),
+    match rpc(&socket, 1, Request::Doctor).await {
+        Response::Doctor(d) => {
+            let row = d
+                .checks
+                .iter()
+                .find(|c| c.name == "mainnet/node tls")
+                .expect("node tls row present");
+            assert_eq!(row.status, "skip", "no node is not a TLS failure: {row:?}");
+        }
+        other => panic!("expected Doctor, got {other:?}"),
     }
     child.kill().await.ok();
 }

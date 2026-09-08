@@ -66,11 +66,6 @@ impl ChainClient for GhostdChainClient {
         Ok(ChainStatus {
             backend_version: "ghostd".into(),
             network: self.network.clone(),
-            // These describe an operator's service, and there is no operator
-            // on this path. Zero is the truth, not a placeholder.
-            has_keys: false,
-            lock_count: 0,
-            active_sessions: 0,
             chain_height: Some(height),
             // `getblockcount` alone cannot distinguish "at tip" from "still
             // syncing". Reporting the height as though it were both would
@@ -78,8 +73,6 @@ impl ChainClient for GhostdChainClient {
             chain_headers: None,
             chain_verification_progress: None,
             chain_initial_block_download: None,
-            l2_height: None,
-            l2_epoch: None,
         })
     }
 

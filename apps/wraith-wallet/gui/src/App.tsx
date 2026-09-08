@@ -1,11 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   connectionStatus,
   daemonEnv,
-  gspAuth,
-  onPaymentDetected,
-  onWatchError,
-  startWatch,
+  watchForPayments,
   walletStatus,
   type ConnectionStatusResponse,
   type DetectedPayment,
@@ -16,7 +13,6 @@ import { Send } from "./screens/Send";
 import { Sign } from "./screens/Sign";
 import { Cosigner } from "./screens/Cosigner";
 import { Mix } from "./screens/Mix";
-import { Glyph } from "./screens/Glyph";
 import { Merchant } from "./screens/Merchant";
 import { Reports } from "./screens/Reports";
 import { Locks } from "./screens/Locks";
@@ -40,7 +36,6 @@ type Screen =
   | "sign"
   | "cosigner"
   | "mix"
-  | "glyph"
   | "merchant"
   | "reports"
   | "locks"
@@ -73,7 +68,6 @@ const NAV_GROUPS: Array<{
       { id: "sign", label: "Sign" },
       { id: "cosigner", label: "Cosigner" },
       { id: "mix", label: "Mix" },
-      { id: "glyph", label: "Glyph" },
     ],
   },
   {
@@ -101,8 +95,6 @@ export default function App() {
   }>({ active: null, unlocked: false });
   const [paymentTick, setPaymentTick] = useState(0);
   const [lastDetect, setLastDetect] = useState<DetectedPayment | null>(null);
-  const [watchErr, setWatchErr] = useState<string | null>(null);
-  const [hasSession, setHasSession] = useState(false);
   const [daemonOffline, setDaemonOffline] = useState(false);
   const [conn, setConn] = useState<ConnectionStatusResponse | null>(null);
   // Two layers of kiosk mode:
@@ -134,11 +126,9 @@ export default function App() {
   };
   const replayTour = () => setShowTour(true);
 
-  const autoAuthInFlight = useRef<string | null>(null);
-
-  // Header status tick — daemon + wallet status, kiosk-mode detection,
-  // auto-gsp-auth on first unlock. Best-effort: every error path here
-  // either falls through silently or surfaces via the "daemon offline"
+  // Header status tick — daemon + wallet status, kiosk-mode detection.
+  // Best-effort: every error path here either falls through silently or
+  // surfaces via the "daemon offline"
   // pill — never crashes the shell.
   useEffect(() => {
     let alive = true;
@@ -169,25 +159,6 @@ export default function App() {
           setDaemonKiosk(isDaemonKiosk);
           if (isDaemonKiosk) setScreen("merchant");
         }
-        if (w.active && w.unlocked) {
-          // Only act on a fresh snapshot; a transient null leaves the
-          // session state untouched until the next tick.
-          if (conn) {
-            setHasSession(conn.gsp_have_token);
-            if (
-              !conn.gsp_have_token &&
-              autoAuthInFlight.current !== w.active
-            ) {
-              autoAuthInFlight.current = w.active;
-              gspAuth().catch(() => {
-                if (alive) autoAuthInFlight.current = null;
-              });
-            }
-          }
-        } else {
-          setHasSession(false);
-          if (!w.active) autoAuthInFlight.current = null;
-        }
       } catch {
         if (alive) setDaemonOffline(true);
       }
@@ -204,52 +175,17 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Live BIP-352 receive notifications — register the event listeners
-  // once at mount. startWatch() itself is deferred to the effect below,
-  // which waits for a GSP session (the watch needs one to run).
+  // Notice money arriving, by asking the node on an interval. Runs whenever a
+  // wallet is unlocked; the watcher's first poll is a baseline, so opening the
+  // app never announces coins that were already there.
   useEffect(() => {
-    let alive = true;
-    let unlistenDetect: (() => void) | undefined;
-    let unlistenError: (() => void) | undefined;
-    (async () => {
-      unlistenDetect = await onPaymentDetected((p) => {
-        if (!alive) return;
-        setLastDetect(p);
-        setPaymentTick((n) => n + 1);
-      });
-      unlistenError = await onWatchError((e) => {
-        if (!alive) return;
-        setWatchErr(e.message);
-      });
-    })();
-    return () => {
-      alive = false;
-      if (unlistenDetect) unlistenDetect();
-      if (unlistenError) unlistenError();
-    };
-  }, []);
-
-  // Start (or restart) the push-watch once a GSP session is live. The
-  // watch needs a session — calling startWatch() before one exists just
-  // fails with "no active sessions". startWatch() is idempotent, so
-  // re-calling it whenever a session appears is safe.
-  useEffect(() => {
-    if (!hasSession) {
-      setWatchErr(null); // no session yet — not an error state
-      return;
-    }
-    let alive = true;
-    startWatch()
-      .then(() => {
-        if (alive) setWatchErr(null);
-      })
-      .catch((e) => {
-        if (alive) setWatchErr((e as Error).message ?? String(e));
-      });
-    return () => {
-      alive = false;
-    };
-  }, [hasSession]);
+    if (!walletState.active || !walletState.unlocked) return;
+    const stop = watchForPayments((p) => {
+      setLastDetect(p);
+      setPaymentTick((n) => n + 1);
+    });
+    return stop;
+  }, [walletState.active, walletState.unlocked]);
 
   // Active-screen renderer wrapped in the boundary so a screen's
   // crash doesn't blank the whole app.
@@ -267,8 +203,6 @@ export default function App() {
         return <Cosigner activeWallet={walletState.active} />;
       case "mix":
         return <Mix activeWallet={walletState.active} />;
-      case "glyph":
-        return <Glyph activeWallet={walletState.active} />;
       case "merchant":
         return (
           <Merchant
@@ -348,12 +282,6 @@ export default function App() {
             title={`txid ${lastDetect.txid.slice(0, 12)}…  vout ${lastDetect.vout}`}
           >
             +{lastDetect.amount_sats.toLocaleString()} sats
-          </span>
-        )}
-
-        {hasSession && watchErr && (
-          <span className="pill fail" title={watchErr}>
-            watch offline
           </span>
         )}
 

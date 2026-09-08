@@ -9049,18 +9049,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-socks"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d4770b8024672c1101b3f6733eab95b18007dbe0847a8afe341fcf79e06043f"
-dependencies = [
- "either",
- "futures-util",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "tokio-stream"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10834,9 +10822,7 @@ dependencies = [
  "bip322",
  "bip39",
  "bitcoin",
- "futures-util",
  "ghost-entropy",
- "ghost-gsp-proto",
  "ghost-keys",
  "ghost-lock",
  "hex",
@@ -10850,11 +10836,8 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-socks",
- "tokio-tungstenite 0.21.0",
  "tracing",
  "ureq",
- "url",
  "wraith-coordinator",
  "wraith-protocol",
  "zeroize",
@@ -10868,7 +10851,6 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "bitcoin",
- "ghost-gsp-proto",
  "ghost-keys",
  "ghost-lock",
  "hex",
@@ -10878,7 +10860,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",

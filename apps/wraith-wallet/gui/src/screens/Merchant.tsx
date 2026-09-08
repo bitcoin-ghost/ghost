@@ -5,10 +5,7 @@ import {
   lightL1Utxos,
   lightReceive,
   walletGhostId,
-  type DetectedPayment,
   type LightL1UtxoEntry,
-  onPaymentDetected,
-  startWatch,
 } from "../lib/tauri";
 import { Numpad } from "../components/Numpad";
 import { ProductCatalog, useProducts, type Product } from "../components/ProductCatalog";
@@ -235,7 +232,6 @@ export function Merchant({
         if (alive) setGhostId(id.ghost_id);
         const env = await daemonEnv();
         if (alive) setNetworkLabel(env.network);
-        await startWatch();
       } catch (e) {
         if (alive) setErr((e as Error).message ?? String(e));
       }
@@ -245,40 +241,14 @@ export function Merchant({
     };
   }, [activeWallet]);
 
-  // Detect: BIP-352 push.
-  useEffect(() => {
-    let alive = true;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        unlisten = await onPaymentDetected((p: DetectedPayment) => {
-          if (!alive) return;
-          const inv = openRef.current;
-          if (!inv) return;
-          const detect_ms = p.received_at * 1000;
-          if (detect_ms < inv.opened_at - 5_000) return;
-          if (p.amount_sats < inv.amount_sats) return;
-          markPaid({
-            invoice_id: inv.id,
-            amount_sats: p.amount_sats,
-            memo: inv.memo,
-            method: "silent_payment",
-            txid: p.txid,
-            paid_at: Date.now(),
-            wallet_name: activeWallet ?? undefined,
-            lines: inv.lines,
-          });
-        });
-      } catch (e) {
-        if (alive) setErr((e as Error).message ?? String(e));
-      }
-    })();
-    return () => {
-      alive = false;
-      if (unlisten) unlisten();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Silent payments are not collected here any more.
+  //
+  // They arrived as a push from the operator's GSP, which scanned the chain on
+  // the wallet's behalf — and had to be given a scan key to do it. That went
+  // with the rest of L2. Detection itself is local and still in the tree
+  // (`candidate_scan`), waiting on a scanner that reads blocks from the
+  // merchant's own node; the direct-deposit poll below covers the on-chain
+  // address in the meantime, which is what the QR actually shows.
 
   // Detect: direct deposit poll.
   useEffect(() => {

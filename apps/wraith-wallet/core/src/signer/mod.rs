@@ -18,7 +18,6 @@
 //!
 //! [`auth::xonly_pubkey_signer`](crate::auth::xonly_pubkey_signer),
 //! [`auth::wallet_id_hex_signer`](crate::auth::wallet_id_hex_signer),
-//! [`auth::make_proof_signer`](crate::auth::make_proof_signer), and
 //! [`auth::sign_data_signer`](crate::auth::sign_data_signer) are the
 //! Signer-aware GSP-auth helpers. The daemon currently calls the
 //! keypair-based variants in `auth::*` because the `Keystore` is what

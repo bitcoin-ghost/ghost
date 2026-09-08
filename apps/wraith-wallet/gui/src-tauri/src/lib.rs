@@ -8,12 +8,10 @@
 //! is fleshed out.
 
 use interprocess::local_socket::traits::tokio::Stream as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, WindowEvent,
+    Manager, WindowEvent,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use wraith_wallet_ipc::{Envelope, Request, Response};
@@ -121,24 +119,6 @@ async fn ensure_daemon() {
     }
 }
 
-/// Coordinates the long-lived watch task so we don't accidentally spawn a
-/// second one if the frontend calls `start_watch()` twice. Frontends that need
-/// per-window subscriptions should manage that themselves; this is a
-/// daemon-wide singleton from the Rust side's perspective.
-struct WatchState {
-    running: AtomicBool,
-}
-
-impl WatchState {
-    fn new() -> Self {
-        Self {
-            running: AtomicBool::new(false),
-        }
-    }
-}
-
-/// Tauri command: ask the daemon for its health and return a JSON-serializable
-/// summary. Used by the frontend to render a "daemon up" badge.
 #[tauri::command]
 async fn daemon_health() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::Health).await?;
@@ -298,20 +278,20 @@ async fn connection_status() -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
-/// Choose which node the wallet talks to. `preset` is `"public"` (the
-/// bundled Ghost fleet) or `"custom"` (uses `ghost_pay_url` + `gsp_url`).
-/// The daemon rebuilds its clients in place, persists the choice, and drops
-/// any live GSP session so it re-authenticates against the new endpoint.
+/// Point the wallet at a node. Clearing every field clears the node, after
+/// which chain operations refuse until one is set again.
 #[tauri::command]
-async fn set_node_endpoints(
-    preset: String,
-    ghost_pay_url: Option<String>,
-    gsp_url: Option<String>,
+async fn set_node(
+    ghostd_url: Option<String>,
+    cookie_path: Option<String>,
+    user: Option<String>,
+    pass: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::SetNodeEndpoints {
-        preset,
-        ghost_pay_url,
-        gsp_url,
+    let resp = call_daemon(Request::SetNode {
+        ghostd_url,
+        cookie_path,
+        user,
+        pass,
     })
     .await?;
     to_value(&resp)
@@ -324,66 +304,8 @@ async fn wallet_ghost_id() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn wallet_glyph(ghost_id: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletGlyph { ghost_id }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn wallet_glyph_claim(
-    ghost_id: String,
-    pixels: Vec<u8>,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletGlyphClaim { ghost_id, pixels }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn wallet_glyph_check(pixels: Vec<u8>) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletGlyphCheck { pixels }).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
 async fn wallet_auth_info() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletAuthInfo).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn gsp_register_scan_key() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::GspRegisterScanKey).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn gsp_session_status() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::GspSessionStatus).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn gsp_auth() -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::GspAuth).await?;
-    to_value(&resp)
-}
-
-#[tauri::command]
-async fn light_send(
-    recipient: String,
-    amount_sats: u64,
-    mode: String,
-    memo: Option<String>,
-    shroud_max_ms: Option<u64>,
-) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::LightSend {
-        recipient,
-        amount_sats,
-        mode,
-        memo,
-        shroud_max_ms,
-    })
-    .await?;
     to_value(&resp)
 }
 
@@ -801,80 +723,6 @@ async fn multisig_descriptor_delete(name: String) -> Result<serde_json::Value, S
     to_value(&resp)
 }
 
-/// Start the daemon watch subscription if it isn't already running.
-/// Forwards each `PaymentDetected` push to the frontend as a Tauri event
-/// named `wraith://payment-detected`. Idempotent — safe to call from
-/// multiple windows.
-#[tauri::command]
-async fn start_watch(
-    app: AppHandle,
-    state: tauri::State<'_, Arc<WatchState>>,
-) -> Result<(), String> {
-    if state
-        .running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Ok(()); // already running
-    }
-    let app = app.clone();
-    let state = state.inner().clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_watch_loop(&app).await {
-            // Surface the failure to the frontend so it can show a banner.
-            let _ = app.emit("wraith://watch-error", serde_json::json!({ "message": e }));
-        }
-        state.running.store(false, Ordering::SeqCst);
-    });
-    Ok(())
-}
-
-async fn run_watch_loop(app: &AppHandle) -> Result<(), String> {
-    let stream = connect_daemon()
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    let (reader, mut writer) = stream.split();
-    let mut line = serde_json::to_string(&Envelope::new(1, Request::WatchPayments))
-        .map_err(|e| format!("serialise: {e}"))?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| format!("write: {e}"))?;
-    let mut reader = BufReader::new(reader);
-    loop {
-        let mut buf = String::new();
-        match reader.read_line(&mut buf).await {
-            Ok(0) => return Ok(()), // daemon closed
-            Ok(_) => {
-                let env: Envelope<Response> = match serde_json::from_str(&buf) {
-                    Ok(e) => e,
-                    Err(_) => continue, // skip bad lines, keep stream alive
-                };
-                match env.payload {
-                    Response::Watching => {}
-                    Response::PaymentDetected(d) => {
-                        let _ = app.emit(
-                            "wraith://payment-detected",
-                            serde_json::json!({
-                                "txid": d.txid,
-                                "block_height": d.block_height,
-                                "vout": d.vout,
-                                "amount_sats": d.amount_sats,
-                                "k": d.k,
-                                "received_at": d.received_at,
-                            }),
-                        );
-                    }
-                    Response::Error(e) => return Err(e.message),
-                    _ => {}
-                }
-            }
-            Err(e) => return Err(format!("read: {e}")),
-        }
-    }
-}
-
 /// Send a request to the running wraithd daemon over its local IPC endpoint.
 /// Returns the parsed [`Response`] payload (without the JSON-RPC envelope).
 async fn call_daemon(request: Request) -> Result<Response, String> {
@@ -915,7 +763,6 @@ pub fn run() {
         )
         .init();
     tauri::Builder::default()
-        .manage(Arc::new(WatchState::new()))
         .setup(|app| {
             // Make sure a daemon is up. On a packaged install `wraithd` ships
             // as a Tauri sidecar next to this binary; spawn it if nothing is
@@ -997,7 +844,6 @@ pub fn run() {
             daemon_env,
             chain_status,
             connection_status,
-            set_node_endpoints,
             wallet_list,
             wallet_status,
             wallet_unlock,
@@ -1013,8 +859,8 @@ pub fn run() {
             light_balance,
             light_receive,
             light_history,
-            light_send,
             l1_send,
+            set_node,
             light_utxos,
             light_l1_utxos,
             wraith_coordinator_discover,
@@ -1031,13 +877,7 @@ pub fn run() {
             ghost_lock_sign_nonce,
             ghost_lock_sign_complete,
             wallet_ghost_id,
-            wallet_glyph,
-            wallet_glyph_claim,
-            wallet_glyph_check,
             wallet_auth_info,
-            gsp_register_scan_key,
-            gsp_session_status,
-            gsp_auth,
             psbt_inspect,
             psbt_sign,
             psbt_create,
@@ -1049,7 +889,6 @@ pub fn run() {
             multisig_descriptor_list,
             multisig_descriptor_addresses,
             multisig_descriptor_delete,
-            start_watch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running wraith-wallet-gui");
