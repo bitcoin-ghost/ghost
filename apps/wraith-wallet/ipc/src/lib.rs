@@ -1267,10 +1267,17 @@ pub struct LightHistoryEntry {
     pub block_height: Option<u32>,
     pub timestamp: i64,
     /// Net satoshi change (positive = received, negative = sent).
-    pub amount_sats: i64,
+    ///
+    /// `None` means the wallet has no record of the amount, which is not the
+    /// same as zero. A locked wallet can relay a finished transaction without
+    /// being able to tell which of its outputs were its own.
+    pub amount_sats: Option<i64>,
     pub fee_sats: Option<u64>,
     pub tx_type: String,
-    pub confirmations: u32,
+    /// `None` when the backend cannot say (a node without `txindex` cannot
+    /// look up a confirmed transaction it does not hold). Distinct from
+    /// `Some(0)`, which means "seen, not yet mined".
+    pub confirmations: Option<u32>,
     pub memo: Option<String>,
 }
 

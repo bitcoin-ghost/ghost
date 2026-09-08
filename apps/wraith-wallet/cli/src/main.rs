@@ -1372,19 +1372,32 @@ mod client {
                     println!("(no transactions)");
                 } else {
                     for t in &h.transactions {
-                        let dir = if t.amount_sats >= 0 { "+" } else { "" };
+                        // An unrecorded amount prints as `?`, never as 0 —
+                        // "the wallet did not note what moved" and "nothing
+                        // moved" are different things to read off a receipt.
+                        let amount = match t.amount_sats {
+                            Some(a) if a >= 0 => format!("+{a}"),
+                            Some(a) => a.to_string(),
+                            None => "?".to_string(),
+                        };
                         let height = t
                             .block_height
                             .map(|h| h.to_string())
-                            .unwrap_or_else(|| "(mempool)".into());
+                            .unwrap_or_else(|| "(unknown)".into());
+                        // Same rule: a node that cannot answer says so,
+                        // rather than reporting a settled payment as pending.
+                        let confs = t
+                            .confirmations
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".into());
                         let memo = t.memo.as_deref().unwrap_or("");
                         println!(
-                            "{}  {dir}{}  {}  height {}  ({} confs){}",
+                            "{}  {}  {}  height {}  ({} confs){}",
                             t.txid,
-                            t.amount_sats,
+                            amount,
                             t.tx_type,
                             height,
-                            t.confirmations,
+                            confs,
                             if memo.is_empty() {
                                 String::new()
                             } else {

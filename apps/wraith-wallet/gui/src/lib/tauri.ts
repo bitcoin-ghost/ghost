@@ -508,10 +508,12 @@ export interface LightHistoryEntry {
   txid: string;
   block_height: number | null;
   timestamp: number;
-  amount_sats: number;
+  /** null = the wallet has no record of the amount; not the same as zero. */
+  amount_sats: number | null;
   fee_sats: number | null;
   tx_type: string;
-  confirmations: number;
+  /** null = the backend cannot say; not the same as zero confirmations. */
+  confirmations: number | null;
   memo: string | null;
 }
 

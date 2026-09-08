@@ -10,6 +10,7 @@ pub mod ghost_lock_account;
 pub mod ghost_lock_store;
 pub mod ghostd;
 pub mod gsp;
+pub mod history_store;
 pub mod keystore;
 pub mod light;
 pub mod lock_cosign_client;

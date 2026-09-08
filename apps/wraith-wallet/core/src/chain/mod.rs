@@ -72,4 +72,15 @@ pub trait ChainClient: Send + Sync {
             "this chain client does not support broadcast".into(),
         ))
     }
+
+    /// How deeply a transaction is buried, if the backend can say.
+    ///
+    /// `Ok(None)` means "this backend cannot tell you" — a node without
+    /// `txindex` cannot look up an arbitrary txid once it has left the
+    /// mempool. That is deliberately distinct from `Ok(Some(0))`, which is
+    /// the definite answer "seen, and not yet in a block". A history that
+    /// prints 0 for both would show every settled payment as pending.
+    async fn tx_confirmations(&self, _txid: &str) -> Result<Option<u32>, ChainError> {
+        Ok(None)
+    }
 }

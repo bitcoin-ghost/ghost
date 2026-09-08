@@ -137,6 +137,27 @@ impl ChainClient for GhostdChainClient {
         self.blocking(move |rpc| rpc.send_raw_transaction(&hex))
             .await
     }
+
+    /// Ask the node how deep a transaction is.
+    ///
+    /// An RPC failure here comes back as `Ok(None)`, not `Err`. Without
+    /// `txindex` a node genuinely cannot answer for a confirmed transaction it
+    /// does not hold, and that is a limit of the node rather than a fault in
+    /// the wallet — failing the whole history because one row is unanswerable
+    /// would hide the rows that were answerable. The caller renders `None` as
+    /// "unknown", never as "unconfirmed".
+    async fn tx_confirmations(&self, txid: &str) -> Result<Option<u32>, ChainError> {
+        let id = txid.to_string();
+        match self
+            .blocking(move |rpc| rpc.get_raw_transaction_verbose(&id))
+            .await
+        {
+            // A transaction the node holds but has not mined reports no
+            // `confirmations` field at all; that is a definite zero.
+            Ok(tx) => Ok(Some(tx.confirmations.unwrap_or(0))),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]

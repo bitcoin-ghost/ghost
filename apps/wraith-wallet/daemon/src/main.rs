@@ -213,6 +213,22 @@ mod server {
         wraith_wallet_core::ghost_lock_store::GhostLockStore::open(path)
     }
 
+    /// Open the wallet's own record of what it has sent.
+    ///
+    /// Beside the lock store. This one exists because transaction history used
+    /// to come from the operator's GSP session: the wallet asked somebody else
+    /// what it had done. With that gone, nothing remembers unless this does.
+    fn history_store_for(
+        state: &DaemonState,
+    ) -> std::io::Result<wraith_wallet_core::history_store::HistoryStore> {
+        let path = state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("history.json");
+        wraith_wallet_core::history_store::HistoryStore::open(path)
+    }
+
     fn lock_record(l: &wraith_wallet_core::ghost_lock_store::StoredLock) -> GhostLockRecord {
         GhostLockRecord {
             lock_id: l.lock_id.clone(),
@@ -2006,12 +2022,89 @@ mod server {
                 .map_err(|e| format!("invalid raw tx: {e}"))?;
             trimmed.to_string()
         };
-        state
+        let txid = state
             .chain()
             .await
             .broadcast_tx(&tx_hex)
             .await
-            .map_err(|e| format!("broadcast: {e}"))
+            .map_err(|e| format!("broadcast: {e}"))?;
+        // Recorded after the node accepted it, because a transaction the node
+        // rejected is not something the wallet did. A failure to record is
+        // logged and not propagated: the money has already moved, and
+        // reporting the broadcast as failed would be the more damaging lie.
+        if let Err(e) = record_broadcast(state, &txid, &tx_hex, "send", None).await {
+            tracing::warn!(
+                txid = %txid,
+                error = %e,
+                "broadcast succeeded but could not be written to local history"
+            );
+        }
+        Ok(txid)
+    }
+
+    /// Write one broadcast into the local history.
+    ///
+    /// The amount is the value leaving the wallet: outputs that do not pay one
+    /// of our own scripts. Working that out needs the keys, so a locked wallet
+    /// records the transaction with no amount rather than with a wrong one —
+    /// `None` reads as "—" in the UI, where a `0` would read as "moved
+    /// nothing".
+    async fn record_broadcast(
+        state: &DaemonState,
+        txid: &str,
+        tx_hex: &str,
+        kind: &str,
+        memo: Option<String>,
+    ) -> Result<(), String> {
+        let amount_sats = outgoing_amount(state, tx_hex).await;
+        let mut store = history_store_for(state).map_err(|e| format!("history store: {e}"))?;
+        store
+            .record(wraith_wallet_core::history_store::HistoryEntry {
+                txid: txid.to_string(),
+                broadcast_at: now_unix_secs() as i64,
+                amount_sats,
+                // The miner fee is inputs minus outputs, and the input values
+                // are not in the transaction. Claiming one would mean guessing.
+                fee_sats: None,
+                kind: kind.to_string(),
+                memo,
+            })
+            .map_err(|e| format!("history write: {e}"))
+    }
+
+    /// Value leaving the wallet in `tx_hex`, negative, or `None` if unknowable.
+    async fn outgoing_amount(state: &DaemonState, tx_hex: &str) -> Option<i64> {
+        let bytes = hex::decode(tx_hex).ok()?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes).ok()?;
+        let ours = own_script_pubkeys(state).await?;
+        let mut leaving: i64 = 0;
+        for out in &tx.output {
+            if !ours.contains(out.script_pubkey.as_bytes()) {
+                leaving = leaving.saturating_add(out.value.to_sat() as i64);
+            }
+        }
+        Some(-leaving)
+    }
+
+    /// The scripts this wallet can spend, over the scan window.
+    ///
+    /// `None` when the wallet is locked — deriving needs the keys. Change
+    /// addresses beyond the window read as somebody else's, which overstates
+    /// what left; that is the safer direction to be wrong in for a record the
+    /// user checks against their own memory of the payment.
+    async fn own_script_pubkeys(state: &DaemonState) -> Option<std::collections::HashSet<Vec<u8>>> {
+        let network = state.network;
+        with_active_wallet(state, move |_, ks| {
+            let mut set = std::collections::HashSet::new();
+            for i in 0..wraith_wallet_core::psbt::DEFAULT_SCAN_INDEX_MAX {
+                let a = light::receive_address(ks, i, network)
+                    .map_err(|e| format!("derive index {i}: {e}"))?;
+                set.insert(a.script_pubkey().as_bytes().to_vec());
+            }
+            Ok(set)
+        })
+        .await
+        .ok()
     }
 
     /// Inspect a multisig descriptor. Pure function: parse, derive
@@ -2604,6 +2697,116 @@ mod server {
         Ok((account, kind, record))
     }
 
+    /// Every receive address the wallet would use, up to `scan_max`.
+    ///
+    /// Shared by the UTXO list and the balance, so the two cannot be computed
+    /// over different address sets and disagree about how much money there is.
+    async fn derived_receive_addresses(
+        state: &Arc<DaemonState>,
+        scan_max: u32,
+    ) -> Result<Vec<(u32, String, String)>, String> {
+        let network = state.network;
+        with_active_wallet(state, move |_, ks| {
+            let mut out = Vec::with_capacity(scan_max as usize);
+            for i in 0..scan_max {
+                let a = light::receive_address(ks, i, network)
+                    .map_err(|e| format!("derive index {i}: {e}"))?;
+                let spk = hex::encode(a.script_pubkey().as_bytes());
+                out.push((i, a.to_string(), spk));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// The wallet's on-chain balance, from the configured chain backend.
+    ///
+    /// Settled and unsettled are summed separately and never added together:
+    /// money that can still vanish must not read as money you have. That is
+    /// the same rule the Lock lanes follow, and for the same reason.
+    async fn l1_balance(
+        state: &Arc<DaemonState>,
+        scan_max: u32,
+    ) -> Result<(u64, u64, u32), String> {
+        let pairs = derived_receive_addresses(state, scan_max).await?;
+        let addresses: Vec<String> = pairs.into_iter().map(|(_, a, _)| a).collect();
+        // Scanned at zero confirmations, then split here — one round trip
+        // gives both figures, where two scans could disagree with each other.
+        let scan = state
+            .chain()
+            .await
+            .scan_utxos(&addresses, 0)
+            .await
+            .map_err(|e| format!("scan: {e}"))?;
+        let mut confirmed = 0u64;
+        let mut unconfirmed = 0u64;
+        for u in &scan.utxos {
+            if u.confirmations == 0 {
+                unconfirmed = unconfirmed.saturating_add(u.amount_sats);
+            } else {
+                confirmed = confirmed.saturating_add(u.amount_sats);
+            }
+        }
+        Ok((confirmed, unconfirmed, scan.chain_height))
+    }
+
+    /// Transaction history from the wallet's own record, confirmed against the
+    /// node.
+    ///
+    /// # What this can and cannot show
+    ///
+    /// Every transaction this wallet broadcast, and nothing else. An incoming
+    /// payment does not appear here: the wallet does not index the chain, so
+    /// it never observes a payment arriving — received coins show up in the
+    /// balance and the UTXO list, which is where they actually are.
+    ///
+    /// The GSP session used to answer this question because the operator kept
+    /// a ledger of both directions. Losing the incoming half is the real cost
+    /// of not having an operator, and it is stated rather than papered over.
+    async fn l1_history(state: &Arc<DaemonState>, limit: u32, offset: u32) -> Response {
+        let store = match history_store_for(state) {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::Error(ErrorResponse {
+                    message: format!("history: {e}"),
+                })
+            }
+        };
+        let all = store.list();
+        let total_count = all.len() as u32;
+        let page: Vec<_> = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        let chain = state.chain().await;
+        let mut transactions = Vec::with_capacity(page.len());
+        for e in page {
+            // Unknown depth is reported as unknown. A node without `txindex`
+            // cannot answer, and printing 0 would show every settled payment
+            // as though it were still pending.
+            let confirmations = chain.tx_confirmations(&e.txid).await.unwrap_or(None);
+            transactions.push(LightHistoryEntry {
+                txid: e.txid,
+                // Deriving a height from confirmations would need the tip, and
+                // the tip moves between the two calls. The confirmation count
+                // is the figure that was actually measured.
+                block_height: None,
+                timestamp: e.broadcast_at,
+                amount_sats: e.amount_sats,
+                fee_sats: e.fee_sats,
+                tx_type: e.kind,
+                confirmations,
+                memo: e.memo,
+            });
+        }
+        Response::LightHistory(LightHistoryResponse {
+            transactions,
+            total_count,
+        })
+    }
+
     /// One lane-name parser, so every caller accepts the same words.
     fn parse_lane(lane: &str) -> Result<wraith_wallet_core::ghost_lock_account::LaneKind, String> {
         use wraith_wallet_core::ghost_lock_account::LaneKind;
@@ -2924,10 +3127,34 @@ mod server {
                 })
             }
             Request::LightBalance => {
+                // On-chain first. This is the wallet's own money seen with its
+                // own eyes; the L2 ledger below is the operator's view of it
+                // and goes when Ghost Pay does.
+                if state.ghostd_url.is_some() {
+                    return match l1_balance(state, 1024).await {
+                        Ok((confirmed, unconfirmed, _height)) => Envelope::new(
+                            id,
+                            Response::LightBalance(LightBalanceResponse {
+                                confirmed_sats: Some(confirmed),
+                                unconfirmed_sats: Some(unconfirmed),
+                                // An operator-side concept with no on-chain
+                                // meaning. `None` says "not applicable" rather
+                                // than claiming nothing is locked.
+                                locked_sats: None,
+                                received_at: Some(now_unix_secs() as i64),
+                            }),
+                        ),
+                        Err(message) => {
+                            Envelope::new(id, Response::Error(ErrorResponse { message }))
+                        }
+                    };
+                }
                 let guard = state.session.read().await;
                 match guard.as_ref() {
                     None => Response::Error(ErrorResponse {
-                        message: "no GSP session — run `wraith gsp auth` first".to_string(),
+                        message: "no chain backend and no GSP session — set GHOSTD_URL, or \
+                                  run `wraith gsp auth`"
+                            .to_string(),
                     }),
                     Some(s) => {
                         let snap = s.handle.snapshot().await;
@@ -4029,6 +4256,12 @@ mod server {
                 }
             }
             Request::LightHistory { limit, offset } => {
+                // The wallet's own record first. It is authoritative for what
+                // this wallet sent, and it is the only source once the
+                // operator-hosted ledger is gone.
+                if state.ghostd_url.is_some() {
+                    return Envelope::new(id, l1_history(state, limit, offset).await);
+                }
                 let guard = state.session.read().await;
                 match guard.as_ref() {
                     None => Response::Error(ErrorResponse {
@@ -4043,10 +4276,10 @@ mod server {
                                     txid: t.txid,
                                     block_height: t.block_height,
                                     timestamp: t.timestamp,
-                                    amount_sats: t.amount_sats,
+                                    amount_sats: Some(t.amount_sats),
                                     fee_sats: t.fee_sats,
                                     tx_type: t.tx_type,
-                                    confirmations: t.confirmations,
+                                    confirmations: Some(t.confirmations),
                                     memo: t.memo,
                                 })
                                 .collect();
@@ -5492,6 +5725,90 @@ mod server {
                 Err(wraith_wallet_core::chain::ChainError::Backend(
                     "test stub".into(),
                 ))
+            }
+        }
+
+        /// A raw regtest transaction paying 5,000 sats to one output.
+        ///
+        /// Built here rather than hard-coded so the amount and the assertion
+        /// cannot drift apart.
+        fn one_output_tx(sats: u64) -> String {
+            use bitcoin::{
+                absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction,
+            };
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: vec![bitcoin::TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey: ScriptBuf::from_hex(
+                        "51200000000000000000000000000000000000000000000000000000000000000001",
+                    )
+                    .unwrap(),
+                }],
+            };
+            bitcoin::consensus::encode::serialize_hex(&tx)
+        }
+
+        /// A locked wallet cannot tell its own outputs from a stranger's, so
+        /// it records no amount. Recording a `0` would tell the user the
+        /// transaction moved nothing, which is the one reading that is
+        /// certainly wrong.
+        #[tokio::test]
+        async fn a_broadcast_without_keys_records_no_amount_rather_than_zero() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            record_broadcast(&state, "deadbeef", &one_output_tx(5_000), "send", None)
+                .await
+                .expect("recording must succeed even with no wallet unlocked");
+            let store = history_store_for(&state).unwrap();
+            let rows = store.list();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].amount_sats, None,
+                "no keys means no amount, not a zero amount"
+            );
+        }
+
+        /// A backend that cannot answer must not have its silence rendered as
+        /// "unconfirmed" — that would show every settled payment as pending.
+        #[tokio::test]
+        async fn history_reports_unknown_confirmations_as_unknown() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            record_broadcast(&state, "aa11", &one_output_tx(1_000), "send", None)
+                .await
+                .unwrap();
+            match l1_history(&state, 10, 0).await {
+                Response::LightHistory(h) => {
+                    assert_eq!(h.total_count, 1);
+                    assert_eq!(
+                        h.transactions[0].confirmations, None,
+                        "the stub chain cannot say, so the history must not claim zero"
+                    );
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
+        }
+
+        /// `total_count` is the whole history, not the size of the page — a
+        /// pager that reports the page length can never advance past page one.
+        #[tokio::test]
+        async fn paging_reports_the_full_total_not_the_page_size() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            for i in 0..5u32 {
+                record_broadcast(&state, &format!("tx{i}"), &one_output_tx(100), "send", None)
+                    .await
+                    .unwrap();
+            }
+            match l1_history(&state, 2, 0).await {
+                Response::LightHistory(h) => {
+                    assert_eq!(h.transactions.len(), 2, "the page is two");
+                    assert_eq!(h.total_count, 5, "the total is five");
+                }
+                other => panic!("expected history, got {other:?}"),
             }
         }
 
