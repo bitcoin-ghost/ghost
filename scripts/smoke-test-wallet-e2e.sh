@@ -106,7 +106,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "  PASS: $*"; }
 
 # ---- binary discovery -------------------------------------------------------
-for b in wraith wraithd wraith-coordinator; do
+for b in wraith wraithd wraith-coordinator ghost-lock-signer; do
     if [ ! -x "$BIN/$b" ]; then
         fail "missing $BIN/$b — run 'cargo build --workspace' (or set \$WRAITH_BIN_DIR)"
     fi
@@ -641,6 +641,145 @@ SPEND_LEFT=$(echo "$LANES_FINAL" \
 pass "the spending lane is empty — the escape moved the coin out"
 
 # ============================================================================
+# FLOW 11: air-gapped Savings spend — wallet + a real backup device, on chain
+#   The Savings key path is MuSig2(owner, backup): the ordinary way money
+#   leaves a Lock. `GhostLockSignBegin` / `SignNonce` / `SignComplete` had NO
+#   test of any kind — they appear only in the IPC definition, the CLI, the
+#   GUI and the daemon. The device side is covered by ghost-lock-signer's own
+#   round trip; the wallet's half of the same ceremony was not, and the two
+#   had never been run against each other.
+#
+#   The device here is the real `ghost-lock-signer` binary with its own seed,
+#   holding a key this wallet does not have.
+# ============================================================================
+step "FLOW 11 — air-gapped Savings spend (owner + backup device, MuSig2 key path)"
+
+DEV_SEED="$DATADIR/device-seed.txt"
+DEV_LEDGER="$DATADIR/device-nonces.json"
+"$BIN/ghost-lock-signer" generate --out "$DEV_SEED" --index 0 >"$DATADIR/device-gen.out" 2>&1 \
+    || { cat "$DATADIR/device-gen.out" >&2; fail "could not create a backup-device seed"; }
+DEV_PK=$("$BIN/ghost-lock-signer" pubkey --seed "$DEV_SEED" --index 0 2>&1 \
+    | grep -oE '[0-9a-f]{64}' | head -1)
+[ ${#DEV_PK} -eq 64 ] || fail "device pubkey is '$DEV_PK', expected 64 hex chars"
+echo "backup device key: $DEV_PK"
+
+# A Lock whose backup key belongs to the device, not to this wallet. Without
+# that the ceremony would be the wallet signing with itself twice, which
+# proves nothing about the protocol.
+AIR_ARGS=(--backup-pubkey "$DEV_PK" --heir-pubkey "$HEIR_PK" --quorum-pubkey "$QUORUM_PK"
+          --anchor-height "$TIP_H" --inherit-height "$((TIP_H + 52560))")
+AIR_SAVE=$(WRAITH --json lock save --label airgap "${AIR_ARGS[@]}")
+AIR_LOCK_ID=$(echo "$AIR_SAVE" | jq -r '.GhostLockSaved.lock.lock_id // .lock.lock_id // empty')
+[ -n "$AIR_LOCK_ID" ] || { echo "$AIR_SAVE" >&2; fail "could not remember the air-gapped Lock"; }
+
+AIR_LANES=$(WRAITH --json lock lanes "${AIR_ARGS[@]}")
+AIR_SAV_ADDR=$(echo "$AIR_LANES" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .address][0] // empty')
+[ -n "$AIR_SAV_ADDR" ] || fail "no savings-lane address for the air-gapped Lock"
+
+AIR_FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$AIR_SAV_ADDR" 0.003)
+$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+AIR_VOUT=$($BCLI getrawtransaction "$AIR_FUND_TXID" 1 \
+    | jq -r --arg a "$AIR_SAV_ADDR" '.vout[] | select(.scriptPubKey.address == $a) | .n')
+[ -n "$AIR_VOUT" ] || fail "the funding tx has no output at the savings lane"
+
+# Key-path spend: no sequence requirement, unlike the escape leaf.
+AIR_DEST=$(WRAITH --json light receive --index 501 | jq -r '.LightReceive.address // .address')
+AIR_PSBT=$($BCLI utxoupdatepsbt "$($BCLI createpsbt \
+    "[{\"txid\":\"$AIR_FUND_TXID\",\"vout\":$AIR_VOUT}]" \
+    "[{\"$AIR_DEST\":0.00298}]")")
+[ -n "$AIR_PSBT" ] || fail "could not build the air-gapped spend PSBT"
+
+# Round 1 (wallet): review the spend, commit our nonce, emit the device payload.
+AIR_BEGIN=$(WRAITH --json lock sign begin \
+    --lock-id "$AIR_LOCK_ID" --lane savings --psbt "$AIR_PSBT" --input-index 0)
+AIR_SESSION=$(echo "$AIR_BEGIN" | jq -r '.GhostLockSignBegun.session // .session // empty')
+[ -n "$AIR_SESSION" ] || { echo "$AIR_BEGIN" >&2; fail "lock sign begin returned no session"; }
+echo "$AIR_BEGIN" | jq -r '.GhostLockSignBegun.device_request // .device_request' > "$DATADIR/dev-request.json"
+pass "round 1: the wallet committed a nonce and produced a device payload"
+
+# The device is interactive across both rounds, so its stdin is held open on a
+# FIFO while its output is followed.
+DEV_IN="$DATADIR/dev-in"
+DEV_OUT="$DATADIR/dev-out"
+rm -f "$DEV_IN" "$DEV_OUT"; mkfifo "$DEV_IN"; : > "$DEV_OUT"
+"$BIN/ghost-lock-signer" sign \
+    --request "$DATADIR/dev-request.json" \
+    --seed "$DEV_SEED" \
+    --ledger "$DEV_LEDGER" \
+    --network regtest \
+    --no-confirm \
+    <"$DEV_IN" >"$DEV_OUT" 2>&1 &
+DEV_PID=$!
+exec 9>"$DEV_IN"
+
+# Payload blocks are delimited: `--- round N ---` ... `--- end ---`.
+read_device_block() {
+    local want="$1" waited=0
+    while [ $waited -lt 200 ]; do
+        if grep -q -- "--- end ---" "$DEV_OUT" 2>/dev/null \
+           && [ "$(grep -c -- '--- end ---' "$DEV_OUT")" -ge "$want" ]; then
+            awk -v want="$want" '
+                /^--- round/ { n++; inside = (n == want); next }
+                /^--- end ---/ { if (inside) exit; inside = 0; next }
+                inside { print }
+            ' "$DEV_OUT"
+            return 0
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    cat "$DEV_OUT" >&2
+    return 1
+}
+
+DEV_NONCE_JSON=$(read_device_block 1) || fail "the device never produced a round-1 nonce"
+DEV_NONCE=$(echo "$DEV_NONCE_JSON" | jq -r '.public_nonce // empty')
+[ -n "$DEV_NONCE" ] || { echo "$DEV_NONCE_JSON" >&2; fail "no public_nonce in the device's round-1 reply"; }
+
+# Round 2 (wallet): sign our own share, burning our nonce durably first.
+AIR_NONCED=$(WRAITH --json lock sign nonce --session "$AIR_SESSION" --device-nonce "$DEV_NONCE")
+AIR_PARTIAL_REQ=$(echo "$AIR_NONCED" | jq -r '.GhostLockSignNonced.device_request // .device_request // empty')
+[ -n "$AIR_PARTIAL_REQ" ] || { echo "$AIR_NONCED" >&2; fail "lock sign nonce returned no device payload"; }
+pass "round 2: the wallet signed its share and produced the second device payload"
+
+echo "$AIR_PARTIAL_REQ" >&9
+DEV_PARTIAL_JSON=$(read_device_block 2) || fail "the device never produced a round-2 partial"
+DEV_PARTIAL=$(echo "$DEV_PARTIAL_JSON" | jq -r '.partial // empty')
+[ -n "$DEV_PARTIAL" ] || { echo "$DEV_PARTIAL_JSON" >&2; fail "no partial in the device's round-2 reply"; }
+exec 9>&-
+wait "$DEV_PID" || fail "the backup device exited non-zero"
+
+# Aggregate. A signature that verifies here is one that checks out against the
+# lane's output key — but only the network decides if it spends the coin.
+AIR_DONE=$(WRAITH --json lock sign complete --session "$AIR_SESSION" --device-partial "$DEV_PARTIAL")
+AIR_SIGNED_PSBT=$(echo "$AIR_DONE" | jq -r '.GhostLockSigned.psbt // .psbt // empty')
+[ -n "$AIR_SIGNED_PSBT" ] || { echo "$AIR_DONE" >&2; fail "the ceremony produced no signed PSBT"; }
+pass "round 3: owner and device partials aggregated into one Schnorr signature"
+
+# Unlike the escape path, this returns a signed PSBT rather than a finished
+# transaction — the key-path signature still has to be finalised into a
+# witness. Letting the node do it is also a check: a signature it cannot
+# finalise is one that was never going to spend the coin.
+AIR_FINAL=$($BCLI finalizepsbt "$AIR_SIGNED_PSBT")
+echo "$AIR_FINAL" | jq -e '.complete == true' >/dev/null \
+    || { echo "$AIR_FINAL" >&2; fail "the node could not finalise the air-gapped spend"; }
+AIR_TX=$(echo "$AIR_FINAL" | jq -r '.hex')
+[ -n "$AIR_TX" ] || fail "finalizepsbt returned no transaction"
+
+AIR_TXID=$($BCLI sendrawtransaction "$AIR_TX") \
+    || fail "the node refused the air-gapped spend — the MuSig2 key path does not work on chain"
+$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+AIR_CONF=$($BCLI getrawtransaction "$AIR_TXID" 1 | jq -r '.confirmations // 0')
+[ "$AIR_CONF" -ge 1 ] || fail "air-gapped spend $AIR_TXID did not confirm"
+pass "air-gapped Savings spend confirmed on chain (tx $AIR_TXID)"
+
+AIR_LEFT=$(WRAITH --json lock lanes "${AIR_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .balance_sats] | add // 0')
+[ "$AIR_LEFT" = "0" ] || fail "the savings lane still holds $AIR_LEFT sats after the spend"
+pass "the savings lane is empty — owner and backup device moved the coin together"
+
+# ============================================================================
 echo
 echo "================================================================"
 echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN"
@@ -655,4 +794,5 @@ echo "  7. Ghost Lock prepare/fund/confirm ok  ($LOCK_ID)"
 echo "  8. on-chain payment (light pay)    ok  ($PAY_TXID)"
 echo "  9. single-round Wraith mix         ok  ($FIRST_TXID)"
 echo " 10. Ghost Lock escape spend        ok  ($ESC_TXID)"
+echo " 11. air-gapped Savings spend       ok  ($AIR_TXID)"
 echo "================================================================"
