@@ -4,6 +4,7 @@
 //! Binaries (`wraithd`, `wraith`) and the GUI shell are thin wrappers over this crate.
 
 pub mod auth;
+pub mod block_scan;
 pub mod candidate_scan;
 pub mod chain;
 pub mod descriptor;
@@ -16,6 +17,7 @@ pub mod light;
 pub mod lock_cosign_client;
 pub mod mainnet_guard;
 pub mod psbt;
+pub mod scan_state;
 pub mod signer;
 /// Re-exported: the implementation moved to `ghost-entropy` so the offline
 /// signer can share it. Unchanged, tags included.

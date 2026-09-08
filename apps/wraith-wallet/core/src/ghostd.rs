@@ -142,6 +142,26 @@ impl GhostdRpc {
         )
     }
 
+    /// One block, with every input's previous output resolved.
+    ///
+    /// `getblock <hash> 3` is what makes local scanning possible without an
+    /// indexer: the node returns each input's `prevout` from its undo data,
+    /// so the wallet can tell which inputs were its own — and therefore what
+    /// it *spent* — without a `txindex` or a lookup per input.
+    ///
+    /// Verbosity 2 would give outputs only, which finds money arriving but
+    /// not money leaving. A history that shows credits and no debits is worse
+    /// than none: it reads like a balance that only ever grows.
+    pub fn get_block_with_prevouts(&self, hash: &str) -> Result<VerboseBlock, GhostdError> {
+        self.rpc(
+            "getblock",
+            vec![
+                serde_json::Value::String(hash.to_string()),
+                serde_json::Value::from(3u8),
+            ],
+        )
+    }
+
     /// `scantxoutset start` over a set of `addr(...)` descriptors.
     ///
     /// Walks the whole UTXO set, so it is expensive and bitcoind serialises
@@ -235,7 +255,7 @@ pub struct RawTransaction {
     pub confirmations: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawVout {
     /// vout index.
     pub n: u32,
@@ -257,7 +277,7 @@ impl RawVout {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawScriptPubKey {
     /// Hex-encoded scriptPubKey.
     pub hex: String,
@@ -295,4 +315,70 @@ pub struct ScannedOutput {
     pub script_pub_key: String,
     /// Height the output was created at.
     pub height: u64,
+}
+
+/// One block from `getblock <hash> 3`.
+///
+/// Only the fields a wallet scan needs. `#[serde(default)]` is deliberately
+/// absent on `height` and `tx`: a block without them is not a block this can
+/// scan, and defaulting them would silently scan nothing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerboseBlock {
+    pub hash: String,
+    pub height: u64,
+    /// Block time, unix seconds. What a transaction's history entry is dated
+    /// by — the wallet may not have been running when it was mined.
+    pub time: i64,
+    pub tx: Vec<BlockTx>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockTx {
+    pub txid: String,
+    #[serde(default)]
+    pub vin: Vec<BlockVin>,
+    #[serde(default)]
+    pub vout: Vec<RawVout>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockVin {
+    /// Absent on a coinbase input, which spends nothing.
+    #[serde(default)]
+    pub txid: Option<String>,
+    #[serde(default)]
+    pub vout: Option<u32>,
+    /// The output this input spends. Present for every non-coinbase input at
+    /// verbosity 3; `None` marks an input whose value is not knowable here,
+    /// which makes any fee computed from this transaction wrong rather than
+    /// merely approximate.
+    #[serde(default)]
+    pub prevout: Option<Prevout>,
+    /// Set only on the coinbase input.
+    #[serde(default)]
+    pub coinbase: Option<String>,
+}
+
+impl BlockVin {
+    /// Whether this is the coinbase input.
+    pub fn is_coinbase(&self) -> bool {
+        self.coinbase.is_some()
+    }
+}
+
+/// The output an input spends, as the node resolved it from undo data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Prevout {
+    /// Value in BTC, as bitcoind encodes it.
+    pub value: f64,
+    #[serde(rename = "scriptPubKey")]
+    pub script_pub_key: RawScriptPubKey,
+}
+
+impl Prevout {
+    /// BTC → satoshis, rounded rather than truncated. `0.000_123_45` arriving
+    /// as `0.000_123_449_999` must not lose a satoshi.
+    pub fn value_sats(&self) -> u64 {
+        (self.value * 100_000_000.0).round() as u64
+    }
 }

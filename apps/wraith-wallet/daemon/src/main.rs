@@ -187,6 +187,18 @@ mod server {
         wraith_wallet_core::history_store::HistoryStore::open(path)
     }
 
+    /// Open the block scanner's bookmark.
+    fn scan_state_for(
+        state: &DaemonState,
+    ) -> std::io::Result<wraith_wallet_core::scan_state::ScanState> {
+        let path = state
+            .node_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("scan-state.json");
+        wraith_wallet_core::scan_state::ScanState::open(path)
+    }
+
     fn lock_record(l: &wraith_wallet_core::ghost_lock_store::StoredLock) -> GhostLockRecord {
         GhostLockRecord {
             lock_id: l.lock_id.clone(),
@@ -799,6 +811,10 @@ mod server {
 
         // Auto-lock task. Wakes every 30 s. If idle_lock_secs is 0 the task
         // exits immediately — no overhead when the feature is disabled.
+        // Watch the chain for money arriving. Cheap when there is nothing to
+        // do: it returns immediately without an unlocked wallet or a node.
+        tokio::spawn(block_scan_task(state.clone()));
+
         if idle_lock_secs > 0 {
             tokio::spawn(idle_lock_task(state.clone()));
         }
@@ -1588,7 +1604,9 @@ mod server {
         store
             .record(wraith_wallet_core::history_store::HistoryEntry {
                 txid: txid.to_string(),
-                broadcast_at: now_unix_secs() as i64,
+                at: now_unix_secs() as i64,
+                // Unconfirmed until the scanner sees it mined.
+                block_height: None,
                 amount_sats,
                 fee_sats,
                 kind: kind.to_string(),
@@ -2121,6 +2139,178 @@ mod server {
         }
     }
 
+    /// How many blocks one scan tick will read.
+    ///
+    /// A wallet that has been shut for a week has a lot to catch up on, and
+    /// reading it in one go would hold the runtime and the node for minutes.
+    /// Bounded work per tick means it catches up steadily and stays responsive
+    /// while it does.
+    const SCAN_BATCH_BLOCKS: u32 = 50;
+
+    /// How far back a reorg is looked for before giving up.
+    ///
+    /// Deeper than any reorg this chain has seen. If the fork is further back
+    /// than this the scanner says so rather than guessing — a bookmark that
+    /// cannot be reconciled is a thing to report, not to paper over.
+    const REORG_SEARCH_DEPTH: u32 = 100;
+
+    /// Read new blocks and record what they did to the wallet.
+    ///
+    /// # What this replaces
+    ///
+    /// The operator's GSP watched the chain and pushed what it found, which
+    /// meant giving somebody a scan key and believing the answer. This asks
+    /// the wallet's own node instead. The cost is latency — a payment appears
+    /// within a tick rather than the instant it is relayed — and the gain is
+    /// that nobody else needs to know the wallet is watching.
+    async fn block_scan_task(state: Arc<DaemonState>) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match scan_new_blocks(&state).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(blocks = n, "block scan caught up"),
+                // A node that is down, syncing or mid-restart is the common
+                // case and not worth an error line every twenty seconds. The
+                // status header already says the node is unreachable.
+                Err(e) => tracing::debug!(error = %e, "block scan tick did not complete"),
+            }
+        }
+    }
+
+    /// One pass of the scanner. Returns how many blocks it read.
+    ///
+    /// Does nothing at all without an unlocked wallet — deriving the scripts
+    /// to match against needs the keys, and there is no useful work to do
+    /// while the wallet is locked.
+    async fn scan_new_blocks(state: &Arc<DaemonState>) -> Result<u32, String> {
+        let Some(ours) = own_script_pubkeys(state).await else {
+            return Ok(0);
+        };
+        let Some(rpc) = state.build_ghostd_rpc().await else {
+            return Ok(0);
+        };
+        let rpc = Arc::new(rpc);
+
+        let tip = {
+            let rpc = rpc.clone();
+            tokio::task::spawn_blocking(move || rpc.get_block_count())
+                .await
+                .map_err(|e| format!("join: {e}"))?
+                .map_err(|e| format!("get_block_count: {e}"))? as u32
+        };
+
+        let mut bookmark = scan_state_for(state).map_err(|e| format!("scan state: {e}"))?;
+
+        // A wallet that has never scanned starts at the tip.
+        //
+        // Not at genesis: reading the whole chain to find a wallet that may
+        // have no history at all is hours of work for, usually, nothing. Coins
+        // that arrived before this point are not lost from view — the balance
+        // and the UTXO list scan the entire UTXO set — they are simply absent
+        // from the history, which is a narrower claim and a stated one.
+        let Some(point) = bookmark.point().cloned() else {
+            let hash = block_hash_at(&rpc, tip).await?;
+            bookmark
+                .set(tip, hash)
+                .map_err(|e| format!("scan state write: {e}"))?;
+            tracing::info!(height = tip, "block scanner started watching from the tip");
+            return Ok(0);
+        };
+
+        // Is the chain we read still the chain that exists?
+        let mut from = point.height;
+        if block_hash_at(&rpc, point.height).await? != point.hash {
+            let mut fork = None;
+            let floor = point.height.saturating_sub(REORG_SEARCH_DEPTH);
+            for h in (floor..point.height).rev() {
+                // Walking back to a height both chains agree on. The first
+                // agreement is the fork point; everything above it was read
+                // from blocks that are no longer in the chain.
+                if let Some(known) = recorded_hash_at(state, h) {
+                    if block_hash_at(&rpc, h).await? == known {
+                        fork = Some(h);
+                        break;
+                    }
+                }
+            }
+            let restart = fork.unwrap_or(floor);
+            let mut history = history_store_for(state).map_err(|e| format!("history: {e}"))?;
+            let n = history
+                .unconfirm_from(restart + 1)
+                .map_err(|e| format!("history: {e}"))?;
+            tracing::warn!(
+                was = point.height,
+                restart_from = restart,
+                unconfirmed = n,
+                "chain reorganised under the scanner; rescanning"
+            );
+            from = restart;
+        }
+
+        if from >= tip {
+            return Ok(0);
+        }
+        let end = tip.min(from + SCAN_BATCH_BLOCKS);
+        let mut history = history_store_for(state).map_err(|e| format!("history: {e}"))?;
+        for height in (from + 1)..=end {
+            let hash = block_hash_at(&rpc, height).await?;
+            let block = {
+                let rpc = rpc.clone();
+                let h = hash.clone();
+                tokio::task::spawn_blocking(move || rpc.get_block_with_prevouts(&h))
+                    .await
+                    .map_err(|e| format!("join: {e}"))?
+                    .map_err(|e| format!("getblock {height}: {e}"))?
+            };
+            for m in wraith_wallet_core::block_scan::scan_block(&block, &ours) {
+                history
+                    .record(wraith_wallet_core::history_store::HistoryEntry {
+                        amount_sats: Some(m.net_sats()),
+                        txid: m.txid,
+                        at: m.time,
+                        block_height: Some(m.height as u32),
+                        fee_sats: m.fee_sats,
+                        kind: if m.is_incoming { "receive" } else { "send" }.to_string(),
+                        // The scanner cannot see a memo. `record` merges, so
+                        // `None` here leaves any memo already recorded alone.
+                        memo: None,
+                    })
+                    .map_err(|e| format!("history write: {e}"))?;
+            }
+            // Advanced per block, not per batch: an interrupted catch-up
+            // resumes where it stopped instead of re-reading from the start.
+            bookmark
+                .set(height, hash)
+                .map_err(|e| format!("scan state write: {e}"))?;
+        }
+        Ok(end - from)
+    }
+
+    /// The hash the node reports at `height`.
+    async fn block_hash_at(
+        rpc: &Arc<wraith_wallet_core::ghostd::GhostdRpc>,
+        height: u32,
+    ) -> Result<String, String> {
+        let rpc = rpc.clone();
+        tokio::task::spawn_blocking(move || rpc.get_block_hash(height as u64))
+            .await
+            .map_err(|e| format!("join: {e}"))?
+            .map_err(|e| format!("get_block_hash {height}: {e}"))
+    }
+
+    /// The hash the bookmark holds for `height`, if it is the bookmarked one.
+    ///
+    /// Only one height is remembered, so the reorg walk can confirm agreement
+    /// at exactly that point and otherwise falls back to rescanning the search
+    /// depth — which is correct, just more work.
+    fn recorded_hash_at(state: &Arc<DaemonState>, height: u32) -> Option<String> {
+        let bookmark = scan_state_for(state).ok()?;
+        let p = bookmark.point()?;
+        (p.height == height).then(|| p.hash.clone())
+    }
+
     /// Derive a Lock's four lanes from the supplied keys plus the active
     /// wallet's owner key.
     ///
@@ -2361,14 +2551,16 @@ mod server {
     ///
     /// # What this can and cannot show
     ///
-    /// Every transaction this wallet broadcast, and nothing else. An incoming
-    /// payment does not appear here: the wallet does not index the chain, so
-    /// it never observes a payment arriving — received coins show up in the
-    /// balance and the UTXO list, which is where they actually are.
+    /// Both directions, now that the block scanner runs: what the wallet sent,
+    /// recorded at broadcast, and what arrived, recorded when a block carrying
+    /// it was read.
     ///
-    /// The GSP session used to answer this question because the operator kept
-    /// a ledger of both directions. Losing the incoming half is the real cost
-    /// of not having an operator, and it is stated rather than papered over.
+    /// The one gap is what happened before the scanner started watching. It
+    /// begins at the tip on first run rather than reading the chain from
+    /// genesis, so a restored wallet's older payments are absent from the
+    /// history. They are not absent from the wallet: the balance and the UTXO
+    /// list scan the whole UTXO set and see every coin. It is a narrower claim
+    /// than it used to be, and a stated one.
     async fn l1_history(state: &Arc<DaemonState>, limit: u32, offset: u32) -> Response {
         let store = match history_store_for(state) {
             Ok(s) => s,
@@ -2387,19 +2579,32 @@ mod server {
             .collect();
 
         let chain = state.chain().await;
+        // One tip read for the whole page. Confirmations are derived from the
+        // height the scanner recorded, so a settled history costs a single
+        // round trip rather than one per row.
+        let tip = chain.status().await.ok().and_then(|s| s.chain_height);
+
         let mut transactions = Vec::with_capacity(page.len());
         for e in page {
-            // Unknown depth is reported as unknown. A node without `txindex`
-            // cannot answer, and printing 0 would show every settled payment
-            // as though it were still pending.
-            let confirmations = chain.tx_confirmations(&e.txid).await.unwrap_or(None);
+            let confirmations = match (e.block_height, tip) {
+                // Inclusive of the block it landed in: an entry in the tip
+                // block has one confirmation, not zero. That off-by-one is the
+                // difference between "spendable" and "invisible".
+                (Some(h), Some(t)) if t >= h as u64 => Some((t - h as u64 + 1) as u32),
+                // Mined deeper than the tip we just read means the tip moved
+                // backwards under us — a reorg the scanner has not caught up
+                // with yet. Unknown is the honest answer for one tick.
+                (Some(_), Some(_)) => None,
+                (Some(_), None) => None,
+                // Never seen in a block. Ask the node whether it at least
+                // holds the transaction, which distinguishes "in the mempool"
+                // from "the node has never heard of this".
+                (None, _) => chain.tx_confirmations(&e.txid).await.unwrap_or(None),
+            };
             transactions.push(LightHistoryEntry {
                 txid: e.txid,
-                // Deriving a height from confirmations would need the tip, and
-                // the tip moves between the two calls. The confirmation count
-                // is the figure that was actually measured.
-                block_height: None,
-                timestamp: e.broadcast_at,
+                block_height: e.block_height,
+                timestamp: e.at,
                 amount_sats: e.amount_sats,
                 fee_sats: e.fee_sats,
                 tx_type: e.kind,
@@ -5122,6 +5327,99 @@ mod server {
             let (net, fee) = psbt_ledger_effect(&psbt, &ours);
             assert_eq!(fee, None, "a partial fee is a wrong fee");
             assert_eq!(net, None);
+        }
+
+        /// A chain stub that answers with a fixed tip, so confirmation
+        /// arithmetic can be tested without a node.
+        struct TipChain(u64);
+
+        #[async_trait::async_trait]
+        impl ChainClient for TipChain {
+            async fn status(
+                &self,
+            ) -> Result<wraith_wallet_core::chain::ChainStatus, wraith_wallet_core::chain::ChainError>
+            {
+                Ok(wraith_wallet_core::chain::ChainStatus {
+                    backend_version: "stub".into(),
+                    network: "regtest".into(),
+                    chain_height: Some(self.0),
+                    chain_headers: Some(self.0),
+                    chain_verification_progress: None,
+                    chain_initial_block_download: Some(false),
+                })
+            }
+        }
+
+        /// Confirmations count the block the transaction landed in.
+        ///
+        /// An entry mined in the tip block has one confirmation, not zero.
+        /// That off-by-one is the difference between a coin reading as
+        /// spendable and reading as not there yet.
+        #[tokio::test]
+        async fn confirmations_are_inclusive_of_the_mining_block() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            state.clients.write().await.chain = Arc::new(TipChain(900_010));
+
+            let mut store = history_store_for(&state).unwrap();
+            for (txid, height) in [("tip", 900_010u32), ("ten_deep", 900_001)] {
+                store
+                    .record(wraith_wallet_core::history_store::HistoryEntry {
+                        txid: txid.into(),
+                        at: 1,
+                        block_height: Some(height),
+                        amount_sats: Some(1_000),
+                        fee_sats: None,
+                        kind: "receive".into(),
+                        memo: None,
+                    })
+                    .unwrap();
+            }
+
+            match l1_history(&state, 10, 0).await {
+                Response::LightHistory(h) => {
+                    let by: std::collections::HashMap<_, _> = h
+                        .transactions
+                        .into_iter()
+                        .map(|t| (t.txid.clone(), t))
+                        .collect();
+                    assert_eq!(by["tip"].confirmations, Some(1), "the tip block counts");
+                    assert_eq!(by["ten_deep"].confirmations, Some(10));
+                    assert_eq!(by["tip"].block_height, Some(900_010));
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
+        }
+
+        /// An entry the scanner has not seen mined must not borrow the tip and
+        /// claim a depth. It is unconfirmed, and the honest count is unknown
+        /// until the node is asked about it directly.
+        #[tokio::test]
+        async fn an_unmined_entry_does_not_infer_confirmations_from_the_tip() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            state.clients.write().await.chain = Arc::new(TipChain(900_010));
+
+            let mut store = history_store_for(&state).unwrap();
+            store
+                .record(wraith_wallet_core::history_store::HistoryEntry {
+                    txid: "pending".into(),
+                    at: 1,
+                    block_height: None,
+                    amount_sats: Some(-1_000),
+                    fee_sats: None,
+                    kind: "send".into(),
+                    memo: None,
+                })
+                .unwrap();
+
+            match l1_history(&state, 10, 0).await {
+                Response::LightHistory(h) => {
+                    assert_eq!(h.transactions[0].confirmations, None);
+                    assert_eq!(h.transactions[0].block_height, None);
+                }
+                other => panic!("expected history, got {other:?}"),
+            }
         }
 
         /// A locked wallet cannot tell its own outputs from a stranger's, so
