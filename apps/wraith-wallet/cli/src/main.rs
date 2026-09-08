@@ -522,6 +522,31 @@ enum LightCommand {
         #[arg(long, value_name = "MS")]
         shroud_max_ms: Option<u64>,
     },
+    /// Pay someone on-chain: build, sign and broadcast in one step.
+    ///
+    /// This spends the wallet's own coins through the configured node. No
+    /// operator is involved and nobody else has to be online.
+    Pay {
+        /// Recipient Bitcoin address.
+        recipient_address: String,
+        /// Amount in satoshis. The miner fee is charged on top.
+        amount_sats: u64,
+        /// Fee rate in satoshis per virtual byte.
+        #[arg(long, default_value_t = 5)]
+        fee_rate: u64,
+        /// Highest BIP86 receive index to scan for spendable coins.
+        #[arg(long, default_value_t = 32)]
+        scan_max: u32,
+        /// Note kept in the local history. Never goes on-chain.
+        #[arg(long)]
+        memo: Option<String>,
+        /// Skip the outbound-broadcast shroud delay for this payment.
+        #[arg(long, conflicts_with = "shroud_max_ms")]
+        immediate: bool,
+        /// Override the daemon's default shroud window (ms).
+        #[arg(long, value_name = "MS")]
+        shroud_max_ms: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -762,6 +787,24 @@ mod client {
                     recipient,
                     amount_sats,
                     mode,
+                    memo,
+                    shroud_max_ms: if immediate { Some(0) } else { shroud_max_ms },
+                },
+                LightCommand::Pay {
+                    recipient_address,
+                    amount_sats,
+                    fee_rate,
+                    scan_max,
+                    memo,
+                    immediate,
+                    shroud_max_ms,
+                } => Request::L1Send {
+                    recipient_address,
+                    amount_sats,
+                    fee_rate_sats_per_vb: fee_rate,
+                    change_index: None,
+                    bip86_scan_max: scan_max,
+                    selected_outpoints: Vec::new(),
                     memo,
                     shroud_max_ms: if immediate { Some(0) } else { shroud_max_ms },
                 },
@@ -1410,6 +1453,22 @@ mod client {
                         h.transactions.len(),
                         h.total_count
                     );
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::L1Sent(s)) => {
+                println!("broadcast");
+                println!("  txid:       {}", s.txid);
+                println!("  recipient:  {}", s.recipient);
+                println!("  amount:     {} sats", s.amount_sats);
+                // Stated separately because the sender pays it on top: the
+                // balance drops by amount + fee, not by amount.
+                println!("  fee:        {} sats", s.fee_sats);
+                println!("  change:     {} sats", s.change_sats);
+                println!("  inputs:     {}", s.input_count);
+                match s.shroud_delay_ms {
+                    Some(ms) => println!("  shroud:     held {ms} ms before broadcast"),
+                    None => println!("  shroud:     disabled (immediate)"),
                 }
                 std::process::ExitCode::SUCCESS
             }

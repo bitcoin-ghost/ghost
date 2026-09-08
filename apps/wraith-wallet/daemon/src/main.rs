@@ -1991,12 +1991,125 @@ mod server {
         })
     }
 
+    /// What one on-chain payment needs to know.
+    ///
+    /// A struct rather than a long argument list: every field but the first
+    /// two is optional in spirit, and eight positional arguments of mostly
+    /// numbers is a place where two of them quietly swap.
+    struct L1SendParams {
+        recipient_address: String,
+        amount_sats: u64,
+        fee_rate_sats_per_vb: u64,
+        change_index: Option<u32>,
+        bip86_scan_max: u32,
+        selected_outpoints: Vec<wraith_wallet_ipc::OutpointRef>,
+        memo: Option<String>,
+        shroud_override_ms: Option<u64>,
+    }
+
+    /// Build, sign and broadcast an ordinary on-chain payment.
+    ///
+    /// Composed from the three verbs that already exist rather than
+    /// re-implementing any of them: `psbt_create_handler` selects coins and
+    /// sets the change, `sign_owned_inputs` signs what the wallet owns, and
+    /// `psbt_broadcast_handler` is the single place a transaction reaches the
+    /// network and the single place history is written.
+    ///
+    /// It stops with a clear error rather than broadcasting a partly signed
+    /// transaction. An incomplete PSBT here means a selected input was not
+    /// ours to sign — which is worth saying, because the alternative is a
+    /// rejection from the node whose message explains nothing.
+    async fn l1_send(
+        state: &Arc<DaemonState>,
+        p: L1SendParams,
+    ) -> Result<wraith_wallet_ipc::L1SendResponse, String> {
+        use wraith_wallet_core::psbt as psbt_mod;
+
+        let L1SendParams {
+            recipient_address,
+            amount_sats,
+            fee_rate_sats_per_vb,
+            change_index,
+            bip86_scan_max,
+            selected_outpoints,
+            memo,
+            shroud_override_ms,
+        } = p;
+
+        let built = psbt_create_handler(
+            state,
+            &recipient_address,
+            amount_sats,
+            fee_rate_sats_per_vb,
+            change_index,
+            bip86_scan_max,
+            &selected_outpoints,
+        )
+        .await?;
+
+        let network = state.network;
+        let scan_max = bip86_scan_max.max(1);
+        let (mut parsed, encoding) =
+            psbt_mod::decode_psbt(&built.psbt).map_err(|e| format!("decode: {e}"))?;
+        let signed_count = with_active_wallet(state, move |_, ks| {
+            psbt_mod::sign_owned_inputs(&mut parsed, ks, network, scan_max)
+                .map(|n| (n, parsed))
+                .map_err(|e| format!("sign: {e}"))
+        })
+        .await?;
+        let (signed, signed_psbt) = signed_count;
+        if !psbt_mod::is_complete(&signed_psbt) {
+            return Err(format!(
+                "signed {} of {} inputs — the rest are not this wallet's to sign, \
+                 so nothing was broadcast",
+                signed.len(),
+                signed_psbt.inputs.len()
+            ));
+        }
+
+        // The same shroud as `LightSend`, and it means more here: this one
+        // does reach the P2P network, where the moment of broadcast is what an
+        // observer correlates against the user's keystrokes.
+        let max_ms = shroud_override_ms.unwrap_or(state.shroud_max_ms);
+        let shroud_delay_ms = shroud_pick_delay(max_ms);
+        if let Some(chosen) = shroud_delay_ms {
+            tracing::debug!(
+                shroud_max_ms = max_ms,
+                chosen_ms = chosen,
+                "shroud relay: holding L1 payment before broadcast"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(chosen)).await;
+        }
+
+        let encoded = psbt_mod::encode_psbt(&signed_psbt, encoding);
+        let txid = psbt_broadcast_handler(state, &encoded, "send", memo).await?;
+
+        Ok(wraith_wallet_ipc::L1SendResponse {
+            txid,
+            recipient: recipient_address,
+            // From the built transaction, not from the request: coin selection
+            // decides what the fee ends up being.
+            amount_sats: built.recipient_sats,
+            fee_sats: built.fee_sats,
+            change_sats: built.change_sats,
+            input_count: built.input_count,
+            shroud_delay_ms,
+        })
+    }
+
     /// Extract a finalized tx from a PSBT (or accept raw tx hex
-    /// directly) and broadcast it via ghost-pay. Returns the
-    /// txid bitcoind accepted.
+    /// directly), broadcast it, and write it into the local history.
+    /// Returns the txid the node accepted.
+    ///
+    /// This is the one place a transaction reaches the network, which is why
+    /// it is also the one place history is written: a spend that never left
+    /// is not something the wallet did, and one that left must not be
+    /// forgotten.
     async fn psbt_broadcast_handler(
         state: &DaemonState,
         psbt_or_tx_hex: &str,
+        kind: &str,
+        memo: Option<String>,
     ) -> Result<String, String> {
         use wraith_wallet_core::psbt as psbt_mod;
         let trimmed = psbt_or_tx_hex.trim();
@@ -2004,6 +2117,7 @@ mod server {
         // Anything else, treat as raw consensus-encoded tx hex.
         let is_psbt =
             trimmed.to_lowercase().starts_with("70736274ff") || trimmed.starts_with("cHNidP");
+        let mut source_psbt = None;
         let tx_hex = if is_psbt {
             let (parsed, _) =
                 psbt_mod::decode_psbt(trimmed).map_err(|e| format!("decode_psbt: {e}"))?;
@@ -2013,9 +2127,15 @@ mod server {
                 );
             }
             let tx = parsed
+                .clone()
                 .extract_tx()
                 .map_err(|e| format!("extract_tx: {e}"))?;
-            bitcoin::consensus::encode::serialize_hex(&tx)
+            let hex = bitcoin::consensus::encode::serialize_hex(&tx);
+            // Kept for the history entry: a PSBT carries the input values, so
+            // it is the only form from which the fee and the true net change
+            // can be worked out. A bare transaction does not carry them.
+            source_psbt = Some(parsed);
+            hex
         } else {
             let bytes = hex::decode(trimmed).map_err(|e| format!("hex: {e}"))?;
             let _: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes)
@@ -2032,7 +2152,7 @@ mod server {
         // rejected is not something the wallet did. A failure to record is
         // logged and not propagated: the money has already moved, and
         // reporting the broadcast as failed would be the more damaging lie.
-        if let Err(e) = record_broadcast(state, &txid, &tx_hex, "send", None).await {
+        if let Err(e) = record_broadcast(state, &txid, source_psbt.as_ref(), kind, memo).await {
             tracing::warn!(
                 txid = %txid,
                 error = %e,
@@ -2044,46 +2164,101 @@ mod server {
 
     /// Write one broadcast into the local history.
     ///
-    /// The amount is the value leaving the wallet: outputs that do not pay one
-    /// of our own scripts. Working that out needs the keys, so a locked wallet
-    /// records the transaction with no amount rather than with a wrong one —
-    /// `None` reads as "—" in the UI, where a `0` would read as "moved
-    /// nothing".
+    /// Both figures come from the PSBT or from nowhere. A raw transaction does
+    /// not carry its input values, so neither the fee nor the net change can
+    /// be derived from one; the entry is then recorded with `None` for both
+    /// rather than with a plausible-looking wrong number. `None` reads as "—"
+    /// in the UI, where a `0` would read as "moved nothing".
     async fn record_broadcast(
         state: &DaemonState,
         txid: &str,
-        tx_hex: &str,
+        source_psbt: Option<&bitcoin::psbt::Psbt>,
         kind: &str,
         memo: Option<String>,
     ) -> Result<(), String> {
-        let amount_sats = outgoing_amount(state, tx_hex).await;
+        let (amount_sats, fee_sats) = match source_psbt {
+            Some(p) => match own_script_pubkeys(state).await {
+                Some(ours) => psbt_ledger_effect(p, &ours),
+                // Locked wallet: the fee is still inputs minus outputs and
+                // needs no keys, but which coins were ours does.
+                None => (None, psbt_ledger_effect_fee(p)),
+            },
+            None => (None, None),
+        };
         let mut store = history_store_for(state).map_err(|e| format!("history store: {e}"))?;
         store
             .record(wraith_wallet_core::history_store::HistoryEntry {
                 txid: txid.to_string(),
                 broadcast_at: now_unix_secs() as i64,
                 amount_sats,
-                // The miner fee is inputs minus outputs, and the input values
-                // are not in the transaction. Claiming one would mean guessing.
-                fee_sats: None,
+                fee_sats,
                 kind: kind.to_string(),
                 memo,
             })
             .map_err(|e| format!("history write: {e}"))
     }
 
-    /// Value leaving the wallet in `tx_hex`, negative, or `None` if unknowable.
-    async fn outgoing_amount(state: &DaemonState, tx_hex: &str) -> Option<i64> {
-        let bytes = hex::decode(tx_hex).ok()?;
-        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes).ok()?;
-        let ours = own_script_pubkeys(state).await?;
-        let mut leaving: i64 = 0;
-        for out in &tx.output {
-            if !ours.contains(out.script_pubkey.as_bytes()) {
-                leaving = leaving.saturating_add(out.value.to_sat() as i64);
+    /// The value backing one PSBT input, from whichever UTXO field carries it.
+    fn psbt_input_value(psbt: &bitcoin::psbt::Psbt, i: usize) -> Option<&bitcoin::TxOut> {
+        let input = psbt.inputs.get(i)?;
+        if let Some(txout) = input.witness_utxo.as_ref() {
+            return Some(txout);
+        }
+        // Legacy inputs carry the whole previous transaction instead.
+        let prev = input.non_witness_utxo.as_ref()?;
+        let outpoint = psbt.unsigned_tx.input.get(i)?.previous_output;
+        prev.output.get(outpoint.vout as usize)
+    }
+
+    /// Miner fee: every input value minus every output value.
+    ///
+    /// `None` if any input's value is missing — a fee computed from a subset
+    /// of the inputs is not a smaller fee, it is a wrong one.
+    fn psbt_ledger_effect_fee(psbt: &bitcoin::psbt::Psbt) -> Option<u64> {
+        let mut inputs = 0u64;
+        for i in 0..psbt.unsigned_tx.input.len() {
+            inputs = inputs.saturating_add(psbt_input_value(psbt, i)?.value.to_sat());
+        }
+        let outputs: u64 = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|o| o.value.to_sat())
+            .sum();
+        Some(inputs.saturating_sub(outputs))
+    }
+
+    /// What this PSBT does to the wallet's balance, and what it pays in fee.
+    ///
+    /// The net is our outputs minus our inputs, so it accounts for change and
+    /// for the fee without either being special-cased: a 50,000 sat payment
+    /// costing 500 in fee nets −50,500, which is the number the balance will
+    /// actually move by. Addresses beyond the scan window read as somebody
+    /// else's and overstate what left — the safer direction to be wrong in for
+    /// a record the user checks against their memory of the payment.
+    fn psbt_ledger_effect(
+        psbt: &bitcoin::psbt::Psbt,
+        ours: &std::collections::HashSet<Vec<u8>>,
+    ) -> (Option<i64>, Option<u64>) {
+        let fee = psbt_ledger_effect_fee(psbt);
+        let mut spent: i64 = 0;
+        for i in 0..psbt.unsigned_tx.input.len() {
+            let Some(txout) = psbt_input_value(psbt, i) else {
+                // One unknown input value makes the net unknowable; the fee
+                // is already `None` for the same reason.
+                return (None, fee);
+            };
+            if ours.contains(txout.script_pubkey.as_bytes()) {
+                spent = spent.saturating_add(txout.value.to_sat() as i64);
             }
         }
-        Some(-leaving)
+        let mut received: i64 = 0;
+        for out in &psbt.unsigned_tx.output {
+            if ours.contains(out.script_pubkey.as_bytes()) {
+                received = received.saturating_add(out.value.to_sat() as i64);
+            }
+        }
+        (Some(received.saturating_sub(spent)), fee)
     }
 
     /// The scripts this wallet can spend, over the scan window.
@@ -4304,6 +4479,33 @@ mod server {
                 Ok(r) => Response::LightSent(r),
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
+            Request::L1Send {
+                recipient_address,
+                amount_sats,
+                fee_rate_sats_per_vb,
+                change_index,
+                bip86_scan_max,
+                selected_outpoints,
+                memo,
+                shroud_max_ms,
+            } => match l1_send(
+                state,
+                L1SendParams {
+                    recipient_address,
+                    amount_sats,
+                    fee_rate_sats_per_vb,
+                    change_index,
+                    bip86_scan_max,
+                    selected_outpoints,
+                    memo,
+                    shroud_override_ms: shroud_max_ms,
+                },
+            )
+            .await
+            {
+                Ok(r) => Response::L1Sent(r),
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
             Request::WalletCreate {
                 name,
                 passphrase,
@@ -5547,7 +5749,7 @@ mod server {
                 Err(e) => Response::Error(ErrorResponse { message: e }),
             },
             Request::PsbtBroadcast { psbt_or_tx_hex } => {
-                match psbt_broadcast_handler(state, &psbt_or_tx_hex).await {
+                match psbt_broadcast_handler(state, &psbt_or_tx_hex, "send", None).await {
                     Ok(txid) => Response::PsbtBroadcast(PsbtBroadcastResponse { txid }),
                     Err(e) => Response::Error(ErrorResponse { message: e }),
                 }
@@ -5728,27 +5930,90 @@ mod server {
             }
         }
 
-        /// A raw regtest transaction paying 5,000 sats to one output.
-        ///
-        /// Built here rather than hard-coded so the amount and the assertion
-        /// cannot drift apart.
-        fn one_output_tx(sats: u64) -> String {
-            use bitcoin::{
-                absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction,
-            };
+        /// A distinct taproot-shaped script, so "ours" and "theirs" can be
+        /// told apart without needing real keys.
+        fn spk(tag: u8) -> bitcoin::ScriptBuf {
+            let mut v = vec![0x51, 0x20];
+            v.extend_from_slice(&[tag; 32]);
+            bitcoin::ScriptBuf::from_bytes(v)
+        }
+
+        /// A PSBT spending `inputs` into `outputs`, each entry a value and the
+        /// script tag paying it.
+        fn test_psbt(inputs: &[(u64, u8)], outputs: &[(u64, u8)]) -> bitcoin::psbt::Psbt {
+            use bitcoin::hashes::Hash;
+            use bitcoin::{absolute::LockTime, transaction::Version, Amount, Transaction, TxOut};
             let tx = Transaction {
                 version: Version::TWO,
                 lock_time: LockTime::ZERO,
-                input: vec![],
-                output: vec![bitcoin::TxOut {
-                    value: Amount::from_sat(sats),
-                    script_pubkey: ScriptBuf::from_hex(
-                        "51200000000000000000000000000000000000000000000000000000000000000001",
-                    )
-                    .unwrap(),
-                }],
+                input: (0..inputs.len())
+                    .map(|i| bitcoin::TxIn {
+                        previous_output: bitcoin::OutPoint {
+                            txid: bitcoin::Txid::from_byte_array([i as u8; 32]),
+                            vout: 0,
+                        },
+                        ..Default::default()
+                    })
+                    .collect(),
+                output: outputs
+                    .iter()
+                    .map(|(v, tag)| TxOut {
+                        value: Amount::from_sat(*v),
+                        script_pubkey: spk(*tag),
+                    })
+                    .collect(),
             };
-            bitcoin::consensus::encode::serialize_hex(&tx)
+            let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).unwrap();
+            for (i, (v, tag)) in inputs.iter().enumerate() {
+                psbt.inputs[i].witness_utxo = Some(TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: spk(*tag),
+                });
+            }
+            psbt
+        }
+
+        /// The net is what the balance will actually move by — the payment
+        /// *and* the fee, with change netted back out. A history that showed
+        /// only the payment would never reconcile against the balance.
+        #[test]
+        fn the_net_change_counts_the_fee_and_nets_out_change() {
+            let ours: std::collections::HashSet<Vec<u8>> =
+                [spk(0xaa).to_bytes()].into_iter().collect();
+            // 100,000 of ours in; 50,000 to a stranger, 49,500 back as change.
+            let psbt = test_psbt(&[(100_000, 0xaa)], &[(50_000, 0xbb), (49_500, 0xaa)]);
+            let (net, fee) = psbt_ledger_effect(&psbt, &ours);
+            assert_eq!(fee, Some(500));
+            assert_eq!(
+                net,
+                Some(-50_500),
+                "the balance drops by the payment plus the fee, not the payment alone"
+            );
+        }
+
+        /// A consolidation pays only the miner. It is not a zero-value event.
+        #[test]
+        fn a_self_send_nets_the_fee_only() {
+            let ours: std::collections::HashSet<Vec<u8>> =
+                [spk(0xaa).to_bytes()].into_iter().collect();
+            let psbt = test_psbt(&[(10_000, 0xaa), (10_000, 0xaa)], &[(19_800, 0xaa)]);
+            let (net, fee) = psbt_ledger_effect(&psbt, &ours);
+            assert_eq!(fee, Some(200));
+            assert_eq!(net, Some(-200));
+        }
+
+        /// One input of unknown value makes both figures unknowable. A fee
+        /// computed from only the inputs that happened to be present is not a
+        /// smaller fee — it is a wrong one, and it would read as authoritative.
+        #[test]
+        fn a_missing_input_value_yields_no_figures_rather_than_partial_ones() {
+            let ours: std::collections::HashSet<Vec<u8>> =
+                [spk(0xaa).to_bytes()].into_iter().collect();
+            let mut psbt = test_psbt(&[(100_000, 0xaa), (100_000, 0xaa)], &[(199_000, 0xbb)]);
+            psbt.inputs[1].witness_utxo = None;
+            let (net, fee) = psbt_ledger_effect(&psbt, &ours);
+            assert_eq!(fee, None, "a partial fee is a wrong fee");
+            assert_eq!(net, None);
         }
 
         /// A locked wallet cannot tell its own outputs from a stranger's, so
@@ -5759,7 +6024,8 @@ mod server {
         async fn a_broadcast_without_keys_records_no_amount_rather_than_zero() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
-            record_broadcast(&state, "deadbeef", &one_output_tx(5_000), "send", None)
+            let psbt = test_psbt(&[(10_000, 0xaa)], &[(9_500, 0xbb)]);
+            record_broadcast(&state, "deadbeef", Some(&psbt), "send", None)
                 .await
                 .expect("recording must succeed even with no wallet unlocked");
             let store = history_store_for(&state).unwrap();
@@ -5769,6 +6035,11 @@ mod server {
                 rows[0].amount_sats, None,
                 "no keys means no amount, not a zero amount"
             );
+            assert_eq!(
+                rows[0].fee_sats,
+                Some(500),
+                "the fee needs no keys — it is inputs minus outputs"
+            );
         }
 
         /// A backend that cannot answer must not have its silence rendered as
@@ -5777,7 +6048,7 @@ mod server {
         async fn history_reports_unknown_confirmations_as_unknown() {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
-            record_broadcast(&state, "aa11", &one_output_tx(1_000), "send", None)
+            record_broadcast(&state, "aa11", None, "send", None)
                 .await
                 .unwrap();
             match l1_history(&state, 10, 0).await {
@@ -5799,7 +6070,7 @@ mod server {
             let dir = tempfile::tempdir().unwrap();
             let state = test_state_in(dir.path().to_path_buf());
             for i in 0..5u32 {
-                record_broadcast(&state, &format!("tx{i}"), &one_output_tx(100), "send", None)
+                record_broadcast(&state, &format!("tx{i}"), None, "send", None)
                     .await
                     .unwrap();
             }

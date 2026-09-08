@@ -387,6 +387,33 @@ async fn light_send(
     to_value(&resp)
 }
 
+/// Build, sign and broadcast an ordinary on-chain payment in one call.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn l1_send(
+    recipient_address: String,
+    amount_sats: u64,
+    fee_rate_sats_per_vb: Option<u64>,
+    change_index: Option<u32>,
+    bip86_scan_max: Option<u32>,
+    selected_outpoints: Option<Vec<wraith_wallet_ipc::OutpointRef>>,
+    memo: Option<String>,
+    shroud_max_ms: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::L1Send {
+        recipient_address,
+        amount_sats,
+        fee_rate_sats_per_vb: fee_rate_sats_per_vb.unwrap_or(5),
+        change_index,
+        bip86_scan_max: bip86_scan_max.unwrap_or(32),
+        selected_outpoints: selected_outpoints.unwrap_or_default(),
+        memo,
+        shroud_max_ms,
+    })
+    .await?;
+    to_value(&resp)
+}
+
 #[tauri::command]
 async fn light_utxos(min_confirmations: Option<u32>) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::LightUtxos {
@@ -987,6 +1014,7 @@ pub fn run() {
             light_receive,
             light_history,
             light_send,
+            l1_send,
             light_utxos,
             light_l1_utxos,
             wraith_coordinator_discover,

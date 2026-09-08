@@ -568,6 +568,46 @@ export async function lightSend(
   return unwrap(resp).payload;
 }
 
+export interface L1SendResponse {
+  txid: string;
+  recipient: string;
+  amount_sats: number;
+  fee_sats: number;
+  change_sats: number;
+  input_count: number;
+  shroud_delay_ms?: number | null;
+}
+
+/// Build, sign and broadcast an on-chain payment in one call.
+///
+/// The PSBT verbs remain for anyone who wants to look at the transaction
+/// before it leaves; this is the ordinary path.
+export async function l1Send(args: {
+  recipient_address: string;
+  amount_sats: number;
+  fee_rate_sats_per_vb?: number;
+  change_index?: number;
+  bip86_scan_max?: number;
+  selected_outpoints?: OutpointRef[];
+  memo?: string;
+  shroud_max_ms?: number;
+}): Promise<L1SendResponse> {
+  const resp = await invoke("l1_send", {
+    recipientAddress: args.recipient_address,
+    amountSats: args.amount_sats,
+    feeRateSatsPerVb: args.fee_rate_sats_per_vb,
+    changeIndex: args.change_index,
+    bip86ScanMax: args.bip86_scan_max,
+    selectedOutpoints: args.selected_outpoints,
+    memo: args.memo,
+    shroudMaxMs: args.shroud_max_ms,
+  });
+  // Must unwrap: a rejected send serializes as { result: "error", message },
+  // which `invoke` RESOLVES. Without this the caller's success branch runs and
+  // the UI reports "Sent" for a payment that never left.
+  return unwrap<L1SendResponse>(resp).payload;
+}
+
 export interface LightUtxoEntry {
   txid: string;
   vout: number;

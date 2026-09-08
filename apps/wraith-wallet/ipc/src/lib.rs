@@ -368,6 +368,39 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shroud_max_ms: Option<u64>,
     },
+    /// Pay someone on-chain: build, sign and broadcast, in one call.
+    ///
+    /// The three steps already exist as `PsbtCreate`, `PsbtSign` and
+    /// `PsbtBroadcast`, and they stay — a user who wants to inspect the
+    /// transaction before it leaves, or sign it somewhere else, should be able
+    /// to. This is the ordinary path, where being asked to shepherd a payment
+    /// through three round trips is not a feature.
+    ///
+    /// It is deliberately a separate verb rather than a flag on `PsbtCreate`:
+    /// building a transaction moves no money and broadcasting one cannot be
+    /// undone, and a request that sometimes does the second is a request whose
+    /// consequences depend on a field somebody might not set.
+    L1Send {
+        recipient_address: String,
+        amount_sats: u64,
+        #[serde(default = "default_fee_rate")]
+        fee_rate_sats_per_vb: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change_index: Option<u32>,
+        #[serde(default = "default_l1_scan_max_index")]
+        bip86_scan_max: u32,
+        /// Coin control, as `PsbtCreate`: empty means "pick for me".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        selected_outpoints: Vec<OutpointRef>,
+        /// Kept locally in the wallet's history. It is never put on-chain and
+        /// never leaves the machine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memo: Option<String>,
+        /// Hold the broadcast for a random delay in `[0, n]` ms, as
+        /// `LightSend`. `None` uses the daemon default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shroud_max_ms: Option<u64>,
+    },
     /// Create a new named wallet on disk and add it to the daemon's unlocked set.
     WalletCreate {
         name: String,
@@ -791,6 +824,7 @@ pub enum Response {
     /// Unsolicited push: a new BIP-352 detection. Daemon sends with `id=0`.
     PaymentDetected(DetectedPaymentEntry),
     LightSent(LightSentResponse),
+    L1Sent(L1SendResponse),
     WalletCreate(WalletCreateResponse),
     /// Reply to `Request::WalletImport`. We don't echo the mnemonic back —
     /// the caller already has it.
@@ -1412,6 +1446,29 @@ pub struct NodeEndpointsResponse {
 }
 
 /// Result of `LightSend` (PreparePayment + sign + SubmitSignedPayment).
+/// The outcome of an [`Request::L1Send`].
+///
+/// Every figure here is measured from the transaction that was actually
+/// broadcast, not from what was asked for: coin selection decides the inputs,
+/// and the fee follows from their size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L1SendResponse {
+    pub txid: String,
+    pub recipient: String,
+    /// What the recipient receives.
+    pub amount_sats: u64,
+    /// The miner fee, on top of `amount_sats`.
+    pub fee_sats: u64,
+    /// What returned to the wallet as change. `0` when the selection landed
+    /// exactly, or when the change would have been dust.
+    pub change_sats: u64,
+    pub input_count: u32,
+    /// Milliseconds the wallet held the signed transaction before broadcasting
+    /// it. `None` when the shroud was disabled for this send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shroud_delay_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightSentResponse {
     pub payment_id: String,
@@ -1971,6 +2028,16 @@ mod tests {
                 shroud_max_ms: None,
                 mode: "onchain".into(),
                 memo: Some("test".into()),
+            },
+            Request::L1Send {
+                recipient_address: "bc1qxyz".into(),
+                amount_sats: 100_000,
+                fee_rate_sats_per_vb: 5,
+                change_index: None,
+                bip86_scan_max: 32,
+                selected_outpoints: Vec::new(),
+                memo: Some("test".into()),
+                shroud_max_ms: None,
             },
             Request::GhostLockRoundDestination {
                 lock_id: "abc123".into(),
