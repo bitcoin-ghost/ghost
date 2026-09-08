@@ -40,7 +40,26 @@ use stratum_apps::stratum_core::{
 // the pool exchange the correct messages upon connection. And that the miner is able to submit
 // shares.
 
-#[tokio::test]
+// ⛔ MULTI-THREADED ON PURPOSE (#849). On the default current-thread runtime this test does not
+// fail — it HANGS, for ever, and takes the whole binary with it.
+//
+// `Sniffer::wait_for_message_type` has a 60s deadline meant to turn exactly this into a failure,
+// and #450 moved its queue read onto the blocking pool so the read could not stall the executor.
+// That hardening is not sufficient. The read is only one of the things on this runtime that takes
+// a BLOCKING lock: the sniffer's own forwarding task (`add_message` -> `safe_lock`), the
+// translator and the pool all do it inline on the executor. tokio's TIMER also lives on that one
+// thread, so as soon as any of them blocks it, `timeout` and `sleep` stop advancing and the 60s
+// deadline can never arrive. The guard is unreachable precisely when it is needed.
+//
+// Measured on this test, `--exact`, quiet box: current-thread hung 5/5 runs to a 150s kill with
+// no panic and no log output after the first 10s. With four worker threads: 0/3 hangs — two runs
+// failed on the 60s deadline with its own message, one passed.
+//
+// ⚠ That surviving 2-in-3 failure is a REAL defect, not a harness artefact: after `CloseChannel`
+// the translator often never opens the fallback upstream, logging `Failed to send fallback status
+// from ChannelManager`. It is filed separately. This attribute does not fix it — it makes it
+// visible as a failure in 60s instead of a 420s CI timeout with an empty log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
     start_tracing();
 
@@ -192,7 +211,7 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
     sniffer_b
         .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
         .await;
-    translator.shutdown().await;
+    shutdown_all!(translator, sniffer_a, sniffer_b);
 }
 
 // Verify's that the non-aggregated mode translator does not shut down if an
@@ -253,7 +272,7 @@ async fn tproxy_sends_single_open_extended_mining_channel_in_aggregated_mode() {
             .await
     );
 
-    shutdown_all!(pool, tproxy);
+    shutdown_all!(pool, tproxy, pool_translator_sniffer);
 }
 
 #[tokio::test]
@@ -497,7 +516,7 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
             break;
         }
     }
-    shutdown_all!(translator, pool);
+    shutdown_all!(translator, pool, sniffer, _sniffer_pool_tp);
 }
 
 // This test launches a tProxy in non-aggregated mode and leverages a MockUpstream to test the
@@ -674,7 +693,7 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
     sv1_sniffer_2
         .wait_for_message(&["mining.submit"], MessageDirection::ToUpstream)
         .await;
-    translator.shutdown().await;
+    shutdown_all!(translator, sniffer);
 }
 
 // This test verifies that the pool server continues accepting new connection

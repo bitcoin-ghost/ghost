@@ -48,6 +48,17 @@ pub struct Sniffer<'a> {
     action: Vec<InterceptAction>,
     timeout: Option<u64>,
     negotiated_extensions: Arc<Mutex<Vec<u16>>>,
+    /// Handles for the tasks `start` spawns, so a test can stop them (#849).
+    ///
+    /// Without this a sniffer runs until the PROCESS exits. Its proxy task retries
+    /// `TcpStream::connect` to its upstream once a second for ever, so a sniffer left behind by
+    /// a finished test keeps looping against an upstream that has gone. Every `tests/*.rs` is one
+    /// binary running many tests, so those accumulate across a file.
+    ///
+    /// `PoolSv2`, `TranslatorSv2` and the JD roles all have a `shutdown()`; the sniffers did not,
+    /// which is why `shutdown_all!` never covered them and why no test could clean them up even
+    /// where it wanted to.
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl<'a> Sniffer<'a> {
@@ -71,6 +82,29 @@ impl<'a> Sniffer<'a> {
             action,
             timeout,
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Stop the tasks this sniffer spawned.
+    ///
+    /// `abort()` rather than a cancellation token: the proxy task spends its life awaiting socket
+    /// reads and an upstream-connect retry loop, both of which are cancel-safe await points, and
+    /// a token would have to be threaded through every one of them to be checked. A test that has
+    /// finished asserting has no interest in a graceful drain.
+    ///
+    /// Idempotent — aborting an already-finished task is a no-op — so a test may call it on a
+    /// sniffer whose peer has already gone.
+    ///
+    /// `async` with nothing to await, so that `shutdown_all!` can take it: that macro expands to
+    /// `tokio::join!` over each handle's `shutdown()`, which requires futures. A sync method here
+    /// would compile everywhere except the one place a test actually wants to use it, and the
+    /// point of this is to be uniform with `PoolSv2`/`TranslatorSv2`/the JD roles.
+    pub async fn shutdown(&self) {
+        if let Ok(mut handles) = self.tasks.lock() {
+            for h in handles.drain(..) {
+                h.abort();
+            }
         }
     }
 
@@ -94,6 +128,8 @@ impl<'a> Sniffer<'a> {
             check_on_drop: false,
             action: Vec::new(),
             timeout,
+            // Test-only constructor: it never calls `start`, so there is nothing to abort.
+            tasks: Arc::new(Mutex::new(Vec::new())),
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -126,7 +162,7 @@ impl<'a> Sniffer<'a> {
         // the port from the moment it is chosen, so an independent bind here fails (#612).
         let std_listener = crate::utils::claim_listener(listening_address);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener)
                 .expect("Sniffer: cannot adopt listener");
             let (downstream_receiver, downstream_sender) =
@@ -154,6 +190,11 @@ impl<'a> Sniffer<'a> {
                 _ = recv_from_up_send_to_down(upstream_receiver, downstream_sender, messages_from_upstream, action, &identifier, negotiated_extensions.clone()) => { },
             };
         });
+        // Registered so `shutdown()` can stop it. Locking here rather than inside the task keeps
+        // the handle out of its own closure.
+        if let Ok(mut t) = self.tasks.lock() {
+            t.push(handle);
+        }
     }
 
     /// Returns the oldest message sent by downstream.
