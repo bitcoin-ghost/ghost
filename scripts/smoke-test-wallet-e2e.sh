@@ -559,6 +559,88 @@ LEDGER_ROWS=$(jq 'length' < "$LEDGER")
 pass "signing ledger recorded all $N coins (no lost authorisations)"
 
 # ============================================================================
+# FLOW 10: Ghost Lock escape spend — leaving alone, on chain
+#   Every earlier flow FUNDS a lane; none has ever spent one. The three
+#   handlers that sign a Lock spend were unit-tested only, so no lane coin had
+#   ever moved on a chain and no escape leaf had ever been executed by a node.
+#
+#   The Spending lane's exit is 1,008 blocks (~7 days), which regtest reaches
+#   in seconds. It needs no quorum and no backup device: a key, a delay and a
+#   transaction. That makes it the one escape that can be driven end to end
+#   here, and it exercises a taproot SCRIPT-path spend, the CSV delay, the
+#   nSequence the leaf demands, and the wallet's own refusal rules.
+# ============================================================================
+step "FLOW 10 — Ghost Lock escape spend (Spending lane, after its exit delay)"
+
+SPEND_ADDR=$(echo "$LANES_AFTER" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "spending") | .address][0] // empty')
+[ -n "$SPEND_ADDR" ] || fail "no spending-lane address"
+
+ESC_FUND_TXID=$($BCLI -rpcwallet=demo sendtoaddress "$SPEND_ADDR" 0.002)
+[ -n "$ESC_FUND_TXID" ] || fail "could not fund the spending lane"
+$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+
+# Before the delay, the wallet must say so rather than hand over a signature.
+PLAN_EARLY=$(WRAITH --json lock escape-plan --lock-id "$LOCK_ID" --lane spending)
+EARLY_REMAINING=$(echo "$PLAN_EARLY" \
+    | jq -r '[(.GhostLockEscapePlan.coins // .coins)[] | select(.txid == "'"$ESC_FUND_TXID"'") | .blocks_remaining][0] // empty')
+[ -n "$EARLY_REMAINING" ] || fail "escape-plan does not see the coin just funded"
+[ "$EARLY_REMAINING" -gt 0 ] \
+    || fail "a coin one block old reports $EARLY_REMAINING blocks remaining on a 1,008-block delay"
+pass "escape-plan reports the coin is not spendable yet ($EARLY_REMAINING blocks to wait)"
+
+# Age it past the exit delay.
+step "mining past the Spending lane's 1,008-block exit delay"
+$BCLI -rpcwallet=demo generatetoaddress 1010 "$DEMO_ADDR" >/dev/null
+
+PLAN=$(WRAITH --json lock escape-plan --lock-id "$LOCK_ID" --lane spending)
+REQ_SEQ=$(echo "$PLAN" | jq -r '.GhostLockEscapePlan.required_sequence // .required_sequence')
+ESC_VOUT=$(echo "$PLAN" \
+    | jq -r '[(.GhostLockEscapePlan.coins // .coins)[] | select(.txid == "'"$ESC_FUND_TXID"'")][0].vout')
+ESC_SATS=$(echo "$PLAN" \
+    | jq -r '[(.GhostLockEscapePlan.coins // .coins)[] | select(.txid == "'"$ESC_FUND_TXID"'")][0].sats')
+ESC_REMAINING=$(echo "$PLAN" \
+    | jq -r '[(.GhostLockEscapePlan.coins // .coins)[] | select(.txid == "'"$ESC_FUND_TXID"'")][0].blocks_remaining')
+[ "$ESC_REMAINING" = "0" ] \
+    || fail "coin still reports $ESC_REMAINING blocks remaining after mining 1,010"
+pass "escape-plan reports the coin is now spendable (nSequence $REQ_SEQ)"
+
+# Build the spend. The wallet signs a PSBT; it does not build one, so the
+# caller supplies it — which is exactly why the signing handlers had to start
+# judging the inputs they are given.
+ESC_DEST=$(WRAITH --json light receive --index 500 | jq -r '.LightReceive.address // .address')
+ESC_OUT_BTC=$(awk -v s="$ESC_SATS" 'BEGIN { printf "%.8f", (s - 2000) / 100000000 }')
+ESC_PSBT_RAW=$($BCLI createpsbt \
+    "[{\"txid\":\"$ESC_FUND_TXID\",\"vout\":$ESC_VOUT,\"sequence\":$REQ_SEQ}]" \
+    "[{\"$ESC_DEST\":$ESC_OUT_BTC}]")
+[ -n "$ESC_PSBT_RAW" ] || fail "could not build the escape PSBT"
+# The signer needs the previous output; the node fills it from the UTXO set.
+ESC_PSBT=$($BCLI utxoupdatepsbt "$ESC_PSBT_RAW")
+
+ESC_SIGNED=$(WRAITH --json lock escape \
+    --lock-id "$LOCK_ID" --lane spending --psbt "$ESC_PSBT" --input-index 0)
+ESC_TX=$(echo "$ESC_SIGNED" | jq -r '.GhostLockEscapeSigned.tx_hex // .tx_hex // empty')
+[ -n "$ESC_TX" ] || { echo "$ESC_SIGNED" >&2; fail "escape signing returned no transaction"; }
+
+# The network is the judge: a wrong witness, a wrong sequence or an immature
+# CSV are all rejected here and nowhere earlier.
+ESC_TXID=$($BCLI sendrawtransaction "$ESC_TX") \
+    || fail "the node refused the escape spend — the script path does not work on chain"
+$BCLI -rpcwallet=demo generatetoaddress 1 "$DEMO_ADDR" >/dev/null
+
+ESC_CONF=$($BCLI getrawtransaction "$ESC_TXID" 1 | jq -r '.confirmations // 0')
+[ "$ESC_CONF" -ge 1 ] || fail "escape spend $ESC_TXID did not confirm"
+pass "escape spend confirmed on chain (tx $ESC_TXID) — a lane coin moved by its script path"
+
+# And the coin really left the lane.
+LANES_FINAL=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}")
+SPEND_LEFT=$(echo "$LANES_FINAL" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "spending") | .balance_sats] | add // 0')
+[ "$SPEND_LEFT" = "0" ] \
+    || fail "the spending lane still holds $SPEND_LEFT sats after the escape spend"
+pass "the spending lane is empty — the escape moved the coin out"
+
+# ============================================================================
 echo
 echo "================================================================"
 echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN"
@@ -572,4 +654,5 @@ echo "  6. L1 scan sees own UTXO           ok  (1,000,000 sats)"
 echo "  7. Ghost Lock prepare/fund/confirm ok  ($LOCK_ID)"
 echo "  8. on-chain payment (light pay)    ok  ($PAY_TXID)"
 echo "  9. single-round Wraith mix         ok  ($FIRST_TXID)"
+echo " 10. Ghost Lock escape spend        ok  ($ESC_TXID)"
 echo "================================================================"
