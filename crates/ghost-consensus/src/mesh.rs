@@ -711,28 +711,9 @@ impl PeerHighWaterMarks {
         path: &std::path::Path,
         snapshot: &HashMap<String, (u64, u64)>,
     ) -> std::io::Result<()> {
-        use std::io::Write;
-
         let encoded = serde_json::to_vec(snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&encoded)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            // Best effort: a filesystem that refuses to open a directory still gave us a durable
-            // temp file and an atomic rename, which is the bulk of the guarantee.
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
+        ghost_common::atomic_file::write_atomic(path, &encoded, None)
     }
 
     /// Move the mark to `sequence` unconditionally, including downwards. Only for a verified
@@ -1946,14 +1927,14 @@ impl MeshNetwork {
         }
     }
 
-    /// Atomically persist the sequence ceiling (write-temp-then-rename).
+    /// Atomically and durably persist the sequence ceiling.
+    ///
+    /// This used to stage with a bare `fs::write` and fsync neither the file
+    /// nor its directory, so a power loss could take back a ceiling already
+    /// reported as persisted — and the ceiling exists precisely so a restart
+    /// cannot reuse a sequence number.
     fn write_sequence_ceiling(path: &std::path::Path, ceiling: u64) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, ceiling.to_string())?;
-        std::fs::rename(&tmp, path)
+        ghost_common::atomic_file::write_atomic(path, ceiling.to_string().as_bytes(), None)
     }
 
     /// Reserve a fresh lease block once the counter nears the persisted ceiling.

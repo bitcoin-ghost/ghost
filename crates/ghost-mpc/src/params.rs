@@ -196,7 +196,7 @@ impl ParameterFiles {
 /// S-5 SECURITY: Uses atomic write (temp file + rename) to prevent corruption
 /// if the process crashes mid-write. Also uses fsync for durability.
 pub fn save_parameters(path: &Path, params: &Parameters<Bls12>) -> MpcResult<()> {
-    let temp_path = path.with_extension("tmp");
+    let temp_path = ghost_common::atomic_file::staging_path(path);
 
     // Write to temp file first
     let result = (|| -> MpcResult<()> {
@@ -220,6 +220,10 @@ pub fn save_parameters(path: &Path, params: &Parameters<Bls12>) -> MpcResult<()>
 
     // Atomic rename to target path
     fs::rename(&temp_path, path)?;
+    // The rename is a metadata change of the directory, and needs its own
+    // sync: without it the file's fsync above survives a power loss and the
+    // rename does not, losing a write already reported as saved.
+    ghost_common::atomic_file::sync_parent_dir(path);
 
     let file_size = fs::metadata(path)?.len();
     info!(
@@ -263,7 +267,7 @@ pub fn read_parameters_from_bytes(bytes: &[u8]) -> MpcResult<Parameters<Bls12>> 
 ///
 /// S-5 SECURITY: Uses atomic write (temp file + rename) to prevent corruption.
 pub fn save_verifying_key(path: &Path, vk: &VerifyingKey<Bls12>) -> MpcResult<()> {
-    let temp_path = path.with_extension("tmp");
+    let temp_path = ghost_common::atomic_file::staging_path(path);
 
     let result = (|| -> MpcResult<()> {
         let file = File::create(&temp_path)?;
@@ -283,6 +287,7 @@ pub fn save_verifying_key(path: &Path, vk: &VerifyingKey<Bls12>) -> MpcResult<()
     }
 
     fs::rename(&temp_path, path)?;
+    ghost_common::atomic_file::sync_parent_dir(path);
 
     info!(path = %path.display(), "Saved verifying key (atomic write)");
 
@@ -366,7 +371,7 @@ pub fn update_current_params(files: &ParameterFiles, version: u32) -> MpcResult<
 
 /// Atomically copy a file by writing to a temp file and renaming.
 fn atomic_copy(src: &Path, dst: &Path) -> MpcResult<()> {
-    let temp_path = dst.with_extension("tmp");
+    let temp_path = ghost_common::atomic_file::staging_path(dst);
 
     let result = (|| -> MpcResult<()> {
         let mut reader = BufReader::new(File::open(src)?);
@@ -385,6 +390,7 @@ fn atomic_copy(src: &Path, dst: &Path) -> MpcResult<()> {
     }
 
     fs::rename(&temp_path, dst)?;
+    ghost_common::atomic_file::sync_parent_dir(dst);
     Ok(())
 }
 
