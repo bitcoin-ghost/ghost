@@ -311,12 +311,25 @@ export async function walletCreate(
   return unwrap<WalletCreateResult>(resp).payload;
 }
 
+/// Restore a wallet from its 24 words.
+///
+/// `birthHeight` is the chain height the seed was first used at. The block
+/// scanner reads forward from there to rebuild the history; without it,
+/// scanning starts at the tip and nothing this seed did before now appears —
+/// the coins are all still found, but what they did is not. Guessing low is
+/// safe and slow; guessing high loses history silently.
 export async function walletImport(
   name: string,
   mnemonic: string,
   passphrase: string,
+  birthHeight?: number,
 ): Promise<{ name: string; path: string }> {
-  const resp = await invoke("wallet_import", { name, mnemonic, passphrase });
+  const resp = await invoke("wallet_import", {
+    name,
+    mnemonic,
+    passphrase,
+    birthHeight,
+  });
   return unwrap<{ name: string; path: string }>(resp).payload;
 }
 

@@ -92,6 +92,7 @@ async fn mainnet_refuses_canonical_test_vector() {
         &socket,
         1,
         Request::WalletImport {
+            birth_height: None,
             name: "blocked".into(),
             mnemonic: CANONICAL_TEST_VECTOR.into(),
             passphrase: "doesnt-matter-aaaaaaaaaaa".into(),
@@ -122,6 +123,7 @@ async fn signet_allows_canonical_test_vector() {
         &socket,
         1,
         Request::WalletImport {
+            birth_height: None,
             name: "ok".into(),
             mnemonic: CANONICAL_TEST_VECTOR.into(),
             passphrase: "signet-test-passphrase-aaa".into(),

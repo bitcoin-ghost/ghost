@@ -193,11 +193,13 @@ async fn wallet_import(
     name: String,
     mnemonic: String,
     passphrase: String,
+    birth_height: Option<u32>,
 ) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletImport {
         name,
         mnemonic,
         passphrase,
+        birth_height,
     })
     .await?;
     to_value(&resp)

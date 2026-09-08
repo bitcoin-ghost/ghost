@@ -20,6 +20,7 @@ pub mod mainnet_guard;
 pub mod psbt;
 pub mod scan_state;
 pub mod signer;
+pub mod wallet_meta;
 /// Re-exported: the implementation moved to `ghost-entropy` so the offline
 /// signer can share it. Unchanged, tags included.
 pub use ghost_entropy as user_entropy;

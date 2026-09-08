@@ -390,6 +390,19 @@ pub enum Request {
         name: String,
         mnemonic: String,
         passphrase: String,
+        /// The chain height this seed was first used at, if known.
+        ///
+        /// The block scanner reads forward from here to rebuild the wallet's
+        /// history. Omit it and scanning starts at the tip, so the restored
+        /// wallet's past is absent from its history — its coins are all still
+        /// found, because the balance and UTXO list scan the whole UTXO set,
+        /// but what it *did* before the restore is not.
+        ///
+        /// Guessing low is safe and slow: every block from here is read, at
+        /// roughly a hundred and fifty a minute. Guessing high silently loses
+        /// history, so when in doubt name a height before the seed existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birth_height: Option<u32>,
     },
     /// Unlock a named wallet by reading from disk + decrypting. Becomes active.
     WalletUnlock {
@@ -1831,6 +1844,7 @@ mod tests {
                 passphrase: "p".repeat(32),
             },
             Request::WalletImport {
+                birth_height: Some(900_000),
                 name: "restored".into(),
                 mnemonic: "abandon ".repeat(11) + "about",
                 passphrase: "long-enough-passphrase".into(),

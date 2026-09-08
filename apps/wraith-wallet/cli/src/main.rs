@@ -566,7 +566,20 @@ enum WalletCommand {
     /// Import a wallet from an existing BIP-39 mnemonic. Prompts for the words
     /// and a new passphrase. Refuses to overwrite an existing wallet of the
     /// same name.
-    Import { name: String },
+    Import {
+        name: String,
+        /// The chain height this seed was first used at.
+        ///
+        /// The block scanner reads forward from here to rebuild the wallet's
+        /// history. Without it, scanning starts at the tip and nothing this
+        /// seed did before now appears in the history — the coins are still
+        /// all found, but what they did is not.
+        ///
+        /// Guessing low is safe and slow; guessing high loses history
+        /// silently, so when in doubt pick a height before the seed existed.
+        #[arg(long, value_name = "HEIGHT")]
+        birth_height: Option<u32>,
+    },
     /// Unlock the named wallet (becomes active).
     Unlock { name: String },
     /// Lock a wallet by name, or the active one if no name is given.
@@ -807,7 +820,7 @@ mod client {
                         Err(e) => return io_err(e),
                     }
                 }
-                WalletCommand::Import { name } => {
+                WalletCommand::Import { name, birth_height } => {
                     let mnemonic = match prompt_mnemonic() {
                         Ok(m) => m,
                         Err(e) => return io_err(e),
@@ -820,6 +833,7 @@ mod client {
                         name,
                         mnemonic,
                         passphrase: pass,
+                        birth_height,
                     }
                 }
                 WalletCommand::Unlock { name } => match prompt_passphrase("passphrase: ") {

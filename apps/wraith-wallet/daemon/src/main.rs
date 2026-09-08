@@ -172,44 +172,103 @@ mod server {
         wraith_wallet_core::ghost_lock_store::GhostLockStore::open(path)
     }
 
-    /// Open the wallet's own record of what it has sent.
+    /// Where one wallet's own records live: `<wallets_dir>/<name>/`.
     ///
-    /// Beside the lock store. This one exists because transaction history used
-    /// to come from the operator's GSP session: the wallet asked somebody else
-    /// what it had done. With that gone, nothing remembers unless this does.
-    fn history_store_for(
-        state: &DaemonState,
-    ) -> std::io::Result<wraith_wallet_core::history_store::HistoryStore> {
-        let path = state
-            .node_config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("history.json");
-        wraith_wallet_core::history_store::HistoryStore::open(path)
+    /// ⚠ Per wallet, not per daemon, and the distinction is load-bearing.
+    /// These files answer "what happened to *this* wallet" — a history, a set
+    /// of detected coins, a scan bookmark. Shared across wallets they are
+    /// wrong in both directions at once: one wallet's payments appear in
+    /// another's history, and the shared bookmark tells the scanner those
+    /// blocks are already read, so a wallet switched to never gets a history
+    /// at all. The keystore and its descriptors already live here, and
+    /// `WalletDelete` removes the directory, so a deleted wallet takes its
+    /// records with it.
+    fn wallet_data_dir(state: &DaemonState, wallet: &str) -> PathBuf {
+        state.wallets_dir.join(wallet)
     }
 
-    /// Open the store of silent payments the scanner has found.
-    fn detection_store_for(
-        state: &DaemonState,
-    ) -> std::io::Result<wraith_wallet_core::detection_store::DetectionStore> {
-        let path = state
-            .node_config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("detections.json");
-        wraith_wallet_core::detection_store::DetectionStore::open(path)
+    /// The active wallet's name, or a message saying there isn't one.
+    async fn active_wallet_name(state: &Arc<DaemonState>) -> Result<String, String> {
+        state.active.read().await.clone().ok_or_else(|| {
+            "no active wallet; run `wraith wallet unlock <name>` or \
+             `wraith wallet select <name>` first"
+                .to_string()
+        })
     }
 
-    /// Open the block scanner's bookmark.
-    fn scan_state_for(
-        state: &DaemonState,
-    ) -> std::io::Result<wraith_wallet_core::scan_state::ScanState> {
-        let path = state
-            .node_config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("scan-state.json");
-        wraith_wallet_core::scan_state::ScanState::open(path)
+    /// Open the active wallet's record of what it has sent and received.
+    ///
+    /// This exists because transaction history used to come from the
+    /// operator's GSP session: the wallet asked somebody else what it had
+    /// done. With that gone, nothing remembers unless this does.
+    async fn history_store_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::history_store::HistoryStore, String> {
+        let name = active_wallet_name(state).await?;
+        wraith_wallet_core::history_store::HistoryStore::open(
+            wallet_data_dir(state, &name).join("history.json"),
+        )
+        .map_err(|e| format!("history store: {e}"))
+    }
+
+    /// Open the active wallet's store of silent payments the scanner found.
+    async fn detection_store_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::detection_store::DetectionStore, String> {
+        let name = active_wallet_name(state).await?;
+        wraith_wallet_core::detection_store::DetectionStore::open(
+            wallet_data_dir(state, &name).join("detections.json"),
+        )
+        .map_err(|e| format!("detections: {e}"))
+    }
+
+    /// Record the height a wallet came into being.
+    ///
+    /// Best-effort by design: a node that is unreachable at creation time must
+    /// not stop a wallet being made. A missing birth height costs history
+    /// depth on a later rescan, which is recoverable by setting one; refusing
+    /// to create the wallet is not.
+    async fn record_birth_height(state: &Arc<DaemonState>, wallet: &str, height: Option<u32>) {
+        let path = wallet_data_dir(state, wallet).join("wallet-meta.json");
+        let meta = wraith_wallet_core::wallet_meta::WalletMeta {
+            birth_height: height,
+        };
+        if let Err(e) = wraith_wallet_core::wallet_meta::save(&path, &meta) {
+            tracing::warn!(wallet, error = %e, "could not record the wallet's birth height");
+        }
+    }
+
+    /// The current chain tip, if a node is reachable.
+    async fn current_tip(state: &Arc<DaemonState>) -> Option<u32> {
+        state
+            .chain()
+            .await
+            .status()
+            .await
+            .ok()
+            .and_then(|s| s.chain_height)
+            .map(|h| h as u32)
+    }
+
+    /// Read the active wallet's metadata.
+    async fn wallet_meta_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::wallet_meta::WalletMeta, String> {
+        let name = active_wallet_name(state).await?;
+        Ok(wraith_wallet_core::wallet_meta::load(
+            wallet_data_dir(state, &name).join("wallet-meta.json"),
+        ))
+    }
+
+    /// Open the active wallet's block-scanner bookmark.
+    async fn scan_state_for(
+        state: &Arc<DaemonState>,
+    ) -> Result<wraith_wallet_core::scan_state::ScanState, String> {
+        let name = active_wallet_name(state).await?;
+        wraith_wallet_core::scan_state::ScanState::open(
+            wallet_data_dir(state, &name).join("scan-state.json"),
+        )
+        .map_err(|e| format!("scan state: {e}"))
     }
 
     fn lock_record(l: &wraith_wallet_core::ghost_lock_store::StoredLock) -> GhostLockRecord {
@@ -1534,7 +1593,7 @@ mod server {
     /// is not something the wallet did, and one that left must not be
     /// forgotten.
     async fn psbt_broadcast_handler(
-        state: &DaemonState,
+        state: &Arc<DaemonState>,
         psbt_or_tx_hex: &str,
         kind: &str,
         memo: Option<String>,
@@ -1598,7 +1657,7 @@ mod server {
     /// rather than with a plausible-looking wrong number. `None` reads as "—"
     /// in the UI, where a `0` would read as "moved nothing".
     async fn record_broadcast(
-        state: &DaemonState,
+        state: &Arc<DaemonState>,
         txid: &str,
         source_psbt: Option<&bitcoin::psbt::Psbt>,
         kind: &str,
@@ -1613,7 +1672,7 @@ mod server {
             },
             None => (None, None),
         };
-        let mut store = history_store_for(state).map_err(|e| format!("history store: {e}"))?;
+        let mut store = history_store_for(state).await?;
         store
             .record(wraith_wallet_core::history_store::HistoryEntry {
                 txid: txid.to_string(),
@@ -2181,13 +2240,28 @@ mod server {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            match scan_new_blocks(&state).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(blocks = n, "block scan caught up"),
-                // A node that is down, syncing or mid-restart is the common
-                // case and not worth an error line every twenty seconds. The
-                // status header already says the node is unreachable.
-                Err(e) => tracing::debug!(error = %e, "block scan tick did not complete"),
+            loop {
+                match scan_new_blocks(&state).await {
+                    Ok(0) => break,
+                    // A full batch means there is more waiting. Go straight
+                    // round again rather than sleeping: a wallet restored from
+                    // a year ago has fifty thousand blocks to read, and doing
+                    // that at one batch per tick would take most of a day.
+                    // Idle, this still costs nothing — the first pass returns
+                    // zero and the loop ends.
+                    Ok(n) if n >= SCAN_BATCH_BLOCKS => continue,
+                    Ok(n) => {
+                        tracing::debug!(blocks = n, "block scan caught up");
+                        break;
+                    }
+                    // A node that is down, syncing or mid-restart is the common
+                    // case and not worth an error line every twenty seconds.
+                    // The status header already says the node is unreachable.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "block scan tick did not complete");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -2222,21 +2296,47 @@ mod server {
                 .map_err(|e| format!("get_block_count: {e}"))? as u32
         };
 
-        let mut bookmark = scan_state_for(state).map_err(|e| format!("scan state: {e}"))?;
+        let mut bookmark = scan_state_for(state).await?;
 
-        // A wallet that has never scanned starts at the tip.
+        // Where a wallet that has never scanned begins.
         //
-        // Not at genesis: reading the whole chain to find a wallet that may
-        // have no history at all is hours of work for, usually, nothing. Coins
-        // that arrived before this point are not lost from view — the balance
-        // and the UTXO list scan the entire UTXO set — they are simply absent
-        // from the history, which is a narrower claim and a stated one.
+        // Its birth height when it has one: a wallet created here recorded the
+        // tip, and a restored one recorded whatever its owner said. Reading
+        // forward from there rebuilds the history.
+        //
+        // Otherwise the tip — not genesis. Reading the whole chain to find a
+        // wallet that may have no history at all is hours of work for, usually,
+        // nothing, and the wallet cannot tell the difference between "restored
+        // from years ago" and "made this morning" unless it is told. Coins that
+        // arrived before this point are not lost from view — the balance and
+        // the UTXO list scan the entire UTXO set — they are absent from the
+        // *history*, which is a narrower claim and a stated one.
         let Some(point) = bookmark.point().cloned() else {
-            let hash = block_hash_at(&rpc, tip).await?;
+            let birth = wallet_meta_for(state)
+                .await
+                .ok()
+                .and_then(|m| m.birth_height);
+            let start = birth.unwrap_or(tip).min(tip);
+            // One before the start, because the loop below scans from
+            // `from + 1`: the birth block itself can hold the first payment.
+            let anchor = start.saturating_sub(1);
+            let hash = block_hash_at(&rpc, anchor).await?;
             bookmark
-                .set(tip, hash)
+                .set(anchor, hash)
                 .map_err(|e| format!("scan state write: {e}"))?;
-            tracing::info!(height = tip, "block scanner started watching from the tip");
+            match birth {
+                Some(b) => tracing::info!(
+                    birth_height = b,
+                    tip,
+                    behind = tip.saturating_sub(b),
+                    "block scanner rebuilding history from the wallet's birth height"
+                ),
+                None => tracing::info!(
+                    height = tip,
+                    "block scanner started watching from the tip — this wallet has no \
+                     recorded birth height, so nothing before now will appear in its history"
+                ),
+            }
             return Ok(0);
         };
 
@@ -2249,7 +2349,7 @@ mod server {
                 // Walking back to a height both chains agree on. The first
                 // agreement is the fork point; everything above it was read
                 // from blocks that are no longer in the chain.
-                if let Some(known) = recorded_hash_at(state, h) {
+                if let Some(known) = recorded_hash_at(state, h).await {
                     if block_hash_at(&rpc, h).await? == known {
                         fork = Some(h);
                         break;
@@ -2257,7 +2357,7 @@ mod server {
                 }
             }
             let restart = fork.unwrap_or(floor);
-            let mut history = history_store_for(state).map_err(|e| format!("history: {e}"))?;
+            let mut history = history_store_for(state).await?;
             let n = history
                 .unconfirm_from(restart + 1)
                 .map_err(|e| format!("history: {e}"))?;
@@ -2274,7 +2374,7 @@ mod server {
             return Ok(0);
         }
         let end = tip.min(from + SCAN_BATCH_BLOCKS);
-        let mut history = history_store_for(state).map_err(|e| format!("history: {e}"))?;
+        let mut history = history_store_for(state).await?;
         for height in (from + 1)..=end {
             let hash = block_hash_at(&rpc, height).await?;
             let block = {
@@ -2306,8 +2406,7 @@ mod server {
                     }
                 }
                 if !found.is_empty() {
-                    let mut detections =
-                        detection_store_for(state).map_err(|e| format!("detections: {e}"))?;
+                    let mut detections = detection_store_for(state).await?;
                     let credited: i64 = found
                         .iter()
                         .filter_map(|d| d.amount_sats)
@@ -2377,8 +2476,8 @@ mod server {
     /// Only one height is remembered, so the reorg walk can confirm agreement
     /// at exactly that point and otherwise falls back to rescanning the search
     /// depth — which is correct, just more work.
-    fn recorded_hash_at(state: &Arc<DaemonState>, height: u32) -> Option<String> {
-        let bookmark = scan_state_for(state).ok()?;
+    async fn recorded_hash_at(state: &Arc<DaemonState>, height: u32) -> Option<String> {
+        let bookmark = scan_state_for(state).await.ok()?;
         let p = bookmark.point()?;
         (p.height == height).then(|| p.hash.clone())
     }
@@ -2634,13 +2733,9 @@ mod server {
     /// list scan the whole UTXO set and see every coin. It is a narrower claim
     /// than it used to be, and a stated one.
     async fn l1_history(state: &Arc<DaemonState>, limit: u32, offset: u32) -> Response {
-        let store = match history_store_for(state) {
+        let store = match history_store_for(state).await {
             Ok(s) => s,
-            Err(e) => {
-                return Response::Error(ErrorResponse {
-                    message: format!("history: {e}"),
-                })
-            }
+            Err(message) => return Response::Error(ErrorResponse { message }),
         };
         let all = store.list();
         let total_count = all.len() as u32;
@@ -3989,7 +4084,7 @@ mod server {
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
-            Request::LightDetected => match detection_store_for(state) {
+            Request::LightDetected => match detection_store_for(state).await {
                 Err(e) => Response::Error(ErrorResponse {
                     message: format!("detections: {e}"),
                 }),
@@ -4080,6 +4175,12 @@ mod server {
                                 Ok(()) => {
                                     state.wallets.write().await.insert(name.clone(), ks);
                                     *state.active.write().await = Some(name.clone());
+                                    // A wallet cannot have been paid before it
+                                    // existed, so the tip is its birth height
+                                    // and the scanner need never look further
+                                    // back than this.
+                                    let tip = current_tip(state).await;
+                                    record_birth_height(state, &name, tip).await;
                                     Response::WalletCreate(WalletCreateResponse {
                                         name,
                                         mnemonic,
@@ -4101,6 +4202,7 @@ mod server {
                 name,
                 mnemonic,
                 passphrase,
+                birth_height,
             } => {
                 if let Some(refused) = refuse_in_kiosk_mode(state, "wallet import") {
                     return Envelope::new(id, refused);
@@ -4135,6 +4237,11 @@ mod server {
                                 Ok(()) => {
                                     state.wallets.write().await.insert(name.clone(), ks);
                                     *state.active.write().await = Some(name.clone());
+                                    // Whatever the owner said, and nothing if
+                                    // they said nothing. Defaulting to the tip
+                                    // here would look like a birth height and
+                                    // silently mean "no history before now".
+                                    record_birth_height(state, &name, birth_height).await;
                                     Response::WalletImported {
                                         name,
                                         path: path.display().to_string(),
@@ -5449,10 +5556,10 @@ mod server {
         #[tokio::test]
         async fn confirmations_are_inclusive_of_the_mining_block() {
             let dir = tempfile::tempdir().unwrap();
-            let state = test_state_in(dir.path().to_path_buf());
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
             state.clients.write().await.chain = Arc::new(TipChain(900_010));
 
-            let mut store = history_store_for(&state).unwrap();
+            let mut store = history_store_for(&state).await.unwrap();
             for (txid, height) in [("tip", 900_010u32), ("ten_deep", 900_001)] {
                 store
                     .record(wraith_wallet_core::history_store::HistoryEntry {
@@ -5488,10 +5595,10 @@ mod server {
         #[tokio::test]
         async fn an_unmined_entry_does_not_infer_confirmations_from_the_tip() {
             let dir = tempfile::tempdir().unwrap();
-            let state = test_state_in(dir.path().to_path_buf());
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
             state.clients.write().await.chain = Arc::new(TipChain(900_010));
 
-            let mut store = history_store_for(&state).unwrap();
+            let mut store = history_store_for(&state).await.unwrap();
             store
                 .record(wraith_wallet_core::history_store::HistoryEntry {
                     txid: "pending".into(),
@@ -5513,6 +5620,81 @@ mod server {
             }
         }
 
+        /// One wallet's history must not appear in another's.
+        ///
+        /// The stores used to sit beside `node.json`, shared by every wallet.
+        /// That is wrong twice over: payments show up under the wrong wallet,
+        /// and the shared scan bookmark tells the scanner those blocks are
+        /// already read — so a wallet switched to would never build a history
+        /// at all.
+        #[tokio::test]
+        async fn two_wallets_do_not_share_a_history() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+
+            *state.active.write().await = Some("alice".to_string());
+            history_store_for(&state)
+                .await
+                .unwrap()
+                .record(wraith_wallet_core::history_store::HistoryEntry {
+                    txid: "alice-tx".into(),
+                    at: 1,
+                    block_height: Some(900_000),
+                    amount_sats: Some(1_000),
+                    fee_sats: None,
+                    kind: "receive".into(),
+                    memo: None,
+                })
+                .unwrap();
+
+            *state.active.write().await = Some("bob".to_string());
+            let bob = history_store_for(&state).await.unwrap();
+            assert!(
+                bob.is_empty(),
+                "bob must not see alice's payment, got {:?}",
+                bob.list()
+            );
+
+            *state.active.write().await = Some("alice".to_string());
+            assert_eq!(
+                history_store_for(&state).await.unwrap().len(),
+                1,
+                "and alice must still have her own"
+            );
+        }
+
+        /// A store keyed on the active wallet has nothing to open when there
+        /// is no active wallet, and says so rather than falling back to a
+        /// shared file.
+        #[tokio::test]
+        async fn a_store_without_an_active_wallet_refuses() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let err = history_store_for(&state).await.expect_err("must refuse");
+            assert!(err.contains("no active wallet"), "got: {err}");
+        }
+
+        /// The birth height is what a restore reads forward from. Recording
+        /// one and reading it back is the whole contract the scanner relies
+        /// on, so it is pinned end to end rather than trusted.
+        #[tokio::test]
+        async fn a_recorded_birth_height_is_read_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
+
+            assert_eq!(
+                wallet_meta_for(&state).await.unwrap().birth_height,
+                None,
+                "a wallet with no recorded height must not invent one"
+            );
+
+            record_birth_height(&state, "harness", Some(880_000)).await;
+            assert_eq!(
+                wallet_meta_for(&state).await.unwrap().birth_height,
+                Some(880_000)
+            );
+        }
+
         /// A locked wallet cannot tell its own outputs from a stranger's, so
         /// it records no amount. Recording a `0` would tell the user the
         /// transaction moved nothing, which is the one reading that is
@@ -5520,12 +5702,12 @@ mod server {
         #[tokio::test]
         async fn a_broadcast_without_keys_records_no_amount_rather_than_zero() {
             let dir = tempfile::tempdir().unwrap();
-            let state = test_state_in(dir.path().to_path_buf());
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
             let psbt = test_psbt(&[(10_000, 0xaa)], &[(9_500, 0xbb)]);
             record_broadcast(&state, "deadbeef", Some(&psbt), "send", None)
                 .await
                 .expect("recording must succeed even with no wallet unlocked");
-            let store = history_store_for(&state).unwrap();
+            let store = history_store_for(&state).await.unwrap();
             let rows = store.list();
             assert_eq!(rows.len(), 1);
             assert_eq!(
@@ -5544,7 +5726,7 @@ mod server {
         #[tokio::test]
         async fn history_reports_unknown_confirmations_as_unknown() {
             let dir = tempfile::tempdir().unwrap();
-            let state = test_state_in(dir.path().to_path_buf());
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
             record_broadcast(&state, "aa11", None, "send", None)
                 .await
                 .unwrap();
@@ -5565,7 +5747,7 @@ mod server {
         #[tokio::test]
         async fn paging_reports_the_full_total_not_the_page_size() {
             let dir = tempfile::tempdir().unwrap();
-            let state = test_state_in(dir.path().to_path_buf());
+            let state = test_state_with_wallet(dir.path().to_path_buf()).await;
             for i in 0..5u32 {
                 record_broadcast(&state, &format!("tx{i}"), None, "send", None)
                     .await
@@ -5586,6 +5768,16 @@ mod server {
         /// we only care that the gate accepts/rejects the right modes.
         fn test_state() -> Arc<DaemonState> {
             test_state_in(std::env::temp_dir())
+        }
+
+        /// A state whose per-wallet stores resolve, without unlocking a real
+        /// keystore. The stores key on the ACTIVE wallet's name; a harness
+        /// without one exercises the "no active wallet" path instead of the
+        /// behaviour under test.
+        async fn test_state_with_wallet(wallets_dir: std::path::PathBuf) -> Arc<DaemonState> {
+            let state = test_state_in(wallets_dir);
+            *state.active.write().await = Some("harness".to_string());
+            state
         }
 
         fn test_state_in(wallets_dir: std::path::PathBuf) -> Arc<DaemonState> {

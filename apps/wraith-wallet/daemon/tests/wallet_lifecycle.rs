@@ -213,6 +213,7 @@ async fn wallet_lifecycle_round_trip() {
         &socket,
         8,
         Request::WalletImport {
+            birth_height: None,
             name: "beta".into(),
             mnemonic: known.clone(),
             passphrase: pass.clone(),
@@ -229,6 +230,7 @@ async fn wallet_lifecycle_round_trip() {
         &socket,
         9,
         Request::WalletImport {
+            birth_height: None,
             name: "beta".into(),
             mnemonic: known,
             passphrase: pass.clone(),
