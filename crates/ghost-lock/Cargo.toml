@@ -8,6 +8,10 @@ license.workspace = true
 bitcoin = { workspace = true }
 bip39 = { workspace = true }
 ghost-entropy = { workspace = true }
+# For the one atomic-file implementation. default-features = false drops
+# ghost-common's UNIX-only `zmq`/`tmq` feature, which the wallet cannot build
+# for Windows.
+ghost-common = { workspace = true, default-features = false }
 bip32 = { workspace = true }
 zeroize = { workspace = true }
 musig2 = { version = "0.4", default-features = false, features = ["secp256k1"] }
