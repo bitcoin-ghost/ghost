@@ -5817,13 +5817,23 @@ mod server {
                 // user supplied, which is a worse answer than a verified
                 // election and a better one than obeying an unverifiable claim
                 // about who is in charge.
-                let (endpoint, epoch) = match verified_election(state).await {
+                let (endpoints, epoch) = match verified_election(state).await {
                     Some(election) => {
                         crate::coordinator_resolve::resolve_from_election(&election, &tier_id)
                     }
-                    None => (None, None),
+                    None => (Vec::new(), None),
                 };
-                Response::WraithCoordinatorResolved { endpoint, epoch }
+                // Head is the seat that owns this tier; the tail is where every
+                // wallet on that seat goes if it stops answering — the same
+                // order for all of them, so the cohort moves together (#711).
+                let mut it = endpoints.into_iter();
+                let endpoint = it.next();
+                let fallbacks: Vec<String> = it.collect();
+                Response::WraithCoordinatorResolved {
+                    endpoint,
+                    fallbacks,
+                    epoch,
+                }
             }
             Request::WraithMixOneShot {
                 coordinator_url,

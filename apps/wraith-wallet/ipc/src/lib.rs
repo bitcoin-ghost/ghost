@@ -862,6 +862,19 @@ pub enum Response {
     /// the election epoch the resolution was sharded on, when known.
     WraithCoordinatorResolved {
         endpoint: Option<String>,
+        /// The deterministic alternates to try if `endpoint` does not answer, in
+        /// order. Pass them straight to the session client's peer list — it
+        /// already dials a base URL then its peers in turn, so failover reuses
+        /// that path rather than growing a second one.
+        ///
+        /// Every wallet sharded to the same seat receives the SAME order, which
+        /// is what keeps a failing seat's cohort together instead of scattering
+        /// it across the remaining seats (#711).
+        ///
+        /// `#[serde(default)]` so a daemon predating this field still
+        /// deserialises against a newer client.
+        #[serde(default)]
+        fallbacks: Vec<String>,
         epoch: Option<u64>,
     },
     WraithMixPrepared(WraithMixPreparedResponse),

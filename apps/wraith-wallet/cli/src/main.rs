@@ -1770,12 +1770,19 @@ mod client {
                 }
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::WraithCoordinatorResolved { endpoint, epoch }) => {
+            Ok(Response::WraithCoordinatorResolved {
+                endpoint,
+                fallbacks,
+                epoch,
+            }) => {
                 match endpoint {
                     Some(ep) => println!("endpoint: {ep}"),
                     None => {
                         println!("endpoint: (none — election off/pending; use a manual URL)")
                     }
+                }
+                if !fallbacks.is_empty() {
+                    println!("fallbacks: {}", fallbacks.join(", "));
                 }
                 if let Some(e) = epoch {
                     println!("epoch:    {e}");

@@ -147,33 +147,6 @@ fn decode_32(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-/// Pick the coordinator endpoint that owns `shard_key` from a node's
-/// `/api/v1/pool/coordinator` JSON. Pure (no I/O) so it is unit-testable.
-///
-/// Shards across the node's *published* seat count, so the wallet and the node
-/// agree on the owner, and so all wallets that share a key (e.g. the same
-/// tier+epoch) converge on the same seat — a larger anonymity set, not load
-/// spreading. Returns `None` when the election is disabled/empty, or the owning
-/// seat hasn't advertised an endpoint yet (caller falls back).
-pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> Option<String> {
-    if status.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
-        return None;
-    }
-    let coords = status.get("coordinators")?.as_array()?;
-    if coords.is_empty() {
-        return None;
-    }
-    let seat = shard_for(shard_key, coords.len());
-    let owner = coords
-        .iter()
-        .find(|c| c.get("seat").and_then(|s| s.as_u64()) == Some(seat as u64))?;
-    owner
-        .get("endpoint")
-        .and_then(|e| e.as_str())
-        .filter(|e| !e.is_empty())
-        .map(String::from)
-}
-
 /// The seats to try for `shard_key`, in order: the owning seat first, then a
 /// deterministic sequence of alternates.
 ///
@@ -183,7 +156,7 @@ pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> O
 /// nowhere to go until the epoch flips. The obvious repair — let each wallet
 /// try whatever it can reach — costs the exact property the sharding exists to
 /// create: wallets that share a key converge on ONE seat, and a larger set is
-/// the whole point (see [`pick_seat_endpoint`]). Wallets probing independently
+/// the whole point. Wallets probing independently
 /// notice a failure at different moments and scatter across different seats,
 /// so the anonymity set fragments precisely when the network is already
 /// degraded, and nothing tells the user it happened.
@@ -251,15 +224,23 @@ pub fn pick_seat_endpoints(status: &serde_json::Value, shard_key: &[u8; 32]) -> 
 /// the dead one inviting whoever wired it up next.
 pub use wraith_protocol::shard_key_for_tier_epoch;
 
-/// Resolve the coordinator endpoint for a mix of `tier_id` from a node's election
-/// JSON (as relayed by ghost-pay). Returns `(endpoint, epoch)`: `endpoint` is
-/// `None` when the election is disabled/empty, the epoch is missing, or the owning
-/// seat hasn't advertised yet — the caller then falls back to a manual URL. Pure
-/// (no I/O) so the daemon handler is a thin fetch around it.
+/// Resolve the coordinators to try for a mix of `tier_id` from a node's election
+/// JSON. Returns `(endpoints, epoch)`.
+///
+/// `endpoints` is the owning seat first, then the deterministic fallbacks from
+/// [`seat_try_order`] — empty when the election is disabled, unverifiable, the
+/// epoch is missing, or nothing has advertised, in which case the caller falls
+/// back to a manually configured URL. Pure (no I/O) so the daemon handler is a
+/// thin fetch around it.
+///
+/// It returns the ORDER rather than a single answer on purpose. Returning one
+/// endpoint and adding a second function for the alternates would put two
+/// schemes in this file, which is the mistake recorded above `shard_key_for_tier_epoch`
+/// — the dead one sits there inviting whoever wires it up next.
 pub fn resolve_from_election(
     election: &serde_json::Value,
     tier_id: &str,
-) -> (Option<String>, Option<u64>) {
+) -> (Vec<String>, Option<u64>) {
     let epoch = election.get("epoch").and_then(|e| e.as_u64());
     // Refuse a draw that does not follow from its own published inputs. The
     // caller falls back to a manually configured coordinator, which is a
@@ -268,11 +249,12 @@ pub fn resolve_from_election(
     if election.get("enabled").and_then(|v| v.as_bool()) == Some(true)
         && !election_is_honest(election)
     {
-        return (None, epoch);
+        return (Vec::new(), epoch);
     }
-    let endpoint =
-        epoch.and_then(|ep| pick_seat_endpoint(election, &shard_key_for_tier_epoch(tier_id, ep)));
-    (endpoint, epoch)
+    let endpoints = epoch
+        .map(|ep| pick_seat_endpoints(election, &shard_key_for_tier_epoch(tier_id, ep)))
+        .unwrap_or_default();
+    (endpoints, epoch)
 }
 
 #[cfg(test)]
@@ -306,7 +288,8 @@ mod tests {
     fn an_honest_election_verifies_and_resolves() {
         let e = honest_election(7, 6, 3);
         assert!(election_is_honest(&e));
-        let (endpoint, epoch) = resolve_from_election(&e, "100k_sats");
+        let (endpoints, epoch) = resolve_from_election(&e, "100k_sats");
+        let endpoint = endpoints.first().cloned();
         assert_eq!(epoch, Some(7));
         assert!(endpoint.is_some(), "a verified election must resolve");
     }
@@ -322,7 +305,7 @@ mod tests {
             c["node_id"] = json!(usurper);
         }
         assert!(!election_is_honest(&e));
-        assert_eq!(resolve_from_election(&e, "100k_sats").0, None);
+        assert!(resolve_from_election(&e, "100k_sats").0.is_empty());
     }
 
     /// Dropping a qualified node from the roster would change who wins, so
@@ -359,7 +342,7 @@ mod tests {
         let mut e = honest_election(7, 6, 3);
         e.as_object_mut().unwrap().remove("beacon");
         assert!(!election_is_honest(&e));
-        assert_eq!(resolve_from_election(&e, "100k_sats").0, None);
+        assert!(resolve_from_election(&e, "100k_sats").0.is_empty());
     }
 
     /// The anchor height is derived from the epoch, never read from the
@@ -407,7 +390,7 @@ mod tests {
     #[test]
     fn a_disabled_election_is_not_treated_as_dishonest() {
         let e = json!({ "enabled": false });
-        assert_eq!(resolve_from_election(&e, "100k_sats"), (None, None));
+        assert_eq!(resolve_from_election(&e, "100k_sats"), (Vec::new(), None));
     }
 
     fn status(enabled: bool, coords: serde_json::Value) -> serde_json::Value {
@@ -425,8 +408,8 @@ mod tests {
         );
         let key = [7u8; 32];
         // Same key → same owner (so wallets converge), and it's one of the seats.
-        let a = pick_seat_endpoint(&s, &key);
-        assert_eq!(a, pick_seat_endpoint(&s, &key));
+        let a = pick_seat_endpoints(&s, &key).first().cloned();
+        assert_eq!(a, pick_seat_endpoints(&s, &key).first().cloned());
         assert!(matches!(
             a.as_deref(),
             Some("http://a:9100") | Some("http://b:9100")
@@ -437,20 +420,24 @@ mod tests {
     fn none_when_disabled_empty_or_unadvertised() {
         // Disabled election.
         assert_eq!(
-            pick_seat_endpoint(&status(false, json!([])), &[0u8; 32]),
+            pick_seat_endpoints(&status(false, json!([])), &[0u8; 32])
+                .first()
+                .cloned(),
             None
         );
         // No coordinators seated.
         assert_eq!(
-            pick_seat_endpoint(&status(true, json!([])), &[0u8; 32]),
+            pick_seat_endpoints(&status(true, json!([])), &[0u8; 32])
+                .first()
+                .cloned(),
             None
         );
         // Single seat whose owner hasn't advertised an endpoint yet.
         let s = status(true, json!([{"node_id":"aa","seat":0,"endpoint":null}]));
-        assert_eq!(pick_seat_endpoint(&s, &[0u8; 32]), None);
+        assert_eq!(pick_seat_endpoints(&s, &[0u8; 32]).first().cloned(), None);
         // Empty-string endpoint is treated as unadvertised.
         let s = status(true, json!([{"node_id":"aa","seat":0,"endpoint":""}]));
-        assert_eq!(pick_seat_endpoint(&s, &[0u8; 32]), None);
+        assert_eq!(pick_seat_endpoints(&s, &[0u8; 32]).first().cloned(), None);
     }
 
     #[test]
@@ -475,7 +462,8 @@ mod tests {
     fn resolve_from_election_uses_epoch_and_falls_back() {
         // A verified election resolves, and reports its epoch.
         let s = honest_election(42, 6, 2);
-        let (ep, epoch) = resolve_from_election(&s, "0.01btc");
+        let (eps, epoch) = resolve_from_election(&s, "0.01btc");
+        let ep = eps.first().cloned();
         assert_eq!(epoch, Some(42));
         assert!(ep.is_some());
 
@@ -491,16 +479,25 @@ mod tests {
             ]
         });
         assert_eq!(
-            resolve_from_election(&unverifiable, "0.01btc"),
+            (
+                resolve_from_election(&unverifiable, "0.01btc")
+                    .0
+                    .first()
+                    .cloned(),
+                resolve_from_election(&unverifiable, "0.01btc").1
+            ),
             (None, Some(42))
         );
 
         // No epoch (election pending) → no endpoint, caller falls back.
         let pending = json!({ "enabled": true, "epoch": null, "coordinators": [] });
-        assert_eq!(resolve_from_election(&pending, "0.01btc"), (None, None));
+        assert_eq!(
+            resolve_from_election(&pending, "0.01btc"),
+            (Vec::new(), None)
+        );
         // Disabled → nothing.
         let off = json!({ "enabled": false });
-        assert_eq!(resolve_from_election(&off, "0.01btc"), (None, None));
+        assert_eq!(resolve_from_election(&off, "0.01btc"), (Vec::new(), None));
     }
 
     /// The property the whole design rests on: every wallet sharded to a dead
