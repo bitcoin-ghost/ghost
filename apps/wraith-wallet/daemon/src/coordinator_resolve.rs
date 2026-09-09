@@ -147,31 +147,72 @@ fn decode_32(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-/// Pick the coordinator endpoint that owns `shard_key` from a node's
-/// `/api/v1/pool/coordinator` JSON. Pure (no I/O) so it is unit-testable.
+/// The seats to try for `shard_key`, in order: the owning seat first, then a
+/// deterministic sequence of alternates.
 ///
-/// Shards across the node's *published* seat count, so the wallet and the node
-/// agree on the owner, and so all wallets that share a key (e.g. the same
-/// tier+epoch) converge on the same seat — a larger anonymity set, not load
-/// spreading. Returns `None` when the election is disabled/empty, or the owning
-/// seat hasn't advertised an endpoint yet (caller falls back).
-pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> Option<String> {
+/// # Why the order is fixed rather than chosen
+///
+/// A seat whose node has gone dark leaves the wallets sharded to it with
+/// nowhere to go until the epoch flips. The obvious repair — let each wallet
+/// try whatever it can reach — costs the exact property the sharding exists to
+/// create: wallets that share a key converge on ONE seat, and a larger set is
+/// the whole point. Wallets probing independently
+/// notice a failure at different moments and scatter across different seats,
+/// so the anonymity set fragments precisely when the network is already
+/// degraded, and nothing tells the user it happened.
+///
+/// Removing the dead seat from the roster instead does not work either. The
+/// roster is deliberately snapshotted a full epoch behind so that every node
+/// answers the same question (`wraith_protocol::roster_snapshot`), and that
+/// module says plainly that nothing there is consensus — it only gives nodes a
+/// commitment to compare so divergence is *seen*. Liveness is a local
+/// observation, so a liveness-driven roster is a divergent roster, which is a
+/// split election rather than a failover.
+///
+/// So the fallback is derived from what is already agreed: walk forward from
+/// the owning seat. Every wallet on a dead seat moves to the SAME next seat, and
+/// it joins that seat's existing cohort rather than forming a new one — the set
+/// moves as a body and gets larger, never smaller. During the window where some
+/// wallets have noticed and others have not, there are two cohorts, not N.
+///
+/// Needs no liveness consensus, no roster mutation and no new wire field: the
+/// order is a function of the published seat count and the shard key.
+pub fn seat_try_order(shard_key: &[u8; 32], seat_count: usize) -> Vec<usize> {
+    if seat_count == 0 {
+        return Vec::new();
+    }
+    let first = shard_for(shard_key, seat_count) as usize;
+    (0..seat_count).map(|i| (first + i) % seat_count).collect()
+}
+
+/// Coordinator endpoints to try for `shard_key`, in [`seat_try_order`].
+///
+/// The caller dials them in order and stops at the first that answers. Seats
+/// that have advertised no endpoint are skipped rather than occupying a
+/// position: a seat nobody can dial is not a fallback.
+pub fn pick_seat_endpoints(status: &serde_json::Value, shard_key: &[u8; 32]) -> Vec<String> {
     if status.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
-        return None;
+        return Vec::new();
     }
-    let coords = status.get("coordinators")?.as_array()?;
+    let Some(coords) = status.get("coordinators").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
     if coords.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let seat = shard_for(shard_key, coords.len());
-    let owner = coords
-        .iter()
-        .find(|c| c.get("seat").and_then(|s| s.as_u64()) == Some(seat as u64))?;
-    owner
-        .get("endpoint")
-        .and_then(|e| e.as_str())
-        .filter(|e| !e.is_empty())
-        .map(String::from)
+
+    seat_try_order(shard_key, coords.len())
+        .into_iter()
+        .filter_map(|seat| {
+            coords
+                .iter()
+                .find(|c| c.get("seat").and_then(|s| s.as_u64()) == Some(seat as u64))?
+                .get("endpoint")
+                .and_then(|e| e.as_str())
+                .filter(|e| !e.is_empty())
+                .map(String::from)
+        })
+        .collect()
 }
 
 /// The shard key comes from `wraith_protocol`, not from here.
@@ -183,15 +224,23 @@ pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> O
 /// the dead one inviting whoever wired it up next.
 pub use wraith_protocol::shard_key_for_tier_epoch;
 
-/// Resolve the coordinator endpoint for a mix of `tier_id` from a node's election
-/// JSON (as relayed by ghost-pay). Returns `(endpoint, epoch)`: `endpoint` is
-/// `None` when the election is disabled/empty, the epoch is missing, or the owning
-/// seat hasn't advertised yet — the caller then falls back to a manual URL. Pure
-/// (no I/O) so the daemon handler is a thin fetch around it.
+/// Resolve the coordinators to try for a mix of `tier_id` from a node's election
+/// JSON. Returns `(endpoints, epoch)`.
+///
+/// `endpoints` is the owning seat first, then the deterministic fallbacks from
+/// [`seat_try_order`] — empty when the election is disabled, unverifiable, the
+/// epoch is missing, or nothing has advertised, in which case the caller falls
+/// back to a manually configured URL. Pure (no I/O) so the daemon handler is a
+/// thin fetch around it.
+///
+/// It returns the ORDER rather than a single answer on purpose. Returning one
+/// endpoint and adding a second function for the alternates would put two
+/// schemes in this file, which is the mistake recorded above `shard_key_for_tier_epoch`
+/// — the dead one sits there inviting whoever wires it up next.
 pub fn resolve_from_election(
     election: &serde_json::Value,
     tier_id: &str,
-) -> (Option<String>, Option<u64>) {
+) -> (Vec<String>, Option<u64>) {
     let epoch = election.get("epoch").and_then(|e| e.as_u64());
     // Refuse a draw that does not follow from its own published inputs. The
     // caller falls back to a manually configured coordinator, which is a
@@ -200,11 +249,12 @@ pub fn resolve_from_election(
     if election.get("enabled").and_then(|v| v.as_bool()) == Some(true)
         && !election_is_honest(election)
     {
-        return (None, epoch);
+        return (Vec::new(), epoch);
     }
-    let endpoint =
-        epoch.and_then(|ep| pick_seat_endpoint(election, &shard_key_for_tier_epoch(tier_id, ep)));
-    (endpoint, epoch)
+    let endpoints = epoch
+        .map(|ep| pick_seat_endpoints(election, &shard_key_for_tier_epoch(tier_id, ep)))
+        .unwrap_or_default();
+    (endpoints, epoch)
 }
 
 #[cfg(test)]
@@ -238,7 +288,8 @@ mod tests {
     fn an_honest_election_verifies_and_resolves() {
         let e = honest_election(7, 6, 3);
         assert!(election_is_honest(&e));
-        let (endpoint, epoch) = resolve_from_election(&e, "100k_sats");
+        let (endpoints, epoch) = resolve_from_election(&e, "100k_sats");
+        let endpoint = endpoints.first().cloned();
         assert_eq!(epoch, Some(7));
         assert!(endpoint.is_some(), "a verified election must resolve");
     }
@@ -254,7 +305,7 @@ mod tests {
             c["node_id"] = json!(usurper);
         }
         assert!(!election_is_honest(&e));
-        assert_eq!(resolve_from_election(&e, "100k_sats").0, None);
+        assert!(resolve_from_election(&e, "100k_sats").0.is_empty());
     }
 
     /// Dropping a qualified node from the roster would change who wins, so
@@ -291,7 +342,7 @@ mod tests {
         let mut e = honest_election(7, 6, 3);
         e.as_object_mut().unwrap().remove("beacon");
         assert!(!election_is_honest(&e));
-        assert_eq!(resolve_from_election(&e, "100k_sats").0, None);
+        assert!(resolve_from_election(&e, "100k_sats").0.is_empty());
     }
 
     /// The anchor height is derived from the epoch, never read from the
@@ -339,7 +390,7 @@ mod tests {
     #[test]
     fn a_disabled_election_is_not_treated_as_dishonest() {
         let e = json!({ "enabled": false });
-        assert_eq!(resolve_from_election(&e, "100k_sats"), (None, None));
+        assert_eq!(resolve_from_election(&e, "100k_sats"), (Vec::new(), None));
     }
 
     fn status(enabled: bool, coords: serde_json::Value) -> serde_json::Value {
@@ -357,8 +408,8 @@ mod tests {
         );
         let key = [7u8; 32];
         // Same key → same owner (so wallets converge), and it's one of the seats.
-        let a = pick_seat_endpoint(&s, &key);
-        assert_eq!(a, pick_seat_endpoint(&s, &key));
+        let a = pick_seat_endpoints(&s, &key).first().cloned();
+        assert_eq!(a, pick_seat_endpoints(&s, &key).first().cloned());
         assert!(matches!(
             a.as_deref(),
             Some("http://a:9100") | Some("http://b:9100")
@@ -369,20 +420,24 @@ mod tests {
     fn none_when_disabled_empty_or_unadvertised() {
         // Disabled election.
         assert_eq!(
-            pick_seat_endpoint(&status(false, json!([])), &[0u8; 32]),
+            pick_seat_endpoints(&status(false, json!([])), &[0u8; 32])
+                .first()
+                .cloned(),
             None
         );
         // No coordinators seated.
         assert_eq!(
-            pick_seat_endpoint(&status(true, json!([])), &[0u8; 32]),
+            pick_seat_endpoints(&status(true, json!([])), &[0u8; 32])
+                .first()
+                .cloned(),
             None
         );
         // Single seat whose owner hasn't advertised an endpoint yet.
         let s = status(true, json!([{"node_id":"aa","seat":0,"endpoint":null}]));
-        assert_eq!(pick_seat_endpoint(&s, &[0u8; 32]), None);
+        assert_eq!(pick_seat_endpoints(&s, &[0u8; 32]).first().cloned(), None);
         // Empty-string endpoint is treated as unadvertised.
         let s = status(true, json!([{"node_id":"aa","seat":0,"endpoint":""}]));
-        assert_eq!(pick_seat_endpoint(&s, &[0u8; 32]), None);
+        assert_eq!(pick_seat_endpoints(&s, &[0u8; 32]).first().cloned(), None);
     }
 
     #[test]
@@ -407,7 +462,8 @@ mod tests {
     fn resolve_from_election_uses_epoch_and_falls_back() {
         // A verified election resolves, and reports its epoch.
         let s = honest_election(42, 6, 2);
-        let (ep, epoch) = resolve_from_election(&s, "0.01btc");
+        let (eps, epoch) = resolve_from_election(&s, "0.01btc");
+        let ep = eps.first().cloned();
         assert_eq!(epoch, Some(42));
         assert!(ep.is_some());
 
@@ -423,15 +479,108 @@ mod tests {
             ]
         });
         assert_eq!(
-            resolve_from_election(&unverifiable, "0.01btc"),
+            (
+                resolve_from_election(&unverifiable, "0.01btc")
+                    .0
+                    .first()
+                    .cloned(),
+                resolve_from_election(&unverifiable, "0.01btc").1
+            ),
             (None, Some(42))
         );
 
         // No epoch (election pending) → no endpoint, caller falls back.
         let pending = json!({ "enabled": true, "epoch": null, "coordinators": [] });
-        assert_eq!(resolve_from_election(&pending, "0.01btc"), (None, None));
+        assert_eq!(
+            resolve_from_election(&pending, "0.01btc"),
+            (Vec::new(), None)
+        );
         // Disabled → nothing.
         let off = json!({ "enabled": false });
-        assert_eq!(resolve_from_election(&off, "0.01btc"), (None, None));
+        assert_eq!(resolve_from_election(&off, "0.01btc"), (Vec::new(), None));
+    }
+
+    /// The property the whole design rests on: every wallet sharded to a dead
+    /// seat moves to the SAME next seat.
+    ///
+    /// If wallets each probed for whatever they could reach, they would notice
+    /// the failure at different moments and scatter — the anonymity set
+    /// fragmenting exactly when the network is already degraded. Here the set
+    /// moves as a body, and joins the destination seat's existing cohort rather
+    /// than forming a new one.
+    #[test]
+    fn every_wallet_on_a_seat_falls_back_to_the_same_seat() {
+        // Two different keys that happen to shard to the same seat stand in for
+        // two wallets in one cohort: whatever their keys, the ORDER after the
+        // owning seat is a function of the seat count, so the cohort cannot split.
+        let n = 5;
+        for a in 0u8..40 {
+            for b in 0u8..40 {
+                let ka = [a; 32];
+                let kb = [b; 32];
+                let oa = seat_try_order(&ka, n);
+                let ob = seat_try_order(&kb, n);
+                if oa[0] == ob[0] {
+                    assert_eq!(
+                        oa, ob,
+                        "two wallets on seat {} disagreed about where to go next",
+                        oa[0]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The first seat tried must be the one that owns the key, or the fallback
+    /// order would quietly move every wallet off its own seat.
+    #[test]
+    fn the_order_starts_at_the_owning_seat() {
+        for i in 0u8..20 {
+            let key = [i; 32];
+            for n in 1usize..8 {
+                assert_eq!(seat_try_order(&key, n)[0], shard_for(&key, n) as usize);
+            }
+        }
+    }
+
+    /// Every seat appears exactly once: no seat is unreachable as a fallback,
+    /// and none is tried twice.
+    #[test]
+    fn the_order_is_a_permutation_of_the_seats() {
+        for n in 1usize..12 {
+            let order = seat_try_order(&[7u8; 32], n);
+            assert_eq!(order.len(), n);
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), n, "n={n} produced a duplicate or a gap");
+        }
+    }
+
+    /// A seat that has advertised no endpoint is skipped rather than occupying a
+    /// position — a seat nobody can dial is not a fallback.
+    #[test]
+    fn seats_without_an_endpoint_are_skipped() {
+        let status = json!({
+            "enabled": true,
+            "coordinators": [
+                { "seat": 0, "endpoint": "" },
+                { "seat": 1, "endpoint": "1.2.3.4:9100" },
+                { "seat": 2, "endpoint": "5.6.7.8:9100" },
+            ],
+        });
+        let endpoints = pick_seat_endpoints(&status, &[3u8; 32]);
+        assert_eq!(endpoints.len(), 2, "the empty endpoint must not be offered");
+        assert!(!endpoints.iter().any(|e| e.is_empty()));
+    }
+
+    /// No seats, no panic — and no endpoints to pretend otherwise.
+    #[test]
+    fn an_empty_election_yields_nothing_to_try() {
+        assert!(seat_try_order(&[0u8; 32], 0).is_empty());
+        let off = json!({ "enabled": false });
+        assert!(pick_seat_endpoints(&off, &[0u8; 32]).is_empty());
+        let empty = json!({ "enabled": true, "coordinators": [] });
+        assert!(pick_seat_endpoints(&empty, &[0u8; 32]).is_empty());
     }
 }
