@@ -76,6 +76,9 @@ ARCHIVE="false"
 # otherwise. --wraith / --no-wraith
 # pin it explicitly.
 WRAITH=""
+# Where a coordinator's per-round service fee lands. Deliberately has NO default —
+# see the [coordinator] block and the validation below.
+COORDINATOR_FEE_ADDRESS=""
 # Tor. OFF by default — a plain clearnet install is completely unchanged.
 #   hybrid   (--tor)      reach outbound peers via Tor AND stay reachable on
 #                         clearnet 8333, plus publish an ephemeral v3 onion.
@@ -170,6 +173,7 @@ while [[ $# -gt 0 ]]; do
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --wraith)         WRAITH="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --coordinator-fee-address) COORDINATOR_FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-wraith)      WRAITH="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor)            TOR="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor-only)       TOR="true"; TOR_MODE="tor-only"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -320,6 +324,21 @@ run_wizard() {
   # now stands on its own. Off by default: running a coordinator is a
   # commitment to be online, not a capability box to tick.
   WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator?" N)"
+  if [[ "$WRAITH" == "true" ]]; then
+    echo "  A coordinator earns a per-round service fee. This must be a FRESH taproot"
+    echo "  address, not your payout address: the payout address is public, so paying"
+    echo "  round fees to it would mark every round you coordinate as yours."
+    while :; do
+      read -rp "  Coordinator fee address (bc1p…): " cfa
+      if [[ ! "$cfa" =~ ^bc1p[a-z0-9]{20,}$ ]]; then
+        echo "  ✗ Must be a mainnet taproot address starting 'bc1p…'."
+      elif [[ "$cfa" == "$PAYOUT_ADDRESS" ]]; then
+        echo "  ✗ That is your payout address. It is public — using it would identify every round."
+      else
+        COORDINATOR_FEE_ADDRESS="$cfa"; break
+      fi
+    done
+  fi
 
   # Tor. Off by default. Hybrid keeps clearnet reachability AND adds an onion;
   # tor-only routes everything over Tor and drops clearnet.
@@ -380,6 +399,23 @@ fi
 
 [[ -n "$PAYOUT_ADDRESS" ]] || { usage; err "--payout-address is required."; }
 [[ "$PAYOUT_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Payout address doesn't look like a mainnet bech32 address."
+
+# A coordinator's fee address is asked for, never inferred.
+#
+# It used to default to the node's payout address, and that is a privacy leak,
+# not a convenience: a payout address is PUBLIC — it receives this node's mining
+# income on chain — so a round paying it is instantly identifiable as a Wraith
+# round AND attributable to the node that coordinated it. That is the `WL01`
+# marker (#695) rebuilt out of an address.
+#
+# P2TR specifically: every mixed output in a round is taproot (#696), so a
+# bech32v0 fee output is the one output in the transaction that does not look
+# like the others.
+if [[ "$WRAITH" == "true" ]]; then
+  [[ -n "$COORDINATOR_FEE_ADDRESS" ]] || err "--coordinator-fee-address is required with --wraith. A coordinator without one is seated and refuses every round (503 fee_address_not_configured), and it must NOT be the node's payout address — that address is public, so paying it makes every round identifiable and attributable."
+  [[ "$COORDINATOR_FEE_ADDRESS" =~ ^bc1p[a-z0-9]{20,}$ ]] || err "Coordinator fee address must be a mainnet P2TR address (bc1p…). Round outputs are all taproot (#696); a different script type singles the fee output out."
+  [[ "$COORDINATOR_FEE_ADDRESS" != "$PAYOUT_ADDRESS" ]] || err "Coordinator fee address must not be the node's payout address. The payout address is public, so every round paying it is identifiable as a Wraith round and attributable to this node. Use a fresh address."
+fi
 [[ "$(uname -m)" == "x86_64" ]] || err "Only x86_64 is supported by this installer right now."
 case "$SYNC_MODE" in ibd) ;;
   haze) if [[ "$WIZARD_RAN" != "true" ]]; then
@@ -819,9 +855,14 @@ coordinator_port = 9100
 # Destination for this coordinator's per-round service fee. NOT optional in
 # practice: a Mix round refuses every input with 503
 # fee_address_not_configured while this is unset, so a coordinator without
-# one is seated and cannot run a round. Defaults to this node's payout
-# address; change it if mixing revenue should land somewhere else.
-coordinator_fee_address = "${PAYOUT_ADDRESS}"
+# one is seated and cannot run a round.
+#
+# ⛔ This USED TO default to the node's payout address, and must never do so
+# again. A payout address is public — it receives this node's mining income on
+# chain — so a round paying it is instantly identifiable as a Wraith round and
+# attributable to the node that coordinated it. That is the WL01 marker (#695)
+# rebuilt out of an address. It is now a required, separate input.
+coordinator_fee_address = "${COORDINATOR_FEE_ADDRESS}"
 EOF
 
 # H-11: configs with secrets must be 0600.
