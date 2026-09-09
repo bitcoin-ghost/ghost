@@ -54,6 +54,7 @@ mod derivation;
 pub mod encryption;
 mod error;
 mod ghost_id;
+pub mod input_keys;
 mod keys;
 pub mod labels;
 pub mod metadata;

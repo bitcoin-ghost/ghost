@@ -14,6 +14,9 @@
 
 use std::collections::HashSet;
 
+use ghost_keys::input_keys::{receiver_pubkey, InputRef};
+use secp256k1::{Parity, PublicKey, XOnlyPublicKey};
+
 use crate::candidate_scan::CandidateOutput;
 use crate::ghostd::{BlockTx, VerboseBlock};
 
@@ -188,13 +191,70 @@ pub fn candidate_in(tx: &BlockTx) -> Option<(String, Vec<CandidateOutput>)> {
         }
     }
 
-    // An announcement with nothing to pay into is not a candidate. Scanning it
-    // would cost an ECDH per block for a transaction that cannot match.
-    let ephemeral = ephemeral?;
+    // Nothing to pay into is not a candidate, whichever way the key is found.
+    // Scanning it would cost an ECDH per block for a transaction that cannot
+    // match.
     if outputs.is_empty() {
         return None;
     }
+
+    // An explicit announcement takes precedence, and exists only for coins
+    // already on chain: nothing emits one now (#867). Dropping the read would
+    // make those coins permanently unfindable, so it stays.
+    let ephemeral = match ephemeral {
+        Some(e) => e,
+        None => ephemeral_from_inputs(tx)?,
+    };
     Some((ephemeral, outputs))
+}
+
+/// The sender's ephemeral point, recovered from the transaction's own inputs.
+///
+/// This is what lets a payment carry no marker at all: the material both sides
+/// need is already on chain as the input public keys, so nothing has to be
+/// announced. See `ghost_keys::input_keys`.
+///
+/// Only taproot inputs can be used. A P2TR prevout publishes its key in the
+/// scriptPubKey, while P2WPKH and friends keep theirs in the witness, which this
+/// block view does not carry. A transaction with any non-taproot input is
+/// skipped rather than guessed at — a partial `A_sum` yields a wrong point and
+/// would silently miss the payment rather than fail.
+fn ephemeral_from_inputs(tx: &BlockTx) -> Option<String> {
+    if tx.vin.is_empty() {
+        return None;
+    }
+    let mut inputs = Vec::with_capacity(tx.vin.len());
+    let mut pubkeys = Vec::with_capacity(tx.vin.len());
+
+    for vin in &tx.vin {
+        // A coinbase has no prevout and cannot be a payment.
+        let txid = vin.txid.as_ref()?;
+        let vout = vin.vout?;
+        let prevout = vin.prevout.as_ref()?;
+
+        let spk = hex::decode(&prevout.script_pub_key.hex).ok()?;
+        if spk.len() != P2TR_LEN || spk[0] != OP_1 || spk[1] != PUSH32 {
+            return None;
+        }
+        let xonly = XOnlyPublicKey::from_slice(&spk[2..P2TR_LEN]).ok()?;
+        // Even-Y, which is what the sender normalised to: a taproot output
+        // records no parity, so there is nothing else it could be.
+        pubkeys.push(PublicKey::from_x_only_public_key(xonly, Parity::Even));
+
+        // ⚠ The node reports a txid in DISPLAY order (reversed). The derivation
+        // hashes the outpoint as a transaction serialises it, internal order.
+        // Getting this backwards changes the smallest outpoint, changes the
+        // hash, and loses the payment with no error anywhere.
+        let mut raw = hex::decode(txid).ok()?;
+        raw.reverse();
+        inputs.push(InputRef {
+            txid: raw.try_into().ok()?,
+            vout,
+        });
+    }
+
+    let point = receiver_pubkey(&inputs, &pubkeys).ok()?;
+    Some(hex::encode(point.serialize()))
 }
 
 /// Every silent-payment candidate in a block, with its txid.
@@ -494,6 +554,88 @@ mod tests {
         assert_eq!(found[0].amount_sats, Some(50_000_000));
         assert_eq!(found[0].k, 0);
         assert_eq!(found[0].block_height, Some(900_000));
+    }
+
+    /// The whole point of #867: a payment with NO announcement, found anyway.
+    ///
+    /// The sender derives from the coins it is spending, the scanner recovers
+    /// the same point from those inputs' public keys as they appear on chain,
+    /// and the transaction carries nothing that marks it — no `OP_RETURN`, no
+    /// zero-value output. It is a taproot spend paying taproot outputs.
+    #[test]
+    fn a_payment_with_no_announcement_is_still_found() {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use ghost_keys::{GhostKeys, GhostNetwork, GhostId};
+
+        let secp = Secp256k1::new();
+        let receiver = GhostKeys::generate();
+        let ghost_id = GhostId::new(*receiver.scan_pubkey(), *receiver.spend_pubkey())
+            .encode_for_network(GhostNetwork::Regtest)
+            .expect("encode");
+
+        // The sender's coins: two taproot inputs it holds the keys to.
+        let keys = [
+            SecretKey::from_slice(&[7u8; 32]).unwrap(),
+            SecretKey::from_slice(&[9u8; 32]).unwrap(),
+        ];
+        let refs = [
+            InputRef { txid: [0xab; 32], vout: 1 },
+            InputRef { txid: [0x12; 32], vout: 0 },
+        ];
+
+        let payment = crate::silent_payment::build_from_inputs(
+            &ghost_id,
+            bitcoin::Network::Regtest,
+            0,
+            &refs,
+            &keys,
+        )
+        .expect("build");
+
+        // Assemble the transaction as the node would report it: each input
+        // carries its prevout, and the txids come back in DISPLAY order.
+        let vin: Vec<serde_json::Value> = refs
+            .iter()
+            .zip(keys.iter())
+            .map(|(r, k)| {
+                let mut display = r.txid;
+                display.reverse();
+                let (xonly, _) = k.public_key(&secp).x_only_public_key();
+                let mut spk = vec![0x51u8, 0x20];
+                spk.extend_from_slice(&xonly.serialize());
+                serde_json::json!({
+                    "txid": hex::encode(display),
+                    "vout": r.vout,
+                    "prevout": { "value": 1.0, "scriptPubKey": { "hex": hex::encode(spk) } }
+                })
+            })
+            .collect();
+
+        let tx: crate::ghostd::BlockTx = serde_json::from_value(serde_json::json!({
+            "txid": "beef",
+            "vin": vin,
+            "vout": [
+                // A decoy taproot output, so the scanner has to pick.
+                { "n": 0, "value": 0.25, "scriptPubKey": { "hex": spk_hex(0xcc) } },
+                { "n": 1, "value": 0.5, "scriptPubKey": { "hex": hex::encode(payment.as_bytes()) } },
+            ],
+        }))
+        .expect("tx fixture");
+
+        assert!(
+            !tx.vout.iter().any(|v| v.script_pubkey.hex.starts_with("6a")),
+            "the transaction must carry no OP_RETURN at all"
+        );
+
+        let (eph_hex, outs) = candidate_in(&tx).expect("a candidate without an announcement");
+        let found =
+            crate::candidate_scan::scan_candidate(&receiver, &eph_hex, &outs, "beef", Some(101))
+                .expect("scan runs");
+
+        assert_eq!(found.len(), 1, "exactly the one output that was ours");
+        assert_eq!(found[0].vout, 1);
+        assert_eq!(found[0].amount_sats, Some(50_000_000));
+        assert_eq!(found[0].k, 0);
     }
 
     /// The same payment addressed to somebody else must not match, or the

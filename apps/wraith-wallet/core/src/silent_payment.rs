@@ -28,7 +28,9 @@
 //! makes, and it is worth knowing before choosing it over an ordinary address.
 
 use bitcoin::{Network, ScriptBuf};
+use ghost_keys::input_keys::{sender_secret, InputRef};
 use ghost_keys::{GhostId, GhostNetwork};
+use secp256k1::SecretKey;
 
 /// The two outputs a silent payment adds to a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,47 @@ pub fn build(
         output_script: ScriptBuf::from_bytes(output),
         announcement_script: ScriptBuf::from_bytes(announcement),
     })
+}
+
+/// Build the output that pays `ghost_id`, with nothing announced (#867).
+///
+/// The shared secret comes from the transaction's own inputs rather than from a
+/// fresh random key, so there is no ephemeral pubkey to publish and the payment
+/// leaves **one** output that looks like any other taproot spend. Compare
+/// [`build`], which returns an `OP_RETURN` alongside and marks the transaction
+/// as a silent payment to every observer.
+///
+/// `inputs` and `input_keys` describe the same inputs — the ones this
+/// transaction will actually spend. They need not be in the same order as each
+/// other or as the transaction, because the derivation sorts by outpoint.
+///
+/// ⚠ The inputs are load-bearing in a way an ordinary output is not: change the
+/// coin selection after calling this and the output no longer matches what a
+/// receiver will compute, so the money lands on a key nobody derives. Select
+/// first, then build.
+pub fn build_from_inputs(
+    ghost_id: &str,
+    network: Network,
+    k: u32,
+    inputs: &[InputRef],
+    input_keys: &[SecretKey],
+) -> Result<ScriptBuf, SilentPaymentError> {
+    let gn = ghost_network_for(network)
+        .ok_or_else(|| SilentPaymentError::BadGhostId(format!("unsupported network {network}")))?;
+    let id = GhostId::decode_for_network(ghost_id.trim(), gn)
+        .map_err(|e| SilentPaymentError::BadGhostId(e.to_string()))?;
+
+    let ephemeral = sender_secret(inputs, input_keys)
+        .map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+    let (output_pubkey, _ephemeral_pub, _tweak) = id
+        .derive_payment_address_v2_with_ephemeral(&ephemeral, k)
+        .map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+
+    let mut output = Vec::with_capacity(34);
+    output.push(0x51); // OP_1
+    output.push(0x20); // PUSH32
+    output.extend_from_slice(&output_pubkey.serialize()[1..]);
+    Ok(ScriptBuf::from_bytes(output))
 }
 
 #[cfg(test)]
