@@ -166,6 +166,13 @@ impl TranslatorSv2 {
             .await
         {
             error!("Failed to initialize any upstream connection: {e:?}");
+            // Tell everything already spawned to stop before the receiver goes
+            // out of scope with this return. Without it a component reporting a
+            // status here finds a closed channel while nothing has asked for a
+            // shutdown — which is exactly the state `report_undeliverable`
+            // treats as impossible, and it would abort the process on a startup
+            // failure that was being handled correctly.
+            cancellation_token.cancel();
             self.shutdown_notify.notify_waiters();
             self.is_alive.store(false, Ordering::Relaxed);
             return;

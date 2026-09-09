@@ -413,6 +413,7 @@ impl Sv1Server {
         let status_sender = StatusSender::Downstream {
             downstream_id,
             tx: status_sender.clone(),
+            shutdown: cancellation_token.clone(),
         };
         Downstream::run_downstream_tasks(
             downstream,
@@ -667,7 +668,10 @@ impl Sv1Server {
             .await
             .map_err(TproxyError::shutdown)?;
 
-        let sv1_status_sender = StatusSender::Sv1Server(status_sender.clone());
+        let sv1_status_sender = StatusSender::Sv1Server {
+            tx: status_sender.clone(),
+            shutdown: cancellation_token.clone(),
+        };
         let task_manager_clone = task_manager.clone();
         let vardiff_enabled = self.config.downstream_difficulty_config.enable_vardiff;
         let keepalive_enabled = self
