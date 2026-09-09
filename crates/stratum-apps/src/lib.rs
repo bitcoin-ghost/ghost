@@ -79,3 +79,6 @@ pub mod coinbase_output_constraints;
 
 /// Fallback coordinator
 pub mod fallback_coordinator;
+
+/// Upstream list re-arming, so a failover list can be swept more than once
+pub mod upstream_list;

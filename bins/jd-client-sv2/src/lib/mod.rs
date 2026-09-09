@@ -18,6 +18,7 @@ use stratum_apps::{
     stratum_core::{bitcoin::consensus::Encodable, parsers_sv2::JobDeclaration},
     task_manager::TaskManager,
     tp_type::TemplateProviderType,
+    upstream_list::stale_upstreams,
     utils::types::{Sv2Frame, GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS},
 };
 use tokio::sync::Notify;
@@ -628,94 +629,120 @@ impl JobDeclaratorClient {
     ) -> Result<(Upstream, JobDeclarator), JDCErrorKind> {
         const MAX_RETRIES: usize = 3;
         let upstream_len = upstreams.len();
-        for (i, upstream_entry) in upstreams.iter_mut().enumerate() {
-            info!(
-                "Trying upstream {} of {}: pool={}:{}, jds={}:{}",
-                i + 1,
-                upstream_len,
-                upstream_entry.pool_host,
-                upstream_entry.pool_port,
-                upstream_entry.jds_host,
-                upstream_entry.jds_port,
-            );
+        // What THIS call has attempted, which is what tells a live flag from a stale one.
+        let mut attempted = vec![false; upstream_len];
 
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    info!("Shutdown requested while waiting to initialize upstream, aborting retries");
-                    return Err(JDCErrorKind::CouldNotInitiateSystem);
-                }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-
-            if upstream_entry.tried_or_flagged {
-                info!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
-                );
-                continue;
-            }
-
-            for attempt in 1..=MAX_RETRIES {
-                if cancellation_token.is_cancelled() {
+        loop {
+            for i in 0..upstream_len {
+                if upstreams[i].tried_or_flagged {
                     info!(
-                        "Shutdown requested before upstream connection attempt, aborting retries"
+                        "Upstream previously marked as malicious, skipping initial attempt warnings."
                     );
-                    return Err(JDCErrorKind::CouldNotInitiateSystem);
+                    continue;
+                }
+                attempted[i] = true;
+
+                info!(
+                    "Trying upstream {} of {}: pool={}:{}, jds={}:{}",
+                    i + 1,
+                    upstream_len,
+                    upstreams[i].pool_host,
+                    upstreams[i].pool_port,
+                    upstreams[i].jds_host,
+                    upstreams[i].jds_port,
+                );
+
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        info!("Shutdown requested while waiting to initialize upstream, aborting retries");
+                        return Err(JDCErrorKind::CouldNotInitiateSystem);
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
 
-                info!("Connection attempt {}/{}...", attempt, MAX_RETRIES);
-
-                match try_initialize_single(
-                    upstream_entry,
-                    upstream_to_channel_manager_sender.clone(),
-                    channel_manager_to_upstream_receiver.clone(),
-                    jd_to_channel_manager_sender.clone(),
-                    channel_manager_to_jd_receiver.clone(),
-                    cancellation_token.clone(),
-                    fallback_coordinator.clone(),
-                    mode.clone(),
-                    task_manager.clone(),
-                    &self.config,
-                )
-                .await
-                {
-                    Ok(pair) => {
-                        upstream_entry.tried_or_flagged = true;
-                        return Ok(pair);
-                    }
-                    Err(e) => {
-                        tracing::error!("Upstream and JDS connection terminated");
-
-                        tokio::select! {
-                            _ = cancellation_token.cancelled() => {
-                                info!("Shutdown requested after upstream initialization failure, aborting retries");
-                                return Err(JDCErrorKind::CouldNotInitiateSystem);
-                            }
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                        }
-
-                        warn!(
-                            "Attempt {}/{} failed for pool={}:{}, jds={}:{}: {:?}",
-                            attempt,
-                            MAX_RETRIES,
-                            upstream_entry.pool_host,
-                            upstream_entry.pool_port,
-                            upstream_entry.jds_host,
-                            upstream_entry.jds_port,
-                            e
+                for attempt in 1..=MAX_RETRIES {
+                    if cancellation_token.is_cancelled() {
+                        info!(
+                            "Shutdown requested before upstream connection attempt, aborting retries"
                         );
-                        if attempt == MAX_RETRIES {
+                        return Err(JDCErrorKind::CouldNotInitiateSystem);
+                    }
+
+                    info!("Connection attempt {}/{}...", attempt, MAX_RETRIES);
+
+                    // Bound the borrow of `upstreams[i]` to this statement, so the arms below can
+                    // take the list mutably.
+                    let outcome = try_initialize_single(
+                        &upstreams[i],
+                        upstream_to_channel_manager_sender.clone(),
+                        channel_manager_to_upstream_receiver.clone(),
+                        jd_to_channel_manager_sender.clone(),
+                        channel_manager_to_jd_receiver.clone(),
+                        cancellation_token.clone(),
+                        fallback_coordinator.clone(),
+                        mode.clone(),
+                        task_manager.clone(),
+                        &self.config,
+                    )
+                    .await;
+
+                    match outcome {
+                        Ok(pair) => {
+                            upstreams[i].tried_or_flagged = true;
+                            return Ok(pair);
+                        }
+                        Err(e) => {
+                            tracing::error!("Upstream and JDS connection terminated");
+
+                            tokio::select! {
+                                _ = cancellation_token.cancelled() => {
+                                    info!("Shutdown requested after upstream initialization failure, aborting retries");
+                                    return Err(JDCErrorKind::CouldNotInitiateSystem);
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
+
                             warn!(
-                                "Max retries reached for pool={}:{}, jds={}:{}, moving to next upstream",
-                                upstream_entry.pool_host,
-                                upstream_entry.pool_port,
-                                upstream_entry.jds_host,
-                                upstream_entry.jds_port,
+                                "Attempt {}/{} failed for pool={}:{}, jds={}:{}: {:?}",
+                                attempt,
+                                MAX_RETRIES,
+                                upstreams[i].pool_host,
+                                upstreams[i].pool_port,
+                                upstreams[i].jds_host,
+                                upstreams[i].jds_port,
+                                e
                             );
+                            if attempt == MAX_RETRIES {
+                                warn!(
+                                    "Max retries reached for pool={}:{}, jds={}:{}, moving to next upstream",
+                                    upstreams[i].pool_host,
+                                    upstreams[i].pool_port,
+                                    upstreams[i].jds_host,
+                                    upstreams[i].jds_port,
+                                );
+                            }
                         }
                     }
                 }
+                upstreams[i].tried_or_flagged = true;
             }
-            upstream_entry.tried_or_flagged = true;
+
+            // Nothing in this pass would take a connection. Anything still flagged that this call
+            // never attempted was flagged by an earlier connection, so re-arm those and sweep
+            // once more; entries this call already failed keep their flag, so this terminates.
+            let flags: Vec<bool> = upstreams.iter().map(|u| u.tried_or_flagged).collect();
+            let stale = stale_upstreams(&flags, &attempted);
+            if stale.is_empty() {
+                break;
+            }
+            warn!(
+                "No upstream accepted a connection in this pass; re-arming {} upstream(s) flagged \
+                 by an earlier connection and sweeping once more",
+                stale.len()
+            );
+            for i in stale {
+                upstreams[i].tried_or_flagged = false;
+            }
         }
 
         tracing::error!("All upstreams failed after {} retries each", MAX_RETRIES);

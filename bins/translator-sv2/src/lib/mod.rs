@@ -26,6 +26,7 @@ use std::{
 use stratum_apps::{
     fallback_coordinator::FallbackCoordinator,
     task_manager::TaskManager,
+    upstream_list::stale_upstreams,
     utils::types::{Sv2Frame, GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS},
 };
 use tokio::sync::Notify;
@@ -436,10 +437,15 @@ impl TranslatorSv2 {
     /// advance to the next entry. This ensures we exhaust every healthy upstream before shutting
     /// the translator down.
     ///
-    /// The `tried_or_flagged` flag in the `UpstreamEntry` acts as the upstream's state machine:
-    ///  `false` means "never tried", while `true` means "already connected or marked as
-    /// malicious". Once an upstream is flagged we skip it on future loops
-    /// to avoid hammering known-bad endpoints during failover.
+    /// The `tried_or_flagged` flag in the `UpstreamEntry` marks an upstream this call has already
+    /// connected to or already failed against, so a pass skips it instead of hammering a known-bad
+    /// endpoint during failover.
+    ///
+    /// A flag left behind by an EARLIER call says nothing about now. Once a pass has failed, those
+    /// entries are re-armed ([`stale_upstreams`]) and the list is swept once more — which is what
+    /// lets the translator fail back to an upstream it has used before. Without that the list was
+    /// one-shot, and the second upstream loss shut the translator down rather than reconnecting to
+    /// an upstream that had since recovered. See `stratum_apps::upstream_list`.
     #[allow(clippy::too_many_arguments)]
     pub async fn initialize_upstream(
         &self,
@@ -455,73 +461,99 @@ impl TranslatorSv2 {
     ) -> Result<(), TproxyErrorKind> {
         const MAX_RETRIES: usize = 3;
         let upstream_len = upstreams.len();
-        for (i, upstream_entry) in upstreams.iter_mut().enumerate() {
-            // Skip upstreams already marked as malicious. We’ve previously failed or
-            // blacklisted them, so no need to warn or attempt reconnecting again.
-            if upstream_entry.tried_or_flagged {
-                debug!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
+        // What THIS call has attempted, which is what tells a live flag from a stale one.
+        let mut attempted = vec![false; upstream_len];
+
+        loop {
+            for i in 0..upstream_len {
+                // Skip upstreams already connected to or marked as malicious. We’ve previously
+                // failed or blacklisted them, so no need to warn or attempt reconnecting again.
+                if upstreams[i].tried_or_flagged {
+                    debug!(
+                        "Upstream previously marked as malicious, skipping initial attempt warnings."
+                    );
+                    continue;
+                }
+                attempted[i] = true;
+
+                info!(
+                    "Trying upstream {} of {}: {}:{}",
+                    i + 1,
+                    upstream_len,
+                    upstreams[i].host,
+                    upstreams[i].port
                 );
-                continue;
-            }
+                for attempt in 1..=MAX_RETRIES {
+                    info!("Connection attempt {}/{}...", attempt, MAX_RETRIES);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
 
-            info!(
-                "Trying upstream {} of {}: {}:{}",
-                i + 1,
-                upstream_len,
-                upstream_entry.host,
-                upstream_entry.port
-            );
-            for attempt in 1..=MAX_RETRIES {
-                info!("Connection attempt {}/{}...", attempt, MAX_RETRIES);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                    // Bound the borrow of `upstreams[i]` to this statement, so the arms below can
+                    // take the list mutably.
+                    let outcome = try_initialize_upstream(
+                        &upstreams[i],
+                        upstream_to_channel_manager_sender.clone(),
+                        channel_manager_to_upstream_receiver.clone(),
+                        cancellation_token.clone(),
+                        fallback_coordinator.clone(),
+                        status_sender.clone(),
+                        task_manager.clone(),
+                        required_extensions.clone(),
+                    )
+                    .await;
 
-                match try_initialize_upstream(
-                    upstream_entry,
-                    upstream_to_channel_manager_sender.clone(),
-                    channel_manager_to_upstream_receiver.clone(),
-                    cancellation_token.clone(),
-                    fallback_coordinator.clone(),
-                    status_sender.clone(),
-                    task_manager.clone(),
-                    required_extensions.clone(),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        // starting sv1 server instance
-                        if let Err(e) = sv1_server_instance
-                            .clone()
-                            .start(
-                                cancellation_token.clone(),
-                                fallback_coordinator.clone(),
-                                status_sender.clone(),
-                                task_manager.clone(),
-                            )
-                            .await
-                        {
-                            error!("SV1 server startup failed: {e:?}");
-                            return Err(*e.kind);
+                    match outcome {
+                        Ok(()) => {
+                            // starting sv1 server instance
+                            if let Err(e) = sv1_server_instance
+                                .clone()
+                                .start(
+                                    cancellation_token.clone(),
+                                    fallback_coordinator.clone(),
+                                    status_sender.clone(),
+                                    task_manager.clone(),
+                                )
+                                .await
+                            {
+                                error!("SV1 server startup failed: {e:?}");
+                                return Err(*e.kind);
+                            }
+
+                            upstreams[i].tried_or_flagged = true;
+                            return Ok(());
                         }
-
-                        upstream_entry.tried_or_flagged = true;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Attempt {}/{} failed for {}:{}: {:?}",
-                            attempt, MAX_RETRIES, upstream_entry.host, upstream_entry.port, e
-                        );
-                        if attempt == MAX_RETRIES {
+                        Err(e) => {
                             warn!(
-                                "Max retries reached for {}:{}, moving to next upstream",
-                                upstream_entry.host, upstream_entry.port
+                                "Attempt {}/{} failed for {}:{}: {:?}",
+                                attempt, MAX_RETRIES, upstreams[i].host, upstreams[i].port, e
                             );
+                            if attempt == MAX_RETRIES {
+                                warn!(
+                                    "Max retries reached for {}:{}, moving to next upstream",
+                                    upstreams[i].host, upstreams[i].port
+                                );
+                            }
                         }
                     }
                 }
+                upstreams[i].tried_or_flagged = true;
             }
-            upstream_entry.tried_or_flagged = true;
+
+            // Nothing in this pass would take a connection. Anything still flagged that this call
+            // never attempted was flagged by an earlier connection, so re-arm those and sweep
+            // once more; entries this call already failed keep their flag, so this terminates.
+            let flags: Vec<bool> = upstreams.iter().map(|u| u.tried_or_flagged).collect();
+            let stale = stale_upstreams(&flags, &attempted);
+            if stale.is_empty() {
+                break;
+            }
+            warn!(
+                "No upstream accepted a connection in this pass; re-arming {} upstream(s) flagged \
+                 by an earlier connection and sweeping once more",
+                stale.len()
+            );
+            for i in stale {
+                upstreams[i].tried_or_flagged = false;
+            }
         }
 
         tracing::error!("All upstreams failed after {} retries each", MAX_RETRIES);
