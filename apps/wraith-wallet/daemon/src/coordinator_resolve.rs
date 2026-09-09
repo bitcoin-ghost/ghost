@@ -147,6 +147,68 @@ fn decode_32(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
+/// What several nodes say about the roster they drew from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterAgreement {
+    /// Fewer than two views answered for this epoch, so there was nothing to
+    /// compare. The roster is one node's word, as it has always been — the
+    /// point of naming this state is that the wallet can SAY so instead of
+    /// implying a check it did not make.
+    Unchecked,
+    /// Every view that answered for this epoch published the same roster.
+    Unanimous,
+    /// Views disagree, so at least one node is drawing from a roster the others
+    /// do not recognise.
+    Disagreement { commitments: Vec<String> },
+}
+
+/// Compare the rosters several nodes published for the same epoch (#710).
+///
+/// # What this catches, and what it does not
+///
+/// `verify_election` proves a seat list follows from the roster published
+/// beside it. It cannot prove the roster is the real qualified set: a node that
+/// omits honest candidates — to improve its own odds, or to seat itself —
+/// produces an election that verifies perfectly. "No self-nomination" holds
+/// against the draw, not against control of the input set.
+///
+/// Asking more than one node closes the *unilateral* case: a liar has to agree
+/// with everyone else or be seen. It does NOT close collusion, and it is not
+/// consensus — that needs a BFT-finalised roster checkpoint on the pool side.
+///
+/// `roster_commitment` exists precisely to be compared like this
+/// (`wraith_protocol::roster_snapshot`), and until now nothing compared it.
+///
+/// # Epoch skew is not dishonesty
+///
+/// Only views answering for `epoch` are compared. Near a boundary two honest
+/// nodes legitimately answer for different epochs, and counting that as
+/// disagreement would refuse elections every epoch flip — a self-inflicted
+/// outage on the schedule, which is worse than the attack.
+pub fn roster_agreement(views: &[serde_json::Value], epoch: u64) -> RosterAgreement {
+    let mut commitments: Vec<String> = views
+        .iter()
+        .filter(|v| v.get("epoch").and_then(|e| e.as_u64()) == Some(epoch))
+        .filter_map(|v| {
+            v.get("roster_commitment")
+                .and_then(|c| c.as_str())
+                .map(|c| c.trim().to_ascii_lowercase())
+        })
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    if commitments.len() < 2 {
+        return RosterAgreement::Unchecked;
+    }
+    commitments.sort();
+    commitments.dedup();
+    if commitments.len() == 1 {
+        RosterAgreement::Unanimous
+    } else {
+        RosterAgreement::Disagreement { commitments }
+    }
+}
+
 /// The seats to try for `shard_key`, in order: the owning seat first, then a
 /// deterministic sequence of alternates.
 ///
@@ -582,5 +644,70 @@ mod tests {
         assert!(pick_seat_endpoints(&off, &[0u8; 32]).is_empty());
         let empty = json!({ "enabled": true, "coordinators": [] });
         assert!(pick_seat_endpoints(&empty, &[0u8; 32]).is_empty());
+    }
+
+    fn view(epoch: u64, commitment: &str) -> serde_json::Value {
+        json!({ "epoch": epoch, "roster_commitment": commitment })
+    }
+
+    /// One node is what the wallet has always had. Naming it Unchecked is the
+    /// point: the wallet can report that it did not check, rather than implying
+    /// a comparison it never made.
+    #[test]
+    fn a_single_view_is_unchecked_not_unanimous() {
+        assert_eq!(
+            roster_agreement(&[view(7, "aa")], 7),
+            RosterAgreement::Unchecked
+        );
+        assert_eq!(roster_agreement(&[], 7), RosterAgreement::Unchecked);
+    }
+
+    #[test]
+    fn matching_rosters_are_unanimous() {
+        assert_eq!(
+            roster_agreement(&[view(7, "aa"), view(7, "AA"), view(7, "aa")], 7),
+            RosterAgreement::Unanimous,
+            "case must not decide whether nodes agree"
+        );
+    }
+
+    /// The case this exists for: a node drawing from a roster the others do not
+    /// recognise. Its election verifies perfectly against its own inputs, which
+    /// is why comparing the inputs is the only way to see it.
+    #[test]
+    fn a_trimmed_roster_shows_up_as_disagreement() {
+        match roster_agreement(&[view(7, "aa"), view(7, "bb")], 7) {
+            RosterAgreement::Disagreement { commitments } => {
+                assert_eq!(commitments, vec!["aa".to_string(), "bb".to_string()]);
+            }
+            other => panic!("expected disagreement, got {other:?}"),
+        }
+    }
+
+    /// Near a boundary two honest nodes answer for different epochs. Counting
+    /// that as a lie would refuse elections on every epoch flip — an outage on
+    /// a schedule, which is worse than the attack being defended against.
+    #[test]
+    fn a_node_answering_for_another_epoch_is_ignored_not_accused() {
+        assert_eq!(
+            roster_agreement(&[view(7, "aa"), view(8, "zz")], 7),
+            RosterAgreement::Unchecked,
+            "the stale view must be ignored, leaving one view and nothing to compare"
+        );
+        assert_eq!(
+            roster_agreement(&[view(7, "aa"), view(7, "aa"), view(8, "zz")], 7),
+            RosterAgreement::Unanimous
+        );
+    }
+
+    /// A view with no commitment contributes nothing rather than counting as
+    /// agreement — otherwise a node could dodge the check by omitting the field.
+    #[test]
+    fn a_missing_commitment_is_not_agreement() {
+        let silent = json!({ "epoch": 7 });
+        assert_eq!(
+            roster_agreement(&[view(7, "aa"), silent], 7),
+            RosterAgreement::Unchecked
+        );
     }
 }
