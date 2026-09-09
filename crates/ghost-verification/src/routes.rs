@@ -183,6 +183,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/verify/policy", get(policy_handler))
         .route("/verify/stratum", get(stratum_handler))
         .route("/verify/ghostpay", get(ghostpay_handler))
+        .route("/verify/coordinator", get(coordinator_verify_handler))
         // API v1 routes for dashboard compatibility
         .route("/api/v1/node/status", get(api_node_status_handler))
         .route("/api/v1/node/info", get(api_node_info_handler))
@@ -1496,6 +1497,96 @@ pub struct StratumQuery {
 /// identity is configured. Use `unsigned=true` to get unsigned response.
 ///
 /// **Security**: Always prefer signed responses to prevent MITM/proxy attacks.
+/// Query for `/verify/coordinator`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CoordinatorVerifyQuery {
+    /// Challenge nonce, bound into the signature so a captured reply cannot be
+    /// replayed at a later challenge.
+    pub nonce: Option<String>,
+    /// Explicitly disable signing (default: signed when possible).
+    pub unsigned: Option<bool>,
+}
+
+/// What a node attests about its own Wraith coordinator role.
+///
+/// ⛔ **These facts are worth nothing unsigned, and not much on their own.**
+///
+/// Anything can serve this JSON — the whole point of #605's Stratum finding is
+/// that `nc -l 3333` passes a bare connect. What makes it evidence is the
+/// signature the handler wraps it in: bound to the challenger's nonce and made
+/// with the node's identity key, so a relay cannot answer for somebody else.
+///
+/// And even signed it proves only *what this node claims about itself*. The
+/// challenger must still dial `advertised_endpoint` and confirm a coordinator
+/// answers there. A signature without a probe proves a key exists; a probe
+/// without a signature proves something listens. The capability needs both.
+///
+/// ⚠ Deliberately NOT included: the election document (beacon, roster, seat
+/// list). It is derived from public inputs, so any node can compute a correct
+/// one without coordinating anything — including it would invite exactly the
+/// mistake #605 records against Archive, where every field was derivable from
+/// the public header and a pruned node passed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoordinatorAttestation {
+    /// Has this node opted into taking a seat.
+    pub enabled: bool,
+    /// Where this node says wallets should dial its coordinator. The address
+    /// the challenger must then probe — a claim, until it does.
+    pub advertised_endpoint: Option<String>,
+    /// The epoch this node currently computes, so a node stuck on a stale view
+    /// is visible rather than merely wrong.
+    pub epoch: Option<u64>,
+    /// The seat this node currently holds, if any.
+    pub my_seat: Option<u64>,
+}
+
+/// `GET /verify/coordinator` — a node's signed attestation about its Wraith
+/// coordinator role (#736).
+///
+/// Half of a proof. See [`CoordinatorAttestation`] for what the other half is
+/// and why this alone is not enough.
+async fn coordinator_verify_handler(
+    State(state): State<Arc<VerificationState>>,
+    Query(query): Query<CoordinatorVerifyQuery>,
+) -> impl IntoResponse {
+    let status = state.coordinator_status();
+    let attestation = CoordinatorAttestation {
+        enabled: status
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        advertised_endpoint: status
+            .get("coordinators")
+            .and_then(|c| c.as_array())
+            .and_then(|coords| {
+                let me = status.get("my_seat").and_then(|s| s.as_u64())?;
+                coords
+                    .iter()
+                    .find(|c| c.get("seat").and_then(|s| s.as_u64()) == Some(me))?
+                    .get("endpoint")
+                    .and_then(|e| e.as_str())
+                    .map(String::from)
+            }),
+        epoch: status.get("epoch").and_then(|e| e.as_u64()),
+        my_seat: status.get("my_seat").and_then(|s| s.as_u64()),
+    };
+
+    // Signed by default. An unsigned attestation is a diagnostic, never
+    // evidence — the caller has to ask for it.
+    if !query.unsigned.unwrap_or(false) && state.can_sign() {
+        if let Some(signed) = state.sign_response(attestation.clone(), query.nonce) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "signed": true, "response": signed })),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "signed": false, "response": attestation })),
+    )
+}
+
 async fn stratum_handler(
     State(state): State<Arc<VerificationState>>,
     Query(query): Query<StratumQuery>,
@@ -12949,6 +13040,106 @@ mod tests {
             *b = (i as u8).wrapping_add(0x42);
         }
         secret
+    }
+
+    /// A node that says it holds seat 1, alongside another seat it does not hold.
+    fn coordinator_state(my_seat: Option<u64>) -> Arc<crate::server::VerificationState> {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let state = crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_coordinator_status(move || {
+            serde_json::json!({
+                "enabled": true,
+                "epoch": 6709,
+                "my_seat": my_seat,
+                "coordinators": [
+                    { "seat": 0, "endpoint": "10.0.0.1:9100" },
+                    { "seat": 1, "endpoint": "10.0.0.2:9100" },
+                ],
+            })
+        });
+        Arc::new(state)
+    }
+
+    /// A node must attest to the endpoint for ITS OWN seat.
+    ///
+    /// Reporting the first seat in the list, or any other node's, would have the
+    /// challenger probe somebody else's coordinator and credit this node for it
+    /// — a capability that passes by pointing at a working neighbour.
+    #[tokio::test]
+    async fn the_attestation_names_this_nodes_own_seat_endpoint() {
+        let state = coordinator_state(Some(1));
+        let resp = coordinator_verify_handler(
+            axum::extract::State(state),
+            axum::extract::Query(CoordinatorVerifyQuery {
+                nonce: None,
+                unsigned: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["signed"], false, "unsigned was explicitly requested");
+        assert_eq!(v["response"]["my_seat"], 1);
+        assert_eq!(
+            v["response"]["advertised_endpoint"], "10.0.0.2:9100",
+            "seat 1 is this node; 10.0.0.1 belongs to seat 0"
+        );
+        assert_eq!(v["response"]["epoch"], 6709);
+    }
+
+    /// A node holding no seat advertises no endpoint. Returning one anyway would
+    /// invite the challenger to probe a coordinator this node does not run.
+    #[tokio::test]
+    async fn a_node_without_a_seat_advertises_nothing_to_probe() {
+        let state = coordinator_state(None);
+        let resp = coordinator_verify_handler(
+            axum::extract::State(state),
+            axum::extract::Query(CoordinatorVerifyQuery {
+                nonce: None,
+                unsigned: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(v["response"]["advertised_endpoint"].is_null());
+        assert!(v["response"]["my_seat"].is_null());
+    }
+
+    /// With nothing wired the node says so, rather than defaulting to a claim.
+    #[tokio::test]
+    async fn a_node_with_no_coordinator_wired_attests_disabled() {
+        let state = create_test_state_with_auth();
+        let resp = coordinator_verify_handler(
+            axum::extract::State(state),
+            axum::extract::Query(CoordinatorVerifyQuery {
+                nonce: None,
+                unsigned: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["response"]["enabled"], false);
     }
 
     fn create_test_state_with_auth() -> Arc<crate::server::VerificationState> {
