@@ -72,8 +72,8 @@ pub fn ghost_network_for(network: Network) -> Option<GhostNetwork> {
 /// Whether `s` looks like a Ghost ID for `network`.
 ///
 /// A prefix check, used to decide which kind of payment the user asked for
-/// before committing to either. The full decode still happens in [`build`] —
-/// this only routes.
+/// before committing to either. The full decode still happens in
+/// [`build_from_inputs`] — this only routes.
 pub fn looks_like_ghost_id(s: &str, network: Network) -> bool {
     let Some(gn) = ghost_network_for(network) else {
         return false;
@@ -137,9 +137,10 @@ pub fn build(
 ///
 /// The shared secret comes from the transaction's own inputs rather than from a
 /// fresh random key, so there is no ephemeral pubkey to publish and the payment
-/// leaves **one** output that looks like any other taproot spend. Compare
-/// [`build`], which returns an `OP_RETURN` alongside and marks the transaction
-/// as a silent payment to every observer.
+/// leaves **one** output that looks like any other taproot spend. The
+/// superseded announcing form returned an `OP_RETURN` alongside it, which
+/// marked the transaction as a silent payment to every observer; it is now
+/// test-only and cannot be reached from here.
 ///
 /// `inputs` and `input_keys` describe the same inputs — the ones this
 /// transaction will actually spend. They need not be in the same order as each
