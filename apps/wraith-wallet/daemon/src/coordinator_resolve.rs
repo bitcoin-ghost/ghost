@@ -174,6 +174,74 @@ pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> O
         .map(String::from)
 }
 
+/// The seats to try for `shard_key`, in order: the owning seat first, then a
+/// deterministic sequence of alternates.
+///
+/// # Why the order is fixed rather than chosen
+///
+/// A seat whose node has gone dark leaves the wallets sharded to it with
+/// nowhere to go until the epoch flips. The obvious repair — let each wallet
+/// try whatever it can reach — costs the exact property the sharding exists to
+/// create: wallets that share a key converge on ONE seat, and a larger set is
+/// the whole point (see [`pick_seat_endpoint`]). Wallets probing independently
+/// notice a failure at different moments and scatter across different seats,
+/// so the anonymity set fragments precisely when the network is already
+/// degraded, and nothing tells the user it happened.
+///
+/// Removing the dead seat from the roster instead does not work either. The
+/// roster is deliberately snapshotted a full epoch behind so that every node
+/// answers the same question (`wraith_protocol::roster_snapshot`), and that
+/// module says plainly that nothing there is consensus — it only gives nodes a
+/// commitment to compare so divergence is *seen*. Liveness is a local
+/// observation, so a liveness-driven roster is a divergent roster, which is a
+/// split election rather than a failover.
+///
+/// So the fallback is derived from what is already agreed: walk forward from
+/// the owning seat. Every wallet on a dead seat moves to the SAME next seat, and
+/// it joins that seat's existing cohort rather than forming a new one — the set
+/// moves as a body and gets larger, never smaller. During the window where some
+/// wallets have noticed and others have not, there are two cohorts, not N.
+///
+/// Needs no liveness consensus, no roster mutation and no new wire field: the
+/// order is a function of the published seat count and the shard key.
+pub fn seat_try_order(shard_key: &[u8; 32], seat_count: usize) -> Vec<usize> {
+    if seat_count == 0 {
+        return Vec::new();
+    }
+    let first = shard_for(shard_key, seat_count) as usize;
+    (0..seat_count).map(|i| (first + i) % seat_count).collect()
+}
+
+/// Coordinator endpoints to try for `shard_key`, in [`seat_try_order`].
+///
+/// The caller dials them in order and stops at the first that answers. Seats
+/// that have advertised no endpoint are skipped rather than occupying a
+/// position: a seat nobody can dial is not a fallback.
+pub fn pick_seat_endpoints(status: &serde_json::Value, shard_key: &[u8; 32]) -> Vec<String> {
+    if status.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        return Vec::new();
+    }
+    let Some(coords) = status.get("coordinators").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    if coords.is_empty() {
+        return Vec::new();
+    }
+
+    seat_try_order(shard_key, coords.len())
+        .into_iter()
+        .filter_map(|seat| {
+            coords
+                .iter()
+                .find(|c| c.get("seat").and_then(|s| s.as_u64()) == Some(seat as u64))?
+                .get("endpoint")
+                .and_then(|e| e.as_str())
+                .filter(|e| !e.is_empty())
+                .map(String::from)
+        })
+        .collect()
+}
+
 /// The shard key comes from `wraith_protocol`, not from here.
 ///
 /// It used to be defined in this file, which meant the value a wallet shards
@@ -433,5 +501,89 @@ mod tests {
         // Disabled → nothing.
         let off = json!({ "enabled": false });
         assert_eq!(resolve_from_election(&off, "0.01btc"), (None, None));
+    }
+
+    /// The property the whole design rests on: every wallet sharded to a dead
+    /// seat moves to the SAME next seat.
+    ///
+    /// If wallets each probed for whatever they could reach, they would notice
+    /// the failure at different moments and scatter — the anonymity set
+    /// fragmenting exactly when the network is already degraded. Here the set
+    /// moves as a body, and joins the destination seat's existing cohort rather
+    /// than forming a new one.
+    #[test]
+    fn every_wallet_on_a_seat_falls_back_to_the_same_seat() {
+        // Two different keys that happen to shard to the same seat stand in for
+        // two wallets in one cohort: whatever their keys, the ORDER after the
+        // owning seat is a function of the seat count, so the cohort cannot split.
+        let n = 5;
+        for a in 0u8..40 {
+            for b in 0u8..40 {
+                let ka = [a; 32];
+                let kb = [b; 32];
+                let oa = seat_try_order(&ka, n);
+                let ob = seat_try_order(&kb, n);
+                if oa[0] == ob[0] {
+                    assert_eq!(
+                        oa, ob,
+                        "two wallets on seat {} disagreed about where to go next",
+                        oa[0]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The first seat tried must be the one that owns the key, or the fallback
+    /// order would quietly move every wallet off its own seat.
+    #[test]
+    fn the_order_starts_at_the_owning_seat() {
+        for i in 0u8..20 {
+            let key = [i; 32];
+            for n in 1usize..8 {
+                assert_eq!(seat_try_order(&key, n)[0], shard_for(&key, n) as usize);
+            }
+        }
+    }
+
+    /// Every seat appears exactly once: no seat is unreachable as a fallback,
+    /// and none is tried twice.
+    #[test]
+    fn the_order_is_a_permutation_of_the_seats() {
+        for n in 1usize..12 {
+            let order = seat_try_order(&[7u8; 32], n);
+            assert_eq!(order.len(), n);
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), n, "n={n} produced a duplicate or a gap");
+        }
+    }
+
+    /// A seat that has advertised no endpoint is skipped rather than occupying a
+    /// position — a seat nobody can dial is not a fallback.
+    #[test]
+    fn seats_without_an_endpoint_are_skipped() {
+        let status = json!({
+            "enabled": true,
+            "coordinators": [
+                { "seat": 0, "endpoint": "" },
+                { "seat": 1, "endpoint": "1.2.3.4:9100" },
+                { "seat": 2, "endpoint": "5.6.7.8:9100" },
+            ],
+        });
+        let endpoints = pick_seat_endpoints(&status, &[3u8; 32]);
+        assert_eq!(endpoints.len(), 2, "the empty endpoint must not be offered");
+        assert!(!endpoints.iter().any(|e| e.is_empty()));
+    }
+
+    /// No seats, no panic — and no endpoints to pretend otherwise.
+    #[test]
+    fn an_empty_election_yields_nothing_to_try() {
+        assert!(seat_try_order(&[0u8; 32], 0).is_empty());
+        let off = json!({ "enabled": false });
+        assert!(pick_seat_endpoints(&off, &[0u8; 32]).is_empty());
+        let empty = json!({ "enabled": true, "coordinators": [] });
+        assert!(pick_seat_endpoints(&empty, &[0u8; 32]).is_empty());
     }
 }
