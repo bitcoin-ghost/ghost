@@ -868,6 +868,26 @@ pub enum CapabilityType {
     /// address it dialled. Convergence therefore rests entirely on the
     /// distinct-challenger majority, exactly as it does for a backfilled verdict.
     Address,
+    /// A capability this binary does not know about.
+    ///
+    /// ⛔ **This exists so a newer peer cannot silence an older one.** Without
+    /// it, `CapabilityType` is a closed serde enum: a peer emitting a capability
+    /// added after this binary was built does not get that one field ignored —
+    /// deserialisation of the WHOLE `VerificationResultMessage` fails and the
+    /// verdict is dropped silently, including verdicts about capabilities this
+    /// node does understand. #729 hit exactly that when `Address` was added.
+    ///
+    /// Removal is the worse direction, which is why this is here now: when
+    /// `GhostPay` goes (#736), nodes on an older binary keep emitting
+    /// `"ghostpay"` and every upgraded peer would discard their entire messages.
+    /// So the tolerance has to ship and reach the whole fleet BEFORE any variant
+    /// is added or removed.
+    ///
+    /// Never emitted deliberately: [`CapabilityType::parse`] will not produce it
+    /// from a string, so an unrecognised capability cannot become a real one by
+    /// round-tripping through text.
+    #[serde(other)]
+    Unknown,
 }
 
 impl CapabilityType {
@@ -879,6 +899,10 @@ impl CapabilityType {
             Self::Stratum => "stratum",
             Self::GhostPay => "ghostpay",
             Self::Address => "address",
+            // Reachable only from a log or a diagnostic; never sent as a verdict
+            // of ours. Named rather than panicking, so an observability path
+            // cannot take the node down.
+            Self::Unknown => "unknown",
         }
     }
 
@@ -890,6 +914,9 @@ impl CapabilityType {
             "stratum" => Some(Self::Stratum),
             "ghostpay" => Some(Self::GhostPay),
             "address" => Some(Self::Address),
+            // Deliberately does not parse "unknown" back into a variant: a
+            // capability nobody recognises must not become a real one by being
+            // written down and read back.
             _ => None,
         }
     }
@@ -2891,6 +2918,59 @@ mod tests {
     fn address_capability_round_trips_on_the_wire() {
         use super::CapabilityType;
         assert_eq!(CapabilityType::Address.as_str(), "address");
+    }
+
+    /// ⛔ The whole point of `CapabilityType::Unknown` (#736 §2).
+    ///
+    /// A peer emitting a capability this binary has never heard of must lose
+    /// THAT FIELD's meaning, not the whole message. Before the tolerance, serde
+    /// failed the entire `VerificationResultMessage` and the verdict was dropped
+    /// silently — including verdicts about capabilities we do understand. This
+    /// test fails on the old enum.
+    #[test]
+    fn a_verdict_naming_an_unknown_capability_still_parses() {
+        let json = serde_json::json!({
+            "target_node_id": "11".repeat(32),
+            "challenger_id": "22".repeat(32),
+            "capability": "wraith_coordinator",
+            "passed": true,
+            "challenge_data": "{}",
+            "response_data": null,
+            "timestamp": 1_700_000_000i64,
+            "signature": "33".repeat(64),
+        });
+        let msg: VerificationResultMessage =
+            serde_json::from_value(json).expect("an unknown capability must not fail the message");
+        assert_eq!(msg.capability, CapabilityType::Unknown);
+        assert!(msg.passed, "the rest of the message must survive intact");
+    }
+
+    /// An unrecognised capability must not become a real one by being written
+    /// down and read back — otherwise "unknown" would round-trip into a variant
+    /// and be stored in the convergence ledger as though it meant something.
+    #[test]
+    fn an_unknown_capability_cannot_be_resurrected_from_text() {
+        assert_eq!(CapabilityType::Unknown.as_str(), "unknown");
+        assert_eq!(CapabilityType::parse("unknown"), None);
+        assert_eq!(CapabilityType::parse("wraith_coordinator"), None);
+    }
+
+    /// The known capabilities are unaffected by the catch-all — a wildcard that
+    /// swallowed a real capability would be worse than the bug it fixes.
+    #[test]
+    fn known_capabilities_still_round_trip() {
+        for c in [
+            CapabilityType::Archive,
+            CapabilityType::Policy,
+            CapabilityType::Stratum,
+            CapabilityType::GhostPay,
+            CapabilityType::Address,
+        ] {
+            assert_eq!(CapabilityType::parse(c.as_str()), Some(c), "{c:?}");
+            let wire = serde_json::to_string(&c).expect("serialise");
+            let back: CapabilityType = serde_json::from_str(&wire).expect("deserialise");
+            assert_eq!(back, c, "{c:?} did not survive the wire");
+        }
         assert_eq!(
             CapabilityType::parse("address"),
             Some(CapabilityType::Address)
@@ -2905,17 +2985,27 @@ mod tests {
         );
     }
 
-    /// Documents the constraint that forces the H-7 emission gate to exist. There is no
-    /// `#[serde(other)]` fallback, so a peer on a binary predating `Address` does not
-    /// merely ignore the new variant — it fails to deserialise the message carrying it and
-    /// drops the verdict whole. Adding such a fallback here would NOT fix a rollout, since
-    /// the nodes that need it are the ones running the old binary; the gate is what fixes
-    /// it. If this test ever starts failing because a fallback was added, the gate still
-    /// has to stay for every already-deployed node.
+    /// The fallback this test used to forbid now exists — and the caveat it was
+    /// written with still stands, so it is kept rather than deleted.
+    ///
+    /// It previously asserted that an unknown capability FAILS to deserialise,
+    /// documenting the constraint that forces the H-7 emission gate to exist. Its
+    /// own note anticipated this change: *"if this test ever starts failing
+    /// because a fallback was added, the gate still has to stay for every
+    /// already-deployed node."*
+    ///
+    /// ⛔ That is the part not to lose. `#[serde(other)]` protects nodes running
+    /// THIS binary and later. It does nothing for a node already in the field on
+    /// an older one — those are precisely the peers that would drop the message,
+    /// and no change here can reach them. **The emission gate is still what makes
+    /// a rollout safe; this only makes the NEXT one safe.**
     #[test]
-    fn an_unknown_capability_fails_to_deserialise_rather_than_degrading() {
+    fn an_unknown_capability_degrades_instead_of_failing_the_message() {
         use super::CapabilityType;
-        assert!(serde_json::from_str::<CapabilityType>("\"not_a_capability\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<CapabilityType>("\"not_a_capability\"").unwrap(),
+            CapabilityType::Unknown
+        );
     }
 
     // ── Deterministic node-list derivation (#625) ────────────────────────────────────────
