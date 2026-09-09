@@ -115,6 +115,25 @@ COLLECT='
   # "correct by accident" — a value nobody chose. List the names, not just a count, so the report
   # says WHICH.
   printf "dead_keys=%s\n"        "$(grep -ohE "^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=" /etc/ghost/pool.toml /etc/ghost/translator-config.toml 2>/dev/null | tr -d " =" | sort -u | paste -sd, -)"
+  # The coordinator fee address must not be the node payout address. A payout
+  # address is public — it receives this node mining income on chain — so a round
+  # paying it is identifiable as a Wraith round AND attributable to the node that
+  # coordinated it. The installer used to default one to the other, so this is a
+  # real state on already-installed nodes, not a hypothetical.
+  #
+  # NOTE: no apostrophes anywhere in this block. COLLECT is a single-quoted
+  # string, so one apostrophe ends it and the whole remote probe stops parsing —
+  # the failure surfaces as a syntax error hundreds of lines away.
+  #
+  # Reported as a verdict, not the addresses: this output gets pasted into issues.
+  _cfa=$(grep -oP "^\s*coordinator_fee_address\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)
+  _pay=$(grep -oP "^\s*node_payout_address\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)
+  if [ -z "$_cfa" ]; then _fee_verdict=unset
+  elif [ "$_cfa" = "$_pay" ]; then _fee_verdict=LEAK_SAME_AS_PAYOUT
+  elif [ "${_cfa#bc1p}" = "$_cfa" ]; then _fee_verdict=not_p2tr
+  else _fee_verdict=ok
+  fi
+  printf "coord_fee_addr=%s\n" "$_fee_verdict"
   printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
   printf "cfg_parses=%s\n"       "$(/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
   # Ops scripts are deployed by NOTHING — `deploy-node.sh` handles ghost-pool, pool_sv2 and
