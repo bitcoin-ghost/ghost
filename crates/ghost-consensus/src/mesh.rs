@@ -220,10 +220,51 @@ pub trait MessageHandler: Send + Sync {
 /// operators sharing an address, not for volume.
 const MAX_INBOUND_PER_IP: usize = 8;
 
-/// Releases an IP's inbound slot however the connection handler exits.
+/// Inbound Noise connections permitted from a single network block (H-12).
+///
+/// A per-IP cap alone is not a limit on an ATTACKER, only on an address. With the
+/// global budget at 100 and 8 per IP, thirteen addresses exhaust every inbound
+/// slot — and thirteen addresses inside one `/24` is a rounding error for anyone
+/// who can attack this at all. Grouping by block is what makes the per-IP cap
+/// mean something.
+///
+/// ⚠ Sized against the actual fleet, not a guess: all eight production nodes sit
+/// in **different** `/24`s (measured 2026-09-09), so no legitimate mesh peer is
+/// competing for a block's allowance. 16 is two full per-IP allowances, and caps
+/// any single block at 16% of inbound.
+const MAX_INBOUND_PER_SUBNET: usize = 16;
+
+/// The address block an inbound peer is counted against.
+///
+/// IPv4 groups by `/24`, the unit the audit named. IPv6 groups by `/64`, because
+/// a per-IP cap is meaningless there — a single allocation hands an attacker
+/// more addresses than the cap could ever count, so the `/64` is the smallest
+/// unit that costs anything to obtain.
+fn inbound_block_of(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, 0))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    }
+}
+
+/// Releases an inbound slot however the connection handler exits.
+///
+/// Both dimensions are released together. Releasing one and leaking the other
+/// would wedge a block shut after `MAX_INBOUND_PER_SUBNET` failed handshakes —
+/// a DoS defence turned into a self-inflicted one, which is the failure the
+/// per-IP guard was written to avoid.
 struct PerIpGuard {
     map: Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     ip: std::net::IpAddr,
+    subnets: Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    block: std::net::IpAddr,
 }
 
 impl Drop for PerIpGuard {
@@ -233,6 +274,15 @@ impl Drop for PerIpGuard {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 m.remove(&self.ip);
+            }
+        }
+        drop(m);
+
+        let mut s = self.subnets.lock();
+        if let Some(n) = s.get_mut(&self.block) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                s.remove(&self.block);
             }
         }
     }
@@ -2803,6 +2853,12 @@ impl MeshNetwork {
             std::net::IpAddr,
             usize,
         >::new()));
+        // H-12: and per address block, because a per-IP cap bounds an address
+        // rather than an attacker — see MAX_INBOUND_PER_SUBNET.
+        let per_subnet = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+            std::net::IpAddr,
+            usize,
+        >::new()));
         // Dial back at most once per inbound host (mesh-registration reverse-sub).
         let reverse_subscribed: Arc<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -2854,6 +2910,7 @@ impl MeshNetwork {
             // after accept and before the handler is spawned, so the connection is dropped without
             // consuming a handshake or a reassembly buffer.
             let ip = addr.ip();
+            let block = inbound_block_of(ip);
             {
                 let mut m = per_ip.lock();
                 let n = m.entry(ip).or_insert(0);
@@ -2868,6 +2925,33 @@ impl MeshNetwork {
                     continue;
                 }
                 *n += 1;
+                drop(m);
+
+                // Take the block's slot too, and give the IP's back if the block
+                // is full — otherwise a refused connection would still consume
+                // an allowance and the cap would leak shut.
+                let mut s = per_subnet.lock();
+                let bn = s.entry(block).or_insert(0);
+                if *bn >= MAX_INBOUND_PER_SUBNET {
+                    drop(s);
+                    let mut m = per_ip.lock();
+                    if let Some(n) = m.get_mut(&ip) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            m.remove(&ip);
+                        }
+                    }
+                    drop(m);
+                    debug!(
+                        peer = %addr,
+                        block = %block,
+                        max = MAX_INBOUND_PER_SUBNET,
+                        "refusing inbound Noise connection: per-block limit reached"
+                    );
+                    drop(permit);
+                    continue;
+                }
+                *bn += 1;
             }
 
             let pool = Arc::clone(&pool);
@@ -2876,6 +2960,8 @@ impl MeshNetwork {
             let per_ip_guard = PerIpGuard {
                 map: Arc::clone(&per_ip),
                 ip,
+                subnets: Arc::clone(&per_subnet),
+                block,
             };
 
             tokio::spawn(async move {
@@ -3985,10 +4071,16 @@ mod tests {
 
         // Each guard dropped — including on an early return — gives the slot back.
         {
+            let subnets = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+                IpAddr,
+                usize,
+            >::new()));
             let _guards: Vec<PerIpGuard> = (0..MAX_INBOUND_PER_IP)
                 .map(|_| PerIpGuard {
                     map: Arc::clone(&map),
                     ip,
+                    subnets: Arc::clone(&subnets),
+                    block: inbound_block_of(ip),
                 })
                 .collect();
         }
@@ -5441,5 +5533,103 @@ mod high_water_tests {
         assert_eq!(read.floor(&SENDER, now), Some(4242));
         assert_eq!(read.floor(&[0xABu8; 32], now), Some(7));
         assert_eq!(read.marks.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod inbound_block_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// H-12: a per-IP cap bounds an address, not an attacker. With 8 per IP and
+    /// a global budget of 100, thirteen addresses take every inbound slot — and
+    /// thirteen addresses inside one /24 is nothing to anyone who can attack
+    /// this at all.
+    #[test]
+    fn addresses_in_one_block_are_counted_together() {
+        let a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200));
+        assert_eq!(inbound_block_of(a), inbound_block_of(b));
+
+        let elsewhere = IpAddr::V4(Ipv4Addr::new(203, 0, 114, 7));
+        assert_ne!(
+            inbound_block_of(a),
+            inbound_block_of(elsewhere),
+            "a neighbouring /24 is a different operator and must not share an allowance"
+        );
+    }
+
+    /// IPv6 groups by /64: a per-IP cap there is meaningless, because one
+    /// allocation hands an attacker more addresses than the cap could count.
+    #[test]
+    fn ipv6_groups_by_allocation_not_by_address() {
+        let a = IpAddr::V6("2001:db8:1:2::1".parse::<Ipv6Addr>().unwrap());
+        let b = IpAddr::V6(
+            "2001:db8:1:2:ffff:ffff:ffff:ffff"
+                .parse::<Ipv6Addr>()
+                .unwrap(),
+        );
+        assert_eq!(inbound_block_of(a), inbound_block_of(b));
+
+        let other = IpAddr::V6("2001:db8:1:3::1".parse::<Ipv6Addr>().unwrap());
+        assert_ne!(inbound_block_of(a), inbound_block_of(other));
+    }
+
+    /// The fleet must not be caught by its own defence: all eight production
+    /// nodes sit in different /24s, which is why 16 per block is safe. If that
+    /// ever stops being true this is the test that should be revisited.
+    #[test]
+    fn the_production_fleet_does_not_share_a_block() {
+        let fleet = [
+            "95.111.221.169",
+            "94.237.102.1",
+            "85.9.198.1",
+            "83.136.251.1",
+            "5.22.219.1",
+            "213.163.207.1",
+            "212.147.227.1",
+            "209.50.50.1",
+        ];
+        let blocks: std::collections::HashSet<IpAddr> = fleet
+            .iter()
+            .map(|a| inbound_block_of(a.parse::<IpAddr>().expect("fleet address")))
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            fleet.len(),
+            "two fleet nodes now share a /24 — they would compete for one block's inbound allowance"
+        );
+    }
+
+    /// A guard releases BOTH dimensions. Leaking the block count would wedge a
+    /// whole /24 shut after MAX_INBOUND_PER_SUBNET failed handshakes — the same
+    /// self-inflicted DoS the per-IP guard exists to avoid, one level up.
+    #[test]
+    fn a_guard_releases_the_block_slot_too() {
+        let ips = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+            IpAddr,
+            usize,
+        >::new()));
+        let subnets = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+            IpAddr,
+            usize,
+        >::new()));
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4));
+        let block = inbound_block_of(ip);
+
+        *ips.lock().entry(ip).or_insert(0) += 1;
+        *subnets.lock().entry(block).or_insert(0) += 1;
+
+        {
+            let _g = PerIpGuard {
+                map: Arc::clone(&ips),
+                ip,
+                subnets: Arc::clone(&subnets),
+                block,
+            };
+        }
+
+        assert!(ips.lock().is_empty(), "the IP slot was not released");
+        assert!(subnets.lock().is_empty(), "the block slot was not released");
     }
 }
