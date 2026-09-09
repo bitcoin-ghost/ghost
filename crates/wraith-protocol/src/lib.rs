@@ -84,6 +84,7 @@ pub mod client_session;
 pub mod clustering;
 pub mod composition;
 pub mod consolidation;
+pub mod election_doc;
 pub mod eligibility;
 pub mod epoch;
 pub mod epoch_handover;
