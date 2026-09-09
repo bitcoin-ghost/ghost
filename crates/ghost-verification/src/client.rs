@@ -912,6 +912,120 @@ impl VerificationClient {
         Ok(result)
     }
 
+    /// Challenge a peer for the Wraith coordinator capability (#736).
+    ///
+    /// Returns the probe result and the target's raw signed attestation, so the
+    /// caller can store it as `target_signed_response` and let a third party
+    /// re-derive the verdict rather than trust this challenger — the same shape
+    /// the other capabilities use.
+    ///
+    /// The nonce is bound into the target's signature, so a reply captured from
+    /// an earlier challenge cannot be replayed at this one.
+    pub async fn verify_coordinator(
+        &self,
+        node_address: &str,
+        nonce: &str,
+        target_node_id_hex: &str,
+        our_election_view: &serde_json::Value,
+    ) -> GhostResult<(CoordinatorProbe, Option<String>)> {
+        let url = self.build_url(
+            node_address,
+            &format!("/verify/coordinator?nonce={}", urlencoding::encode(nonce)),
+        )?;
+        debug!(url = %url, "Challenging Wraith coordinator capability");
+
+        let wrapper: serde_json::Value = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| {
+                debug!("coordinator attestation request failed: {}", e);
+                GhostError::VerificationTimeout("coordinator attestation request failed".into())
+            })?
+            .json()
+            .await
+            .map_err(|e| {
+                debug!("coordinator attestation parse error: {}", e);
+                GhostError::InvalidVerificationResponse("invalid coordinator attestation".into())
+            })?;
+
+        let signed = wrapper.get("signed").and_then(|v| v.as_bool()) == Some(true);
+        let inner = wrapper.get("response").ok_or_else(|| {
+            GhostError::InvalidVerificationResponse("missing 'response' field".into())
+        })?;
+        // When signed, the payload sits inside the SignedResponse envelope.
+        let payload = inner.get("payload").unwrap_or(inner);
+
+        // An UNSIGNED attestation is not evidence, whatever it says. Anything can
+        // serve this JSON — that is #605's Stratum finding — so treat it as a
+        // failed challenge rather than a claim worth probing.
+        let attested_seat = if signed {
+            payload.get("my_seat").and_then(|v| v.as_u64())
+        } else {
+            debug!("coordinator attestation was unsigned; not evidence");
+            None
+        };
+        let endpoint = payload
+            .get("advertised_endpoint")
+            .and_then(|v| v.as_str())
+            .filter(|e| !e.is_empty())
+            .map(String::from);
+
+        // Probe what it named. A node that attests to a seat but answers nothing
+        // there has not shown it coordinates.
+        let endpoint_answered = match (attested_seat, endpoint.as_deref()) {
+            (Some(_), Some(ep)) => self.coordinator_answers_at(ep).await,
+            _ => false,
+        };
+
+        // Resolve the endpoint from OUR view, not from the target's claim. A
+        // node naming a neighbour's coordinator gets a genuine signature and a
+        // genuine answer; this is the check that says whose coordinator it is.
+        let endpoint_is_theirs = match endpoint.as_deref() {
+            Some(ep) => endpoint_owned_by(our_election_view, target_node_id_hex)
+                .is_some_and(|ours| ours == ep),
+            None => false,
+        };
+
+        let raw_signed = signed.then(|| inner.to_string());
+        Ok((
+            CoordinatorProbe {
+                attested_seat,
+                endpoint,
+                endpoint_answered,
+                endpoint_is_theirs,
+            },
+            raw_signed,
+        ))
+    }
+
+    /// Does a Wraith coordinator answer at `endpoint`?
+    ///
+    /// Deliberately a liveness check and nothing more. `/health` is unsigned and
+    /// `CoordinatorState` holds no identity key, so this cannot prove WHO runs
+    /// it — see the note on [`CoordinatorProbe::passed`]. What it does prove is
+    /// that the address the node signed for is not empty air.
+    async fn coordinator_answers_at(&self, endpoint: &str) -> bool {
+        let Ok(url) = self.build_url(endpoint, "/health") else {
+            debug!(
+                endpoint,
+                "refusing to probe an internal or unresolvable address"
+            );
+            return false;
+        };
+        match self.client.get(&url).send().await {
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(v) => v.get("service").and_then(|s| s.as_str()) == Some("wraith-coordinator"),
+                Err(_) => false,
+            },
+            Err(e) => {
+                debug!(endpoint, error = %e, "no coordinator answered");
+                false
+            }
+        }
+    }
+
     /// Verify GhostPay capability
     ///
     /// H-1 FIX: Now accepts challenge_epoch parameter to require epoch state proof.
@@ -1209,6 +1323,75 @@ impl VerificationClient {
 }
 
 /// Result of full verification suite
+/// The coordinator endpoint an election view assigns to `node_id_hex`, if any.
+///
+/// Looked up by node id rather than by seat: the seat a node claims is the thing
+/// under test, so trusting it to find the endpoint would let the answer be
+/// chosen by the party being challenged.
+fn endpoint_owned_by(view: &serde_json::Value, node_id_hex: &str) -> Option<String> {
+    let want = node_id_hex.trim().to_ascii_lowercase();
+    view.get("coordinators")?
+        .as_array()?
+        .iter()
+        .find(|c| {
+            c.get("node_id")
+                .and_then(|n| n.as_str())
+                .map(|n| n.trim().to_ascii_lowercase() == want)
+                .unwrap_or(false)
+        })?
+        .get("endpoint")
+        .and_then(|e| e.as_str())
+        .filter(|e| !e.is_empty())
+        .map(String::from)
+}
+
+/// What a Wraith coordinator challenge found (#736).
+///
+/// ⛔ **Both halves are required.** A signature without a probe proves a key
+/// exists; a probe without a signature proves something listens. Only together
+/// do they say *this node, provably, serves a coordinator at the address it
+/// committed to*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorProbe {
+    /// The seat the node signed for, with its identity key, bound to our nonce.
+    pub attested_seat: Option<u64>,
+    /// The endpoint it named in that signed attestation.
+    pub endpoint: Option<String>,
+    /// A coordinator actually answered there.
+    pub endpoint_answered: bool,
+    /// OUR OWN election view assigns that endpoint to this node_id.
+    ///
+    /// This is what stops a node passing by naming a neighbour's coordinator:
+    /// the challenger does not take the target's word for who owns the address,
+    /// it looks the target's node_id up in the view its own node computed.
+    pub endpoint_is_theirs: bool,
+}
+
+impl CoordinatorProbe {
+    /// Did this node prove it coordinates?
+    ///
+    /// Three things, and each closes a different lie:
+    ///
+    /// * **signed** — an unsigned attestation is not evidence, whatever it says.
+    ///   Anything can serve that JSON (#605: `nc -l 3333` passes a bare connect).
+    /// * **answered** — a node that attests to a seat and answers nothing at the
+    ///   address it named has not shown it coordinates.
+    /// * **theirs** — and the address has to be ITS OWN. Without this a node
+    ///   passes by naming a neighbour's coordinator: its signature, a real
+    ///   coordinator answering, and nothing of its own running. The challenger
+    ///   therefore resolves the endpoint from the view ITS OWN node computed,
+    ///   never from the target's claim about itself.
+    ///
+    /// ⚠ The third check is only as good as the roster the challenger's view was
+    /// drawn from, which is the publisher's word until rosters are compared
+    /// across nodes (#710). That is a bound on this check, not a hole in it: a
+    /// target cannot improve its odds by lying, only a challenger's own node can
+    /// be wrong about the fleet.
+    pub fn passed(&self) -> bool {
+        self.attested_seat.is_some() && self.endpoint_answered && self.endpoint_is_theirs
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VerificationSuiteResult {
     /// Health response
@@ -1737,5 +1920,86 @@ mod tests {
                 "{addr} must be refused as Unreachable, not treated as a failed proof"
             );
         }
+    }
+
+    /// All three checks are required, and each assertion names the lie the
+    /// missing one would have let through.
+    #[test]
+    fn a_coordinator_passes_only_when_all_three_checks_hold() {
+        let probe = |seat: Option<u64>, answered: bool, theirs: bool| CoordinatorProbe {
+            attested_seat: seat,
+            endpoint: Some("10.0.0.2:9100".to_string()),
+            endpoint_answered: answered,
+            endpoint_is_theirs: theirs,
+        };
+
+        assert!(
+            probe(Some(1), true, true).passed(),
+            "signed, answering, and its own"
+        );
+        assert!(
+            !probe(Some(1), false, true).passed(),
+            "attests to a seat and answers nothing there — has not shown it coordinates"
+        );
+        assert!(
+            !probe(None, true, true).passed(),
+            "unsigned is not evidence whatever it says (#605: `nc -l 3333` passes a bare connect)"
+        );
+        assert!(
+            !probe(Some(1), true, false).passed(),
+            "the neighbour attack: a real signature and a real coordinator answering, but the \
+             address belongs to somebody else"
+        );
+    }
+
+    /// A node with no seat cannot pass on liveness alone.
+    #[test]
+    fn no_seat_means_no_capability_however_reachable() {
+        let probe = CoordinatorProbe {
+            attested_seat: None,
+            endpoint: None,
+            endpoint_answered: true,
+            endpoint_is_theirs: true,
+        };
+        assert!(!probe.passed());
+    }
+
+    /// Ownership is resolved by node id, never by the seat the target claims —
+    /// the seat is the thing under test, so using it to find the endpoint would
+    /// let the answer be chosen by the party being challenged.
+    #[test]
+    fn ownership_is_looked_up_by_node_id_not_by_claimed_seat() {
+        let view = serde_json::json!({
+            "coordinators": [
+                { "seat": 0, "node_id": "AA".repeat(32), "endpoint": "10.0.0.1:9100" },
+                { "seat": 1, "node_id": "bb".repeat(32), "endpoint": "10.0.0.2:9100" },
+            ],
+        });
+
+        assert_eq!(
+            endpoint_owned_by(&view, &"aa".repeat(32)),
+            Some("10.0.0.1:9100".to_string()),
+            "case must not decide who owns an endpoint"
+        );
+        assert_eq!(
+            endpoint_owned_by(&view, &"cc".repeat(32)),
+            None,
+            "a node absent from our view owns nothing, so it cannot pass"
+        );
+    }
+
+    /// Fail-closed: a challenger that cannot say who owns an endpoint must not
+    /// credit the capability. Treating "I do not know" as "fine" is how an
+    /// unverified capability starts paying.
+    #[test]
+    fn a_challenger_with_no_view_credits_nobody() {
+        assert_eq!(
+            endpoint_owned_by(&serde_json::json!({}), &"aa".repeat(32)),
+            None
+        );
+        assert_eq!(
+            endpoint_owned_by(&serde_json::json!({ "coordinators": [] }), &"aa".repeat(32)),
+            None
+        );
     }
 }
