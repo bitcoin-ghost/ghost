@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn a_payment_with_no_announcement_is_still_found() {
         use bitcoin::secp256k1::{Secp256k1, SecretKey};
-        use ghost_keys::{GhostKeys, GhostNetwork, GhostId};
+        use ghost_keys::{GhostId, GhostKeys, GhostNetwork};
 
         let secp = Secp256k1::new();
         let receiver = GhostKeys::generate();
@@ -579,8 +579,14 @@ mod tests {
             SecretKey::from_slice(&[9u8; 32]).unwrap(),
         ];
         let refs = [
-            InputRef { txid: [0xab; 32], vout: 1 },
-            InputRef { txid: [0x12; 32], vout: 0 },
+            InputRef {
+                txid: [0xab; 32],
+                vout: 1,
+            },
+            InputRef {
+                txid: [0x12; 32],
+                vout: 0,
+            },
         ];
 
         let payment = crate::silent_payment::build_from_inputs(
@@ -623,7 +629,9 @@ mod tests {
         .expect("tx fixture");
 
         assert!(
-            !tx.vout.iter().any(|v| v.script_pubkey.hex.starts_with("6a")),
+            !tx.vout
+                .iter()
+                .any(|v| v.script_pubkey.hex.starts_with("6a")),
             "the transaction must carry no OP_RETURN at all"
         );
 

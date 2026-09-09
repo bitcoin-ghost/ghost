@@ -1282,11 +1282,20 @@ mine 2
 # The announcement has to be on chain: an OP_RETURN carrying the ephemeral key,
 # beside a taproot output nobody can attribute without it.
 SP_TX=$($BCLI getrawtransaction "$SP_TXID" 1)
-echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "nulldata")] | length == 1' >/dev/null \
-    || fail "the payment carries no OP_RETURN announcement — nothing tells the recipient it exists"
+# NO marker (#867). The announcement used to be required here; carrying one is
+# now the bug. `6a 21` + 33 bytes beside a taproot output is a shape an indexer
+# greps the whole chain for at zero cost — it hid who was paid while advertising
+# that a private payment happened. The secret comes from the transaction's own
+# inputs instead, so there is nothing to publish.
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "nulldata")] | length == 0' >/dev/null \
+    || fail "the payment carries an OP_RETURN — it is marked as a silent payment to every observer"
 echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "witness_v1_taproot")] | length >= 1' >/dev/null \
     || fail "the payment has no taproot output to be found"
-pass "the payment is on chain with its announcement (tx $SP_TXID)"
+# Nothing may distinguish it: every output is taproot, so it reads as an
+# ordinary spend.
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type != "witness_v1_taproot")] | length == 0' >/dev/null \
+    || fail "the payment has a non-taproot output, which singles it out: $(echo "$SP_TX" | jq -c '[.vout[].scriptPubKey.type]')"
+pass "the payment is on chain and carries no marker at all (tx $SP_TXID)"
 
 # Wait for the scanner to be CURRENT before judging it.
 #

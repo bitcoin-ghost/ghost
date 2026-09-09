@@ -1635,25 +1635,94 @@ mod server {
         // 4. Build the unsigned PSBT.
         //
         // A Ghost ID is paid differently from an address: the money goes to a
-        // taproot output derived per-payment, and an OP_RETURN alongside it
-        // carries the ephemeral key the recipient needs to find it. Routed on
-        // the recipient's form rather than on a flag, so the caller cannot ask
-        // for one and get the other.
+        // taproot output derived per-payment. It carries NOTHING else — no
+        // announcement, no marker (#867) — because the secret is derived from
+        // the transaction's own inputs. Routed on the recipient's form rather
+        // than on a flag, so the caller cannot ask for one and get the other.
         let (psbt, meta) = if wraith_wallet_core::silent_payment::looks_like_ghost_id(
             recipient_address,
             network,
         ) {
-            let pay = wraith_wallet_core::silent_payment::build(recipient_address, network, 0)
-                .map_err(|e| format!("silent payment: {e}"))?;
-            psbt_mod::create_psbt_to_scripts(
+            // The output key depends on WHICH coins are spent, and selection
+            // happens inside the builder. So build against a placeholder, then
+            // rewrite the output once the input set is known. Both scripts are
+            // 34-byte P2TR, so the fee, the vsize and the change are identical
+            // either way — this reorders the derivation, it does not change the
+            // transaction's shape.
+            let placeholder = {
+                let mut v = Vec::with_capacity(34);
+                v.push(0x51);
+                v.push(0x20);
+                v.extend_from_slice(&[0u8; 32]);
+                bitcoin::ScriptBuf::from_bytes(v)
+            };
+            let (mut psbt, meta) = psbt_mod::create_psbt_to_scripts(
                 &available,
-                pay.output_script,
+                placeholder.clone(),
                 amount_sats,
-                std::slice::from_ref(&pay.announcement_script),
+                &[],
                 &change_addr,
                 fee_rate_sats_per_vb,
             )
-            .map_err(|e| format!("create_psbt: {e}"))?
+            .map_err(|e| format!("create_psbt: {e}"))?;
+
+            // The coins the builder actually chose, with the scripts that say
+            // which key owns each.
+            let selected: Vec<(bitcoin::Txid, u32, bitcoin::ScriptBuf)> = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|txin| {
+                    let op = txin.previous_output;
+                    available
+                        .iter()
+                        .find(|u| u.txid == op.txid && u.vout == op.vout)
+                        .map(|u| (op.txid, op.vout, u.script_pubkey.clone()))
+                        .ok_or_else(|| {
+                            format!(
+                                "selected input {}:{} is not in the scanned set",
+                                op.txid, op.vout
+                            )
+                        })
+                })
+                .collect::<Result<_, String>>()?;
+
+            let payment_spk = {
+                let wallets = state.wallets.read().await;
+                let ks = wallets
+                    .get(&active_name)
+                    .ok_or_else(|| format!("active wallet '{active_name}' is not unlocked"))?;
+                let (refs, keys) = wraith_wallet_core::silent_payment::input_keys_for(
+                    ks, network, &selected, scan_max,
+                )
+                .map_err(|e| format!("silent payment inputs: {e}"))?;
+                wraith_wallet_core::silent_payment::build_from_inputs(
+                    recipient_address,
+                    network,
+                    0,
+                    &refs,
+                    &keys,
+                )
+                .map_err(|e| format!("silent payment: {e}"))?
+            };
+
+            // Refuse to hand back a transaction still paying the placeholder.
+            // That script is unspendable by anyone, so shipping one would burn
+            // the money in silence — this is the one failure here that must be
+            // impossible rather than unlikely.
+            let mut replaced = 0usize;
+            for out in psbt.unsigned_tx.output.iter_mut() {
+                if out.script_pubkey == placeholder {
+                    out.script_pubkey = payment_spk.clone();
+                    replaced += 1;
+                }
+            }
+            if replaced != 1 {
+                return Err(format!(
+                    "silent payment output was not substituted exactly once (replaced {replaced})                      — refusing to sign a transaction that may pay an unspendable script"
+                ));
+            }
+            (psbt, meta)
         } else {
             psbt_mod::create_psbt(
                 &available,
