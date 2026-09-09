@@ -947,8 +947,16 @@ impl VerificationResultHandler {
                 //
                 // The convergence ledger insert above is the whole of the storage: an
                 // address proof has no `*_challenges` analogue because nothing consumes it
-                // as a per-node capability. It qualifies a CHALLENGER's `/24` for the
-                // diversity count, which reads the ledger directly.
+                // as a per-node capability.
+                //
+                // ⛔ IT IS ALSO NOT YET CONSUMED AT ALL. This comment used to say the
+                // proof "qualifies a CHALLENGER's /24 for the diversity count, which reads
+                // the ledger directly". It does not:
+                // `ledger_voterset_challenger_stats` derives the /24 from
+                // `nodes.public_address` — the SELF-REPORTED value — and never looks at an
+                // address verdict. So H-7 stands open and these rows are collected
+                // evidence nobody reads. Corrected here because a comment claiming a
+                // defence is live is worse than no comment: the next reader builds on it.
                 //
                 // Re-derivation is not merely unwired here, it is impossible. The other
                 // four re-derive by checking the TARGET's signed response against this
