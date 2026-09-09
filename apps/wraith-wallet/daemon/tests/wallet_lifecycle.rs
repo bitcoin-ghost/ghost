@@ -532,3 +532,69 @@ async fn idle_lock_locks_wallets_after_threshold() {
 
     child.kill().await.ok();
 }
+
+/// A birth height given to `wallet import` must reach `wallet-meta.json`,
+/// because the block scanner reads it from there and nothing else remembers it.
+///
+/// #865: a wallet restored on regtest with `--birth-height 101` recovered its
+/// balance exactly but rebuilt 1 of 13 history entries, and the daemon logged
+/// `this wallet has no recorded birth height` for it. That log line has two
+/// possible causes — the value never reaching disk, or the scanner reading the
+/// file before the import writes it — and they need different fixes. This
+/// isolates the first.
+#[tokio::test]
+async fn an_imported_birth_height_reaches_the_wallet_metadata() {
+    let (mut child, socket, tmp) = spawn_daemon().await;
+    let wallets = tmp.path().join("wallets");
+    let pass = "integration-test-passphrase-bbb".to_string();
+
+    // A real mnemonic to import, taken from a wallet we make first.
+    let mnemonic = match rpc(
+        &socket,
+        1,
+        Request::WalletCreate {
+            name: "source".into(),
+            passphrase: pass.clone(),
+            user_entropy_digest: None,
+        },
+    )
+    .await
+    {
+        Response::WalletCreate(c) => c.mnemonic,
+        other => panic!("expected WalletCreate, got {other:?}"),
+    };
+
+    match rpc(
+        &socket,
+        2,
+        Request::WalletImport {
+            name: "restored".into(),
+            mnemonic,
+            passphrase: pass,
+            birth_height: Some(101),
+        },
+    )
+    .await
+    {
+        Response::WalletImported { name, .. } => assert_eq!(name, "restored"),
+        other => panic!("expected WalletImported, got {other:?}"),
+    }
+
+    let meta_path = wallets.join("restored").join("wallet-meta.json");
+    let raw = std::fs::read_to_string(&meta_path).unwrap_or_else(|e| {
+        panic!(
+            "no wallet metadata written at {}: {e} — the birth height the owner \
+             gave is gone, and a restored wallet has no history",
+            meta_path.display()
+        )
+    });
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("wallet-meta.json is not JSON: {e}"));
+    assert_eq!(
+        parsed.get("birth_height").and_then(|v| v.as_u64()),
+        Some(101),
+        "wallet-meta.json does not carry the birth height the import was given: {raw}"
+    );
+
+    child.kill().await.ok();
+}

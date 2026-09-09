@@ -1,4 +1,4 @@
-# Wraith Wallet
+# Ghost Wallet
 
 Desktop wallet for Bitcoin Ghost. Bundles light-wallet, Wraith CoinJoin participation,
 Ghost Locks custody, and TAP (L2) payments behind a single GUI / CLI / daemon.
@@ -211,7 +211,7 @@ guard against. The expected signing workflow (offline release key) is:
 
 ## Installing a release (the free path)
 
-Wraith Wallet ships **free installers with no paid code-signing certificates**
+Ghost Wallet ships **free installers with no paid code-signing certificates**
 — no Apple Developer Program, no Authenticode CA, no accounts, nothing to sign
 up for. The trust anchor is **not** a vendor certificate; it's the **GPG-signed
 checksum manifest** you verify yourself before you run anything. Verify first,
@@ -263,7 +263,7 @@ Authenticode cert). Click **More info → Run anyway** — once. This is normal 
 unsigned software; it does **not** mean the file is tampered with — you already
 proved integrity with the checksum/GPG step above.
 
-**macOS (`.dmg`)** — open the `.dmg`, drag **Wraith Wallet** to Applications.
+**macOS (`.dmg`)** — open the `.dmg`, drag **Ghost Wallet** to Applications.
 The app is **ad-hoc signed** (so it launches) but **not notarized** (that needs
 an Apple account), so first launch is gated by Gatekeeper. Bypass it once:
 
@@ -271,7 +271,7 @@ an Apple account), so first launch is gated by Gatekeeper. Bypass it once:
   the dialog. macOS remembers the choice; normal double-click works afterward.
 - Or clear the quarantine flag from a terminal:
   ```sh
-  xattr -cr "/Applications/Wraith Wallet.app"
+  xattr -cr "/Applications/Ghost Wallet.app"
   ```
 
 Ad-hoc signing is what prevents the Apple-Silicon **"app is damaged and can't be

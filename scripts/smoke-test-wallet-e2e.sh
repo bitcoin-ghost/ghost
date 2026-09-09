@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # smoke-test-wallet-e2e.sh — headless end-to-end smoke test for the
-# Wraith Wallet.
+# Ghost Wallet.
 #
 # Drives the all-in-one wallet through its core flows against a real
 # regtest backend, asserting success at each step. The point is to be
@@ -344,6 +344,11 @@ echo "$CREATE_OUT" | grep -q "created at" || fail "wallet create did not report 
 MNEMONIC_WORDS=$(echo "$CREATE_OUT" | awk 'NF==24{print NF; exit}')
 [ "$MNEMONIC_WORDS" = "24" ] || fail "expected a 24-word BIP-39 mnemonic, got '$MNEMONIC_WORDS'"
 pass "wallet 'smoke' created with a 24-word BIP-39 mnemonic"
+# The height this seed came into existence at. Flow 14 hands it back to a
+# recovered wallet so the scanner knows where to start reading; without it a
+# restore begins at the tip and the history is silently empty.
+BIRTH_H=$(height)
+echo "wallet birth height: $BIRTH_H"
 
 # ============================================================================
 # FLOW 2: select (unlock-active)
@@ -1064,9 +1069,282 @@ mine 1
 pass "Cash lane spent with the owner's key alone (tx $CASH_TXID)"
 
 # ============================================================================
+# FLOW 14: recovery — both paths, against a chain
+#   The wallet has spent this whole run building on-chain history. None of the
+#   flows ever asked the only question that matters when a device is lost: can
+#   that money be reached again from the backup alone?
+#
+#   Two independent paths, because they fail differently:
+#     a. the encrypted keystore file — `wallet export` / `wallet restore`
+#     b. the BIP-39 words plus a birth height — `wallet import --birth-height`
+#
+#   (b) is the one that has to rebuild HISTORY, not just find coins. A restored
+#   wallet scans forward from its birth height; without one it starts at the tip
+#   and everything the seed did before the restore is invisible. Balance alone
+#   is not the assertion.
+# ============================================================================
+step "FLOW 14 — recover the wallet from backup (keystore file, and words + birth height)"
+
+# What we must be able to get back to.
+ORIG_BAL=$(WRAITH --json light balance | jq -r '.LightBalance.confirmed_sats // .confirmed_sats // 0')
+ORIG_HIST=$(WRAITH --json light history | jq -r '(.LightHistory.transactions // .transactions // []) | length')
+ORIG_ADDR0="$RECV_ADDR"
+echo "before recovery: balance=$ORIG_BAL history_entries=$ORIG_HIST"
+[ "$ORIG_HIST" -gt 0 ] || fail "the wallet has no history to recover — this flow would prove nothing"
+
+# ---- (a) encrypted keystore backup ----------------------------------------
+BACKUP="$DATADIR/smoke-keystore.bak"
+WRAITH wallet export smoke "$BACKUP" >/dev/null
+[ -s "$BACKUP" ] || fail "wallet export produced no backup file"
+WRAITH wallet restore restored-file "$BACKUP" >/dev/null
+WRAITH wallet select restored-file <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+WRAITH wallet unlock restored-file <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+R_ADDR=$(WRAITH --json light receive --index 0 | jq -r '.LightReceive.address // .address')
+[ "$R_ADDR" = "$ORIG_ADDR0" ] \
+    || fail "the restored keystore derives $R_ADDR at index 0, not $ORIG_ADDR0 — it is a different wallet"
+pass "keystore backup restores the same wallet (index 0 derives $R_ADDR)"
+
+# ---- (b) words + birth height ---------------------------------------------
+# The seed, as the owner would have written it down.
+WORDS=$(WRAITH wallet show-mnemonic smoke <<< 'smoke-pass-1234' 2>/dev/null | awk 'NF==24{print; exit}')
+[ -n "$WORDS" ] || fail "could not read back the mnemonic to recover from"
+
+# Import as a NEW wallet, from words alone, telling it where to start reading.
+printf '%s\nsmoke-pass-1234\n' "$WORDS" \
+    | WRAITH wallet import restored-words --birth-height "$BIRTH_H" >/dev/null 2>&1 \
+    || fail "wallet import from the mnemonic failed"
+WRAITH wallet select restored-words >/dev/null 2>&1 || true
+WRAITH wallet unlock restored-words <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+
+W_ADDR=$(WRAITH --json light receive --index 0 | jq -r '.LightReceive.address // .address')
+[ "$W_ADDR" = "$ORIG_ADDR0" ] \
+    || fail "the words derive $W_ADDR at index 0, not $ORIG_ADDR0"
+
+# The money must be reachable. Scanning is what finds it, so allow the scanner
+# a bounded window rather than asserting on the first read.
+R_BAL=0
+for _ in $(seq 1 40); do
+    R_BAL=$(WRAITH --json light balance | jq -r '.LightBalance.confirmed_sats // .confirmed_sats // 0')
+    [ "$R_BAL" != "0" ] && break
+    sleep 3
+done
+[ "$R_BAL" = "$ORIG_BAL" ] \
+    || fail "recovered balance is $R_BAL, expected $ORIG_BAL — the money is not reachable from the words"
+pass "words + birth height recover the balance ($R_BAL sats)"
+
+# And the history, which is what the birth height exists for.
+# ALL of it, not merely some. A partial rebuild is the failure this is here to
+# catch: a scanner that starts too late finds the coins but loses what they
+# did, and "more than zero" would pass on a wallet that recovered one entry
+# out of thirteen.
+R_HIST=0
+for _ in $(seq 1 60); do
+    R_HIST=$(WRAITH --json light history | jq -r '(.LightHistory.transactions // .transactions // []) | length')
+    [ "$R_HIST" -ge "$ORIG_HIST" ] && break
+    sleep 3
+done
+[ "$R_HIST" -eq "$ORIG_HIST" ] \
+    || fail "the recovered wallet rebuilt $R_HIST of $ORIG_HIST history entries from birth height $BIRTH_H — the coins are found but what they did is lost"
+pass "the whole history rebuilt from birth height $BIRTH_H ($R_HIST of $ORIG_HIST entries)"
+
+# Back to the original wallet so nothing downstream inherits a restored one.
+#
+# ASSERTED, not hoped for. These two calls were `|| true` and silent, and when
+# the select failed the run carried on with a RESTORED wallet active — one
+# whose scanner was a thousand blocks behind. Flows 15 and 16 then tested the
+# wrong wallet, and FLOW 16 failed as "the scanner did not detect the silent
+# payment" — true, and completely misleading: the scanner was busy backfilling
+# somebody else. A handover the flows below depend on has to be checked.
+WRAITH wallet select smoke >/dev/null 2>&1 || true
+WRAITH wallet unlock smoke <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+ACTIVE_NOW=$(WRAITH --json wallet list \
+    | jq -r '((.WalletList.wallets // .wallets // [])[] | select(.active) | .name) // empty')
+[ "$ACTIVE_NOW" = "smoke" ] \
+    || fail "the run did not hand back to 'smoke' after recovery — active wallet is '${ACTIVE_NOW:-none}', so every flow below would test a restored wallet"
+pass "handed back to the original wallet after recovery"
+
+# ============================================================================
+# FLOW 15: fund a lane THROUGH a round — the Lock's actual privacy claim
+#   Every earlier flow funds a lane by paying its address directly from the
+#   node wallet. That works, and it publishes the link between those coins and
+#   the Lock — which is the thing the four-lane design exists to avoid.
+#
+#   `lock fund` is the private entry: the round's OUTPUT is the lane, so on
+#   chain the deposit is indistinguishable from any other round output. It had
+#   no test. One participant funds a lane; the rest mix normally, because a
+#   round of one proves nothing.
+# ============================================================================
+step "FLOW 15 — fund a Savings lane through a round (private entry)"
+
+LF_LANE_ADDR=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .address][0] // empty')
+[ -n "$LF_LANE_ADDR" ] || fail "no savings-lane address on the smoke Lock"
+LF_BEFORE=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .balance_sats] | add // 0')
+
+# A fresh set of seat-priced inputs; flow 9's are long spent.
+declare -a LF_TXIDS LF_VOUTS LF_SPKS LF_OUTS LF_PIDS
+for i in $(seq 0 $((N-1))); do
+    LF_OUTS[$i]=$(WRAITH --json light receive --index "$((300+i))" | jq -r '.LightReceive.address // .address')
+    a=$(WRAITH --json light receive --index "$((200+i))" | jq -r '.LightReceive.address // .address')
+    LF_TXIDS[$i]=$($BCLI -rpcwallet=demo sendtoaddress "$a" "$SEAT_PRICE_BTC")
+done
+mine 6
+LF_SCAN=$(WRAITH --json light l1-utxos --scan-max-index $((200+N+1)))
+for i in $(seq 0 $((N-1))); do
+    a=$(WRAITH --json light receive --index "$((200+i))" | jq -r '.LightReceive.address // .address')
+    e=$(echo "$LF_SCAN" | jq --arg a "$a" '(.LightL1Utxos.utxos // .utxos) | map(select(.address == $a)) | .[0]')
+    [ -n "$e" ] && [ "$e" != "null" ] || fail "scanner did not see the round input for participant $i"
+    LF_VOUTS[$i]=$(echo "$e" | jq '.vout')
+    LF_SPKS[$i]=$(echo "$e" | jq -r '.scriptpubkey_hex')
+done
+
+step "one participant funds a lane, $((N-1)) mix normally"
+for i in $(seq 0 $((N-1))); do
+    (
+        if [ "$i" = "0" ]; then
+            # The lane is named, never an address: the daemon derives it from
+            # the remembered Lock, so a typo cannot pay a stranger.
+            WRAITH --json lock fund \
+                --lock-id "$LOCK_ID" --lane savings \
+                --coordinator "$COORD_URL" --tier 100k_sats \
+                --ghost-id "lockfund_$i" \
+                --utxo "${LF_TXIDS[$i]}:${LF_VOUTS[$i]}" \
+                --utxo-value "$SEAT_PRICE" \
+                --utxo-scriptpubkey "${LF_SPKS[$i]}" \
+                --bip86-index "$((200+i))" \
+                > "$DATADIR/lockfund-$i.out" 2>&1
+        else
+            WRAITH --json mix run \
+                --coordinator "$COORD_URL" --tier 100k_sats \
+                --ghost-id "lockfund_$i" \
+                --utxo "${LF_TXIDS[$i]}:${LF_VOUTS[$i]}" \
+                --utxo-value "$SEAT_PRICE" \
+                --utxo-scriptpubkey "${LF_SPKS[$i]}" \
+                --mix-output-address "${LF_OUTS[$i]}" \
+                --bip86-index "$((200+i))" \
+                > "$DATADIR/lockfund-$i.out" 2>&1
+        fi
+    ) &
+    LF_PIDS[$i]=$!
+done
+for i in $(seq 0 $((N-1))); do
+    if ! wait "${LF_PIDS[$i]}"; then
+        cat "$DATADIR/lockfund-$i.out" >&2
+        fail "participant $i did not complete the lane-funding round"
+    fi
+done
+
+LF_TXID=$(jq -r '.WraithMixCompleted.broadcast_txid // .broadcast_txid // .GhostLockFunded.broadcast_txid // empty' \
+    < "$DATADIR/lockfund-0.out")
+[ -n "$LF_TXID" ] || { cat "$DATADIR/lockfund-0.out" >&2; fail "the lane-funding participant returned no txid"; }
+mine 1
+
+# The round paid the lane itself — that is the whole claim.
+$BCLI getrawtransaction "$LF_TXID" 1 \
+    | jq -e --arg a "$LF_LANE_ADDR" '[.vout[] | select(.scriptPubKey.address == $a)] | length >= 1' >/dev/null \
+    || fail "the round tx does not pay the savings lane $LF_LANE_ADDR"
+pass "the round's own output funded the lane (tx $LF_TXID)"
+
+LF_AFTER=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .balance_sats] | add // 0')
+[ "$((LF_AFTER - LF_BEFORE))" = "100000" ] \
+    || fail "savings lane moved by $((LF_AFTER - LF_BEFORE)) sats, expected one 100,000-sat denomination (before $LF_BEFORE, after $LF_AFTER)"
+pass "the lane received a full denomination with no direct payment to it"
+
+# ============================================================================
+# FLOW 16: silent payment, end to end — send AND find
+#   The sender was built with a unit test over its own output; the receiving
+#   half — the block scanner recognising a coin paid to a key nobody published
+#   — had no on-chain test at all. The two had never been run against each
+#   other on a chain.
+#
+#   Paying our own Ghost ID is a fair test precisely because detection is
+#   key-derived: the wallet finds this coin by re-deriving it from the sender's
+#   ephemeral key, not by recognising an address it handed out. Nothing about
+#   the sender being us makes the scan easier.
+# ============================================================================
+step "FLOW 16 — silent payment: send to a Ghost ID and detect it"
+
+GID=$(WRAITH --json wallet ghost-id | jq -r '.WalletGhostId.ghost_id // .ghost_id // empty')
+[ -n "$GID" ] || fail "the wallet has no Ghost ID to be paid at"
+echo "ghost id: $GID"
+
+SP_BEFORE=$(WRAITH --json light detected | jq -r '(.LightDetected.detections // .detections // []) | length')
+
+# --scan-max: by this point the wallet's coins sit at the high indices flows 15
+# and 16 derived, well past the default 32.
+SP_TXID=$(WRAITH --json light pay --scan-max 520 "$GID" 40000 \
+    | jq -r '.LightSendBroadcast.txid // .L1Send.txid // .txid // empty')
+[ -n "$SP_TXID" ] || fail "the silent payment did not broadcast"
+mine 2
+
+# The announcement has to be on chain: an OP_RETURN carrying the ephemeral key,
+# beside a taproot output nobody can attribute without it.
+SP_TX=$($BCLI getrawtransaction "$SP_TXID" 1)
+# NO marker (#867). The announcement used to be required here; carrying one is
+# now the bug. `6a 21` + 33 bytes beside a taproot output is a shape an indexer
+# greps the whole chain for at zero cost — it hid who was paid while advertising
+# that a private payment happened. The secret comes from the transaction's own
+# inputs instead, so there is nothing to publish.
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "nulldata")] | length == 0' >/dev/null \
+    || fail "the payment carries an OP_RETURN — it is marked as a silent payment to every observer"
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "witness_v1_taproot")] | length >= 1' >/dev/null \
+    || fail "the payment has no taproot output to be found"
+# Nothing may distinguish it: every output is taproot, so it reads as an
+# ordinary spend.
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type != "witness_v1_taproot")] | length == 0' >/dev/null \
+    || fail "the payment has a non-taproot output, which singles it out: $(echo "$SP_TX" | jq -c '[.vout[].scriptPubKey.type]')"
+pass "the payment is on chain and carries no marker at all (tx $SP_TXID)"
+
+# Wait for the scanner to be CURRENT before judging it.
+#
+# This flow first failed as "the scanner did not detect the silent payment",
+# which was true and misleading: the earlier flows mine about a thousand
+# regtest blocks, the scanner reads ~50 per pass at roughly 2 blocks/second,
+# and it was still hundreds of blocks short of the payment when the window
+# expired. A detection test that starts before the scanner reaches the block
+# measures the scanner's backlog, not its correctness.
+#
+# `blocks_behind` is what makes this checkable rather than a guess: 0 is the
+# only state in which an absent payment means genuinely absent.
+BEHIND=""
+for _ in $(seq 1 200); do
+    BEHIND=$(WRAITH --json wallet status \
+        | jq -r '(.WalletStatus.blocks_behind // .blocks_behind) // empty')
+    [ "$BEHIND" = "0" ] && break
+    sleep 3
+done
+[ "$BEHIND" = "0" ] \
+    || fail "the scanner never caught up (still ${BEHIND:-unknown} blocks behind after 600s) — detection cannot be judged until it does"
+pass "the scanner is current, so an undetected payment would mean undetected"
+
+# And the scanner must find it. This is the half that had no test.
+SP_AFTER=0
+for _ in $(seq 1 40); do
+    SP_AFTER=$(WRAITH --json light detected | jq -r '(.LightDetected.detections // .detections // []) | length')
+    [ "$SP_AFTER" -gt "$SP_BEFORE" ] && break
+    sleep 3
+done
+[ "$SP_AFTER" -gt "$SP_BEFORE" ] \
+    || fail "the scanner did not detect the silent payment — it is on chain and invisible to its recipient"
+
+# The detection must carry `k`. Without it the coin is found but unspendable,
+# because k is what re-derives the key that opens the output.
+SP_ENTRY=$(WRAITH --json light detected \
+    | jq --arg t "$SP_TXID" '[(.LightDetected.detections // .detections)[] | select(.txid == $t)][0]')
+[ -n "$SP_ENTRY" ] && [ "$SP_ENTRY" != "null" ] \
+    || fail "detections grew but none of them is $SP_TXID"
+echo "$SP_ENTRY" | jq -e '.amount_sats == 40000' >/dev/null \
+    || fail "detected the payment at the wrong amount: $(echo "$SP_ENTRY" | jq -c '.amount_sats')"
+echo "$SP_ENTRY" | jq -e 'has("k")' >/dev/null \
+    || fail "the detection carries no k — the coin is found but cannot be spent"
+pass "the scanner found it and recorded k ($(echo "$SP_ENTRY" | jq -c '{vout,amount_sats,k}'))"
+
+# ============================================================================
 echo
 echo "================================================================"
-echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
+echo "  GHOST WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
 echo "================================================================"
 echo "  1. BIP-39 wallet create            ok"
 echo "  2. select active wallet            ok"
@@ -1081,4 +1359,7 @@ echo " 10. Ghost Lock escape spend         ok  ($ESC_TXID)"
 echo " 11. air-gapped Savings spend        ok  ($AIR_TXID)"
 echo " 12. quorum co-signed spend          ok  ($Q_TXID)"
 echo " 13. Cash lane spend                 ok  ($CASH_TXID)"
+echo " 14. recover from backup + words     ok  ($R_HIST history entries)"
+echo " 15. fund a lane through a round     ok  ($LF_TXID)"
+echo " 16. silent payment send + detect    ok  ($SP_TXID)"
 echo "================================================================"

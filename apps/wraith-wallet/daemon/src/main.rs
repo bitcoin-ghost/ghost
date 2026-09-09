@@ -1635,25 +1635,93 @@ mod server {
         // 4. Build the unsigned PSBT.
         //
         // A Ghost ID is paid differently from an address: the money goes to a
-        // taproot output derived per-payment, and an OP_RETURN alongside it
-        // carries the ephemeral key the recipient needs to find it. Routed on
-        // the recipient's form rather than on a flag, so the caller cannot ask
-        // for one and get the other.
+        // taproot output derived per-payment. It carries NOTHING else — no
+        // announcement, no marker (#867) — because the secret is derived from
+        // the transaction's own inputs. Routed on the recipient's form rather
+        // than on a flag, so the caller cannot ask for one and get the other.
         let (psbt, meta) = if wraith_wallet_core::silent_payment::looks_like_ghost_id(
             recipient_address,
             network,
         ) {
-            let pay = wraith_wallet_core::silent_payment::build(recipient_address, network, 0)
-                .map_err(|e| format!("silent payment: {e}"))?;
-            psbt_mod::create_psbt_to_scripts(
+            // The output key depends on WHICH coins are spent, and selection
+            // happens inside the builder. So build against a placeholder, then
+            // rewrite the output once the input set is known. Both scripts are
+            // 34-byte P2TR, so the fee, the vsize and the change are identical
+            // either way — this reorders the derivation, it does not change the
+            // transaction's shape.
+            let placeholder = {
+                let mut v = Vec::with_capacity(34);
+                v.push(0x51);
+                v.push(0x20);
+                v.extend_from_slice(&[0u8; 32]);
+                bitcoin::ScriptBuf::from_bytes(v)
+            };
+            let (mut psbt, meta) = psbt_mod::create_psbt_to_scripts(
                 &available,
-                pay.output_script,
+                placeholder.clone(),
                 amount_sats,
-                std::slice::from_ref(&pay.announcement_script),
+                &[],
                 &change_addr,
                 fee_rate_sats_per_vb,
             )
-            .map_err(|e| format!("create_psbt: {e}"))?
+            .map_err(|e| format!("create_psbt: {e}"))?;
+
+            // The coins the builder actually chose, with the scripts that say
+            // which key owns each.
+            let selected: Vec<(bitcoin::Txid, u32, bitcoin::ScriptBuf)> = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|txin| {
+                    let op = txin.previous_output;
+                    available
+                        .iter()
+                        .find(|u| u.txid == op.txid && u.vout == op.vout)
+                        .map(|u| (op.txid, op.vout, u.script_pubkey.clone()))
+                        .ok_or_else(|| {
+                            format!(
+                                "selected input {}:{} is not in the scanned set",
+                                op.txid, op.vout
+                            )
+                        })
+                })
+                .collect::<Result<_, String>>()?;
+
+            let payment_spk = {
+                let wallets = state.wallets.read().await;
+                let ks = wallets
+                    .get(&active_name)
+                    .ok_or_else(|| format!("active wallet '{active_name}' is not unlocked"))?;
+                let prepared = wraith_wallet_core::silent_payment::input_keys_for(
+                    ks, network, &selected, scan_max,
+                )
+                .map_err(|e| format!("silent payment inputs: {e}"))?;
+                wraith_wallet_core::silent_payment::build_from_inputs(
+                    recipient_address,
+                    network,
+                    0,
+                    &prepared,
+                )
+                .map_err(|e| format!("silent payment: {e}"))?
+            };
+
+            // Refuse to hand back a transaction still paying the placeholder.
+            // That script is unspendable by anyone, so shipping one would burn
+            // the money in silence — this is the one failure here that must be
+            // impossible rather than unlikely.
+            let mut replaced = 0usize;
+            for out in psbt.unsigned_tx.output.iter_mut() {
+                if out.script_pubkey == placeholder {
+                    out.script_pubkey = payment_spk.clone();
+                    replaced += 1;
+                }
+            }
+            if replaced != 1 {
+                return Err(format!(
+                    "silent payment output was not substituted exactly once (replaced {replaced})                      — refusing to sign a transaction that may pay an unspendable script"
+                ));
+            }
+            (psbt, meta)
         } else {
             psbt_mod::create_psbt(
                 &available,
@@ -2443,19 +2511,67 @@ mod server {
     async fn block_scan_task(state: Arc<DaemonState>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The last failure this loop reported, so a persistent fault is stated
+        // once rather than every twenty seconds — and so a NEW fault is not
+        // swallowed by the noise of an old one.
+        //
+        // It has to be said at all: a scan tick that fails on every pass used
+        // to be a debug line, so a scanner that had stopped working looked
+        // exactly like a scanner with nothing to do. The history it was meant
+        // to rebuild simply never appeared, and the log at default level said
+        // nothing whatsoever. Balance and the UTXO list come from
+        // `scantxoutset` and keep working, which hides it further.
+        let mut reported: Option<String> = None;
         loop {
             tick.tick().await;
             loop {
                 match scan_new_blocks(&state).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        if let Some(previous) = reported.take() {
+                            tracing::info!(
+                                previous_error = %previous,
+                                "block scan is working again"
+                            );
+                        }
+                        break;
+                    }
                     // A full batch means there is more waiting. Go straight
                     // round again rather than sleeping: a wallet restored from
                     // a year ago has fifty thousand blocks to read, and doing
                     // that at one batch per tick would take most of a day.
                     // Idle, this still costs nothing — the first pass returns
                     // zero and the loop ends.
-                    Ok(n) if n >= SCAN_BATCH_BLOCKS => continue,
+                    // A full batch means there is more waiting, so this arm
+                    // can run for minutes on a restored wallet — and it used to
+                    // say nothing at all while it did, which is
+                    // indistinguishable from a scanner that has stopped. Worse,
+                    // silent-payment detection and history for the ACTIVE wallet
+                    // wait behind it, so "my payment never arrived" and "the
+                    // scanner is busy" looked identical.
+                    Ok(n) if n >= SCAN_BATCH_BLOCKS => {
+                        // Read the name out before the macro: holding the guard
+                        // across it makes this future non-Send.
+                        let wallet = state
+                            .active
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_string());
+                        tracing::info!(
+                            wallet = %wallet,
+                            blocks = n,
+                            "block scan is backfilling — detection and history lag until it \
+                             catches up"
+                        );
+                        continue;
+                    }
                     Ok(n) => {
+                        if let Some(previous) = reported.take() {
+                            tracing::info!(
+                                previous_error = %previous,
+                                "block scan is working again"
+                            );
+                        }
                         tracing::debug!(blocks = n, "block scan caught up");
                         break;
                     }
@@ -2463,13 +2579,42 @@ mod server {
                     // case and not worth an error line every twenty seconds.
                     // The status header already says the node is unreachable.
                     Err(e) => {
-                        tracing::debug!(error = %e, "block scan tick did not complete");
+                        let e = e.to_string();
+                        // A node that is down, syncing or mid-restart is the
+                        // common case, so this must not shout every tick — but
+                        // it must shout once, and again whenever the reason
+                        // changes.
+                        if reported.as_deref() != Some(e.as_str()) {
+                            let idle = e == SCAN_IDLE_NO_WALLET || e == SCAN_IDLE_NO_NODE;
+                            if idle {
+                                tracing::info!(
+                                    reason = %e,
+                                    "block scan is idle — transaction history will not advance \
+                                     until this changes (balance and UTXOs are unaffected, they \
+                                     do not use the scanner)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    error = %e,
+                                    "block scan is not running — transaction history will not \
+                                     advance until this clears (balance and UTXOs are \
+                                     unaffected, they do not use the scanner)"
+                                );
+                            }
+                            reported = Some(e);
+                        }
                         break;
                     }
                 }
             }
         }
     }
+
+    /// Why a scan pass did nothing, when the reason is an ordinary state rather
+    /// than a fault. Reported like any other stop reason so the log says which,
+    /// but at info: neither is broken, and neither should read as an alarm.
+    const SCAN_IDLE_NO_WALLET: &str = "no unlocked wallet to derive scripts from";
+    const SCAN_IDLE_NO_NODE: &str = "no reachable node RPC";
 
     /// One pass of the scanner. Returns how many blocks it read.
     ///
@@ -2478,7 +2623,13 @@ mod server {
     /// while the wallet is locked.
     async fn scan_new_blocks(state: &Arc<DaemonState>) -> Result<u32, String> {
         let Some(ours) = own_script_pubkeys(state).await else {
-            return Ok(0);
+            // Not an error — a locked or unselected wallet is a normal state.
+            // But it is indistinguishable from "scanned, nothing new" at the
+            // call site, and the difference matters: in the second case history
+            // is up to date, in this one it silently stops advancing while
+            // balance and the UTXO list keep working from `scantxoutset`. Say
+            // which, once per change of state.
+            return Err(SCAN_IDLE_NO_WALLET.to_string());
         };
         // The Ghost ID's scan and spend keys. A silent payment lands on a key
         // derived from these rather than on any address the wallet published,
@@ -2489,7 +2640,7 @@ mod server {
         .await
         .ok();
         let Some(rpc) = state.build_ghostd_rpc().await else {
-            return Ok(0);
+            return Err(SCAN_IDLE_NO_NODE.to_string());
         };
         let rpc = Arc::new(rpc);
 
@@ -5111,11 +5262,35 @@ mod server {
                 let path = active
                     .as_ref()
                     .map(|n| keystore_path(&state.wallets_dir, n).display().to_string());
+                // Where the scanner has got to. Both reads are best-effort:
+                // a status call must still answer when the node is down or the
+                // wallet has never scanned, and `None` says so rather than
+                // claiming zero.
+                drop(wallets);
+                let scan_height = scan_state_for(state)
+                    .await
+                    .ok()
+                    .and_then(|b| b.point().map(|p| p.height));
+                let chain_height = state
+                    .chain()
+                    .await
+                    .status()
+                    .await
+                    .ok()
+                    .and_then(|s| s.chain_height)
+                    .map(|h| h as u32);
+                let blocks_behind = match (scan_height, chain_height) {
+                    (Some(s), Some(t)) => Some(t.saturating_sub(s)),
+                    _ => None,
+                };
                 Response::WalletStatus(WalletStatusResponse {
                     active,
                     path,
                     unlocked,
                     signer,
+                    scan_height,
+                    chain_height,
+                    blocks_behind,
                 })
             }
             Request::WalletDerive { path } => {

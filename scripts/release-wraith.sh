@@ -64,7 +64,7 @@ SIGNING_KEY="${WRAITH_RELEASE_SIGNING_KEY:-}"
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 size_of() { wc -c < "$1" | tr -d ' '; }
 
-echo "==> Wraith Wallet release ${VERSION} for ${TRIPLE}"
+echo "==> Ghost Wallet release ${VERSION} for ${TRIPLE}"
 mkdir -p dist
 rm -rf "$STAGING" "$TARBALL" "${TARBALL}.sha256" "$MANIFEST" "${MANIFEST}.asc"
 mkdir -p "$STAGING/bin" "$STAGING/completions"

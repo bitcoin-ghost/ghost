@@ -27,10 +27,17 @@
 //! paid*, not *that a payment occurred*. That is the trade this protocol
 //! makes, and it is worth knowing before choosing it over an ordinary address.
 
+use bitcoin::hashes::Hash;
 use bitcoin::{Network, ScriptBuf};
-use ghost_keys::{GhostId, GhostNetwork};
 
-/// The two outputs a silent payment adds to a transaction.
+use crate::keystore::Keystore;
+use ghost_keys::input_keys::{sender_secret, Outpoint, PaymentInput};
+use ghost_keys::{GhostId, GhostNetwork};
+use secp256k1::SecretKey;
+
+/// The two outputs the ANNOUNCING form of a silent payment added to a
+/// transaction. Test-only — see [`build`].
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SilentPayment {
     /// The taproot output that carries the money.
@@ -65,8 +72,8 @@ pub fn ghost_network_for(network: Network) -> Option<GhostNetwork> {
 /// Whether `s` looks like a Ghost ID for `network`.
 ///
 /// A prefix check, used to decide which kind of payment the user asked for
-/// before committing to either. The full decode still happens in [`build`] —
-/// this only routes.
+/// before committing to either. The full decode still happens in
+/// [`build_from_inputs`] — this only routes.
 pub fn looks_like_ghost_id(s: &str, network: Network) -> bool {
     let Some(gn) = ghost_network_for(network) else {
         return false;
@@ -83,6 +90,17 @@ pub fn looks_like_ghost_id(s: &str, network: Network) -> bool {
 ///
 /// A fresh ephemeral key is generated per call, so paying the same Ghost ID
 /// twice produces unrelated on-chain outputs.
+/// ⛔ **Test-only, and deliberately unreachable from production (#867).**
+///
+/// This is the announcing form: it emits an `OP_RETURN` carrying the ephemeral
+/// key, which marks the transaction as a silent payment to every observer. It
+/// is kept solely to build fixtures for the tests that prove coins ALREADY paid
+/// this way remain findable — the scanner must keep reading announcements even
+/// though nothing writes them any more.
+///
+/// It is `#[cfg(test)]` rather than deprecated because a leak that is merely
+/// discouraged comes back. Use [`build_from_inputs`].
+#[cfg(test)]
 pub fn build(
     ghost_id: &str,
     network: Network,
@@ -113,6 +131,115 @@ pub fn build(
         output_script: ScriptBuf::from_bytes(output),
         announcement_script: ScriptBuf::from_bytes(announcement),
     })
+}
+
+/// Build the output that pays `ghost_id`, with nothing announced (#867).
+///
+/// The shared secret comes from the transaction's own inputs rather than from a
+/// fresh random key, so there is no ephemeral pubkey to publish and the payment
+/// leaves **one** output that looks like any other taproot spend. The
+/// superseded announcing form returned an `OP_RETURN` alongside it, which
+/// marked the transaction as a silent payment to every observer; it is now
+/// test-only and cannot be reached from here.
+///
+/// `inputs` are the coins this transaction will actually spend, each carrying
+/// the key that controls it — they cannot drift apart, because they are one
+/// value. Order does not matter; the derivation sorts by outpoint.
+///
+/// ⚠ The inputs are load-bearing in a way an ordinary output is not: change the
+/// coin selection after calling this and the output no longer matches what a
+/// receiver will compute, so the money lands on a key nobody derives. Select
+/// first, then build.
+pub fn build_from_inputs(
+    ghost_id: &str,
+    network: Network,
+    k: u32,
+    inputs: &[PaymentInput],
+) -> Result<ScriptBuf, SilentPaymentError> {
+    let gn = ghost_network_for(network)
+        .ok_or_else(|| SilentPaymentError::BadGhostId(format!("unsupported network {network}")))?;
+    let id = GhostId::decode_for_network(ghost_id.trim(), gn)
+        .map_err(|e| SilentPaymentError::BadGhostId(e.to_string()))?;
+
+    let ephemeral = sender_secret(inputs).map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+    let (output_pubkey, _ephemeral_pub, _tweak) = id
+        .derive_payment_address_v2_with_ephemeral(&ephemeral, k)
+        .map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+
+    let mut output = Vec::with_capacity(34);
+    output.push(0x51); // OP_1
+    output.push(0x20); // PUSH32
+    output.extend_from_slice(&output_pubkey.serialize()[1..]);
+    Ok(ScriptBuf::from_bytes(output))
+}
+
+/// The tweaked private keys controlling `inputs`, with their outpoints.
+///
+/// `inputs` are the coins a transaction will spend: outpoint plus the
+/// scriptPubKey they pay to, which is how the owning key is found.
+///
+/// ⚠ **Tweaked, not internal.** A BIP-86 output is controlled by the key-path
+/// tweaked key, and the tweaked key is what appears in the scriptPubKey — so it
+/// is what a receiver sums into `A_sum`. Handing the untweaked key to
+/// [`build_from_inputs`] produces a payment nobody can find, with no error at
+/// any point. The tweak here is the same `tap_tweak` the signer applies.
+pub fn input_keys_for(
+    keystore: &Keystore,
+    network: Network,
+    inputs: &[(bitcoin::Txid, u32, ScriptBuf)],
+    scan_max: u32,
+) -> Result<Vec<PaymentInput>, SilentPaymentError> {
+    use bitcoin::key::TapTweak;
+    use secp256k1::{Keypair, Secp256k1};
+
+    let secp = Secp256k1::new();
+    let mut prepared = Vec::with_capacity(inputs.len());
+
+    for (txid, vout, spk) in inputs {
+        let idx = crate::psbt::find_bip86_index_for_script(keystore, network, spk, scan_max)
+            .map_err(|e| SilentPaymentError::Derive(e.to_string()))?
+            .ok_or_else(|| {
+                SilentPaymentError::Derive(format!(
+                    "input {txid}:{vout} is not a receive-chain coin of this wallet within                      {scan_max} indices, so its key cannot be derived"
+                ))
+            })?;
+
+        let xprv = keystore
+            .derive_xprv(&crate::light::receive_path(idx))
+            .map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+        let sk = SecretKey::from_slice(&xprv.private_key().to_bytes())
+            .map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+        let tweaked = Keypair::from_secret_key(&secp, &sk)
+            .tap_tweak(&secp, None)
+            .to_keypair()
+            .secret_key();
+
+        // The x-only key the output actually carries. Passing it makes the
+        // constructor CHECK that `tweaked` controls this coin rather than
+        // trusting that the tweak was applied — the difference between an
+        // error here and a payment the recipient can never find.
+        let spk_bytes = spk.as_bytes();
+        if spk_bytes.len() != 34 {
+            return Err(SilentPaymentError::Derive(format!(
+                "input {txid}:{vout} is not a taproot output, so its key is not on chain"
+            )));
+        }
+        let mut output_xonly = [0u8; 32];
+        output_xonly.copy_from_slice(&spk_bytes[2..34]);
+
+        prepared.push(
+            PaymentInput::spending_taproot_output(
+                // `bitcoin::Txid` stores internal order; the display form is
+                // the reversed one, and the constructor names which is which.
+                Outpoint::from_internal_bytes(txid.to_byte_array(), *vout),
+                tweaked,
+                &output_xonly,
+            )
+            .map_err(|e| SilentPaymentError::Derive(e.to_string()))?,
+        );
+    }
+
+    Ok(prepared)
 }
 
 #[cfg(test)]
