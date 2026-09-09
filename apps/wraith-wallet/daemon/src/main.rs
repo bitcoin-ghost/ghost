@@ -539,6 +539,9 @@ mod server {
         ghostd: RwLock<GhostdSettings>,
         /// A Ghost pool node, consulted only for the coordinator election.
         pool_url: RwLock<Option<String>>,
+        /// Further pools asked the same question so their rosters can be
+        /// compared (#710). Empty = the roster is unchecked, and said so.
+        pool_peers: RwLock<Vec<String>>,
         /// The last verified election, with the epoch it was drawn for.
         ///
         /// Cached for the whole epoch — 144 blocks, about a day — so the
@@ -643,6 +646,19 @@ mod server {
         /// A Ghost pool node, consulted only for the coordinator election.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pool_url: Option<String>,
+        /// Further pool nodes asked the SAME election question, so their answers
+        /// can be compared (#710).
+        ///
+        /// The draw is verifiable but the roster it draws from is not: a node
+        /// that omits honest candidates publishes an election that verifies
+        /// perfectly. Asking more than one node is what turns a unilateral liar
+        /// into a visible disagreement. They need not be coordinators or even
+        /// qualified — they only have to publish their view.
+        ///
+        /// Empty means the roster is one node's word, which is what it has
+        /// always been; the wallet then says so rather than implying otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pool_peers: Vec<String>,
     }
 
     /// Resolve where the node-selection config lives. `WRAITHD_NODE_CONFIG`
@@ -776,6 +792,7 @@ mod server {
                 &NodeConfig {
                     ghostd: next.clone(),
                     pool_url: pool_url.clone(),
+                    pool_peers: self.pool_peers.read().await.clone(),
                 },
             )
             .map_err(|e| format!("persist node.json: {e}"))?;
@@ -959,6 +976,11 @@ mod server {
         } else {
             persisted.clone().map(|c| c.ghostd).unwrap_or_default()
         };
+        // Peers are read before `pool_url` consumes `persisted`.
+        let pool_peers: Vec<String> = persisted
+            .as_ref()
+            .map(|c| c.pool_peers.clone())
+            .unwrap_or_default();
         let pool_url = std::env::var(POOL_URL_ENV)
             .ok()
             .filter(|s| !s.is_empty())
@@ -1035,6 +1057,7 @@ mod server {
             ghostd: RwLock::new(ghostd),
             ghostd_env_override,
             pool_url: RwLock::new(pool_url),
+            pool_peers: RwLock::new(pool_peers),
             election_cache: RwLock::new(None),
         });
         state.clients.write().await.chain = state.build_chain().await;
@@ -2937,6 +2960,65 @@ mod server {
         if election.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
             tracing::debug!("the pool has coordinator elections turned off");
             return None;
+        }
+
+        // #710: the draw is verifiable, the roster it draws from is not.
+        //
+        // A node that omits honest candidates — to improve its own odds, or to
+        // seat itself — publishes an election that verifies perfectly against
+        // the roster it published beside it. Comparing the roster with other
+        // nodes is the only thing that sees it, and `roster_commitment` exists
+        // to be compared. Nothing compared it until now.
+        //
+        // Refuse on disagreement rather than picking a majority: the wallet
+        // then falls back to a manually configured coordinator and mixes later,
+        // which costs a round. Taking the majority would mix ANYWAY while
+        // knowing at least one node is lying about who was eligible, and the
+        // whole point of the round is not to trust the coordinator.
+        //
+        // ⚠ It is a denial-of-service surface and that is the accepted trade: a
+        // single lying peer can stop an honest wallet mixing. It is bounded —
+        // the operator chooses the peer list — and the alternative is mixing on
+        // a roster somebody is known to have invented.
+        let peers = state.pool_peers.read().await.clone();
+        if !peers.is_empty() {
+            let mut views = Vec::with_capacity(peers.len() + 1);
+            views.push(election.clone());
+            for peer in &peers {
+                let purl = format!("{}/api/v1/pool/coordinator", peer.trim_end_matches('/'));
+                match client.get(&purl).send().await {
+                    Ok(r) => match r.json::<serde_json::Value>().await {
+                        Ok(v) => views.push(v),
+                        // A peer that cannot answer is not a peer that
+                        // disagrees. Silence must not be evidence.
+                        Err(e) => tracing::debug!(peer, error = %e, "peer election was not JSON"),
+                    },
+                    Err(e) => tracing::debug!(peer, error = %e, "peer did not answer"),
+                }
+            }
+            match crate::coordinator_resolve::roster_agreement(&views, epoch) {
+                crate::coordinator_resolve::RosterAgreement::Unanimous => {
+                    tracing::debug!(peers = views.len(), "the roster is agreed across nodes");
+                }
+                crate::coordinator_resolve::RosterAgreement::Unchecked => {
+                    tracing::warn!(
+                        configured_peers = peers.len(),
+                        "no peer answered for this epoch, so the roster is one node's word —                          the draw is verified, the set it drew from is not"
+                    );
+                }
+                crate::coordinator_resolve::RosterAgreement::Disagreement { commitments } => {
+                    tracing::warn!(
+                        ?commitments,
+                        epoch,
+                        "nodes disagree about the coordinator roster — at least one is drawing                          from a set the others do not recognise. Refusing this election; the                          wallet will fall back and can mix in a later round"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            tracing::debug!(
+                "no pool peers configured, so the roster is one node's word (see node.json                  pool_peers)"
+            );
         }
 
         // Pin the beacon to the chain. Verifying the draw against the beacon
@@ -7268,6 +7350,7 @@ mod server {
                 ghostd: RwLock::new(GhostdSettings::default()),
                 ghostd_env_override: false,
                 pool_url: RwLock::new(None),
+                pool_peers: RwLock::new(Vec::new()),
                 election_cache: RwLock::new(None),
             })
         }
