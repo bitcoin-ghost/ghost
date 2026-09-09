@@ -1417,6 +1417,22 @@ pub struct WalletStatusResponse {
     /// Phase 13: signer info for the active wallet, when one is unlocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<SignerInfoIpc>,
+    /// The height the block scanner has read up to for this wallet.
+    ///
+    /// Without this the wallet cannot answer the first question a restore
+    /// raises — "where is my history?" — because a scanner still reading and a
+    /// scanner that has finished look identical from outside: the balance and
+    /// the UTXO list are correct either way, they come from `scantxoutset`.
+    /// `None` when no wallet is active or it has never scanned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_height: Option<u32>,
+    /// The node's tip, as the daemon last read it. `None` when unreachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_height: Option<u32>,
+    /// How far the scanner still has to read. `Some(0)` means caught up, and is
+    /// the only state in which an absent payment means it is genuinely absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks_behind: Option<u32>,
 }
 
 /// One entry in `WalletListResponse::wallets`.

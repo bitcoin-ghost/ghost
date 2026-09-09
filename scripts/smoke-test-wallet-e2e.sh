@@ -1148,8 +1148,20 @@ done
 pass "the whole history rebuilt from birth height $BIRTH_H ($R_HIST of $ORIG_HIST entries)"
 
 # Back to the original wallet so nothing downstream inherits a restored one.
+#
+# ASSERTED, not hoped for. These two calls were `|| true` and silent, and when
+# the select failed the run carried on with a RESTORED wallet active — one
+# whose scanner was a thousand blocks behind. Flows 15 and 16 then tested the
+# wrong wallet, and FLOW 16 failed as "the scanner did not detect the silent
+# payment" — true, and completely misleading: the scanner was busy backfilling
+# somebody else. A handover the flows below depend on has to be checked.
 WRAITH wallet select smoke >/dev/null 2>&1 || true
 WRAITH wallet unlock smoke <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+ACTIVE_NOW=$(WRAITH --json wallet list \
+    | jq -r '((.WalletList.wallets // .wallets // [])[] | select(.active) | .name) // empty')
+[ "$ACTIVE_NOW" = "smoke" ] \
+    || fail "the run did not hand back to 'smoke' after recovery — active wallet is '${ACTIVE_NOW:-none}', so every flow below would test a restored wallet"
+pass "handed back to the original wallet after recovery"
 
 # ============================================================================
 # FLOW 15: fund a lane THROUGH a round — the Lock's actual privacy claim
@@ -1275,6 +1287,28 @@ echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "nulldata")] | le
 echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "witness_v1_taproot")] | length >= 1' >/dev/null \
     || fail "the payment has no taproot output to be found"
 pass "the payment is on chain with its announcement (tx $SP_TXID)"
+
+# Wait for the scanner to be CURRENT before judging it.
+#
+# This flow first failed as "the scanner did not detect the silent payment",
+# which was true and misleading: the earlier flows mine about a thousand
+# regtest blocks, the scanner reads ~50 per pass at roughly 2 blocks/second,
+# and it was still hundreds of blocks short of the payment when the window
+# expired. A detection test that starts before the scanner reaches the block
+# measures the scanner's backlog, not its correctness.
+#
+# `blocks_behind` is what makes this checkable rather than a guess: 0 is the
+# only state in which an absent payment means genuinely absent.
+BEHIND=""
+for _ in $(seq 1 200); do
+    BEHIND=$(WRAITH --json wallet status \
+        | jq -r '(.WalletStatus.blocks_behind // .blocks_behind) // empty')
+    [ "$BEHIND" = "0" ] && break
+    sleep 3
+done
+[ "$BEHIND" = "0" ] \
+    || fail "the scanner never caught up (still ${BEHIND:-unknown} blocks behind after 600s) — detection cannot be judged until it does"
+pass "the scanner is current, so an undetected payment would mean undetected"
 
 # And the scanner must find it. This is the half that had no test.
 SP_AFTER=0
