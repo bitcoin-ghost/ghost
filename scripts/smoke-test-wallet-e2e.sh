@@ -1152,6 +1152,95 @@ WRAITH wallet select smoke >/dev/null 2>&1 || true
 WRAITH wallet unlock smoke <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
 
 # ============================================================================
+# FLOW 15: fund a lane THROUGH a round — the Lock's actual privacy claim
+#   Every earlier flow funds a lane by paying its address directly from the
+#   node wallet. That works, and it publishes the link between those coins and
+#   the Lock — which is the thing the four-lane design exists to avoid.
+#
+#   `lock fund` is the private entry: the round's OUTPUT is the lane, so on
+#   chain the deposit is indistinguishable from any other round output. It had
+#   no test. One participant funds a lane; the rest mix normally, because a
+#   round of one proves nothing.
+# ============================================================================
+step "FLOW 15 — fund a Savings lane through a round (private entry)"
+
+LF_LANE_ADDR=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .address][0] // empty')
+[ -n "$LF_LANE_ADDR" ] || fail "no savings-lane address on the smoke Lock"
+LF_BEFORE=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .balance_sats] | add // 0')
+
+# A fresh set of seat-priced inputs; flow 9's are long spent.
+declare -a LF_TXIDS LF_VOUTS LF_SPKS LF_OUTS LF_PIDS
+for i in $(seq 0 $((N-1))); do
+    LF_OUTS[$i]=$(WRAITH --json light receive --index "$((300+i))" | jq -r '.LightReceive.address // .address')
+    a=$(WRAITH --json light receive --index "$((200+i))" | jq -r '.LightReceive.address // .address')
+    LF_TXIDS[$i]=$($BCLI -rpcwallet=demo sendtoaddress "$a" "$SEAT_PRICE_BTC")
+done
+mine 6
+LF_SCAN=$(WRAITH --json light l1-utxos --scan-max-index $((200+N+1)))
+for i in $(seq 0 $((N-1))); do
+    a=$(WRAITH --json light receive --index "$((200+i))" | jq -r '.LightReceive.address // .address')
+    e=$(echo "$LF_SCAN" | jq --arg a "$a" '(.LightL1Utxos.utxos // .utxos) | map(select(.address == $a)) | .[0]')
+    [ -n "$e" ] && [ "$e" != "null" ] || fail "scanner did not see the round input for participant $i"
+    LF_VOUTS[$i]=$(echo "$e" | jq '.vout')
+    LF_SPKS[$i]=$(echo "$e" | jq -r '.scriptpubkey_hex')
+done
+
+step "one participant funds a lane, $((N-1)) mix normally"
+for i in $(seq 0 $((N-1))); do
+    (
+        if [ "$i" = "0" ]; then
+            # The lane is named, never an address: the daemon derives it from
+            # the remembered Lock, so a typo cannot pay a stranger.
+            WRAITH --json lock fund \
+                --lock-id "$LOCK_ID" --lane savings \
+                --coordinator "$COORD_URL" --tier 100k_sats \
+                --ghost-id "lockfund_$i" \
+                --utxo "${LF_TXIDS[$i]}:${LF_VOUTS[$i]}" \
+                --utxo-value "$SEAT_PRICE" \
+                --utxo-scriptpubkey "${LF_SPKS[$i]}" \
+                --bip86-index "$((200+i))" \
+                > "$DATADIR/lockfund-$i.out" 2>&1
+        else
+            WRAITH --json mix run \
+                --coordinator "$COORD_URL" --tier 100k_sats \
+                --ghost-id "lockfund_$i" \
+                --utxo "${LF_TXIDS[$i]}:${LF_VOUTS[$i]}" \
+                --utxo-value "$SEAT_PRICE" \
+                --utxo-scriptpubkey "${LF_SPKS[$i]}" \
+                --mix-output-address "${LF_OUTS[$i]}" \
+                --bip86-index "$((200+i))" \
+                > "$DATADIR/lockfund-$i.out" 2>&1
+        fi
+    ) &
+    LF_PIDS[$i]=$!
+done
+for i in $(seq 0 $((N-1))); do
+    if ! wait "${LF_PIDS[$i]}"; then
+        cat "$DATADIR/lockfund-$i.out" >&2
+        fail "participant $i did not complete the lane-funding round"
+    fi
+done
+
+LF_TXID=$(jq -r '.WraithMixCompleted.broadcast_txid // .broadcast_txid // .GhostLockFunded.broadcast_txid // empty' \
+    < "$DATADIR/lockfund-0.out")
+[ -n "$LF_TXID" ] || { cat "$DATADIR/lockfund-0.out" >&2; fail "the lane-funding participant returned no txid"; }
+mine 1
+
+# The round paid the lane itself — that is the whole claim.
+$BCLI getrawtransaction "$LF_TXID" 1 \
+    | jq -e --arg a "$LF_LANE_ADDR" '[.vout[] | select(.scriptPubKey.address == $a)] | length >= 1' >/dev/null \
+    || fail "the round tx does not pay the savings lane $LF_LANE_ADDR"
+pass "the round's own output funded the lane (tx $LF_TXID)"
+
+LF_AFTER=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
+    | jq -r '[(.GhostLockLanes.lanes // .lanes)[] | select(.kind == "savings") | .balance_sats] | add // 0')
+[ "$((LF_AFTER - LF_BEFORE))" = "100000" ] \
+    || fail "savings lane moved by $((LF_AFTER - LF_BEFORE)) sats, expected one 100,000-sat denomination (before $LF_BEFORE, after $LF_AFTER)"
+pass "the lane received a full denomination with no direct payment to it"
+
+# ============================================================================
 echo
 echo "================================================================"
 echo "  GHOST WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
@@ -1170,4 +1259,5 @@ echo " 11. air-gapped Savings spend        ok  ($AIR_TXID)"
 echo " 12. quorum co-signed spend          ok  ($Q_TXID)"
 echo " 13. Cash lane spend                 ok  ($CASH_TXID)"
 echo " 14. recover from backup + words     ok  ($R_HIST history entries)"
+echo " 15. fund a lane through a round     ok  ($LF_TXID)"
 echo "================================================================"
