@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the Wraith Wallet GUI — only the bare minimum needed to invoke our own commands from the static frontend.",
+  "description": "Capabilities for the Ghost Wallet GUI — only the bare minimum needed to invoke our own commands from the static frontend.",
   "windows": ["main"],
   "permissions": [
     "core:default"

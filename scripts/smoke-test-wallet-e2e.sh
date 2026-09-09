@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # smoke-test-wallet-e2e.sh — headless end-to-end smoke test for the
-# Wraith Wallet.
+# Ghost Wallet.
 #
 # Drives the all-in-one wallet through its core flows against a real
 # regtest backend, asserting success at each step. The point is to be
@@ -344,6 +344,11 @@ echo "$CREATE_OUT" | grep -q "created at" || fail "wallet create did not report 
 MNEMONIC_WORDS=$(echo "$CREATE_OUT" | awk 'NF==24{print NF; exit}')
 [ "$MNEMONIC_WORDS" = "24" ] || fail "expected a 24-word BIP-39 mnemonic, got '$MNEMONIC_WORDS'"
 pass "wallet 'smoke' created with a 24-word BIP-39 mnemonic"
+# The height this seed came into existence at. Flow 14 hands it back to a
+# recovered wallet so the scanner knows where to start reading; without it a
+# restore begins at the tip and the history is silently empty.
+BIRTH_H=$(height)
+echo "wallet birth height: $BIRTH_H"
 
 # ============================================================================
 # FLOW 2: select (unlock-active)
@@ -1064,9 +1069,92 @@ mine 1
 pass "Cash lane spent with the owner's key alone (tx $CASH_TXID)"
 
 # ============================================================================
+# FLOW 14: recovery — both paths, against a chain
+#   The wallet has spent this whole run building on-chain history. None of the
+#   flows ever asked the only question that matters when a device is lost: can
+#   that money be reached again from the backup alone?
+#
+#   Two independent paths, because they fail differently:
+#     a. the encrypted keystore file — `wallet export` / `wallet restore`
+#     b. the BIP-39 words plus a birth height — `wallet import --birth-height`
+#
+#   (b) is the one that has to rebuild HISTORY, not just find coins. A restored
+#   wallet scans forward from its birth height; without one it starts at the tip
+#   and everything the seed did before the restore is invisible. Balance alone
+#   is not the assertion.
+# ============================================================================
+step "FLOW 14 — recover the wallet from backup (keystore file, and words + birth height)"
+
+# What we must be able to get back to.
+ORIG_BAL=$(WRAITH --json light balance | jq -r '.LightBalance.confirmed_sats // .confirmed_sats // 0')
+ORIG_HIST=$(WRAITH --json light history | jq -r '(.LightHistory.transactions // .transactions // []) | length')
+ORIG_ADDR0="$RECV_ADDR"
+echo "before recovery: balance=$ORIG_BAL history_entries=$ORIG_HIST"
+[ "$ORIG_HIST" -gt 0 ] || fail "the wallet has no history to recover — this flow would prove nothing"
+
+# ---- (a) encrypted keystore backup ----------------------------------------
+BACKUP="$DATADIR/smoke-keystore.bak"
+WRAITH wallet export smoke "$BACKUP" >/dev/null
+[ -s "$BACKUP" ] || fail "wallet export produced no backup file"
+WRAITH wallet restore restored-file "$BACKUP" >/dev/null
+WRAITH wallet select restored-file <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+WRAITH wallet unlock restored-file <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+R_ADDR=$(WRAITH --json light receive --index 0 | jq -r '.LightReceive.address // .address')
+[ "$R_ADDR" = "$ORIG_ADDR0" ] \
+    || fail "the restored keystore derives $R_ADDR at index 0, not $ORIG_ADDR0 — it is a different wallet"
+pass "keystore backup restores the same wallet (index 0 derives $R_ADDR)"
+
+# ---- (b) words + birth height ---------------------------------------------
+# The seed, as the owner would have written it down.
+WORDS=$(WRAITH wallet show-mnemonic smoke <<< 'smoke-pass-1234' 2>/dev/null | awk 'NF==24{print; exit}')
+[ -n "$WORDS" ] || fail "could not read back the mnemonic to recover from"
+
+# Import as a NEW wallet, from words alone, telling it where to start reading.
+printf '%s\nsmoke-pass-1234\n' "$WORDS" \
+    | WRAITH wallet import restored-words --birth-height "$BIRTH_H" >/dev/null 2>&1 \
+    || fail "wallet import from the mnemonic failed"
+WRAITH wallet select restored-words >/dev/null 2>&1 || true
+WRAITH wallet unlock restored-words <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+
+W_ADDR=$(WRAITH --json light receive --index 0 | jq -r '.LightReceive.address // .address')
+[ "$W_ADDR" = "$ORIG_ADDR0" ] \
+    || fail "the words derive $W_ADDR at index 0, not $ORIG_ADDR0"
+
+# The money must be reachable. Scanning is what finds it, so allow the scanner
+# a bounded window rather than asserting on the first read.
+R_BAL=0
+for _ in $(seq 1 40); do
+    R_BAL=$(WRAITH --json light balance | jq -r '.LightBalance.confirmed_sats // .confirmed_sats // 0')
+    [ "$R_BAL" != "0" ] && break
+    sleep 3
+done
+[ "$R_BAL" = "$ORIG_BAL" ] \
+    || fail "recovered balance is $R_BAL, expected $ORIG_BAL — the money is not reachable from the words"
+pass "words + birth height recover the balance ($R_BAL sats)"
+
+# And the history, which is what the birth height exists for.
+# ALL of it, not merely some. A partial rebuild is the failure this is here to
+# catch: a scanner that starts too late finds the coins but loses what they
+# did, and "more than zero" would pass on a wallet that recovered one entry
+# out of thirteen.
+R_HIST=0
+for _ in $(seq 1 60); do
+    R_HIST=$(WRAITH --json light history | jq -r '(.LightHistory.transactions // .transactions // []) | length')
+    [ "$R_HIST" -ge "$ORIG_HIST" ] && break
+    sleep 3
+done
+[ "$R_HIST" -eq "$ORIG_HIST" ] \
+    || fail "the recovered wallet rebuilt $R_HIST of $ORIG_HIST history entries from birth height $BIRTH_H — the coins are found but what they did is lost"
+pass "the whole history rebuilt from birth height $BIRTH_H ($R_HIST of $ORIG_HIST entries)"
+
+# Back to the original wallet so nothing downstream inherits a restored one.
+WRAITH wallet select smoke >/dev/null 2>&1 || true
+WRAITH wallet unlock smoke <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
+
+# ============================================================================
 echo
 echo "================================================================"
-echo "  WRAITH WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
+echo "  GHOST WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
 echo "================================================================"
 echo "  1. BIP-39 wallet create            ok"
 echo "  2. select active wallet            ok"
@@ -1081,4 +1169,5 @@ echo " 10. Ghost Lock escape spend         ok  ($ESC_TXID)"
 echo " 11. air-gapped Savings spend        ok  ($AIR_TXID)"
 echo " 12. quorum co-signed spend          ok  ($Q_TXID)"
 echo " 13. Cash lane spend                 ok  ($CASH_TXID)"
+echo " 14. recover from backup + words     ok  ($R_HIST history entries)"
 echo "================================================================"
