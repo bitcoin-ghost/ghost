@@ -1692,7 +1692,7 @@ mod server {
                 let ks = wallets
                     .get(&active_name)
                     .ok_or_else(|| format!("active wallet '{active_name}' is not unlocked"))?;
-                let (refs, keys) = wraith_wallet_core::silent_payment::input_keys_for(
+                let prepared = wraith_wallet_core::silent_payment::input_keys_for(
                     ks, network, &selected, scan_max,
                 )
                 .map_err(|e| format!("silent payment inputs: {e}"))?;
@@ -1700,8 +1700,7 @@ mod server {
                     recipient_address,
                     network,
                     0,
-                    &refs,
-                    &keys,
+                    &prepared,
                 )
                 .map_err(|e| format!("silent payment: {e}"))?
             };

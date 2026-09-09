@@ -31,7 +31,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Network, ScriptBuf};
 
 use crate::keystore::Keystore;
-use ghost_keys::input_keys::{sender_secret, InputRef};
+use ghost_keys::input_keys::{sender_secret, Outpoint, PaymentInput};
 use ghost_keys::{GhostId, GhostNetwork};
 use secp256k1::SecretKey;
 
@@ -142,9 +142,9 @@ pub fn build(
 /// marked the transaction as a silent payment to every observer; it is now
 /// test-only and cannot be reached from here.
 ///
-/// `inputs` and `input_keys` describe the same inputs — the ones this
-/// transaction will actually spend. They need not be in the same order as each
-/// other or as the transaction, because the derivation sorts by outpoint.
+/// `inputs` are the coins this transaction will actually spend, each carrying
+/// the key that controls it — they cannot drift apart, because they are one
+/// value. Order does not matter; the derivation sorts by outpoint.
 ///
 /// ⚠ The inputs are load-bearing in a way an ordinary output is not: change the
 /// coin selection after calling this and the output no longer matches what a
@@ -154,16 +154,14 @@ pub fn build_from_inputs(
     ghost_id: &str,
     network: Network,
     k: u32,
-    inputs: &[InputRef],
-    input_keys: &[SecretKey],
+    inputs: &[PaymentInput],
 ) -> Result<ScriptBuf, SilentPaymentError> {
     let gn = ghost_network_for(network)
         .ok_or_else(|| SilentPaymentError::BadGhostId(format!("unsupported network {network}")))?;
     let id = GhostId::decode_for_network(ghost_id.trim(), gn)
         .map_err(|e| SilentPaymentError::BadGhostId(e.to_string()))?;
 
-    let ephemeral =
-        sender_secret(inputs, input_keys).map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
+    let ephemeral = sender_secret(inputs).map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
     let (output_pubkey, _ephemeral_pub, _tweak) = id
         .derive_payment_address_v2_with_ephemeral(&ephemeral, k)
         .map_err(|e| SilentPaymentError::Derive(e.to_string()))?;
@@ -190,13 +188,12 @@ pub fn input_keys_for(
     network: Network,
     inputs: &[(bitcoin::Txid, u32, ScriptBuf)],
     scan_max: u32,
-) -> Result<(Vec<InputRef>, Vec<SecretKey>), SilentPaymentError> {
+) -> Result<Vec<PaymentInput>, SilentPaymentError> {
     use bitcoin::key::TapTweak;
     use secp256k1::{Keypair, Secp256k1};
 
     let secp = Secp256k1::new();
-    let mut refs = Vec::with_capacity(inputs.len());
-    let mut keys = Vec::with_capacity(inputs.len());
+    let mut prepared = Vec::with_capacity(inputs.len());
 
     for (txid, vout, spk) in inputs {
         let idx = crate::psbt::find_bip86_index_for_script(keystore, network, spk, scan_max)
@@ -217,16 +214,32 @@ pub fn input_keys_for(
             .to_keypair()
             .secret_key();
 
-        // Internal byte order, which is what `bitcoin::Txid` stores and what a
-        // transaction serialises — not the reversed display form.
-        refs.push(InputRef {
-            txid: txid.to_byte_array(),
-            vout: *vout,
-        });
-        keys.push(tweaked);
+        // The x-only key the output actually carries. Passing it makes the
+        // constructor CHECK that `tweaked` controls this coin rather than
+        // trusting that the tweak was applied — the difference between an
+        // error here and a payment the recipient can never find.
+        let spk_bytes = spk.as_bytes();
+        if spk_bytes.len() != 34 {
+            return Err(SilentPaymentError::Derive(format!(
+                "input {txid}:{vout} is not a taproot output, so its key is not on chain"
+            )));
+        }
+        let mut output_xonly = [0u8; 32];
+        output_xonly.copy_from_slice(&spk_bytes[2..34]);
+
+        prepared.push(
+            PaymentInput::spending_taproot_output(
+                // `bitcoin::Txid` stores internal order; the display form is
+                // the reversed one, and the constructor names which is which.
+                Outpoint::from_internal_bytes(txid.to_byte_array(), *vout),
+                tweaked,
+                &output_xonly,
+            )
+            .map_err(|e| SilentPaymentError::Derive(e.to_string()))?,
+        );
     }
 
-    Ok((refs, keys))
+    Ok(prepared)
 }
 
 #[cfg(test)]

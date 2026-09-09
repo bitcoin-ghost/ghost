@@ -14,8 +14,7 @@
 
 use std::collections::HashSet;
 
-use ghost_keys::input_keys::{receiver_pubkey, InputRef};
-use secp256k1::{Parity, PublicKey, XOnlyPublicKey};
+use ghost_keys::input_keys::{receiver_pubkey, Outpoint, ScannedInput};
 
 use crate::candidate_scan::CandidateOutput;
 use crate::ghostd::{BlockTx, VerboseBlock};
@@ -224,36 +223,24 @@ fn ephemeral_from_inputs(tx: &BlockTx) -> Option<String> {
         return None;
     }
     let mut inputs = Vec::with_capacity(tx.vin.len());
-    let mut pubkeys = Vec::with_capacity(tx.vin.len());
 
     for vin in &tx.vin {
         // A coinbase has no prevout and cannot be a payment.
         let txid = vin.txid.as_ref()?;
         let vout = vin.vout?;
         let prevout = vin.prevout.as_ref()?;
-
         let spk = hex::decode(&prevout.script_pub_key.hex).ok()?;
-        if spk.len() != P2TR_LEN || spk[0] != OP_1 || spk[1] != PUSH32 {
-            return None;
-        }
-        let xonly = XOnlyPublicKey::from_slice(&spk[2..P2TR_LEN]).ok()?;
-        // Even-Y, which is what the sender normalised to: a taproot output
-        // records no parity, so there is nothing else it could be.
-        pubkeys.push(PublicKey::from_x_only_public_key(xonly, Parity::Even));
 
-        // ⚠ The node reports a txid in DISPLAY order (reversed). The derivation
-        // hashes the outpoint as a transaction serialises it, internal order.
-        // Getting this backwards changes the smallest outpoint, changes the
-        // hash, and loses the payment with no error anywhere.
-        let mut raw = hex::decode(txid).ok()?;
-        raw.reverse();
-        inputs.push(InputRef {
-            txid: raw.try_into().ok()?,
-            vout,
-        });
+        // The node reports txids in display order, and the constructor is named
+        // for that — the derivation's internal order is a different call, so the
+        // two cannot be confused silently.
+        let outpoint = Outpoint::from_display_hex(txid, vout).ok()?;
+        // Non-taproot inputs are refused here rather than skipped quietly: a
+        // partial `A_sum` is a wrong point, not a smaller one.
+        inputs.push(ScannedInput::from_taproot_script_pubkey(outpoint, &spk).ok()?);
     }
 
-    let point = receiver_pubkey(&inputs, &pubkeys).ok()?;
+    let point = receiver_pubkey(&inputs).ok()?;
     Some(hex::encode(point.serialize()))
 }
 
@@ -578,40 +565,46 @@ mod tests {
             SecretKey::from_slice(&[7u8; 32]).unwrap(),
             SecretKey::from_slice(&[9u8; 32]).unwrap(),
         ];
-        let refs = [
-            InputRef {
-                txid: [0xab; 32],
-                vout: 1,
-            },
-            InputRef {
-                txid: [0x12; 32],
-                vout: 0,
-            },
-        ];
+        let raw = [([0xabu8; 32], 1u32), ([0x12u8; 32], 0u32)];
+
+        // Each input carries the key that controls it, checked against the
+        // output that key is spending — the pairing cannot drift.
+        let spend: Vec<ghost_keys::input_keys::PaymentInput> = raw
+            .iter()
+            .zip(keys.iter())
+            .map(|((txid, vout), k)| {
+                let xonly = k.public_key(&secp).x_only_public_key().0.serialize();
+                ghost_keys::input_keys::PaymentInput::spending_taproot_output(
+                    Outpoint::from_internal_bytes(*txid, *vout),
+                    *k,
+                    &xonly,
+                )
+                .expect("the key controls the output")
+            })
+            .collect();
 
         let payment = crate::silent_payment::build_from_inputs(
             &ghost_id,
             bitcoin::Network::Regtest,
             0,
-            &refs,
-            &keys,
+            &spend,
         )
         .expect("build");
 
         // Assemble the transaction as the node would report it: each input
         // carries its prevout, and the txids come back in DISPLAY order.
-        let vin: Vec<serde_json::Value> = refs
+        let vin: Vec<serde_json::Value> = raw
             .iter()
             .zip(keys.iter())
-            .map(|(r, k)| {
-                let mut display = r.txid;
+            .map(|((txid, vout), k)| {
+                let mut display = *txid;
                 display.reverse();
                 let (xonly, _) = k.public_key(&secp).x_only_public_key();
                 let mut spk = vec![0x51u8, 0x20];
                 spk.extend_from_slice(&xonly.serialize());
                 serde_json::json!({
                     "txid": hex::encode(display),
-                    "vout": r.vout,
+                    "vout": vout,
                     "prevout": { "value": 1.0, "scriptPubKey": { "hex": hex::encode(spk) } }
                 })
             })

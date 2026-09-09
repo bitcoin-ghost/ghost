@@ -86,21 +86,46 @@ use crate::error::GhostKeyError;
 /// the two hashes can never collide even on identical bytes.
 const INPUT_HASH_TAG: &[u8] = b"ghost-keys/input-hash/v1";
 
-/// One transaction input, as both sides must see it.
+/// A transaction outpoint, in the one byte order the derivation uses.
 ///
-/// `txid` is the internal byte order — the bytes as they appear in the
-/// serialised transaction, NOT the reversed display form. Getting this backwards
-/// changes `outpoint_L` and so changes the secret, which is the kind of mistake
-/// that costs a payment rather than raising an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InputRef {
-    pub txid: [u8; 32],
-    pub vout: u32,
+/// The field is private and there is no way to build one without saying which
+/// order the bytes are in. That is deliberate: a txid reversed is still 32
+/// valid-looking bytes, it changes which outpoint is smallest, and so it
+/// changes the secret — producing a payment the recipient cannot find, with no
+/// error at any point. The only defence is to make the question unavoidable at
+/// the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Outpoint {
+    /// Internal order: the bytes as a transaction serialises them.
+    txid: [u8; 32],
+    vout: u32,
 }
 
-impl InputRef {
-    /// The 36 bytes an outpoint is compared and hashed as: txid ‖ vout, with
-    /// the vout little-endian, exactly as a transaction serialises it.
+impl Outpoint {
+    /// From the bytes as a transaction serialises them — what `bitcoin::Txid`
+    /// stores, and what `Txid::to_byte_array` returns.
+    pub fn from_internal_bytes(txid: [u8; 32], vout: u32) -> Self {
+        Self { txid, vout }
+    }
+
+    /// From the reversed, human-facing hex a node reports in JSON.
+    pub fn from_display_hex(txid_hex: &str, vout: u32) -> Result<Self, GhostKeyError> {
+        let mut bytes = hex::decode(txid_hex.trim())
+            .map_err(|e| GhostKeyError::DerivationError(format!("txid is not hex: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(GhostKeyError::DerivationError(format!(
+                "a txid is 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        bytes.reverse();
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&bytes);
+        Ok(Self { txid, vout })
+    }
+
+    /// The 36 bytes an outpoint is compared and hashed as: txid ‖ vout, the
+    /// vout little-endian, exactly as a transaction serialises it.
     fn to_bytes(self) -> [u8; 36] {
         let mut out = [0u8; 36];
         out[..32].copy_from_slice(&self.txid);
@@ -109,13 +134,101 @@ impl InputRef {
     }
 }
 
-/// `input_hash` over the inputs and their summed public key.
-fn input_hash(inputs: &[InputRef], a_sum: &PublicKey) -> Result<[u8; 32], GhostKeyError> {
-    let smallest = inputs
+/// One input the sender is spending: its outpoint and the key that controls it.
+///
+/// The two are bundled so they cannot be supplied as parallel lists that drift
+/// apart, and the key is private so it can only arrive through
+/// [`PaymentInput::spending_taproot_output`], which checks it.
+#[derive(Debug, Clone)]
+pub struct PaymentInput {
+    outpoint: Outpoint,
+    /// Parity-normalised at construction.
+    key: SecretKey,
+}
+
+impl PaymentInput {
+    /// The input spending a taproot output, checked against that output.
+    ///
+    /// `output_xonly` is the 32-byte key from the scriptPubKey being spent, and
+    /// `key` must be the key that controls it — for a BIP-86 coin that is the
+    /// **tweaked** key, not the internal one.
+    ///
+    /// This is verified rather than trusted. A BIP-86 output is controlled by
+    /// the tweaked key, and it is the tweaked key that appears on chain and so
+    /// the one a receiver sums into `A_sum` — but the untweaked key is the one
+    /// sitting in the keystore, and passing it produces a payment nobody can
+    /// ever find with nothing anywhere reporting a problem. Comparing the key
+    /// against the output it claims to spend turns that into an error before a
+    /// transaction exists.
+    ///
+    /// Parity is normalised here too: a taproot output records only an
+    /// x-coordinate, so a receiver assumes even-Y, and an odd-Y key must be
+    /// negated or the two sides derive different points.
+    pub fn spending_taproot_output(
+        outpoint: Outpoint,
+        key: SecretKey,
+        output_xonly: &[u8; 32],
+    ) -> Result<Self, GhostKeyError> {
+        let secp = Secp256k1::new();
+        let (xonly, parity) = key.public_key(&secp).x_only_public_key();
+        if &xonly.serialize() != output_xonly {
+            return Err(GhostKeyError::DerivationError(format!(
+                "this key does not control the output it claims to spend \
+                 ({}:{}) — a BIP-86 coin is controlled by the TWEAKED key, and an \
+                 untweaked one derives a payment the recipient can never find",
+                hex::encode(outpoint.txid),
+                outpoint.vout
+            )));
+        }
+        let key = match parity {
+            secp256k1::Parity::Even => key,
+            secp256k1::Parity::Odd => key.negate(),
+        };
+        Ok(Self { outpoint, key })
+    }
+}
+
+/// One input as the receiver sees it: an outpoint and the public key the chain
+/// shows for it.
+#[derive(Debug, Clone)]
+pub struct ScannedInput {
+    outpoint: Outpoint,
+    pubkey: PublicKey,
+}
+
+impl ScannedInput {
+    /// From the taproot scriptPubKey the input spends.
+    ///
+    /// Parses the `OP_1 PUSH32 <x-only>` shape and lifts to even-Y, which is
+    /// what the sender normalised to. Anything else is not a usable input and
+    /// says so, rather than contributing a wrong point to `A_sum`.
+    pub fn from_taproot_script_pubkey(
+        outpoint: Outpoint,
+        script_pubkey: &[u8],
+    ) -> Result<Self, GhostKeyError> {
+        if script_pubkey.len() != 34 || script_pubkey[0] != 0x51 || script_pubkey[1] != 0x20 {
+            return Err(GhostKeyError::DerivationError(
+                "not a taproot output: only P2TR inputs publish a usable key".into(),
+            ));
+        }
+        let xonly = secp256k1::XOnlyPublicKey::from_slice(&script_pubkey[2..34])
+            .map_err(|e| GhostKeyError::DerivationError(format!("input key: {e}")))?;
+        Ok(Self {
+            outpoint,
+            pubkey: PublicKey::from_x_only_public_key(xonly, secp256k1::Parity::Even),
+        })
+    }
+}
+
+/// `input_hash` over the outpoints and their summed public key.
+fn input_hash(outpoints: &[Outpoint], a_sum: &PublicKey) -> Result<[u8; 32], GhostKeyError> {
+    let smallest = outpoints
         .iter()
-        .map(|i| i.to_bytes())
+        .map(|o| o.to_bytes())
         .min()
-        .ok_or_else(|| GhostKeyError::DerivationError("a payment needs at least one input".into()))?;
+        .ok_or_else(|| {
+            GhostKeyError::DerivationError("a payment needs at least one input".into())
+        })?;
 
     let mut hasher = Sha256::new();
     hasher.update(INPUT_HASH_TAG);
@@ -132,71 +245,48 @@ fn scalar(bytes: [u8; 32]) -> Result<Scalar, GhostKeyError> {
 
 /// The sender's side: the scalar that replaces the old random ephemeral key.
 ///
-/// `input_keys` are the private keys of the inputs being spent, in any order.
-/// Keys whose public counterpart is odd-Y are negated first — see the parity
-/// note in the module docs.
-pub fn sender_secret(
-    inputs: &[InputRef],
-    input_keys: &[SecretKey],
-) -> Result<SecretKey, GhostKeyError> {
+/// Every input of the transaction must be present. The receiver computes
+/// `A_sum` from all of them, so a sender that omits one — a coin it cannot sign,
+/// say — derives a different point and the payment is lost.
+pub fn sender_secret(inputs: &[PaymentInput]) -> Result<SecretKey, GhostKeyError> {
     let secp = Secp256k1::new();
-    if input_keys.is_empty() {
-        return Err(GhostKeyError::DerivationError(
-            "a payment needs at least one input key".into(),
-        ));
-    }
+    let (first, rest) = inputs.split_first().ok_or_else(|| {
+        GhostKeyError::DerivationError("a payment needs at least one input".into())
+    })?;
 
-    // Normalise to even-Y, because that is all the chain will show a receiver.
-    let normalised: Vec<SecretKey> = input_keys
-        .iter()
-        .map(|k| {
-            let (_, parity) = k.public_key(&secp).x_only_public_key();
-            match parity {
-                secp256k1::Parity::Even => *k,
-                secp256k1::Parity::Odd => k.negate(),
-            }
-        })
-        .collect();
-
-    let mut a_sum = normalised[0];
-    for k in &normalised[1..] {
+    let mut a_sum = first.key;
+    for input in rest {
         a_sum = a_sum
-            .add_tweak(&Scalar::from(*k))
+            .add_tweak(&Scalar::from(input.key))
             .map_err(|e| GhostKeyError::DerivationError(format!("summing input keys: {e}")))?;
     }
 
-    let hash = input_hash(inputs, &a_sum.public_key(&secp))?;
+    let outpoints: Vec<Outpoint> = inputs.iter().map(|i| i.outpoint).collect();
+    let hash = input_hash(&outpoints, &a_sum.public_key(&secp))?;
     a_sum
         .mul_tweak(&scalar(hash)?)
         .map_err(|e| GhostKeyError::DerivationError(format!("applying input hash: {e}")))
 }
 
-/// The receiver's side: the point the sender's scalar corresponds to, computed
-/// from what the chain shows.
-///
-/// `input_pubkeys` are the public keys of the transaction's inputs. For taproot
-/// inputs that is the x-only key lifted to even-Y, which is what the sender
-/// normalised to.
-pub fn receiver_pubkey(
-    inputs: &[InputRef],
-    input_pubkeys: &[PublicKey],
-) -> Result<PublicKey, GhostKeyError> {
+/// The receiver's side: the same point, from what the chain shows.
+pub fn receiver_pubkey(inputs: &[ScannedInput]) -> Result<PublicKey, GhostKeyError> {
     let secp = Secp256k1::new();
-    if input_pubkeys.is_empty() {
+    if inputs.is_empty() {
         return Err(GhostKeyError::DerivationError(
             "a transaction with no eligible inputs cannot carry a payment".into(),
         ));
     }
 
-    let refs: Vec<&PublicKey> = input_pubkeys.iter().collect();
-    let a_sum = if refs.len() == 1 {
-        *refs[0]
+    let keys: Vec<&PublicKey> = inputs.iter().map(|i| &i.pubkey).collect();
+    let a_sum = if keys.len() == 1 {
+        *keys[0]
     } else {
-        PublicKey::combine_keys(&refs)
+        PublicKey::combine_keys(&keys)
             .map_err(|e| GhostKeyError::DerivationError(format!("summing input pubkeys: {e}")))?
     };
 
-    let hash = input_hash(inputs, &a_sum)?;
+    let outpoints: Vec<Outpoint> = inputs.iter().map(|i| i.outpoint).collect();
+    let hash = input_hash(&outpoints, &a_sum)?;
     a_sum
         .mul_tweak(&secp, &scalar(hash)?)
         .map_err(|e| GhostKeyError::DerivationError(format!("applying input hash: {e}")))
@@ -210,11 +300,26 @@ mod tests {
         SecretKey::from_slice(&[byte; 32]).expect("valid key")
     }
 
-    fn input(n: u8, vout: u32) -> InputRef {
-        InputRef {
-            txid: [n; 32],
-            vout,
-        }
+    /// The x-only bytes a taproot output would carry for this key.
+    fn output_xonly(k: &SecretKey) -> [u8; 32] {
+        let secp = Secp256k1::new();
+        k.public_key(&secp).x_only_public_key().0.serialize()
+    }
+
+    fn spending(n: u8, vout: u32, k: &SecretKey) -> PaymentInput {
+        PaymentInput::spending_taproot_output(
+            Outpoint::from_internal_bytes([n; 32], vout),
+            *k,
+            &output_xonly(k),
+        )
+        .expect("key controls the output")
+    }
+
+    fn scanned(n: u8, vout: u32, k: &SecretKey) -> ScannedInput {
+        let mut spk = vec![0x51u8, 0x20];
+        spk.extend_from_slice(&output_xonly(k));
+        ScannedInput::from_taproot_script_pubkey(Outpoint::from_internal_bytes([n; 32], vout), &spk)
+            .expect("a taproot script")
     }
 
     /// The whole point: what the sender computes privately and what the
@@ -223,28 +328,28 @@ mod tests {
     fn both_sides_agree() {
         let secp = Secp256k1::new();
         let keys = [key(1), key(2), key(3)];
-        let inputs = [input(9, 1), input(4, 0), input(7, 3)];
-
-        let e = sender_secret(&inputs, &keys).expect("sender");
-        // What a receiver reads off the chain: even-Y public keys.
-        let pubs: Vec<PublicKey> = keys
+        let spend: Vec<PaymentInput> = keys
             .iter()
-            .map(|k| {
-                let (xonly, _) = k.public_key(&secp).x_only_public_key();
-                PublicKey::from_x_only_public_key(xonly, secp256k1::Parity::Even)
-            })
+            .enumerate()
+            .map(|(i, k)| spending(9 - i as u8, i as u32, k))
             .collect();
-        let big_e = receiver_pubkey(&inputs, &pubs).expect("receiver");
+        let seen: Vec<ScannedInput> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| scanned(9 - i as u8, i as u32, k))
+            .collect();
 
-        assert_eq!(e.public_key(&secp), big_e, "sender scalar must match receiver point");
+        assert_eq!(
+            sender_secret(&spend).unwrap().public_key(&secp),
+            receiver_pubkey(&seen).unwrap(),
+        );
     }
 
-    /// An odd-Y input key is the case that silently breaks detection if the
-    /// sender does not normalise. One key is enough to prove the handling.
+    /// TRAP 1, now impossible to get wrong: an odd-Y key is normalised inside
+    /// the constructor, so no caller can forget.
     #[test]
     fn an_odd_y_input_key_still_agrees() {
         let secp = Secp256k1::new();
-        // Search for a key whose public counterpart is odd-Y.
         let odd = (1u8..=255)
             .map(key)
             .find(|k| {
@@ -255,28 +360,83 @@ mod tests {
             })
             .expect("some key in this range is odd-Y");
 
-        let inputs = [input(3, 0)];
-        let e = sender_secret(&inputs, &[odd]).expect("sender");
-        let (xonly, _) = odd.public_key(&secp).x_only_public_key();
-        let big_e = receiver_pubkey(
-            &inputs,
-            &[PublicKey::from_x_only_public_key(xonly, secp256k1::Parity::Even)],
-        )
-        .expect("receiver");
+        assert_eq!(
+            sender_secret(&[spending(3, 0, &odd)])
+                .unwrap()
+                .public_key(&secp),
+            receiver_pubkey(&[scanned(3, 0, &odd)]).unwrap(),
+        );
+    }
 
-        assert_eq!(e.public_key(&secp), big_e);
+    /// TRAP 2, now impossible to get wrong: the two byte orders are different
+    /// constructors, so the call site has to say which it has.
+    #[test]
+    fn the_two_byte_orders_are_different_outpoints() {
+        let display = "00".repeat(31) + "ff";
+        let from_display = Outpoint::from_display_hex(&display, 0).expect("valid hex");
+
+        let mut internal = [0u8; 32];
+        internal[31] = 0xff;
+        let mistaken = Outpoint::from_internal_bytes(internal, 0);
+
+        assert_ne!(
+            from_display, mistaken,
+            "a display txid read as internal bytes must not silently produce the same outpoint"
+        );
+        // And the correct reading is the reverse.
+        let mut reversed = [0u8; 32];
+        reversed[0] = 0xff;
+        assert_eq!(from_display, Outpoint::from_internal_bytes(reversed, 0));
+    }
+
+    #[test]
+    fn a_txid_of_the_wrong_length_is_refused() {
+        assert!(Outpoint::from_display_hex("00ff", 0).is_err());
+        assert!(Outpoint::from_display_hex("not hex", 0).is_err());
+    }
+
+    /// TRAP 3, now caught rather than silent: an untweaked BIP-86 key does not
+    /// control the output it claims to spend, and saying so costs an error
+    /// instead of a payment nobody can find.
+    #[test]
+    fn a_key_that_does_not_control_the_output_is_refused() {
+        let internal = key(11);
+        let actual_output = key(12); // stands in for the tweaked key
+        let err = PaymentInput::spending_taproot_output(
+            Outpoint::from_internal_bytes([1; 32], 0),
+            internal,
+            &output_xonly(&actual_output),
+        )
+        .expect_err("the mismatch must be caught");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not control the output"),
+            "the error must name the problem, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_non_taproot_input_is_refused_rather_than_summed() {
+        // P2WPKH: OP_0 PUSH20 <hash>. Its key lives in the witness, not here.
+        let mut spk = vec![0x00u8, 0x14];
+        spk.extend_from_slice(&[0xab; 20]);
+        assert!(ScannedInput::from_taproot_script_pubkey(
+            Outpoint::from_internal_bytes([1; 32], 0),
+            &spk
+        )
+        .is_err());
     }
 
     /// Input order must not change the secret — a wallet does not control the
     /// order its coin selection hands back.
     #[test]
     fn input_order_does_not_change_the_secret() {
-        let keys = [key(5), key(6)];
-        let a = [input(2, 1), input(8, 0)];
-        let b = [input(8, 0), input(2, 1)];
+        let (k5, k6) = (key(5), key(6));
+        let a = [spending(2, 1, &k5), spending(8, 0, &k6)];
+        let b = [spending(8, 0, &k6), spending(2, 1, &k5)];
         assert_eq!(
-            sender_secret(&a, &keys).unwrap().secret_bytes(),
-            sender_secret(&b, &keys).unwrap().secret_bytes()
+            sender_secret(&a).unwrap().secret_bytes(),
+            sender_secret(&b).unwrap().secret_bytes()
         );
     }
 
@@ -284,17 +444,17 @@ mod tests {
     /// wallet to one Ghost ID would land on the same output key.
     #[test]
     fn different_inputs_give_a_different_secret() {
-        let keys = [key(5)];
+        let k = key(5);
         assert_ne!(
-            sender_secret(&[input(1, 0)], &keys).unwrap().secret_bytes(),
-            sender_secret(&[input(1, 1)], &keys).unwrap().secret_bytes(),
+            sender_secret(&[spending(1, 0, &k)]).unwrap().secret_bytes(),
+            sender_secret(&[spending(1, 1, &k)]).unwrap().secret_bytes(),
             "the vout alone must change the secret"
         );
     }
 
     #[test]
     fn no_inputs_is_an_error_not_a_panic() {
-        assert!(sender_secret(&[], &[key(1)]).is_err());
-        assert!(receiver_pubkey(&[], &[]).is_err());
+        assert!(sender_secret(&[]).is_err());
+        assert!(receiver_pubkey(&[]).is_err());
     }
 }
