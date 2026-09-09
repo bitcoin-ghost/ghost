@@ -15182,6 +15182,74 @@ mod tests {
         assert_eq!(mesh_capability_shares(false, false, false, false, true), 1);
     }
 
+    /// The weighting exists TWICE — here for the dashboard, and in
+    /// `NodeCapabilities::total_shares()` for the payout path — so pin them
+    /// together across every combination.
+    ///
+    /// ⛔ This matters most for a change nobody has made yet. #736 moves the +4
+    /// off GhostPay when that service is removed, and a reweight that lands in
+    /// one of these and not the other does not fail loudly: nodes get paid on
+    /// one number while the dashboard shows another, and the disagreement
+    /// surfaces as an operator asking why their earnings do not match their
+    /// screen. This test makes that a red build instead.
+    #[test]
+    fn the_dashboard_and_payout_weightings_agree() {
+        use ghost_common::types::NodeCapabilities;
+
+        for bits in 0u8..32 {
+            let archive = bits & 1 != 0;
+            let ghost_pay = bits & 2 != 0;
+            let public_mining = bits & 4 != 0;
+            let reaper = bits & 8 != 0;
+            let elder = bits & 16 != 0;
+
+            let caps = NodeCapabilities {
+                archive_mode: archive,
+                ghost_pay,
+                public_mining,
+                reaper,
+                elder_status: elder,
+                coordinator: false,
+            };
+            assert_eq!(
+                mesh_capability_shares(archive, ghost_pay, public_mining, reaper, elder) as i32,
+                caps.total_shares(),
+                "the dashboard and the payout path disagree for \
+                 archive={archive} ghost_pay={ghost_pay} mining={public_mining} \
+                 reaper={reaper} elder={elder}"
+            );
+        }
+    }
+
+    /// The coordinator flag earns the mixing service fee, not 5-4-3-2-1 shares,
+    /// and is excluded from the total on purpose — it is self-reported in a
+    /// health ping, so paying for it would pay for an assertion.
+    ///
+    /// Pinned because #736 intends to change exactly this. When the +4 moves to
+    /// a VERIFIED coordinator capability, this test should fail and be updated
+    /// deliberately — rather than the exclusion being dropped by accident and
+    /// nobody noticing that an unverified boolean started paying.
+    #[test]
+    fn the_coordinator_flag_earns_no_shares_yet() {
+        use ghost_common::types::NodeCapabilities;
+
+        let mut caps = NodeCapabilities {
+            archive_mode: false,
+            ghost_pay: false,
+            public_mining: false,
+            reaper: false,
+            elder_status: false,
+            coordinator: false,
+        };
+        assert_eq!(caps.total_shares(), 0);
+        caps.coordinator = true;
+        assert_eq!(
+            caps.total_shares(),
+            0,
+            "the coordinator flag is self-reported; it must not pay until it is verified (#736)"
+        );
+    }
+
     #[test]
     fn test_mesh_node_name_uses_host() {
         // Host portion of an advertised address.
