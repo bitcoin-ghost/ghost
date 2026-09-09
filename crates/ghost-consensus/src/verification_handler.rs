@@ -497,6 +497,21 @@ impl VerificationResultHandler {
         let short_challenger = &challenger_hex[..8];
         let short_target = &target_hex[..8];
 
+        // A capability this binary does not know. The message parsed — which is
+        // the whole point of the tolerance — so the peer is not silenced; this
+        // one verdict simply has nothing to say to us. Recording it would put a
+        // capability named "unknown" into the convergence ledger, which is a
+        // stored format other nodes reconcile on.
+        if matches!(msg.capability, CapabilityType::Unknown) {
+            debug!(
+                challenger = %short_challenger,
+                target = %short_target,
+                "ignoring a verdict for a capability this binary does not know — \
+                 the peer is newer, not wrong"
+            );
+            return Ok(());
+        }
+
         // H-5: Validate challenge_data size to prevent memory exhaustion attacks
         if msg.challenge_data.len() > MAX_CHALLENGE_DATA_SIZE {
             warn!(
@@ -918,6 +933,14 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store ghostpay challenge result");
                 }
+            }
+            CapabilityType::Unknown => {
+                // Unreachable: filtered at the top of this function, before any
+                // storage. Spelled out rather than caught by a wildcard so that
+                // adding a capability is a COMPILE error here — a new variant
+                // falling silently into a catch-all is how a capability gets
+                // recorded in the convergence ledger with no handling.
+                debug_assert!(false, "Unknown capability reached the storage match");
             }
             CapabilityType::Address => {
                 // H-7. Deliberately no legacy table and no re-derivation.
