@@ -226,7 +226,10 @@ impl Upstream {
         }
 
         // Wrap status sender and start upstream task
-        let wrapped_status_sender = StatusSender::Upstream(status_sender);
+        let wrapped_status_sender = StatusSender::Upstream {
+            tx: status_sender,
+            shutdown: cancellation_token.clone(),
+        };
 
         self.run_upstream_task(
             cancellation_token,

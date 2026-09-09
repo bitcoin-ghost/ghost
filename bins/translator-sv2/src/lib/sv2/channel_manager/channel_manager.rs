@@ -181,7 +181,10 @@ impl ChannelManager {
         status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
     ) {
-        let status_sender = StatusSender::ChannelManager(status_sender);
+        let status_sender = StatusSender::ChannelManager {
+            tx: status_sender,
+            shutdown: cancellation_token.clone(),
+        };
 
         task_manager.spawn(async move {
             // we just spawned a new task that's relevant to fallback coordination
