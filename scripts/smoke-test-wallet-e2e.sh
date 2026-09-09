@@ -1241,6 +1241,64 @@ LF_AFTER=$(WRAITH --json lock lanes "${LOCK_ARGS[@]}" \
 pass "the lane received a full denomination with no direct payment to it"
 
 # ============================================================================
+# FLOW 16: silent payment, end to end — send AND find
+#   The sender was built with a unit test over its own output; the receiving
+#   half — the block scanner recognising a coin paid to a key nobody published
+#   — had no on-chain test at all. The two had never been run against each
+#   other on a chain.
+#
+#   Paying our own Ghost ID is a fair test precisely because detection is
+#   key-derived: the wallet finds this coin by re-deriving it from the sender's
+#   ephemeral key, not by recognising an address it handed out. Nothing about
+#   the sender being us makes the scan easier.
+# ============================================================================
+step "FLOW 16 — silent payment: send to a Ghost ID and detect it"
+
+GID=$(WRAITH --json wallet ghost-id | jq -r '.WalletGhostId.ghost_id // .ghost_id // empty')
+[ -n "$GID" ] || fail "the wallet has no Ghost ID to be paid at"
+echo "ghost id: $GID"
+
+SP_BEFORE=$(WRAITH --json light detected | jq -r '(.LightDetected.detections // .detections // []) | length')
+
+# --scan-max: by this point the wallet's coins sit at the high indices flows 15
+# and 16 derived, well past the default 32.
+SP_TXID=$(WRAITH --json light pay --scan-max 520 "$GID" 40000 \
+    | jq -r '.LightSendBroadcast.txid // .L1Send.txid // .txid // empty')
+[ -n "$SP_TXID" ] || fail "the silent payment did not broadcast"
+mine 2
+
+# The announcement has to be on chain: an OP_RETURN carrying the ephemeral key,
+# beside a taproot output nobody can attribute without it.
+SP_TX=$($BCLI getrawtransaction "$SP_TXID" 1)
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "nulldata")] | length == 1' >/dev/null \
+    || fail "the payment carries no OP_RETURN announcement — nothing tells the recipient it exists"
+echo "$SP_TX" | jq -e '[.vout[] | select(.scriptPubKey.type == "witness_v1_taproot")] | length >= 1' >/dev/null \
+    || fail "the payment has no taproot output to be found"
+pass "the payment is on chain with its announcement (tx $SP_TXID)"
+
+# And the scanner must find it. This is the half that had no test.
+SP_AFTER=0
+for _ in $(seq 1 40); do
+    SP_AFTER=$(WRAITH --json light detected | jq -r '(.LightDetected.detections // .detections // []) | length')
+    [ "$SP_AFTER" -gt "$SP_BEFORE" ] && break
+    sleep 3
+done
+[ "$SP_AFTER" -gt "$SP_BEFORE" ] \
+    || fail "the scanner did not detect the silent payment — it is on chain and invisible to its recipient"
+
+# The detection must carry `k`. Without it the coin is found but unspendable,
+# because k is what re-derives the key that opens the output.
+SP_ENTRY=$(WRAITH --json light detected \
+    | jq --arg t "$SP_TXID" '[(.LightDetected.detections // .detections)[] | select(.txid == $t)][0]')
+[ -n "$SP_ENTRY" ] && [ "$SP_ENTRY" != "null" ] \
+    || fail "detections grew but none of them is $SP_TXID"
+echo "$SP_ENTRY" | jq -e '.amount_sats == 40000' >/dev/null \
+    || fail "detected the payment at the wrong amount: $(echo "$SP_ENTRY" | jq -c '.amount_sats')"
+echo "$SP_ENTRY" | jq -e 'has("k")' >/dev/null \
+    || fail "the detection carries no k — the coin is found but cannot be spent"
+pass "the scanner found it and recorded k ($(echo "$SP_ENTRY" | jq -c '{vout,amount_sats,k}'))"
+
+# ============================================================================
 echo
 echo "================================================================"
 echo "  GHOST WALLET END-TO-END SMOKE TEST — ALL FLOWS GREEN ($NETWORK)"
@@ -1260,4 +1318,5 @@ echo " 12. quorum co-signed spend          ok  ($Q_TXID)"
 echo " 13. Cash lane spend                 ok  ($CASH_TXID)"
 echo " 14. recover from backup + words     ok  ($R_HIST history entries)"
 echo " 15. fund a lane through a round     ok  ($LF_TXID)"
+echo " 16. silent payment send + detect    ok  ($SP_TXID)"
 echo "================================================================"
