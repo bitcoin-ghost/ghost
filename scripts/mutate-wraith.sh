@@ -133,6 +133,10 @@ mutate "every tier gets the same ordering" sortition.rs \
 '    h.update(tier_id.as_bytes());' \
 '    h.update(b"");' sortition
 
+mutate "one node may lead several tiers while others idle" sortition.rs \
+'                .position(|id| !leading.contains(id))' \
+'                .position(|_| true)' sortition
+
 mutate "eligibility ignores maturity" eligibility.rs \
 '    if known < policy.maturity_secs {' \
 '    if false {' eligibility

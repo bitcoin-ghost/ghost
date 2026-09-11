@@ -1,28 +1,37 @@
 //! Deterministic, publicly-verifiable coordinator election (sortition).
 //!
-//! This is increment 1 of the decentralised-coordinator design
-//! (`tasks/plan_decentralised_coordinators.md`): the pure selection core, with
-//! NO coupling to consensus, networking, or funds. Given three agreed inputs —
-//! an unpredictable randomness `beacon`, the `epoch` number, and the
-//! consensus-frozen `roster` of qualified node ids — it elects `n` coordinators
-//! for that epoch.
+//! The pure selection core of the decentralised-coordinator design
+//! (`tasks/plan_decentralised_coordinators.md`), with NO coupling to consensus,
+//! networking, or funds. Given three agreed inputs — an unpredictable `beacon`,
+//! the `epoch` number, and the `roster` of eligible node ids — it names a
+//! leader for every denomination, and the order a wallet falls back through.
 //!
 //! ## Properties (the whole point)
 //!
-//! - **No self-nomination.** A node's rank is `H(beacon ‖ epoch ‖ node_id)`. The
-//!   node controls neither the beacon nor (cheaply) its own id, so it cannot
-//!   grind itself into a seat. The network doesn't *vote for* candidates; it
-//!   agrees on the beacon + roster, and the winners fall out deterministically.
+//! - **No self-nomination.** A node's rank for a tier is
+//!   `H(beacon ‖ epoch ‖ tier ‖ node_id)`. The node controls neither the beacon
+//!   nor (cheaply) its own id, so it cannot grind itself into a lead. The
+//!   network doesn't *vote for* candidates; it agrees on the beacon + roster,
+//!   and the leaders fall out deterministically.
 //! - **Determinism.** Every node (and every wallet) computes the byte-identical
 //!   result from the same inputs — so they agree on who coordinates without a
 //!   second round of communication.
-//! - **Public verifiability.** Anyone can recompute the election (`verify_election`)
-//!   and the session→coordinator mapping (`shard_for`); there is no trusted
-//!   tallier.
-//! - **Fairness.** Ranks are uniform over the roster, so each qualified node is
-//!   elected with probability ≈ `n / roster_len` per epoch.
+//! - **Public verifiability.** Anyone can recompute [`tier_leaders`]; there is
+//!   no trusted tallier.
+//! - **Evenness.** Every tier has a *different* leader whenever the roster is at
+//!   least as large as the tier list, and every node is equally likely to lead
+//!   every tier. Opting in means being called on — see [`tier_leaders`].
 //! - **Rotation.** A fresh `beacon`/`epoch` reshuffles the draw, so coordination
 //!   rotates across the network over time.
+//!
+//! ## Why there is no seat count
+//!
+//! This used to elect `n` coordinators into seats and send each tier to
+//! `shard(tier, epoch) mod n`. With `n` sized from session demand — zero on
+//! mainnet — that was one seat, so a single node carried every denomination for
+//! a whole day while every other opted-in node sat idle. And `n` was one more
+//! number nodes had to agree on: two nodes with identical rosters but different
+//! demand snapshots sent the same tier to different coordinators.
 //!
 //! The *security* of the whole scheme rests on the beacon being **ungrindable**
 //! (increment 2) — that is deliberately abstracted out here: this module treats
@@ -36,21 +45,19 @@ use std::collections::HashSet;
 /// dependency. Callers pass the qualified-node roster as these ids.
 pub type CoordinatorNodeId = [u8; 32];
 
-/// Domain separators so a sortition hash can never collide with a shard hash or
-/// any other hash in the system. Versioned for forward changes.
+/// Domain separator so a sortition hash can never collide with any other hash
+/// in the system. Versioned for forward changes.
 const DOMAIN_RANK: &[u8] = b"ghost/wraith/coordinator-sortition/rank/v1";
-const DOMAIN_SHARD: &[u8] = b"ghost/wraith/coordinator-sortition/shard/v1";
 
-/// One elected coordinator for an epoch.
+/// One place in a tier's ranking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectedCoordinator {
-    /// The elected node's id.
+    /// The node's id.
     pub node_id: CoordinatorNodeId,
-    /// The sortition hash that won it the seat (lower = higher priority). Carried
-    /// so verifiers and observers can see *why* this node was chosen.
+    /// The sortition hash that placed it (lower = higher priority). Carried so
+    /// verifiers and observers can see *why* this node is where it is.
     pub rank: [u8; 32],
-    /// Seat index `0..n`, in ascending-rank order. Sessions are sharded across
-    /// seats via [`shard_for`], so the seat is this coordinator's shard.
+    /// Position `0..n` in the tier's ranking, in ascending-rank order.
     pub seat: u32,
 }
 
@@ -132,69 +139,83 @@ pub fn coordinator_order_for_tier(
         .collect()
 }
 
-/// Elect `n` coordinators from `roster` for `epoch` under `beacon`.
+/// Who coordinates one denomination for an epoch.
 ///
-/// Ranks every (deduplicated) roster member, sorts ascending by `(rank, node_id)`
-/// — node_id only as a tie-break, astronomically unlikely with 256-bit ranks —
-/// and returns the lowest `n`, each tagged with its seat `0..n`. Returns fewer
-/// than `n` (all of them) when the roster is smaller, and an empty vec for an
-/// empty roster or `n == 0`. A duplicated id in `roster` is counted once (a node
-/// cannot hold two seats).
-pub fn elect_coordinators(
+/// `order[0]` leads it. The rest is where its wallets go if the leader does not
+/// answer, walked in this order by every wallet, so a dead leader's cohort moves
+/// as one body to the same next node instead of scattering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierLeadership {
+    /// The tier's stable id (`LiteTier::id`).
+    pub tier_id: String,
+    /// Leader first, then the failover path. Holds every roster node.
+    pub order: Vec<CoordinatorNodeId>,
+}
+
+impl TierLeadership {
+    /// The node that leads this tier. `None` only for an empty roster.
+    pub fn leader(&self) -> Option<&CoordinatorNodeId> {
+        self.order.first()
+    }
+}
+
+/// Every tier's leader and failover order for `epoch`, one entry per tier in
+/// the order `tiers` gives them.
+///
+/// # Different leaders, not merely independent ones
+///
+/// Each tier has its own ranking ([`coordinator_order_for_tier`]). Taking each
+/// ranking's top node independently would let one node lead several tiers while
+/// others lead none — with eight nodes and four tiers, all four leaders differ
+/// in only ~41% of epochs. So tiers are filled in turn, each by the
+/// best-ranked node **not already leading one**.
+///
+/// That changes nothing about fairness. Ranks are independent and uniform and
+/// the rule never looks at who a node is, so every node is equally likely to
+/// lead every tier; what it removes is the doubling-up. With `n ≥ tiers`, every
+/// epoch has `tiers` different leaders; with fewer nodes than tiers every node
+/// leads, and some lead more than one.
+///
+/// # The failover order
+///
+/// The leader, then the rest of the tier's own ranking. The next node is often
+/// another tier's leader; its load grows, which is the right trade against
+/// sending wallets to a node nobody else would pick.
+///
+/// Deduplicates the roster; an empty roster yields empty orders.
+pub fn tier_leaders(
     beacon: &[u8; 32],
     epoch: u64,
+    tiers: &[&str],
     roster: &[CoordinatorNodeId],
-    n: usize,
-) -> Vec<ElectedCoordinator> {
-    if n == 0 || roster.is_empty() {
-        return Vec::new();
-    }
-    let mut seen: HashSet<CoordinatorNodeId> = HashSet::with_capacity(roster.len());
-    let mut ranked: Vec<([u8; 32], CoordinatorNodeId)> = roster
+) -> Vec<TierLeadership> {
+    let mut leading: HashSet<CoordinatorNodeId> = HashSet::with_capacity(tiers.len());
+    tiers
         .iter()
-        .filter(|id| seen.insert(**id))
-        .map(|id| (rank_of(beacon, epoch, id), *id))
-        .collect();
-    // Total order: by rank, then node_id. Deterministic on every node.
-    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    ranked
-        .into_iter()
-        .take(n)
-        .enumerate()
-        .map(|(seat, (rank, node_id))| ElectedCoordinator {
-            node_id,
-            rank,
-            seat: seat as u32,
+        .map(|tier_id| {
+            let ranked: Vec<CoordinatorNodeId> =
+                coordinator_order_for_tier(beacon, epoch, tier_id, roster)
+                    .into_iter()
+                    .map(|c| c.node_id)
+                    .collect();
+            // Once every node leads something, doubling up is unavoidable; the
+            // tier then goes to its own top-ranked node.
+            let pick = ranked
+                .iter()
+                .position(|id| !leading.contains(id))
+                .unwrap_or(0);
+            let mut order = ranked;
+            if !order.is_empty() {
+                let leader = order.remove(pick);
+                leading.insert(leader);
+                order.insert(0, leader);
+            }
+            TierLeadership {
+                tier_id: (*tier_id).to_string(),
+                order,
+            }
         })
         .collect()
-}
-
-/// Deterministically map a session to one of `seats` elected coordinators, so a
-/// wallet and every node independently agree which coordinator owns the session:
-/// `SHA256(DOMAIN_SHARD ‖ session_id)[..8] mod seats`. Returns 0 when `seats <= 1`.
-pub fn shard_for(session_id: &[u8; 32], seats: usize) -> u32 {
-    if seats <= 1 {
-        return 0;
-    }
-    let mut h = Sha256::new();
-    h.update(DOMAIN_SHARD);
-    h.update(session_id);
-    let d = h.finalize();
-    let v = u64::from_le_bytes(d[..8].try_into().expect("32-byte digest has 8 bytes"));
-    (v % seats as u64) as u32
-}
-
-/// Recompute the election and check a claimed result matches exactly. The audit
-/// path: anyone with the same agreed inputs confirms a published coordinator set
-/// was elected honestly.
-pub fn verify_election(
-    beacon: &[u8; 32],
-    epoch: u64,
-    roster: &[CoordinatorNodeId],
-    n: usize,
-    claimed: &[ElectedCoordinator],
-) -> bool {
-    elect_coordinators(beacon, epoch, roster, n) == claimed
 }
 
 #[cfg(test)]
@@ -217,175 +238,157 @@ mod tests {
         [seed; 32]
     }
 
-    #[test]
-    fn determinism_same_inputs_same_output() {
-        let r = roster(20);
-        let a = elect_coordinators(&beacon(1), 42, &r, 4);
-        let b = elect_coordinators(&beacon(1), 42, &r, 4);
-        assert_eq!(a, b, "election must be byte-identical across calls");
-        assert_eq!(a.len(), 4);
-        // seats are 0..n in order
-        for (i, e) in a.iter().enumerate() {
-            assert_eq!(e.seat, i as u32);
-        }
-        // strictly ascending ranks
-        assert!(a.windows(2).all(|w| w[0].rank <= w[1].rank));
+    const TIERS: [&str; 4] = ["100k_sats", "1m_sats", "10m_sats", "100m_sats"];
+
+    fn leaders(b: &[u8; 32], epoch: u64, r: &[CoordinatorNodeId]) -> Vec<CoordinatorNodeId> {
+        tier_leaders(b, epoch, &TIERS, r)
+            .iter()
+            .map(|t| *t.leader().expect("non-empty roster"))
+            .collect()
     }
 
     #[test]
-    fn no_self_nomination_node_cannot_force_a_win() {
-        // A fixed node either wins or not depending purely on the beacon, which
-        // it does not control. Across many beacons its win-rate ≈ n/roster, and
-        // it is NOT always elected — so it cannot nominate itself in.
+    fn determinism_same_inputs_same_output() {
         let r = roster(20);
-        let target = r[7];
-        let mut wins = 0;
-        let trials = 4000u64;
-        for e in 0..trials {
-            // vary the beacon each trial (stand-in for the per-epoch beacon)
-            let elected = elect_coordinators(&beacon((e % 251) as u8 + 1), e, &r, 4);
-            if elected.iter().any(|c| c.node_id == target) {
-                wins += 1;
-            }
+        let a = tier_leaders(&beacon(1), 42, &TIERS, &r);
+        let b = tier_leaders(&beacon(1), 42, &TIERS, &r);
+        assert_eq!(a, b, "the draw must be byte-identical across calls");
+        assert_eq!(a.len(), TIERS.len());
+        for (t, want) in a.iter().zip(TIERS) {
+            assert_eq!(t.tier_id, want, "one entry per tier, in the order given");
         }
-        // Expected ≈ trials * 4/20 = 20%. Assert it's clearly bounded away from
-        // both 0% (could never win) and 100% (always wins / self-nominated).
-        let pct = (wins as f64) / (trials as f64);
-        assert!(
-            pct > 0.10 && pct < 0.32,
-            "win-rate {pct:.3} should sit near 0.20 — never guaranteed, never impossible"
+    }
+
+    #[test]
+    fn two_nodes_with_the_roster_in_different_orders_agree() {
+        let r = roster(8);
+        let mut shuffled = r.clone();
+        shuffled.reverse();
+        assert_eq!(
+            tier_leaders(&beacon(3), 9, &TIERS, &r),
+            tier_leaders(&beacon(3), 9, &TIERS, &shuffled)
         );
     }
 
     #[test]
-    fn fairness_uniform_over_epochs() {
-        // Over many epochs every roster member is elected ≈ equally.
-        let r = roster(20);
-        let n = 4usize;
-        let trials = 8000u64;
-        let mut counts = vec![0u64; r.len()];
+    fn every_tier_has_a_different_leader_when_there_are_enough_nodes() {
+        // Independent top picks would double up in ~59% of epochs at 8 nodes.
+        for e in 0..2000u64 {
+            let l = leaders(&beacon((e % 251) as u8), e, &roster(8));
+            let distinct: HashSet<_> = l.iter().collect();
+            assert_eq!(distinct.len(), TIERS.len(), "epoch {e}: {l:?}");
+        }
+    }
+
+    /// The property the operator asked for: unbiased, and even. Every node
+    /// leads every tier about equally often, so every opted-in node is called on
+    /// and has the same chance at the tier that pays most.
+    #[test]
+    fn every_node_leads_every_tier_equally_often() {
+        let r = roster(8);
+        let trials = 16_000u64;
+        let mut counts = vec![[0u64; 4]; r.len()];
         for e in 0..trials {
-            for c in elect_coordinators(&beacon(9), e, &r, n) {
-                let idx = r.iter().position(|x| *x == c.node_id).unwrap();
-                counts[idx] += 1;
+            for (t, leader) in leaders(&beacon(9), e, &r).iter().enumerate() {
+                let idx = r.iter().position(|x| x == leader).unwrap();
+                counts[idx][t] += 1;
             }
         }
-        let expected = (trials as f64) * (n as f64) / (r.len() as f64); // = 1600
-        for (i, &c) in counts.iter().enumerate() {
-            let dev = (c as f64 - expected).abs() / expected;
-            assert!(
-                dev < 0.15,
-                "node {i} elected {c} times, expected ~{expected:.0} (dev {dev:.3})"
-            );
+        let expected = trials as f64 / r.len() as f64; // 2000 per (node, tier)
+        for (i, per_tier) in counts.iter().enumerate() {
+            for (t, &c) in per_tier.iter().enumerate() {
+                let dev = (c as f64 - expected).abs() / expected;
+                assert!(
+                    dev < 0.10,
+                    "node {i} led {} {c} times, expected ~{expected:.0} (dev {dev:.3})",
+                    TIERS[t]
+                );
+            }
         }
     }
 
     #[test]
-    fn n_exceeds_roster_elects_all_no_panic() {
-        let r = roster(3);
-        let e = elect_coordinators(&beacon(2), 1, &r, 10);
-        assert_eq!(e.len(), 3, "cannot elect more than the roster");
-        let ids: HashSet<_> = e.iter().map(|c| c.node_id).collect();
-        assert_eq!(ids.len(), 3, "all distinct");
-    }
-
-    #[test]
-    fn empty_roster_and_zero_n() {
-        assert!(elect_coordinators(&beacon(1), 1, &[], 4).is_empty());
-        assert!(elect_coordinators(&beacon(1), 1, &roster(5), 0).is_empty());
-    }
-
-    #[test]
-    fn duplicate_ids_counted_once() {
-        let mut r = roster(5);
-        r.push(r[2]); // duplicate
-        r.push(r[2]);
-        let e = elect_coordinators(&beacon(3), 7, &r, 5);
-        let ids: HashSet<_> = e.iter().map(|c| c.node_id).collect();
-        assert_eq!(ids.len(), e.len(), "no node holds two seats");
-        assert_eq!(e.len(), 5, "5 distinct after dedup");
+    fn no_self_nomination_node_cannot_force_a_win() {
+        // A fixed node leads or not depending purely on the beacon, which it
+        // does not control: never guaranteed, never impossible.
+        let r = roster(20);
+        let target = r[7];
+        let trials = 4000u64;
+        let wins = (0..trials)
+            .filter(|&e| leaders(&beacon((e % 251) as u8 + 1), e, &r).contains(&target))
+            .count();
+        // Expected ≈ 4/20 = 20%.
+        let pct = wins as f64 / trials as f64;
+        assert!(
+            pct > 0.10 && pct < 0.32,
+            "lead-rate {pct:.3} should sit near 0.20"
+        );
     }
 
     #[test]
     fn rotation_changes_the_draw() {
         let r = roster(20);
-        let a: Vec<_> = elect_coordinators(&beacon(5), 100, &r, 4)
-            .into_iter()
-            .map(|c| c.node_id)
-            .collect();
-        let b: Vec<_> = elect_coordinators(&beacon(5), 101, &r, 4)
-            .into_iter()
-            .map(|c| c.node_id)
-            .collect();
-        assert_ne!(a, b, "a fresh epoch should reshuffle the coordinator set");
+        assert_ne!(
+            leaders(&beacon(5), 100, &r),
+            leaders(&beacon(5), 101, &r),
+            "a fresh epoch should reshuffle the leaders"
+        );
     }
 
     #[test]
-    fn shard_for_is_deterministic_and_bounded() {
-        let s = [0x5a; 32];
-        assert_eq!(shard_for(&s, 4), shard_for(&s, 4), "deterministic");
-        assert!(shard_for(&s, 4) < 4, "in range");
-        assert_eq!(shard_for(&s, 1), 0);
-        assert_eq!(shard_for(&s, 0), 0);
+    fn fewer_nodes_than_tiers_still_covers_every_tier() {
+        let r = roster(2);
+        let l = leaders(&beacon(2), 1, &r);
+        assert_eq!(l.len(), TIERS.len(), "no tier is left without a leader");
+        let distinct: HashSet<_> = l.iter().collect();
+        assert_eq!(distinct.len(), 2, "both nodes are called on");
     }
 
     #[test]
-    fn shard_for_distributes_evenly() {
-        let seats = 5usize;
-        let trials = 5000u32;
-        let mut buckets = vec![0u32; seats];
-        for i in 0..trials {
-            let mut sid = [0u8; 32];
-            sid[..4].copy_from_slice(&i.to_le_bytes());
-            buckets[shard_for(&sid, seats) as usize] += 1;
-        }
-        let expected = (trials as f64) / (seats as f64);
-        for (k, &c) in buckets.iter().enumerate() {
-            let dev = (c as f64 - expected).abs() / expected;
-            assert!(
-                dev < 0.12,
-                "seat {k} got {c}, expected ~{expected:.0} (dev {dev:.3})"
+    fn the_order_is_the_leader_then_the_tiers_own_ranking() {
+        let r = roster(9);
+        let b = beacon(4);
+        for t in tier_leaders(&b, 55, &TIERS, &r) {
+            let ranking: Vec<_> = coordinator_order_for_tier(&b, 55, &t.tier_id, &r)
+                .into_iter()
+                .map(|c| c.node_id)
+                .collect();
+            let leader = *t.leader().unwrap();
+            let rest: Vec<_> = ranking.iter().copied().filter(|id| *id != leader).collect();
+            assert_eq!(
+                t.order[1..],
+                rest[..],
+                "{}: failover keeps rank order",
+                t.tier_id
+            );
+            assert_eq!(
+                t.order.len(),
+                r.len(),
+                "every node is somewhere in the path"
             );
         }
     }
 
     #[test]
-    fn verify_election_accepts_valid_rejects_tampered() {
-        let r = roster(12);
-        let (b, e, n) = (beacon(4), 55u64, 3usize);
-        let valid = elect_coordinators(&b, e, &r, n);
-        assert!(
-            verify_election(&b, e, &r, n, &valid),
-            "honest result verifies"
-        );
-
-        // tamper: swap in a non-elected node
-        let mut t1 = valid.clone();
-        t1[0].node_id = r[11];
-        assert!(
-            !verify_election(&b, e, &r, n, &t1),
-            "substituted node rejected"
-        );
-
-        // tamper: reorder seats
-        let mut t2 = valid.clone();
-        t2.swap(0, 1);
-        assert!(
-            !verify_election(&b, e, &r, n, &t2),
-            "reordered seats rejected"
-        );
-
-        // tamper: forged rank
-        let mut t3 = valid.clone();
-        t3[1].rank = [0u8; 32];
-        assert!(!verify_election(&b, e, &r, n, &t3), "forged rank rejected");
-
-        // wrong beacon → different election → claimed (old) no longer verifies
-        assert!(
-            !verify_election(&beacon(99), e, &r, n, &valid),
-            "beacon-bound"
-        );
+    fn empty_roster_leads_nothing() {
+        for t in tier_leaders(&beacon(1), 1, &TIERS, &[]) {
+            assert!(t.order.is_empty());
+            assert!(t.leader().is_none());
+        }
     }
+
+    #[test]
+    fn duplicate_ids_counted_once() {
+        let mut r = roster(5);
+        r.push(r[2]);
+        r.push(r[2]);
+        for t in tier_leaders(&beacon(3), 7, &TIERS, &r) {
+            let ids: HashSet<_> = t.order.iter().collect();
+            assert_eq!(ids.len(), t.order.len(), "no node appears twice");
+            assert_eq!(t.order.len(), 5);
+        }
+    }
+
     #[test]
     fn tiers_of_the_same_length_still_get_different_orderings() {
         // Every other tier fixture here has a distinct name length, so the

@@ -1509,7 +1509,7 @@ pub struct VerificationState {
     get_self_check: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Coordinator-election snapshot callback (pre-serialized JSON to avoid a
     /// reverse-dependency on the `wraith-protocol`/`ghost-pool` election types).
-    /// Returns `{enabled, epoch, seats, my_seat, elected}` when the feature is
+    /// Returns `{enabled, epoch, tiers, coordinators, my_tiers, my_endpoint, …}` when the feature is
     /// on, or `{enabled:false}` when off / not wired. Read-only.
     get_coordinator_status: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Mesh-wide deduplicated active miner count callback. Returns the size

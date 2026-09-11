@@ -20,7 +20,7 @@
 //| FILE: beacon.rs                                                                                                     |
 //|======================================================================================================================|
 
-//! The randomness `elect_coordinators` consumes — and why it cannot be a block hash.
+//! The randomness the coordinator draw consumes — and why it cannot be a block hash.
 //!
 //! `sortition::rank_of` is `H(domain ‖ beacon ‖ epoch ‖ node_id)`. Whoever
 //! controls the beacon controls the draw, so the beacon is the entire security
@@ -369,20 +369,26 @@ mod tests {
 
     #[test]
     fn the_beacon_actually_moves_the_election() {
-        // End to end: this exists to feed `elect_coordinators`, and a different
+        // End to end: this exists to feed the coordinator draw, and a different
         // beacon must produce a different draw or none of the above matters.
-        use crate::sortition::{elect_coordinators, CoordinatorNodeId};
+        use crate::epoch::EpochCoordinators;
+        use crate::sortition::CoordinatorNodeId;
         let roster: Vec<CoordinatorNodeId> = (1..=20u8).map(|i| [i; 32]).collect();
 
         let a = round_of(5).finalise(&[9u8; 32], 1_001, 1_000, 5).unwrap();
         let b = round_of(5).finalise(&[8u8; 32], 1_001, 1_000, 5).unwrap();
 
-        let ea = elect_coordinators(&a, 7, &roster, 4);
-        let eb = elect_coordinators(&b, 7, &roster, 4);
+        let leaders = |beacon: &[u8; 32]| -> Vec<CoordinatorNodeId> {
+            EpochCoordinators::elect(7, beacon, &roster)
+                .tiers
+                .iter()
+                .filter_map(|t| t.leader().copied())
+                .collect()
+        };
         assert_ne!(
-            ea.iter().map(|c| c.node_id).collect::<Vec<_>>(),
-            eb.iter().map(|c| c.node_id).collect::<Vec<_>>(),
-            "a different beacon must draw a different set"
+            leaders(&a),
+            leaders(&b),
+            "a different beacon must draw different leaders"
         );
     }
 }

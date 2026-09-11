@@ -108,16 +108,17 @@ pub mod sortition;
 pub mod spend_log_file;
 pub mod standing_order;
 pub use epoch::{
-    canonical_roster, derive_beacon, epoch_for_height, shard_key_for_tier_epoch,
-    snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
+    canonical_roster, derive_beacon, epoch_for_height, snapshot_height_for_epoch,
+    EpochCoordinators, EPOCH_BLOCKS,
 };
 pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,
     DEFAULT_REMIX_COUNT, MAX_REMIX_COUNT,
 };
-pub use service::{CoordinatorView, EndpointMap};
+pub use service::{CoordinatorView, EndpointMap, ServingCoordinator};
 pub use sortition::{
-    elect_coordinators, rank_of, shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,
+    coordinator_order_for_tier, rank_of, tier_leaders, CoordinatorNodeId, ElectedCoordinator,
+    TierLeadership,
 };
 
 /// Session type determines fee structure

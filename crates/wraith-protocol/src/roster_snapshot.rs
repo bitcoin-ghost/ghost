@@ -263,7 +263,7 @@ mod tests {
         // Why any of this matters: the two rosters produce different
         // coordinators from the same beacon, so the two nodes disagree about
         // who owns a session.
-        use crate::sortition::elect_coordinators;
+        use crate::epoch::EpochCoordinators;
         let beacon = [7u8; 32];
         let ours = roster(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let theirs = roster(&[1, 2, 3, 4, 5, 6, 7, 9]);
@@ -272,11 +272,15 @@ mod tests {
             Agreement::Diverged { .. }
         ));
 
-        let a = elect_coordinators(&beacon, 3, &ours, 4);
-        let b = elect_coordinators(&beacon, 3, &theirs, 4);
-        assert_ne!(
-            a.iter().map(|c| c.node_id).collect::<Vec<_>>(),
-            b.iter().map(|c| c.node_id).collect::<Vec<_>>()
-        );
+        // One node's difference does not move every epoch's leaders, but it
+        // moves some — and a single epoch of disagreement is a split.
+        let leaders = |r: &[CoordinatorNodeId], epoch: u64| -> Vec<CoordinatorNodeId> {
+            EpochCoordinators::elect(epoch, &beacon, r)
+                .tiers
+                .iter()
+                .filter_map(|t| t.leader().copied())
+                .collect()
+        };
+        assert!((0..50u64).any(|e| leaders(&ours, e) != leaders(&theirs, e)));
     }
 }
