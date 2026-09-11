@@ -102,6 +102,7 @@ COLLECT='
   printf "en_sritrans=%s\n"      "$(systemctl is-enabled sri-translator 2>/dev/null | head -1)"
   printf "en_bitcoind=%s\n"      "$(systemctl is-enabled bitcoind 2>/dev/null | head -1)"
   printf "en_poolgate=%s\n"      "$(systemctl is-enabled ghost-pool-gate 2>/dev/null | head -1)"
+  printf "en_mining_fw=%s\n"     "$(systemctl is-enabled ghost-mining-firewall.path 2>/dev/null | head -1)"
   # #758: the farm tier was decided ON for every public mining node (#410, 2026-07-27) and reached
   # exactly ONE of eight. It was visible here only as `vardiff` drift, because vm8 returned two
   # min_individual_miner_hashrate values where others returned one — which reads as a config
@@ -110,6 +111,14 @@ COLLECT='
   printf "farm_listen=%s\n"      "$($SUDO ss -ltn 2>/dev/null | grep -c ":4444")"
   printf "farm_ufw=%s\n"         "$($SUDO ufw status 2>/dev/null | grep -c "4444")"
   printf "mining_mode=%s\n"      "$(grep -oP "^\s*mining_mode\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)"
+  # The Wraith coordinator port. `reconcile-mining-firewall.sh` opens 9100 when
+  # coordinator_role_enabled is true, and a .path unit re-runs it whenever pool.toml changes.
+  # Measured 2026-09-11: all eight opted in, and 9100 was open on TWO. Five nodes ran a copy of
+  # the reconcile script older than its 9100 block and two had no reconcile unit at all, so the
+  # opt-in fired, reconciled Stratum, and silently left the coordinator unreachable.
+  printf "coord_role=%s\n"       "$(grep -cE "^[[:space:]]*coordinator_role_enabled[[:space:]]*=[[:space:]]*true([[:space:]]|$)" /etc/ghost/pool.toml 2>/dev/null)"
+  printf "coord_ufw=%s\n"        "$($SUDO ufw status 2>/dev/null | grep -cE "^9100(/tcp)?[[:space:]]")"
+  printf "coord_listen=%s\n"     "$($SUDO ss -ltn 2>/dev/null | grep -c ":9100 ")"
   # #759: config is never reconciled against what the repo ships, so dead keys survive for months
   # and required ones are absent while the compiled default silently covers for them. Both are
   # "correct by accident" — a value nobody chose. List the names, not just a count, so the report
@@ -144,6 +153,7 @@ COLLECT='
   printf "ops_auto_update=%s\n"   "$($SUDO sha256sum /opt/ghost/bin/ghost-auto-update.sh 2>/dev/null | cut -c1-16)"
   printf "ops_pool_sig=%s\n"      "$($SUDO sha256sum /opt/ghost/bin/update-pool-signature.sh 2>/dev/null | cut -c1-16)"
   printf "ops_wait_sync=%s\n"     "$($SUDO sha256sum /opt/ghost/bin/wait-for-ghostd-sync.sh 2>/dev/null | cut -c1-16)"
+  printf "ops_mining_fw=%s\n"     "$($SUDO sha256sum /opt/ghost/bin/reconcile-mining-firewall.sh 2>/dev/null | cut -c1-16)"
   # #761: the dead_keys grep above can only ever find the three names written into it, so a clean
   # report from it proves nothing about any OTHER unknown key. --check-config is the generic
   # oracle: it round-trips the file through NodeConfig and diffs written-vs-understood, so the
@@ -309,7 +319,9 @@ for n in "${REACHED[@]}"; do
         *)                              gp_units="en_ghostpool:ghost-pool en_sripool:sri-pool"
                                         echo "  WARN $n no ghost-pool-gate — ghost-pool must be enabled directly here" ;;
     esac
-    for spec in "en_ghostd:ghostd" $gp_units "en_sritrans:sri-translator"; do
+    # ghost-mining-firewall.path is what makes a port follow its opt-in. Without it, flipping
+    # mining_mode or coordinator_role_enabled changes nothing at the firewall.
+    for spec in "en_ghostd:ghostd" $gp_units "en_sritrans:sri-translator" "en_mining_fw:ghost-mining-firewall.path"; do
         IFS=: read -r fld unit <<<"$spec"
         e="${VALUES[$n|$fld]:-}"
         case "$e" in
@@ -333,6 +345,17 @@ for n in "${REACHED[@]}"; do
     if [ "${fw:-0}" -gt 0 ] 2>/dev/null && [ "${fl:-0}" -eq 0 ] 2>/dev/null; then
         echo "  FAIL $n ufw allows 4444 but NOTHING listens there — an audit by firewall reads this as reachable"; rc=1
     fi
+    # The Wraith coordinator: opt-in, firewall and listener must agree. Opted in with 9100 closed
+    # is the state measured on six of eight nodes on 2026-09-11 — the node is drawn as a tier
+    # leader, the election sends wallets to it, and none of them can connect.
+    cr="${VALUES[$n|coord_role]:-0}"; cw="${VALUES[$n|coord_ufw]:-0}"; cl="${VALUES[$n|coord_listen]:-0}"
+    if [ "${cr:-0}" -gt 0 ] 2>/dev/null; then
+        [ "${cw:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n coordinator opted in but ufw does not allow 9100 — wallets sent here cannot connect"; rc=1; }
+        [ "${cl:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n coordinator opted in but NOTHING listens on :9100"; rc=1; }
+    elif [ "${cw:-0}" -gt 0 ] 2>/dev/null; then
+        echo "  FAIL $n ufw allows 9100 but the coordinator role is off — an open port nothing should answer on"; rc=1
+    fi
+
     # mining_mode decides whether payouts go through BFT. Relying on MiningMode::default() means a
     # change to that default silently reconfigures the node.
     [ -n "$mm" ] || { echo "  FAIL $n mining_mode is not set in pool.toml — running on MiningMode::default() (#758)"; rc=1; }
@@ -388,7 +411,7 @@ for n in "${REACHED[@]}"; do
     # Only files that HAVE a repo source are compared. `update-pool-signature.sh` and
     # `wait-for-ghostd-sync.sh` are node-local, so they are still gathered above for cross-node
     # drift, which is all that can honestly be said about them.
-    for ops in "ops_restart_watch:scripts/ghost-restart-watch.sh" "ops_auto_update:scripts/ghost-auto-update.sh"; do
+    for ops in "ops_restart_watch:scripts/ghost-restart-watch.sh" "ops_auto_update:scripts/ghost-auto-update.sh" "ops_mining_fw:scripts/reconcile-mining-firewall.sh"; do
         field="${ops%%:*}"; src="$REPO_ROOT/${ops#*:}"
         [ -r "$src" ] || { echo "  WARN $n cannot read $src to compare $field"; continue; }
         want="$(sha256sum "$src" 2>/dev/null | cut -c1-16)"
