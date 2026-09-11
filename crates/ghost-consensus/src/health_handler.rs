@@ -472,6 +472,9 @@ pub struct HealthPingHandler {
     /// For consensus-critical uptime verification, nodes must query distributed uptime
     /// from peers via the verification system (see ghost-verification crate).
     first_seen_times: RwLock<HashMap<NodeId, Instant>>,
+    /// Peers whose in-memory `first_seen` has been restored from the database this
+    /// process. One read per peer per restart; see `PeerManager::backdate_first_seen`.
+    age_restored: RwLock<std::collections::HashSet<NodeId>>,
     /// L-7/L-9 SECURITY: Dynamic PoW difficulty adjuster
     ///
     /// L-9: This difficulty adjustment is NODE-LOCAL for DoS protection only.
@@ -523,6 +526,7 @@ impl HealthPingHandler {
             ban_manager,
             last_registration: RwLock::new(HashMap::new()),
             first_seen_times: RwLock::new(HashMap::new()),
+            age_restored: RwLock::new(std::collections::HashSet::new()),
             difficulty_adjuster: DynamicDifficultyAdjuster::new(),
         }
     }
@@ -697,6 +701,39 @@ impl HealthPingHandler {
     /// - One extra ping from a soon-to-be-banned node doesn't affect consensus
     ///
     /// The ban check is still performed for defense-in-depth.
+    /// Restore a peer's real first sighting from the database, once per process.
+    ///
+    /// The in-memory peer table starts empty at every restart and the database is
+    /// the only place the first sighting survives (its upsert never overwrites
+    /// `first_seen`). Without this, a restarted node judged every peer a day-old
+    /// newcomer: on v1.11.39 its Wraith roster held itself alone for 24 hours.
+    fn restore_peer_age(&self, db: &Database, node_id: &NodeId, node_id_hex: &str) {
+        if self.age_restored.read().contains(node_id) {
+            return;
+        }
+        match db.get_peer(node_id_hex) {
+            Ok(Some(rec)) if rec.first_seen > 0 => {
+                if self
+                    .peers
+                    .backdate_first_seen(node_id, rec.first_seen as u64)
+                {
+                    debug!(
+                        node_id = %&node_id_hex[..8],
+                        first_seen = rec.first_seen,
+                        "Restored peer first sighting from the database"
+                    );
+                }
+            }
+            Ok(_) => {}
+            // Try again on the next ping rather than marking it done.
+            Err(e) => {
+                warn!(error = %e, node_id = %&node_id_hex[..8], "Could not read peer age from the database");
+                return;
+            }
+        }
+        self.age_restored.write().insert(*node_id);
+    }
+
     async fn handle_ping(&self, envelope: &MessageEnvelope) -> GhostResult<()> {
         let node_id_hex = hex::encode(envelope.sender);
         let short_id = node_id_hex[..8].to_string();
@@ -895,6 +932,7 @@ impl HealthPingHandler {
 
         // Persist to database if available
         if let Some(ref db) = self.db {
+            self.restore_peer_age(db, &envelope.sender, &node_id_hex);
             let now = chrono::Utc::now().timestamp();
             let capabilities_json = serde_json::to_string(&ping.capabilities).unwrap_or_default();
 
@@ -1341,5 +1379,132 @@ mod tests {
             address_to_persist(Some("203.0.113.7:8555"), "198.51.100.9:8555"),
             Some("203.0.113.7:8555")
         );
+    }
+
+    /// v1.11.39 on its first canary: every peer re-entered the in-memory table at
+    /// restart as brand new, so the 24h coordinator maturity rule held a restarted
+    /// node's roster to itself for a day. The database had the real first sighting
+    /// all along and nothing read it back.
+    #[test]
+    fn a_restart_restores_each_peers_first_sighting_from_the_database() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        let peers = Arc::new(PeerManager::new([0u8; 32], 100));
+        let handler =
+            HealthPingHandler::new(peers.clone(), Some(db.clone()), Arc::new(BanManager::new()));
+
+        let id = [5u8; 32];
+        let hex_id = hex::encode(id);
+        let sixty_days_ago = chrono::Utc::now().timestamp() - 60 * 86_400;
+        db.upsert_peer(&PeerRecord {
+            peer_id: hex_id.clone(),
+            address: "10.0.0.5".into(),
+            port: 8555,
+            node_id: Some(hex_id.clone()),
+            first_seen: sixty_days_ago,
+            last_seen: sixty_days_ago,
+            last_success: None,
+            last_failure: None,
+            connection_count: 1,
+            failure_count: 0,
+            is_banned: false,
+            ban_until: None,
+            capabilities: None,
+            protocol_version: Some(1),
+        })
+        .expect("seed");
+
+        // What a restart does: the peer comes back through Peer::new.
+        peers.upsert_peer(crate::peer::Peer::new(id, "10.0.0.5:8555".into()));
+        assert!(
+            peers.get_peer(&id).unwrap().first_seen > sixty_days_ago as u64,
+            "precondition"
+        );
+
+        handler.restore_peer_age(&db, &id, &hex_id);
+        assert_eq!(
+            peers.get_peer(&id).unwrap().first_seen,
+            sixty_days_ago as u64
+        );
+
+        // Once per process: a second call does not read again or change anything.
+        assert!(handler.age_restored.read().contains(&id));
+        handler.restore_peer_age(&db, &id, &hex_id);
+        assert_eq!(
+            peers.get_peer(&id).unwrap().first_seen,
+            sixty_days_ago as u64
+        );
+    }
+
+    /// The same repair through the real entry point: a health ping. Pins that the
+    /// ping path CALLS the restore, not just that the restore works when called.
+    #[tokio::test]
+    async fn a_health_ping_after_a_restart_restores_the_peers_age() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        let peers = Arc::new(PeerManager::new([0u8; 32], 100));
+        let config = HealthHandlerConfig {
+            // The ping carries no proof of work; that is not what is under test.
+            reject_invalid_pow_peers: false,
+            ..Default::default()
+        };
+        let handler = HealthPingHandler::with_config(
+            peers.clone(),
+            Some(db.clone()),
+            config,
+            Arc::new(BanManager::new()),
+        );
+
+        let id = [8u8; 32];
+        let hex_id = hex::encode(id);
+        let long_ago = chrono::Utc::now().timestamp() - 90 * 86_400;
+        db.upsert_peer(&PeerRecord {
+            peer_id: hex_id.clone(),
+            address: "10.0.0.8".into(),
+            port: 8555,
+            node_id: Some(hex_id.clone()),
+            first_seen: long_ago,
+            last_seen: long_ago,
+            last_success: None,
+            last_failure: None,
+            connection_count: 1,
+            failure_count: 0,
+            is_banned: false,
+            ban_until: None,
+            capabilities: None,
+            protocol_version: Some(1),
+        })
+        .expect("seed");
+        peers.upsert_peer(crate::peer::Peer::new(id, "10.0.0.8:8555".into()));
+
+        let ping = serde_json::json!({
+            "node_id": id,
+            "public_address": "10.0.0.8:8555",
+            "block_height": 966_500u64,
+            "round_id": 1u64,
+            "capabilities": ghost_common::types::NodeCapabilities::default(),
+            "miner_count": 0u32,
+            // Milliseconds, as `validate_timestamp` reads it.
+            "timestamp": chrono::Utc::now().timestamp_millis() as u64,
+        });
+        let payload = serde_json::to_vec(&serde_json::json!({ "ping": ping })).expect("payload");
+        let envelope = MessageEnvelope::new(MessageType::HealthPing, id, payload, 1, [0u8; 64]);
+        handler
+            .handle_message(Arc::new(envelope))
+            .await
+            .expect("ping handled");
+
+        assert_eq!(peers.get_peer(&id).unwrap().first_seen, long_ago as u64);
+    }
+
+    #[test]
+    fn a_peer_the_database_has_never_seen_keeps_its_first_sighting() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        let peers = Arc::new(PeerManager::new([0u8; 32], 100));
+        let handler =
+            HealthPingHandler::new(peers.clone(), Some(db.clone()), Arc::new(BanManager::new()));
+        let id = [6u8; 32];
+        peers.upsert_peer(crate::peer::Peer::new(id, "10.0.0.6:8555".into()));
+        let before = peers.get_peer(&id).unwrap().first_seen;
+        handler.restore_peer_age(&db, &id, &hex::encode(id));
+        assert_eq!(peers.get_peer(&id).unwrap().first_seen, before);
     }
 }
