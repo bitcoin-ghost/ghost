@@ -338,6 +338,30 @@ impl PeerManager {
             .collect()
     }
 
+    /// Move a peer's `first_seen` back to `first_seen_secs`, if that is earlier.
+    /// Returns whether it moved.
+    ///
+    /// # Why this exists
+    ///
+    /// This table is rebuilt from nothing at startup: every peer re-enters through
+    /// [`Peer::new`] with `first_seen = now`, and the database — which keeps the real
+    /// first sighting across restarts — was never read back into it. So for a day
+    /// after every restart each peer read as brand new, and anything judging age from
+    /// here was wrong. The Wraith coordinator roster requires 24h of maturity, so on
+    /// v1.11.39 a restarted node's roster was itself alone until the day passed.
+    ///
+    /// Only ever earlier: a later value would make a known peer look newer than it
+    /// is, which is the defect being repaired.
+    pub fn backdate_first_seen(&self, node_id: &NodeId, first_seen_secs: u64) -> bool {
+        match self.peers.write().get_mut(node_id) {
+            Some(peer) if first_seen_secs > 0 && first_seen_secs < peer.first_seen => {
+                peer.first_seen = first_seen_secs;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Update peer last seen
     pub fn update_last_seen(&self, node_id: &NodeId) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
@@ -1433,6 +1457,35 @@ mod tests {
         assert!(
             !peer.is_stale(300),
             "Peer not seen for 120s should NOT be stale with threshold 300s"
+        );
+    }
+
+    #[test]
+    fn first_seen_is_backdated_only_ever_earlier() {
+        let mgr = PeerManager::new([0u8; 32], 100);
+        let id = [7u8; 32];
+        mgr.upsert_peer(Peer::new(id, "10.0.0.7:8555".to_string()));
+        let now = mgr.get_peer(&id).unwrap().first_seen;
+
+        assert!(
+            mgr.backdate_first_seen(&id, now - 86_400 * 60),
+            "sixty days back is restored"
+        );
+        assert_eq!(mgr.get_peer(&id).unwrap().first_seen, now - 86_400 * 60);
+
+        assert!(
+            !mgr.backdate_first_seen(&id, now),
+            "a later value never replaces an earlier one"
+        );
+        assert_eq!(mgr.get_peer(&id).unwrap().first_seen, now - 86_400 * 60);
+
+        assert!(
+            !mgr.backdate_first_seen(&id, 0),
+            "zero is no information, not the epoch"
+        );
+        assert!(
+            !mgr.backdate_first_seen(&[9u8; 32], 1),
+            "an unknown peer is not created"
         );
     }
 }
