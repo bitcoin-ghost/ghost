@@ -7873,15 +7873,10 @@ async fn main() -> Result<()> {
         config.coordinator.advertised_endpoint.clone(),
         Arc::clone(&mesh),
         Arc::clone(&rpc),
-        {
-            // The same verified-capability provider the health handler uses, so
-            // the election judges a node by what it PROVED under challenge
-            // rather than by what it claims in its health ping. A claimed
-            // archive flag costs an attacker nothing; a proved one costs
-            // storage.
-            let qp = Arc::clone(&qualification_provider_for_health);
-            Arc::new(move |node_id: &[u8; 32]| qp.get_qualified(node_id))
-        },
+        // No verified-capability provider. It read THIS node's own challenge
+        // ledger, which no two nodes share, so the roster could not converge
+        // (`wraith_protocol::eligibility`, "Why qualification and archive are
+        // not here").
     );
     {
         let coord_for_api = coordinator_election.clone();
@@ -10761,16 +10756,17 @@ async fn main() -> Result<()> {
                         warn!(round_id = round_id, error = %e, "Failed to persist round at start");
                     }
 
-                    // Refresh the coordinator-election view if the epoch has
-                    // changed (cheap no-op within an epoch; a no-op entirely
+                    // Refresh the coordinator-election view: re-read the roster,
+                    // rebuild only if it or the epoch changed (a no-op entirely
                     // when the feature is off). Read-only — activates nothing.
                     if let Some(ref coord) = coord_for_events {
                         coord.refresh_for_height(height).await;
                         // Start/stop the in-process coordinator to match the
                         // freshly-recomputed election (no-op when role activation
-                        // is off or the seat is unchanged).
+                        // is off or the seat is unchanged). A seat lost mid-epoch
+                        // is served until the epoch turns — see `should_serve`.
                         if let Some(ref sup) = supervisor_for_events {
-                            sup.reconcile(coord.am_i_coordinator()).await;
+                            sup.reconcile(coord.should_serve()).await;
                         }
                     }
 

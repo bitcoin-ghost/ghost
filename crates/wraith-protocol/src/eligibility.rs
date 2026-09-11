@@ -33,17 +33,44 @@
 //!
 //! # Declared, not observed
 //!
-//! Every input here is something the node itself declared and gossiped, or a
-//! qualification verdict the network reached together:
+//! Every input here is something the node itself declared and gossiped:
 //!
 //! - opted in to coordinate
 //! - advertises an endpoint a wallet can dial
-//! - passes qualification — 95% uptime over seven days, ten challenges
-//! - runs in archive mode
 //! - has been known long enough to be mature
+//! - has not been absent for days
 //!
 //! None of it depends on whether *this* node currently holds a socket to that
 //! peer.
+//!
+//! # Why qualification and archive are not here
+//!
+//! Both used to be. Both were described as "a qualification verdict the network
+//! reached together", and neither was: the caller filled them from
+//! `QualifiedCapabilityProvider`, which reads **this node's own** verification
+//! ledger — the challenges it issued and the verdicts it holds. Challenge
+//! rotation samples a few peers per round, so no two nodes ever hold the same
+//! evidence, and the roster could not converge by construction.
+//!
+//! The night all eight mainnet nodes opted in (2026-09-10, epoch 6711) the
+//! rosters read 6/7/5/5/2/2/4/5 and the fleet elected two different
+//! coordinators for one epoch. Most of that was the pool freezing whatever
+//! roster it saw first (fixed alongside this, in `ghost-pool`). But a fix for
+//! the freeze alone would still leave an input that disagrees for ever, and
+//! one such input is enough to split a draw that is otherwise deterministic.
+//!
+//! Qualification was not load-bearing for safety. A coordinator can deny
+//! service but cannot take coins — the round is atomic and blind-signed
+//! whichever node runs it. Misbehaviour is answered by the outpoint ban list,
+//! unreachability by walking to the next coordinator, and identity by the
+//! coordinator challenge. What is given up is a Sybil cost: an identity now
+//! needs its proof-of-work, a day of maturity and a dialable endpoint, not a
+//! verified archive. That is weaker, and it is stated here rather than implied
+//! by a field that could not deliver it.
+//!
+//! ⛔ **Do not add a verdict back unless every node reads the same one.** A
+//! BFT-finalised or chain-anchored verdict would qualify; one assembled from a
+//! node's own challenge history never will.
 //!
 //! # Liveness is coarse, on purpose
 //!
@@ -65,20 +92,18 @@
 //!
 //! [`EligibilityPolicy::maturity_secs`] requires an identity to have been known
 //! *before* the beacon it is ranked under existed, which makes that grind
-//! useless. It does not stop an attacker registering many identities in advance;
-//! qualification is what costs them there.
+//! useless. It does not stop an attacker registering many identities in advance.
 
 use crate::sortition::CoordinatorNodeId;
 
-/// What is known about a candidate coordinator. All declared or network-agreed.
+/// What is known about a candidate coordinator. All of it declared by the node
+/// and gossiped, so every node holding the same gossip computes the same roster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeFacts {
     /// Identity.
     pub node_id: CoordinatorNodeId,
     /// Declared the coordinator capability.
     pub opted_in: bool,
-    /// Declared archive mode.
-    pub archive: bool,
     /// Advertised endpoint. `None` or empty means a wallet cannot dial it.
     pub endpoint: Option<String>,
     /// When this identity was first seen, unix seconds.
@@ -86,21 +111,11 @@ pub struct NodeFacts {
     /// When it was last heard from, unix seconds. Used only against the
     /// **coarse** pruning window.
     pub last_seen_secs: u64,
-    /// Passes `ghost-verification::qualification`.
-    pub qualified: bool,
 }
 
 /// Eligibility rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EligibilityPolicy {
-    /// Require archive mode.
-    ///
-    /// Raises a Sybil farm from lightweight VMs to real storage. Worth having
-    /// and not a barrier: archive capability can be proxied, because remote
-    /// attestation cannot tell *"I store it"* from *"I can fetch it quickly"*.
-    pub require_archive: bool,
-    /// Require passing qualification.
-    pub require_qualified: bool,
     /// How long an identity must have been known before it may be elected.
     pub maturity_secs: u64,
     /// How long an absent node stays in the roster. **Days, not seconds.**
@@ -111,8 +126,6 @@ impl Default for EligibilityPolicy {
     /// Parameters, not results. None of these is measured.
     fn default() -> Self {
         Self {
-            require_archive: true,
-            require_qualified: true,
             // One epoch's worth of days, comfortably longer than the gossip
             // needed to agree an identity exists.
             maturity_secs: 24 * 60 * 60,
@@ -131,12 +144,6 @@ pub enum Ineligible {
     /// No endpoint to dial.
     #[error("node advertises no coordinator endpoint, so no wallet can reach it")]
     NoEndpoint,
-    /// Does not pass qualification.
-    #[error("node does not pass qualification (uptime and challenge history)")]
-    NotQualified,
-    /// Not an archive node.
-    #[error("node does not run in archive mode")]
-    NotArchive,
     /// Identity is too new to be ranked under this beacon.
     #[error("identity has been known for {known_secs}s, below the {required_secs}s maturity; a fresh key could be ground against a beacon already in hand")]
     TooNew {
@@ -169,12 +176,6 @@ pub fn check(facts: &NodeFacts, policy: EligibilityPolicy, now: u64) -> Result<(
         .unwrap_or(true)
     {
         return Err(Ineligible::NoEndpoint);
-    }
-    if policy.require_qualified && !facts.qualified {
-        return Err(Ineligible::NotQualified);
-    }
-    if policy.require_archive && !facts.archive {
-        return Err(Ineligible::NotArchive);
     }
 
     let known = now.saturating_sub(facts.first_seen_secs);
@@ -226,17 +227,25 @@ mod tests {
         NodeFacts {
             node_id: [id; 32],
             opted_in: true,
-            archive: true,
             endpoint: Some("node.example:8443".into()),
             first_seen_secs: NOW - 30 * DAY,
             last_seen_secs: NOW - 60,
-            qualified: true,
         }
     }
 
     #[test]
-    fn a_qualified_archive_node_that_opted_in_is_eligible() {
+    fn a_mature_node_that_opted_in_with_an_endpoint_is_eligible() {
         assert_eq!(check(&good(1), EligibilityPolicy::default(), NOW), Ok(()));
+    }
+
+    #[test]
+    fn a_node_that_has_not_opted_in_is_never_conscripted() {
+        let mut f = good(5);
+        f.opted_in = false;
+        assert_eq!(
+            check(&f, EligibilityPolicy::default(), NOW),
+            Err(Ineligible::NotOptedIn)
+        );
     }
 
     #[test]
@@ -278,26 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unqualified_node_cannot_coordinate() {
-        let mut f = good(5);
-        f.qualified = false;
-        assert_eq!(
-            check(&f, EligibilityPolicy::default(), NOW),
-            Err(Ineligible::NotQualified)
-        );
-    }
-
-    #[test]
-    fn a_non_archive_node_cannot_coordinate() {
-        let mut f = good(6);
-        f.archive = false;
-        assert_eq!(
-            check(&f, EligibilityPolicy::default(), NOW),
-            Err(Ineligible::NotArchive)
-        );
-    }
-
-    #[test]
     fn an_endpoint_nobody_can_dial_is_no_endpoint() {
         // Blank and whitespace both mean unreachable; treating either as an
         // endpoint seats a coordinator no wallet can talk to.
@@ -330,21 +319,9 @@ mod tests {
     fn the_ineligible_are_absent_rather_than_ranked_last() {
         let p = EligibilityPolicy::default();
         let mut bad = good(4);
-        bad.qualified = false;
+        bad.endpoint = None;
         let roster = eligible_roster(&[good(1), bad, good(2)], p, NOW);
         assert_eq!(roster.len(), 2);
         assert!(!roster.contains(&[4u8; 32]));
-    }
-
-    #[test]
-    fn relaxing_archive_admits_a_non_archive_node() {
-        // The requirement is a policy, so a test network can run without it.
-        let mut f = good(8);
-        f.archive = false;
-        let p = EligibilityPolicy {
-            require_archive: false,
-            ..Default::default()
-        };
-        assert_eq!(check(&f, p, NOW), Ok(()));
     }
 }
