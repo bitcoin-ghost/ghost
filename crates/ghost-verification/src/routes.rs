@@ -1521,23 +1521,29 @@ pub struct CoordinatorVerifyQuery {
 /// answers there. A signature without a probe proves a key exists; a probe
 /// without a signature proves something listens. The capability needs both.
 ///
-/// ⚠ Deliberately NOT included: the election document (beacon, roster, seat
-/// list). It is derived from public inputs, so any node can compute a correct
+/// ⚠ Deliberately NOT included: the election document (beacon, roster, tier
+/// leaders). It is derived from public inputs, so any node can compute a correct
 /// one without coordinating anything — including it would invite exactly the
 /// mistake #605 records against Archive, where every field was derivable from
 /// the public header and a pruned node passed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CoordinatorAttestation {
-    /// Has this node opted into taking a seat.
+    /// Has this node turned the coordinator election on.
     pub enabled: bool,
+    /// Whether this node runs a coordinator this epoch — true for every node on
+    /// its own roster, leading a tier or not, since the rest are the failover
+    /// path.
+    pub serving: bool,
     /// Where this node says wallets should dial its coordinator. The address
-    /// the challenger must then probe — a claim, until it does.
+    /// the challenger must then probe — a claim, until it does. `None` when the
+    /// node is not serving.
     pub advertised_endpoint: Option<String>,
     /// The epoch this node currently computes, so a node stuck on a stale view
     /// is visible rather than merely wrong.
     pub epoch: Option<u64>,
-    /// The seat this node currently holds, if any.
-    pub my_seat: Option<u64>,
+    /// The tiers this node leads this epoch. Informational: which node leads
+    /// what follows from public inputs, so it proves nothing about the node.
+    pub my_tiers: Vec<String>,
 }
 
 /// `GET /verify/coordinator` — a node's signed attestation about its Wraith
@@ -1555,20 +1561,29 @@ async fn coordinator_verify_handler(
             .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        // This node's OWN endpoint, as its election service reports it. Never
+        // the first entry in `coordinators`, or any other node's: that would
+        // have the challenger probe somebody else's coordinator and credit
+        // this node for it.
         advertised_endpoint: status
-            .get("coordinators")
-            .and_then(|c| c.as_array())
-            .and_then(|coords| {
-                let me = status.get("my_seat").and_then(|s| s.as_u64())?;
-                coords
-                    .iter()
-                    .find(|c| c.get("seat").and_then(|s| s.as_u64()) == Some(me))?
-                    .get("endpoint")
-                    .and_then(|e| e.as_str())
-                    .map(String::from)
-            }),
+            .get("my_endpoint")
+            .and_then(|e| e.as_str())
+            .filter(|e| !e.is_empty())
+            .map(String::from),
+        serving: status
+            .get("my_endpoint")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| !e.is_empty()),
         epoch: status.get("epoch").and_then(|e| e.as_u64()),
-        my_seat: status.get("my_seat").and_then(|s| s.as_u64()),
+        my_tiers: status
+            .get("my_tiers")
+            .and_then(|t| t.as_array())
+            .map(|t| {
+                t.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     // Signed by default. An unsigned attestation is a diagnostic, never
@@ -12463,8 +12478,9 @@ async fn api_self_check_handler(State(state): State<Arc<VerificationState>>) -> 
 
 /// Read-only decentralised-coordinator election view
 /// (`tasks/plan_decentralised_coordinators.md`). Returns
-/// `{enabled, epoch, seats, my_seat, elected:[hex node ids]}` when the operator
-/// has turned on `[coordinator] wraith_election_enabled`, else `{enabled:false}`.
+/// `{enabled, epoch, tiers, coordinators, my_tiers, my_endpoint, beacon, roster, …}`
+/// when the operator has turned on `[coordinator] wraith_election_enabled`,
+/// else `{enabled:false}`.
 /// This endpoint activates nothing — it only reports the public election draw.
 async fn api_pool_coordinator_handler(
     State(state): State<Arc<VerificationState>>,
@@ -13042,8 +13058,10 @@ mod tests {
         secret
     }
 
-    /// A node that says it holds seat 1, alongside another seat it does not hold.
-    fn coordinator_state(my_seat: Option<u64>) -> Arc<crate::server::VerificationState> {
+    /// A node whose own endpoint is listed SECOND, after another node's.
+    fn coordinator_state(
+        my_endpoint: Option<&'static str>,
+    ) -> Arc<crate::server::VerificationState> {
         use ghost_common::types::NodeCapabilities;
         use ghost_policy::PolicyProfile;
 
@@ -13057,24 +13075,26 @@ mod tests {
             serde_json::json!({
                 "enabled": true,
                 "epoch": 6709,
-                "my_seat": my_seat,
+                "my_endpoint": my_endpoint,
+                "my_tiers": if my_endpoint.is_some() { vec!["100m_sats"] } else { vec![] },
                 "coordinators": [
-                    { "seat": 0, "endpoint": "10.0.0.1:9100" },
-                    { "seat": 1, "endpoint": "10.0.0.2:9100" },
+                    { "node_id": "aa", "endpoint": "10.0.0.1:9100", "leads": ["100k_sats"] },
+                    { "node_id": "bb", "endpoint": "10.0.0.2:9100", "leads": ["100m_sats"] },
                 ],
             })
         });
         Arc::new(state)
     }
 
-    /// A node must attest to the endpoint for ITS OWN seat.
+    /// A node must attest to ITS OWN endpoint.
     ///
-    /// Reporting the first seat in the list, or any other node's, would have the
-    /// challenger probe somebody else's coordinator and credit this node for it
-    /// — a capability that passes by pointing at a working neighbour.
+    /// Reporting the first coordinator in the list, or any other node's, would
+    /// have the challenger probe somebody else's coordinator and credit this
+    /// node for it — a capability that passes by pointing at a working
+    /// neighbour.
     #[tokio::test]
-    async fn the_attestation_names_this_nodes_own_seat_endpoint() {
-        let state = coordinator_state(Some(1));
+    async fn the_attestation_names_this_nodes_own_endpoint() {
+        let state = coordinator_state(Some("10.0.0.2:9100"));
         let resp = coordinator_verify_handler(
             axum::extract::State(state),
             axum::extract::Query(CoordinatorVerifyQuery {
@@ -13090,18 +13110,19 @@ mod tests {
             .expect("body");
         let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(v["signed"], false, "unsigned was explicitly requested");
-        assert_eq!(v["response"]["my_seat"], 1);
+        assert_eq!(v["response"]["serving"], true);
         assert_eq!(
             v["response"]["advertised_endpoint"], "10.0.0.2:9100",
-            "seat 1 is this node; 10.0.0.1 belongs to seat 0"
+            "10.0.0.1 is listed first and belongs to another node"
         );
+        assert_eq!(v["response"]["my_tiers"], serde_json::json!(["100m_sats"]));
         assert_eq!(v["response"]["epoch"], 6709);
     }
 
-    /// A node holding no seat advertises no endpoint. Returning one anyway would
-    /// invite the challenger to probe a coordinator this node does not run.
+    /// A node that is not serving advertises no endpoint. Returning one anyway
+    /// would invite the challenger to probe a coordinator this node does not run.
     #[tokio::test]
-    async fn a_node_without_a_seat_advertises_nothing_to_probe() {
+    async fn a_node_not_serving_advertises_nothing_to_probe() {
         let state = coordinator_state(None);
         let resp = coordinator_verify_handler(
             axum::extract::State(state),
@@ -13118,7 +13139,7 @@ mod tests {
             .expect("body");
         let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert!(v["response"]["advertised_endpoint"].is_null());
-        assert!(v["response"]["my_seat"].is_null());
+        assert_eq!(v["response"]["serving"], false);
     }
 
     /// With nothing wired the node says so, rather than defaulting to a claim.

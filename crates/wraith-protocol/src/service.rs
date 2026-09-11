@@ -2,50 +2,41 @@
 //! live use (increment 4b, layer 1).
 //!
 //! A Ghost node and a wallet both build a [`CoordinatorView`] for an epoch from
-//! the *same* agreed inputs (the beacon, the frozen qualified roster, and the
-//! node→endpoint map), and get consistent answers to the two operational
-//! questions the wiring needs:
+//! the *same* agreed inputs (the beacon, the roster, and the node→endpoint map),
+//! and get consistent answers to the two operational questions the wiring needs:
 //!
-//! - **node**: "am I elected this epoch, and for which seat (shard)?" — so a node
-//!   knows when to spin up its co-located coordinator and which sessions it owns.
-//! - **wallet**: "which coordinator endpoint owns *my* session?" — so a wallet
-//!   connects to the right node without trusting anyone to tell it.
+//! - **node**: "do I run a coordinator this epoch, and which tiers do I lead?"
+//! - **wallet**: "which endpoints do I dial for my tier, and in what order?" — so
+//!   a wallet connects to the right node without trusting anyone to tell it.
 //!
 //! Because the underlying schedule is deterministic ([`EpochCoordinators`]), the
-//! node and the wallet independently agree on who owns each session. This module
-//! is still pure — the endpoint map and election inputs are passed in; populating
-//! them from live consensus/discovery is the next layer.
+//! node and the wallet independently agree on who leads each tier. This module
+//! is still pure — the endpoint map and election inputs are passed in.
 
 use std::collections::BTreeMap;
 
 use crate::epoch::EpochCoordinators;
-use crate::sortition::CoordinatorNodeId;
+use crate::sortition::{CoordinatorNodeId, TierLeadership};
 
 /// Maps a coordinator node id to the base URL of its coordinator endpoint
 /// (e.g. `https://node.example:9100`). Sourced from the node-discovery layer.
 pub type EndpointMap = BTreeMap<CoordinatorNodeId, String>;
 
-/// One seated coordinator with its reachable endpoint — the unit the read-only
-/// status endpoint publishes and the wallet resolves against.
-#[derive(Debug, Clone)]
-pub struct SeatedCoordinator {
-    /// The elected node's id.
+/// One roster node as the status endpoint publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingCoordinator {
+    /// The node's id.
     pub node_id: CoordinatorNodeId,
-    /// Seat index `0..seats`; sessions shard onto seats via `shard_for`.
-    pub seat: u32,
-    /// The sortition hash that won the seat. Published so a consumer can
-    /// recompute the draw and see *why* this node holds it, rather than
-    /// taking the seat list on trust (#697).
-    pub rank: [u8; 32],
-    /// The endpoint a wallet dials for this seat, or `None` if the owner hasn't
-    /// advertised one yet (the wallet then waits or picks another epoch).
+    /// Where a wallet dials it, or `None` if it has not advertised yet.
     pub endpoint: Option<String>,
+    /// The tiers it leads this epoch. Empty for a node that is only on the
+    /// failover path, which still runs its coordinator.
+    pub leads: Vec<String>,
 }
 
 /// The resolved coordinator assignment for one epoch, with endpoints attached.
 #[derive(Debug, Clone)]
 pub struct CoordinatorView {
-    epoch: u64,
     coords: EpochCoordinators,
     endpoints: EndpointMap,
 }
@@ -53,94 +44,102 @@ pub struct CoordinatorView {
 impl CoordinatorView {
     /// Wrap an already-computed schedule with an endpoint map.
     pub fn new(coords: EpochCoordinators, endpoints: EndpointMap) -> Self {
-        Self {
-            epoch: coords.epoch,
-            coords,
-            endpoints,
-        }
+        Self { coords, endpoints }
     }
 
     /// Build directly from election inputs + endpoints.
     pub fn build(
         epoch: u64,
         beacon: &[u8; 32],
-        qualified: &[CoordinatorNodeId],
+        roster: &[CoordinatorNodeId],
         endpoints: EndpointMap,
-        n: usize,
     ) -> Self {
-        Self::new(
-            EpochCoordinators::elect(epoch, beacon, qualified, n),
-            endpoints,
-        )
+        Self::new(EpochCoordinators::elect(epoch, beacon, roster), endpoints)
     }
 
     /// The epoch this view is for.
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.coords.epoch
     }
 
-    /// Number of coordinators seated this epoch.
-    pub fn seats(&self) -> usize {
-        self.coords.seats()
+    /// Every tier's leader and failover order, in `LiteTier::all` order.
+    pub fn tiers(&self) -> &[TierLeadership] {
+        &self.coords.tiers
     }
 
-    /// The seated coordinators in seat order, each with its advertised endpoint
-    /// (`None` when the owner hasn't advertised one). Drives the read-only status
-    /// endpoint and the wallet's "which endpoint owns my session" resolution.
-    pub fn seated(&self) -> Vec<SeatedCoordinator> {
-        let mut out: Vec<SeatedCoordinator> = self
-            .coords
-            .coordinators
+    /// Every roster node, in canonical order, with its endpoint and the tiers
+    /// it leads. Drives the read-only status endpoint.
+    pub fn serving(&self) -> Vec<ServingCoordinator> {
+        self.coords
+            .roster
             .iter()
-            .map(|c| SeatedCoordinator {
-                node_id: c.node_id,
-                seat: c.seat,
-                rank: c.rank,
-                endpoint: self.endpoints.get(&c.node_id).cloned(),
+            .map(|id| ServingCoordinator {
+                node_id: *id,
+                endpoint: self.endpoints.get(id).cloned(),
+                leads: self
+                    .coords
+                    .tiers_led_by(id)
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
             })
-            .collect();
-        out.sort_unstable_by_key(|s| s.seat);
-        out
+            .collect()
     }
 
     // ── node-side ────────────────────────────────────────────────────────────
 
-    /// Whether `self_id` is elected a coordinator this epoch.
-    pub fn am_i_coordinator(&self, self_id: &CoordinatorNodeId) -> bool {
+    /// Whether `self_id` should run a coordinator this epoch — true for every
+    /// roster node, leading or not, because the rest are the failover path.
+    pub fn serves(&self, self_id: &CoordinatorNodeId) -> bool {
         self.coords.is_coordinator(self_id)
     }
 
-    /// If `self_id` is elected, the seat (shard) it must serve this epoch.
-    pub fn my_seat(&self, self_id: &CoordinatorNodeId) -> Option<u32> {
-        self.coords.seat_of(self_id)
+    /// The tiers `self_id` leads this epoch.
+    pub fn tiers_led_by(&self, self_id: &CoordinatorNodeId) -> Vec<&str> {
+        self.coords.tiers_led_by(self_id)
     }
 
-    /// Whether `self_id` owns the sessions for `tier_id` this epoch — the
-    /// node's check for "are these sessions mine to coordinate?".
+    /// Whether `self_id` leads `tier_id` this epoch — the node's check for "are
+    /// these sessions mine to coordinate?".
     pub fn owns_tier(&self, self_id: &CoordinatorNodeId, tier_id: &str) -> bool {
         self.coordinator_node_for_tier(tier_id).as_ref() == Some(self_id)
     }
 
     // ── wallet-side ──────────────────────────────────────────────────────────
 
-    /// The coordinator *node* that owns `tier_id`'s sessions this epoch
-    /// (`None` when no coordinators are seated).
+    /// The node that leads `tier_id` this epoch (`None` for an empty roster).
     pub fn coordinator_node_for_tier(&self, tier_id: &str) -> Option<CoordinatorNodeId> {
-        self.coords.coordinator_for_tier(tier_id).map(|c| c.node_id)
+        self.coords.coordinator_for_tier(tier_id).copied()
     }
 
-    /// The endpoint a wallet should connect to for `tier_id`. `None` if no
-    /// coordinator is seated, or the owning coordinator has no known endpoint
-    /// (the wallet then waits for discovery to catch up, or picks another epoch).
+    /// The leader's endpoint for `tier_id`. `None` if nobody leads it, or the
+    /// leader has not advertised one.
     pub fn endpoint_for_tier(&self, tier_id: &str) -> Option<&str> {
         let node = self.coordinator_node_for_tier(tier_id)?;
         self.endpoints.get(&node).map(String::as_str)
+    }
+
+    /// The endpoints to try for `tier_id`, leader first, in the tier's failover
+    /// order. Nodes that have advertised no endpoint are skipped rather than
+    /// holding a place: a node nobody can dial is not a fallback.
+    pub fn endpoints_for_tier(&self, tier_id: &str) -> Vec<&str> {
+        self.coords
+            .for_tier(tier_id)
+            .map(|t| {
+                t.order
+                    .iter()
+                    .filter_map(|id| self.endpoints.get(id).map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TIERS: [&str; 4] = ["100k_sats", "1m_sats", "10m_sats", "100m_sats"];
 
     fn node(i: u8) -> CoordinatorNodeId {
         let mut id = [0u8; 32];
@@ -161,50 +160,49 @@ mod tests {
             .collect()
     }
 
-    fn view(n: usize) -> (CoordinatorView, Vec<CoordinatorNodeId>) {
+    fn view() -> (CoordinatorView, Vec<CoordinatorNodeId>) {
         let q = qualified(12);
-        let v = CoordinatorView::build(3, &beacon(7), &q, endpoints(&q), n);
+        let v = CoordinatorView::build(3, &beacon(7), &q, endpoints(&q));
         (v, q)
     }
 
     #[test]
-    fn node_knows_if_and_where_it_is_elected() {
-        let (v, _q) = view(4);
-        assert_eq!(v.seats(), 4);
-        // exactly the seated nodes report a seat
-        let seated: Vec<_> = (0..12u8)
-            .map(node)
-            .filter(|id| v.am_i_coordinator(id))
+    fn a_node_knows_it_serves_and_which_tiers_it_leads() {
+        let (v, q) = view();
+        let leaders: Vec<_> = q
+            .iter()
+            .filter(|id| !v.tiers_led_by(id).is_empty())
             .collect();
-        assert_eq!(seated.len(), 4);
-        for (expect_seat, id) in seated.iter().enumerate() {
-            // my_seat agrees with am_i_coordinator
-            assert!(v.my_seat(id).is_some());
-            let _ = expect_seat;
+        assert_eq!(leaders.len(), TIERS.len(), "four different leaders");
+        for id in &q {
+            assert!(v.serves(id), "every roster node serves");
         }
-        // a non-roster node is never elected
-        assert!(!v.am_i_coordinator(&node(200)));
-        assert_eq!(v.my_seat(&node(200)), None);
+        assert!(!v.serves(&node(200)));
+        assert!(v.tiers_led_by(&node(200)).is_empty());
     }
 
     #[test]
     fn wallet_resolves_a_real_endpoint_for_every_tier() {
-        let (v, _q) = view(5);
-        for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
+        let (v, _q) = view();
+        for tier in TIERS {
             let ep = v
                 .endpoint_for_tier(tier)
                 .expect("an endpoint for every tier");
             assert!(ep.starts_with("https://node"));
+            assert_eq!(
+                v.endpoints_for_tier(tier)[0],
+                ep,
+                "the leader is tried first"
+            );
         }
     }
 
     /// The node's "is this mine?" answer and the wallet's "who do I dial?"
-    /// answer are the same function, so they cannot disagree. They used to be
-    /// two different functions keyed on different things.
+    /// answer are the same function, so they cannot disagree.
     #[test]
     fn node_and_wallet_agree_on_the_owner() {
-        let (v, _q) = view(5);
-        for tier in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
+        let (v, _q) = view();
+        for tier in TIERS {
             let owner = v.coordinator_node_for_tier(tier).unwrap();
             assert!(v.owns_tier(&owner, tier));
             for other in (0..12u8).map(node).filter(|x| *x != owner) {
@@ -216,51 +214,38 @@ mod tests {
     #[test]
     fn missing_endpoint_yields_none_but_owner_still_known() {
         let q = qualified(12);
-        // endpoints for everyone EXCEPT whoever ends up owning the tier
         let mut eps = endpoints(&q);
-        let v_full = CoordinatorView::build(3, &beacon(7), &q, eps.clone(), 5);
-        let owner = v_full.coordinator_node_for_tier("100k_sats").unwrap();
+        let full = CoordinatorView::build(3, &beacon(7), &q, eps.clone());
+        let owner = full.coordinator_node_for_tier("100k_sats").unwrap();
         eps.remove(&owner);
-        let v = CoordinatorView::build(3, &beacon(7), &q, eps, 5);
-        // owner still known…
+        let v = CoordinatorView::build(3, &beacon(7), &q, eps);
         assert_eq!(v.coordinator_node_for_tier("100k_sats"), Some(owner));
-        // …but no endpoint to dial
         assert_eq!(v.endpoint_for_tier("100k_sats"), None);
+        // …and the wallet walks straight to the next node that can be dialled.
+        let tried = v.endpoints_for_tier("100k_sats");
+        assert_eq!(tried.len(), q.len() - 1);
+        assert_eq!(tried, full.endpoints_for_tier("100k_sats")[1..]);
     }
 
     #[test]
-    fn empty_roster_seats_nobody() {
-        let v = CoordinatorView::build(1, &beacon(1), &[], EndpointMap::new(), 4);
-        assert_eq!(v.seats(), 0);
-        assert!(!v.am_i_coordinator(&node(0)));
+    fn empty_roster_serves_nobody() {
+        let v = CoordinatorView::build(1, &beacon(1), &[], EndpointMap::new());
+        assert!(!v.serves(&node(0)));
         assert_eq!(v.endpoint_for_tier("100k_sats"), None);
+        assert!(v.endpoints_for_tier("100k_sats").is_empty());
+        assert!(v.serving().is_empty());
     }
 
     #[test]
-    fn seated_lists_every_seat_with_its_endpoint_in_order() {
-        let (v, _q) = view(5);
-        let seated = v.seated();
-        assert_eq!(seated.len(), 5);
-        for (i, s) in seated.iter().enumerate() {
-            assert_eq!(s.seat as usize, i, "seats must be 0..n in order");
-            assert!(s
-                .endpoint
-                .as_deref()
-                .expect("every seated coordinator has an endpoint here")
-                .starts_with("https://node"));
+    fn serving_lists_every_roster_node_with_what_it_leads() {
+        let (v, q) = view();
+        let serving = v.serving();
+        assert_eq!(serving.len(), q.len());
+        let led: usize = serving.iter().map(|s| s.leads.len()).sum();
+        assert_eq!(led, TIERS.len(), "each tier is led exactly once");
+        for s in &serving {
+            assert!(s.endpoint.as_deref().unwrap().starts_with("https://node"));
+            assert_eq!(s.leads, v.tiers_led_by(&s.node_id));
         }
-    }
-
-    #[test]
-    fn seated_endpoint_is_none_when_owner_has_not_advertised() {
-        let q = qualified(12);
-        let mut eps = endpoints(&q);
-        let full = CoordinatorView::build(3, &beacon(7), &q, eps.clone(), 5);
-        let owner = full.seated()[0].node_id;
-        eps.remove(&owner);
-        let v = CoordinatorView::build(3, &beacon(7), &q, eps, 5);
-        // Still seated (owner known) but no endpoint to dial.
-        assert_eq!(v.seated()[0].node_id, owner);
-        assert_eq!(v.seated()[0].endpoint, None);
     }
 }

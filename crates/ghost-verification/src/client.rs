@@ -960,11 +960,11 @@ impl VerificationClient {
         // An UNSIGNED attestation is not evidence, whatever it says. Anything can
         // serve this JSON — that is #605's Stratum finding — so treat it as a
         // failed challenge rather than a claim worth probing.
-        let attested_seat = if signed {
-            payload.get("my_seat").and_then(|v| v.as_u64())
+        let attested_serving = if signed {
+            payload.get("serving").and_then(|v| v.as_bool()) == Some(true)
         } else {
             debug!("coordinator attestation was unsigned; not evidence");
-            None
+            false
         };
         let endpoint = payload
             .get("advertised_endpoint")
@@ -972,10 +972,10 @@ impl VerificationClient {
             .filter(|e| !e.is_empty())
             .map(String::from);
 
-        // Probe what it named. A node that attests to a seat but answers nothing
-        // there has not shown it coordinates.
-        let endpoint_answered = match (attested_seat, endpoint.as_deref()) {
-            (Some(_), Some(ep)) => self.coordinator_answers_at(ep).await,
+        // Probe what it named. A node that attests to serving but answers
+        // nothing there has not shown it coordinates.
+        let endpoint_answered = match (attested_serving, endpoint.as_deref()) {
+            (true, Some(ep)) => self.coordinator_answers_at(ep).await,
             _ => false,
         };
 
@@ -991,7 +991,7 @@ impl VerificationClient {
         let raw_signed = signed.then(|| inner.to_string());
         Ok((
             CoordinatorProbe {
-                attested_seat,
+                attested_serving,
                 endpoint,
                 endpoint_answered,
                 endpoint_is_theirs,
@@ -1325,9 +1325,9 @@ impl VerificationClient {
 /// Result of full verification suite
 /// The coordinator endpoint an election view assigns to `node_id_hex`, if any.
 ///
-/// Looked up by node id rather than by seat: the seat a node claims is the thing
-/// under test, so trusting it to find the endpoint would let the answer be
-/// chosen by the party being challenged.
+/// Looked up by node id rather than by anything the target claims about its
+/// role: that claim is the thing under test, so trusting it to find the
+/// endpoint would let the answer be chosen by the party being challenged.
 fn endpoint_owned_by(view: &serde_json::Value, node_id_hex: &str) -> Option<String> {
     let want = node_id_hex.trim().to_ascii_lowercase();
     view.get("coordinators")?
@@ -1353,8 +1353,9 @@ fn endpoint_owned_by(view: &serde_json::Value, node_id_hex: &str) -> Option<Stri
 /// committed to*.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorProbe {
-    /// The seat the node signed for, with its identity key, bound to our nonce.
-    pub attested_seat: Option<u64>,
+    /// The node signed, with its identity key and bound to our nonce, that it
+    /// runs a coordinator this epoch.
+    pub attested_serving: bool,
     /// The endpoint it named in that signed attestation.
     pub endpoint: Option<String>,
     /// A coordinator actually answered there.
@@ -1374,7 +1375,7 @@ impl CoordinatorProbe {
     ///
     /// * **signed** — an unsigned attestation is not evidence, whatever it says.
     ///   Anything can serve that JSON (#605: `nc -l 3333` passes a bare connect).
-    /// * **answered** — a node that attests to a seat and answers nothing at the
+    /// * **answered** — a node that attests to serving and answers nothing at the
     ///   address it named has not shown it coordinates.
     /// * **theirs** — and the address has to be ITS OWN. Without this a node
     ///   passes by naming a neighbour's coordinator: its signature, a real
@@ -1388,7 +1389,7 @@ impl CoordinatorProbe {
     /// target cannot improve its odds by lying, only a challenger's own node can
     /// be wrong about the fleet.
     pub fn passed(&self) -> bool {
-        self.attested_seat.is_some() && self.endpoint_answered && self.endpoint_is_theirs
+        self.attested_serving && self.endpoint_answered && self.endpoint_is_theirs
     }
 }
 
@@ -1926,37 +1927,37 @@ mod tests {
     /// missing one would have let through.
     #[test]
     fn a_coordinator_passes_only_when_all_three_checks_hold() {
-        let probe = |seat: Option<u64>, answered: bool, theirs: bool| CoordinatorProbe {
-            attested_seat: seat,
+        let probe = |serving: bool, answered: bool, theirs: bool| CoordinatorProbe {
+            attested_serving: serving,
             endpoint: Some("10.0.0.2:9100".to_string()),
             endpoint_answered: answered,
             endpoint_is_theirs: theirs,
         };
 
         assert!(
-            probe(Some(1), true, true).passed(),
+            probe(true, true, true).passed(),
             "signed, answering, and its own"
         );
         assert!(
-            !probe(Some(1), false, true).passed(),
-            "attests to a seat and answers nothing there — has not shown it coordinates"
+            !probe(true, false, true).passed(),
+            "attests to serving and answers nothing there — has not shown it coordinates"
         );
         assert!(
-            !probe(None, true, true).passed(),
+            !probe(false, true, true).passed(),
             "unsigned is not evidence whatever it says (#605: `nc -l 3333` passes a bare connect)"
         );
         assert!(
-            !probe(Some(1), true, false).passed(),
+            !probe(true, true, false).passed(),
             "the neighbour attack: a real signature and a real coordinator answering, but the \
              address belongs to somebody else"
         );
     }
 
-    /// A node with no seat cannot pass on liveness alone.
+    /// A node that does not attest to serving cannot pass on liveness alone.
     #[test]
-    fn no_seat_means_no_capability_however_reachable() {
+    fn not_serving_means_no_capability_however_reachable() {
         let probe = CoordinatorProbe {
-            attested_seat: None,
+            attested_serving: false,
             endpoint: None,
             endpoint_answered: true,
             endpoint_is_theirs: true,
@@ -1964,15 +1965,15 @@ mod tests {
         assert!(!probe.passed());
     }
 
-    /// Ownership is resolved by node id, never by the seat the target claims —
-    /// the seat is the thing under test, so using it to find the endpoint would
-    /// let the answer be chosen by the party being challenged.
+    /// Ownership is resolved by node id, never by what the target claims about
+    /// its role — that claim is the thing under test, so using it to find the
+    /// endpoint would let the answer be chosen by the party being challenged.
     #[test]
-    fn ownership_is_looked_up_by_node_id_not_by_claimed_seat() {
+    fn ownership_is_looked_up_by_node_id_not_by_claimed_role() {
         let view = serde_json::json!({
             "coordinators": [
-                { "seat": 0, "node_id": "AA".repeat(32), "endpoint": "10.0.0.1:9100" },
-                { "seat": 1, "node_id": "bb".repeat(32), "endpoint": "10.0.0.2:9100" },
+                { "node_id": "AA".repeat(32), "endpoint": "10.0.0.1:9100", "leads": ["100k_sats"] },
+                { "node_id": "bb".repeat(32), "endpoint": "10.0.0.2:9100", "leads": [] },
             ],
         });
 

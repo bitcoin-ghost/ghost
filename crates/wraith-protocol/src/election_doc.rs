@@ -29,21 +29,38 @@
 //! and a second implementation of that answer is how two parties end up
 //! disagreeing about who is honest.
 //!
-//! The functions were written for the wallet (#697) and moved unchanged.
+//! The functions were written for the wallet (#697) and moved here when the
+//! challenger needed them too.
 
-use crate::epoch::{derive_beacon, snapshot_height_for_epoch};
-use crate::sortition::{verify_election, CoordinatorNodeId, ElectedCoordinator};
+use crate::epoch::{derive_beacon, snapshot_height_for_epoch, EpochCoordinators};
+use crate::sortition::CoordinatorNodeId;
 
-/// The election's whole claim is public verifiability: rank is
-/// `H(beacon ‖ epoch ‖ node_id)`, so nobody can nominate themselves. That
-/// property belongs to the *draw*, not to a JSON document describing one —
-/// and until this check existed the wallet believed the document. Anything
-/// relaying it could have named itself every seat, and every wallet asking
-/// for a coordinator would have been sent to it (#697).
+/// Recompute the schedule from the inputs a document publishes beside it:
+/// `epoch`, `beacon`, `roster`. `None` if any is missing or malformed.
+fn recompute(election: &serde_json::Value) -> Option<EpochCoordinators> {
+    let epoch = election.get("epoch")?.as_u64()?;
+    let beacon = election.get("beacon")?.as_str().and_then(decode_32)?;
+    let roster = election
+        .get("roster")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().and_then(decode_32))
+        .collect::<Option<Vec<CoordinatorNodeId>>>()?;
+    Some(EpochCoordinators::elect(epoch, &beacon, &roster))
+}
+
+/// The election's whole claim is public verifiability: a node's rank for a
+/// tier is `H(beacon ‖ epoch ‖ tier ‖ node_id)`, so nobody can nominate
+/// themselves. That property belongs to the *draw*, not to a JSON document
+/// describing one — and until this check existed the wallet believed the
+/// document. Anything relaying it could have named itself leader of every
+/// tier, and every wallet asking for a coordinator would have been sent to it
+/// (#697).
 ///
-/// What recomputing buys: the seat list must actually follow from the beacon
-/// and roster published beside it. A relay that edits seats, drops a
-/// qualified node, or forges a rank is refused.
+/// What recomputing buys: the published `tiers` — each tier's leader and
+/// failover order — and the `leads` beside each coordinator must actually follow
+/// from the beacon and roster published with them. A relay that edits a leader,
+/// reorders a failover path, or drops a node from the roster is refused.
 ///
 /// What it does not buy, and this matters: the beacon and roster arrive from
 /// the same place as the result. A node that lies about *both*, consistently,
@@ -51,59 +68,91 @@ use crate::sortition::{verify_election, CoordinatorNodeId, ElectedCoordinator};
 /// be pinned — it is `SHA256(domain ‖ epoch ‖ block_hash_at(anchor_height))`,
 /// so a wallet with chain access can re-derive it and refuse a fabricated
 /// one; `anchor_height` is published for exactly that. The roster is the
-/// remaining trusted input, and closing it needs the qualified set to come
-/// from consensus rather than from whoever answered.
+/// remaining trusted input; comparing it across nodes (`roster_commitment`)
+/// catches a unilateral liar, and closing it fully needs consensus.
 pub fn election_is_honest(election: &serde_json::Value) -> bool {
-    let Some(epoch) = election.get("epoch").and_then(|e| e.as_u64()) else {
-        return false;
-    };
-    let Some(beacon) = election
-        .get("beacon")
-        .and_then(|b| b.as_str())
-        .and_then(decode_32)
-    else {
-        return false;
-    };
-    let Some(roster) = election.get("roster").and_then(|r| r.as_array()).map(|r| {
-        r.iter()
-            .map(|v| v.as_str().and_then(decode_32))
-            .collect::<Option<Vec<CoordinatorNodeId>>>()
-    }) else {
-        return false;
-    };
-    let Some(roster) = roster else { return false };
-    let Some(seats) = election.get("seats").and_then(|s| s.as_u64()) else {
+    let Some(expected) = recompute(election) else {
         return false;
     };
 
-    // The claimed draw, in seat order — `verify_election` compares against a
-    // freshly computed one, so the ordering has to match how it was built.
-    let Some(claimed) = election
+    // Every tier, in order, with exactly the recomputed failover path.
+    let Some(tiers) = election.get("tiers").and_then(|t| t.as_array()) else {
+        return false;
+    };
+    if tiers.len() != expected.tiers.len() {
+        return false;
+    }
+    for (claimed, want) in tiers.iter().zip(&expected.tiers) {
+        if claimed.get("tier").and_then(|t| t.as_str()) != Some(want.tier_id.as_str()) {
+            return false;
+        }
+        let Some(order) = claimed.get("order").and_then(|o| o.as_array()).map(|o| {
+            o.iter()
+                .map(|v| v.as_str().and_then(decode_32))
+                .collect::<Option<Vec<CoordinatorNodeId>>>()
+        }) else {
+            return false;
+        };
+        if order.as_deref() != Some(want.order.as_slice()) {
+            return false;
+        }
+    }
+
+    // The per-node summary must agree too: it is what a reader looks at, and a
+    // relay could otherwise leave `tiers` intact and forge `leads`.
+    let Some(coordinators) = election.get("coordinators").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    coordinators.iter().all(|c| {
+        let Some(id) = c
+            .get("node_id")
+            .and_then(|n| n.as_str())
+            .and_then(decode_32)
+        else {
+            return false;
+        };
+        let Some(leads) = c.get("leads").and_then(|l| l.as_array()) else {
+            return false;
+        };
+        let leads: Vec<&str> = leads.iter().filter_map(|t| t.as_str()).collect();
+        expected.is_coordinator(&id) && leads == expected.tiers_led_by(&id)
+    })
+}
+
+/// The endpoints to dial for `tier_id`, leader first, in the tier's failover
+/// order — recomputed from the document's inputs, never read from its claims.
+///
+/// Endpoints come from `coordinators[].endpoint`; a node that advertises none
+/// is skipped rather than holding a place. Empty if the inputs are missing.
+/// Call [`election_is_honest`] first: this answers "who", not "should I".
+pub fn endpoints_for_tier(election: &serde_json::Value, tier_id: &str) -> Vec<String> {
+    let Some(schedule) = recompute(election) else {
+        return Vec::new();
+    };
+    let Some(tier) = schedule.for_tier(tier_id) else {
+        return Vec::new();
+    };
+    let published = election
         .get("coordinators")
         .and_then(|c| c.as_array())
-        .map(|c| {
-            c.iter()
-                .map(|v| {
-                    Some(ElectedCoordinator {
-                        node_id: v
-                            .get("node_id")
-                            .and_then(|n| n.as_str())
-                            .and_then(decode_32)?,
-                        rank: v.get("rank").and_then(|r| r.as_str()).and_then(decode_32)?,
-                        seat: v.get("seat").and_then(|s| s.as_u64())? as u32,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-        })
-    else {
-        return false;
+        .cloned()
+        .unwrap_or_default();
+    let endpoint_of = |id: &CoordinatorNodeId| -> Option<String> {
+        published
+            .iter()
+            .find(|c| {
+                c.get("node_id")
+                    .and_then(|n| n.as_str())
+                    .and_then(decode_32)
+                    .as_ref()
+                    == Some(id)
+            })?
+            .get("endpoint")?
+            .as_str()
+            .filter(|e| !e.trim().is_empty())
+            .map(String::from)
     };
-    let Some(mut claimed) = claimed else {
-        return false;
-    };
-    claimed.sort_by_key(|c| c.seat);
-
-    verify_election(&beacon, epoch, &roster, seats as usize, &claimed)
+    tier.order.iter().filter_map(endpoint_of).collect()
 }
 
 /// The block height whose hash must anchor this election's beacon, and the

@@ -22,12 +22,12 @@
 
 //! What happens to a session that is still signing when the epoch rotates.
 //!
-//! `shard_key_for_tier_epoch` mixes the epoch in, so at every rotation a tier's
-//! sessions map to a *different* seat. Meanwhile `service::owns_tier` asks "is
-//! this tier mine **this epoch**". Put those together and a coordinator holding
-//! a `Locked` session — participants committed, partial signatures collected —
-//! answers `false` the instant the epoch turns, while wallets computing the new
-//! epoch's shard dial somebody else.
+//! The draw mixes the epoch in, so at every rotation a tier's lead usually moves
+//! to a *different* node. Meanwhile `service::owns_tier` asks "is this tier mine
+//! **this epoch**". Put those together and a coordinator holding a `Locked`
+//! session — participants committed, partial signatures collected — answers
+//! `false` the instant the epoch turns, while wallets drawing the new epoch's
+//! leaders dial somebody else.
 //!
 //! Nobody is wrong. Each side follows the rule it was given. The session simply
 //! stops having an owner, with participants' inputs already committed to it.
@@ -135,7 +135,7 @@ pub fn owns_session(
     if coords.epoch != session.opened_in {
         return None;
     }
-    Some(coords.coordinator_for_tier(tier_id).map(|c| c.node_id) == Some(*self_id))
+    Some(coords.coordinator_for_tier(tier_id) == Some(self_id))
 }
 
 /// Whether to open a new session for `tier_id` at `current_height`.
@@ -188,7 +188,7 @@ pub fn disposition(
     tier_id: &str,
     outstanding: usize,
 ) -> Disposition {
-    let ours = current.coordinator_for_tier(tier_id).map(|c| c.node_id) == Some(*self_id);
+    let ours = current.coordinator_for_tier(tier_id) == Some(self_id);
     match (ours, outstanding) {
         (true, _) => Disposition::Active,
         (false, 0) => Disposition::Idle,
@@ -207,16 +207,14 @@ mod tests {
         (1..=8u8).map(node).collect()
     }
     fn elect(epoch: u64) -> EpochCoordinators {
-        EpochCoordinators::elect(epoch, &[9u8; 32], &roster(), 4)
+        EpochCoordinators::elect(epoch, &[9u8; 32], &roster())
     }
 
-    /// Find a tier whose owning seat differs between two epochs. That is the
+    /// Find a tier whose leader differs between two epochs. That is the
     /// rotation case; if no tier moved, the fixture proves nothing.
     fn tier_that_moves(a: &EpochCoordinators, b: &EpochCoordinators) -> String {
-        for t in ["100k_sats", "1m_sats", "10k_sats", "500k_sats", "5m_sats"] {
-            if a.coordinator_for_tier(t).map(|c| c.node_id)
-                != b.coordinator_for_tier(t).map(|c| c.node_id)
-            {
+        for t in ["100k_sats", "1m_sats", "10m_sats", "100m_sats"] {
+            if a.coordinator_for_tier(t) != b.coordinator_for_tier(t) {
                 return t.to_string();
             }
         }
@@ -237,12 +235,12 @@ mod tests {
         // holding partial signatures stops owning its own session at rotation.
         let (a, b) = (elect(3), elect(4));
         let tier = tier_that_moves(&a, &b);
-        let owner = a.coordinator_for_tier(&tier).unwrap().node_id;
+        let owner = a.coordinator_for_tier(&tier).copied().unwrap();
 
         let session = SessionEpoch::at_height(3 * EPOCH_BLOCKS + 100);
 
         // Under the old scheme the new epoch's election answers, and it says no.
-        assert_ne!(b.coordinator_for_tier(&tier).unwrap().node_id, owner);
+        assert_ne!(b.coordinator_for_tier(&tier).copied().unwrap(), owner);
 
         // Bound to its opening epoch, it is still ours.
         assert_eq!(owns_session(&a, &owner, &tier, &session), Some(true));
@@ -253,7 +251,7 @@ mod tests {
         // Silently answering from whichever election is to hand IS the bug.
         let (a, b) = (elect(3), elect(4));
         let tier = tier_that_moves(&a, &b);
-        let owner = a.coordinator_for_tier(&tier).unwrap().node_id;
+        let owner = a.coordinator_for_tier(&tier).copied().unwrap();
         let session = SessionEpoch::at_height(3 * EPOCH_BLOCKS + 100);
         assert_eq!(owns_session(&b, &owner, &tier, &session), None);
     }
@@ -262,7 +260,7 @@ mod tests {
     fn a_session_is_not_opened_on_the_edge_of_a_rotation() {
         let coords = elect(3);
         let tier = "100k_sats";
-        let owner = coords.coordinator_for_tier(tier).unwrap().node_id;
+        let owner = coords.coordinator_for_tier(tier).copied().unwrap();
         let last = (3 + 1) * EPOCH_BLOCKS - 1;
         assert!(matches!(
             check_open(&coords, &owner, tier, last),
@@ -277,7 +275,7 @@ mod tests {
     fn a_node_does_not_open_sessions_for_a_tier_it_does_not_own() {
         let coords = elect(3);
         let tier = "100k_sats";
-        let owner = coords.coordinator_for_tier(tier).unwrap().node_id;
+        let owner = coords.coordinator_for_tier(tier).copied().unwrap();
         let other = roster().into_iter().find(|n| *n != owner).unwrap();
         assert!(matches!(
             check_open(&coords, &other, tier, 3 * EPOCH_BLOCKS + 10),
@@ -291,7 +289,7 @@ mod tests {
         // competes with the new owner. Draining is neither.
         let (a, b) = (elect(3), elect(4));
         let tier = tier_that_moves(&a, &b);
-        let old = a.coordinator_for_tier(&tier).unwrap().node_id;
+        let old = a.coordinator_for_tier(&tier).copied().unwrap();
 
         assert_eq!(disposition(&a, &old, &tier, 2), Disposition::Active);
         assert_eq!(disposition(&b, &old, &tier, 2), Disposition::Draining);
@@ -302,7 +300,7 @@ mod tests {
     fn the_new_owner_is_active_immediately() {
         let (a, b) = (elect(3), elect(4));
         let tier = tier_that_moves(&a, &b);
-        let new = b.coordinator_for_tier(&tier).unwrap().node_id;
+        let new = b.coordinator_for_tier(&tier).copied().unwrap();
         assert_eq!(disposition(&b, &new, &tier, 0), Disposition::Active);
     }
 }

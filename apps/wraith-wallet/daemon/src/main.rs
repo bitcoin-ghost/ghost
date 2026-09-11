@@ -5905,8 +5905,8 @@ mod server {
                     }
                     None => (Vec::new(), None),
                 };
-                // Head is the seat that owns this tier; the tail is where every
-                // wallet on that seat goes if it stops answering — the same
+                // Head is the node leading this tier; the tail is where every
+                // wallet on the tier goes if it stops answering — the same
                 // order for all of them, so the cohort moves together (#711).
                 let mut it = endpoints.into_iter();
                 let endpoint = it.next();

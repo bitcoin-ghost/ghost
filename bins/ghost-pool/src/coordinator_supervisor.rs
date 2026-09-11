@@ -107,21 +107,21 @@ impl CoordinatorSupervisor {
         })))
     }
 
-    /// Reconcile the running coordinator against the election: start when newly
-    /// elected, stop when the seat is lost, and refresh the advertised session
-    /// count while running. No-op when role activation is disabled.
-    pub async fn reconcile(&self, am_i_coordinator: bool) {
+    /// Reconcile the running coordinator against the election: start when this
+    /// node should serve, stop when it should not, and refresh the advertised
+    /// session count while running. No-op when role activation is disabled.
+    pub async fn reconcile(&self, should_serve: bool) {
         if !self.cfg.enabled {
             return;
         }
         let is_running = self.running.lock().is_some();
-        match (am_i_coordinator, is_running) {
+        match (should_serve, is_running) {
             (true, false) => self.start().await,
             (false, true) => self.stop(),
             _ => {}
         }
-        // While serving, publish the live session count so the mesh can size
-        // seats by demand (the source for `seats_for_demand`).
+        // While serving, publish the live session count. Observability only:
+        // the election no longer sizes anything from it.
         if let Some(r) = self.running.lock().as_ref() {
             self.mesh
                 .set_coordinator_sessions(r.state.sessions.len() as u32);
@@ -184,12 +184,12 @@ impl CoordinatorSupervisor {
     fn stop(&self) {
         if let Some(r) = self.running.lock().take() {
             // Signal graceful shutdown; abort as a backstop so a stuck server
-            // can't keep the seat's port held into the next epoch.
+            // can't keep the port held.
             r.shutdown.notify_waiters();
             r.handle.abort();
-            info!("coordinator: seat lost — stopped");
+            info!("coordinator: no longer serving — stopped");
         }
-        // No longer coordinating → stop contributing to mesh demand.
+        // No longer coordinating → stop advertising sessions.
         self.mesh.set_coordinator_sessions(0);
     }
 }
