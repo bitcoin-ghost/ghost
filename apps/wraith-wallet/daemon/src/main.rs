@@ -2914,6 +2914,21 @@ mod server {
     /// needs its own BFT-finalised checkpoint on the pool side, with a height
     /// gate and a fleet roll. Until then this is chain-anchored, not
     /// trustless, and the difference is the roster.
+    /// The coordinators a mix at `chosen` may join instead when `chosen` is full
+    /// or unreachable: the rest of the tier's order from a verified election.
+    /// Empty when there is no verified election, or `chosen` is not on it.
+    async fn spill_alternates(
+        state: &Arc<DaemonState>,
+        tier_id: &str,
+        chosen: &str,
+    ) -> Vec<String> {
+        let Some(election) = verified_election(state).await else {
+            return Vec::new();
+        };
+        let (order, _) = crate::coordinator_resolve::resolve_from_election(&election, tier_id);
+        crate::coordinator_resolve::alternates_after(&order, chosen)
+    }
+
     async fn verified_election(state: &Arc<DaemonState>) -> Option<serde_json::Value> {
         let pool_url = state.pool_url.read().await.clone()?;
 
@@ -5657,6 +5672,9 @@ mod server {
                 use wraith_wallet_core::wraith::{
                     MixRequest, ParticipantUtxo, WraithClientError, WraithSessionClient,
                 };
+                // If the tier's leader is full, the rest of its order — so rising
+                // demand reaches more coordinators instead of queueing on one.
+                let alternates = spill_alternates(state, &tier_id, &coordinator_url).await;
                 let client_result = match socks5_proxy.as_deref() {
                     Some(proxy) => WraithSessionClient::with_outputs_proxy(
                         coordinator_url.clone(),
@@ -5672,7 +5690,8 @@ mod server {
                         coordinator_peers.clone(),
                         state.network,
                     )),
-                };
+                }
+                .map(|c| c.with_alternates(alternates));
                 let client = match client_result {
                     Ok(c) => Arc::new(c),
                     Err(e) => {
@@ -5938,6 +5957,9 @@ mod server {
                 use wraith_wallet_core::wraith_signer::{
                     sign_taproot_key_path, sign_taproot_key_path_at_index, DEFAULT_SCAN_INDEX_MAX,
                 };
+                // If the tier's leader is full, the rest of its order — so rising
+                // demand reaches more coordinators instead of queueing on one.
+                let alternates = spill_alternates(state, &tier_id, &coordinator_url).await;
                 let client_result = match socks5_proxy.as_deref() {
                     Some(proxy) => WraithSessionClient::with_outputs_proxy(
                         coordinator_url.clone(),
@@ -5953,7 +5975,8 @@ mod server {
                         coordinator_peers.clone(),
                         state.network,
                     )),
-                };
+                }
+                .map(|c| c.with_alternates(alternates));
                 let client = match client_result {
                     Ok(c) => c,
                     Err(e) => {

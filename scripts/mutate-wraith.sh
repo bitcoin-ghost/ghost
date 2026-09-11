@@ -133,6 +133,10 @@ mutate "every tier gets the same ordering" sortition.rs \
 '    h.update(tier_id.as_bytes());' \
 '    h.update(b"");' sortition
 
+mutate "a full coordinator keeps opening rounds, so demand never spills" lite_session.rs \
+'            if live >= self.max_live_rounds {' \
+'            if false {' lite_session
+
 mutate "one node may lead several tiers while others idle" sortition.rs \
 '                .position(|id| !leading.contains(id))' \
 '                .position(|_| true)' sortition

@@ -256,6 +256,10 @@ pub struct DiscoverPayload {
 #[derive(Debug, Clone)]
 pub struct PreparedMix {
     pub session_id: String,
+    /// The coordinator running this round — the one that accepted the
+    /// enrolment, which is not the one first asked when that one was full.
+    /// Submission goes back here: no other coordinator knows the session.
+    pub coordinator_url: String,
     /// The full unsigned round transaction — already mixed with
     /// other participants' inputs and outputs, just missing
     /// witnesses.
@@ -464,6 +468,7 @@ where
 
 /// Wallet-side participant client. Constructed once per coordinator,
 /// re-used across rounds.
+#[derive(Clone)]
 pub struct WraithSessionClient {
     base_url: String,
     /// Optional fallback coordinator URLs. When the primary
@@ -477,6 +482,15 @@ pub struct WraithSessionClient {
     /// blinded signatures are bound to the original Active's
     /// signing key.
     peers: Vec<String>,
+    /// Other coordinators to join instead when this one is full or
+    /// unreachable — the rest of the tier's order, as the election gives it.
+    ///
+    /// Distinct from `peers`. A peer is a standby of THIS coordinator that
+    /// mirrors its sessions, so a request can move to one mid-round. An
+    /// alternate is an independent coordinator that has never heard of our
+    /// session, so it is only ever tried at join time; once a coordinator has
+    /// accepted us, the whole round stays with it.
+    alternates: Vec<String>,
     network: Network,
     /// HTTP client used for everything that's NOT /outputs. The
     /// coordinator already knows the participant's identity at these
@@ -504,6 +518,7 @@ impl WraithSessionClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             peers: Vec::new(),
+            alternates: Vec::new(),
             network,
             outputs_http: http.clone(),
             http,
@@ -553,10 +568,90 @@ impl WraithSessionClient {
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             peers: Vec::new(),
+            alternates: Vec::new(),
             network,
             http: direct,
             outputs_http,
         })
+    }
+
+    /// The coordinators to join instead, in order, when this one answers
+    /// [`wraith_protocol::COORDINATOR_FULL`] or cannot be reached: the rest of
+    /// the tier's order after this coordinator. Every wallet on the tier walks
+    /// the same list, so an overflow gathers into one round on the next node
+    /// rather than scattering — which is how rising demand reaches more
+    /// coordinators.
+    pub fn with_alternates(mut self, alternates: Vec<String>) -> Self {
+        self.alternates = alternates
+            .into_iter()
+            .map(|u| u.trim_end_matches('/').to_string())
+            .collect();
+        self
+    }
+
+    /// This client, aimed at `url` for the rest of a round.
+    ///
+    /// Standbys belong to one coordinator, so they survive only if `url` is the
+    /// coordinator they stand by for.
+    fn pinned(&self, url: &str) -> Self {
+        let url = url.trim_end_matches('/');
+        let mut c = self.clone();
+        c.alternates = Vec::new();
+        if url != self.base_url {
+            c.base_url = url.to_string();
+            c.peers = Vec::new();
+        }
+        c
+    }
+
+    /// Join a round: this coordinator first, then each alternate in order,
+    /// moving on only when one is full or unreachable. Returns a client pinned
+    /// to the coordinator that accepted, for the rest of the round.
+    ///
+    /// Any other refusal is final. It means a coordinator answered and said no
+    /// (already registered, a composition rule, a malformed request), and the
+    /// next node would have no reason to say otherwise.
+    async fn enrol(
+        &self,
+        request: &MixRequest,
+    ) -> Result<(Self, FindOrCreateResponse), WraithClientError> {
+        let body = serde_json::json!({
+            "tier_id": request.tier_id,
+            "ghost_id": request.ghost_id,
+        });
+        let mut last: Option<WraithClientError> = None;
+        let candidates = std::iter::once(self.base_url.as_str())
+            .chain(self.alternates.iter().map(String::as_str));
+        for (i, url) in candidates.enumerate() {
+            let client = self.pinned(url);
+            match client
+                .post_json::<FindOrCreateResponse>("/api/v1/session/find_or_create", &body)
+                .await
+            {
+                Ok(foc) => {
+                    if i > 0 {
+                        tracing::info!(
+                            coordinator = %url,
+                            tier = %request.tier_id,
+                            "joined the next coordinator in the tier's order"
+                        );
+                    }
+                    return Ok((client, foc));
+                }
+                Err(e) if is_coordinator_full(&e) || is_unreachable(&e) => {
+                    tracing::warn!(
+                        coordinator = %url,
+                        tier = %request.tier_id,
+                        error = %e,
+                        "coordinator full or unreachable; trying the next in the tier's order"
+                    );
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| WraithClientError::Shape("no coordinator URLs configured".into())))
     }
 
     /// Drive a single Wraith Lite round end-to-end with a synchronous
@@ -625,22 +720,30 @@ impl WraithSessionClient {
     pub async fn prepare_mix<P, PFut>(
         &self,
         request: MixRequest,
+        prove_ownership: P,
+    ) -> Result<PreparedMix, WraithClientError>
+    where
+        P: FnMut(&str) -> PFut,
+        PFut: std::future::Future<Output = Result<String, WraithClientError>>,
+    {
+        // 1. Enrol — with this coordinator, or the next in the tier's order if
+        //    it is full. Everything after this talks to whichever accepted.
+        let (client, foc) = self.enrol(&request).await?;
+        client.prepare_enrolled(foc, request, prove_ownership).await
+    }
+
+    /// Steps 2 onwards of [`Self::prepare_mix`], on the coordinator that
+    /// accepted the enrolment.
+    async fn prepare_enrolled<P, PFut>(
+        &self,
+        foc: FindOrCreateResponse,
+        request: MixRequest,
         mut prove_ownership: P,
     ) -> Result<PreparedMix, WraithClientError>
     where
         P: FnMut(&str) -> PFut,
         PFut: std::future::Future<Output = Result<String, WraithClientError>>,
     {
-        // 1. Enrol.
-        let foc: FindOrCreateResponse = self
-            .post_json(
-                "/api/v1/session/find_or_create",
-                &serde_json::json!({
-                    "tier_id": request.tier_id,
-                    "ghost_id": request.ghost_id,
-                }),
-            )
-            .await?;
         let session_id = foc.session.session_id.clone();
         debug!(%session_id, "enrolled in session");
 
@@ -824,6 +927,7 @@ impl WraithSessionClient {
 
         Ok(PreparedMix {
             session_id,
+            coordinator_url: self.base_url.clone(),
             unsigned_tx: tx,
             input_index,
             prev_amount_sats: request.utxo.value_sats,
@@ -845,6 +949,8 @@ impl WraithSessionClient {
         witness: Witness,
     ) -> Result<MixOutcome, WraithClientError> {
         let prepared = inspected.prepared();
+        // The round lives on the coordinator that accepted it.
+        let client = self.pinned(&prepared.coordinator_url);
 
         // Inspection is only worth something if the signature commits to what
         // was inspected. Checked here rather than in `execute_mix` alone,
@@ -855,7 +961,7 @@ impl WraithSessionClient {
         let witness_hex = bitcoin::consensus::encode::serialize_hex(&witness);
         let session_id = &prepared.session_id;
 
-        let wresp: WitnessResponse = self
+        let wresp: WitnessResponse = client
             .post_json(
                 &format!("/api/v1/session/{session_id}/witness"),
                 &serde_json::json!({
@@ -873,7 +979,7 @@ impl WraithSessionClient {
         let broadcast_txid = match wresp.broadcast_txid {
             Some(txid_hex) => Txid::from_str_hex(&txid_hex)?,
             None => {
-                self.wait_for_complete(session_id).await?;
+                client.wait_for_complete(session_id).await?;
                 Txid::from_str_hex(&prepared.unsigned_tx.compute_txid().to_string())?
             }
         };
@@ -1188,6 +1294,32 @@ fn is_connectivity_error(e: &reqwest::Error) -> bool {
     e.is_connect() || e.is_timeout() || e.is_request()
 }
 
+/// The coordinator answered, and said it is at its live-round limit for the
+/// tier — the one refusal a wallet walks past (`wraith_protocol::COORDINATOR_FULL`).
+///
+/// Read from the error code in the body, not from the status alone: a 503 from
+/// a proxy in front of a coordinator is not a coordinator saying it is full.
+fn is_coordinator_full(e: &WraithClientError) -> bool {
+    match e {
+        WraithClientError::Coordinator {
+            status: 503,
+            detail,
+        } => {
+            serde_json::from_str::<serde_json::Value>(detail)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|c| c.as_str()).map(String::from))
+                .as_deref()
+                == Some(wraith_protocol::COORDINATOR_FULL)
+        }
+        _ => false,
+    }
+}
+
+/// Nobody answered, at this coordinator or any of its standbys.
+fn is_unreachable(e: &WraithClientError) -> bool {
+    matches!(e, WraithClientError::Transport(t) if is_connectivity_error(t))
+}
+
 fn locate_mix_output_index(
     tx: &Transaction,
     address: &str,
@@ -1310,4 +1442,61 @@ struct WitnessResponse {
 #[derive(Debug, Deserialize)]
 struct SessionStatusResponse {
     session: SessionDescriptor,
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+
+    fn coordinator(status: u16, detail: &str) -> WraithClientError {
+        WraithClientError::Coordinator {
+            status,
+            detail: detail.to_string(),
+        }
+    }
+
+    #[test]
+    fn full_is_read_from_the_coordinators_error_code() {
+        let body = serde_json::json!({ "error": wraith_protocol::COORDINATOR_FULL, "detail": "x" });
+        assert!(is_coordinator_full(&coordinator(503, &body.to_string())));
+    }
+
+    /// A 503 from a proxy in front of a coordinator is not a coordinator saying
+    /// it is full, and walking past it would split a cohort for no reason.
+    #[test]
+    fn a_bare_503_is_not_full() {
+        assert!(!is_coordinator_full(&coordinator(
+            503,
+            "<html>Service Unavailable</html>"
+        )));
+        assert!(!is_coordinator_full(&coordinator(503, "")));
+    }
+
+    /// Any other refusal is final: a coordinator answered and said no.
+    #[test]
+    fn the_code_under_another_status_is_not_full() {
+        let body = serde_json::json!({ "error": wraith_protocol::COORDINATOR_FULL });
+        assert!(!is_coordinator_full(&coordinator(409, &body.to_string())));
+        let other = serde_json::json!({ "error": "already_registered" });
+        assert!(!is_coordinator_full(&coordinator(503, &other.to_string())));
+    }
+
+    #[test]
+    fn a_pinned_client_keeps_standbys_only_for_its_own_coordinator() {
+        let c = WraithSessionClient::with_peers(
+            "http://leader:9100",
+            vec!["http://leader-standby:9100".into()],
+            Network::Signet,
+        )
+        .with_alternates(vec!["http://next:9100/".into()]);
+        let same = c.pinned("http://leader:9100/");
+        assert_eq!(same.peers, vec!["http://leader-standby:9100"]);
+        assert!(same.alternates.is_empty(), "a joined round never moves");
+        let moved = c.pinned("http://next:9100");
+        assert_eq!(moved.base_url, "http://next:9100");
+        assert!(
+            moved.peers.is_empty(),
+            "the leader's standbys know nothing of the next node's round"
+        );
+    }
 }

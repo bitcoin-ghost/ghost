@@ -237,6 +237,99 @@ async fn five_wallets_complete_a_full_mix_round() {
     }
 }
 
+/// A whole round on the coordinator the wallets spilled to — enrolment, signing,
+/// submission, broadcast. Submission is the step that proves the round stayed
+/// pinned: sent back to the full leader, it would name a session that node has
+/// never heard of.
+#[tokio::test]
+async fn wallets_spilled_off_a_full_leader_complete_their_round_on_the_next_node() {
+    async fn serve(full: bool) -> (Arc<CoordinatorState>, StubBroadcaster, String) {
+        let broadcaster = StubBroadcaster::new();
+        let mut state = CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(wraith_protocol::SystemClock),
+            Arc::new(wraith_protocol::RandomSessionIdGenerator),
+            Some(signet_addr(99)),
+            Some(Arc::new(broadcaster.clone()) as Arc<dyn Broadcaster>),
+        )
+        .with_utxo_source(Arc::new(participant_utxos()));
+        if full {
+            state.sessions = wraith_protocol::LiteSessionRegistry::new().with_max_live_rounds(0);
+        }
+        let state = Arc::new(state);
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (state, broadcaster, format!("http://127.0.0.1:{port}"))
+    }
+
+    let (leader, leader_broadcaster, leader_url) = serve(true).await;
+    let (next, next_broadcaster, next_url) = serve(false).await;
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let (leader_url, next_url) = (leader_url.clone(), next_url.clone());
+        handles.push(tokio::spawn(async move {
+            let client = WraithSessionClient::new(leader_url, Network::Signet)
+                .with_alternates(vec![next_url]);
+            let req = MixRequest {
+                min_entities: 1,
+                tier_id: TIER_ID.into(),
+                ghost_id: format!("wallet-{i}"),
+                utxo: ParticipantUtxo {
+                    txid: "11".repeat(32),
+                    vout: i as u32,
+                    value_sats: SEAT_PRICE,
+                    scriptpubkey_hex: participant_address(i as u8).script_pubkey().to_hex_string(),
+                },
+                mix_output_address: participant_address(i as u8 + 10).to_string(),
+            };
+            let signer = |_tx: &bitcoin::Transaction, _idx: usize, _amt: u64| {
+                let mut w = Witness::new();
+                w.push([0xdeu8; 64]);
+                Ok::<Witness, WraithClientError>(w)
+            };
+            let prove = move |challenge: &str| {
+                let challenge = challenge.to_string();
+                async move {
+                    let txid = "11".repeat(32);
+                    let sid = challenge.lines().nth(1).unwrap_or_default().to_string();
+                    Ok::<String, WraithClientError>(ownership_proof(&sid, i as u8, &txid, i as u32))
+                }
+            };
+            let mut ledger = wraith_protocol::signing_ledger::SigningLedger::new(
+                wraith_protocol::signing_ledger::VolatileStore::default(),
+            );
+            client.execute_mix(req, signer, prove, &mut ledger).await
+        }));
+    }
+
+    let session_id = wait_for_quorum(&next).await;
+    let _ = next.sessions.apply_event(SessionGossipEvent::StateChanged {
+        session_id: session_id.clone(),
+        new_state: LiteSessionState::Locked,
+    });
+    for h in handles {
+        let outcome = h
+            .await
+            .expect("task join")
+            .expect("the spilled round completes");
+        assert_eq!(outcome.session_id, session_id);
+    }
+    assert_eq!(
+        next_broadcaster.count(),
+        1,
+        "the next node broadcast the round"
+    );
+    assert_eq!(
+        leader_broadcaster.count(),
+        0,
+        "the full leader broadcast nothing"
+    );
+    assert!(leader.sessions.is_empty(), "and created nothing");
+}
+
 /// Block until the coordinator's session registry contains exactly
 /// one session with N enrolled participants. Returns its session_id.
 /// Bounded poll loop — gives up after a generous timeout so the test
@@ -392,6 +485,76 @@ async fn a_round_below_the_floor_is_left_before_the_coin_is_committed() {
 // ---------------------------------------------------------------------------
 // SOCKS5 proxy wiring (B: Tor anonymity for /outputs)
 // ---------------------------------------------------------------------------
+
+/// Rising demand reaching another coordinator, end to end over real HTTP: the
+/// wallet asks the tier's leader, the leader is at its live-round limit, and the
+/// wallet enrols with the next node in the tier's order instead.
+#[tokio::test]
+async fn a_full_coordinator_sends_the_wallet_to_the_next_in_the_tiers_order() {
+    async fn serve(full: bool) -> (Arc<CoordinatorState>, String) {
+        let mut state = CoordinatorState::with_components(
+            Network::Signet,
+            Arc::new(wraith_protocol::SystemClock),
+            Arc::new(wraith_protocol::RandomSessionIdGenerator),
+            Some(signet_addr(99)),
+            Some(Arc::new(StubBroadcaster::new()) as Arc<dyn Broadcaster>),
+        )
+        .with_utxo_source(Arc::new(participant_utxos()));
+        if full {
+            state.sessions = wraith_protocol::LiteSessionRegistry::new().with_max_live_rounds(0);
+        }
+        let state = Arc::new(state);
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (state, format!("http://127.0.0.1:{port}"))
+    }
+
+    let (leader, leader_url) = serve(true).await;
+    let (next, next_url) = serve(false).await;
+    let client =
+        WraithSessionClient::new(leader_url, Network::Signet).with_alternates(vec![next_url]);
+    let req = MixRequest {
+        min_entities: 1,
+        tier_id: TIER_ID.into(),
+        ghost_id: "wallet-spill".into(),
+        utxo: ParticipantUtxo {
+            txid: "11".repeat(32),
+            vout: 0,
+            value_sats: SEAT_PRICE,
+            scriptpubkey_hex: participant_address(0).script_pubkey().to_hex_string(),
+        },
+        mix_output_address: participant_address(10).to_string(),
+    };
+    // The round never reaches quorum with one wallet, so prepare_mix waits;
+    // where it enrolled is what is under test, and that happens first.
+    let task = tokio::spawn(async move {
+        client
+            .prepare_mix(req, |_c: &str| async {
+                Ok::<String, WraithClientError>(String::new())
+            })
+            .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while next.sessions.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the wallet never reached the next coordinator"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    task.abort();
+    assert_eq!(
+        next.sessions.len(),
+        1,
+        "enrolled with the next node in the order"
+    );
+    assert!(
+        leader.sessions.is_empty(),
+        "the full leader created nothing"
+    );
+}
 
 #[tokio::test]
 async fn with_outputs_proxy_accepts_valid_socks_url() {
@@ -824,6 +987,7 @@ fn a_prepared_round_below_the_floor_is_refused_before_signing() {
 
     let prepared = PreparedMix {
         session_id: "s".into(),
+        coordinator_url: "http://127.0.0.1:1".into(),
         unsigned_tx: tx,
         input_index: 0,
         prev_amount_sats: 150_000,

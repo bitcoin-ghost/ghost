@@ -36,6 +36,7 @@ use wraith_protocol::anonymity_set::Role;
 use wraith_protocol::composition::CompositionPolicy;
 use wraith_protocol::{
     find_or_create_session, LiteSessionError, LiteTier, SessionDescriptor, SessionType,
+    COORDINATOR_FULL,
 };
 
 use crate::state::CoordinatorState;
@@ -137,7 +138,7 @@ pub async fn post(
     // Try once, retry once if the session we picked got filled out from
     // under us between discover and claim. See module docstring.
     for attempt in 0..2 {
-        let descriptor = find_or_create_session(
+        let descriptor = match find_or_create_session(
             tier,
             session_type,
             req.round_index.unwrap_or(0),
@@ -145,7 +146,28 @@ pub async fn post(
             state.clock.as_ref(),
             state.id_gen.as_ref(),
             state.fill_window_secs,
-        );
+        ) {
+            Ok(d) => d,
+            // Full: every round this node runs for the tier is live and none
+            // has room. 503 with `coordinator_full` is the one refusal a wallet
+            // walks past, to the next node in the tier's order — which is how
+            // a busy tier reaches a second coordinator.
+            Err(e @ LiteSessionError::AtCapacity { .. }) => {
+                debug!(tier = %tier.id(), "find_or_create refused: {e}");
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    COORDINATOR_FULL,
+                    e.to_string(),
+                );
+            }
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session_registry",
+                    e.to_string(),
+                );
+            }
+        };
         let pre_count = descriptor.slots_filled;
         let now = state.now();
         match state.sessions.add_participant(
