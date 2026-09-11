@@ -374,6 +374,37 @@ async fn find_or_create_creates_a_new_session_when_registry_is_empty() {
     assert_eq!(state.sessions.len(), 1);
 }
 
+/// The contract a wallet's spill-over depends on: a coordinator at its
+/// live-round limit answers 503 with `coordinator_full` — the one refusal a
+/// wallet walks past to the next node in the tier's order — and creates nothing.
+#[tokio::test]
+async fn find_or_create_at_the_live_round_limit_answers_coordinator_full() {
+    let mut state = CoordinatorState::with_components(
+        Network::Signet,
+        Arc::new(MockClock::new(1_000_000)),
+        Arc::new(DeterministicSessionIdGenerator::new()),
+        Some(TEST_FEE_ADDRESS.to_string()),
+        None,
+    );
+    state.sessions = wraith_protocol::LiteSessionRegistry::new().with_max_live_rounds(0);
+    let state = Arc::new(state);
+    let response = build_router(state.clone())
+        .oneshot(post_json(
+            "/api/v1/session/find_or_create",
+            serde_json::json!({
+                "tier_id": "100k_sats",
+                "ghost_id": "wallet-alice",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], wraith_protocol::COORDINATOR_FULL);
+    assert_eq!(state.sessions.len(), 0, "a refusal creates nothing");
+}
+
 #[tokio::test]
 async fn find_or_create_joins_an_existing_open_session() {
     let (router, _state, _broadcaster) = deterministic_router(1_000_000);

@@ -142,6 +142,44 @@ pub fn resolve_from_election(
     (endpoints, epoch)
 }
 
+/// Where a wallet may join instead of `chosen` for this tier: the nodes after
+/// it in the tier's order (as [`resolve_from_election`] returns it), when
+/// `chosen` is on that order at all.
+///
+/// A coordinator the user typed in by hand, or one the election does not name,
+/// gets no alternates. Spilling a user's explicit choice onto nodes they did
+/// not pick would be the wallet overriding them.
+///
+/// Endpoints are compared without scheme or trailing slash, since the election
+/// publishes `host:port` and a wallet dials a URL. An alternate with no scheme
+/// borrows `chosen`'s.
+pub fn alternates_after(order: &[String], chosen: &str) -> Vec<String> {
+    fn host_port(s: &str) -> &str {
+        let s = s.trim().trim_end_matches('/');
+        s.strip_prefix("http://")
+            .or_else(|| s.strip_prefix("https://"))
+            .unwrap_or(s)
+    }
+    let scheme = if chosen.trim().starts_with("https://") {
+        "https://"
+    } else {
+        "http://"
+    };
+    let Some(pos) = order.iter().position(|e| host_port(e) == host_port(chosen)) else {
+        return Vec::new();
+    };
+    order[pos + 1..]
+        .iter()
+        .map(|e| {
+            if e.contains("://") {
+                e.clone()
+            } else {
+                format!("{scheme}{}", e.trim())
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +463,43 @@ mod tests {
         assert_eq!(
             roster_agreement(&[view(7, "aa"), silent], 7),
             RosterAgreement::Unchecked
+        );
+    }
+
+    #[test]
+    fn a_wallet_on_the_leader_may_spill_down_the_rest_of_the_order() {
+        let order: Vec<String> = ["1.1.1.1:9100", "2.2.2.2:9100", "3.3.3.3:9100"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            alternates_after(&order, "http://1.1.1.1:9100/"),
+            vec!["http://2.2.2.2:9100", "http://3.3.3.3:9100"],
+            "scheme and trailing slash do not decide identity"
+        );
+        assert_eq!(
+            alternates_after(&order, "http://2.2.2.2:9100"),
+            vec!["http://3.3.3.3:9100"]
+        );
+        assert!(
+            alternates_after(&order, "http://3.3.3.3:9100").is_empty(),
+            "the end of the order"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_the_user_chose_by_hand_gets_no_alternates() {
+        let order = vec!["1.1.1.1:9100".to_string(), "2.2.2.2:9100".to_string()];
+        assert!(alternates_after(&order, "http://my-own-coordinator:9100").is_empty());
+        assert!(alternates_after(&[], "http://1.1.1.1:9100").is_empty());
+    }
+
+    #[test]
+    fn alternates_keep_the_chosen_scheme() {
+        let order = vec!["a.onion:9100".to_string(), "b.onion:9100".to_string()];
+        assert_eq!(
+            alternates_after(&order, "https://a.onion:9100"),
+            vec!["https://b.onion:9100"]
         );
     }
 }

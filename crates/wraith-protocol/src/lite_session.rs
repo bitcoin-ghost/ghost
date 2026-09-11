@@ -111,7 +111,53 @@ pub enum LiteSessionError {
     /// The round's composition rules refused the seat.
     #[error("composition refused the seat: {0}")]
     Composition(String),
+    /// This coordinator already runs its limit of live rounds for the tier, and
+    /// none of them has room. The wallet moves to the next coordinator in the
+    /// tier's order; see [`MAX_LIVE_ROUNDS_PER_TIER`].
+    #[error("coordinator at capacity for {tier}: {live} live rounds, limit {cap}")]
+    AtCapacity {
+        /// The tier refused.
+        tier: &'static str,
+        /// Live rounds it already runs.
+        live: usize,
+        /// The limit.
+        cap: usize,
+    },
 }
+
+/// How many live rounds one coordinator runs per tier before it answers "full"
+/// and the wallet moves to the next coordinator in that tier's order.
+///
+/// This is what turns demand into more coordinators. A tier's leader takes
+/// every round until it holds this many at once; the next wallet is told
+/// [`COORDINATOR_FULL`], walks to the next node in the tier's order, and — since
+/// every wallet walks the same order — the overflow gathers into a real round
+/// there rather than scattering. A busier tier spills further down the order.
+///
+/// # Why a count and not a demand figure
+///
+/// Spilling needs no number the nodes must agree on: the only input is the
+/// answer the full coordinator gives. The demand-sized seat count this replaces
+/// was read from each node's own snapshot of gossiped session counters, and two
+/// nodes could disagree about it.
+///
+/// # What counts as live
+///
+/// Rounds that need the coordinator and have participants waiting on it:
+/// filling (with its window still open), locked, and signing. A round that has
+/// broadcast is only waiting for confirmations; counting it would have a node
+/// report "full" while it sat idle.
+///
+/// A parameter, not a measurement: what one coordinator can carry has not been
+/// measured. Low enough that a busy tier reaches a second node, high enough
+/// that an ordinary burst stays on the leader.
+pub const MAX_LIVE_ROUNDS_PER_TIER: usize = 4;
+
+/// The error code a coordinator at capacity answers `find_or_create` with.
+///
+/// It is the only refusal a wallet walks past. Any other error means a
+/// coordinator answered and said no, which is not a reason to try elsewhere.
+pub const COORDINATOR_FULL: &str = "coordinator_full";
 
 /// Where a session is in its lifecycle. Participants may register only
 /// during `Filling`; signatures may be collected only during `Signing`;
@@ -223,6 +269,20 @@ impl LiteSession {
                     && now < *fill_window_expires_at
             }
             _ => false,
+        }
+    }
+
+    /// Whether this round counts against [`MAX_LIVE_ROUNDS_PER_TIER`]: it needs
+    /// the coordinator and has participants waiting on it.
+    pub fn is_live(&self, now: u64) -> bool {
+        match &self.state {
+            LiteSessionState::Filling {
+                fill_window_expires_at,
+            } => now < *fill_window_expires_at,
+            LiteSessionState::Locked | LiteSessionState::Signing => true,
+            LiteSessionState::Broadcasting
+            | LiteSessionState::Complete
+            | LiteSessionState::Failed { .. } => false,
         }
     }
 }
@@ -497,6 +557,8 @@ impl GossipSink for NullGossipSink {
 pub struct LiteSessionRegistry {
     sessions: Mutex<HashMap<String, LiteSession>>,
     gossip: Option<Box<dyn GossipSink>>,
+    /// Live rounds per tier before `find_or_create_open` refuses.
+    max_live_rounds: usize,
 }
 
 impl LiteSessionRegistry {
@@ -504,7 +566,15 @@ impl LiteSessionRegistry {
         Self {
             sessions: Mutex::new(HashMap::new()),
             gossip: None,
+            max_live_rounds: MAX_LIVE_ROUNDS_PER_TIER,
         }
+    }
+
+    /// Override the live-round limit. For tests and deliberately small
+    /// deployments; a production coordinator uses [`MAX_LIVE_ROUNDS_PER_TIER`].
+    pub fn with_max_live_rounds(mut self, cap: usize) -> Self {
+        self.max_live_rounds = cap;
+        self
     }
 
     /// Construct a registry that publishes state changes to `sink`. Used
@@ -515,6 +585,7 @@ impl LiteSessionRegistry {
         Self {
             sessions: Mutex::new(HashMap::new()),
             gossip: Some(sink),
+            max_live_rounds: MAX_LIVE_ROUNDS_PER_TIER,
         }
     }
 
@@ -672,7 +743,7 @@ impl LiteSessionRegistry {
         round_index: u32,
         now: u64,
         new_session: LiteSession,
-    ) -> SessionDescriptor {
+    ) -> Result<SessionDescriptor, LiteSessionError> {
         // Single critical section for both the find and the
         // possible insert. No other registry operation can race
         // with us between those two steps.
@@ -688,9 +759,24 @@ impl LiteSessionRegistry {
                     && s.round_index == round_index
                     && s.is_open_for_new_participants(now)
             }) {
-                return SessionDescriptor::from_session(existing);
+                return Ok(SessionDescriptor::from_session(existing));
             }
-            // None open — insert the prebuilt session.
+            // None open. Refuse rather than open another round past the limit:
+            // the wallet takes the refusal to the next node in the tier's order.
+            // Counted inside the same critical section as the insert, so two
+            // concurrent callers cannot both see room for one more.
+            let live = guard
+                .values()
+                .filter(|s| s.tier == tier && s.session_type == session_type && s.is_live(now))
+                .count();
+            if live >= self.max_live_rounds {
+                return Err(LiteSessionError::AtCapacity {
+                    tier: tier.id(),
+                    live,
+                    cap: self.max_live_rounds,
+                });
+            }
+            // Insert the prebuilt session.
             assert!(
                 !guard.contains_key(&new_session.session_id),
                 "session_id collision (csprng broken or dev test using duplicate id): {}",
@@ -704,7 +790,7 @@ impl LiteSessionRegistry {
         if let Some(s) = created {
             self.gossip(SessionGossipEvent::SessionCreated { session: s });
         }
-        descriptor
+        Ok(descriptor)
     }
 
     /// Add a participant to an existing session. Validates state +
@@ -953,7 +1039,7 @@ pub fn find_or_create_session(
     clock: &dyn Clock,
     id_gen: &dyn SessionIdGenerator,
     fill_window_secs: u64,
-) -> SessionDescriptor {
+) -> Result<SessionDescriptor, LiteSessionError> {
     let now = clock.unix_secs();
     // Build the prospective new session up front — id_gen produces
     // a fresh session_id that we'll only end up using if we find no
@@ -1002,7 +1088,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_eq!(d.session_id, "test-session-0000");
         assert_eq!(d.tier_id, "100k_sats");
         assert_eq!(d.state, "filling");
@@ -1023,7 +1110,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let d2 = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Mix,
@@ -1032,7 +1120,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_eq!(d1.session_id, d2.session_id);
         // Only one session in the registry — the second call didn't
         // accidentally create a duplicate.
@@ -1070,6 +1159,7 @@ mod tests {
                     &*g,
                     LITE_FILL_WINDOW_SECS,
                 )
+                .expect("under the live-round limit")
                 .session_id
             }));
         }
@@ -1100,7 +1190,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let d_big = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
@@ -1109,7 +1200,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_ne!(d_small.session_id, d_big.session_id);
         assert_eq!(d_small.tier_id, "100k_sats");
         assert_eq!(d_big.tier_id, "1m_sats");
@@ -1130,7 +1222,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let jump = find_or_create_session(
             LiteTier::Denom100kSats,
             SessionType::Jump,
@@ -1139,7 +1232,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_ne!(mix.session_id, jump.session_id);
         assert_eq!(reg.len(), 2);
     }
@@ -1155,7 +1249,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Fill it to the max (20 for 100k tier).
         for i in 0..20 {
             reg.add_participant(
@@ -1179,7 +1274,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_ne!(d.session_id, d2.session_id);
         assert_eq!(reg.len(), 2);
     }
@@ -1195,7 +1291,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Advance past the fill window (300s).
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let d2 = find_or_create_session(
@@ -1206,7 +1303,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_ne!(d1.session_id, d2.session_id);
         // Old session is still in registry but no longer "open."
         assert_eq!(reg.len(), 2);
@@ -1223,7 +1321,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_eq!(d.slots_filled, 0);
         let d2 = reg
             .add_participant(
@@ -1248,7 +1347,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         reg.add_participant(
             &d.session_id,
             "alice",
@@ -1283,7 +1383,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         for i in 0..20 {
             reg.add_participant(
                 &d.session_id,
@@ -1322,7 +1423,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let err = reg
             .add_participant(
@@ -1352,7 +1454,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // 5 participants is exactly min — enough for quorum.
         for i in 0..5 {
             reg.add_participant(
@@ -1382,7 +1485,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // 4 < min participants of 5.
         for i in 0..4 {
             reg.add_participant(
@@ -1416,7 +1520,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
         let first = reg.tick(clock.unix_secs());
         let second = reg.tick(clock.unix_secs());
@@ -1438,7 +1543,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Fill to max → Locked.
         for i in 0..20 {
             reg.add_participant(
@@ -1470,7 +1576,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Cannot go Filling → Broadcasting.
         let err = reg
             .transition_to_broadcasting(&d.session_id)
@@ -1494,7 +1601,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let r = reg.fail_session(&d.session_id, "test-abort").unwrap();
         assert_eq!(r.state, "failed");
         // Re-failing a Failed session is rejected.
@@ -1515,7 +1623,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let s = serde_json::to_string(&d).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
@@ -1585,7 +1694,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_eq!(sink.len(), 1);
         match &sink.events()[0] {
             SessionGossipEvent::SessionCreated { session } => {
@@ -1608,7 +1718,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         active
             .add_participant(
                 &d.session_id,
@@ -1645,7 +1756,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         for i in 0..LiteTier::Denom100kSats.max_participants() {
             active
                 .add_participant(
@@ -1680,7 +1792,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         for i in 0..LiteTier::Denom100kSats.min_participants() {
             active
                 .add_participant(
@@ -1700,7 +1813,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         sink.events(); // checkpoint baseline
         let baseline = sink.len();
         clock.advance(LITE_FILL_WINDOW_SECS + 1);
@@ -1730,7 +1844,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Fill to max so we're Locked.
         for i in 0..LiteTier::Denom100kSats.max_participants() {
             active
@@ -1770,7 +1885,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let baseline = sink.len();
         active.fail_session(&d.session_id, "test-abort").unwrap();
         let new_events = &sink.events()[baseline..];
@@ -1795,7 +1911,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Apply the captured event.
         for ev in sink.events() {
             standby.apply_event(ev).unwrap();
@@ -1819,7 +1936,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         active
             .add_participant(
                 &d.session_id,
@@ -1890,7 +2008,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         for i in 0..5 {
             active
                 .add_participant(
@@ -1916,7 +2035,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         for i in 0..3 {
             active
                 .add_participant(
@@ -1969,7 +2089,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // No way to inspect the null sink (by design), but no panic = pass.
         assert_eq!(registry.len(), 1);
     }
@@ -2027,7 +2148,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         let other_tier = find_or_create_session(
             LiteTier::Denom1mSats,
             SessionType::Mix,
@@ -2036,7 +2158,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         // Fill the second one to max so it locks.
         for i in 0..LiteTier::Denom1mSats.max_participants() {
             reg.add_participant(
@@ -2058,7 +2181,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         assert_ne!(new_1m.session_id, other_tier.session_id);
         // Registry now has 3 sessions.
         assert_eq!(reg.len(), 3);
@@ -2077,7 +2201,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         for i in 0..policy.max_mixing_slots {
             reg.add_participant(
                 &d.session_id,
@@ -2124,7 +2249,8 @@ mod tests {
             &clock,
             &gen,
             LITE_FILL_WINDOW_SECS,
-        );
+        )
+        .expect("under the live-round limit");
         reg.add_participant(
             &d.session_id,
             "lp-7-a",
@@ -2162,5 +2288,150 @@ mod tests {
         let p: LiteSessionParticipant =
             serde_json::from_str(r#"{"ghost_id":"g1","registered_at":1}"#).expect("parses");
         assert_eq!(p.role, Role::Payer);
+    }
+
+    // ── the live-round limit: what turns demand into more coordinators ──
+
+    /// Open a 100k round and fill it to its maximum, which locks it.
+    fn a_locked_round(
+        reg: &LiteSessionRegistry,
+        clock: &MockClock,
+        gen: &DeterministicSessionIdGenerator,
+        tag: &str,
+    ) -> String {
+        let d = find_or_create_session(
+            LiteTier::Denom100kSats,
+            SessionType::Mix,
+            0,
+            reg,
+            clock,
+            gen,
+            LITE_FILL_WINDOW_SECS,
+        )
+        .expect("room for another round");
+        for i in 0..LiteTier::Denom100kSats.max_participants() {
+            reg.add_participant(
+                &d.session_id,
+                &format!("{tag}-{i}"),
+                Role::Payer,
+                CompositionPolicy::default(),
+                clock.unix_secs(),
+            )
+            .expect("add up to max");
+        }
+        assert!(matches!(
+            reg.get(&d.session_id).unwrap().state,
+            LiteSessionState::Locked
+        ));
+        d.session_id
+    }
+
+    fn ask(
+        reg: &LiteSessionRegistry,
+        clock: &MockClock,
+        gen: &DeterministicSessionIdGenerator,
+        tier: LiteTier,
+    ) -> Result<SessionDescriptor, LiteSessionError> {
+        find_or_create_session(
+            tier,
+            SessionType::Mix,
+            0,
+            reg,
+            clock,
+            gen,
+            LITE_FILL_WINDOW_SECS,
+        )
+    }
+
+    #[test]
+    fn a_coordinator_at_its_limit_refuses_a_new_round() {
+        let (reg, clock, gen) = fixtures();
+        for r in 0..MAX_LIVE_ROUNDS_PER_TIER {
+            a_locked_round(&reg, &clock, &gen, &format!("r{r}"));
+        }
+        match ask(&reg, &clock, &gen, LiteTier::Denom100kSats) {
+            Err(LiteSessionError::AtCapacity { tier, live, cap }) => {
+                assert_eq!(
+                    (tier, live, cap),
+                    (
+                        "100k_sats",
+                        MAX_LIVE_ROUNDS_PER_TIER,
+                        MAX_LIVE_ROUNDS_PER_TIER
+                    )
+                );
+            }
+            other => panic!("expected a refusal at the limit, got {other:?}"),
+        }
+        assert_eq!(
+            reg.len(),
+            MAX_LIVE_ROUNDS_PER_TIER,
+            "the refusal created nothing"
+        );
+    }
+
+    #[test]
+    fn an_open_round_is_still_joined_at_the_limit() {
+        // The limit stops a NEW round, never a seat in one that is filling:
+        // refusing there would split a round that has room.
+        let (reg, clock, gen) = fixtures();
+        for r in 0..MAX_LIVE_ROUNDS_PER_TIER - 1 {
+            a_locked_round(&reg, &clock, &gen, &format!("r{r}"));
+        }
+        let filling = ask(&reg, &clock, &gen, LiteTier::Denom100kSats).expect("the last slot");
+        let again = ask(&reg, &clock, &gen, LiteTier::Denom100kSats).expect("joins the open round");
+        assert_eq!(again.session_id, filling.session_id);
+    }
+
+    #[test]
+    fn a_broadcast_round_frees_its_place() {
+        // Waiting for confirmations needs nothing from the coordinator, so it
+        // must not hold a place a filling round could use.
+        let (reg, clock, gen) = fixtures();
+        let ids: Vec<String> = (0..MAX_LIVE_ROUNDS_PER_TIER)
+            .map(|r| a_locked_round(&reg, &clock, &gen, &format!("r{r}")))
+            .collect();
+        assert!(ask(&reg, &clock, &gen, LiteTier::Denom100kSats).is_err());
+        reg.transition_to_signing(&ids[0]).unwrap();
+        assert!(
+            ask(&reg, &clock, &gen, LiteTier::Denom100kSats).is_err(),
+            "signing is still live"
+        );
+        reg.transition_to_broadcasting(&ids[0]).unwrap();
+        assert!(ask(&reg, &clock, &gen, LiteTier::Denom100kSats).is_ok());
+    }
+
+    #[test]
+    fn an_expired_filling_round_does_not_hold_a_place() {
+        let (reg, clock, gen) = fixtures();
+        for r in 0..MAX_LIVE_ROUNDS_PER_TIER - 1 {
+            a_locked_round(&reg, &clock, &gen, &format!("r{r}"));
+        }
+        ask(&reg, &clock, &gen, LiteTier::Denom100kSats).expect("a filling round");
+        clock.advance(LITE_FILL_WINDOW_SECS + 1);
+        assert!(ask(&reg, &clock, &gen, LiteTier::Denom100kSats).is_ok());
+    }
+
+    #[test]
+    fn the_limit_is_per_tier() {
+        let (reg, clock, gen) = fixtures();
+        for r in 0..MAX_LIVE_ROUNDS_PER_TIER {
+            a_locked_round(&reg, &clock, &gen, &format!("r{r}"));
+        }
+        assert!(ask(&reg, &clock, &gen, LiteTier::Denom100kSats).is_err());
+        assert!(
+            ask(&reg, &clock, &gen, LiteTier::Denom1mSats).is_ok(),
+            "a busy tier does not block another"
+        );
+    }
+
+    #[test]
+    fn a_registry_can_be_given_a_smaller_limit() {
+        let (_, clock, gen) = fixtures();
+        let reg = LiteSessionRegistry::new().with_max_live_rounds(1);
+        a_locked_round(&reg, &clock, &gen, "only");
+        assert!(matches!(
+            ask(&reg, &clock, &gen, LiteTier::Denom100kSats),
+            Err(LiteSessionError::AtCapacity { cap: 1, .. })
+        ));
     }
 }

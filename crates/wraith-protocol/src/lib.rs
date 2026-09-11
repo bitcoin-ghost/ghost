@@ -67,7 +67,8 @@ pub use lite_session::{
     find_or_create_session, Clock, DeterministicSessionIdGenerator, GossipSink, LiteSession,
     LiteSessionError, LiteSessionParticipant, LiteSessionRegistry, LiteSessionState, MockClock,
     NullGossipSink, RandomSessionIdGenerator, RecordingGossipSink, SessionDescriptor,
-    SessionGossipEvent, SessionIdGenerator, SystemClock,
+    SessionGossipEvent, SessionIdGenerator, SystemClock, COORDINATOR_FULL,
+    MAX_LIVE_ROUNDS_PER_TIER,
 };
 
 pub mod ownership;
