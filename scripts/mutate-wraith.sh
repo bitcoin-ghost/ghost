@@ -137,8 +137,8 @@ mutate "eligibility ignores maturity" eligibility.rs \
 '    if known < policy.maturity_secs {' \
 '    if false {' eligibility
 
-mutate "eligibility ignores archive mode" eligibility.rs \
-'    if policy.require_archive && !facts.archive {' \
+mutate "eligibility conscripts nodes that did not opt in" eligibility.rs \
+'    if !facts.opted_in {' \
 '    if false {' eligibility
 
 mutate "assignment ignores the modulus check" assignment.rs \

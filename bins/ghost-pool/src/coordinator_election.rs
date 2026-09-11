@@ -35,22 +35,8 @@ use ghost_common::rpc::BitcoinRpc;
 use ghost_consensus::mesh::MeshNetwork;
 
 use ghost_common::types::NodeCapabilities;
+use tracing::info;
 use wraith_protocol::eligibility::{eligible_roster, EligibilityPolicy, NodeFacts};
-
-/// Verified-capability lookup, matching `CapabilityVerifierCallback` in
-/// `ghost-consensus` so the same provider serves both.
-pub type QualifiedCapsFn = Arc<dyn Fn(&CoordinatorNodeId) -> NodeCapabilities + Send + Sync>;
-
-/// Did this node pass the qualification gatekeeper at all?
-///
-/// Judged on the **verified** capability flags. `coordinator` is deliberately
-/// excluded: it is documented as opt-in that "needs no verification challenge",
-/// so counting it would let a self-declared flag masquerade as a challenge
-/// result — which is exactly the confusion this whole roster change exists to
-/// remove.
-fn passed_gatekeeper(caps: &NodeCapabilities) -> bool {
-    caps.archive_mode || caps.ghost_pay || caps.public_mining || caps.reaper || caps.elder_status
-}
 use wraith_protocol::epoch::canonical_roster;
 use wraith_protocol::roster_snapshot::roster_commitment;
 use wraith_protocol::service::{CoordinatorView, EndpointMap};
@@ -188,6 +174,71 @@ struct Cached {
     /// the roster comes from live mesh state, which is the defect this value
     /// exposes rather than repairs.
     roster_commitment: [u8; 32],
+    /// The endpoint map the view was built with, kept so a refresh can tell
+    /// whether anything a wallet would dial has changed.
+    endpoints: EndpointMap,
+    /// Session demand as first read this epoch. Frozen: the roster may still
+    /// change within an epoch, the seat target may not, or ordinary churn in
+    /// the session counters would reshuffle seats every few minutes.
+    demand: u64,
+    /// This node held a seat in some view of this epoch, not necessarily the
+    /// current one. See [`CoordinatorElection::should_serve`].
+    seated_this_epoch: bool,
+}
+
+/// The view to cache next, or `None` to keep the current one.
+///
+/// # Why this runs on every refresh, not once per epoch
+///
+/// The view used to be computed once, when the epoch changed, and then held for
+/// the rest of the epoch (~a day). Whatever the peer table looked like at that
+/// instant became this node's roster until the next flip. A node restarted
+/// mid-epoch drew from a table health pings had barely begun to fill; a node
+/// that computed before a peer opted in never saw that peer at all.
+///
+/// Measured on mainnet the night all eight nodes opted in (2026-09-10, epoch
+/// 6711): one node restarted while three others still had coordinating switched
+/// off, and ten hours later its roster was still missing exactly those three.
+/// The rest of the fleet had filled in theirs, so it elected a different
+/// coordinator from everyone else.
+///
+/// Recomputing the roster whenever it is asked for lets every node converge on
+/// the gossip it now holds. The beacon and the seat target stay frozen for the
+/// epoch; only the roster, and with it the draw, may move.
+fn next_view(
+    prev: Option<&Cached>,
+    self_id: &CoordinatorNodeId,
+    epoch: u64,
+    fresh_beacon: Option<[u8; 32]>,
+    roster: Vec<CoordinatorNodeId>,
+    endpoints: EndpointMap,
+    demand: u64,
+) -> Option<Cached> {
+    let (beacon, demand, seated_before) = match prev.filter(|c| c.epoch == epoch) {
+        Some(c) => {
+            if c.roster == roster && c.endpoints == endpoints {
+                return None;
+            }
+            (c.beacon, c.demand, c.seated_this_epoch)
+        }
+        // A new epoch needs its own beacon. Without one, keep the last good view
+        // rather than cache a partial one.
+        None => (fresh_beacon?, demand, false),
+    };
+    let seats = seats_for_demand(demand, roster.len());
+    let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints.clone(), seats);
+    let anchor_height = anchor_height_for_epoch(epoch);
+    Some(Cached {
+        epoch,
+        seated_this_epoch: seated_before || view.am_i_coordinator(self_id),
+        view,
+        beacon,
+        roster_commitment: roster_commitment(epoch, anchor_height, &roster),
+        roster,
+        anchor_height,
+        endpoints,
+        demand,
+    })
 }
 
 /// Live coordinator-election service for ghost-pool.
@@ -211,12 +262,6 @@ pub struct CoordinatorElection {
     mesh: Arc<MeshNetwork>,
     /// Ghost Core RPC — source of the beacon anchor (block hash at a height).
     rpc: Arc<BitcoinRpc>,
-    /// Verified capabilities for a node, from `QualifiedCapabilityProvider`.
-    ///
-    /// Returns what a node has **proved** through challenges, not what it
-    /// claims in its health ping. The distinction is the point: archive mode is
-    /// the Sybil cost, and a claimed one costs nothing.
-    qualified_caps: QualifiedCapsFn,
     /// Cached current-epoch view.
     cached: RwLock<Option<Cached>>,
 }
@@ -230,10 +275,8 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
-        qualified_caps: QualifiedCapsFn,
     ) -> Self {
         Self {
-            qualified_caps,
             self_id: identity.node_id(),
             self_coordinator: capabilities.coordinator,
             self_endpoint,
@@ -252,7 +295,6 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
-        qualified_caps: QualifiedCapsFn,
     ) -> Option<Arc<Self>> {
         if !enabled {
             return None;
@@ -263,17 +305,16 @@ impl CoordinatorElection {
             self_endpoint,
             mesh,
             rpc,
-            qualified_caps,
         )))
     }
 
     /// The eligible coordinator roster for this epoch, plus the endpoint map.
     ///
-    /// A peer is eligible iff it opted in, advertises a dialable endpoint, has
-    /// **verified** archive capability, passed the qualification gatekeeper, is
-    /// mature, and is not long-absent. Self is judged by the same verified
-    /// verdict as everyone else. The roster is canonicalised (dedup + sort), so
-    /// a node's own collection order cannot change the result.
+    /// A peer is eligible iff it opted in, advertises a dialable endpoint, is
+    /// mature, and is not long-absent — all of it declared by the peer and
+    /// gossiped, so nodes holding the same gossip agree. The roster is
+    /// canonicalised (dedup + sort), so a node's own collection order cannot
+    /// change the result.
     ///
     /// # Declared facts only
     ///
@@ -286,9 +327,11 @@ impl CoordinatorElection {
     /// order-independent, not two nodes' answers equal.
     ///
     /// Eligibility is now `wraith_protocol::eligibility`, over facts a node
-    /// declared about itself or the network agreed on together: opted in, has
-    /// an endpoint, qualified, archive, mature, not long-absent. None of it
-    /// depends on whether *this* node holds a socket.
+    /// declared about itself: opted in, has an endpoint, mature, not
+    /// long-absent. None of it depends on whether *this* node holds a socket,
+    /// or on the verdicts *this* node happens to hold — the verified archive
+    /// and qualification checks were removed for that reason (see that
+    /// module).
     ///
     /// `Cached::roster_commitment` stays regardless — it is how a split is
     /// *seen*, and it is the only field in the status response one node cannot
@@ -309,21 +352,15 @@ impl CoordinatorElection {
         // honest nodes disagree.
         for p in self.mesh.peers().get_all_peers() {
             let endpoint = p.coordinator_endpoint.clone();
-            // Verified, not claimed. `p.capabilities.archive_mode` is what the
-            // peer says about itself; this is what it proved under challenge,
-            // and a claimed archive flag costs an attacker nothing.
-            let verified = (self.qualified_caps)(&p.node_id);
             let f = NodeFacts {
                 node_id: p.node_id,
                 // Opt-in stays declared: `coordinator` carries no challenge by
                 // design, and a node that has not asked to coordinate should
                 // not be conscripted.
                 opted_in: p.capabilities.coordinator,
-                archive: verified.archive_mode,
                 endpoint: endpoint.clone(),
                 first_seen_secs: p.first_seen,
                 last_seen_secs: p.last_seen,
-                qualified: passed_gatekeeper(&verified),
             };
             if let Some(ep) = endpoint {
                 if !ep.trim().is_empty() {
@@ -341,18 +378,12 @@ impl CoordinatorElection {
                 .filter(|e| !e.trim().is_empty())
             {
                 endpoints.insert(self.self_id, ep.to_string());
-                // Self is judged by the same verified verdict as everyone
-                // else. Trusting our own claim here would make this node the
-                // one peer that never has to prove anything.
-                let mine = (self.qualified_caps)(&self.self_id);
                 facts.push(NodeFacts {
                     node_id: self.self_id,
                     opted_in: true,
-                    archive: mine.archive_mode,
                     endpoint: Some(ep.to_string()),
                     first_seen_secs: 0,
                     last_seen_secs: now,
-                    qualified: passed_gatekeeper(&mine),
                 });
                 demand = demand.saturating_add(self.mesh.coordinator_sessions() as u64);
             }
@@ -374,46 +405,64 @@ impl CoordinatorElection {
         Some(derive_beacon(epoch, &anchor))
     }
 
-    /// Recompute and cache the `CoordinatorView` for the epoch `current_height`
-    /// falls in — but only when the epoch has actually changed since the last
-    /// cached view (cheap no-op otherwise). Safe to call on every new block /
-    /// round advance. Returns the (possibly unchanged) current epoch.
+    /// Recompute the roster and, if it or the epoch has changed, rebuild and
+    /// cache the `CoordinatorView` for the epoch `current_height` falls in.
+    /// Safe to call on every new block / round advance: the beacon is fetched
+    /// once per epoch, and an unchanged roster is a no-op. Returns the current
+    /// epoch.
     ///
     /// On any input failure (no anchor block yet, RPC error) it leaves the
     /// existing cache untouched and returns the current epoch unchanged — never
     /// poisons the cache with a partial view.
     pub async fn refresh_for_height(&self, current_height: u64) -> u64 {
         let epoch = epoch_for_height(current_height);
+        let (roster, endpoints, demand) = self.roster_with_endpoints();
 
-        // Fast path: same epoch as the cached view → nothing to do.
-        if let Some(c) = self.cached.read().as_ref() {
-            if c.epoch == epoch {
+        let same_epoch = self
+            .cached
+            .read()
+            .as_ref()
+            .is_some_and(|c| c.epoch == epoch);
+        let fresh_beacon = if same_epoch {
+            None
+        } else {
+            let Some(beacon) = self.beacon_for_epoch(epoch).await else {
+                // Anchor not reachable yet — keep the last good view.
                 return epoch;
-            }
-        }
+            };
+            Some(beacon)
+        };
 
-        let Some(beacon) = self.beacon_for_epoch(epoch).await else {
-            // Anchor not reachable yet — keep the last good view.
+        let (next, previous_size) = {
+            let guard = self.cached.read();
+            let prev = guard.as_ref();
+            let previous_size = prev.filter(|c| c.epoch == epoch).map(|c| c.roster.len());
+            let next = next_view(
+                prev,
+                &self.self_id,
+                epoch,
+                fresh_beacon,
+                roster,
+                endpoints,
+                demand,
+            );
+            (next, previous_size)
+        };
+        let Some(next) = next else {
             return epoch;
         };
-        // Roster = opted-in coordinators advertising a reachable endpoint (+ self
-        // when opted in), with the endpoint map a wallet uses to dial the owner.
-        // Seats are sized from the frozen, mesh-summed recent session demand —
-        // this recompute only runs when the epoch flips, so the snapshot is the
-        // per-epoch freeze.
-        let (roster, endpoints, demand) = self.roster_with_endpoints();
-        let seats = seats_for_demand(demand, roster.len());
-        let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, seats);
-        let anchor_height = anchor_height_for_epoch(epoch);
-        let commitment = roster_commitment(epoch, anchor_height, &roster);
-        *self.cached.write() = Some(Cached {
+        // Said once per change, so a split can be traced to the moment one
+        // node's roster moved rather than reconstructed afterwards.
+        info!(
             epoch,
-            view,
-            beacon,
-            roster,
-            anchor_height,
-            roster_commitment: commitment,
-        });
+            within_epoch = same_epoch,
+            roster_size = next.roster.len(),
+            previous_roster_size = ?previous_size,
+            seats = next.view.seats(),
+            roster_commitment = %hex::encode(next.roster_commitment),
+            "Coordinator roster changed"
+        );
+        *self.cached.write() = Some(next);
         epoch
     }
 
@@ -426,6 +475,23 @@ impl CoordinatorElection {
             .as_ref()
             .map(|c| c.view.am_i_coordinator(&self.self_id))
             .unwrap_or(false)
+    }
+
+    /// Whether THIS node should be running its coordinator: seated now, **or
+    /// seated at any point earlier in this epoch**.
+    ///
+    /// Distinct from [`Self::am_i_coordinator`] because the roster can now move
+    /// within an epoch. A node that loses its seat mid-epoch may be holding
+    /// rounds that participants have already committed inputs to, and stopping
+    /// the coordinator aborts them. So it keeps serving until the epoch turns:
+    /// new wallets follow the current view elsewhere, and the rounds it already
+    /// holds get to finish. The cost is an idle coordinator for the rest of a
+    /// day, which is cheap.
+    pub fn should_serve(&self) -> bool {
+        self.cached
+            .read()
+            .as_ref()
+            .is_some_and(|c| c.seated_this_epoch)
     }
 
     /// A JSON snapshot of the cached election for the read-only HTTP endpoint:
@@ -674,6 +740,251 @@ mod tests {
         assert_eq!(seats_for_demand(10_000, 3), 3);
         // … and by MAX_SEATS when plenty are eligible.
         assert_eq!(seats_for_demand(10_000_000, 100), MAX_SEATS);
+    }
+
+    // ── refresh: the roster converges within an epoch ──
+
+    /// A node outside every test roster, for tests about the roster rather
+    /// than about this node's own seat.
+    const OBSERVER: CoordinatorNodeId = [0xEE; 32];
+
+    fn endpoints_for(roster: &[CoordinatorNodeId]) -> EndpointMap {
+        roster
+            .iter()
+            .map(|id| (*id, format!("10.0.0.{}:9100", id[0])))
+            .collect()
+    }
+
+    fn first_draw_as(
+        me: &CoordinatorNodeId,
+        epoch: u64,
+        roster: &[CoordinatorNodeId],
+        demand: u64,
+    ) -> Cached {
+        next_view(
+            None,
+            me,
+            epoch,
+            Some(derive_beacon(epoch, &[7u8; 32])),
+            roster.to_vec(),
+            endpoints_for(roster),
+            demand,
+        )
+        .expect("a first draw with a beacon always produces a view")
+    }
+
+    fn first_draw(epoch: u64, roster: &[CoordinatorNodeId], demand: u64) -> Cached {
+        first_draw_as(&OBSERVER, epoch, roster, demand)
+    }
+
+    /// Same epoch, a new roster — what a refresh does once more gossip is in.
+    fn redraw_as(
+        me: &CoordinatorNodeId,
+        prev: &Cached,
+        roster: &[CoordinatorNodeId],
+    ) -> Option<Cached> {
+        next_view(
+            Some(prev),
+            me,
+            prev.epoch,
+            None,
+            roster.to_vec(),
+            endpoints_for(roster),
+            prev.demand,
+        )
+    }
+
+    fn winner(c: &Cached) -> CoordinatorNodeId {
+        c.view.seated()[0].node_id
+    }
+
+    /// The mainnet failure, epoch 6711: a node that drew while three peers had
+    /// not yet opted in kept that roster for the whole epoch, and elected a
+    /// different coordinator from the nodes that drew later.
+    #[test]
+    fn a_node_that_drew_early_converges_on_the_late_nodes_election() {
+        let full: Vec<_> = (1u8..=8).map(node).collect();
+        let partial: Vec<_> = full.iter().copied().filter(|id| id[0] > 3).collect();
+
+        let late = first_draw(6711, &full, 0);
+        let early = first_draw(6711, &partial, 0);
+        assert_ne!(
+            early.roster_commitment, late.roster_commitment,
+            "precondition: the two nodes start out split"
+        );
+
+        let caught_up = redraw_as(&OBSERVER, &early, &full)
+            .expect("a roster that grew within the epoch must be redrawn, not held");
+
+        let seating = |c: &Cached| -> Vec<(u32, CoordinatorNodeId, Option<String>)> {
+            c.view
+                .seated()
+                .into_iter()
+                .map(|s| (s.seat, s.node_id, s.endpoint))
+                .collect()
+        };
+        assert_eq!(caught_up.roster_commitment, late.roster_commitment);
+        assert_eq!(caught_up.beacon, late.beacon);
+        assert_eq!(
+            seating(&caught_up),
+            seating(&late),
+            "same roster and beacon must seat the same coordinators"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_roster_is_not_redrawn() {
+        let roster: Vec<_> = (1u8..=8).map(node).collect();
+        let cached = first_draw(10, &roster, 0);
+        assert!(redraw_as(&OBSERVER, &cached, &roster).is_none());
+    }
+
+    #[test]
+    fn a_moved_endpoint_is_picked_up_within_the_epoch() {
+        // A wallet dials the endpoint, so a stale one is as wrong as a stale
+        // roster even when the draw itself is unchanged.
+        let roster: Vec<_> = (1u8..=5).map(node).collect();
+        let cached = first_draw(10, &roster, 0);
+        let mut moved = endpoints_for(&roster);
+        moved.insert(node(2), "10.9.9.9:9100".into());
+        let next = next_view(Some(&cached), &OBSERVER, 10, None, roster, moved.clone(), 0)
+            .expect("a changed endpoint must be republished");
+        assert_eq!(next.endpoints, moved);
+    }
+
+    #[test]
+    fn the_seat_target_is_frozen_for_the_epoch() {
+        // Session counters move constantly. If a roster change also re-read
+        // them, seats would be resized mid-epoch by ordinary traffic.
+        let roster: Vec<_> = (1u8..=8).map(node).collect();
+        let cached = first_draw(10, &roster[..6], 0);
+        assert_eq!(cached.view.seats(), 1);
+        let busy = TARGET_SESSIONS_PER_SEAT * 4;
+        let next = next_view(
+            Some(&cached),
+            &OBSERVER,
+            10,
+            None,
+            roster.clone(),
+            endpoints_for(&roster),
+            busy,
+        )
+        .unwrap();
+        assert_eq!(
+            next.view.seats(),
+            1,
+            "demand read mid-epoch must not resize seats"
+        );
+        assert_eq!(next.demand, 0);
+    }
+
+    #[test]
+    fn a_new_epoch_is_drawn_with_its_own_beacon_and_demand() {
+        let roster: Vec<_> = (1u8..=8).map(node).collect();
+        let cached = first_draw(10, &roster, 0);
+        let busy = TARGET_SESSIONS_PER_SEAT * 3;
+        let beacon = derive_beacon(11, &[8u8; 32]);
+        let next = next_view(
+            Some(&cached),
+            &OBSERVER,
+            11,
+            Some(beacon),
+            roster.clone(),
+            endpoints_for(&roster),
+            busy,
+        )
+        .expect("a new epoch is always redrawn");
+        assert_eq!(next.epoch, 11);
+        assert_eq!(next.beacon, beacon);
+        assert_eq!(next.view.seats(), 3);
+    }
+
+    #[test]
+    fn a_new_epoch_without_its_beacon_keeps_the_last_good_view() {
+        let roster: Vec<_> = (1u8..=8).map(node).collect();
+        let cached = first_draw(10, &roster, 0);
+        assert!(next_view(
+            Some(&cached),
+            &OBSERVER,
+            11,
+            None,
+            roster.clone(),
+            endpoints_for(&roster),
+            0
+        )
+        .is_none());
+    }
+
+    /// An epoch in which the full roster seats a node the partial roster did
+    /// not — so the partial roster's winner loses its seat on catching up.
+    /// Searched for rather than hard-coded, so the test states the situation it
+    /// needs instead of depending on what one beacon happens to rank first.
+    fn epoch_where_catching_up_unseats(
+        full: &[CoordinatorNodeId],
+        partial: &[CoordinatorNodeId],
+    ) -> (u64, CoordinatorNodeId) {
+        (1..500u64)
+            .find_map(|epoch| {
+                let early = winner(&first_draw(epoch, partial, 0));
+                let late = winner(&first_draw(epoch, full, 0));
+                (early != late).then_some((epoch, early))
+            })
+            .expect("some epoch in 500 seats a node outside the partial roster")
+    }
+
+    #[test]
+    fn a_seat_lost_within_the_epoch_is_served_until_the_epoch_turns() {
+        // Stopping the coordinator aborts the rounds it holds, and participants
+        // may already have committed inputs to them. Losing the seat to a
+        // roster that filled in is not a reason to do that.
+        let full: Vec<_> = (1u8..=8).map(node).collect();
+        let partial: Vec<_> = full.iter().copied().filter(|id| id[0] > 3).collect();
+        let (epoch, me) = epoch_where_catching_up_unseats(&full, &partial);
+
+        let early = first_draw_as(&me, epoch, &partial, 0);
+        assert!(
+            early.view.am_i_coordinator(&me),
+            "precondition: seated early"
+        );
+        assert!(early.seated_this_epoch);
+
+        let caught_up = redraw_as(&me, &early, &full).unwrap();
+        assert!(
+            !caught_up.view.am_i_coordinator(&me),
+            "the published view moves on — new wallets go to the new seat"
+        );
+        assert!(
+            caught_up.seated_this_epoch,
+            "but the coordinator keeps serving what it already holds"
+        );
+    }
+
+    #[test]
+    fn a_new_epoch_forgets_a_seat_held_in_the_last_one() {
+        let full: Vec<_> = (1u8..=8).map(node).collect();
+        let partial: Vec<_> = full.iter().copied().filter(|id| id[0] > 3).collect();
+        let (epoch, me) = epoch_where_catching_up_unseats(&full, &partial);
+        let held = redraw_as(&me, &first_draw_as(&me, epoch, &partial, 0), &full).unwrap();
+        assert!(held.seated_this_epoch);
+
+        // Walk forward to an epoch that does not seat `me`, so the only way it
+        // could still be serving is a seat carried over from before.
+        let next = (epoch + 1..epoch + 500)
+            .find_map(|e| {
+                let v = next_view(
+                    Some(&held),
+                    &me,
+                    e,
+                    Some(derive_beacon(e, &[7u8; 32])),
+                    full.clone(),
+                    endpoints_for(&full),
+                    0,
+                )
+                .unwrap();
+                (!v.view.am_i_coordinator(&me)).then_some(v)
+            })
+            .expect("some later epoch leaves `me` unseated");
+        assert!(!next.seated_this_epoch, "a seat does not outlive its epoch");
     }
 
     #[test]
