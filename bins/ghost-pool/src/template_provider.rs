@@ -426,6 +426,41 @@ impl TemplateDistributionServer {
 // Client Handler
 // ============================================================================
 
+/// Releases a TDP client slot on EVERY exit path — the early `?` returns during
+/// setup, the normal disconnect, and a panic.
+///
+/// The slot used to be released by a bare `clients.write().remove(..)` placed
+/// after the read loop, which is reachable only on a clean disconnect. Six
+/// `?` / `return Err` paths sit between registration and that line (the
+/// SetupConnection read, an unexpected handshake frame, a missing frame header,
+/// building SetupConnectionSuccess, a closed channel, and the first
+/// `send_new_template` / `send_set_new_prev_hash`), and each of them leaked the
+/// slot for the life of the ghost-pool process.
+///
+/// That is worse than it sounds. `max_connections` is 10 while the fleet only
+/// ever needs one TDP client, so nine leaks were invisible and the tenth refused
+/// every future `pool_sv2` with `TDP connection limit reached`. Since systemd
+/// restarts a failing `sri-pool` every few seconds, one bad setup becomes ten in
+/// under a minute: the node stops serving miners and cannot recover until
+/// ghost-pool itself is restarted. A deploy rollback cannot repair it, because
+/// the leak is HERE and not in the binary being rolled back — measured on
+/// ghost-vm4, 2026-09-12, where the restored known-good `pool_sv2` was refused
+/// exactly as the new one had been.
+struct TdpClientSlot {
+    clients: Arc<RwLock<HashMap<u64, TdpClient>>>,
+    client_id: u64,
+    writer_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for TdpClientSlot {
+    fn drop(&mut self) {
+        if let Some(handle) = self.writer_handle.take() {
+            handle.abort();
+        }
+        self.clients.write().remove(&self.client_id);
+    }
+}
+
 /// Handle a single TDP client connection (after Noise handshake)
 async fn handle_tdp_client(
     noise_stream: NoiseTcpStream<Message>,
@@ -461,6 +496,15 @@ async fn handle_tdp_client(
             }
         }
     });
+
+    // From here on the function has fallible steps. The slot and the writer task
+    // are owned by this guard so that every exit path releases them; see
+    // `TdpClientSlot` for what leaking one costs.
+    let _slot = TdpClientSlot {
+        clients: Arc::clone(&clients),
+        client_id,
+        writer_handle: Some(writer_handle),
+    };
 
     // Handle SetupConnection first
     debug!("Waiting for SetupConnection from {}", peer_addr);
@@ -599,10 +643,7 @@ async fn handle_tdp_client(
         }
     }
 
-    // Cleanup
-    writer_handle.abort();
-    clients.write().remove(&client_id);
-
+    // Cleanup is `_slot`'s job now, on this path and on every fallible one above.
     info!("TDP client {} disconnected", peer_addr);
     Ok(())
 }
@@ -1456,6 +1497,71 @@ fn get_block_subsidy(height: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a registered client slot the way `handle_tdp_client` does.
+    fn registered(clients: &Arc<RwLock<HashMap<u64, TdpClient>>>, client_id: u64) -> TdpClientSlot {
+        let (frame_tx, _rx) = unbounded::<Sv2Frame>();
+        clients.write().insert(
+            client_id,
+            TdpClient {
+                addr: "127.0.0.1:1234".parse().expect("addr"),
+                frame_tx,
+                setup_complete: false,
+                coinbase_constraints: None,
+                last_template_id: 0,
+            },
+        );
+        TdpClientSlot {
+            clients: Arc::clone(clients),
+            client_id,
+            writer_handle: None,
+        }
+    }
+
+    /// The slot must come back when the handler leaves, however it leaves.
+    #[test]
+    fn a_client_slot_is_released_when_the_handler_returns() {
+        let clients: Arc<RwLock<HashMap<u64, TdpClient>>> = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let _slot = registered(&clients, 1);
+            assert_eq!(clients.read().len(), 1, "registered");
+        }
+        assert_eq!(clients.read().len(), 0, "released on scope exit");
+    }
+
+    /// The regression, stated as the operator sees it.
+    ///
+    /// `max_connections` is 10 and the fleet needs one. Cleanup used to sit after
+    /// the read loop, so a setup that failed early never released its slot: ten
+    /// failures — under a minute, since systemd restarts `sri-pool` every few
+    /// seconds — and every later `pool_sv2` was refused with `TDP connection
+    /// limit reached`, for the life of the ghost-pool process. The node stopped
+    /// serving miners and a deploy rollback could not repair it, because the leak
+    /// is here rather than in the binary being rolled back (ghost-vm4,
+    /// 2026-09-12).
+    #[test]
+    fn a_setup_that_fails_early_does_not_consume_the_connection_budget() {
+        let clients: Arc<RwLock<HashMap<u64, TdpClient>>> = Arc::new(RwLock::new(HashMap::new()));
+        let limit = TdpConfig::new_for_testing()
+            .expect("test config")
+            .max_connections;
+
+        // Far more failed setups than the budget, each leaving early.
+        for client_id in 0..(limit as u64 * 5) {
+            let _slot = registered(&clients, client_id);
+            // ... the `?` fires here and the guard drops.
+        }
+
+        assert_eq!(
+            clients.read().len(),
+            0,
+            "every failed setup must give its slot back"
+        );
+        assert!(
+            clients.read().len() < limit,
+            "a fresh pool_sv2 must still be admitted after {limit} failures"
+        );
+    }
 
     #[test]
     fn test_tdp_config_try_default() {
