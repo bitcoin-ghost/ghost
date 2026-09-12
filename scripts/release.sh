@@ -91,6 +91,11 @@ CANARY_NODES="ghost-vm5 ghost-vm6 ghost-vm7 ghost-vm8"
 PRODUCTION_NODES="ghost-vm4 ghost-vm3 ghost-vm2 ghost-vm1"
 SOAK_MINUTES="${SOAK_MINUTES:-62}"
 
+# How long `phase_tag` waits for release.yml to create the release its tag push triggered, and
+# how often it looks. See the comment in `phase_tag` for what a single un-waited look cost.
+TAG_RELEASE_WAIT_SECS="${TAG_RELEASE_WAIT_SECS:-600}"
+TAG_RELEASE_POLL_SECS="${TAG_RELEASE_POLL_SECS:-10}"
+
 STATE_DIR="${GHOST_RELEASE_STATE:-$HOME/.ghost-deploy/release}"
 mkdir -p "$STATE_DIR"
 
@@ -516,18 +521,37 @@ phase_tag() {
         git tag -a "$TAG" "$sha" -m "$TAG" || die "tag failed"
         git push -q origin "$TAG" || die "tag push failed"
     fi
-    # ⛔ `gh release view` SUCCEEDS for a draft, and release.yml creates the release as a draft.
-    # So "a release exists" is not "it is published" — conflating them meant this phase never
-    # attempted a publish at all, printed success, and left v1.11.38 a draft while the whole fleet
-    # ran it (#857).
-    if ! gh release view "$TAG" >/dev/null 2>&1; then
+    # ⛔ The tag push above TRIGGERS release.yml, and THAT workflow is what creates the release
+    # carrying the tarballs and the signed SHA256SUMS. On a fresh tag there is a window — seconds
+    # to minutes — in which the tag exists and the release does not.
+    #
+    # This used to look exactly once and refuse. v1.11.42 died here at 22:17:26 BST while the
+    # workflow created its release at 22:17:23: a three-second miss, reported as
+    # "no release found ... to publish", AFTER all eight nodes were already deployed. It had only
+    # ever worked because the tag was pushed by an EARLIER aborted run, so the release already
+    # existed by the time this phase ran — the happy path was an accident of a previous failure.
+    #
+    # So wait for the workflow's release rather than racing it, and only mint our own if none
+    # appears at all (a repo with no release workflow, which is what the create was for).
+    local rel_id="" waited=0
+    while :; do
+        rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
+                    --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
+        [ -n "$rel_id" ] && break
+        [ "$waited" -ge "$TAG_RELEASE_WAIT_SECS" ] && break
+        sleep "$TAG_RELEASE_POLL_SECS"
+        waited=$((waited + TAG_RELEASE_POLL_SECS))
+    done
+
+    if [ -n "$rel_id" ]; then
+        [ "$waited" -gt 0 ] && info "release for $TAG appeared after ${waited}s"
+    else
+        info "no release for $TAG after ${waited}s — creating one"
         gh release create "$TAG" --title "$TAG" --generate-notes >/dev/null \
             || die "gh release create failed"
+        rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
+                    --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
     fi
-
-    local rel_id
-    rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
-                --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
     [ -n "$rel_id" ] || die "no release found for $TAG to publish"
 
     if [ "$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)" = "true" ]; then
