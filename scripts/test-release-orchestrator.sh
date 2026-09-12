@@ -104,12 +104,18 @@ case "$*" in
       # GH_PUBLISH_WORKS=0 models the real trap: the call SUCCEEDS and changes nothing.
       [ "${GH_PUBLISH_WORKS:-1}" = "1" ] && echo "draft=false" >> "$S"
       exit 0 ;;
-  *releases\?per_page*)  echo 4242; exit 0 ;;
+  *releases\?per_page*)
+      # Model release.yml: the tag push creates the release ASYNCHRONOUSLY, so the first
+      # $GH_RELEASE_APPEARS_AFTER lookups find nothing. A release we minted ourselves is
+      # visible immediately.
+      n=$(( $(cat "$GH_LOOKUPS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GH_LOOKUPS"
+      if [ -f "$GH_CREATED" ] || [ "$n" -gt "${GH_RELEASE_APPEARS_AFTER:-0}" ]; then echo 4242; fi
+      exit 0 ;;
   *releases/4242*jq*draft*)     grep -E '^draft=' "$S"    | tail -1 | cut -d= -f2; exit 0 ;;
   *releases/4242*jq*tag_name*)  grep -E '^tagname=' "$S"  | tail -1 | cut -d= -f2; exit 0 ;;
   "release view"*)   exit 0 ;;
   "release list"*)   echo "v9.9.9	Draft	v9.9.9	2026-01-01"; exit 0 ;;
-  "release create"*) exit 0 ;;
+  "release create"*) echo created > "$GH_CREATED"; exit 0 ;;
 esac
 exit 0
 GH_STUB
@@ -118,9 +124,14 @@ chmod +x "$TMP/bin/gh"
 run_tag_phase() {   # $1 = GH_PUBLISH_WORKS
     printf 'draft=true\ntagname=v9.9.9\n' > "$TMP/gh_state"
     : > "$TMP/gh_calls"
+    : > "$TMP/gh_lookups"
+    rm -f "$TMP/gh_created"
     ( cd "$REPO" && PATH="$TMP/bin:$PATH" \
         GH_STATE="$TMP/gh_state" GH_CALLS="$TMP/gh_calls" GH_PUBLISH_WORKS="$1" \
+        GH_LOOKUPS="$TMP/gh_lookups" GH_CREATED="$TMP/gh_created" \
+        GH_RELEASE_APPEARS_AFTER="${GH_RELEASE_APPEARS_AFTER:-0}" \
         GHOST_RELEASE_STATE="$TMP/state" \
+        TAG_RELEASE_WAIT_SECS="${TAG_RELEASE_WAIT_SECS:-5}" TAG_RELEASE_POLL_SECS=1 \
         ./scripts/release.sh 9.9.9 --from tag 2>&1 )
 }
 
@@ -144,6 +155,39 @@ if [ $rc -ne 0 ] && ! printf '%s' "$out" | grep -qE '^  published'; then
     ok "a publish that silently did nothing FAILS the phase instead of reporting success"
 else
     bad "phase reported success while the release was still a DRAFT (rc=$rc) — #857 regression"
+fi
+
+# ---------------------------------------------------------------- the release.yml race
+#
+# The tag push TRIGGERS release.yml, and that workflow creates the release. Looking exactly once
+# therefore refuses a release that is merely still being made: v1.11.42 died on a three-second
+# miss, after all eight nodes were already running it. It had only ever worked because the tag
+# had been pushed by an earlier aborted run, so the release already existed.
+
+out="$(GH_RELEASE_APPEARS_AFTER=3 run_tag_phase 1)"; rc=$?
+if [ $rc -eq 0 ] && grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null; then
+    ok "a release release.yml is still creating is waited for, then published"
+else
+    bad "refused a release the workflow was still creating (rc=$rc): $(printf '%s' "$out" | tail -1)"
+fi
+
+# ⚠ The assertion above is NOT enough on its own, and a mutation proved it: with the wait removed
+# the phase still exits 0, because it falls through and mints its OWN release. That is not a pass
+# — it is how you end up publishing a release with no tarballs and no signed SHA256SUMS while the
+# workflow quietly finishes building the real one. So pin that we waited rather than raced.
+if [ -f "$TMP/gh_created" ]; then
+    bad "minted a rival release while release.yml was still creating one — the published \
+release would carry no assets"
+else
+    ok "the workflow's release is waited for, not replaced by one of ours (assets survive)"
+fi
+
+# ...but the wait must be bounded, and a repo with no release workflow must still get a release.
+out="$(GH_RELEASE_APPEARS_AFTER=9999 run_tag_phase 1)"; rc=$?
+if [ $rc -eq 0 ] && grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null; then
+    ok "when no workflow ever produces one, the phase stops waiting and creates it"
+else
+    bad "no release was ever created after the wait elapsed (rc=$rc): $(printf '%s' "$out" | tail -1)"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
