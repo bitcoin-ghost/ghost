@@ -731,6 +731,20 @@ impl HealthPingHandler {
                 return;
             }
         }
+        // A ping can arrive BEFORE its peer is in the in-memory table, and
+        // `backdate_first_seen` then writes nothing and returns false. Marking
+        // the restore done on that path stranded the peer at `first_seen = now`
+        // — below the 24h coordinator maturity — for the life of the process,
+        // because the restore runs at most once per peer per process.
+        //
+        // So only finish when the peer is actually there to have been repaired.
+        // Everything else waits for the next ping, 10s away. The retry is
+        // bounded by the peer appearing: once it is in the table there is
+        // nothing left to wait for, whether or not the database had a sighting
+        // to apply.
+        if self.peers.get_peer(node_id).is_none() {
+            return;
+        }
         self.age_restored.write().insert(*node_id);
     }
 
@@ -1432,6 +1446,91 @@ mod tests {
         assert_eq!(
             peers.get_peer(&id).unwrap().first_seen,
             sixty_days_ago as u64
+        );
+    }
+
+    /// The gap #888 left, and what it cost.
+    ///
+    /// A ping can arrive BEFORE its peer is in the in-memory table.
+    /// `backdate_first_seen` then returns `false` — there is nothing to write to
+    /// — but the restore was marked done regardless, and being once-per-process
+    /// it never ran again. That peer kept `first_seen = now` and so sat below the
+    /// 24h coordinator maturity for a full day.
+    ///
+    /// Measured on mainnet 2026-09-12 after the v1.11.40 roll: roster sizes
+    /// 3/7/3/4/7/4/8/7 across eight nodes that all agreed on the epoch and all
+    /// advertised an endpoint. Which peers a node lost depended only on which
+    /// pings won the race, which is why no two nodes agreed — and why `/peers`
+    /// looked healthy throughout: it serves the DATABASE's `first_seen`, not the
+    /// in-memory one the roster actually reads.
+    #[test]
+    fn a_ping_that_arrives_before_the_peer_does_is_restored_on_a_later_ping() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        let peers = Arc::new(PeerManager::new([0u8; 32], 100));
+        let handler =
+            HealthPingHandler::new(peers.clone(), Some(db.clone()), Arc::new(BanManager::new()));
+
+        let id = [6u8; 32];
+        let hex_id = hex::encode(id);
+        let sixty_days_ago = chrono::Utc::now().timestamp() - 60 * 86_400;
+        db.upsert_peer(&PeerRecord {
+            peer_id: hex_id.clone(),
+            address: "10.0.0.6".into(),
+            port: 8555,
+            node_id: Some(hex_id.clone()),
+            first_seen: sixty_days_ago,
+            last_seen: sixty_days_ago,
+            last_success: None,
+            last_failure: None,
+            connection_count: 1,
+            failure_count: 0,
+            is_banned: false,
+            ban_until: None,
+            capabilities: None,
+            protocol_version: Some(1),
+        })
+        .expect("seed");
+
+        // The ping beats the peer into the table: there is nothing to backdate.
+        handler.restore_peer_age(&db, &id, &hex_id);
+        assert!(
+            !handler.age_restored.read().contains(&id),
+            "a restore that wrote nothing must not be marked done, or the peer \
+             is stranded below the maturity gate for the life of the process"
+        );
+
+        // The peer arrives. The next ping must still repair it.
+        peers.upsert_peer(crate::peer::Peer::new(id, "10.0.0.6:8555".into()));
+        handler.restore_peer_age(&db, &id, &hex_id);
+        assert_eq!(
+            peers.get_peer(&id).unwrap().first_seen,
+            sixty_days_ago as u64,
+            "the real first sighting must be restored once the peer exists"
+        );
+        assert!(
+            handler.age_restored.read().contains(&id),
+            "and now it is genuinely done"
+        );
+    }
+
+    /// The retry must not become unbounded: a peer that IS in the table and has
+    /// no stored sighting has nothing to wait for, so it is done — otherwise
+    /// every ping from it re-reads the database for ever.
+    #[test]
+    fn a_peer_with_nothing_to_restore_is_not_retried_for_ever() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        let peers = Arc::new(PeerManager::new([0u8; 32], 100));
+        let handler =
+            HealthPingHandler::new(peers.clone(), Some(db.clone()), Arc::new(BanManager::new()));
+
+        let id = [7u8; 32];
+        let hex_id = hex::encode(id);
+        peers.upsert_peer(crate::peer::Peer::new(id, "10.0.0.7:8555".into()));
+
+        handler.restore_peer_age(&db, &id, &hex_id);
+        assert!(
+            handler.age_restored.read().contains(&id),
+            "present in the table with no record to apply is a finished restore"
         );
     }
 
