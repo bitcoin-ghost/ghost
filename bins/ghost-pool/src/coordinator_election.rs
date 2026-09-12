@@ -36,7 +36,9 @@ use ghost_consensus::mesh::MeshNetwork;
 
 use ghost_common::types::NodeCapabilities;
 use tracing::info;
-use wraith_protocol::eligibility::{eligible_roster, EligibilityPolicy, NodeFacts};
+use wraith_protocol::eligibility::{
+    eligible_roster_with_reasons, EligibilityPolicy, Ineligible, NodeFacts,
+};
 use wraith_protocol::epoch::canonical_roster;
 use wraith_protocol::roster_snapshot::roster_commitment;
 use wraith_protocol::service::{CoordinatorView, EndpointMap};
@@ -238,6 +240,15 @@ pub struct CoordinatorElection {
     rpc: Arc<BitcoinRpc>,
     /// Cached current-epoch view.
     cached: RwLock<Option<Cached>>,
+    /// Why each candidate that is NOT on the roster was refused, as of the last
+    /// recompute. Diagnostic only — deliberately outside [`Cached`] so it can
+    /// never affect the view, the commitment, or when the view is rebuilt.
+    ///
+    /// Refreshed on EVERY recompute, including the ones that leave the roster
+    /// unchanged: "the roster did not move and here is what is still being
+    /// refused" is the reading that ends an investigation, and it is exactly the
+    /// one a change-triggered record cannot give.
+    refusals: RwLock<Vec<(CoordinatorNodeId, Ineligible)>>,
 }
 
 impl CoordinatorElection {
@@ -257,6 +268,7 @@ impl CoordinatorElection {
             mesh,
             rpc,
             cached: RwLock::new(None),
+            refusals: RwLock::new(Vec::new()),
         }
     }
 
@@ -311,8 +323,15 @@ impl CoordinatorElection {
     /// *seen*, and it is the only field in the status response one node cannot
     /// self-check.
     ///
-    /// Returns the canonical roster and the endpoint map.
-    fn roster_with_endpoints(&self) -> (Vec<CoordinatorNodeId>, EndpointMap) {
+    /// Returns the canonical roster, the endpoint map, and why every candidate
+    /// that did not make the roster was refused.
+    fn roster_with_endpoints(
+        &self,
+    ) -> (
+        Vec<CoordinatorNodeId>,
+        EndpointMap,
+        Vec<(CoordinatorNodeId, Ineligible)>,
+    ) {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let policy = EligibilityPolicy::default();
 
@@ -359,9 +378,9 @@ impl CoordinatorElection {
             }
         }
 
-        let roster = eligible_roster(&facts, policy, now);
+        let (roster, refusals) = eligible_roster_with_reasons(&facts, policy, now);
         endpoints.retain(|id, _| roster.contains(id));
-        (canonical_roster(&roster), endpoints)
+        (canonical_roster(&roster), endpoints, refusals)
     }
 
     /// Fetch the beacon for `epoch` by anchoring on the epoch-start block hash
@@ -386,7 +405,11 @@ impl CoordinatorElection {
     /// poisons the cache with a partial view.
     pub async fn refresh_for_height(&self, current_height: u64) -> u64 {
         let epoch = epoch_for_height(current_height);
-        let (roster, endpoints) = self.roster_with_endpoints();
+        let (roster, endpoints, refusals) = self.roster_with_endpoints();
+        // Recorded before the early returns below. A refresh that cannot reach
+        // the anchor, or that finds the roster unchanged, still learned exactly
+        // why each absent node is absent, and that is the reading worth having.
+        *self.refusals.write() = refusals;
 
         let same_epoch = self
             .cached
@@ -422,6 +445,7 @@ impl CoordinatorElection {
             previous_roster_size = ?previous_size,
             leads = ?next.view.tiers_led_by(&self.self_id),
             roster_commitment = %hex::encode(next.roster_commitment),
+            refused = %refusal_summary(&self.refusals.read()),
             "Coordinator roster changed"
         );
         *self.cached.write() = Some(next);
@@ -452,7 +476,7 @@ impl CoordinatorElection {
     /// consumer recomputes it rather than trusting it. Pre-serialised so
     /// `ghost-verification` needn't depend on `wraith-protocol`.
     pub fn status_json(&self) -> serde_json::Value {
-        status_json_for(&self.cached, &self.self_id)
+        status_json_for(&self.cached, &self.self_id, &self.refusals.read())
     }
 }
 
@@ -461,6 +485,7 @@ impl CoordinatorElection {
 fn status_json_for(
     cached: &RwLock<Option<Cached>>,
     self_id: &CoordinatorNodeId,
+    refusals: &[(CoordinatorNodeId, Ineligible)],
 ) -> serde_json::Value {
     let guard = cached.read();
     let Some(c) = guard.as_ref() else {
@@ -478,6 +503,7 @@ fn status_json_for(
             "roster": [],
             "roster_size": 0,
             "roster_commitment": serde_json::Value::Null,
+            "ineligible": ineligible_json(refusals),
             "degraded": true,
         });
     };
@@ -531,8 +557,51 @@ fn status_json_for(
         // rotated, and so "no single party is the operator" is checkable
         // rather than assumed (#708).
         "roster_size": c.roster.len(),
+        // Why every candidate that is NOT in `roster` was refused. A node
+        // missing from a roster used to be indistinguishable from a node never
+        // heard of; this names the gate that refused it and the numbers behind
+        // it, so a split is read off the endpoint rather than inferred.
+        "ineligible": ineligible_json(refusals),
         "degraded": roster_is_degraded(c.roster.len()),
     })
+}
+
+/// Refusals as JSON: the node, a stable `reason` tag to filter on, and the
+/// human `detail` that carries the numbers.
+fn ineligible_json(refusals: &[(CoordinatorNodeId, Ineligible)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        refusals
+            .iter()
+            .map(|(id, why)| {
+                serde_json::json!({
+                    "node_id": hex::encode(id),
+                    "reason": why.kind(),
+                    "detail": why.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// A one-line tally for the log: `too_new=3,no_endpoint=1`, or `none`.
+///
+/// A count per gate rather than a list of ids, so the line stays one line on a
+/// fleet of any size while still saying which gate is doing the refusing —
+/// which is the part that points at the cause.
+fn refusal_summary(refusals: &[(CoordinatorNodeId, Ineligible)]) -> String {
+    if refusals.is_empty() {
+        return "none".to_string();
+    }
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for (_, why) in refusals {
+        *counts.entry(why.kind()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The JSON returned for the read-only endpoint when the feature is OFF (the
@@ -794,9 +863,18 @@ mod tests {
     /// Build the JSON the endpoint would serve for `c`, as `me`, without a
     /// live mesh: the same code path as `status_json`, minus the service.
     fn published(c: &Cached, me: &CoordinatorNodeId) -> serde_json::Value {
+        published_with_refusals(c, me, &[])
+    }
+
+    /// As [`published`], but with refusals to render.
+    fn published_with_refusals(
+        c: &Cached,
+        me: &CoordinatorNodeId,
+        refusals: &[(CoordinatorNodeId, Ineligible)],
+    ) -> serde_json::Value {
         let svc = Cached::clone(c);
         let lock = RwLock::new(Some(svc));
-        status_json_for(&lock, me)
+        status_json_for(&lock, me, refusals)
     }
 
     #[test]
@@ -837,5 +915,91 @@ mod tests {
         let outsider = published(&cached, &node(200));
         assert!(outsider["my_tiers"].as_array().unwrap().is_empty());
         assert!(outsider["my_endpoint"].is_null());
+    }
+
+    // ── the refusals are visible on the endpoint ──
+
+    /// The endpoint used to report `roster_size` and nothing about the gap, so a
+    /// node absent from the roster was indistinguishable from one never heard
+    /// of. This is the reading that ends an investigation.
+    #[test]
+    fn the_endpoint_names_every_node_it_refused_and_why() {
+        let roster: Vec<_> = (1u8..=3).map(node).collect();
+        let refusals = vec![
+            (node(9), Ineligible::NoEndpoint),
+            (
+                node(10),
+                Ineligible::TooNew {
+                    known_secs: 3600,
+                    required_secs: 86_400,
+                },
+            ),
+        ];
+        let doc = published_with_refusals(&first_draw(6711, &roster), &roster[0], &refusals);
+
+        let listed = doc["ineligible"].as_array().expect("an array");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["node_id"], hex::encode(node(9)));
+        assert_eq!(listed[0]["reason"], "no_endpoint");
+        assert_eq!(listed[1]["reason"], "too_new");
+        assert!(
+            listed[1]["detail"].as_str().unwrap().contains("3600"),
+            "the detail must carry the measurement: {}",
+            listed[1]["detail"]
+        );
+    }
+
+    /// A healthy fleet must not grow a confusing empty-ish field: the key is
+    /// always present, as an empty array.
+    #[test]
+    fn nothing_refused_is_an_empty_list_not_a_missing_key() {
+        let roster: Vec<_> = (1u8..=8).map(node).collect();
+        let doc = published(&first_draw(6711, &roster), &roster[0]);
+        assert_eq!(doc["ineligible"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Adding a diagnostic field must not break the check a wallet runs over
+    /// the same document.
+    #[test]
+    fn refusals_do_not_disturb_the_wallets_verification() {
+        let roster: Vec<_> = (1u8..=8).map(node).collect();
+        let doc = published_with_refusals(
+            &first_draw(6711, &roster),
+            &roster[0],
+            &[(node(9), Ineligible::NotOptedIn)],
+        );
+        assert!(
+            wraith_protocol::election_doc::election_is_honest(&doc),
+            "{doc:#}"
+        );
+    }
+
+    /// The log line has to stay one line on a fleet of any size, while still
+    /// saying which gate is refusing — that is the part that points at a cause.
+    #[test]
+    fn the_log_summary_tallies_by_gate() {
+        let refusals = vec![
+            (node(1), Ineligible::NoEndpoint),
+            (
+                node(2),
+                Ineligible::TooNew {
+                    known_secs: 1,
+                    required_secs: 2,
+                },
+            ),
+            (
+                node(3),
+                Ineligible::TooNew {
+                    known_secs: 1,
+                    required_secs: 2,
+                },
+            ),
+        ];
+        assert_eq!(refusal_summary(&refusals), "no_endpoint=1,too_new=2");
+    }
+
+    #[test]
+    fn the_log_summary_says_none_rather_than_nothing() {
+        assert_eq!(refusal_summary(&[]), "none");
     }
 }
