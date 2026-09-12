@@ -201,6 +201,17 @@ impl PeerManager {
             if merged.coordinator_endpoint.is_none() {
                 merged.coordinator_endpoint = existing.coordinator_endpoint.clone();
             }
+            // Same rule as the endpoint above, and as `update_health_metrics`'s own
+            // guard: "not reported" and "reported all false" are identical for a
+            // struct of plain bools, so an all-default re-announce must not be
+            // believed. Missing this while preserving the endpoint beside it is
+            // why, once the maturity bug (#891) was fixed, every remaining Wraith
+            // roster refusal was `not_opted_in` and never `no_endpoint`: discovery
+            // blanked `coordinator` on each re-announce and the next health ping
+            // put it back, so rosters flapped between 3 and 8 all day.
+            if merged.capabilities == ghost_common::types::NodeCapabilities::default() {
+                merged.capabilities = existing.capabilities;
+            }
             // Same reasoning as the fields above: a bare re-announce carries no tier ports, and
             // blanking them would drop the peer out of farm routing until its next full ping.
             if merged.hobby_port.is_none() {
@@ -1119,6 +1130,91 @@ mod tests {
             mgr.get_peer(&pid).unwrap().active_miner_id_hashes,
             vec![[9u8; 16]],
             "a real ping update must still overwrite"
+        );
+    }
+
+    /// The field the re-announce guard forgot.
+    ///
+    /// `upsert_peer` rescues twelve fields when discovery rebuilds a peer with
+    /// `Peer::new` — hashrate, miner counts, tier ports, telemetry, `first_seen`,
+    /// and the coordinator ENDPOINT. It did not rescue `capabilities`, so every
+    /// re-announce blanked `coordinator` back to false until the next health
+    /// ping up to 10s later, and the node dropped out of the Wraith roster for
+    /// that window. `test_upsert_preserves_gossiped_metrics_on_reannounce`
+    /// passes `NodeCapabilities::default()`, so it never exercised this.
+    ///
+    /// Measured on the v1.11.41 canaries, 2026-09-12: with the maturity bug
+    /// (#891) fixed, roster sizes still swung between 3 and 8 — and EVERY
+    /// refusal was `not_opted_in`, never `no_endpoint`, because the endpoint was
+    /// preserved here and the capability beside it was not.
+    #[test]
+    fn a_reannounce_does_not_blank_the_coordinator_capability() {
+        use ghost_common::types::NodeCapabilities;
+        let mgr = PeerManager::new([0u8; 32], 100);
+        let pid = [8u8; 32];
+        mgr.upsert_peer(Peer::new(pid, "1.2.3.4:8555".to_string()));
+
+        let caps = NodeCapabilities {
+            coordinator: true,
+            public_mining: true,
+            ..Default::default()
+        };
+        mgr.update_health_metrics(&pid, 1, caps, Some("1.2.3.4:9100".into()), 0, None);
+        assert!(
+            mgr.get_peer(&pid).unwrap().capabilities.coordinator,
+            "precondition: the ping told us it coordinates"
+        );
+
+        // Discovery re-announces the SAME peer with a freshly-built (empty) Peer.
+        mgr.upsert_peer(Peer::new(pid, "1.2.3.4:8555".to_string()));
+
+        let got = mgr.get_peer(&pid).unwrap();
+        assert!(
+            got.capabilities.coordinator,
+            "a re-announce must not blank the coordinator opt-in — that is the \
+             node falling out of the roster until its next health ping"
+        );
+        assert!(got.capabilities.public_mining, "nor any other capability");
+        assert_eq!(
+            got.coordinator_endpoint.as_deref(),
+            Some("1.2.3.4:9100"),
+            "the endpoint was already preserved and must stay so"
+        );
+    }
+
+    /// The rescue must not freeze the flags: a re-announce that genuinely
+    /// carries capabilities still wins, exactly as a real ping does.
+    #[test]
+    fn a_reannounce_that_carries_capabilities_still_updates_them() {
+        use ghost_common::types::NodeCapabilities;
+        let mgr = PeerManager::new([0u8; 32], 100);
+        let pid = [9u8; 32];
+        mgr.upsert_peer(Peer::new(pid, "1.2.3.4:8555".to_string()));
+        mgr.update_health_metrics(
+            &pid,
+            1,
+            NodeCapabilities {
+                coordinator: true,
+                ..Default::default()
+            },
+            None,
+            0,
+            None,
+        );
+
+        let mut reannounce = Peer::new(pid, "1.2.3.4:8555".to_string());
+        reannounce.capabilities = NodeCapabilities {
+            coordinator: false,
+            reaper: true,
+            ..Default::default()
+        };
+        mgr.upsert_peer(reannounce);
+
+        let got = mgr.get_peer(&pid).unwrap();
+        assert!(got.capabilities.reaper, "a real value must apply");
+        assert!(
+            !got.capabilities.coordinator,
+            "and it must be able to turn a flag OFF, or the rescue is a freeze"
         );
     }
 
