@@ -164,6 +164,22 @@ pub enum Ineligible {
     },
 }
 
+impl Ineligible {
+    /// A stable machine-readable tag for this reason.
+    ///
+    /// The `Display` text carries the numbers and is what a human reads; this is
+    /// what a log filter or an aggregation greps for, so it must not change when
+    /// the wording does.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotOptedIn => "not_opted_in",
+            Self::NoEndpoint => "no_endpoint",
+            Self::TooNew { .. } => "too_new",
+            Self::LongAbsent { .. } => "long_absent",
+        }
+    }
+}
+
 /// Whether `facts` may coordinate at `now`.
 pub fn check(facts: &NodeFacts, policy: EligibilityPolicy, now: u64) -> Result<(), Ineligible> {
     if !facts.opted_in {
@@ -206,14 +222,48 @@ pub fn eligible_roster(
     policy: EligibilityPolicy,
     now: u64,
 ) -> Vec<CoordinatorNodeId> {
-    let mut out: Vec<CoordinatorNodeId> = facts
-        .iter()
-        .filter(|f| check(f, policy, now).is_ok())
-        .map(|f| f.node_id)
-        .collect();
+    eligible_roster_with_reasons(facts, policy, now).0
+}
+
+/// The eligible roster, **and why every other candidate was refused**.
+///
+/// # Why the refusals are returned rather than dropped
+///
+/// `check` computes a reason precise enough to end an investigation —
+/// `TooNew` carries how long the identity has been known and the requirement,
+/// `LongAbsent` carries the silence and the window. `eligible_roster` threw all
+/// of it away behind `.is_ok()`, so a node missing from a roster was
+/// indistinguishable from a node that had never been heard of, and nothing on
+/// the node could say which of the four gates had refused it.
+///
+/// That is why the 2026-09-12 fleet split took code reading and a who-sees-whom
+/// matrix to narrow, and still ended without naming the failing gate: the
+/// answer was computed eight times a minute on every node and discarded each
+/// time. Callers that only want the roster keep using [`eligible_roster`].
+///
+/// Refusals are sorted by node id so two nodes' diagnostics line up, and a node
+/// that appears twice in `facts` is reported once.
+pub fn eligible_roster_with_reasons(
+    facts: &[NodeFacts],
+    policy: EligibilityPolicy,
+    now: u64,
+) -> (Vec<CoordinatorNodeId>, Vec<(CoordinatorNodeId, Ineligible)>) {
+    let mut out: Vec<CoordinatorNodeId> = Vec::new();
+    let mut refused: Vec<(CoordinatorNodeId, Ineligible)> = Vec::new();
+    for f in facts {
+        match check(f, policy, now) {
+            Ok(()) => out.push(f.node_id),
+            Err(reason) => refused.push((f.node_id, reason)),
+        }
+    }
     out.sort_unstable();
     out.dedup();
-    out
+    refused.sort_unstable_by_key(|(id, _)| *id);
+    refused.dedup_by_key(|(id, _)| *id);
+    // A node that is eligible on one fact and refused on another is eligible;
+    // reporting it as refused too would read as a contradiction in the log.
+    refused.retain(|(id, _)| out.binary_search(id).is_err());
+    (out, refused)
 }
 
 #[cfg(test)]
@@ -323,5 +373,102 @@ mod tests {
         let roster = eligible_roster(&[good(1), bad, good(2)], p, NOW);
         assert_eq!(roster.len(), 2);
         assert!(!roster.contains(&[4u8; 32]));
+    }
+
+    // ── the refusals are the point ──
+
+    /// The regression this exists to stop: `eligible_roster` computed a precise
+    /// reason for every refusal and dropped it, so a node missing from a roster
+    /// could not be told from one never heard of.
+    #[test]
+    fn every_refusal_is_reported_with_the_gate_that_refused_it() {
+        let mut not_opted = good(2);
+        not_opted.opted_in = false;
+        let mut no_endpoint = good(3);
+        no_endpoint.endpoint = None;
+        let mut too_new = good(4);
+        too_new.first_seen_secs = NOW - 60;
+        let mut long_absent = good(5);
+        long_absent.last_seen_secs = NOW - 30 * DAY;
+
+        let facts = vec![good(1), not_opted, no_endpoint, too_new, long_absent];
+        let (roster, refused) =
+            eligible_roster_with_reasons(&facts, EligibilityPolicy::default(), NOW);
+
+        assert_eq!(roster, vec![[1u8; 32]], "only the healthy node is eligible");
+        let kinds: Vec<_> = refused.iter().map(|(_, why)| why.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["not_opted_in", "no_endpoint", "too_new", "long_absent"],
+            "every gate names itself, and the refusals are sorted by node id"
+        );
+    }
+
+    /// The numbers are what end an investigation, not just the tag.
+    #[test]
+    fn a_refusal_carries_the_measurement_behind_it() {
+        let mut f = good(7);
+        f.first_seen_secs = NOW - 3600;
+        let (_, refused) = eligible_roster_with_reasons(&[f], EligibilityPolicy::default(), NOW);
+        assert_eq!(
+            refused[0].1,
+            Ineligible::TooNew {
+                known_secs: 3600,
+                required_secs: 24 * 60 * 60
+            },
+            "it must say how long it HAS been known and what was required"
+        );
+    }
+
+    /// `eligible_roster` is now a wrapper; it must not have drifted from the
+    /// pair it delegates to.
+    #[test]
+    fn the_roster_only_wrapper_still_agrees_with_the_pair() {
+        let mut bad = good(9);
+        bad.opted_in = false;
+        let facts = vec![good(8), bad, good(10)];
+        let policy = EligibilityPolicy::default();
+        assert_eq!(
+            eligible_roster(&facts, policy, NOW),
+            eligible_roster_with_reasons(&facts, policy, NOW).0
+        );
+    }
+
+    /// A node that is eligible on one fact and refused on another is eligible.
+    /// Reporting it in both lists would read as the endpoint contradicting
+    /// itself.
+    #[test]
+    fn a_node_that_is_eligible_somewhere_is_never_also_listed_as_refused() {
+        let mut stale = good(11);
+        stale.opted_in = false;
+        let facts = vec![stale, good(11)];
+        let (roster, refused) =
+            eligible_roster_with_reasons(&facts, EligibilityPolicy::default(), NOW);
+        assert_eq!(roster, vec![[11u8; 32]]);
+        assert!(refused.is_empty(), "got {refused:?}");
+    }
+
+    /// The tags are what a log filter greps, so they must survive rewording of
+    /// the human text.
+    #[test]
+    fn the_reason_tags_are_stable() {
+        assert_eq!(Ineligible::NotOptedIn.kind(), "not_opted_in");
+        assert_eq!(Ineligible::NoEndpoint.kind(), "no_endpoint");
+        assert_eq!(
+            Ineligible::TooNew {
+                known_secs: 1,
+                required_secs: 2
+            }
+            .kind(),
+            "too_new"
+        );
+        assert_eq!(
+            Ineligible::LongAbsent {
+                absent_secs: 1,
+                limit_secs: 2
+            }
+            .kind(),
+            "long_absent"
+        );
     }
 }
