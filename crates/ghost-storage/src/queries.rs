@@ -9414,11 +9414,27 @@ impl Database {
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             }
 
-            // Persist checkpoint record
+            // Persist checkpoint record.
+            //
+            // ON CONFLICT, not a plain INSERT: `height` is the PRIMARY KEY and a checkpoint is
+            // routinely already present for it, because tree sync replays checkpoints into this
+            // table. A plain INSERT raised `UNIQUE constraint failed: l2_checkpoints.height` and
+            // rolled the WHOLE transaction back -- taking the nullifier writes above with it --
+            // roughly 100 times per node per day (#899).
+            //
+            // DO UPDATE rather than INSERT OR REPLACE so the row's `created_at` default is not
+            // reset on every replay.
             tx.execute(
                 "INSERT INTO l2_checkpoints
                  (height, epoch, commitment_root, tx_count, proposer_id, active_node_count, block_data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(height) DO UPDATE SET
+                     epoch = excluded.epoch,
+                     commitment_root = excluded.commitment_root,
+                     tx_count = excluded.tx_count,
+                     proposer_id = excluded.proposer_id,
+                     active_node_count = excluded.active_node_count,
+                     block_data = excluded.block_data",
                 params![
                     record.height as i64,
                     record.epoch as i64,
@@ -9438,7 +9454,8 @@ impl Database {
     /// Upsert an L2 checkpoint (idempotent via INSERT OR REPLACE).
     ///
     /// Used by tree sync to persist replayed checkpoints without failing on
-    /// duplicate heights (unlike `persist_l2_checkpoint_atomic` which uses INSERT).
+    /// duplicate heights. `persist_l2_checkpoint_atomic` is also duplicate-safe since #899;
+    /// the difference now is that this one does not carry the nullifiers.
     pub fn upsert_l2_checkpoint(&self, record: &L2CheckpointRecord) -> GhostResult<()> {
         self.with_connection(|conn| {
             conn.execute(
@@ -15138,5 +15155,154 @@ mod ledger_reconciliation_tests {
             seen, 1,
             "must stop at the first failure, not walk the ledger"
         );
+    }
+}
+
+#[cfg(test)]
+mod l2_checkpoint_atomicity_tests {
+    //! Regression cover for #899.
+    //!
+    //! `persist_l2_checkpoint_atomic` used a plain `INSERT` against `l2_checkpoints.height`,
+    //! which is the PRIMARY KEY. Tree sync routinely replays a checkpoint into a height that
+    //! already holds one, so the INSERT raised a UNIQUE violation and rolled the WHOLE
+    //! transaction back -- discarding the nullifier writes that shared it -- roughly 100 times
+    //! per node per day.
+
+    use super::*;
+    use crate::Database;
+
+    /// An in-memory database with the epoch these checkpoints reference already present —
+    /// `l2_checkpoints.epoch` and `l2_nullifiers.epoch` are both foreign keys into `l2_epochs`.
+    fn db() -> Database {
+        let db = Database::in_memory().expect("in-memory database must build");
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO l2_epochs (epoch, start_height, initial_root) VALUES (1, 0, X'00')",
+                [],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seeding the epoch must succeed");
+        db
+    }
+
+    fn record(height: u64, tx_count: u32) -> L2CheckpointRecord {
+        L2CheckpointRecord {
+            height,
+            epoch: 1,
+            commitment_root: [height as u8; 32],
+            tx_count,
+            proposer_id: "node-a".to_string(),
+            active_node_count: 8,
+            block_data: vec![1, 2, 3],
+        }
+    }
+
+    fn nullifier(seed: u8, height: u64) -> ([u8; 32], u64, u64) {
+        ([seed; 32], 1, height)
+    }
+
+    fn checkpoint_count(db: &Database, height: u64) -> i64 {
+        db.with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM l2_checkpoints WHERE height = ?1",
+                params![height as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("count must run")
+    }
+
+    fn nullifier_count(db: &Database) -> i64 {
+        db.with_connection(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM l2_nullifiers", [], |row| row.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("count must run")
+    }
+
+    /// The bug: a second persist at the same height must NOT fail.
+    #[test]
+    fn a_replayed_height_persists_instead_of_failing() {
+        let db = db();
+        db.persist_l2_checkpoint_atomic(&record(100, 3), &[nullifier(1, 100)])
+            .expect("first persist must succeed");
+
+        db.persist_l2_checkpoint_atomic(&record(100, 5), &[nullifier(2, 100)])
+            .expect("a replayed height must persist, not raise UNIQUE constraint failed");
+
+        assert_eq!(
+            checkpoint_count(&db, 100),
+            1,
+            "the replay must update the row in place, not duplicate it"
+        );
+    }
+
+    /// The consequence that actually mattered: the rollback took the nullifiers with it.
+    /// Both nullifiers must be durable after a replayed height.
+    #[test]
+    fn nullifiers_survive_a_replayed_height() {
+        let db = db();
+        db.persist_l2_checkpoint_atomic(&record(200, 1), &[nullifier(10, 200)])
+            .expect("first persist must succeed");
+        assert_eq!(nullifier_count(&db), 1);
+
+        db.persist_l2_checkpoint_atomic(&record(200, 2), &[nullifier(11, 200)])
+            .expect("replayed height must persist");
+
+        assert_eq!(
+            nullifier_count(&db),
+            2,
+            "the second nullifier must commit — a rolled-back transaction would leave 1"
+        );
+    }
+
+    /// The replay must carry the new values, so a node that re-derives a checkpoint converges
+    /// on the replayed content rather than silently keeping the stale row.
+    #[test]
+    fn a_replayed_height_updates_the_stored_record() {
+        let db = db();
+        db.persist_l2_checkpoint_atomic(&record(300, 1), &[])
+            .expect("first persist must succeed");
+
+        let mut updated = record(300, 9);
+        updated.commitment_root = [0xAB; 32];
+        updated.proposer_id = "node-b".to_string();
+        db.persist_l2_checkpoint_atomic(&updated, &[])
+            .expect("replayed height must persist");
+
+        let (tx_count, root, proposer): (i64, Vec<u8>, String) = db
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT tx_count, commitment_root, proposer_id FROM l2_checkpoints WHERE height = ?1",
+                    params![300i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("row must be readable");
+
+        assert_eq!(tx_count, 9, "tx_count must be updated by the replay");
+        assert_eq!(root, vec![0xAB; 32], "commitment_root must be updated");
+        assert_eq!(proposer, "node-b", "proposer_id must be updated");
+    }
+
+    /// Distinct heights must still each get their own row — the ON CONFLICT clause must not
+    /// have collapsed the table onto one key.
+    #[test]
+    fn distinct_heights_remain_distinct() {
+        let db = db();
+        for h in [400u64, 401, 402] {
+            db.persist_l2_checkpoint_atomic(&record(h, 1), &[])
+                .expect("persist must succeed");
+        }
+        for h in [400u64, 401, 402] {
+            assert_eq!(
+                checkpoint_count(&db, h),
+                1,
+                "height {h} must have its own row"
+            );
+        }
     }
 }
