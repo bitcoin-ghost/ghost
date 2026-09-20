@@ -24,7 +24,7 @@ use stratum_apps::stratum_core::{
     template_distribution_sv2::SubmitSolution,
 };
 use stratum_apps::utils::types::SharesPerMinute;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
@@ -105,6 +105,25 @@ fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) ->
 /// reporting it as `min-extranonce-size-too-large` blames the client's requested size and
 /// sends whoever investigates in exactly the wrong direction.
 pub(crate) const EXTRANONCE_SPACE_EXHAUSTED: &str = "extranonce-space-exhausted";
+
+/// Whether a channel that has just been seeded with `seeded_template_id` may safely be
+/// activated by the cached `SetNewPrevHash`.
+///
+/// `ChannelManagerData::last_future_template` and `::last_new_prev_hash` are written by two
+/// different Template Distribution handlers, each taking the lock separately. Between a
+/// `NewTemplate(N)` and its `SetNewPrevHash(N)` the cached pair straddles two template
+/// generations: the template is already `N` while the prev hash still refers to `N - 1`.
+///
+/// A channel opening inside that window seeds job `N` and would then ask the job store to
+/// activate `N - 1`, which it has never been given. The channel reports that as
+/// `TemplateIdNotFound`, and on the open path that used to be escalated to `Action::Shutdown`,
+/// taking the whole pool down and disconnecting every miner on the node (#898).
+///
+/// Returning `false` means "seed the future job but leave it unactivated" — the next
+/// `SetNewPrevHash` broadcast activates it for every downstream, so nothing is lost.
+fn may_activate_seeded_job(prev_hash_template_id: u64, seeded_template_id: u64) -> bool {
+    prev_hash_template_id == seeded_template_id
+}
 
 /// Validates an `OpenExtendedMiningChannel` request and, only if it is acceptable, mints the
 /// extranonce prefix for the channel it will open.
@@ -366,7 +385,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     Some(_) => crate::tier_binding::strip_plain_node_tag(&last_future_template),
                     None => last_future_template,
                 };
-                standard_channel.on_new_template(channel_template, coinbase_outputs.clone()).map_err(PoolError::shutdown)?;
+                standard_channel.on_new_template(channel_template, coinbase_outputs.clone()).map_err(|e| PoolError::disconnect(e, downstream_id))?;
                 let future_standard_job_id = standard_channel
                     .get_future_job_id_from_template_id(template_id)
                     .expect("future job id must exist");
@@ -377,21 +396,36 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     future_standard_job.get_job_message().clone().into_static();
 
                 messages.push((downstream_id, Mining::NewMiningJob(future_standard_job_message)).into());
-                let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
-                let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
-                let n_bits = last_set_new_prev_hash_tdp.n_bits;
-                let set_new_prev_hash_mining = SetNewPrevHash {
-                    channel_id,
-                    job_id: future_standard_job_id,
-                    prev_hash,
-                    min_ntime: header_timestamp,
-                    nbits: n_bits,
-                };
 
-                standard_channel
-                .on_set_new_prev_hash(last_set_new_prev_hash_tdp.clone()).map_err(PoolError::shutdown)?;
+                // Same guard as the extended path — see #898. Only activate when the cached
+                // `last_new_prev_hash` refers to the same template we just seeded; a channel
+                // opening between a `NewTemplate(N)` and its `SetNewPrevHash(N)` would otherwise
+                // try to activate N-1 and take the whole process down.
+                if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, template_id) {
+                    let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
+                    let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
+                    let n_bits = last_set_new_prev_hash_tdp.n_bits;
+                    let set_new_prev_hash_mining = SetNewPrevHash {
+                        channel_id,
+                        job_id: future_standard_job_id,
+                        prev_hash,
+                        min_ntime: header_timestamp,
+                        nbits: n_bits,
+                    };
 
-                messages.push((downstream_id, Mining::SetNewPrevHash(set_new_prev_hash_mining)).into());
+                    standard_channel
+                    .on_set_new_prev_hash(last_set_new_prev_hash_tdp.clone()).map_err(|e| PoolError::disconnect(e, downstream_id))?;
+
+                    messages.push((downstream_id, Mining::SetNewPrevHash(set_new_prev_hash_mining)).into());
+                } else {
+                    debug!(
+                        channel_id,
+                        template_id,
+                        prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
+                        "Opened channel between NewTemplate and its SetNewPrevHash — \
+                         leaving the future job unactivated for the next broadcast"
+                    );
+                }
 
                 downstream_data.standard_channels.insert(channel_id, standard_channel);
                 if !downstream.requires_standard_jobs.load(Ordering::SeqCst) {
@@ -636,7 +670,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         // jobs so we just process the SetNewPrevHash
                         // message
                         if downstream.requires_custom_work.load(Ordering::SeqCst) {
-                            extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(PoolError::shutdown)?;
+                            extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(|e| PoolError::disconnect(e, downstream_id))?;
                             // if the client does not require custom work, we need to send the
                             // future extended job
                             // and the SetNewPrevHash message
@@ -655,7 +689,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             extended_channel.on_new_template(
                                 channel_template,
                                 coinbase_outputs,
-                            ).map_err(PoolError::shutdown)?;
+                            ).map_err(|e| PoolError::disconnect(e, downstream_id))?;
 
                             let future_extended_job_id = extended_channel
                                 .get_future_job_id_from_template_id(last_future_template.template_id)
@@ -678,27 +712,51 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     .into(),
                             );
 
-                            // SetNewPrevHash message activates the future job
-                            let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
-                            let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
-                            let n_bits = last_set_new_prev_hash_tdp.n_bits;
-                            let set_new_prev_hash_mining = SetNewPrevHash {
-                                channel_id,
-                                job_id: future_extended_job_id,
-                                prev_hash,
-                                min_ntime: header_timestamp,
-                                nbits: n_bits,
-                            };
+                            // Activate the future job we just seeded — but ONLY when the two
+                            // cached Template Distribution fields actually agree.
+                            //
+                            // `last_future_template` and `last_new_prev_hash` are written by two
+                            // different TP handlers, each taking this lock separately. Between a
+                            // `NewTemplate(N)` and its `SetNewPrevHash(N)` the pair is legitimately
+                            // mismatched: the template is already N while the prev hash still
+                            // refers to N-1. A channel opening in that window would seed job N and
+                            // then ask to activate N-1, which `on_set_new_prev_hash` reports as
+                            // `TemplateIdNotFound` (#898).
+                            //
+                            // Skipping is safe and loses nothing: the channel keeps its future job,
+                            // and the next `SetNewPrevHash` broadcast activates it for every
+                            // downstream. Sending the client a `SetNewPrevHash` built from the
+                            // stale prev hash would be actively wrong, so that is skipped with it.
+                            if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, last_future_template.template_id) {
+                                let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
+                                let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
+                                let n_bits = last_set_new_prev_hash_tdp.n_bits;
+                                let set_new_prev_hash_mining = SetNewPrevHash {
+                                    channel_id,
+                                    job_id: future_extended_job_id,
+                                    prev_hash,
+                                    min_ntime: header_timestamp,
+                                    nbits: n_bits,
+                                };
 
-                            extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(PoolError::shutdown)?;
+                                extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(|e| PoolError::disconnect(e, downstream_id))?;
 
-                            messages.push(
-                                (
-                                    downstream_id,
-                                    Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                                )
-                                    .into(),
-                            );
+                                messages.push(
+                                    (
+                                        downstream_id,
+                                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                                    )
+                                        .into(),
+                                );
+                            } else {
+                                debug!(
+                                    channel_id,
+                                    template_id = last_future_template.template_id,
+                                    prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
+                                    "Opened channel between NewTemplate and its SetNewPrevHash — \
+                                     leaving the future job unactivated for the next broadcast"
+                                );
+                            }
 
                             let full_extranonce_size = extended_channel.get_full_extranonce_size();
                             downstream_data.group_channel.add_channel_id(channel_id, full_extranonce_size).map_err(|e| {
@@ -1960,5 +2018,156 @@ mod extranonce_allocation_tests {
         // by a miner authorising as plain `sri/donate`.
         assert!(PayoutMode::try_from(PROVISIONAL_CHANNEL_IDENTITY).is_ok());
         assert_ne!(PROVISIONAL_CHANNEL_IDENTITY, "sri/donate");
+    }
+}
+
+#[cfg(test)]
+mod seeded_job_activation_tests {
+    //! Regression cover for #898.
+    //!
+    //! A channel opening between a `NewTemplate(N)` and its `SetNewPrevHash(N)` used to ask the
+    //! job store to activate a template it had never been given. The resulting
+    //! `TemplateIdNotFound` was classified `Action::Shutdown`, so one stale miner frame exited
+    //! the whole process and dropped every miner on the node.
+    //!
+    //! These tests drive a REAL `ExtendedChannel`, so `may_activate_seeded_job` is asserted
+    //! against what the channel actually does rather than against itself.
+
+    use super::*;
+    use stratum_apps::stratum_core::{
+        bitcoin::{transaction::TxOut, Amount, ScriptBuf},
+        channels_sv2::server::{error::ExtendedChannelError, jobs::extended::ExtendedJob},
+        template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp},
+    };
+
+    const SATS_AVAILABLE_IN_TEMPLATE: u64 = 5_000_000_000;
+
+    fn channel() -> ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>> {
+        ExtendedChannel::new_for_pool(
+            1,
+            "user_identity".to_string(),
+            vec![0, 0, 0, 1],
+            Target::MAX,
+            // A realistic nominal rate: `Target::MAX` is the difficulty-1 target, and a toy
+            // hashrate derives a target ABOVE it, which `new_for_pool` rejects outright.
+            1e12,
+            true,
+            4,
+            100,
+            6.0,
+            DefaultJobStore::new(),
+            String::new(),
+        )
+        .expect("channel must build")
+    }
+
+    fn template(template_id: u64) -> NewTemplate<'static> {
+        NewTemplate {
+            template_id,
+            future_template: true,
+            version: 536870912,
+            coinbase_tx_version: 2,
+            coinbase_prefix: vec![82, 0].try_into().expect("valid prefix"),
+            coinbase_tx_input_sequence: 4294967295,
+            coinbase_tx_value_remaining: SATS_AVAILABLE_IN_TEMPLATE,
+            coinbase_tx_outputs_count: 1,
+            // A real serialised OP_RETURN witness-commitment output: an empty vec does not
+            // deserialise, and the job factory rejects the template before it is ever stored.
+            coinbase_tx_outputs: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 38, 106, 36, 170, 33, 169, 237, 226, 246, 28, 63, 113, 209,
+                222, 253, 63, 169, 153, 223, 163, 105, 83, 117, 92, 105, 6, 137, 121, 153, 98, 180,
+                139, 235, 216, 54, 151, 78, 140, 249,
+            ]
+            .try_into()
+            .expect("valid outputs"),
+            coinbase_tx_locktime: 0,
+            merkle_path: vec![].try_into().expect("valid merkle path"),
+        }
+    }
+
+    fn prev_hash(template_id: u64) -> SetNewPrevHashTdp<'static> {
+        SetNewPrevHashTdp {
+            template_id,
+            prev_hash: [0u8; 32].into(),
+            header_timestamp: 1746839905,
+            n_bits: 503543726,
+            target: [0xffu8; 32].into(),
+        }
+    }
+
+    fn payout_outputs() -> Vec<TxOut> {
+        vec![TxOut {
+            value: Amount::from_sat(SATS_AVAILABLE_IN_TEMPLATE),
+            script_pubkey: ScriptBuf::new(),
+        }]
+    }
+
+    /// The matched case: the predicate says "activate", and the channel agrees.
+    #[test]
+    fn matched_pair_activates_and_the_predicate_says_so() {
+        let mut channel = channel();
+        channel
+            .on_new_template(template(2734), payout_outputs())
+            .expect("seeding the future job must succeed");
+
+        assert!(
+            may_activate_seeded_job(2734, 2734),
+            "a matched pair must be activatable"
+        );
+        channel
+            .on_set_new_prev_hash(prev_hash(2734))
+            .expect("a matched pair must activate cleanly");
+    }
+
+    /// The bug: a mismatched pair is exactly what the channel rejects with
+    /// `TemplateIdNotFound`. This is the call the shipped code must NOT make.
+    #[test]
+    fn mismatched_pair_is_what_the_channel_rejects() {
+        let mut channel = channel();
+        channel
+            .on_new_template(template(2734), payout_outputs())
+            .expect("seeding the future job must succeed");
+
+        // The predicate must refuse it...
+        assert!(
+            !may_activate_seeded_job(2733, 2734),
+            "a pair straddling a template rotation must NOT be activatable"
+        );
+
+        // ...and this is precisely why: the real channel errors, and that error used to be
+        // escalated to Action::Shutdown.
+        let err = channel
+            .on_set_new_prev_hash(prev_hash(2733))
+            .expect_err("a mismatched pair must be rejected by the channel");
+        assert!(
+            matches!(err, ExtendedChannelError::TemplateIdNotFound),
+            "expected TemplateIdNotFound, got {err:?}"
+        );
+    }
+
+    /// The predicate must agree with the channel across a spread of pairs — this is what stops
+    /// someone loosening it back into the shutdown path.
+    #[test]
+    fn predicate_agrees_with_the_channel_on_every_pair() {
+        for (seeded, incoming) in [
+            (2734u64, 2734u64),
+            (2734, 2733),
+            (2734, 2735),
+            (1, 1),
+            (1, 0),
+        ] {
+            let mut channel = channel();
+            channel
+                .on_new_template(template(seeded), payout_outputs())
+                .expect("seeding the future job must succeed");
+
+            let predicted = may_activate_seeded_job(incoming, seeded);
+            let actual = channel.on_set_new_prev_hash(prev_hash(incoming)).is_ok();
+
+            assert_eq!(
+                predicted, actual,
+                "predicate disagreed with the channel for seeded={seeded} incoming={incoming}"
+            );
+        }
     }
 }
