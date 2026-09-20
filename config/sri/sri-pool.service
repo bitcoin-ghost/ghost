@@ -2,14 +2,19 @@
 Description=SRI Pool (SV2) - Ghost Network
 After=network.target ghost-pool.service
 Wants=ghost-pool.service
-
 [Service]
 Type=simple
-User=ghost
-Group=ghost
+User=root
+Group=root
+ExecStartPre=/opt/ghost/bin/update-pool-signature.sh
 ExecStart=/opt/ghost/bin/pool_sv2 --config /etc/ghost/pool-config.toml
+# `debug` here made sri-pool ~30x louder than it needs to be and evicted the journal
+# (#903): on the loudest node it left 4.1 days of history against the other nodes' full
+# two weeks. The mining message handler stays at debug because those
+# OpenExtendedMiningChannel / CloseChannel lines are what diagnose channel faults --
+# they are what pinned down #898.
+Environment=RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target

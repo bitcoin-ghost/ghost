@@ -36,6 +36,11 @@ PAIRS = {
     # field that no longer exists. Running it on a private pool would have dropped every
     # miner. It had also never gained the Wraith coordinator block the installer copy has.
     "RECONCILE_MINING_FW_EOF":         "scripts/reconcile-mining-firewall.sh",
+    # Added after config/sri/sri-pool.service was found describing a unit that matches NO
+    # live node (#903): it still said `User=ghost`, carried no `ExecStartPre` and no
+    # `RUST_LOG`, while all 8 production nodes run the installer's copy. The repo copy was
+    # not merely stale, it was never deployed by anything -- so nothing contradicted it.
+    "SRI_POOL_SERVICE_EOF":            "config/sri/sri-pool.service",
 }
 
 src = open(INSTALLER).read()

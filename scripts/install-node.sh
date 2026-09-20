@@ -1268,7 +1268,9 @@ EOF
 # TDP server is up, then connects — no manual ordering needed. These are installed
 # in EVERY mining mode so any node can serve miners; the firewall (below) decides
 # whether the ports are reachable from off-box.
-cat > /etc/systemd/system/sri-pool.service <<'EOF'
+# Canonical source: config/sri/sri-pool.service — kept byte-identical by
+# scripts/check-inlined-copies.sh, which is why this heredoc has a named marker.
+cat > /etc/systemd/system/sri-pool.service <<'SRI_POOL_SERVICE_EOF'
 [Unit]
 Description=SRI Pool (SV2) - Ghost Network
 After=network.target ghost-pool.service
@@ -1279,12 +1281,17 @@ User=root
 Group=root
 ExecStartPre=/opt/ghost/bin/update-pool-signature.sh
 ExecStart=/opt/ghost/bin/pool_sv2 --config /etc/ghost/pool-config.toml
-Environment=RUST_LOG=debug
+# `debug` here made sri-pool ~30x louder than it needs to be and evicted the journal
+# (#903): on the loudest node it left 4.1 days of history against the other nodes' full
+# two weeks. The mining message handler stays at debug because those
+# OpenExtendedMiningChannel / CloseChannel lines are what diagnose channel faults --
+# they are what pinned down #898.
+Environment=RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug
 Restart=always
 RestartSec=5
 [Install]
 WantedBy=multi-user.target
-EOF
+SRI_POOL_SERVICE_EOF
 cat > /etc/systemd/system/sri-translator.service <<'EOF'
 [Unit]
 Description=SRI Translator (SV1 to SV2) - Ghost Network
