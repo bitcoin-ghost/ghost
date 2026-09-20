@@ -7,8 +7,11 @@
 # twice before anyone noticed.
 #
 # Exit: 0 = verified clean, 1 = misattribution detected, 2 = INCONCLUSIVE (no shares to judge).
-# The 2 matters: it used to return 0 on a node with no miners, which is every canary, so the
-# post-deploy check reported PASS having examined nothing (#461, #464).
+# The 2 matters: it used to return 0 on a node with no miners, so the post-deploy check
+# reported PASS having examined nothing (#461, #464). ⚠ This line used to say "which is every
+# canary" — that is no longer true (2026-09-20: vm5 held 5 miners, vm6 held none), but the
+# INCONCLUSIVE exit matters more now, not less: which nodes are idle varies run to run, so
+# whether this examined anything cannot be assumed from the node's name.
 #
 # Usage: verify_attribution.sh <node> [window_secs]
 set -uo pipefail

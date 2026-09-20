@@ -18,8 +18,9 @@
 #
 #   <node>    ssh alias, e.g. ghost-vm5
 #   <binary>  one of: ghost-pool | pool_sv2 | translator_sv2
-#   --canary  target is a canary node (not in DNS, no miners); relaxes the soak requirement
-#             but NOT the clean-tree or test requirements.
+#   --canary  target is a canary node; relaxes the soak requirement but NOT the clean-tree
+#             or test requirements. ⛔ A canary is NOT free to restart: all eight nodes are
+#             in the mining DNS and canaries do carry miners (see CANARY_NODES below).
 #
 # Exit codes: 0 ok, 1 precondition failed, 2 deploy failed, 3 smoke failed (rolled back).
 #
@@ -196,11 +197,16 @@ fi
 
 # Exercise the SHARE-SUBMISSION path against a node, synthetically.
 #
-# A canary has no miners (#461), so "healthy for 60 minutes" says nothing about the code path
-# where both of the regressions that motivated this gate actually lived: attribution, and a
-# declared difficulty that never reached the wire. A node can sit green for the whole window
-# with either bug fully present and the soak will still report satisfied — the same
-# can't-fail-shape as #459.
+# A canary cannot be RELIED ON to have miners (#461), so "healthy for 60 minutes" says nothing
+# about the code path where both of the regressions that motivated this gate actually lived:
+# attribution, and a declared difficulty that never reached the wire. A node can sit green for
+# the whole window with either bug fully present and the soak will still report satisfied —
+# the same can't-fail-shape as #459.
+#
+# ⚠ The original wording here was "a canary has no miners", which is no longer true — measured
+# 2026-09-20, vm5 held 5 of the fleet's 10 connected miners while vm6 held none. The REASONING
+# is unaffected, because it never depended on the count being zero: a synthetic client is the
+# only way to exercise submission deterministically on whichever node you happen to target.
 #
 # The smoke suite synthesises a real SV1 client, so it works on a node with zero miners. It is
 # the only part of the soak that touches submission at all, which is why it is mandatory here

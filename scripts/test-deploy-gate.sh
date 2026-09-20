@@ -184,10 +184,11 @@ check "a 5-minute soak does not satisfy a 60-minute requirement" "has not soaked
 # ---------------------------------------------------------------------------
 # 5. A LONG ENOUGH soak whose submission path is broken must NOT satisfy the gate.
 #
-#    This is the #461 case. A canary has no miners, so "healthy for 60 minutes" says nothing
-#    about the path where both motivating regressions lived. Before this, the gate accepted a
-#    soak purely on elapsed time and a matching hash — a build could handshake-deadlock every
-#    miner and still be waved into production.
+#    This is the #461 case. A canary cannot be relied on to have miners, so "healthy for 60
+#    minutes" says nothing about the path where both motivating regressions lived. Before this,
+#    the gate accepted a soak purely on elapsed time and a matching hash — a build could
+#    handshake-deadlock every miner and still be waved into production.
+#    (Wording corrected 2026-09-20: it read "a canary has no miners", which is no longer true.)
 # ---------------------------------------------------------------------------
 printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
     > "$TMP/state/soaked-$SHA-ghost-vm5-translator_sv2"
