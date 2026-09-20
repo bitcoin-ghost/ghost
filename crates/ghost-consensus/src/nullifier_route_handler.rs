@@ -1422,15 +1422,29 @@ impl NullifierRouteHandler {
                 .and_then(|p| serde_json::to_vec(p).ok())
                 .unwrap_or_default(),
         };
-        // Use upsert fallback for idempotent persistence (checkpoint may already exist from tree sync)
-        let atomic_ok = self
+        // The atomic path is duplicate-safe since #899, so reaching the fallback now means a
+        // GENUINE database fault -- disk full, corruption, a poisoned lock -- not the routine
+        // replayed-height case that used to account for ~100 of these per node per day.
+        //
+        // Report the error. It used to be discarded by `.is_ok()`, which left the warning
+        // unable to say WHY the write failed, so an operator could not tell a healthy node
+        // from a failing one.
+        let atomic_ok = match self
             .db
             .persist_l2_checkpoint_atomic(&record, &pending_nullifiers)
-            .is_ok();
-        if !atomic_ok {
-            warn!(height, "Checkpoint atomic persist failed, upserting checkpoint record (nullifier WAL preserved)");
-            self.db.upsert_l2_checkpoint(&record)?;
-        }
+        {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    height,
+                    error = %e,
+                    nullifiers = pending_nullifiers.len(),
+                    "Checkpoint atomic persist failed, upserting checkpoint record (nullifier WAL preserved)"
+                );
+                self.db.upsert_l2_checkpoint(&record)?;
+                false
+            }
+        };
 
         // C-9: Only clear the nullifier write-ahead log if the atomic persist succeeded.
         // The atomic persist moves nullifiers from pending_nullifiers → l2_nullifiers in
