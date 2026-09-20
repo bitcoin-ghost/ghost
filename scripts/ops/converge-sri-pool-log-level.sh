@@ -82,15 +82,37 @@ for n in "${NODES[@]}"; do
     eff="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" \
         'systemctl show sri-pool -p Environment --value 2>/dev/null' 2>/dev/null)"
     if echo "$eff" | grep -qF "$WANT_ENV"; then
-        started="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" \
-            'systemctl show sri-pool -p ActiveEnterTimestampMonotonic --value 2>/dev/null' 2>/dev/null)"
-        reloaded="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" \
-            'systemctl show sri-pool -p StateChangeTimestampMonotonic --value 2>/dev/null' 2>/dev/null)"
-        if [ -n "$started" ] && [ -n "$reloaded" ] && [ "$reloaded" -gt "$started" ] 2>/dev/null; then
+        # Ask the RUNNING PROCESS what it was started with, via /proc/<MainPID>/environ.
+        #
+        # This used to compare `StateChangeTimestampMonotonic` against
+        # `ActiveEnterTimestampMonotonic` on the theory that a daemon-reload bumps the former.
+        # It does not do so reliably. On the 2026-09-20 run that comparison reported 5 of 8
+        # nodes "live" moments after the drop-in was first written to them -- when every one of
+        # the 8 was necessarily still running the old value. Ground truth was
+        # restart-pending=7, and the check said 3.
+        #
+        # That is the precise failure this script exists to prevent, so it now reads the
+        # process rather than inferring from a timestamp whose semantics it guessed.
+        #
+        # ⚠ `sudo cat FILE | tr` -- NOT `sudo tr < FILE`. The redirect is opened by the CALLING
+        # shell before sudo runs, so the privileged form silently yields "Permission denied" on
+        # the nodes where sri-pool runs as root. That cost a wrong reading once already.
+        running="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" \
+            'S=$(command -v sudo >/dev/null && echo "sudo -n" || echo)
+             P=$(systemctl show sri-pool -p MainPID --value 2>/dev/null)
+             [ -n "$P" ] && [ "$P" != 0 ] || exit 0
+             $S cat /proc/$P/environ 2>/dev/null | tr "\0" "\n" | grep "^RUST_LOG="' 2>/dev/null)"
+
+        if [ -z "$running" ]; then
+            # Unreadable is NOT "live". Silence here previously read as success.
+            echo "| unit=OK, running value UNREADABLE — cannot confirm; treat as pending"
             pending_restart=$((pending_restart + 1))
-            echo "| unit=OK, RESTART PENDING (process predates the change)"
+            rc=1
+        elif [ "$running" = "$WANT_ENV" ]; then
+            echo "| unit=OK, live (process confirms)"
         else
-            echo "| unit=OK, live"
+            pending_restart=$((pending_restart + 1))
+            echo "| unit=OK, RESTART PENDING (process has ${running#RUST_LOG=})"
         fi
     else
         echo "| EFFECTIVE VALUE STILL WRONG: ${eff:-<unreadable>}"
