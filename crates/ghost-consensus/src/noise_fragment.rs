@@ -133,21 +133,30 @@ pub const REASSEMBLY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 
 /// Ceiling on what any ONE connection may hold.
 ///
-/// Grounded in what a legitimate message can be, not in the reassembly cap: the largest
-/// per-type limit `message_validator` accepts is `MAX_ZK_PROPOSAL_SIZE` (2,000,000 bytes) and
-/// every other type is at or below 1.1 MB. 2 MiB clears that, and anything larger is refused
-/// by the validator after reassembly anyway — so declining to buffer it here refuses earlier
-/// and cheaper.
+/// Grounded in the SERIALIZED size, because that is what this layer reassembles.
 ///
-/// ⚠ The headroom over 2,000,000 is only ~4.9%. That is deliberate and asserted: raising a
-/// message-type limit past this must fail a test rather than silently start disconnecting
-/// honest peers.
+/// ⚠ An earlier version of this comment reasoned from `MAX_ZK_PROPOSAL_SIZE` (2,000,000) and
+/// claimed "~4.9% headroom" — the same unit error the assert below was fixed for. That is a
+/// cap on `envelope.payload.len()` BEFORE serialization, and `serde_json` writes `Vec<u8>` as
+/// decimal integers (~3.7x, see `message_validator.rs`). The quantity actually enforced on the
+/// wire is `MAX_ENVELOPE_SIZE` (1,000,000), which `validate_envelope_header` applies to the
+/// serialized bytes, so real headroom here is ~110%.
+///
+/// Exceeding this no longer disconnects anyone: an oversized message is DROPPED and its
+/// fragments poisoned, and the parse-time bound stays at `MAX_REASSEMBLY_SIZE`.
 pub const REASSEMBLY_PER_CONN_BYTES: usize = 2 * 1024 * 1024;
 
 /// The smallest budget that still keeps one `/24` a minority of it.
 ///
 /// Derived, not chosen: any override below this reintroduces cornering, so the env knob
 /// refuses it rather than accepting a number that quietly breaks the guarantee.
+/// Largest budget the env override will accept.
+///
+/// The floor stops the budget being set so low that one `/24` corners it; this stops it being
+/// set so high that it stops being a bound at all. A typo of one extra zero on a 3,867 MiB
+/// node is a ~915 MiB ceiling, which is the OOM this module exists to prevent.
+pub const MAX_REASSEMBLY_BUDGET_BYTES: usize = 4 * REASSEMBLY_BUDGET_BYTES;
+
 pub const MIN_REASSEMBLY_BUDGET_BYTES: usize =
     2 * crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES;
 
@@ -183,12 +192,12 @@ const _: () = assert!(
 /// layer, or honest traffic is DISCONNECTED rather than refused — mesh treats any accept
 /// error as fatal.
 ///
-/// ⚠ The comparison is against `MAX_ENVELOPE_SIZE`, the cap `validate_envelope_header` applies
-/// to the SERIALIZED bytes — which is what gets fragmented and reassembled here. An earlier
-/// version compared against `MAX_ZK_PROPOSAL_SIZE`, a cap on `envelope.payload.len()` BEFORE
-/// serialization. `MessageEnvelope::serialize` is `serde_json::to_vec` and `payload: Vec<u8>`
-/// encodes as a JSON decimal array, so the two differ by roughly 3.5x — the assert was
-/// comparing quantities in different units and the headroom it implied was wrong.
+/// ⚠ `MAX_ENVELOPE_SIZE` is the right constant and the SUFFICIENT one: `validate_envelope_header`
+/// refuses any serialized envelope above it, so a per-type payload cap larger than
+/// `MAX_ENVELOPE_SIZE / 3.7` is already unreachable on the wire and cannot widen what this layer
+/// sees. An earlier comment promised that raising a per-type cap "must fail a test"; no such
+/// test existed, and inventing one would assert a bound that is not the binding one. This assert
+/// is.
 const _: () = assert!(
     REASSEMBLY_PER_CONN_BYTES > crate::message_validator::MAX_ENVELOPE_SIZE,
     "the per-connection reassembly cap is below the largest serialized envelope"
@@ -278,11 +287,20 @@ impl FragmentHeader {
         if chunk_count > MAX_FRAGMENT_COUNT {
             return Err(NoiseError::Decryption("fragment: too many chunks".into()));
         }
-        // Refuse here, BEFORE any buffering, anything the per-connection quota would refuse
-        // later. The two limits disagreeing is not cosmetic: mesh.rs treats every `accept`
-        // error as fatal and drops the connection, so a peer sending a message this layer's
-        // own contract called legal would be disconnected rather than told no.
-        if total_len > REASSEMBLY_PER_CONN_BYTES {
+        // The PROTOCOL bound. Deliberately NOT the per-connection quota.
+        //
+        // ⛔ An earlier revision refused here at `REASSEMBLY_PER_CONN_BYTES` (2 MiB) reasoning
+        // that the two limits should agree. That is a self-inflicted outage: mesh.rs breaks the
+        // inbound loop on ANY `recv` error, and the send path serializes without a size check,
+        // so an L2 checkpoint or tree-sync near its 1,000,000-byte payload cap — ~3.7 MB once
+        // serde_json expands `Vec<u8>` to decimal — would tear the connection down, the sender
+        // would reconnect, re-broadcast the same periodic message, and loop. Before that change
+        // the envelope reassembled and `validate_envelope_header` refused it cleanly with the
+        // connection intact.
+        //
+        // Size is a RESOURCE decision, and resource decisions drop the message (below), never
+        // the connection. Only a malformed frame is a protocol error.
+        if total_len > MAX_REASSEMBLY_SIZE {
             return Err(NoiseError::Decryption(
                 "fragment: total_len exceeds reassembly cap".into(),
             ));
@@ -640,20 +658,22 @@ impl ReassemblyBudget {
         let delta = payload.len();
         let have = g.entries[&id].bytes;
 
+        // ⛔ Both refusals below DROP THE MESSAGE and keep the connection.
+        //
+        // Returning `Err` here would tear the socket down (mesh.rs breaks on any recv error),
+        // which turns "this node is busy" into "this peer is gone" and, for a periodic
+        // broadcast, into a reconnect loop. The message is poisoned so its remaining fragments
+        // are discarded rather than re-buffered, and the peer is free to send something else.
         if have + delta > g.per_conn {
-            Self::clear(&mut g, id, reclaimed);
+            Self::poison_and_clear(&mut g, id, header.message_id, reclaimed);
             g.rejections += 1;
-            return Err(NoiseError::Decryption(
-                "fragment: per-connection reassembly quota exceeded".into(),
-            ));
+            return Ok(None);
         }
 
         if !Self::make_room(&mut g, id, delta, reclaimed, logs) {
-            Self::clear(&mut g, id, reclaimed);
+            Self::poison_and_clear(&mut g, id, header.message_id, reclaimed);
             g.rejections += 1;
-            return Err(NoiseError::Decryption(
-                "fragment: reassembly budget exhausted".into(),
-            ));
+            return Ok(None);
         }
 
         // ---- write it
@@ -701,6 +721,20 @@ impl ReassemblyBudget {
             out.extend_from_slice(&chunk.expect("all chunks present when count matches"));
         }
         Ok(Some(out))
+    }
+
+    /// Drop `id`'s buffer, its accounting, AND remember the message so its remaining fragments
+    /// are discarded instead of re-buffered into something that can never complete.
+    fn poison_and_clear(
+        g: &mut BudgetInner,
+        id: u64,
+        message_id: u64,
+        reclaimed: &mut Vec<InFlight>,
+    ) {
+        Self::clear(g, id, reclaimed);
+        if let Some(e) = g.entries.get_mut(&id) {
+            e.poisoned = Some(message_id);
+        }
     }
 
     /// Drop `id`'s buffer and its accounting together.
@@ -830,7 +864,22 @@ fn budget_limit_from_env(raw: Option<&str>) -> usize {
         return REASSEMBLY_BUDGET_BYTES;
     };
     match raw.trim().parse::<usize>() {
-        Ok(v) if v >= MIN_REASSEMBLY_BUDGET_BYTES => v,
+        // ⛔ A CEILING as well as a floor. Every other bad input was warned about; the one
+        // genuinely dangerous direction was the only silent one. On a 3,867 MiB node a single
+        // extra zero (960000000) would set a ~915 MiB ceiling and `held` would grow to it
+        // before anything evicted — the OOM this budget exists to prevent.
+        Ok(v) if v > MAX_REASSEMBLY_BUDGET_BYTES => {
+            tracing::warn!(
+                requested = v,
+                ceiling = MAX_REASSEMBLY_BUDGET_BYTES,
+                using = REASSEMBLY_BUDGET_BYTES,
+                "GHOST_REASSEMBLY_BUDGET_BYTES is above the ceiling — ignoring it"
+            );
+            REASSEMBLY_BUDGET_BYTES
+        }
+        // ⚠ STRICTLY greater. At exactly the floor one /24 holds exactly half, which is not
+        // the "minority" this module claims everywhere.
+        Ok(v) if v > MIN_REASSEMBLY_BUDGET_BYTES => v,
         // Say so. An operator trimming reassembly memory on a 3,867 MiB node is who this knob
         // is for; silently using the default leaves the failure invisible in the one case it
         // matters.
@@ -1016,26 +1065,58 @@ mod tests {
         );
     }
 
-    /// The fragment layer must refuse what the quota would refuse, BEFORE buffering.
+    /// ⛔ An oversized message must be DROPPED, never disconnect the peer.
     ///
-    /// mesh.rs treats any `accept` error as fatal and drops the connection, so the two limits
-    /// disagreeing means a peer sending something this layer's own contract called legal gets
-    /// disconnected instead of told no.
+    /// mesh.rs breaks the inbound loop on ANY recv error and the send path has no size check,
+    /// so returning `Err` for a size condition turns "too big for me right now" into a torn
+    /// socket — and for a periodic broadcast, into a reconnect loop. An L2 checkpoint near its
+    /// 1,000,000-byte payload cap is ~3.7 MB serialized, squarely in the band an earlier
+    /// revision rejected at parse.
     #[test]
-    fn parse_refuses_what_the_quota_would_refuse() {
-        let too_big = REASSEMBLY_PER_CONN_BYTES + 1;
-        let frame = frag(1, 0, chunks_for(too_big), too_big as u32, &[0u8; 8]);
-        let r = FragmentHeader::parse(&frame);
-        match r {
-            Err(e) => assert!(
-                format!("{e:?}").contains("reassembly cap"),
-                "the refusal must name the cap, got {e:?}"
-            ),
-            Ok(_) => panic!(
-                "a declared length above the per-connection cap must be refused at parse, \
-                 before any buffering — otherwise mesh drops the connection instead"
-            ),
+    fn an_oversized_message_is_dropped_not_disconnected() {
+        let budget = ReassemblyBudget::new(MIN_REASSEMBLY_BUDGET_BYTES + 1);
+        let mut peer = FragmentReassembler::with_budget(budget.clone());
+
+        // Larger than the per-connection quota, but legal to the fragment protocol.
+        let declared = REASSEMBLY_PER_CONN_BYTES + MAX_FRAGMENT_PAYLOAD;
+        assert!(declared <= MAX_REASSEMBLY_SIZE, "still a legal frame");
+        let count = chunks_for(declared);
+
+        let mut saw_err = false;
+        for i in 0..count {
+            if peer
+                .accept(frag(
+                    9,
+                    i,
+                    count,
+                    declared as u32,
+                    &vec![3u8; MAX_FRAGMENT_PAYLOAD],
+                ))
+                .is_err()
+            {
+                saw_err = true;
+                break;
+            }
         }
+        assert!(
+            !saw_err,
+            "a size refusal must never surface as an error — mesh would drop the connection"
+        );
+        assert_eq!(
+            peer.held_bytes(),
+            0,
+            "the oversized message must hold nothing once refused"
+        );
+
+        // And the peer can still use the connection for something that fits.
+        let payload: Vec<u8> = (0..84_000u32).map(|i| (i % 251) as u8).collect();
+        let mut out = None;
+        for f in fragment_message(&payload) {
+            if let Some(done) = peer.accept(f).expect("the connection must still work") {
+                out = Some(done);
+            }
+        }
+        assert_eq!(out.as_deref(), Some(payload.as_slice()));
     }
 
     /// Eviction must not manufacture doomed buffers.
@@ -1092,16 +1173,32 @@ mod tests {
     fn the_env_override_enforces_the_subnet_floor() {
         assert_eq!(budget_limit_from_env(None), REASSEMBLY_BUDGET_BYTES);
 
-        let ok = MIN_REASSEMBLY_BUDGET_BYTES;
+        // ⚠ STRICTLY above the floor: at exactly the floor one /24 holds exactly half, which
+        // is not the "minority" this module claims.
+        assert_eq!(
+            budget_limit_from_env(Some(&MIN_REASSEMBLY_BUDGET_BYTES.to_string())),
+            REASSEMBLY_BUDGET_BYTES,
+            "exactly the floor leaves one /24 at 50% — it must be refused"
+        );
+
+        let ok = MIN_REASSEMBLY_BUDGET_BYTES + 1;
         assert_eq!(budget_limit_from_env(Some(&ok.to_string())), ok);
         assert_eq!(
             budget_limit_from_env(Some(&(ok * 2).to_string())),
             ok * 2,
-            "a larger budget must be honoured"
+            "a larger budget below the ceiling must be honoured"
         );
 
         // MAX_REASSEMBLY_SIZE is the value the broken version accepted, so name it explicitly.
-        for bad in [MAX_REASSEMBLY_SIZE, MIN_REASSEMBLY_BUDGET_BYTES - 1, 0, 1] {
+        for bad in [
+            MAX_REASSEMBLY_SIZE,
+            MIN_REASSEMBLY_BUDGET_BYTES - 1,
+            0,
+            1,
+            // Above the ceiling — a single extra zero on a 3,867 MiB node.
+            MAX_REASSEMBLY_BUDGET_BYTES + 1,
+            960_000_000,
+        ] {
             assert_eq!(
                 budget_limit_from_env(Some(&bad.to_string())),
                 REASSEMBLY_BUDGET_BYTES,
@@ -1212,7 +1309,8 @@ mod tests {
         );
     }
 
-    /// A connection cannot corner the budget on its own, however much it sends.
+    /// A connection cannot corner the budget on its own, however much it sends — and being
+    /// refused costs it the message, not the connection.
     #[test]
     fn one_connection_cannot_exceed_its_per_connection_quota() {
         const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
@@ -1221,32 +1319,20 @@ mod tests {
 
         let declared = 8 * CHUNK;
         let count = chunks_for(declared);
-
-        // ⚠ Check the chunk that CROSSES the quota, not the last one sent. A rejection clears
-        // the partial, so the fragment after it legitimately starts a fresh buffer and
-        // succeeds — reading only the last result would miss the refusal entirely.
-        let mut first_err = None;
         for i in 0..4u16 {
             let r = hog.accept(frag(1, i, count, declared as u32, &vec![9u8; CHUNK]));
-            if let Err(e) = r {
-                first_err = Some(e);
-                break;
-            }
+            assert!(
+                r.is_ok(),
+                "a quota refusal must be a dropped message, not an error that disconnects"
+            );
             assert!(
                 hog.held_bytes() <= 2 * CHUNK,
-                "held {} exceeded the quota mid-loop",
+                "held {} exceeded the quota",
                 hog.held_bytes()
             );
         }
-        let err = first_err.expect("the per-connection quota must stop this connection");
-        assert!(
-            format!("{err:?}").contains("per-connection"),
-            "the refusal must name the quota, got {err:?}"
-        );
-        assert!(
-            budget.stats().0 <= 2 * CHUNK,
-            "one connection held more than its quota"
-        );
+        assert!(budget.stats().0 <= 2 * CHUNK);
+        assert!(budget.stats().2 > 0, "the refusal must be counted");
     }
 
     /// Stale first, then LRU. A buffer that has not progressed within REASSEMBLY_TIMEOUT is the
