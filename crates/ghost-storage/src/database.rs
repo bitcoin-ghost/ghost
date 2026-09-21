@@ -694,10 +694,17 @@ impl Database {
     /// yield, so calling this from an async context parks the tokio worker it runs on rather
     /// than returning it to the runtime (#537). Prefer `spawn_blocking` at the call site in
     /// async code.
+    #[track_caller]
     pub fn with_connection<F, T>(&self, f: F) -> GhostResult<T>
     where
         F: FnOnce(&Connection) -> GhostResult<T>,
     {
+        // ⛔ WHO held it. The warning reported `held_ms` and nothing else, so a 20-second hold
+        // measured on a live node (#537, vm5 2026-09-21) could not be attributed to any call
+        // site — every one of them looks identical in the journal. `#[track_caller]` gets the
+        // caller's location with no change at any call site and no cost unless the warning
+        // fires.
+        let caller = std::panic::Location::caller();
         use std::sync::atomic::Ordering::Relaxed;
         // Timed from BEFORE the lock: waiting for it is exactly as blocking as holding it, and
         // under contention the wait is the larger half. Timing only the closure would report the
@@ -713,6 +720,7 @@ impl Database {
             DB_SLOW_CALLS.fetch_add(1, Relaxed);
             tracing::warn!(
                 held_ms = elapsed.as_millis(),
+                caller = %caller,
                 "database connection held past the slow threshold -- on a 2-CPU node this parks \
                  a tokio worker for the duration (#537)"
             );
@@ -757,21 +765,56 @@ impl Database {
     }
 
     /// Execute a transaction
+    ///
+    /// ⚠ BLOCKS the calling thread, exactly as [`Self::with_connection`] does — the same
+    /// `parking_lot::Mutex`, held for the whole transaction rather than one statement, so if
+    /// anything it parks a tokio worker for LONGER (#537).
+    ///
+    /// ⛔ This was entirely unmeasured. `with_connection` counted its calls, accumulated its
+    /// micros and warned past the slow threshold; `transaction` did none of it. So the 20.25s
+    /// worst hold measured on vm5 (2026-09-21) is a floor, not a maximum — it came only from
+    /// the half of the lock's users that were instrumented, and the checkpoint path goes
+    /// through here.
+    #[track_caller]
     pub fn transaction<F, T>(&self, f: F) -> GhostResult<T>
     where
         F: FnOnce(&rusqlite::Transaction) -> GhostResult<T>,
     {
-        let mut conn = self.inner.write_conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| GhostError::Database(e.to_string()))?;
+        use std::sync::atomic::Ordering::Relaxed;
+        let caller = std::panic::Location::caller();
+        // Timed from BEFORE the lock, for the same reason as `with_connection`: under
+        // contention the wait is the larger half, and timing only the body reports the system
+        // healthiest precisely when it is worst.
+        let started = std::time::Instant::now();
 
-        let result = f(&tx)?;
+        let result = (|| {
+            let mut conn = self.inner.write_conn.lock();
+            let tx = conn
+                .transaction()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
 
-        tx.commit()
-            .map_err(|e| GhostError::Database(e.to_string()))?;
+            let result = f(&tx)?;
 
-        Ok(result)
+            tx.commit()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(result)
+        })();
+
+        let elapsed = started.elapsed();
+        DB_CALLS.fetch_add(1, Relaxed);
+        DB_MICROS.fetch_add(elapsed.as_micros() as u64, Relaxed);
+        if elapsed >= SLOW_DB_CALL {
+            DB_SLOW_CALLS.fetch_add(1, Relaxed);
+            tracing::warn!(
+                held_ms = elapsed.as_millis(),
+                caller = %caller,
+                kind = "transaction",
+                "database connection held past the slow threshold -- on a 2-CPU node this parks \
+                 a tokio worker for the duration (#537)"
+            );
+        }
+        result
     }
 
     /// Execute a transaction with retry logic for transient errors
@@ -2230,5 +2273,54 @@ mod tests {
         assert!(!v.missing_tables.is_empty());
 
         let _ = std::fs::remove_file(&other);
+    }
+
+    /// ⛔ Transactions must be counted like any other hold of the write lock.
+    ///
+    /// `with_connection` counted its calls, accumulated its micros and warned past the slow
+    /// threshold. `transaction` took the SAME `parking_lot::Mutex`, held it for a whole
+    /// transaction rather than one statement, and did none of that — so every measurement of
+    /// how long this lock is held (#537) was taken from only half its users, and the half that
+    /// holds it longest was the invisible one. The checkpoint path goes through `transaction`.
+    ///
+    /// ⚠ The counters are process-global statics and the suite runs in parallel, so an exact
+    /// `before + 1` is FLAKY — it passed filtered and failed in the full run at `left: 9,
+    /// right: 8` because other tests incremented between the two reads. Doing many
+    /// transactions and asserting a floor is robust to that while still discriminating: if
+    /// `transaction` counted nothing, the delta could only reach `N` if concurrent tests
+    /// happened to make N database calls inside this window, and N is chosen large enough that
+    /// they do not.
+    #[test]
+    fn a_transaction_is_counted_like_any_other_connection_hold() {
+        const N: u64 = 200;
+        let db = Database::in_memory().expect("in-memory database must build");
+        db.transaction(|tx| {
+            tx.execute("CREATE TABLE IF NOT EXISTS t537 (a INTEGER)", [])
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .expect("setup must succeed");
+
+        let (calls_before, micros_before, _) = Database::connection_stats();
+        for i in 0..N {
+            db.transaction(|tx| {
+                tx.execute("INSERT INTO t537 (a) VALUES (?1)", [i as i64])
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                Ok(())
+            })
+            .expect("the transaction must succeed");
+        }
+        let (calls_after, micros_after, _) = Database::connection_stats();
+
+        assert!(
+            calls_after >= calls_before + N,
+            "{N} transactions moved the call counter by {} — transactions must be counted, or \
+             the lock's busiest users are absent from every measurement of it",
+            calls_after - calls_before
+        );
+        assert!(
+            micros_after >= micros_before,
+            "transactions must accumulate their held time"
+        );
     }
 }
