@@ -218,7 +218,7 @@ pub trait MessageHandler: Send + Sync {
 /// all honest inbound, and each connection also owns an 8 MiB reassembly slot — so the same host
 /// can pin hundreds of megabytes. A legitimate peer needs one or two; the margin is for NAT'd
 /// operators sharing an address, not for volume.
-const MAX_INBOUND_PER_IP: usize = 8;
+pub(crate) const MAX_INBOUND_PER_IP: usize = 8;
 
 /// Inbound Noise connections permitted from a single network block (H-12).
 ///

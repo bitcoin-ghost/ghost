@@ -131,6 +131,23 @@ pub const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// room for ~780 concurrent real reassemblies, against a fleet of 8 nodes.
 pub const REASSEMBLY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Ceiling on what any ONE connection may hold.
+///
+/// ⛔ This exists because of a measured hole in the first version of this budget, which left
+/// `per_conn` at [`MAX_REASSEMBLY_SIZE`]. `MAX_INBOUND_PER_IP` (8) x 8 MiB is 67,108,864 bytes
+/// — EXACTLY [`REASSEMBLY_BUDGET_BYTES`]. One address, inside its own per-IP cap, could hold
+/// 100% of the budget and so decide who got evicted.
+///
+/// Grounded in what a legitimate message can actually be rather than in the reassembly cap:
+/// the largest per-type limit `message_validator` will accept is `MAX_ZK_PROPOSAL_SIZE`
+/// (2,000,000 bytes), and every other type is at or below 1.1 MB. 3 MiB is comfortable headroom
+/// over that, and anything larger is refused by the validator AFTER reassembly anyway — so
+/// declining to buffer it here is strictly cheaper, and refuses earlier.
+///
+/// With this, one address's full inbound allowance reaches 24 MiB of the 64 MiB budget rather
+/// than all of it. `one_ip_cannot_corner_the_budget` pins the relationship.
+pub const REASSEMBLY_PER_CONN_BYTES: usize = 3 * 1024 * 1024;
+
 // Compile-time guarantee that a full fragment frame fits in one Noise frame.
 const _: () = assert!(FRAGMENT_HEADER_LEN + MAX_FRAGMENT_PAYLOAD <= MAX_PAYLOAD_SIZE);
 
@@ -322,7 +339,7 @@ impl Clone for ReassemblyBudget {
 
 impl ReassemblyBudget {
     pub fn new(limit: usize) -> Self {
-        Self::with_per_conn(limit, MAX_REASSEMBLY_SIZE.min(limit))
+        Self::with_per_conn(limit, REASSEMBLY_PER_CONN_BYTES.min(limit))
     }
 
     /// `per_conn` bounds what any ONE connection may hold, so a single peer cannot corner the
@@ -813,6 +830,32 @@ mod tests {
             Some(payload.as_slice()),
             "an honest checkpoint must still complete while the drips are parked — suppressing \
              it is the quieter DoS the first design traded the memory DoS for"
+        );
+    }
+
+    /// ⛔ THE INVARIANT THE FIRST VERSION BROKE, pinned as arithmetic.
+    ///
+    /// `MAX_INBOUND_PER_IP` x the per-connection cap must stay a MINORITY of the budget. In the
+    /// first version the per-connection cap was `MAX_REASSEMBLY_SIZE` (8 MiB) and 8 x 8 MiB was
+    /// exactly `REASSEMBLY_BUDGET_BYTES`, so one address — entirely inside its own per-IP cap —
+    /// could hold 100% of the budget and thereby choose who got evicted.
+    ///
+    /// This is arithmetic over constants, so it fails the moment anyone retunes one of them
+    /// into that shape again.
+    #[test]
+    fn one_ip_cannot_corner_the_budget() {
+        let per_ip = crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES;
+        assert!(
+            per_ip * 2 <= REASSEMBLY_BUDGET_BYTES,
+            "one IP can hold {per_ip} of {REASSEMBLY_BUDGET_BYTES} bytes — a single address must \
+             not reach half the budget, or it decides who gets evicted"
+        );
+
+        // And the cap must still clear the largest message the validator would ever accept,
+        // or honest traffic is refused before it is even parsed.
+        assert!(
+            REASSEMBLY_PER_CONN_BYTES > crate::message_validator::MAX_ZK_PROPOSAL_SIZE,
+            "the per-connection cap must exceed the largest legitimate message"
         );
     }
 
