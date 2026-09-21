@@ -93,8 +93,26 @@ SOAK_MINUTES="${SOAK_MINUTES:-62}"
 
 # How long `phase_tag` waits for release.yml to create the release its tag push triggered, and
 # how often it looks. See the comment in `phase_tag` for what a single un-waited look cost.
-TAG_RELEASE_WAIT_SECS="${TAG_RELEASE_WAIT_SECS:-600}"
+#
+# ⛔ This was 600s, against a workflow that has NEVER finished in under 18 minutes — three
+# platform builds plus the PGP signing step. Measured: v1.11.40 20m03s, v1.11.42 18m55s,
+# v1.11.43 ~19m. So the fallback below was not an edge case, it was the DEFAULT path, and on
+# 2026-09-20 it published an empty v1.11.43 as Latest (#909).
+#
+# The wait now keys off the workflow RUN rather than this timer; the timer is only a backstop
+# for a repo with no release workflow at all, so it is set clear of any observed duration.
+TAG_RELEASE_WAIT_SECS="${TAG_RELEASE_WAIT_SECS:-2400}"
 TAG_RELEASE_POLL_SECS="${TAG_RELEASE_POLL_SECS:-10}"
+
+# An absolute ceiling on following a RUNNING workflow. Without one, a run wedged in
+# `in_progress` hangs the release indefinitely — which is safer than publishing an empty
+# release, but is still a hang. Reaching this REFUSES; it never falls through to minting.
+TAG_RELEASE_MAX_SECS="${TAG_RELEASE_MAX_SECS:-3600}"
+
+# What a correctly built release carries: 3 platform tarballs + SHA256SUMS.txt +
+# SHA256SUMS.txt.asc. Asserted before this script will call a release published, because the
+# failure that motivated #909 produced a release with ZERO assets that passed every other check.
+RELEASE_MIN_ASSETS="${RELEASE_MIN_ASSETS:-5}"
 
 STATE_DIR="${GHOST_RELEASE_STATE:-$HOME/.ghost-deploy/release}"
 mkdir -p "$STATE_DIR"
@@ -533,11 +551,46 @@ phase_tag() {
     #
     # So wait for the workflow's release rather than racing it, and only mint our own if none
     # appears at all (a repo with no release workflow, which is what the create was for).
-    local rel_id="" waited=0
+    #
+    # ⛔ Waiting on a FIXED TIMER is what broke this (#909). 600s against a ~19-minute workflow
+    # meant the "no workflow exists" fallback fired on every normal release, and that fallback
+    # creates a release with no assets and publishes it. The timer could not tell "the workflow
+    # is still building" from "there is no workflow", and those need opposite responses.
+    #
+    # So ask the workflow. If a run exists for this tag, follow IT — wait while it is queued or
+    # in progress, and refuse outright if it fails, rather than papering over a failed build with
+    # an empty release. The timer survives only as a backstop for the genuinely-no-workflow case.
+    local rel_id="" waited=0 run_state=""
     while :; do
         rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
                     --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
         [ -n "$rel_id" ] && break
+
+        # `head_branch` is the tag name for a tag-triggered run.
+        run_state=$(gh api "repos/$GH_REPO/actions/runs?per_page=30" \
+            --jq "[.workflow_runs[]|select(.head_branch==\"$TAG\")]|.[0]|\"\(.status):\(.conclusion//\"\")\"" \
+            2>/dev/null)
+
+        case "$run_state" in
+            completed:failure|completed:cancelled|completed:timed_out)
+                die "release.yml for $TAG finished '$run_state' — the build FAILED.
+       Fix it and re-run this phase. Refusing to mint a substitute release: an
+       empty one published as Latest is what #909 was filed for." ;;
+            queued:*|in_progress:*|waiting:*|requested:*|pending:*)
+                # A real build is running. Keep waiting past the backstop timer — its duration
+                # is the workflow's business, not a number guessed here — but not forever: a run
+                # wedged in `in_progress` would otherwise hang the release with no output.
+                if [ "$waited" -ge "$TAG_RELEASE_MAX_SECS" ]; then
+                    die "release.yml for $TAG is still '$run_state' after ${waited}s.
+       Refusing to continue. Check the run, then re-run this phase — do NOT let a
+       substitute release be minted for a build that never finished (#909)."
+                fi
+                sleep "$TAG_RELEASE_POLL_SECS"
+                waited=$((waited + TAG_RELEASE_POLL_SECS))
+                [ $((waited % 120)) -eq 0 ] && info "release.yml for $TAG is $run_state (${waited}s)"
+                continue ;;
+        esac
+
         [ "$waited" -ge "$TAG_RELEASE_WAIT_SECS" ] && break
         sleep "$TAG_RELEASE_POLL_SECS"
         waited=$((waited + TAG_RELEASE_POLL_SECS))
@@ -546,13 +599,34 @@ phase_tag() {
     if [ -n "$rel_id" ]; then
         [ "$waited" -gt 0 ] && info "release for $TAG appeared after ${waited}s"
     else
-        info "no release for $TAG after ${waited}s — creating one"
-        gh release create "$TAG" --title "$TAG" --generate-notes >/dev/null \
+        # Reached only when NO run for this tag ever appeared — i.e. no release workflow.
+        # Left as a DRAFT on purpose: this path cannot produce assets, and a human should
+        # decide whether an assetless release is what they want.
+        info "no release.yml run for $TAG after ${waited}s — creating a DRAFT release"
+        gh release create "$TAG" --title "$TAG" --generate-notes --draft >/dev/null \
             || die "gh release create failed"
         rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
                     --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
+        [ -n "$rel_id" ] || die "no release found for $TAG to publish"
+        die "created $TAG as a DRAFT with no assets, because no release workflow ran for it.
+       Attach artefacts and publish by hand, or fix the workflow and re-run this phase."
     fi
     [ -n "$rel_id" ] || die "no release found for $TAG to publish"
+
+    # The release must actually CONTAIN something before it is published. #909: the old path
+    # published `assets=0` and reported success, because it only ever checked flags it had set
+    # itself. Assert the artefacts, and assert the signature is among them by name.
+    local n_assets asset_names
+    n_assets=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq '.assets|length' 2>/dev/null)
+    asset_names=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq '.assets[].name' 2>/dev/null)
+    [ "${n_assets:-0}" -ge "$RELEASE_MIN_ASSETS" ] \
+        || die "$TAG has ${n_assets:-0} assets, want >= $RELEASE_MIN_ASSETS — refusing to publish.
+       A release with no artefacts is what #909 was filed for. Assets present:
+       ${asset_names:-<none>}"
+    grep -q 'SHA256SUMS.txt.asc' <<<"$asset_names" \
+        || die "$TAG carries no SHA256SUMS.txt.asc — refusing to publish an UNSIGNED release.
+       Assets present: $asset_names"
+    info "artefacts present: $n_assets assets including SHA256SUMS.txt.asc"
 
     if [ "$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)" = "true" ]; then
         # NOT `gh release edit --draft=false`: that is a no-op in the installed gh — it prints
@@ -566,12 +640,19 @@ phase_tag() {
 
     # Read the OUTCOME back rather than trusting the call's exit code. The publish path's whole
     # failure mode is succeeding while changing nothing, so an unverified publish is not a publish.
-    local draft tagged
+    #
+    # ⚠ `draft` and `tag_name` are both properties this function SET. Checking only those is how
+    # an empty release passed for a correct one (#909), so the asset count is re-read here too —
+    # from the published state, not from the pre-publish check above.
+    local draft tagged final_assets
     draft=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)
     tagged=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .tag_name 2>/dev/null)
+    final_assets=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq '.assets|length' 2>/dev/null)
     [ "$draft" = "false" ] || die "$TAG is STILL a draft after publishing — see #857"
     [ "$tagged" = "$TAG" ] || die "$TAG detached from its tag (now '$tagged') — re-PATCH with tag_name"
-    info "published $TAG (verified: draft=false, tag=$tagged)"
+    [ "${final_assets:-0}" -ge "$RELEASE_MIN_ASSETS" ] \
+        || die "$TAG published with only ${final_assets:-0} assets — see #909"
+    info "published $TAG (verified: draft=false, tag=$tagged, assets=$final_assets)"
 }
 
 # ---------------------------------------------------------------- driver
