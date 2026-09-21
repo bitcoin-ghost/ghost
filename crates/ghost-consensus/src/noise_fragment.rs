@@ -114,39 +114,42 @@ pub const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-wide ceiling on bytes held in PARTIAL reassembly buffers (#911).
 ///
-/// [`MAX_REASSEMBLY_SIZE`] bounds ONE message from ONE peer. It does not bound the process:
-/// the reassembler is per-connection, so the total is `connections x 8 MiB`. The inbound caps
-/// (`MAX_INBOUND_PER_IP = 8`, `MAX_INBOUND_PER_SUBNET = 16`) bound what a single source can
-/// pin, not the aggregate — addresses spread across enough distinct `/24`s are each
-/// individually under their limit while together reaching the same ceiling the old global
-/// semaphore allowed (~800 MiB).
+/// [`MAX_REASSEMBLY_SIZE`] bounds ONE message from ONE peer; it does not bound the process,
+/// because the reassembler is per-connection. Nothing counted the aggregate.
 ///
-/// That matters on these nodes: seven of the eight production nodes have 3,867 MiB of RAM
-/// TOTAL (measured 2026-09-21), shared between `ghostd`, `ghost-pool`, `pool_sv2` and
-/// `translator_sv2`. Hundreds of megabytes of attacker-pinned buffers is not a slow path, it
-/// is the OOM killer taking a consensus process.
+/// ⛔ SIZED AGAINST `MAX_INBOUND_PER_SUBNET`, NOT `MAX_INBOUND_PER_IP`. The threat model is
+/// addresses spread across a `/24`, which is what makes the per-IP cap insufficient in the
+/// first place — so bounding one IP's share and calling it done measures the wrong thing. An
+/// earlier revision did exactly that: it capped one IP at 37.5% while one `/24` legally held
+/// **75%** of the budget and therefore still chose every eviction victim.
 ///
-/// 64 MiB is deliberately generous against legitimate use and mean against abuse: the only
-/// messages that fragment at all are checkpoint / tree-sync proposals at ~84 KB, so this is
-/// room for ~780 concurrent real reassemblies, against a fleet of 8 nodes.
-pub const REASSEMBLY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// The relationship that has to hold is
+/// `MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES * 2 <= REASSEMBLY_BUDGET_BYTES`,
+/// asserted by `one_subnet_cannot_corner_the_budget`.
+///
+/// 96 MiB against the nodes' 3,867 MiB of RAM is ~2.5%, and only materialises if a peer
+/// actually sends the bytes — the budget charges what arrived, never what was declared.
+pub const REASSEMBLY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 
 /// Ceiling on what any ONE connection may hold.
 ///
-/// ⛔ This exists because of a measured hole in the first version of this budget, which left
-/// `per_conn` at [`MAX_REASSEMBLY_SIZE`]. `MAX_INBOUND_PER_IP` (8) x 8 MiB is 67,108,864 bytes
-/// — EXACTLY [`REASSEMBLY_BUDGET_BYTES`]. One address, inside its own per-IP cap, could hold
-/// 100% of the budget and so decide who got evicted.
+/// Grounded in what a legitimate message can be, not in the reassembly cap: the largest
+/// per-type limit `message_validator` accepts is `MAX_ZK_PROPOSAL_SIZE` (2,000,000 bytes) and
+/// every other type is at or below 1.1 MB. 2 MiB clears that, and anything larger is refused
+/// by the validator after reassembly anyway — so declining to buffer it here refuses earlier
+/// and cheaper.
 ///
-/// Grounded in what a legitimate message can actually be rather than in the reassembly cap:
-/// the largest per-type limit `message_validator` will accept is `MAX_ZK_PROPOSAL_SIZE`
-/// (2,000,000 bytes), and every other type is at or below 1.1 MB. 3 MiB is comfortable headroom
-/// over that, and anything larger is refused by the validator AFTER reassembly anyway — so
-/// declining to buffer it here is strictly cheaper, and refuses earlier.
+/// ⚠ The headroom over 2,000,000 is only ~4.9%. That is deliberate and asserted: raising a
+/// message-type limit past this must fail a test rather than silently start disconnecting
+/// honest peers.
+pub const REASSEMBLY_PER_CONN_BYTES: usize = 2 * 1024 * 1024;
+
+/// The smallest budget that still keeps one `/24` a minority of it.
 ///
-/// With this, one address's full inbound allowance reaches 24 MiB of the 64 MiB budget rather
-/// than all of it. `one_ip_cannot_corner_the_budget` pins the relationship.
-pub const REASSEMBLY_PER_CONN_BYTES: usize = 3 * 1024 * 1024;
+/// Derived, not chosen: any override below this reintroduces cornering, so the env knob
+/// refuses it rather than accepting a number that quietly breaks the guarantee.
+pub const MIN_REASSEMBLY_BUDGET_BYTES: usize =
+    2 * crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES;
 
 // Compile-time guarantee that a full fragment frame fits in one Noise frame.
 const _: () = assert!(FRAGMENT_HEADER_LEN + MAX_FRAGMENT_PAYLOAD <= MAX_PAYLOAD_SIZE);
@@ -221,7 +224,11 @@ impl FragmentHeader {
         if chunk_count > MAX_FRAGMENT_COUNT {
             return Err(NoiseError::Decryption("fragment: too many chunks".into()));
         }
-        if total_len > MAX_REASSEMBLY_SIZE {
+        // Refuse here, BEFORE any buffering, anything the per-connection quota would refuse
+        // later. The two limits disagreeing is not cosmetic: mesh.rs treats every `accept`
+        // error as fatal and drops the connection, so a peer sending a message this layer's
+        // own contract called legal would be disconnected rather than told no.
+        if total_len > REASSEMBLY_PER_CONN_BYTES {
             return Err(NoiseError::Decryption(
                 "fragment: total_len exceeds reassembly cap".into(),
             ));
@@ -272,6 +279,16 @@ struct InFlight {
 /// lock, the ordering rule and the race together.
 struct Entry {
     slot: Option<InFlight>,
+    /// The `message_id` most recently EVICTED from this connection.
+    ///
+    /// ⛔ Without this, eviction manufactures the very churn this module exists to remove.
+    /// The victim's next fragment finds an empty slot, allocates a fresh `InFlight` with a new
+    /// `started_at`, and re-accumulates up to the quota for a message that can NEVER complete:
+    /// the evicted chunks are gone and nothing re-requests them. Because `started_at` was just
+    /// reset, that doomed buffer is not stale either, so stale-first cannot reclaim it for
+    /// another 30s. Under sustained pressure eviction would convert completable buffers into
+    /// guaranteed-doomed ones.
+    poisoned: Option<u64>,
     /// Always equal to `slot.received_bytes`, or 0 when there is no slot. Maintained here so
     /// the sum over entries is `held` by construction rather than by agreement.
     bytes: usize,
@@ -293,6 +310,16 @@ struct BudgetInner {
     /// log-amplification DoS wearing the defence's clothes — on nodes with 3,867 MiB of RAM
     /// and journald on disk, that is not a theoretical cost.
     last_log: Option<Instant>,
+    suppressed: u64,
+}
+
+/// One rate-limited eviction line, captured under the lock and emitted outside it.
+struct EvictionLog {
+    freed: usize,
+    stale: bool,
+    held: usize,
+    limit: usize,
+    evictions_total: u64,
     suppressed: u64,
 }
 
@@ -372,6 +399,7 @@ impl ReassemblyBudget {
             Entry {
                 slot: None,
                 bytes: 0,
+                poisoned: None,
                 seq,
             },
         );
@@ -432,10 +460,27 @@ impl ReassemblyBudget {
         header: &FragmentHeader,
         payload: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, NoiseError> {
-        // Buffers to free AFTER the lock is released.
+        // Buffers to free, and lines to log, AFTER the lock is released.
+        //
+        // ⛔ `tracing::warn!` writes to journald, on disk, on these nodes. Emitting it while
+        // holding the one lock every fragment on every connection needs serialises the whole
+        // mesh behind a disk write, at a rate an attacker chooses. Same reasoning as dropping
+        // the buffers out here: nothing slow belongs inside this lock.
         let mut reclaimed: Vec<InFlight> = Vec::new();
-        let result = self.accept_locked(id, header, payload, &mut reclaimed);
+        let mut logs: Vec<EvictionLog> = Vec::new();
+        let result = self.accept_locked(id, header, payload, &mut reclaimed, &mut logs);
         drop(reclaimed);
+        for l in logs {
+            tracing::warn!(
+                evicted_bytes = l.freed,
+                stale = l.stale,
+                held = l.held,
+                limit = l.limit,
+                evictions_total = l.evictions_total,
+                suppressed_since_last_log = l.suppressed,
+                "reassembly budget under pressure — evicted a partial message (#911)"
+            );
+        }
         result
     }
 
@@ -445,6 +490,7 @@ impl ReassemblyBudget {
         header: &FragmentHeader,
         payload: Vec<u8>,
         reclaimed: &mut Vec<InFlight>,
+        logs: &mut Vec<EvictionLog>,
     ) -> Result<Option<Vec<u8>>, NoiseError> {
         let mut g = self.inner.lock();
 
@@ -453,6 +499,11 @@ impl ReassemblyBudget {
             return Err(NoiseError::Decryption(
                 "fragment: reassembler is no longer registered".into(),
             ));
+        }
+
+        // ---- a fragment of a message we already destroyed cannot complete: drop it
+        if g.entries[&id].poisoned == Some(header.message_id) {
+            return Ok(None);
         }
 
         // ---- reset if this is a new message, a different one, or a stale one
@@ -466,6 +517,10 @@ impl ReassemblyBudget {
         };
         if need_reset {
             let e = g.entries.get_mut(&id).expect("checked above");
+            // A different message means the peer has moved on; stop suppressing.
+            if e.poisoned.is_some_and(|m| m != header.message_id) {
+                e.poisoned = None;
+            }
             let freed = e.bytes;
             if let Some(old) = e.slot.take() {
                 reclaimed.push(old);
@@ -518,7 +573,7 @@ impl ReassemblyBudget {
             ));
         }
 
-        if !Self::make_room(&mut g, id, delta, reclaimed) {
+        if !Self::make_room(&mut g, id, delta, reclaimed, logs) {
             Self::clear(&mut g, id, reclaimed);
             g.rejections += 1;
             return Err(NoiseError::Decryption(
@@ -554,14 +609,21 @@ impl ReassemblyBudget {
         g.held = g.held.saturating_sub(freed);
         drop(g);
 
-        let mut out = Vec::with_capacity(slot.total_len);
-        for chunk in slot.chunks {
-            out.extend_from_slice(&chunk.expect("all chunks present when count matches"));
-        }
-        if out.len() != slot.total_len {
+        // ⛔ Check BEFORE allocating, and size from what actually arrived.
+        //
+        // `Vec::with_capacity(slot.total_len)` allocated the DECLARED length and only compared
+        // afterwards. The parser's consistency rule permits 140 chunks declaring ~8 MiB, so
+        // 140 one-byte chunks — about 2.9 KB on the wire, 140 bytes charged — produced a
+        // multi-megabyte allocation that was then thrown away. An attacker-sized, unbudgeted
+        // allocation in the one module whose job is bounding reassembly memory.
+        if slot.received_bytes != slot.total_len {
             return Err(NoiseError::Decryption(
                 "fragment: reassembled length mismatch".into(),
             ));
+        }
+        let mut out = Vec::with_capacity(slot.received_bytes);
+        for chunk in slot.chunks {
+            out.extend_from_slice(&chunk.expect("all chunks present when count matches"));
         }
         Ok(Some(out))
     }
@@ -587,6 +649,7 @@ impl ReassemblyBudget {
         id: u64,
         delta: usize,
         reclaimed: &mut Vec<InFlight>,
+        logs: &mut Vec<EvictionLog>,
     ) -> bool {
         if delta > g.limit {
             return false;
@@ -625,6 +688,9 @@ impl ReassemblyBudget {
                 let e = g.entries.get_mut(&vid).expect("victim present");
                 let freed = e.bytes;
                 if let Some(old) = e.slot.take() {
+                    // Remember WHICH message we destroyed, so its later fragments are dropped
+                    // rather than re-buffered into a message that can never complete.
+                    e.poisoned = Some(old.message_id);
                     reclaimed.push(old);
                 }
                 e.bytes = 0;
@@ -642,15 +708,14 @@ impl ReassemblyBudget {
             if due {
                 let suppressed = std::mem::take(&mut g.suppressed);
                 g.last_log = Some(now);
-                tracing::warn!(
-                    evicted_bytes = freed,
-                    stale = was_stale,
-                    held = g.held,
-                    limit = g.limit,
-                    evictions_total = g.evictions,
-                    suppressed_since_last_log = suppressed,
-                    "reassembly budget under pressure — evicted a partial message (#911)"
-                );
+                logs.push(EvictionLog {
+                    freed,
+                    stale: was_stale,
+                    held: g.held,
+                    limit: g.limit,
+                    evictions_total: g.evictions,
+                    suppressed,
+                });
             } else {
                 g.suppressed += 1;
             }
@@ -833,33 +898,133 @@ mod tests {
         );
     }
 
-    /// ⛔ THE INVARIANT THE FIRST VERSION BROKE, pinned as arithmetic.
+    /// ⛔ THE INVARIANT, pinned as arithmetic over the constants.
     ///
-    /// `MAX_INBOUND_PER_IP` x the per-connection cap must stay a MINORITY of the budget. In the
-    /// first version the per-connection cap was `MAX_REASSEMBLY_SIZE` (8 MiB) and 8 x 8 MiB was
-    /// exactly `REASSEMBLY_BUDGET_BYTES`, so one address — entirely inside its own per-IP cap —
-    /// could hold 100% of the budget and thereby choose who got evicted.
+    /// Two revisions got this wrong in the same place. First `per_conn` was
+    /// `MAX_REASSEMBLY_SIZE`, and `MAX_INBOUND_PER_IP * 8 MiB` was EXACTLY the budget — one
+    /// address held 100%. Then the cap was tightened but the test asserted the per-**IP**
+    /// ratio, while the threat model this module documents is addresses spread across a
+    /// `/24`: one `/24` legally held **75%** and still chose every eviction victim.
     ///
-    /// This is arithmetic over constants, so it fails the moment anyone retunes one of them
-    /// into that shape again.
+    /// So the binding constant is `MAX_INBOUND_PER_SUBNET`, and this asserts it directly.
     #[test]
-    fn one_ip_cannot_corner_the_budget() {
-        let per_ip = crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES;
+    fn one_subnet_cannot_corner_the_budget() {
+        let subnet = crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES;
         assert!(
-            per_ip * 2 <= REASSEMBLY_BUDGET_BYTES,
-            "one IP can hold {per_ip} of {REASSEMBLY_BUDGET_BYTES} bytes — a single address must \
-             not reach half the budget, or it decides who gets evicted"
+            subnet * 2 <= REASSEMBLY_BUDGET_BYTES,
+            "one /24 can hold {subnet} of {REASSEMBLY_BUDGET_BYTES} bytes — a single subnet \
+             must not reach half the budget, or it decides who gets evicted"
         );
 
-        // And the cap must still clear the largest message the validator would ever accept,
-        // or honest traffic is refused before it is even parsed.
+        // The per-IP share follows from it, but assert it too so a change to either cap is caught.
+        let ip = crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES;
+        assert!(ip * 2 <= REASSEMBLY_BUDGET_BYTES, "one IP holds {ip}");
+
+        // The cap must still clear the largest message the validator would accept, or honest
+        // traffic is disconnected rather than refused (mesh treats accept errors as fatal).
         assert!(
             REASSEMBLY_PER_CONN_BYTES > crate::message_validator::MAX_ZK_PROPOSAL_SIZE,
             "the per-connection cap must exceed the largest legitimate message"
         );
+
+        // And the env floor must itself satisfy the invariant, or the knob reintroduces it.
+        assert!(
+            crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES * 2
+                <= MIN_REASSEMBLY_BUDGET_BYTES,
+            "the smallest accepted override must still keep one /24 a minority"
+        );
     }
 
-    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.
+    /// The fragment layer must refuse what the quota would refuse, BEFORE buffering.
+    ///
+    /// mesh.rs treats any `accept` error as fatal and drops the connection, so the two limits
+    /// disagreeing means a peer sending something this layer's own contract called legal gets
+    /// disconnected instead of told no.
+    #[test]
+    fn parse_refuses_what_the_quota_would_refuse() {
+        let too_big = REASSEMBLY_PER_CONN_BYTES + 1;
+        let frame = frag(1, 0, chunks_for(too_big), too_big as u32, &[0u8; 8]);
+        let r = FragmentHeader::parse(&frame);
+        match r {
+            Err(e) => assert!(
+                format!("{e:?}").contains("reassembly cap"),
+                "the refusal must name the cap, got {e:?}"
+            ),
+            Ok(_) => panic!(
+                "a declared length above the per-connection cap must be refused at parse, \
+                 before any buffering — otherwise mesh drops the connection instead"
+            ),
+        }
+    }
+
+    /// Eviction must not manufacture doomed buffers.
+    ///
+    /// The victim's remaining fragments cannot complete the message — the evicted chunks are
+    /// gone and nothing re-requests them — so re-buffering them holds memory for a message
+    /// that can never finish, with a fresh `started_at` that also defeats stale-first.
+    #[test]
+    fn fragments_of_an_evicted_message_are_not_re_buffered() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(2 * CHUNK);
+        let mut victim = FragmentReassembler::with_budget(budget.clone());
+        let mut a = FragmentReassembler::with_budget(budget.clone());
+        let mut b = FragmentReassembler::with_budget(budget.clone());
+
+        let declared = 3 * CHUNK;
+        let count = chunks_for(declared);
+        victim
+            .accept(frag(77, 0, count, declared as u32, &vec![1u8; CHUNK]))
+            .unwrap();
+
+        // Two more arrivals evict the victim.
+        a.accept(frag(1, 0, count, declared as u32, &vec![2u8; CHUNK]))
+            .unwrap();
+        b.accept(frag(2, 0, count, declared as u32, &vec![3u8; CHUNK]))
+            .unwrap();
+        assert!(!victim.has_slot(), "the victim must have been evicted");
+
+        // Its next fragment must be dropped, not re-buffered into a doomed message.
+        let r = victim
+            .accept(frag(77, 1, count, declared as u32, &vec![1u8; CHUNK]))
+            .expect("a fragment of an evicted message is dropped, not an error");
+        assert!(r.is_none());
+        assert_eq!(
+            victim.held_bytes(),
+            0,
+            "a fragment of a destroyed message must not re-accumulate — it can never complete"
+        );
+
+        // A DIFFERENT message from the same peer is accepted normally.
+        victim
+            .accept(frag(78, 0, count, declared as u32, &vec![4u8; CHUNK]))
+            .expect("a new message must not be suppressed");
+        assert!(victim.has_slot(), "the peer must be able to start again");
+    }
+
+    /// A completed message must never allocate the DECLARED length.
+    ///
+    /// 140 one-byte chunks declaring ~2 MiB is ~2.9 KB on the wire and 140 bytes charged, but
+    /// used to trigger a multi-megabyte `Vec::with_capacity` that was then discarded.
+    #[test]
+    fn a_short_message_does_not_allocate_its_declared_length() {
+        let budget = ReassemblyBudget::new(4 * 1024 * 1024);
+        let mut re = FragmentReassembler::with_budget(budget.clone());
+
+        let declared = REASSEMBLY_PER_CONN_BYTES;
+        let count = chunks_for(declared);
+        let mut last = Ok(None);
+        for i in 0..count {
+            last = re.accept(frag(1, i, count, declared as u32, &[0u8; 1]));
+        }
+        let err = last.expect_err("a message whose chunks do not sum to total_len must fail");
+        assert!(
+            format!("{err:?}").contains("length mismatch"),
+            "got {err:?}"
+        );
+        assert_eq!(budget.stats().0, 0, "the failed message must hold nothing");
+    }
+
+    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.
     #[test]
     fn real_bytes_are_bounded_across_many_connections() {
         const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
