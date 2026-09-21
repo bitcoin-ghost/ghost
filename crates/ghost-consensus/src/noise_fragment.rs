@@ -177,14 +177,19 @@ const _: () = assert!(FRAGMENT_HEADER_LEN + MAX_FRAGMENT_PAYLOAD <= MAX_PAYLOAD_
 /// One `/24` must not reach half the budget, or it decides who gets evicted. This is the
 /// binding one: the threat model is addresses spread across a subnet, which is exactly why
 /// the per-IP cap alone is insufficient.
+///
+/// ⚠ STRICT. `<=` permitted exactly half, while `budget_limit_from_env` refuses exactly half
+/// for the identical relation — so a compiled default of 64 MiB would ship while the same
+/// number supplied through the env knob was rejected, and the compiled default is the one
+/// nobody has to opt into.
 const _: () = assert!(
-    2 * crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES <= REASSEMBLY_BUDGET_BYTES,
+    2 * crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES < REASSEMBLY_BUDGET_BYTES,
     "one /24 can reach half the reassembly budget — it would choose every eviction victim"
 );
 
 /// Follows from the above, asserted separately so a change to either cap is caught.
 const _: () = assert!(
-    2 * crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES <= REASSEMBLY_BUDGET_BYTES,
+    2 * crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES < REASSEMBLY_BUDGET_BYTES,
     "one IP can reach half the reassembly budget"
 );
 
@@ -337,7 +342,23 @@ struct InFlight {
     chunks: Vec<Option<Vec<u8>>>,
     received_bytes: usize,
     received_count: usize,
-    started_at: Instant,
+    /// When this message last made progress.
+    ///
+    /// ⚠ There is deliberately NO `started_at`. It existed, staleness was judged on it, and
+    /// that made `REASSEMBLY_TIMEOUT` a TOTAL-message deadline while every comment here
+    /// describes "has not progressed". Once staleness moved to this field nothing read
+    /// `started_at` at all, so carrying it would be a field inviting the same mistake back.
+    ///
+    /// ⛔ Staleness is judged on THIS, not `started_at`. `started_at` is set once and never
+    /// refreshed, so judging on it makes `REASSEMBLY_TIMEOUT` a TOTAL-message deadline while
+    /// every comment in this module describes it as "has not progressed" — an idle one. A
+    /// ~2 MiB message over a congested inter-VM link at ~500 kbit/s takes ~34s, so it would be
+    /// poisoned mid-flight and could never complete, with no error and no counter.
+    ///
+    /// An idle deadline still bounds the drip attacker: their buffer is capped by the
+    /// per-connection quota and remains evictable under budget pressure. Memory is what the
+    /// budget defends, and memory stays bounded.
+    last_progress: Instant,
 }
 
 /// One connection's reassembly state, owned by the budget.
@@ -385,14 +406,37 @@ struct BudgetInner {
     suppressed: u64,
 }
 
-/// One rate-limited eviction line, captured under the lock and emitted outside it.
-struct EvictionLog {
-    freed: usize,
-    stale: bool,
-    held: usize,
-    limit: usize,
-    evictions_total: u64,
-    suppressed: u64,
+/// One rate-limited line, captured under the lock and emitted outside it.
+///
+/// ⛔ REJECTIONS get one too, not just evictions. A refused message vanishes: the node then
+/// logs "proposal data missing — requesting tree sync" and nothing connects that to
+/// reassembly. Counting it in `rejections` is not enough when nothing reads the counter — the
+/// eviction path was given a voice and the rejection path was not, which left the quieter
+/// failure the invisible one.
+enum BudgetLog {
+    Evicted {
+        freed: usize,
+        stale: bool,
+        held: usize,
+        limit: usize,
+        evictions_total: u64,
+        suppressed: u64,
+    },
+    Rejected {
+        message_id: u64,
+        held: usize,
+        limit: usize,
+    },
+}
+
+impl BudgetLog {
+    fn rejected(message_id: u64, held: usize, limit: usize) -> Self {
+        Self::Rejected {
+            message_id,
+            held,
+            limit,
+        }
+    }
 }
 
 /// How often the eviction path may log, however fast evictions arrive.
@@ -503,13 +547,16 @@ impl ReassemblyBudget {
     /// Age an entry's buffer, so the stale-first eviction path is testable without waiting
     /// out [`REASSEMBLY_TIMEOUT`]. A test that cannot reach the stale branch would assert the
     /// LRU fallback and call it stale-first.
+    /// Age an entry's buffer, so the stale-first eviction path is testable without waiting
+    /// out [`REASSEMBLY_TIMEOUT`]. A test that cannot reach the stale branch would assert the
+    /// LRU fallback and call it stale-first.
     #[cfg(test)]
     fn backdate(&self, id: u64, by: Duration) {
         let mut g = self.inner.lock();
         if let Some(e) = g.entries.get_mut(&id) {
             if let Some(slot) = e.slot.as_mut() {
-                slot.started_at = slot
-                    .started_at
+                slot.last_progress = slot
+                    .last_progress
                     .checked_sub(by)
                     .expect("test backdate must not underflow the clock");
             }
@@ -539,19 +586,39 @@ impl ReassemblyBudget {
         // mesh behind a disk write, at a rate an attacker chooses. Same reasoning as dropping
         // the buffers out here: nothing slow belongs inside this lock.
         let mut reclaimed: Vec<InFlight> = Vec::new();
-        let mut logs: Vec<EvictionLog> = Vec::new();
+        let mut logs: Vec<BudgetLog> = Vec::new();
         let result = self.accept_locked(id, header, payload, &mut reclaimed, &mut logs);
         drop(reclaimed);
         for l in logs {
-            tracing::warn!(
-                evicted_bytes = l.freed,
-                stale = l.stale,
-                held = l.held,
-                limit = l.limit,
-                evictions_total = l.evictions_total,
-                suppressed_since_last_log = l.suppressed,
-                "reassembly budget under pressure — evicted a partial message (#911)"
-            );
+            match l {
+                BudgetLog::Evicted {
+                    freed,
+                    stale,
+                    held,
+                    limit,
+                    evictions_total,
+                    suppressed,
+                } => tracing::warn!(
+                    evicted_bytes = freed,
+                    stale,
+                    held,
+                    limit,
+                    evictions_total,
+                    suppressed_since_last_log = suppressed,
+                    "reassembly budget under pressure — evicted a partial message (#911)"
+                ),
+                BudgetLog::Rejected {
+                    message_id,
+                    held,
+                    limit,
+                } => tracing::warn!(
+                    message_id,
+                    held,
+                    limit,
+                    "reassembly budget refused a message — it was DROPPED, so expect a \
+                     tree-sync retry for it (#911)"
+                ),
+            }
         }
         result
     }
@@ -562,7 +629,7 @@ impl ReassemblyBudget {
         header: &FragmentHeader,
         payload: Vec<u8>,
         reclaimed: &mut Vec<InFlight>,
-        logs: &mut Vec<EvictionLog>,
+        logs: &mut Vec<BudgetLog>,
     ) -> Result<Option<Vec<u8>>, NoiseError> {
         let mut g = self.inner.lock();
 
@@ -579,36 +646,54 @@ impl ReassemblyBudget {
         }
 
         // ---- reset if this is a new message, a different one, or a stale one
-        let need_reset = match g.entries[&id].slot.as_ref() {
-            None => true,
-            Some(cur) => {
-                cur.message_id != header.message_id
-                    || cur.chunk_count != header.chunk_count
-                    || cur.started_at.elapsed() > REASSEMBLY_TIMEOUT
-            }
+        // ⛔ WHY the slot is being replaced decides what happens, and conflating the reasons
+        // produced two opposite outcomes for the same violation. `stale_same_message` used to
+        // be "any reset with a matching message_id", which swallowed a peer contradicting its
+        // own declared `chunk_count` into the timeout path — poisoned, `Ok(None)`, no counter,
+        // connection kept, repeatable for free. Meanwhile a `total_len` change WITHIN one
+        // chunk-count band still hit the error below and dropped the connection. Same
+        // violation, opposite result, decided by an arbitrary 60,000-byte boundary.
+        enum Reset {
+            /// No slot, or the peer has moved on to a different message.
+            Fresh,
+            /// The peer contradicted its own framing. A protocol error, not a resource one.
+            Contradiction,
+            /// No progress within REASSEMBLY_TIMEOUT.
+            Idle,
+            /// Keep the existing slot.
+            None_,
+        }
+        let reset = match g.entries[&id].slot.as_ref() {
+            None => Reset::Fresh,
+            Some(cur) if cur.message_id != header.message_id => Reset::Fresh,
+            Some(cur) if cur.chunk_count != header.chunk_count => Reset::Contradiction,
+            Some(cur) if cur.last_progress.elapsed() > REASSEMBLY_TIMEOUT => Reset::Idle,
+            Some(_) => Reset::None_,
         };
-        if need_reset {
+
+        if let Reset::Contradiction = reset {
+            Self::clear(&mut g, id, reclaimed);
+            return Err(NoiseError::Decryption(
+                "fragment: chunk_count changed mid-message".into(),
+            ));
+        }
+
+        if let Reset::Idle = reset {
             // ⛔ A slot discarded for STALENESS leaves the same doomed buffer eviction did.
             // Its earlier chunks are gone and nothing re-requests them, so re-buffering the
             // rest accumulates against the global budget for a message that can never
             // complete — and the fresh `started_at` defeats stale-first for another 30s. Only
             // the eviction path was poisoned; this one manufactured the identical failure.
-            let stale_same_message = g.entries[&id]
-                .slot
-                .as_ref()
-                .is_some_and(|cur| cur.message_id == header.message_id);
-            if stale_same_message {
-                let e = g.entries.get_mut(&id).expect("checked above");
-                let freed = e.bytes;
-                if let Some(old) = e.slot.take() {
-                    e.poisoned = Some(old.message_id);
-                    reclaimed.push(old);
-                }
-                e.bytes = 0;
-                g.held = g.held.saturating_sub(freed);
-                return Ok(None);
-            }
+            // Its earlier chunks are gone and nothing re-requests them, so re-buffering the
+            // rest would accumulate against the global budget for a message that can never
+            // complete. Poison it and drop — a resource outcome, not a protocol one.
+            Self::poison_and_clear(&mut g, id, header.message_id, reclaimed);
+            g.rejections += 1;
+            logs.push(BudgetLog::rejected(header.message_id, g.held, g.limit));
+            return Ok(None);
+        }
 
+        if matches!(reset, Reset::Fresh) {
             let e = g.entries.get_mut(&id).expect("checked above");
             // A different message means the peer has moved on; stop suppressing.
             if e.poisoned.is_some_and(|m| m != header.message_id) {
@@ -629,7 +714,7 @@ impl ReassemblyBudget {
                 chunks: vec![None; header.chunk_count],
                 received_bytes: 0,
                 received_count: 0,
-                started_at: Instant::now(),
+                last_progress: Instant::now(),
             });
         }
 
@@ -667,12 +752,14 @@ impl ReassemblyBudget {
         if have + delta > g.per_conn {
             Self::poison_and_clear(&mut g, id, header.message_id, reclaimed);
             g.rejections += 1;
+            logs.push(BudgetLog::rejected(header.message_id, g.held, g.limit));
             return Ok(None);
         }
 
         if !Self::make_room(&mut g, id, delta, reclaimed, logs) {
             Self::poison_and_clear(&mut g, id, header.message_id, reclaimed);
             g.rejections += 1;
+            logs.push(BudgetLog::rejected(header.message_id, g.held, g.limit));
             return Ok(None);
         }
 
@@ -686,6 +773,7 @@ impl ReassemblyBudget {
         slot.received_bytes += delta;
         slot.chunks[header.chunk_index] = Some(payload);
         slot.received_count += 1;
+        slot.last_progress = Instant::now();
         g.held += delta;
 
         let complete = {
@@ -758,7 +846,7 @@ impl ReassemblyBudget {
         id: u64,
         delta: usize,
         reclaimed: &mut Vec<InFlight>,
-        logs: &mut Vec<EvictionLog>,
+        logs: &mut Vec<BudgetLog>,
     ) -> bool {
         if delta > g.limit {
             return false;
@@ -775,7 +863,7 @@ impl ReassemblyBudget {
                         && e.bytes > 0
                         && e.slot
                             .as_ref()
-                            .is_some_and(|s| s.started_at.elapsed() > REASSEMBLY_TIMEOUT)
+                            .is_some_and(|s| s.last_progress.elapsed() > REASSEMBLY_TIMEOUT)
                 })
                 .min_by_key(|(_, e)| e.seq)
                 .map(|(vid, _)| *vid);
@@ -817,7 +905,7 @@ impl ReassemblyBudget {
             if due {
                 let suppressed = std::mem::take(&mut g.suppressed);
                 g.last_log = Some(now);
-                logs.push(EvictionLog {
+                logs.push(BudgetLog::Evicted {
                     freed,
                     stale: was_stale,
                     held: g.held,
@@ -1212,6 +1300,95 @@ mod tests {
             budget_limit_from_env(Some(&format!("  {ok}  "))),
             ok,
             "surrounding whitespace must not silently discard a valid override"
+        );
+    }
+
+    /// A peer contradicting its own framing is a PROTOCOL error; a timeout is a resource one.
+    ///
+    /// These were conflated: any reset with a matching `message_id` took the staleness path, so
+    /// a contradicted `chunk_count` was poisoned and silently dropped, no counter moved, and
+    /// the peer could repeat it for free — while changing `total_len` WITHIN one chunk-count
+    /// band still errored and dropped the connection. Same violation, opposite outcome, decided
+    /// by an arbitrary 60,000-byte boundary.
+    #[test]
+    fn a_framing_contradiction_is_an_error_but_a_timeout_is_not() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(MIN_REASSEMBLY_BUDGET_BYTES + 1);
+
+        // (a) chunk_count contradiction -> protocol error.
+        let mut liar = FragmentReassembler::with_budget(budget.clone());
+        let a_len = 2 * CHUNK;
+        liar.accept(frag(
+            5,
+            0,
+            chunks_for(a_len),
+            a_len as u32,
+            &vec![1u8; CHUNK],
+        ))
+        .unwrap();
+        let b_len = 6 * CHUNK;
+        let err = liar
+            .accept(frag(
+                5,
+                1,
+                chunks_for(b_len),
+                b_len as u32,
+                &vec![1u8; CHUNK],
+            ))
+            .expect_err("contradicting its own chunk_count is a protocol error");
+        assert!(
+            format!("{err:?}").contains("chunk_count changed"),
+            "got {err:?}"
+        );
+
+        // (b) the same message going quiet past the timeout -> dropped, NOT an error.
+        let mut slow = FragmentReassembler::with_budget(budget.clone());
+        let len = 4 * CHUNK;
+        let count = chunks_for(len);
+        slow.accept(frag(6, 0, count, len as u32, &vec![2u8; CHUNK]))
+            .unwrap();
+        budget.backdate(slow.id, REASSEMBLY_TIMEOUT + Duration::from_secs(1));
+        let r = slow
+            .accept(frag(6, 1, count, len as u32, &vec![2u8; CHUNK]))
+            .expect("a timeout is a resource outcome, not a protocol error");
+        assert!(r.is_none());
+        assert_eq!(slow.held_bytes(), 0);
+    }
+
+    /// Staleness must be an IDLE deadline, not a total-message one.
+    ///
+    /// `started_at` is set once and never refreshed, so judging on it makes REASSEMBLY_TIMEOUT
+    /// a total deadline — a ~2 MiB message over a slow link takes ~34s and would be poisoned
+    /// mid-flight, unable ever to complete, with no error and no counter. Every comment in this
+    /// module describes "has not progressed", which is idle.
+    #[test]
+    fn a_slow_but_progressing_message_is_not_poisoned() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(MIN_REASSEMBLY_BUDGET_BYTES + 1);
+        let mut slow = FragmentReassembler::with_budget(budget.clone());
+
+        let len = 4 * CHUNK;
+        let count = chunks_for(len);
+        assert!(count >= 4, "need several gaps for this to mean anything");
+
+        let mut completed = None;
+        for i in 0..count {
+            let r = slow
+                .accept(frag(7, i, count, len as u32, &vec![3u8; CHUNK]))
+                .expect("a progressing message must never be refused for age");
+            completed = r.or(completed);
+
+            // ⚠ Each GAP is under the idle deadline, but they TOTAL well over it. Ageing by
+            // more than the deadline would correctly make it stale — idle means idle. Ageing
+            // only `started_at` would not discriminate at all: a mutation removing the
+            // `last_progress` refresh stayed green against that, because `last_progress` then
+            // simply equals creation time and the test never aged it.
+            budget.backdate(slow.id, REASSEMBLY_TIMEOUT / 2);
+        }
+        assert!(
+            completed.is_some(),
+            "a message whose fragments each arrive inside the idle window must complete, \
+             however long it takes in total"
         );
     }
 
