@@ -28,13 +28,43 @@ pub struct WalletMeta {
 /// falls back rather than failing. That is the opposite call from the
 /// detections beside it, where silence would hide coins.
 pub fn load(path: impl AsRef<Path>) -> WalletMeta {
+    load_with_source(path).0
+}
+
+/// Where the returned [`WalletMeta`] actually came from.
+///
+/// ⛔ This exists because [`load`] cannot tell a caller the difference between "the file is not
+/// there" and "the file says `birth_height: null`", and the scanner reports both as
+/// `"this wallet has no recorded birth height"`. That single sentence asserts a fact the code
+/// cannot distinguish from a failed read, which is why #865 — an imported `--birth-height`
+/// being written and then not seen — has an unestablished root cause: the one log line that
+/// would name which of the two happened does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaSource {
+    /// Read and parsed.
+    Loaded,
+    /// No file at that path.
+    Missing,
+    /// A file that could not be parsed; its contents were discarded.
+    Unreadable,
+}
+
+/// Like [`load`], but says where the value came from.
+///
+/// The leniency is deliberate and unchanged — losing this costs history depth on a rescan, not
+/// money, so a bad file must not stop a wallet opening. What changes is that the caller can now
+/// SAY which case it hit.
+pub fn load_with_source(path: impl AsRef<Path>) -> (WalletMeta, MetaSource) {
     let path = path.as_ref();
     match fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(path = %path.display(), error = %e, "wallet metadata unreadable");
-            WalletMeta::default()
-        }),
-        Err(_) => WalletMeta::default(),
+        Ok(raw) => match serde_json::from_str(&raw) {
+            Ok(meta) => (meta, MetaSource::Loaded),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "wallet metadata unreadable");
+                (WalletMeta::default(), MetaSource::Unreadable)
+            }
+        },
+        Err(_) => (WalletMeta::default(), MetaSource::Missing),
     }
 }
 
@@ -49,6 +79,61 @@ pub fn save(path: impl AsRef<Path>, meta: &WalletMeta) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔ The distinction #865 needed and did not have.
+    ///
+    /// A missing file and a file saying `birth_height: null` both yield the same `WalletMeta`,
+    /// and the scanner reported both as "this wallet has no recorded birth height". They have
+    /// opposite fixes — one means the owner did not supply one, the other means the write
+    /// landed somewhere the reader is not looking — so collapsing them cost the root cause.
+    #[test]
+    fn a_missing_file_is_distinguishable_from_no_birth_height() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing.
+        let absent = dir.path().join("does-not-exist.json");
+        let (meta, source) = load_with_source(&absent);
+        assert_eq!(source, MetaSource::Missing);
+        assert_eq!(meta.birth_height, None);
+
+        // Present, explicitly no birth height.
+        let null = dir.path().join("null.json");
+        save(&null, &WalletMeta { birth_height: None }).unwrap();
+        let (meta, source) = load_with_source(&null);
+        assert_eq!(
+            source,
+            MetaSource::Loaded,
+            "a file that exists and parses must not report as Missing — that is the whole point"
+        );
+        assert_eq!(meta.birth_height, None);
+
+        // Present and set.
+        let set = dir.path().join("set.json");
+        save(
+            &set,
+            &WalletMeta {
+                birth_height: Some(101),
+            },
+        )
+        .unwrap();
+        let (meta, source) = load_with_source(&set);
+        assert_eq!(source, MetaSource::Loaded);
+        assert_eq!(meta.birth_height, Some(101));
+
+        // Present but corrupt — discarded, and SAID to be discarded.
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, b"{not json").unwrap();
+        let (meta, source) = load_with_source(&bad);
+        assert_eq!(
+            source,
+            MetaSource::Unreadable,
+            "a corrupt file must not look like an absent one"
+        );
+        assert_eq!(
+            meta.birth_height, None,
+            "leniency is deliberate and unchanged"
+        );
+    }
 
     #[test]
     fn a_birth_height_survives_a_reopen() {
