@@ -272,13 +272,25 @@ mod server {
     }
 
     /// Read the active wallet's metadata.
-    async fn wallet_meta_for(
+    /// The active wallet's metadata, the path it came from, and whether that path had a file.
+    ///
+    /// The scanner needs all three: reporting "this wallet has no recorded birth height" when
+    /// the file could not be read is an assertion the code cannot support, and it is exactly
+    /// the ambiguity that left #865 without a root cause.
+    async fn wallet_meta_for_with_source(
         state: &Arc<DaemonState>,
-    ) -> Result<wraith_wallet_core::wallet_meta::WalletMeta, String> {
+    ) -> Result<
+        (
+            wraith_wallet_core::wallet_meta::WalletMeta,
+            wraith_wallet_core::wallet_meta::MetaSource,
+            PathBuf,
+        ),
+        String,
+    > {
         let name = active_wallet_name(state).await?;
-        Ok(wraith_wallet_core::wallet_meta::load(
-            wallet_data_dir(state, &name).join("wallet-meta.json"),
-        ))
+        let path = wallet_data_dir(state, &name).join("wallet-meta.json");
+        let (meta, source) = wraith_wallet_core::wallet_meta::load_with_source(&path);
+        Ok((meta, source, path))
     }
 
     /// Open the active wallet's block-scanner bookmark.
@@ -2691,10 +2703,11 @@ mod server {
         // the UTXO list scan the entire UTXO set — they are absent from the
         // *history*, which is a narrower claim and a stated one.
         let Some(point) = bookmark.point().cloned() else {
-            let birth = wallet_meta_for(state)
+            let (meta, source, meta_path) = wallet_meta_for_with_source(state)
                 .await
-                .ok()
-                .and_then(|m| m.birth_height);
+                .map(|(m, s, p)| (Some(m), Some(s), Some(p)))
+                .unwrap_or((None, None, None));
+            let birth = meta.and_then(|m| m.birth_height);
             let start = birth.unwrap_or(tip).min(tip);
             // One before the start, because the loop below scans from
             // `from + 1`: the birth block itself can hold the first payment.
@@ -2710,10 +2723,20 @@ mod server {
                     behind = tip.saturating_sub(b),
                     "block scanner rebuilding history from the wallet's birth height"
                 ),
+                // ⚠ Name WHICH of the two this is. "No recorded birth height" was reported
+                // both when the file said `null` and when the file could not be read at all,
+                // and those have different fixes — one is "the owner did not say", the other
+                // is "we wrote it somewhere else, or not yet". #865 is unresolved precisely
+                // because this line could not tell them apart.
                 None => tracing::info!(
                     height = tip,
-                    "block scanner started watching from the tip — this wallet has no \
-                     recorded birth height, so nothing before now will appear in its history"
+                    meta_source = ?source,
+                    meta_path = %meta_path
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<no active wallet>".to_string()),
+                    "block scanner started watching from the tip — no birth height available, \
+                     so nothing before now will appear in this wallet's history"
                 ),
             }
             return Ok(0);
@@ -7246,14 +7269,22 @@ mod server {
             let state = test_state_with_wallet(dir.path().to_path_buf()).await;
 
             assert_eq!(
-                wallet_meta_for(&state).await.unwrap().birth_height,
+                wallet_meta_for_with_source(&state)
+                    .await
+                    .unwrap()
+                    .0
+                    .birth_height,
                 None,
                 "a wallet with no recorded height must not invent one"
             );
 
             record_birth_height(&state, "harness", Some(880_000)).await;
             assert_eq!(
-                wallet_meta_for(&state).await.unwrap().birth_height,
+                wallet_meta_for_with_source(&state)
+                    .await
+                    .unwrap()
+                    .0
+                    .birth_height,
                 Some(880_000)
             );
         }
