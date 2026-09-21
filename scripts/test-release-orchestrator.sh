@@ -104,6 +104,12 @@ case "$*" in
       # GH_PUBLISH_WORKS=0 models the real trap: the call SUCCEEDS and changes nothing.
       [ "${GH_PUBLISH_WORKS:-1}" = "1" ] && echo "draft=false" >> "$S"
       exit 0 ;;
+  *"actions/runs?per_page"*)
+      # Model the release.yml RUN for this tag. Empty output = no run exists at all, which is
+      # the genuinely-no-workflow case. Otherwise "status:conclusion", e.g. "in_progress:" or
+      # "completed:failure".
+      printf '%s' "${GH_RUN_STATE-}"; [ -n "${GH_RUN_STATE-}" ] && echo
+      exit 0 ;;
   *releases\?per_page*)
       # Model release.yml: the tag push creates the release ASYNCHRONOUSLY, so the first
       # $GH_RELEASE_APPEARS_AFTER lookups find nothing. A release we minted ourselves is
@@ -111,11 +117,30 @@ case "$*" in
       n=$(( $(cat "$GH_LOOKUPS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GH_LOOKUPS"
       if [ -f "$GH_CREATED" ] || [ "$n" -gt "${GH_RELEASE_APPEARS_AFTER:-0}" ]; then echo 4242; fi
       exit 0 ;;
+  # ⚠ `|` and `[]` are glob metacharacters in a case pattern — quoted so they match literally.
+  *".assets|length"*)
+      # A release WE minted carries no artefacts — the count must agree with the name list
+      # below, or a mutation can hide behind the two disagreeing.
+      [ -f "$GH_CREATED" ] && { echo 0; exit 0; }
+      echo "${GH_ASSETS:-5}"; exit 0 ;;
+  *".assets[].name"*)
+      # A release we minted ourselves has NO assets, whatever GH_ASSETS says.
+      [ -f "$GH_CREATED" ] && exit 0
+      i=0; while [ "$i" -lt "${GH_ASSETS:-5}" ]; do
+          case $i in
+            0) echo "bitcoin-ghost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" ;;
+            1) echo "bitcoin-ghost-v9.9.9-x86_64-apple-darwin.tar.gz" ;;
+            2) echo "bitcoin-ghost-v9.9.9-aarch64-apple-darwin.tar.gz" ;;
+            3) echo "SHA256SUMS.txt" ;;
+            4) [ "${GH_SIGNED:-1}" = "1" ] && echo "SHA256SUMS.txt.asc" || echo "extra.txt" ;;
+            *) echo "extra$i.txt" ;;
+          esac; i=$((i+1)); done
+      exit 0 ;;
   *releases/4242*jq*draft*)     grep -E '^draft=' "$S"    | tail -1 | cut -d= -f2; exit 0 ;;
   *releases/4242*jq*tag_name*)  grep -E '^tagname=' "$S"  | tail -1 | cut -d= -f2; exit 0 ;;
   "release view"*)   exit 0 ;;
   "release list"*)   echo "v9.9.9	Draft	v9.9.9	2026-01-01"; exit 0 ;;
-  "release create"*) echo created > "$GH_CREATED"; exit 0 ;;
+  "release create"*) echo "CREATE $*" >> "$GH_CALLS"; echo created > "$GH_CREATED"; exit 0 ;;
 esac
 exit 0
 GH_STUB
@@ -130,6 +155,8 @@ run_tag_phase() {   # $1 = GH_PUBLISH_WORKS
         GH_STATE="$TMP/gh_state" GH_CALLS="$TMP/gh_calls" GH_PUBLISH_WORKS="$1" \
         GH_LOOKUPS="$TMP/gh_lookups" GH_CREATED="$TMP/gh_created" \
         GH_RELEASE_APPEARS_AFTER="${GH_RELEASE_APPEARS_AFTER:-0}" \
+        GH_RUN_STATE="${GH_RUN_STATE-}" GH_ASSETS="${GH_ASSETS:-5}" GH_SIGNED="${GH_SIGNED:-1}" \
+        TAG_RELEASE_MAX_SECS="${TAG_RELEASE_MAX_SECS:-4}" \
         GHOST_RELEASE_STATE="$TMP/state" \
         TAG_RELEASE_WAIT_SECS="${TAG_RELEASE_WAIT_SECS:-5}" TAG_RELEASE_POLL_SECS=1 \
         ./scripts/release.sh 9.9.9 --from tag 2>&1 )
@@ -182,12 +209,69 @@ else
     ok "the workflow's release is waited for, not replaced by one of ours (assets survive)"
 fi
 
-# ...but the wait must be bounded, and a repo with no release workflow must still get a release.
-out="$(GH_RELEASE_APPEARS_AFTER=9999 run_tag_phase 1)"; rc=$?
-if [ $rc -eq 0 ] && grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null; then
-    ok "when no workflow ever produces one, the phase stops waiting and creates it"
+# ⛔ BEHAVIOUR CHANGED (#909). This case used to assert that when no release appears the phase
+# "stops waiting and creates it" — and PUBLISHES it. That is precisely the bug: on 2026-09-20 the
+# 600s timer expired against a ~19-minute workflow and published an EMPTY v1.11.43 as Latest.
+# A release with no artefacts must never be published, so the no-workflow path now creates a
+# DRAFT and refuses, leaving a human to decide.
+out="$(GH_RELEASE_APPEARS_AFTER=9999 GH_RUN_STATE= run_tag_phase 1)"; rc=$?
+# ⚠ Assert NO PUBLISH WAS ATTEMPTED. Checking only rc!=0 is not enough: a later guard (the
+# signature check) also refuses here, so the case would pass even if this path went back to
+# publishing. The discriminating fact is that no PATCH was ever issued.
+if [ $rc -ne 0 ] && grep -q 'CREATE.*--draft' "$TMP/gh_calls" 2>/dev/null && ! grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null; then
+    ok "no release workflow at all: a DRAFT is created and the phase REFUSES, never publishing it"
 else
-    bad "no release was ever created after the wait elapsed (rc=$rc): $(printf '%s' "$out" | tail -1)"
+    bad "no-workflow path attempted a publish or did not refuse (rc=$rc, patched=$(grep -qc 'PATCH' "$TMP/gh_calls" 2>/dev/null || echo 0)): $(printf '%s' "$out" | tail -1)"
+fi
+
+# ---------------------------------------------------------------- #909: the empty release
+#
+# The failure this file exists to prevent now has its own cases. Each one is a state in which the
+# OLD code exited 0 having published something wrong.
+
+# 1. The workflow is still building and the backstop timer has long expired. The phase must keep
+#    waiting on the RUN, not fall through to minting a rival release.
+out="$(GH_RELEASE_APPEARS_AFTER=9999 GH_RUN_STATE=in_progress: TAG_RELEASE_WAIT_SECS=2 TAG_RELEASE_MAX_SECS=4 run_tag_phase 1)"; rc=$?
+if [ ! -f "$TMP/gh_created" ] && [ $rc -ne 0 ]; then
+    ok "a still-building release.yml is waited for even past the backstop timer — no rival release"
+else
+    bad "minted a release while release.yml was still building (#909): rc=$rc created=$([ -f "$TMP/gh_created" ] && echo yes || echo no)"
+fi
+
+# 2. The workflow FAILED. Publishing anything here hides a broken build behind a green release.
+out="$(GH_RELEASE_APPEARS_AFTER=9999 GH_RUN_STATE=completed:failure run_tag_phase 1)"; rc=$?
+if [ $rc -ne 0 ] && ! [ -f "$TMP/gh_created" ]; then
+    ok "a FAILED release.yml refuses the phase and mints no substitute release"
+else
+    bad "a failed build did not stop the release (rc=$rc)"
+fi
+
+# 3. The release exists but carries NO assets — the exact end state of the #909 incident.
+# ⚠ Assert the ASSET-COUNT reason by name. A bare "it refused" passes even with the count check
+# deleted, because the signature check refuses this input too — a mutation proved exactly that.
+out="$(GH_ASSETS=0 run_tag_phase 1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'assets, want >=' && ! grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null; then
+    ok "a release with zero assets is REFUSED by the asset-count check, before any publish (#909)"
+else
+    bad "zero-asset release not refused by the count check (rc=$rc) — #909 regression: $(printf '%s' "$out" | tail -1)"
+fi
+
+# 4. Assets present but UNSIGNED. The signature is the point of the release; its absence must not
+#    be inferable only from a count.
+out="$(GH_ASSETS=5 GH_SIGNED=0 run_tag_phase 1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'SHA256SUMS.txt.asc'; then
+    ok "a release without SHA256SUMS.txt.asc is REFUSED as unsigned"
+else
+    bad "published an unsigned release (rc=$rc)"
+fi
+
+# 5. POSITIVE CONTROL. Every case above asserts a refusal, and a phase that refused everything
+#    would pass all of them. A correct, signed, fully-built release must still publish.
+out="$(GH_ASSETS=5 GH_SIGNED=1 GH_RUN_STATE=completed:success run_tag_phase 1)"; rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -qE '^  published .* assets=5'; then
+    ok "a correct signed release with all 5 assets still publishes (positive control)"
+else
+    bad "refused a perfectly good release (rc=$rc): $(printf '%s' "$out" | tail -1)"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
