@@ -215,10 +215,11 @@ pub trait MessageHandler: Send + Sync {
 /// Inbound Noise connections permitted from a single IP (H-12).
 ///
 /// The global semaphore is 100. Without a per-IP dimension one host can hold every permit and deny
-/// all honest inbound, and each connection also owns a reassembly buffer (bounded by
-// REASSEMBLY_PER_CONN_BYTES and by the process-wide budget since #911) — so the same host
-/// can pin hundreds of megabytes. A legitimate peer needs one or two; the margin is for NAT'd
-/// operators sharing an address, not for volume.
+/// all honest inbound, and each connection also owns a reassembly buffer — so the same host could
+/// pin hundreds of megabytes. Since #911 that buffer is bounded twice: by
+/// `REASSEMBLY_PER_CONN_BYTES` per connection, and by a process-wide budget sized so that this
+/// cap times `MAX_INBOUND_PER_SUBNET` stays a minority of it. A legitimate peer needs one or two
+/// connections; the margin is for NAT'd operators sharing an address, not for volume.
 pub(crate) const MAX_INBOUND_PER_IP: usize = 8;
 
 /// Inbound Noise connections permitted from a single network block (H-12).

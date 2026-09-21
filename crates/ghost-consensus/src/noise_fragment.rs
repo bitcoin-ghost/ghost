@@ -154,6 +154,60 @@ pub const MIN_REASSEMBLY_BUDGET_BYTES: usize =
 // Compile-time guarantee that a full fragment frame fits in one Noise frame.
 const _: () = assert!(FRAGMENT_HEADER_LEN + MAX_FRAGMENT_PAYLOAD <= MAX_PAYLOAD_SIZE);
 
+// ---------------------------------------------------------------------------------------
+// The budget invariants, enforced AT COMPILE TIME (#911).
+//
+// These were runtime tests. Compile-time is strictly stronger — the relationship simply
+// cannot be violated in a build — and it is the pattern this file already uses above.
+//
+// They are relationships between constants in three different modules, and two revisions of
+// this budget shipped with one of them broken: first `MAX_INBOUND_PER_IP * per_conn` equalled
+// the whole budget, then the per-IP ratio was fixed while one `/24` still held 75%. Nothing
+// was checking the relationship itself, only the code around it.
+
+/// One `/24` must not reach half the budget, or it decides who gets evicted. This is the
+/// binding one: the threat model is addresses spread across a subnet, which is exactly why
+/// the per-IP cap alone is insufficient.
+const _: () = assert!(
+    2 * crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES <= REASSEMBLY_BUDGET_BYTES,
+    "one /24 can reach half the reassembly budget — it would choose every eviction victim"
+);
+
+/// Follows from the above, asserted separately so a change to either cap is caught.
+const _: () = assert!(
+    2 * crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES <= REASSEMBLY_BUDGET_BYTES,
+    "one IP can reach half the reassembly budget"
+);
+
+/// The per-connection cap must clear the largest message that can legitimately reach this
+/// layer, or honest traffic is DISCONNECTED rather than refused — mesh treats any accept
+/// error as fatal.
+///
+/// ⚠ The comparison is against `MAX_ENVELOPE_SIZE`, the cap `validate_envelope_header` applies
+/// to the SERIALIZED bytes — which is what gets fragmented and reassembled here. An earlier
+/// version compared against `MAX_ZK_PROPOSAL_SIZE`, a cap on `envelope.payload.len()` BEFORE
+/// serialization. `MessageEnvelope::serialize` is `serde_json::to_vec` and `payload: Vec<u8>`
+/// encodes as a JSON decimal array, so the two differ by roughly 3.5x — the assert was
+/// comparing quantities in different units and the headroom it implied was wrong.
+const _: () = assert!(
+    REASSEMBLY_PER_CONN_BYTES > crate::message_validator::MAX_ENVELOPE_SIZE,
+    "the per-connection reassembly cap is below the largest serialized envelope"
+);
+
+/// ⚠ The floor must not exceed the default, or the compiled default would itself be refused.
+///
+/// This replaces an assert that compared `2 * SUBNET * per_conn` against
+/// `MIN_REASSEMBLY_BUDGET_BYTES` — which is DEFINED as that expression, so it was a tautology
+/// that held for any value and protected nothing. It read as cover for the env floor while
+/// the floor was in fact wired to a different constant entirely.
+const _: () = assert!(
+    MIN_REASSEMBLY_BUDGET_BYTES <= REASSEMBLY_BUDGET_BYTES,
+    "the minimum accepted budget override exceeds the compiled default"
+);
+
+/// A connection may never be asked to hold more than one message can legally be.
+const _: () = assert!(REASSEMBLY_PER_CONN_BYTES <= MAX_REASSEMBLY_SIZE);
+
 /// Process-global monotonic source of `message_id` values.
 ///
 /// Uniqueness only needs to hold within a connection's reassembly window; a
@@ -516,6 +570,27 @@ impl ReassemblyBudget {
             }
         };
         if need_reset {
+            // ⛔ A slot discarded for STALENESS leaves the same doomed buffer eviction did.
+            // Its earlier chunks are gone and nothing re-requests them, so re-buffering the
+            // rest accumulates against the global budget for a message that can never
+            // complete — and the fresh `started_at` defeats stale-first for another 30s. Only
+            // the eviction path was poisoned; this one manufactured the identical failure.
+            let stale_same_message = g.entries[&id]
+                .slot
+                .as_ref()
+                .is_some_and(|cur| cur.message_id == header.message_id);
+            if stale_same_message {
+                let e = g.entries.get_mut(&id).expect("checked above");
+                let freed = e.bytes;
+                if let Some(old) = e.slot.take() {
+                    e.poisoned = Some(old.message_id);
+                    reclaimed.push(old);
+                }
+                e.bytes = 0;
+                g.held = g.held.saturating_sub(freed);
+                return Ok(None);
+            }
+
             let e = g.entries.get_mut(&id).expect("checked above");
             // A different message means the peer has moved on; stop suppressing.
             if e.poisoned.is_some_and(|m| m != header.message_id) {
@@ -727,16 +802,59 @@ impl ReassemblyBudget {
 /// The process-wide budget every connection shares.
 ///
 /// `GHOST_REASSEMBLY_BUDGET_BYTES` overrides it, so the limit can be retuned on a live fleet
-/// without a rebuild. Values below [`MAX_REASSEMBLY_SIZE`] are refused: a budget smaller than
-/// one legal message would reject honest checkpoints rather than merely evict them.
+/// without a rebuild.
+///
+/// ⛔ The floor is [`MIN_REASSEMBLY_BUDGET_BYTES`], the smallest budget that still keeps one
+/// `/24` a minority — NOT [`MAX_REASSEMBLY_SIZE`]. It was the latter, and the constant below
+/// was written, documented as the floor, and then never wired in. At an 8 MiB override just
+/// four connections held the whole budget, inside a single IP's allowance, so that address
+/// chose every eviction victim: the exact cornering this module exists to stop, re-opened by
+/// the one knob that ships enabled.
 static GLOBAL_BUDGET: once_cell::sync::Lazy<ReassemblyBudget> = once_cell::sync::Lazy::new(|| {
-    let limit = std::env::var("GHOST_REASSEMBLY_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= MAX_REASSEMBLY_SIZE)
-        .unwrap_or(REASSEMBLY_BUDGET_BYTES);
-    ReassemblyBudget::new(limit)
+    ReassemblyBudget::new(budget_limit_from_env(
+        std::env::var("GHOST_REASSEMBLY_BUDGET_BYTES")
+            .ok()
+            .as_deref(),
+    ))
 });
+
+/// Resolve the budget limit from the raw env value.
+///
+/// ⛔ A FREE FUNCTION so it can be tested. This logic previously lived inline in the `Lazy`
+/// initialiser, which is read once per process and therefore unreachable from a test — and
+/// that is exactly how it shipped wired to the WRONG constant ([`MAX_REASSEMBLY_SIZE`], 8 MiB)
+/// while [`MIN_REASSEMBLY_BUDGET_BYTES`] sat defined, documented as the floor, and referenced
+/// by nothing. Untestable code is where that hides.
+fn budget_limit_from_env(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return REASSEMBLY_BUDGET_BYTES;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(v) if v >= MIN_REASSEMBLY_BUDGET_BYTES => v,
+        // Say so. An operator trimming reassembly memory on a 3,867 MiB node is who this knob
+        // is for; silently using the default leaves the failure invisible in the one case it
+        // matters.
+        Ok(v) => {
+            tracing::warn!(
+                requested = v,
+                floor = MIN_REASSEMBLY_BUDGET_BYTES,
+                using = REASSEMBLY_BUDGET_BYTES,
+                "GHOST_REASSEMBLY_BUDGET_BYTES is below the floor that keeps one /24 a \
+                 minority of the budget — ignoring it"
+            );
+            REASSEMBLY_BUDGET_BYTES
+        }
+        Err(e) => {
+            tracing::warn!(
+                requested = %raw,
+                error = %e,
+                using = REASSEMBLY_BUDGET_BYTES,
+                "GHOST_REASSEMBLY_BUDGET_BYTES is not a number — ignoring it"
+            );
+            REASSEMBLY_BUDGET_BYTES
+        }
+    }
+}
 
 /// Handle to the process-wide reassembly budget (#911).
 pub fn global_budget() -> ReassemblyBudget {
@@ -898,43 +1016,6 @@ mod tests {
         );
     }
 
-    /// ⛔ THE INVARIANT, pinned as arithmetic over the constants.
-    ///
-    /// Two revisions got this wrong in the same place. First `per_conn` was
-    /// `MAX_REASSEMBLY_SIZE`, and `MAX_INBOUND_PER_IP * 8 MiB` was EXACTLY the budget — one
-    /// address held 100%. Then the cap was tightened but the test asserted the per-**IP**
-    /// ratio, while the threat model this module documents is addresses spread across a
-    /// `/24`: one `/24` legally held **75%** and still chose every eviction victim.
-    ///
-    /// So the binding constant is `MAX_INBOUND_PER_SUBNET`, and this asserts it directly.
-    #[test]
-    fn one_subnet_cannot_corner_the_budget() {
-        let subnet = crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES;
-        assert!(
-            subnet * 2 <= REASSEMBLY_BUDGET_BYTES,
-            "one /24 can hold {subnet} of {REASSEMBLY_BUDGET_BYTES} bytes — a single subnet \
-             must not reach half the budget, or it decides who gets evicted"
-        );
-
-        // The per-IP share follows from it, but assert it too so a change to either cap is caught.
-        let ip = crate::mesh::MAX_INBOUND_PER_IP * REASSEMBLY_PER_CONN_BYTES;
-        assert!(ip * 2 <= REASSEMBLY_BUDGET_BYTES, "one IP holds {ip}");
-
-        // The cap must still clear the largest message the validator would accept, or honest
-        // traffic is disconnected rather than refused (mesh treats accept errors as fatal).
-        assert!(
-            REASSEMBLY_PER_CONN_BYTES > crate::message_validator::MAX_ZK_PROPOSAL_SIZE,
-            "the per-connection cap must exceed the largest legitimate message"
-        );
-
-        // And the env floor must itself satisfy the invariant, or the knob reintroduces it.
-        assert!(
-            crate::mesh::MAX_INBOUND_PER_SUBNET * REASSEMBLY_PER_CONN_BYTES * 2
-                <= MIN_REASSEMBLY_BUDGET_BYTES,
-            "the smallest accepted override must still keep one /24 a minority"
-        );
-    }
-
     /// The fragment layer must refuse what the quota would refuse, BEFORE buffering.
     ///
     /// mesh.rs treats any `accept` error as fatal and drops the connection, so the two limits
@@ -1001,6 +1082,82 @@ mod tests {
         assert!(victim.has_slot(), "the peer must be able to start again");
     }
 
+    /// The env override must enforce the SUBNET floor, not merely "one message fits".
+    ///
+    /// This is the case that shipped broken: the floor was `MAX_REASSEMBLY_SIZE` (8 MiB) while
+    /// `MIN_REASSEMBLY_BUDGET_BYTES` was defined, documented as the floor, and wired to
+    /// nothing. At 8 MiB just four connections held the whole budget — inside ONE IP's
+    /// allowance — so that address chose every eviction victim.
+    #[test]
+    fn the_env_override_enforces_the_subnet_floor() {
+        assert_eq!(budget_limit_from_env(None), REASSEMBLY_BUDGET_BYTES);
+
+        let ok = MIN_REASSEMBLY_BUDGET_BYTES;
+        assert_eq!(budget_limit_from_env(Some(&ok.to_string())), ok);
+        assert_eq!(
+            budget_limit_from_env(Some(&(ok * 2).to_string())),
+            ok * 2,
+            "a larger budget must be honoured"
+        );
+
+        // MAX_REASSEMBLY_SIZE is the value the broken version accepted, so name it explicitly.
+        for bad in [MAX_REASSEMBLY_SIZE, MIN_REASSEMBLY_BUDGET_BYTES - 1, 0, 1] {
+            assert_eq!(
+                budget_limit_from_env(Some(&bad.to_string())),
+                REASSEMBLY_BUDGET_BYTES,
+                "{bad} is below the floor and must be refused, not accepted"
+            );
+        }
+
+        assert_eq!(budget_limit_from_env(Some("128M")), REASSEMBLY_BUDGET_BYTES);
+        assert_eq!(budget_limit_from_env(Some("")), REASSEMBLY_BUDGET_BYTES);
+        assert_eq!(
+            budget_limit_from_env(Some(&format!("  {ok}  "))),
+            ok,
+            "surrounding whitespace must not silently discard a valid override"
+        );
+    }
+
+    /// A slot discarded for STALENESS must poison the message too, not just eviction.
+    ///
+    /// The timeout path manufactured the identical doomed buffer: earlier chunks gone, nothing
+    /// re-requests them, so the rest accumulate against the global budget for a message that
+    /// can never complete — with a fresh `started_at` that also defeats stale-first for another
+    /// 30s. Only the eviction path was poisoned.
+    #[test]
+    fn a_message_abandoned_by_timeout_is_not_re_buffered() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(MIN_REASSEMBLY_BUDGET_BYTES);
+        let mut peer = FragmentReassembler::with_budget(budget.clone());
+
+        let declared = 8 * CHUNK;
+        let count = chunks_for(declared);
+        peer.accept(frag(42, 0, count, declared as u32, &vec![1u8; CHUNK]))
+            .unwrap();
+        assert_eq!(peer.held_bytes(), CHUNK);
+
+        // Let it go stale, as a peer that paused past REASSEMBLY_TIMEOUT would.
+        budget.backdate(peer.id, REASSEMBLY_TIMEOUT + Duration::from_secs(1));
+
+        // The next chunk of the SAME message must be dropped, not started afresh.
+        let r = peer
+            .accept(frag(42, 1, count, declared as u32, &vec![1u8; CHUNK]))
+            .expect("a fragment of a timed-out message is dropped, not an error");
+        assert!(r.is_none());
+        assert_eq!(
+            peer.held_bytes(),
+            0,
+            "a timed-out message must not re-accumulate — its earlier chunks are gone, so it \
+             can never complete"
+        );
+        assert_eq!(budget.stats().0, 0, "and it must hold none of the budget");
+
+        // A NEW message from the same peer is accepted normally.
+        peer.accept(frag(43, 0, count, declared as u32, &vec![2u8; CHUNK]))
+            .expect("a new message must not be suppressed");
+        assert!(peer.has_slot());
+    }
+
     /// A completed message must never allocate the DECLARED length.
     ///
     /// 140 one-byte chunks declaring ~2 MiB is ~2.9 KB on the wire and 140 bytes charged, but
@@ -1024,7 +1181,7 @@ mod tests {
         assert_eq!(budget.stats().0, 0, "the failed message must hold nothing");
     }
 
-    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.
+    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.
     #[test]
     fn real_bytes_are_bounded_across_many_connections() {
         const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
