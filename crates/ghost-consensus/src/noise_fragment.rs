@@ -75,7 +75,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -244,63 +244,107 @@ struct InFlight {
     started_at: Instant,
 }
 
-/// The shared slot a [`ReassemblyBudget`] can reach into to evict.
+/// One connection's reassembly state, owned by the budget.
 ///
-/// Eviction has to FREE memory, which means reaching another connection's buffer. Marking a
-/// victim and waiting for it to notice does not bound anything: a buffer that never receives
-/// another fragment is precisely the attack, so its owner never runs again to see the mark.
-type SharedSlot = Arc<Mutex<Option<InFlight>>>;
-
-struct BudgetEntry {
-    /// Bytes this reassembler is currently accounted for.
+/// ⛔ The buffers live HERE, not in the `FragmentReassembler`, and that is the whole design.
+/// The first attempt kept them per-connection behind their own mutex and had the budget reach
+/// in to evict. That needed a documented budget->slot lock order, and it still left a window
+/// between reserving and writing in which a connection could be evicted and then repopulate
+/// itself — leaving a live buffer the budget accounted as zero and, because the victim filter
+/// skipped zero-byte entries, could never evict again. Owning the state removes the second
+/// lock, the ordering rule and the race together.
+struct Entry {
+    slot: Option<InFlight>,
+    /// Always equal to `slot.received_bytes`, or 0 when there is no slot. Maintained here so
+    /// the sum over entries is `held` by construction rather than by agreement.
     bytes: usize,
-    /// Monotonic touch counter — the LRU key. A counter rather than an `Instant` so the
-    /// victim is deterministic in tests instead of depending on clock resolution.
+    /// Monotonic touch counter — the LRU key. A counter, not an `Instant`, so the victim is
+    /// deterministic in tests instead of depending on clock resolution.
     seq: u64,
-    /// Weak so a dropped connection's entry cannot keep its buffer alive.
-    slot: Weak<Mutex<Option<InFlight>>>,
 }
 
 struct BudgetInner {
     limit: usize,
+    per_conn: usize,
     held: usize,
-    entries: HashMap<u64, BudgetEntry>,
+    entries: HashMap<u64, Entry>,
     next_id: u64,
     next_seq: u64,
     evictions: u64,
     rejections: u64,
+    /// Rate limiting for the eviction log. Unbounded logging under attacker control is a
+    /// log-amplification DoS wearing the defence's clothes — on nodes with 3,867 MiB of RAM
+    /// and journald on disk, that is not a theoretical cost.
+    last_log: Option<Instant>,
+    suppressed: u64,
 }
 
-/// A process-wide byte budget across every connection's reassembly buffer (#911).
+/// How often the eviction path may log, however fast evictions arrive.
+const EVICTION_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A process-wide byte budget over every connection's reassembly buffer (#911).
 ///
-/// ## Lock order
+/// ## What is charged
 ///
-/// ⛔ The budget lock is taken FIRST, then a victim's slot lock. `FragmentReassembler::accept`
-/// therefore must not hold its own slot lock across a call into here, or two connections
-/// evicting each other invert the order and deadlock. Every call below takes the budget lock
-/// and only then touches a slot.
-#[derive(Clone)]
+/// **Bytes actually received**, never the declared `total_len`.
+///
+/// Charging the declared length looks more conservative and is far more dangerous. A peer only
+/// has to send one 60 KB chunk to hold an 8 MiB charge, so eight sockets from a single address
+/// — exactly `MAX_INBOUND_PER_IP`, so the per-IP cap does not stop them — pin the entire 64 MiB
+/// budget with about 469 KiB of real memory, a 140x amplification. From that point every
+/// reservation must evict, and the attacker's drips keep their own entries fresh, so the LRU
+/// victim is always an honest peer part-way through a checkpoint. Its slot is cleared, its
+/// remaining fragments land in a fresh buffer, the message never completes, and NOTHING is
+/// reported to either side. That is the "proposal data missing — requesting tree sync" churn
+/// this module exists to remove: a memory DoS traded for a cheaper, quieter suppression DoS.
+///
+/// Charging real bytes removes the amplification entirely: pinning N bytes of budget costs an
+/// attacker N bytes of traffic, and the budget measures the thing it is defending.
+///
+/// ## Why eviction is the last resort, not the normal path
+///
+/// A stale entry — one whose message has not progressed within [`REASSEMBLY_TIMEOUT`] — is
+/// freed before any live entry is considered. Without that the timeout is decorative: it is
+/// only ever evaluated when the same connection sends another fragment, and inbound
+/// connections have no idle timeout and are not in the pool, so a peer that goes silent holds
+/// its buffer for the life of the socket.
 pub struct ReassemblyBudget {
     inner: Arc<Mutex<BudgetInner>>,
 }
 
+impl Clone for ReassemblyBudget {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl ReassemblyBudget {
     pub fn new(limit: usize) -> Self {
+        Self::with_per_conn(limit, MAX_REASSEMBLY_SIZE.min(limit))
+    }
+
+    /// `per_conn` bounds what any ONE connection may hold, so a single peer cannot corner the
+    /// budget and turn eviction against everyone else.
+    pub fn with_per_conn(limit: usize, per_conn: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(BudgetInner {
                 limit,
+                per_conn,
                 held: 0,
                 entries: HashMap::new(),
                 next_id: 1,
                 next_seq: 1,
                 evictions: 0,
                 rejections: 0,
+                last_log: None,
+                suppressed: 0,
             })),
         }
     }
 
-    /// Register a reassembler's slot and get its id.
-    fn register(&self, slot: &SharedSlot) -> u64 {
+    fn register(&self) -> u64 {
         let mut g = self.inner.lock();
         let id = g.next_id;
         g.next_id += 1;
@@ -308,106 +352,309 @@ impl ReassemblyBudget {
         g.next_seq += 1;
         g.entries.insert(
             id,
-            BudgetEntry {
+            Entry {
+                slot: None,
                 bytes: 0,
                 seq,
-                slot: Arc::downgrade(slot),
             },
         );
         id
     }
 
     fn unregister(&self, id: u64) {
-        let mut g = self.inner.lock();
-        if let Some(e) = g.entries.remove(&id) {
-            g.held = g.held.saturating_sub(e.bytes);
-        }
-    }
-
-    /// Account `id` as holding exactly `want` bytes, evicting the least-recently-used OTHER
-    /// buffers until it fits.
-    ///
-    /// Set-to-absolute rather than increment: the caller's buffer may have been evicted
-    /// between calls, and an increment would then drift against reality permanently.
-    ///
-    /// Returns `false` when `want` cannot be accommodated even after evicting everything
-    /// evictable — the caller must then refuse the fragment rather than allocate anyway.
-    fn reserve(&self, id: u64, want: usize) -> bool {
-        let mut g = self.inner.lock();
-
-        let current = g.entries.get(&id).map(|e| e.bytes).unwrap_or(0);
-        g.held = g.held.saturating_sub(current);
-        if let Some(e) = g.entries.get_mut(&id) {
-            e.bytes = 0;
-            let seq = g.next_seq;
-            g.next_seq += 1;
-            if let Some(e) = g.entries.get_mut(&id) {
-                e.seq = seq;
-            }
-        }
-
-        // A single buffer may never exceed the whole budget, however empty it is.
-        if want > g.limit {
-            g.rejections += 1;
-            return false;
-        }
-
-        while g.held + want > g.limit {
-            // Least-recently-touched entry that is NOT us and actually holds something.
-            let victim = g
-                .entries
-                .iter()
-                .filter(|(vid, e)| **vid != id && e.bytes > 0)
-                .min_by_key(|(_, e)| e.seq)
-                .map(|(vid, _)| *vid);
-
-            let Some(vid) = victim else {
-                // Nothing left to evict and it still does not fit.
-                g.rejections += 1;
-                return false;
-            };
-
-            let freed = {
-                let e = g.entries.get_mut(&vid).expect("victim present");
-                let freed = e.bytes;
-                e.bytes = 0;
-                if let Some(slot) = e.slot.upgrade() {
-                    // Budget lock held, then slot lock — the documented order.
-                    *slot.lock() = None;
+        // Take the buffer out under the lock, drop it after. Freeing up to 8 MiB of `Vec`s
+        // inside the global lock serialises every other connection behind a large deallocation.
+        let victim = {
+            let mut g = self.inner.lock();
+            match g.entries.remove(&id) {
+                Some(e) => {
+                    g.held = g.held.saturating_sub(e.bytes);
+                    e.slot
                 }
-                freed
-            };
-            g.held = g.held.saturating_sub(freed);
-            g.evictions += 1;
-            tracing::warn!(
-                evicted_id = vid,
-                freed_bytes = freed,
-                held = g.held,
-                limit = g.limit,
-                "reassembly budget exhausted — evicted the least-recently-used partial message (#911)"
-            );
-        }
-
-        g.held += want;
-        if let Some(e) = g.entries.get_mut(&id) {
-            e.bytes = want;
-        }
-        true
+                None => None,
+            }
+        };
+        drop(victim);
     }
 
-    /// Bytes currently held, and how many evictions/rejections have happened.
-    ///
-    /// Exposed so exhaustion is observable. A budget that silently drops honest traffic is its
-    /// own outage, and one nobody can see is worse.
+    /// Bytes held, evictions, rejections. Held is real occupancy, not declared.
     pub fn stats(&self) -> (usize, u64, u64) {
         let g = self.inner.lock();
         (g.held, g.evictions, g.rejections)
     }
+
+    /// Age an entry's buffer, so the stale-first eviction path is testable without waiting
+    /// out [`REASSEMBLY_TIMEOUT`]. A test that cannot reach the stale branch would assert the
+    /// LRU fallback and call it stale-first.
+    #[cfg(test)]
+    fn backdate(&self, id: u64, by: Duration) {
+        let mut g = self.inner.lock();
+        if let Some(e) = g.entries.get_mut(&id) {
+            if let Some(slot) = e.slot.as_mut() {
+                slot.started_at = slot
+                    .started_at
+                    .checked_sub(by)
+                    .expect("test backdate must not underflow the clock");
+            }
+        }
+    }
+
+    /// Current limit and per-connection cap, for reporting.
+    pub fn limits(&self) -> (usize, usize) {
+        let g = self.inner.lock();
+        (g.limit, g.per_conn)
+    }
+
+    /// The whole of `accept`'s stateful half, run under ONE lock.
+    ///
+    /// Everything that reads or writes a buffer happens here, so there is no second lock to
+    /// order against and no window in which accounting and reality can disagree.
+    fn accept_fragment(
+        &self,
+        id: u64,
+        header: &FragmentHeader,
+        payload: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, NoiseError> {
+        // Buffers to free AFTER the lock is released.
+        let mut reclaimed: Vec<InFlight> = Vec::new();
+        let result = self.accept_locked(id, header, payload, &mut reclaimed);
+        drop(reclaimed);
+        result
+    }
+
+    fn accept_locked(
+        &self,
+        id: u64,
+        header: &FragmentHeader,
+        payload: Vec<u8>,
+        reclaimed: &mut Vec<InFlight>,
+    ) -> Result<Option<Vec<u8>>, NoiseError> {
+        let mut g = self.inner.lock();
+
+        // A connection whose entry has gone (dropped concurrently) cannot reassemble.
+        if !g.entries.contains_key(&id) {
+            return Err(NoiseError::Decryption(
+                "fragment: reassembler is no longer registered".into(),
+            ));
+        }
+
+        // ---- reset if this is a new message, a different one, or a stale one
+        let need_reset = match g.entries[&id].slot.as_ref() {
+            None => true,
+            Some(cur) => {
+                cur.message_id != header.message_id
+                    || cur.chunk_count != header.chunk_count
+                    || cur.started_at.elapsed() > REASSEMBLY_TIMEOUT
+            }
+        };
+        if need_reset {
+            let e = g.entries.get_mut(&id).expect("checked above");
+            let freed = e.bytes;
+            if let Some(old) = e.slot.take() {
+                reclaimed.push(old);
+            }
+            e.bytes = 0;
+            g.held = g.held.saturating_sub(freed);
+
+            let e = g.entries.get_mut(&id).expect("checked above");
+            e.slot = Some(InFlight {
+                message_id: header.message_id,
+                chunk_count: header.chunk_count,
+                total_len: header.total_len,
+                chunks: vec![None; header.chunk_count],
+                received_bytes: 0,
+                received_count: 0,
+                started_at: Instant::now(),
+            });
+        }
+
+        // ---- validate against the slot we now have
+        {
+            let slot = g.entries[&id].slot.as_ref().expect("set above");
+            if slot.total_len != header.total_len {
+                Self::clear(&mut g, id, reclaimed);
+                return Err(NoiseError::Decryption(
+                    "fragment: total_len changed mid-message".into(),
+                ));
+            }
+            if slot.chunks[header.chunk_index].is_some() {
+                Self::clear(&mut g, id, reclaimed);
+                return Err(NoiseError::Decryption("fragment: duplicate chunk".into()));
+            }
+            if slot.received_bytes + payload.len() > slot.total_len {
+                Self::clear(&mut g, id, reclaimed);
+                return Err(NoiseError::Decryption(
+                    "fragment: received bytes exceed total_len".into(),
+                ));
+            }
+        }
+
+        // ---- admit the bytes we are ACTUALLY about to hold
+        let delta = payload.len();
+        let have = g.entries[&id].bytes;
+
+        if have + delta > g.per_conn {
+            Self::clear(&mut g, id, reclaimed);
+            g.rejections += 1;
+            return Err(NoiseError::Decryption(
+                "fragment: per-connection reassembly quota exceeded".into(),
+            ));
+        }
+
+        if !Self::make_room(&mut g, id, delta, reclaimed) {
+            Self::clear(&mut g, id, reclaimed);
+            g.rejections += 1;
+            return Err(NoiseError::Decryption(
+                "fragment: reassembly budget exhausted".into(),
+            ));
+        }
+
+        // ---- write it
+        let seq = g.next_seq;
+        g.next_seq += 1;
+        let e = g.entries.get_mut(&id).expect("checked above");
+        e.seq = seq;
+        e.bytes += delta;
+        let slot = e.slot.as_mut().expect("set above");
+        slot.received_bytes += delta;
+        slot.chunks[header.chunk_index] = Some(payload);
+        slot.received_count += 1;
+        g.held += delta;
+
+        let complete = {
+            let slot = g.entries[&id].slot.as_ref().expect("set above");
+            slot.received_count == slot.chunk_count
+        };
+        if !complete {
+            return Ok(None);
+        }
+
+        // ---- complete: the bytes become the caller's, not ours
+        let e = g.entries.get_mut(&id).expect("checked above");
+        let freed = e.bytes;
+        let slot = e.slot.take().expect("set above");
+        e.bytes = 0;
+        g.held = g.held.saturating_sub(freed);
+        drop(g);
+
+        let mut out = Vec::with_capacity(slot.total_len);
+        for chunk in slot.chunks {
+            out.extend_from_slice(&chunk.expect("all chunks present when count matches"));
+        }
+        if out.len() != slot.total_len {
+            return Err(NoiseError::Decryption(
+                "fragment: reassembled length mismatch".into(),
+            ));
+        }
+        Ok(Some(out))
+    }
+
+    /// Drop `id`'s buffer and its accounting together.
+    fn clear(g: &mut BudgetInner, id: u64, reclaimed: &mut Vec<InFlight>) {
+        if let Some(e) = g.entries.get_mut(&id) {
+            let freed = e.bytes;
+            if let Some(old) = e.slot.take() {
+                reclaimed.push(old);
+            }
+            e.bytes = 0;
+            g.held = g.held.saturating_sub(freed);
+        }
+    }
+
+    /// Make space for `delta` more bytes for `id`, stale entries first.
+    ///
+    /// Returns false when even evicting everything evictable leaves no room, so the caller
+    /// refuses the fragment rather than allocating anyway.
+    fn make_room(
+        g: &mut BudgetInner,
+        id: u64,
+        delta: usize,
+        reclaimed: &mut Vec<InFlight>,
+    ) -> bool {
+        if delta > g.limit {
+            return false;
+        }
+        while g.held + delta > g.limit {
+            // STALE FIRST. A buffer that has not progressed within REASSEMBLY_TIMEOUT is the
+            // one actually leaking, and freeing it costs an honest peer nothing. Only when
+            // none is stale does this fall back to LRU.
+            let stale = g
+                .entries
+                .iter()
+                .filter(|(vid, e)| {
+                    **vid != id
+                        && e.bytes > 0
+                        && e.slot
+                            .as_ref()
+                            .is_some_and(|s| s.started_at.elapsed() > REASSEMBLY_TIMEOUT)
+                })
+                .min_by_key(|(_, e)| e.seq)
+                .map(|(vid, _)| *vid);
+
+            let victim = stale.or_else(|| {
+                g.entries
+                    .iter()
+                    .filter(|(vid, e)| **vid != id && e.bytes > 0)
+                    .min_by_key(|(_, e)| e.seq)
+                    .map(|(vid, _)| *vid)
+            });
+
+            let Some(vid) = victim else {
+                return false;
+            };
+            let was_stale = stale.is_some();
+
+            let freed = {
+                let e = g.entries.get_mut(&vid).expect("victim present");
+                let freed = e.bytes;
+                if let Some(old) = e.slot.take() {
+                    reclaimed.push(old);
+                }
+                e.bytes = 0;
+                freed
+            };
+            g.held = g.held.saturating_sub(freed);
+            g.evictions += 1;
+
+            // Rate-limited: an attacker choosing the eviction rate must not also choose the
+            // log rate.
+            let now = Instant::now();
+            let due = g
+                .last_log
+                .is_none_or(|t| now.duration_since(t) >= EVICTION_LOG_INTERVAL);
+            if due {
+                let suppressed = std::mem::take(&mut g.suppressed);
+                g.last_log = Some(now);
+                tracing::warn!(
+                    evicted_bytes = freed,
+                    stale = was_stale,
+                    held = g.held,
+                    limit = g.limit,
+                    evictions_total = g.evictions,
+                    suppressed_since_last_log = suppressed,
+                    "reassembly budget under pressure — evicted a partial message (#911)"
+                );
+            } else {
+                g.suppressed += 1;
+            }
+        }
+        true
+    }
 }
 
 /// The process-wide budget every connection shares.
-static GLOBAL_BUDGET: once_cell::sync::Lazy<ReassemblyBudget> =
-    once_cell::sync::Lazy::new(|| ReassemblyBudget::new(REASSEMBLY_BUDGET_BYTES));
+///
+/// `GHOST_REASSEMBLY_BUDGET_BYTES` overrides it, so the limit can be retuned on a live fleet
+/// without a rebuild. Values below [`MAX_REASSEMBLY_SIZE`] are refused: a budget smaller than
+/// one legal message would reject honest checkpoints rather than merely evict them.
+static GLOBAL_BUDGET: once_cell::sync::Lazy<ReassemblyBudget> = once_cell::sync::Lazy::new(|| {
+    let limit = std::env::var("GHOST_REASSEMBLY_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= MAX_REASSEMBLY_SIZE)
+        .unwrap_or(REASSEMBLY_BUDGET_BYTES);
+    ReassemblyBudget::new(limit)
+});
 
 /// Handle to the process-wide reassembly budget (#911).
 pub fn global_budget() -> ReassemblyBudget {
@@ -416,16 +663,9 @@ pub fn global_budget() -> ReassemblyBudget {
 
 /// Reassembles fragmented Noise messages for a single connection.
 ///
-/// Because [`NoiseConnection::send`](crate::noise_pool::NoiseConnection::send)
-/// emits all fragments of a message under one transport lock, fragments of
-/// different messages never interleave on a connection's ordered stream. A
-/// single reassembly slot per connection is therefore sufficient — and it
-/// naturally bounds memory to at most one [`MAX_REASSEMBLY_SIZE`] buffer per
-/// peer. A stale slot (peer sent some chunks then went quiet) is dropped after
-/// [`REASSEMBLY_TIMEOUT`].
+/// The buffer itself lives in the shared [`ReassemblyBudget`]; this is the connection's handle
+/// to it. See that type for why.
 pub struct FragmentReassembler {
-    /// Shared so the budget can evict it — see [`ReassemblyBudget`].
-    slot: SharedSlot,
     budget: ReassemblyBudget,
     id: u64,
 }
@@ -439,7 +679,8 @@ impl Default for FragmentReassembler {
 impl Drop for FragmentReassembler {
     fn drop(&mut self) {
         // A closed connection must return its bytes, or the budget leaks until restart and
-        // eventually refuses everything.
+        // eventually refuses everything — a self-inflicted outage wearing a DoS defence's
+        // clothes.
         self.budget.unregister(self.id);
     }
 }
@@ -450,123 +691,40 @@ impl FragmentReassembler {
         Self::with_budget(global_budget())
     }
 
-    /// Create one against a specific budget. Used by tests to exercise exhaustion without a
-    /// 64 MiB allocation.
+    /// Create one against a specific budget. Used by tests to exercise exhaustion without
+    /// allocating 64 MiB.
     pub fn with_budget(budget: ReassemblyBudget) -> Self {
-        let slot: SharedSlot = Arc::new(Mutex::new(None));
-        let id = budget.register(&slot);
-        Self { slot, budget, id }
+        let id = budget.register();
+        Self { budget, id }
     }
 
     /// Feed one received Noise frame.
     ///
     /// * A non-fragment frame is returned as `Ok(Some(bytes))` immediately
-    ///   (complete-message fast path).
+    ///   (complete-message fast path — it never touches the budget).
     /// * A fragment that completes a message returns `Ok(Some(bytes))`.
     /// * A fragment that does not yet complete a message returns `Ok(None)`.
-    /// * A malformed / duplicate / oversized fragment returns `Err(..)` and the
-    ///   partial state is discarded so a subsequent message is not poisoned.
+    /// * A malformed / duplicate / oversized fragment, or one that cannot be admitted, returns
+    ///   `Err(..)` and the partial state is discarded so a subsequent message is not poisoned.
     pub fn accept(&mut self, frame: Vec<u8>) -> Result<Option<Vec<u8>>, NoiseError> {
         let (header, payload) = match FragmentHeader::parse(&frame)? {
             None => return Ok(Some(frame)), // Complete single message.
             Some((h, p)) => (h, p.to_vec()),
         };
+        self.budget.accept_fragment(self.id, &header, payload)
+    }
 
-        // Ask the budget BEFORE touching our own slot.
-        //
-        // ⛔ Lock order is budget -> slot (see `ReassemblyBudget`). Holding our slot lock across
-        // this call would let two connections evicting each other deadlock, so the reservation
-        // happens first and the slot is locked afterwards.
-        //
-        // The reservation is for the FULL declared message, not the bytes in hand. A peer that
-        // announces an 8 MiB `total_len` and then sends one chunk has committed that memory as
-        // far as we are concerned — charging only for what arrived is exactly how a slow-drip
-        // sender stays under a budget while pinning it.
-        if !self.budget.reserve(self.id, header.total_len) {
-            *self.slot.lock() = None;
-            return Err(NoiseError::Decryption(
-                "fragment: reassembly budget exhausted".into(),
-            ));
-        }
+    /// The bytes this connection currently holds, for tests and diagnostics.
+    #[cfg(test)]
+    fn held_bytes(&self) -> usize {
+        let g = self.budget.inner.lock();
+        g.entries.get(&self.id).map(|e| e.bytes).unwrap_or(0)
+    }
 
-        let mut guard = self.slot.lock();
-
-        // Start a fresh slot if this is a new message, the previous slot is for
-        // a different message, the previous slot has gone stale, or the budget
-        // evicted it while we were not looking.
-        let need_reset = match guard.as_ref() {
-            None => true,
-            Some(cur) => {
-                cur.message_id != header.message_id
-                    || cur.chunk_count != header.chunk_count
-                    || cur.started_at.elapsed() > REASSEMBLY_TIMEOUT
-            }
-        };
-        if need_reset {
-            *guard = Some(InFlight {
-                message_id: header.message_id,
-                chunk_count: header.chunk_count,
-                total_len: header.total_len,
-                chunks: vec![None; header.chunk_count],
-                received_bytes: 0,
-                received_count: 0,
-                started_at: Instant::now(),
-            });
-        }
-
-        let slot = guard.as_mut().expect("slot set above");
-
-        // Guard against a mid-stream total_len change for the same message_id.
-        if slot.total_len != header.total_len {
-            *guard = None;
-            drop(guard);
-            self.budget.reserve(self.id, 0);
-            return Err(NoiseError::Decryption(
-                "fragment: total_len changed mid-message".into(),
-            ));
-        }
-
-        // Reject duplicate chunk indices — prevents a peer inflating a buffer or
-        // silently overwriting already-received data.
-        if slot.chunks[header.chunk_index].is_some() {
-            *guard = None;
-            drop(guard);
-            self.budget.reserve(self.id, 0);
-            return Err(NoiseError::Decryption("fragment: duplicate chunk".into()));
-        }
-
-        slot.received_bytes += payload.len();
-        if slot.received_bytes > slot.total_len {
-            *guard = None;
-            drop(guard);
-            self.budget.reserve(self.id, 0);
-            return Err(NoiseError::Decryption(
-                "fragment: received bytes exceed total_len".into(),
-            ));
-        }
-
-        slot.chunks[header.chunk_index] = Some(payload);
-        slot.received_count += 1;
-
-        if slot.received_count < slot.chunk_count {
-            return Ok(None); // Await more fragments.
-        }
-
-        // All chunks present: concatenate in index order.
-        let slot = guard.take().expect("slot present");
-        drop(guard);
-        // Completed: the bytes are about to become the caller's, not ours.
-        self.budget.reserve(self.id, 0);
-        let mut out = Vec::with_capacity(slot.total_len);
-        for chunk in slot.chunks {
-            out.extend_from_slice(&chunk.expect("all chunks present when count matches"));
-        }
-        if out.len() != slot.total_len {
-            return Err(NoiseError::Decryption(
-                "fragment: reassembled length mismatch".into(),
-            ));
-        }
-        Ok(Some(out))
+    #[cfg(test)]
+    fn has_slot(&self) -> bool {
+        let g = self.budget.inner.lock();
+        g.entries.get(&self.id).is_some_and(|e| e.slot.is_some())
     }
 }
 
@@ -579,16 +737,6 @@ mod tests {
     /// Build one fragment frame by hand so a test can declare a `total_len` far larger than the
     /// bytes it actually sends — which is the abuse shape: announce 8 MiB, send one chunk, pin
     /// the buffer, never complete.
-    /// The chunk_count a given `total_len` must declare to satisfy the parser's consistency
-    /// rule (`(count-1)*MAX_FRAGMENT_PAYLOAD < total_len <= count*MAX_FRAGMENT_PAYLOAD`).
-    ///
-    /// That rule is itself a defence — it stops a peer declaring 8 MiB in two chunks — but it
-    /// does NOT stop the attack #911 is about: the peer declares 8 MiB across a valid 140
-    /// chunks and then sends one of them, pinning the buffer without completing it.
-    fn chunks_for(total_len: usize) -> u16 {
-        total_len.div_ceil(MAX_FRAGMENT_PAYLOAD) as u16
-    }
-
     fn frag(message_id: u64, idx: u16, count: u16, total_len: u32, payload: &[u8]) -> Vec<u8> {
         let mut f = Vec::with_capacity(FRAGMENT_HEADER_LEN + payload.len());
         f.extend_from_slice(&FRAGMENT_MAGIC);
@@ -600,117 +748,215 @@ mod tests {
         f
     }
 
-    /// The bug (#911): per-source caps bound ONE address, not the process. Many distinct
-    /// connections — each individually well inside `MAX_INBOUND_PER_IP` and
-    /// `MAX_INBOUND_PER_SUBNET`, so those caps cannot be what stops this — must not be able to
-    /// pin unbounded memory between them.
-    #[test]
-    fn many_connections_cannot_exceed_the_global_budget() {
-        const SLOT: usize = 1024 * 1024; // 1 MiB declared per message
-        let budget = ReassemblyBudget::new(4 * SLOT); // room for 4
+    /// The chunk_count a given `total_len` must declare to satisfy the parser's consistency
+    /// rule. That rule stops a peer declaring 8 MiB in two chunks, but not declaring it in a
+    /// valid 140 and then sending one of them.
+    fn chunks_for(total_len: usize) -> u16 {
+        total_len.div_ceil(MAX_FRAGMENT_PAYLOAD) as u16
+    }
 
-        // 40 separate connections, far more than the budget allows to hold at once.
-        let mut conns: Vec<FragmentReassembler> = (0..40)
+    /// ⛔ THE REGRESSION TEST FOR THE FIRST ATTEMPT'S VULNERABILITY.
+    ///
+    /// The first version of this budget charged the DECLARED `total_len`. Eight sockets from a
+    /// single address — exactly `MAX_INBOUND_PER_IP`, so the per-IP cap does not stop them —
+    /// each declaring 8 MiB and sending one 60 KB chunk pinned the entire 64 MiB budget with
+    /// ~469 KiB of real memory, a 140x amplification. Every later reservation then had to
+    /// evict, and since the attacker's drips kept their own entries fresh, the victim was
+    /// always an honest peer mid-checkpoint — whose message then silently never completed.
+    ///
+    /// Charging real bytes is what makes that impossible, so this pins it directly.
+    #[test]
+    fn declared_length_cannot_pin_the_budget() {
+        const BUDGET: usize = 1024 * 1024;
+        let budget = ReassemblyBudget::new(BUDGET);
+
+        // Eight connections, each DECLARING a large message and sending one tiny chunk.
+        let mut attackers: Vec<FragmentReassembler> = (0..8)
             .map(|_| FragmentReassembler::with_budget(budget.clone()))
             .collect();
-
-        for (i, c) in conns.iter_mut().enumerate() {
-            // Declare a 1 MiB message, send only its first chunk, never complete it.
-            let f = frag(i as u64 + 1, 0, chunks_for(SLOT), SLOT as u32, &[0u8; 64]);
-            let _ = c.accept(f);
-            let (held, _, _) = budget.stats();
-            assert!(
-                held <= 4 * SLOT,
-                "held {held} exceeded the budget {} after {} connections",
-                4 * SLOT,
-                i + 1
-            );
+        const DECLARED: usize = 600_000;
+        for (i, a) in attackers.iter_mut().enumerate() {
+            a.accept(frag(
+                i as u64 + 1,
+                0,
+                chunks_for(DECLARED),
+                DECLARED as u32,
+                &[0u8; 64],
+            ))
+            .expect("the drip itself is legal");
         }
 
         let (held, evictions, _) = budget.stats();
-        assert!(held <= 4 * SLOT, "final held {held} over budget");
-        assert!(
-            evictions > 0,
-            "40 connections each declaring 1 MiB against a 4 MiB budget must have evicted"
+        assert_eq!(
+            held,
+            8 * 64,
+            "the budget must charge BYTES RECEIVED (8 x 64), not bytes declared \
+             (8 x {DECLARED}) — charging declared is the 140x amplification that let one IP \
+             corner the whole budget"
+        );
+        assert_eq!(
+            evictions, 0,
+            "eight tiny drips must not have caused a single eviction"
+        );
+
+        // And the honest peer that follows is served normally, not evicted.
+        let mut honest = FragmentReassembler::with_budget(budget.clone());
+        let payload: Vec<u8> = (0..84_000u32).map(|i| (i % 251) as u8).collect();
+        let mut out = None;
+        for f in fragment_message(&payload) {
+            if let Some(done) = honest.accept(f).expect("honest traffic must be admitted") {
+                out = Some(done);
+            }
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(payload.as_slice()),
+            "an honest checkpoint must still complete while the drips are parked — suppressing \
+             it is the quieter DoS the first design traded the memory DoS for"
         );
     }
 
-    /// LRU, not newest-drop. An attacker's buffers are by construction the ones NOT completing,
-    /// so the stalest partial is the right victim; evicting the newest arrival would punish the
-    /// honest peer that just started sending.
+    /// Real bytes ARE bounded: many connections sending full chunks cannot exceed the budget.
     #[test]
-    fn the_eviction_victim_is_the_stalest_partial() {
-        const SLOT: usize = 1024 * 1024;
-        let budget = ReassemblyBudget::new(2 * SLOT);
+    fn real_bytes_are_bounded_across_many_connections() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        const BUDGET: usize = 4 * CHUNK;
+        let budget = ReassemblyBudget::new(BUDGET);
 
+        // Each declares a 2-chunk message and sends chunk 0 in full, so it stays partial.
+        let declared = 2 * CHUNK;
+        let mut conns: Vec<FragmentReassembler> = (0..40)
+            .map(|_| FragmentReassembler::with_budget(budget.clone()))
+            .collect();
+        for (i, c) in conns.iter_mut().enumerate() {
+            let _ = c.accept(frag(
+                i as u64 + 1,
+                0,
+                chunks_for(declared),
+                declared as u32,
+                &vec![7u8; CHUNK],
+            ));
+            let (held, _, _) = budget.stats();
+            assert!(held <= BUDGET, "held {held} exceeded budget {BUDGET}");
+        }
+        let (held, evictions, _) = budget.stats();
+        assert!(held <= BUDGET, "final held {held} over budget");
+        assert!(
+            evictions > 0,
+            "40 full chunks against a 4-chunk budget must evict"
+        );
+    }
+
+    /// A connection cannot corner the budget on its own, however much it sends.
+    #[test]
+    fn one_connection_cannot_exceed_its_per_connection_quota() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::with_per_conn(100 * CHUNK, 2 * CHUNK);
+        let mut hog = FragmentReassembler::with_budget(budget.clone());
+
+        let declared = 8 * CHUNK;
+        let count = chunks_for(declared);
+
+        // ⚠ Check the chunk that CROSSES the quota, not the last one sent. A rejection clears
+        // the partial, so the fragment after it legitimately starts a fresh buffer and
+        // succeeds — reading only the last result would miss the refusal entirely.
+        let mut first_err = None;
+        for i in 0..4u16 {
+            let r = hog.accept(frag(1, i, count, declared as u32, &vec![9u8; CHUNK]));
+            if let Err(e) = r {
+                first_err = Some(e);
+                break;
+            }
+            assert!(
+                hog.held_bytes() <= 2 * CHUNK,
+                "held {} exceeded the quota mid-loop",
+                hog.held_bytes()
+            );
+        }
+        let err = first_err.expect("the per-connection quota must stop this connection");
+        assert!(
+            format!("{err:?}").contains("per-connection"),
+            "the refusal must name the quota, got {err:?}"
+        );
+        assert!(
+            budget.stats().0 <= 2 * CHUNK,
+            "one connection held more than its quota"
+        );
+    }
+
+    /// Stale first, then LRU. A buffer that has not progressed within REASSEMBLY_TIMEOUT is the
+    /// one actually leaking; freeing it costs an honest peer nothing.
+    #[test]
+    fn eviction_takes_the_stale_buffer_before_a_live_one() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(2 * CHUNK);
+
+        let mut stale = FragmentReassembler::with_budget(budget.clone());
+        let mut live = FragmentReassembler::with_budget(budget.clone());
+        let mut arriving = FragmentReassembler::with_budget(budget.clone());
+
+        let declared = 2 * CHUNK;
+        let count = chunks_for(declared);
+        // ⚠ ORDER MATTERS, and getting it wrong made this test worthless. `live` is touched
+        // FIRST so it holds the LOWER seq and is what a pure-LRU policy would evict. The stale
+        // buffer is touched SECOND, so only a stale-first policy picks it. With the touches the
+        // other way round both policies choose the same victim and the test passes against
+        // either — a mutation (stale-first -> pure LRU) proved exactly that by staying green.
+        live.accept(frag(2, 0, count, declared as u32, &vec![2u8; CHUNK]))
+            .unwrap();
+        stale
+            .accept(frag(1, 0, count, declared as u32, &vec![1u8; CHUNK]))
+            .unwrap();
+
+        budget.backdate(stale.id, REASSEMBLY_TIMEOUT + Duration::from_secs(1));
+
+        arriving
+            .accept(frag(3, 0, count, declared as u32, &vec![3u8; CHUNK]))
+            .unwrap();
+
+        assert!(
+            !stale.has_slot(),
+            "the STALE buffer must be evicted first — it is the one actually leaking"
+        );
+        assert!(
+            live.has_slot(),
+            "a live buffer must survive while a stale one exists, even though it is older by \
+             LRU order"
+        );
+        assert!(arriving.has_slot(), "the arriving message must be held");
+    }
+
+    /// With nothing stale, the victim is the least-recently-used.
+    #[test]
+    fn with_nothing_stale_the_victim_is_least_recently_used() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(2 * CHUNK);
         let mut a = FragmentReassembler::with_budget(budget.clone());
         let mut b = FragmentReassembler::with_budget(budget.clone());
         let mut c = FragmentReassembler::with_budget(budget.clone());
 
-        // a first, then b: a is the stalest.
-        a.accept(frag(1, 0, chunks_for(SLOT), SLOT as u32, &[0u8; 64]))
+        let declared = 2 * CHUNK;
+        let count = chunks_for(declared);
+        a.accept(frag(1, 0, count, declared as u32, &vec![1u8; CHUNK]))
             .unwrap();
-        b.accept(frag(2, 0, chunks_for(SLOT), SLOT as u32, &[0u8; 64]))
+        b.accept(frag(2, 0, count, declared as u32, &vec![2u8; CHUNK]))
             .unwrap();
-        assert!(a.slot.lock().is_some(), "a should hold a partial");
-        assert!(b.slot.lock().is_some(), "b should hold a partial");
-
-        // c arrives and does not fit: a — the stalest — must be the one dropped.
-        c.accept(frag(3, 0, chunks_for(SLOT), SLOT as u32, &[0u8; 64]))
+        c.accept(frag(3, 0, count, declared as u32, &vec![3u8; CHUNK]))
             .unwrap();
 
-        assert!(
-            a.slot.lock().is_none(),
-            "the STALEST partial (a) must be evicted"
-        );
-        assert!(
-            b.slot.lock().is_some(),
-            "b is newer than a and must survive — evicting it would be newest-drop, not LRU"
-        );
-        assert!(c.slot.lock().is_some(), "the arriving message must be held");
+        assert!(!a.has_slot(), "the stalest by LRU (a) must be evicted");
+        assert!(b.has_slot(), "b must survive");
+        assert!(c.has_slot(), "the arrival must be held");
     }
 
-    /// A buffer bigger than the entire budget is refused outright rather than evicting every
-    /// other peer to make room for something that still cannot fit.
-    #[test]
-    fn a_message_larger_than_the_whole_budget_is_refused() {
-        let budget = ReassemblyBudget::new(256 * 1024);
-        let mut a = FragmentReassembler::with_budget(budget.clone());
-        let mut victim = FragmentReassembler::with_budget(budget.clone());
-
-        // 120 KB spans two chunks, so sending one leaves the buffer PENDING. A single-chunk
-        // message would complete on arrival and hold nothing, testing nothing.
-        const PENDING: usize = 120_000;
-        assert!(
-            chunks_for(PENDING) > 1,
-            "the victim must actually stay partial"
-        );
-        victim
-            .accept(frag(1, 0, chunks_for(PENDING), PENDING as u32, &[0u8; 64]))
-            .unwrap();
-
-        let err = a
-            .accept(frag(2, 0, chunks_for(1024 * 1024), 1024 * 1024, &[0u8; 64]))
-            .expect_err("a message larger than the budget must be refused");
-        assert!(
-            format!("{err:?}").contains("budget"),
-            "the refusal must name the budget, got {err:?}"
-        );
-        assert!(
-            victim.slot.lock().is_some(),
-            "an impossible request must not evict innocent buffers on its way to failing"
-        );
-    }
-
-    /// POSITIVE CONTROL. Every assertion above is about refusing or evicting, and a budget of
-    /// zero would satisfy all of them. A legitimate multi-fragment message must still reassemble
-    /// with the budget in force, and must release its bytes when it completes.
+    /// POSITIVE CONTROL. Every assertion above is about refusing, evicting or not-charging, and
+    /// a budget that admitted nothing would satisfy several of them. A legitimate ~84 KB
+    /// checkpoint must still reassemble byte-for-byte and release its bytes on completion.
     #[test]
     fn a_legitimate_message_still_reassembles_and_releases_its_bytes() {
         let budget = ReassemblyBudget::new(4 * 1024 * 1024);
         let mut re = FragmentReassembler::with_budget(budget.clone());
 
-        // ~84 KB, the real checkpoint/tree-sync shape.
         let payload: Vec<u8> = (0..84_000u32).map(|i| (i % 251) as u8).collect();
         let frames = fragment_message(&payload);
         assert!(frames.len() > 1, "this payload must actually fragment");
@@ -733,22 +979,64 @@ mod tests {
     }
 
     /// A dropped connection returns its bytes. Without this the budget leaks until restart and
-    /// eventually refuses everything — a self-inflicted outage wearing a DoS defence's clothes.
+    /// eventually refuses everything.
     #[test]
-    fn a_dropped_connection_releases_its_reservation() {
-        const SLOT: usize = 1024 * 1024;
-        let budget = ReassemblyBudget::new(4 * SLOT);
+    fn a_dropped_connection_releases_its_bytes() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(4 * CHUNK);
+        let declared = 2 * CHUNK;
         {
             let mut a = FragmentReassembler::with_budget(budget.clone());
-            a.accept(frag(1, 0, chunks_for(SLOT), SLOT as u32, &[0u8; 64]))
-                .unwrap();
-            assert_eq!(budget.stats().0, SLOT, "the partial must be accounted");
+            a.accept(frag(
+                1,
+                0,
+                chunks_for(declared),
+                declared as u32,
+                &vec![5u8; CHUNK],
+            ))
+            .unwrap();
+            assert_eq!(budget.stats().0, CHUNK, "the partial must be accounted");
+            assert_eq!(a.held_bytes(), CHUNK);
         }
         assert_eq!(
             budget.stats().0,
             0,
             "dropping the connection must return its bytes to the budget"
         );
+    }
+
+    /// `held` must equal the sum of per-entry bytes after any mix of operations, or the ceiling
+    /// is arithmetic rather than a guarantee.
+    #[test]
+    fn held_always_equals_the_sum_of_entries() {
+        const CHUNK: usize = MAX_FRAGMENT_PAYLOAD;
+        let budget = ReassemblyBudget::new(3 * CHUNK);
+        let declared = 2 * CHUNK;
+        let count = chunks_for(declared);
+
+        let mut conns: Vec<FragmentReassembler> = (0..6)
+            .map(|_| FragmentReassembler::with_budget(budget.clone()))
+            .collect();
+        for (i, c) in conns.iter_mut().enumerate() {
+            let _ = c.accept(frag(
+                i as u64 + 1,
+                0,
+                count,
+                declared as u32,
+                &vec![1u8; CHUNK],
+            ));
+            let _ = c.accept(frag(
+                i as u64 + 1,
+                1,
+                count,
+                declared as u32,
+                &vec![1u8; CHUNK],
+            ));
+        }
+        let g = budget.inner.lock();
+        let sum: usize = g.entries.values().map(|e| e.bytes).sum();
+        assert_eq!(g.held, sum, "held drifted from the sum of entries");
+        assert!(g.held <= g.limit, "held {} over limit {}", g.held, g.limit);
     }
 
     /// A small message is never fragmented and round-trips unchanged.
@@ -857,7 +1145,7 @@ mod tests {
         // Re-send the same first chunk -> duplicate.
         let err = re.accept(frames[0].clone()).unwrap_err();
         assert!(matches!(err, NoiseError::Decryption(_)));
-        assert!(re.slot.lock().is_none(), "partial state cleared on error");
+        assert!(!re.has_slot(), "partial state cleared on error");
     }
 
     /// A chunk whose index is >= chunk_count is rejected.
@@ -906,7 +1194,7 @@ mod tests {
         assert!(re.accept(frames[0].clone()).unwrap().is_none());
         assert!(re.accept(frames[2].clone()).unwrap().is_none());
         // Message is still incomplete; slot retained awaiting chunk 1.
-        assert!(re.slot.lock().is_some());
+        assert!(re.has_slot());
     }
 
     /// The fragment magic can never collide with a serde_json envelope, which
