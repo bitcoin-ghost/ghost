@@ -2898,6 +2898,46 @@ async fn main() -> Result<()> {
     // Prometheus metrics
     let metrics = Metrics::default_metrics();
 
+    // #913: publish the reassembly budget, and say what it is once at startup.
+    //
+    // The budget defends memory correctly and almost invisibly: a refusal or eviction drops the
+    // message and never tells the sender, because erroring would tear the connection down. The
+    // visible consequence surfaces elsewhere as checkpoint tree-sync churn, with nothing
+    // connecting it back. The only other signal is a warn rate-limited to one line per 10s, which
+    // makes a sustained eviction storm and a single eviction look nearly identical in the journal.
+    //
+    // The startup line matters on its own: GHOST_REASSEMBLY_BUDGET_BYTES appears in no config,
+    // unit or deploy script, so without this there is no way to tell from a running node what
+    // budget it is actually enforcing — the override could be set, ignored, or absent.
+    {
+        let (limit, per_conn) = ghost_consensus::noise_fragment::global_budget().limits();
+        info!(
+            limit_bytes = limit,
+            per_conn_bytes = per_conn,
+            limit_mib = limit / (1024 * 1024),
+            per_conn_mib = per_conn / (1024 * 1024),
+            "Noise fragment reassembly budget"
+        );
+
+        // Sampled rather than pushed from the hot path: the budget's counters are the source of
+        // truth and this mirrors them, so a missed tick cannot make the totals drift the way
+        // accumulating deltas would. 10s matches the eviction-log interval and sits under a
+        // typical scrape.
+        let budget_metrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let budget = ghost_consensus::noise_fragment::global_budget();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let (held, evictions, rejections) = budget.stats();
+                budget_metrics.reassembly_held_bytes.set(held as i64);
+                budget_metrics.reassembly_evictions.set(evictions as i64);
+                budget_metrics.reassembly_rejections.set(rejections as i64);
+            }
+        });
+    }
+
     // Initialize round manager with mining mode
     let is_mainnet_round = config.bitcoin.network == ghost_common::config::BitcoinNetwork::Mainnet;
     let round_config = RoundConfig {

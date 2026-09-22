@@ -547,9 +547,6 @@ impl ReassemblyBudget {
     /// Age an entry's buffer, so the stale-first eviction path is testable without waiting
     /// out [`REASSEMBLY_TIMEOUT`]. A test that cannot reach the stale branch would assert the
     /// LRU fallback and call it stale-first.
-    /// Age an entry's buffer, so the stale-first eviction path is testable without waiting
-    /// out [`REASSEMBLY_TIMEOUT`]. A test that cannot reach the stale branch would assert the
-    /// LRU fallback and call it stale-first.
     #[cfg(test)]
     fn backdate(&self, id: u64, by: Duration) {
         let mut g = self.inner.lock();
