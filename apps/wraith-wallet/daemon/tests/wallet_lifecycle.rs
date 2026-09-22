@@ -347,6 +347,7 @@ async fn wallet_lifecycle_round_trip() {
         Request::WalletRestore {
             name: "gamma".into(),
             from_path: backup_path.display().to_string(),
+            birth_height: None,
         },
     )
     .await
@@ -594,6 +595,166 @@ async fn an_imported_birth_height_reaches_the_wallet_metadata() {
         parsed.get("birth_height").and_then(|v| v.as_u64()),
         Some(101),
         "wallet-meta.json does not carry the birth height the import was given: {raw}"
+    );
+
+    child.kill().await.ok();
+}
+
+/// #924: `wallet restore` must be able to carry a birth height too.
+///
+/// A keystore backup is a byte-for-byte copy of the encrypted keystore, so it cannot hold one.
+/// Before this, `restore` had no way to accept one either — so the path the wallet tells people
+/// to back up with always started its history at the tip, silently, while returning the correct
+/// balance from `scantxoutset`.
+#[tokio::test]
+async fn a_restored_birth_height_reaches_the_wallet_metadata() {
+    let (mut child, socket, tmp) = spawn_daemon().await;
+    let wallets = tmp.path().join("wallets");
+    let pass = "integration-test-passphrase-ccc".to_string();
+    let backup = tmp.path().join("backup.keystore");
+
+    match rpc(
+        &socket,
+        1,
+        Request::WalletCreate {
+            name: "origin".into(),
+            passphrase: pass.clone(),
+            user_entropy_digest: None,
+        },
+    )
+    .await
+    {
+        Response::WalletCreate(_) => {}
+        other => panic!("expected WalletCreate, got {other:?}"),
+    }
+
+    match rpc(
+        &socket,
+        2,
+        Request::WalletExport {
+            name: "origin".into(),
+            to_path: backup.display().to_string(),
+        },
+    )
+    .await
+    {
+        Response::WalletExported { name, .. } => assert_eq!(name, "origin"),
+        other => panic!("expected WalletExported, got {other:?}"),
+    }
+
+    match rpc(
+        &socket,
+        3,
+        Request::WalletRestore {
+            name: "from-backup".into(),
+            from_path: backup.display().to_string(),
+            birth_height: Some(101),
+        },
+    )
+    .await
+    {
+        Response::WalletRestored { name, .. } => assert_eq!(name, "from-backup"),
+        other => panic!("expected WalletRestored, got {other:?}"),
+    }
+
+    let meta_path = wallets.join("from-backup").join("wallet-meta.json");
+    let raw = std::fs::read_to_string(&meta_path).unwrap_or_else(|e| {
+        panic!(
+            "no wallet metadata written at {}: {e} — a restore given a birth height \
+             still starts its history at the tip",
+            meta_path.display()
+        )
+    });
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("wallet-meta.json is not JSON: {e}"));
+    assert_eq!(
+        parsed.get("birth_height").and_then(|v| v.as_u64()),
+        Some(101),
+        "wallet-meta.json does not carry the birth height the restore was given: {raw}"
+    );
+
+    child.kill().await.ok();
+}
+
+/// A restore given NO birth height must still leave a file saying so.
+///
+/// `null` and `missing` both read back as "no birth height", but they mean different things:
+/// one is "the owner did not say", the other is "nothing wrote it". Only the second is a bug,
+/// and the scanner's log could not tell them apart until #914 — which is what cost #865 its
+/// root cause.
+#[tokio::test]
+async fn a_restore_without_a_birth_height_still_records_that_fact() {
+    let (mut child, socket, tmp) = spawn_daemon().await;
+    let wallets = tmp.path().join("wallets");
+    let pass = "integration-test-passphrase-ddd".to_string();
+    let backup = tmp.path().join("backup2.keystore");
+
+    match rpc(
+        &socket,
+        1,
+        Request::WalletCreate {
+            name: "origin2".into(),
+            passphrase: pass.clone(),
+            user_entropy_digest: None,
+        },
+    )
+    .await
+    {
+        Response::WalletCreate(_) => {}
+        other => panic!("expected WalletCreate, got {other:?}"),
+    }
+    match rpc(
+        &socket,
+        2,
+        Request::WalletExport {
+            name: "origin2".into(),
+            to_path: backup.display().to_string(),
+        },
+    )
+    .await
+    {
+        Response::WalletExported { .. } => {}
+        other => panic!("expected WalletExported, got {other:?}"),
+    }
+    match rpc(
+        &socket,
+        3,
+        Request::WalletRestore {
+            name: "no-height".into(),
+            from_path: backup.display().to_string(),
+            birth_height: None,
+        },
+    )
+    .await
+    {
+        Response::WalletRestored { .. } => {}
+        other => panic!("expected WalletRestored, got {other:?}"),
+    }
+
+    let meta_path = wallets.join("no-height").join("wallet-meta.json");
+    let raw = std::fs::read_to_string(&meta_path).unwrap_or_else(|e| {
+        panic!(
+            "no wallet metadata at {}: {e} — an absent birth height must be RECORDED \
+             as absent, not left unwritten",
+            meta_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    // The FILE existing is the whole point: `load_with_source` then reports `Loaded` with no
+    // height, which the scanner can tell apart from `Missing`. The key itself is omitted rather
+    // than written as null, because WalletMeta carries `skip_serializing_if = "Option::is_none"`
+    // — so `{}` is the correct on-disk form, and asserting an explicit null would be asserting
+    // the serialiser's shape rather than the behaviour.
+    assert!(
+        parsed.is_object(),
+        "wallet-meta.json must be a JSON object, got: {raw}"
+    );
+    assert!(
+        parsed
+            .get("birth_height")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        "a restore given no birth height must not invent one, got: {raw}"
     );
 
     child.kill().await.ok();

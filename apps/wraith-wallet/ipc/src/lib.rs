@@ -532,6 +532,17 @@ pub enum Request {
     WalletRestore {
         name: String,
         from_path: String,
+        /// The chain height this seed was first used at, if known.
+        ///
+        /// A keystore backup is an opaque encrypted file and carries no birth height, so a
+        /// restore that is not told one starts scanning at the tip and the wallet's past is
+        /// absent from its history for good — the coins are still all found, because balance and
+        /// the UTXO list scan the whole UTXO set, which is exactly what hides it (#924).
+        ///
+        /// Same rule as `WalletImport`: guessing low is safe and slow, guessing high silently
+        /// loses history, so when in doubt name a height before the seed existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birth_height: Option<u32>,
     },
     /// Derive a BIP86 taproot receive address at index `index` from the active wallet.
     LightReceive {
@@ -845,6 +856,14 @@ pub enum Response {
         name: String,
         path: String,
         bytes: u64,
+        /// The exported wallet's birth height, so the owner can keep it WITH the backup.
+        ///
+        /// The backup file itself cannot carry it — it is a byte-for-byte copy of the encrypted
+        /// keystore — so this is the only moment the number is known to someone who can write it
+        /// down. Without it `wallet restore --birth-height` exists but nobody knows what to pass
+        /// (#924).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birth_height: Option<u32>,
     },
     WalletRestored {
         name: String,

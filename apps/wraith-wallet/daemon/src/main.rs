@@ -5614,10 +5614,20 @@ mod server {
                                             std::fs::Permissions::from_mode(0o600),
                                         );
                                     }
+                                    // #924: the only moment this number is visible to
+                                    // someone who can keep it with the backup. The backup
+                                    // itself is a byte-for-byte copy of the encrypted
+                                    // keystore and cannot carry it.
+                                    let meta_path =
+                                        wallet_data_dir(state, &name).join("wallet-meta.json");
+                                    let birth_height =
+                                        wraith_wallet_core::wallet_meta::load(&meta_path)
+                                            .birth_height;
                                     Response::WalletExported {
                                         name,
                                         path: dst.display().to_string(),
                                         bytes,
+                                        birth_height,
                                     }
                                 }
                                 Err(e) => Response::Error(ErrorResponse {
@@ -5628,7 +5638,11 @@ mod server {
                     }
                 }
             }
-            Request::WalletRestore { name, from_path } => {
+            Request::WalletRestore {
+                name,
+                from_path,
+                birth_height,
+            } => {
                 if let Err(e) = validate_wallet_name(&name) {
                     Response::Error(ErrorResponse { message: e })
                 } else {
@@ -5667,6 +5681,13 @@ mod server {
                                             std::fs::Permissions::from_mode(0o600),
                                         );
                                     }
+                                    // #924: a keystore backup carries no birth height, so
+                                    // without this a restored wallet starts scanning at the tip
+                                    // and its whole past is missing from its history — silently,
+                                    // because the balance comes from scantxoutset and stays
+                                    // correct. Recorded here, before anything can activate the
+                                    // wallet, for the reason publish_new_wallet documents.
+                                    let _ = record_birth_height(state, &name, birth_height).await;
                                     Response::WalletRestored {
                                         name,
                                         path: dst.display().to_string(),
