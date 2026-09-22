@@ -70,6 +70,12 @@ jobs:
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # install-node.sh hardens the secret-bearing configs at install time and nothing ever
+      # asked again, so four of eight nodes sat at 644 ghost:ghost on a file carrying
+      # authority_secret_key (#916). The reconciler that closes that is only worth having if it
+      # NOTICES, so it is driven against deliberately-permissive fixtures here. Temp dir, no node.
+      - name: Secret-config hardening self-test
+        run: ./scripts/test-harden-secret-configs.sh
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.
