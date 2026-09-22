@@ -2016,6 +2016,50 @@ impl VerificationTask {
         Ok(())
     }
 
+    /// The name of the probe a given gate state selects, for the ledger record.
+    ///
+    /// Exists so `challenge_data` and `response_data` cannot disagree about which probe ran.
+    /// They did: `response_data` hardcoded the bare-connect label while `challenge_data` was
+    /// derived from `use_handshake`, so every row contradicted itself (#918). One function,
+    /// used by both, makes that divergence unrepresentable rather than merely fixed once.
+    fn stratum_probe_label(use_handshake: bool) -> &'static str {
+        if use_handshake {
+            "independent_stratum_handshake"
+        } else {
+            "independent_tcp_connect"
+        }
+    }
+
+    /// The `(challenge_data, response_data)` pair for one stratum verdict.
+    ///
+    /// Built together, from the same `use_handshake` and `port` the probe was selected with, so
+    /// the two cannot describe different probes. They did: `response_data` carried a hardcoded
+    /// bare-connect label and `SV1_STRATUM_PORT` while `challenge_data` reported the real choice
+    /// (#918). Returning both from one place makes that divergence unrepresentable rather than
+    /// merely corrected once.
+    fn stratum_ledger_records(
+        use_handshake: bool,
+        port: u16,
+        connected: bool,
+        latency_ms: Option<u32>,
+    ) -> (String, String) {
+        let probe = Self::stratum_probe_label(use_handshake);
+        let challenge_data = serde_json::json!({
+            "protocol": "sv1",
+            "probe": probe,
+            "port": port,
+        })
+        .to_string();
+        let response_data = serde_json::json!({
+            "reachable": connected,
+            "port": port,
+            "probe": probe,
+            "latency_ms": latency_ms,
+        })
+        .to_string();
+        (challenge_data, response_data)
+    }
+
     /// Verify stratum capability via an INDEPENDENT probe.
     ///
     /// CONSENSUS SECURITY: the challenger itself opens a TCP connection to the
@@ -2066,13 +2110,6 @@ impl VerificationTask {
             SV1_STRATUM_PORT
         };
 
-        let challenge_data = serde_json::json!({
-            "protocol": "sv1",
-            "probe": if use_handshake { "independent_stratum_handshake" } else { "independent_tcp_connect" },
-            "port": port,
-        })
-        .to_string();
-
         // Independent probe by THIS challenger — never the target's own account of itself.
         let start = std::time::Instant::now();
         let probe = if use_handshake {
@@ -2101,15 +2138,20 @@ impl VerificationTask {
             }
         };
 
-        let response_data = Some(
-            serde_json::json!({
-                "reachable": connected,
-                "port": SV1_STRATUM_PORT,
-                "probe": "independent_tcp_connect",
-                "latency_ms": latency_ms,
-            })
-            .to_string(),
-        );
+        // #918: both records describe the probe that ACTUALLY ran, built together from the same
+        // two values the probe itself was selected with.
+        //
+        // They had drifted: `response_data` hardcoded "independent_tcp_connect" and
+        // SV1_STRATUM_PORT while `challenge_data` was derived from `use_handshake`, so every one
+        // of the 278,493 stratum rows on the fleet contradicted itself — claiming a bare connect
+        // for a handshake that had been in force since height 962,000.
+        //
+        // That is worse than omitting the field. `response_data` is what an auditor reads as the
+        // outcome, so a wrong label actively misleads the audit the ledger exists to support
+        // (#920), and it is what caused #918 to be filed against the wrong defect.
+        let (challenge_data, response_data) =
+            Self::stratum_ledger_records(use_handshake, port, connected, latency_ms);
+        let response_data = Some(response_data);
 
         info!(peer = %short_id, passed = passed, connected = connected, "Stratum verification complete (independent probe)");
 
@@ -2718,6 +2760,79 @@ mod tests {
             VerificationTaskConfig::default().archive_tx_gate_height,
             u64::MAX,
             "#605: an unwired archive gate must never activate on its own"
+        );
+    }
+
+    /// #918: the two ledger records must never describe different probes.
+    ///
+    /// They did. `response_data` hardcoded "independent_tcp_connect" and `SV1_STRATUM_PORT`
+    /// while `challenge_data` reported the real choice, so all 278,493 stratum rows on the fleet
+    /// claimed a bare connect for a handshake in force since height 962,000.
+    ///
+    /// Driven with the gate BOTH armed and dormant. Only the armed case can catch the original
+    /// bug — with the gate dormant the hardcoded label is accidentally correct, which is exactly
+    /// how it survived. A test that checked only the default would have passed throughout.
+    #[test]
+    fn stratum_ledger_records_agree_on_probe_and_port() {
+        for (use_handshake, want_probe) in [
+            (true, "independent_stratum_handshake"),
+            (false, "independent_tcp_connect"),
+        ] {
+            let port: u16 = if use_handshake { 34255 } else { 3333 };
+            let (challenge, response) =
+                VerificationTask::stratum_ledger_records(use_handshake, port, true, Some(42));
+
+            let c: serde_json::Value = serde_json::from_str(&challenge).unwrap();
+            let r: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+            assert_eq!(
+                c["probe"], want_probe,
+                "challenge_data must name the probe that ran (use_handshake={use_handshake})"
+            );
+            assert_eq!(
+                r["probe"], want_probe,
+                "#918: response_data must name the probe that ran, not a hardcoded label \
+                 (use_handshake={use_handshake})"
+            );
+            assert_eq!(
+                c["probe"], r["probe"],
+                "#918: the two records disagree about which probe ran"
+            );
+            assert_eq!(
+                c["port"], port,
+                "challenge_data must record the port actually probed"
+            );
+            assert_eq!(
+                r["port"], port,
+                "#918: response_data must record the port actually probed, not SV1_STRATUM_PORT"
+            );
+            assert_eq!(
+                c["port"], r["port"],
+                "#918: the two records disagree about which port was probed"
+            );
+        }
+    }
+
+    /// The non-shared fields still have to carry the probe's actual outcome.
+    ///
+    /// Separate from the agreement test above: two records can agree perfectly about the probe
+    /// and still report the wrong result, which would be a passing test over a useless row.
+    #[test]
+    fn stratum_response_record_carries_the_outcome() {
+        let (_, unreachable) = VerificationTask::stratum_ledger_records(true, 3333, false, Some(7));
+        let r: serde_json::Value = serde_json::from_str(&unreachable).unwrap();
+        assert_eq!(
+            r["reachable"], false,
+            "a failed probe must record reachable=false"
+        );
+        assert_eq!(r["latency_ms"], 7);
+
+        let (_, no_latency) = VerificationTask::stratum_ledger_records(false, 3333, true, None);
+        let r2: serde_json::Value = serde_json::from_str(&no_latency).unwrap();
+        assert_eq!(r2["reachable"], true);
+        assert!(
+            r2["latency_ms"].is_null(),
+            "an unmeasured latency must stay null rather than become 0"
         );
     }
 
