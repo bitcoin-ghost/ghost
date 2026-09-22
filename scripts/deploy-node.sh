@@ -555,9 +555,9 @@ if [ "$BINARY" = "ghost-pool" ]; then
     echo "  ###############################################################################" >&2
   else
     POOL_SV2_CONF="/etc/ghost/pool-config.toml"
-    # The file is root-owned 0600 on vm5-8 and ghost-owned on vm1-4, so it needs the same
-    # sudo-if-present dance the deploy uses. Read into a variable and parsed HERE; the value
-    # never reaches a log line, a message, or the terminal.
+    # The file is root-owned 0600 on every node (#916 — it was ghost-owned 0644 on vm1-4 until
+    # 2026-09-22), so it needs the same sudo-if-present dance the deploy uses. Read into a
+    # variable and parsed HERE; the value never reaches a log line, a message, or the terminal.
     WEBHOOK_CONF=$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" \
         "S=\$(command -v sudo >/dev/null && echo sudo || echo); \$S cat $POOL_SV2_CONF 2>/dev/null" \
         2>/dev/null) || WEBHOOK_CONF=""
@@ -983,6 +983,52 @@ if [ -r "$WATCHDOG_SRC" ]; then
         fi
     else
         info "ops: watchdog current"
+    fi
+fi
+
+# --------------------------------------------------- secret-config hardening (#916)
+#
+# Same disease as the watchdog above, on the files that carry the secrets. `install-node.sh`
+# chowns and chmods them correctly — once, at install time. Nothing re-applies it, so a node
+# provisioned before a hardening step landed never receives it and later drift is permanent.
+#
+# Measured 2026-09-22: four of the eight nodes held /etc/ghost/pool-config.toml at 644
+# ghost:ghost rather than 600 root:root. That file carries authority_secret_key and its only
+# consumer is sri-pool.service, which runs as root — so the permissive mode bought nothing and
+# handed the unprivileged service account read access to key material. The timestamped .bak
+# copies inherit their source's mode, so the permissive source had quietly produced a set of
+# permissive copies, several holding CURRENT key material.
+#
+# Converge rather than refuse, for the same reason as the watchdog: a mode the deploy can fix
+# itself is no reason to abandon a binary roll. Piped over ssh rather than installed, so there
+# is no second copy to keep in step (check-inlined-copies.sh).
+#
+# ⚠ Deliberately BEFORE the swap, and it reconciles ownership too — chowning the whole set to
+# root would break ghost-pool, so the script carries a per-file owner table rather than one rule.
+HARDEN_SRC="$REPO_ROOT/scripts/ops/harden-secret-configs.sh"
+if [ -r "$HARDEN_SRC" ]; then
+    harden_out="$(timeout 60 ssh "${SSH_OPTS[@]}" "$NODE" 'bash -s' < "$HARDEN_SRC" 2>&1)"; harden_rc=$?
+    if [ "$harden_rc" -eq 2 ]; then
+        # No target file matched. That is not a pass — it means the run examined nothing.
+        echo "  WARN: secret-config hardening examined NOTHING on $NODE (no config matched)" >&2
+    elif [ "$harden_rc" -ne 0 ]; then
+        echo "  WARN: could not reconcile secret-config permissions on $NODE — deploy continues" >&2
+        printf '%s\n' "$harden_out" | sed 's/^/        /' >&2
+    else
+        # Verify the OUTCOME, never the command's own report: ask again and require a clean
+        # verdict. An apply that printed success while leaving a file permissive fails here.
+        verify_out="$(timeout 60 ssh "${SSH_OPTS[@]}" "$NODE" 'bash -s -- --check' < "$HARDEN_SRC" 2>&1)"
+        verify_rc=$?
+        if [ "$verify_rc" -eq 0 ]; then
+            case "$harden_out" in
+                *corrected=0*) info "ops: secret-config permissions current" ;;
+                *) info "ops: secret-config permissions converged"
+                   printf '%s\n' "$harden_out" | sed 's/^/        /' ;;
+            esac
+        else
+            echo "  WARN: secret-config hardening ran but $NODE is still not clean" >&2
+            printf '%s\n' "$verify_out" | sed 's/^/        /' >&2
+        fi
     fi
 fi
 
