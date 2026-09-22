@@ -249,7 +249,19 @@ mod server {
     /// not stop a wallet being made. A missing birth height costs history
     /// depth on a later rescan, which is recoverable by setting one; refusing
     /// to create the wallet is not.
-    async fn record_birth_height(state: &Arc<DaemonState>, wallet: &str, height: Option<u32>) {
+    /// Proof that a wallet's birth height has been written to disk.
+    ///
+    /// Exists so a wallet cannot be published as active without one. `publish_new_wallet` takes
+    /// this by value and the only way to obtain it is `record_birth_height`, so the ordering is
+    /// enforced by the compiler rather than by a comment someone has to remember — reversing the
+    /// two, which is the #865 failure, stops compiling instead of silently losing history.
+    struct BirthHeightRecorded;
+
+    async fn record_birth_height(
+        state: &Arc<DaemonState>,
+        wallet: &str,
+        height: Option<u32>,
+    ) -> BirthHeightRecorded {
         let path = wallet_data_dir(state, wallet).join("wallet-meta.json");
         let meta = wraith_wallet_core::wallet_meta::WalletMeta {
             birth_height: height,
@@ -257,6 +269,39 @@ mod server {
         if let Err(e) = wraith_wallet_core::wallet_meta::save(&path, &meta) {
             tracing::warn!(wallet, error = %e, "could not record the wallet's birth height");
         }
+        BirthHeightRecorded
+    }
+
+    /// Publish a newly created or imported wallet: record its birth height, THEN make it active.
+    ///
+    /// The order is the whole point, and getting it wrong loses history permanently.
+    ///
+    /// The block scanner reads the ACTIVE wallet's `wallet-meta.json` on its first tick for that
+    /// wallet, and that read happens exactly once: it immediately writes a scan bookmark, and the
+    /// birth height is only ever consulted on the `bookmark.point() == None` branch. So a tick
+    /// landing between "this wallet is active" and "its birth height is on disk" makes the wallet
+    /// start scanning from the tip — for good — with no error, no warning, and a correct balance
+    /// to hide it. Rewriting the metadata afterwards cannot undo it.
+    ///
+    /// That window was not hypothetical. `wallet create` set the active wallet and only then did
+    /// an RPC round trip for the tip, so the gap was as long as the node took to answer; `wallet
+    /// import` had the same shape with a shorter one (#865).
+    ///
+    /// Recording first closes it: by the time anything can observe this wallet as active, its
+    /// birth height is already readable. A wallet with no birth height to record is unaffected —
+    /// `record_birth_height` writes `null`, which is a different and honest answer from "missing".
+    async fn publish_new_wallet(
+        state: &Arc<DaemonState>,
+        name: &str,
+        keystore: Keystore,
+        _recorded: BirthHeightRecorded,
+    ) {
+        state
+            .wallets
+            .write()
+            .await
+            .insert(name.to_string(), keystore);
+        *state.active.write().await = Some(name.to_string());
     }
 
     /// The current chain tip, if a node is reachable.
@@ -5138,14 +5183,18 @@ mod server {
                         match Keystore::create_with_mixed_digest(mixed.as_ref()) {
                             Ok((ks, mnemonic)) => match ks.save(&path, &pass) {
                                 Ok(()) => {
-                                    state.wallets.write().await.insert(name.clone(), ks);
-                                    *state.active.write().await = Some(name.clone());
                                     // A wallet cannot have been paid before it
                                     // existed, so the tip is its birth height
                                     // and the scanner need never look further
                                     // back than this.
+                                    //
+                                    // Read BEFORE publishing: this is an RPC
+                                    // round trip, and it used to sit inside the
+                                    // window where the wallet was already
+                                    // active with no birth height on disk (#865).
                                     let tip = current_tip(state).await;
-                                    record_birth_height(state, &name, tip).await;
+                                    let recorded = record_birth_height(state, &name, tip).await;
+                                    publish_new_wallet(state, &name, ks, recorded).await;
                                     Response::WalletCreate(WalletCreateResponse {
                                         name,
                                         mnemonic,
@@ -5200,13 +5249,13 @@ mod server {
                         match Keystore::from_mnemonic(&mnemonic) {
                             Ok(ks) => match ks.save(&path, &pass) {
                                 Ok(()) => {
-                                    state.wallets.write().await.insert(name.clone(), ks);
-                                    *state.active.write().await = Some(name.clone());
                                     // Whatever the owner said, and nothing if
                                     // they said nothing. Defaulting to the tip
                                     // here would look like a birth height and
                                     // silently mean "no history before now".
-                                    record_birth_height(state, &name, birth_height).await;
+                                    let recorded =
+                                        record_birth_height(state, &name, birth_height).await;
+                                    publish_new_wallet(state, &name, ks, recorded).await;
                                     Response::WalletImported {
                                         name,
                                         path: path.display().to_string(),
@@ -7278,7 +7327,7 @@ mod server {
                 "a wallet with no recorded height must not invent one"
             );
 
-            record_birth_height(&state, "harness", Some(880_000)).await;
+            let _ = record_birth_height(&state, "harness", Some(880_000)).await;
             assert_eq!(
                 wallet_meta_for_with_source(&state)
                     .await
@@ -7287,6 +7336,77 @@ mod server {
                     .birth_height,
                 Some(880_000)
             );
+        }
+
+        /// #865: a wallet must never be observable as ACTIVE before its birth height is on disk.
+        ///
+        /// The block scanner reads the active wallet's metadata on its first tick for that wallet
+        /// and then writes a bookmark; the birth height is never consulted again. So a tick that
+        /// lands while the wallet is active but its metadata is not yet written makes it scan from
+        /// the tip permanently — silently, and with a correct balance to hide it.
+        ///
+        /// This asserts the postcondition that matters to the scanner: the moment the wallet is
+        /// active, `wallet_meta_for_with_source` reports `Loaded`, not `Missing`. The ordering
+        /// itself is enforced structurally — both call sites go through `publish_new_wallet`,
+        /// which records before it publishes — because a test that tried to catch the interleaving
+        /// directly would be a flaky race rather than a guard.
+        #[tokio::test]
+        async fn a_published_wallet_has_its_birth_height_before_it_is_active() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+
+            assert!(
+                state.active.read().await.is_none(),
+                "the harness must start with no active wallet, or this proves nothing"
+            );
+
+            let recorded = record_birth_height(&state, "fresh", Some(101)).await;
+            publish_new_wallet(&state, "fresh", ks, recorded).await;
+
+            assert_eq!(
+                state.active.read().await.as_deref(),
+                Some("fresh"),
+                "the wallet must end up active"
+            );
+            let (meta, source, _) = wallet_meta_for_with_source(&state).await.unwrap();
+            assert_eq!(
+                source,
+                wraith_wallet_core::wallet_meta::MetaSource::Loaded,
+                "the scanner must find metadata, not a missing file, for an active new wallet"
+            );
+            assert_eq!(meta.birth_height, Some(101));
+        }
+
+        /// A wallet with nothing to record must still leave a file saying so.
+        ///
+        /// `null` and `missing` both yield `birth_height: None`, but they mean different things:
+        /// one is "the owner did not say", the other is "we have not written it yet". Only the
+        /// second is a bug, and collapsing them is what cost #865 its root cause.
+        #[tokio::test]
+        async fn publishing_without_a_birth_height_still_writes_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let ks = Keystore::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon about",
+            )
+            .expect("keystore from mnemonic");
+
+            let recorded = record_birth_height(&state, "no-birth", None).await;
+            publish_new_wallet(&state, "no-birth", ks, recorded).await;
+
+            let (meta, source, _) = wallet_meta_for_with_source(&state).await.unwrap();
+            assert_eq!(
+                source,
+                wraith_wallet_core::wallet_meta::MetaSource::Loaded,
+                "an absent birth height must still be RECORDED as absent, not left unwritten"
+            );
+            assert_eq!(meta.birth_height, None);
         }
 
         /// A locked wallet cannot tell its own outputs from a stranger's, so
