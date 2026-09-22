@@ -273,6 +273,28 @@ pub struct Metrics {
     pub clock_skew_secs: Gauge,
 
     // =========================================================================
+    // Fragment Reassembly Metrics (#913)
+    // =========================================================================
+    // Mirrors of `ghost_consensus::noise_fragment::ReassemblyBudget`, published by a sampler in
+    // ghost-pool because this crate cannot depend on ghost-consensus.
+    //
+    // The budget's failure mode is quiet BY DESIGN: a refusal or eviction drops the message and
+    // never tells the sender, because erroring would tear the connection down. The visible
+    // consequence surfaces somewhere else entirely, as checkpoint tree-sync churn, with nothing
+    // connecting it back. These three numbers are what make that connectable.
+    //
+    // `evictions`/`rejections` are held in a Gauge rather than a Counter because the source of
+    // truth is the budget's own atomic total: this mirrors an absolute value rather than
+    // accumulating deltas, which would drift if a sample were ever missed. They are still
+    // RENDERED as Prometheus counters, which is what they are.
+    /// Bytes currently held in partial reassemblies
+    pub reassembly_held_bytes: Gauge,
+    /// Partial reassemblies evicted to stay within budget (monotonic total)
+    pub reassembly_evictions: Gauge,
+    /// Fragments refused because the budget was exhausted (monotonic total)
+    pub reassembly_rejections: Gauge,
+
+    // =========================================================================
     // Performance Metrics
     // =========================================================================
     /// Share processing latency (milliseconds)
@@ -339,6 +361,11 @@ impl Metrics {
             circuit_breaker_trips_total: Counter::new(),
             circuit_breaker_open: Gauge::new(),
             clock_skew_secs: Gauge::new(),
+
+            // Fragment reassembly (#913)
+            reassembly_held_bytes: Gauge::new(),
+            reassembly_evictions: Gauge::new(),
+            reassembly_rejections: Gauge::new(),
 
             // Performance
             share_latency_ms: Histogram::latency_buckets(),
@@ -539,6 +566,24 @@ impl Metrics {
             self.clock_skew_secs.get()
         );
 
+        // Fragment reassembly (#913). `held` is a live gauge; the other two are monotonic
+        // totals mirrored from the budget, so they render as counters.
+        write_gauge!(
+            "reassembly_held_bytes",
+            "Bytes currently held in partial fragment reassemblies",
+            self.reassembly_held_bytes.get()
+        );
+        write_counter!(
+            "reassembly_evictions",
+            "Partial reassemblies evicted to stay within the reassembly budget",
+            self.reassembly_evictions.get()
+        );
+        write_counter!(
+            "reassembly_rejections",
+            "Fragments refused because the reassembly budget was exhausted",
+            self.reassembly_rejections.get()
+        );
+
         // Latency histograms
         self.write_histogram(
             &mut output,
@@ -661,6 +706,64 @@ mod tests {
         histogram.observe(150.0);
 
         assert_eq!(histogram.get_count(), 4);
+    }
+
+    /// #913: the reassembly budget must be readable off /metrics.
+    ///
+    /// The acceptance for that issue is that an operator seeing checkpoint tree-sync churn can
+    /// answer "is the reassembly budget involved?" without knowing the module exists. That needs
+    /// three things present with the right Prometheus TYPE, not merely a field on the struct —
+    /// `stats()` and `limits()` already existed and had no callers at all, which is the bug.
+    #[test]
+    fn reassembly_budget_is_exported() {
+        let metrics = Metrics::default_metrics();
+
+        metrics.reassembly_held_bytes.set(4096);
+        metrics.reassembly_evictions.set(7);
+        metrics.reassembly_rejections.set(3);
+
+        let out = metrics.render();
+
+        assert!(
+            out.contains("ghost_pool_reassembly_held_bytes 4096"),
+            "held bytes must be exported"
+        );
+        assert!(
+            out.contains("ghost_pool_reassembly_evictions 7"),
+            "evictions must be exported"
+        );
+        assert!(
+            out.contains("ghost_pool_reassembly_rejections 3"),
+            "rejections must be exported"
+        );
+
+        // Type matters to the scraper: a counter rendered as a gauge loses rate() and breaks the
+        // "sustained non-zero evictions" alert this exists to make possible.
+        assert!(
+            out.contains("# TYPE ghost_pool_reassembly_held_bytes gauge"),
+            "held is a live occupancy, so it must be a gauge"
+        );
+        assert!(
+            out.contains("# TYPE ghost_pool_reassembly_evictions counter"),
+            "evictions is a monotonic total, so it must be a counter"
+        );
+        assert!(
+            out.contains("# TYPE ghost_pool_reassembly_rejections counter"),
+            "rejections is a monotonic total, so it must be a counter"
+        );
+    }
+
+    /// A zero must still be PUBLISHED, not omitted.
+    ///
+    /// "No evictions" and "nobody is looking" have to be distinguishable on a dashboard; a metric
+    /// that only appears once it is non-zero makes a quiet node and a broken exporter identical —
+    /// the same failure this issue exists to remove from the journal.
+    #[test]
+    fn reassembly_budget_exports_zero_rather_than_omitting_it() {
+        let out = Metrics::default_metrics().render();
+        assert!(out.contains("ghost_pool_reassembly_evictions 0"));
+        assert!(out.contains("ghost_pool_reassembly_rejections 0"));
+        assert!(out.contains("ghost_pool_reassembly_held_bytes 0"));
     }
 
     #[test]
