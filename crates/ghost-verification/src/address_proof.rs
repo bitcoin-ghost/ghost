@@ -17,12 +17,22 @@
 //!   3. the reply must be a `SignedResponse` whose `signer` is the claimed node id,
 //!      whose `challenge_nonce` is the nonce from step 1, and whose signature verifies
 //!
-//! Only then may that address's `/24` count toward diversity.
+//! Only then may that address's `/24` count toward diversity — which is enforced from
+//! `ADDRESS_PROOF_ENFORCEMENT_HEIGHT` onward, by dropping a caught liar's subnet from the
+//! distinct-`/24` count in `qualification.rs` (#605). Dormant until that gate is armed.
+//!
+//! ⚖ The DRAW pool is deliberately not filtered: a node caught lying can still be selected to
+//! challenge, it just stops contributing a subnet. Excluding it from the draw as well is a
+//! stricter rule and a separate decision — see the warning further down this file about a probe
+//! that cannot succeed collapsing the pool to zero.
 //!
 //! The verification is a pure function of the response body so it can be tested without a
-//! network. The transport that performs step 2 is deliberately NOT here yet: probing is
-//! blocked on `nodes.public_address` being populated at all — it currently holds one row in
-//! eight on every production node, so there is nothing to probe. See #629.
+//! network. ⚠ This used to say the transport for step 2 was "deliberately NOT here yet",
+//! blocked on `nodes.public_address` being empty (#629). Both stopped being true: the transport
+//! is `VerificationClient::probe_claimed_address`, the gate fired at
+//! `ADDRESS_PROOF_HEIGHT = 966_000`, and the fleet has recorded 108k signed proofs at a 1.0000
+//! pass rate. A comment claiming a feature does not exist is worse than no comment — it is how
+//! three issues came to be filed against work that was already done.
 
 use ghost_common::identity::verify_signature;
 
