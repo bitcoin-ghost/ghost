@@ -70,6 +70,12 @@ jobs:
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
+      # caught lying about its address stops counting toward the diversity floor, which changes
+      # which nodes qualify and how the node-reward pool splits. There are FIVE construction
+      # sites in ghost-pool; one that missed the gate would diverge from the fleet silently.
+      - name: Address-enforcement wiring
+        run: ./scripts/check-address-enforcement-wiring.sh
       # install-node.sh hardens the secret-bearing configs at install time and nothing ever
       # asked again, so four of eight nodes sat at 644 ghost:ghost on a file carrying
       # authority_secret_key (#916). The reconciler that closes that is only worth having if it

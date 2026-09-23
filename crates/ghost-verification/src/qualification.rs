@@ -142,6 +142,13 @@ pub struct QualifiedCapabilityProvider {
     /// drawn to challenge the target that round. `None` → the assignment filter is
     /// skipped and A-2 (voter-set + subnet) behaviour stands.
     block_hash_oracle: Option<Arc<dyn crate::challenger_assignment::BlockHashProvider>>,
+    /// H-7 ENFORCEMENT: the height at/above which a challenger caught lying about its own
+    /// address stops counting toward a target's distinct-`/24` diversity floor (#605).
+    ///
+    /// `u64::MAX` (the default) is DORMANT, and dormant means bit-identical: the unfiltered
+    /// path below is the original aggregate query, untouched, so a build that forgets to wire
+    /// this cannot change what qualifies.
+    address_enforcement_height: u64,
 }
 
 impl QualifiedCapabilityProvider {
@@ -153,7 +160,20 @@ impl QualifiedCapabilityProvider {
             // M-7/H-14 FIX: Initialize with empty cache
             cached_network_size: parking_lot::RwLock::new(None),
             block_hash_oracle: None,
+            address_enforcement_height: u64::MAX,
         }
+    }
+
+    /// Set the height at/above which a FAILED address proof costs a challenger its `/24` in the
+    /// diversity count (#605), from `ghost_pool::address_proof_enforcement_height()`.
+    ///
+    /// Dormant unless called, because arming changes which nodes QUALIFY: if some nodes enforced
+    /// while others did not they would compute different qualified sets and the node-reward
+    /// split would diverge. Same reasoning as every other gate here — forgetting to wire it is
+    /// then safe rather than dangerous.
+    pub fn with_address_enforcement(mut self, height: u64) -> Self {
+        self.address_enforcement_height = height;
+        self
     }
 
     /// Attach the L1 block-hash oracle that lets qualification recompute the
@@ -174,6 +194,7 @@ impl QualifiedCapabilityProvider {
             config,
             cached_network_size: parking_lot::RwLock::new(None),
             block_hash_oracle: None,
+            address_enforcement_height: u64::MAX,
         }
     }
 
@@ -940,10 +961,21 @@ impl QualifiedCapabilityProvider {
             // voter-set behaviour below (never silently count everything).
         }
         if voter_set_scoped {
-            let (chal_pass, chal_total, distinct_subnets) = self
-                .db
-                .ledger_voterset_challenger_stats(node_id_hex, capability, since, until)
-                .unwrap_or((0, 0, 0));
+            let (chal_pass, chal_total, distinct_subnets) =
+                if self.address_enforcement_height == u64::MAX {
+                    // DORMANT: the original aggregate query, untouched. Keeping the unfiltered
+                    // path byte-for-byte is the point of a dormant gate — a recomputation that
+                    // merely *ought* to agree is a way to change the node split by accident.
+                    self.db
+                        .ledger_voterset_challenger_stats(node_id_hex, capability, since, until)
+                        .unwrap_or((0, 0, 0))
+                } else {
+                    // ARMED (#605): same three numbers, computed from the per-verdict rows so a
+                    // challenger caught lying about its address can be dropped from the SUBNET
+                    // count. It keeps its verdict — only its claim to a distinct `/24` is lost,
+                    // because that claim is the thing the probe disproved.
+                    self.voterset_stats_less_liars(node_id_hex, capability, since, until)
+                };
             // Count floor on voter-set challengers; Sybil floor on distinct SUBNETS
             // (not identities); strict majority of the voter-set challengers passed.
             chal_total >= min_challenges
@@ -964,6 +996,66 @@ impl QualifiedCapabilityProvider {
     /// `ledger_voterset_challenger_stats` but filters each raw verdict by the recomputed
     /// draw first. A row with no `round_height` (pre-A-2b) or whose round seed is
     /// unavailable is dropped (fail-safe: never falsely counted).
+    /// H-7 ARMED form of `ledger_voterset_challenger_stats` (#605).
+    ///
+    /// Returns the same `(challengers_pass, challengers_total, distinct_subnets)` triple and
+    /// replicates the aggregate's semantics exactly — per challenger, `c_pass * 2 >= c_total`
+    /// counts as a pass — differing in ONE way: a challenger a majority of its own challengers
+    /// caught lying about its address contributes **no subnet**.
+    ///
+    /// ⚖ It keeps its VERDICT. The address proof disproves where a node lives, not that it is a
+    /// voter-set member, so the narrow consequence is the right one: it loses the claim the
+    /// probe actually refuted, which is its distinct `/24`. Dropping its verdict as well would
+    /// be a second, unrelated punishment.
+    ///
+    /// ⚠ Where a challenger's `public_address` changed inside the window, the aggregate counts
+    /// every distinct value and this counts the first. One challenger contributing one subnet is
+    /// the intended reading of a diversity floor, and this path only runs once the gate is armed.
+    fn voterset_stats_less_liars(
+        &self,
+        node_id_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+    ) -> (u32, u32, u32) {
+        use std::collections::{HashMap, HashSet};
+
+        let rows = self
+            .db
+            .ledger_voterset_challenger_rows(node_id_hex, capability, since, until)
+            .unwrap_or_default();
+        let liars = self
+            .db
+            .address_proof_failed_nodes(since, until, self.address_enforcement_height)
+            .unwrap_or_default();
+
+        // challenger_id -> (pass_count, total_count, subnet)
+        let mut per_ch: HashMap<String, (u32, u32, Option<String>)> = HashMap::new();
+        for r in rows {
+            let entry = per_ch
+                .entry(r.challenger_id.clone())
+                .or_insert((0, 0, r.subnet.clone()));
+            entry.1 += 1;
+            if r.passed {
+                entry.0 += 1;
+            }
+        }
+
+        let challengers_total = per_ch.len() as u32;
+        let challengers_pass = per_ch
+            .values()
+            .filter(|(pass, total, _)| pass * 2 >= *total)
+            .count() as u32;
+        let distinct_subnets = per_ch
+            .iter()
+            .filter(|(id, _)| !liars.contains(*id))
+            .filter_map(|(_, (_, _, subnet))| subnet.clone())
+            .collect::<HashSet<_>>()
+            .len() as u32;
+
+        (challengers_pass, challengers_total, distinct_subnets)
+    }
+
     fn assigned_challenger_stats(
         &self,
         node_id_hex: &str,
@@ -1017,9 +1109,20 @@ impl QualifiedCapabilityProvider {
             .values()
             .filter(|(pass, total, _)| pass * 2 >= *total)
             .count() as u32;
+        // H-7 ENFORCEMENT (#605): a challenger caught lying about its address contributes no
+        // subnet. Dormant unless armed, and it costs a DB read only then — `u64::MAX` short
+        // circuits before the query so the unarmed path is unchanged in cost as well as result.
+        let liars = if self.address_enforcement_height == u64::MAX {
+            HashSet::new()
+        } else {
+            self.db
+                .address_proof_failed_nodes(since, until, self.address_enforcement_height)
+                .unwrap_or_default()
+        };
         let distinct_subnets = per_ch
-            .values()
-            .filter_map(|(_, _, subnet)| subnet.clone())
+            .iter()
+            .filter(|(id, _)| !liars.contains(*id))
+            .filter_map(|(_, (_, _, subnet))| subnet.clone())
             .collect::<HashSet<_>>()
             .len() as u32;
         (challengers_pass, challengers_total, distinct_subnets)
@@ -1666,6 +1769,198 @@ mod tests {
             provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false),
             vec![(decode_node_id(&target).unwrap(), 5)],
             "4 voter-set challengers across ≥3 distinct subnets clears the floor"
+        );
+    }
+
+    /// H-7 ENFORCEMENT (#605): a challenger caught lying about its address stops contributing
+    /// a distinct `/24` — and DORMANT must change nothing at all.
+    ///
+    /// The dormant half is the load-bearing one. Arming this changes which nodes qualify, so a
+    /// build that merely *ought* to behave identically while unwired is a way to move the
+    /// node-reward split by accident. Asserting the armed behaviour alone would pass just as
+    /// happily with the gate stuck on.
+    #[test]
+    fn address_enforcement_drops_a_liars_subnet_and_is_inert_while_dormant() {
+        let target = hex_id(0xE7);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // min_challenges 4, min_unique 3
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        let chs = [hex_id(0x21), hex_id(0x22), hex_id(0x23), hex_id(0x24)];
+        // Exactly 3 distinct /24s across 4 challengers — sitting ON the floor, so losing one
+        // subnet is the difference between qualifying and not.
+        let addrs = [
+            "10.0.0.1:8080",
+            "10.0.0.2:8080",
+            "172.16.5.5:8080",
+            "192.168.9.9:8080",
+        ];
+        for (c, a) in chs.iter().zip(addrs.iter()) {
+            register_voter(&db, c, a);
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &target,
+                capability: "archive",
+                passed: true,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
+        }
+
+        // chs[2] is caught lying about where it lives: 2 of 3 distinct challengers say FAIL.
+        for (c, passed) in [(&chs[0], false), (&chs[1], false), (&chs[3], true)] {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &chs[2],
+                capability: "address",
+                passed,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: Some(1_000),
+            })
+            .unwrap();
+        }
+
+        // DORMANT: the address verdicts exist and cost nothing.
+        let dormant = QualifiedCapabilityProvider::new(Arc::clone(&db));
+        assert_eq!(
+            dormant.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false),
+            vec![(decode_node_id(&target).unwrap(), 5)],
+            "with the gate dormant a failed address proof must change nothing — this is what \
+             makes an unwired build safe rather than silently divergent"
+        );
+
+        // ARMED: the liar's /24 no longer counts, so the target drops below the floor of 3.
+        let armed = QualifiedCapabilityProvider::new(Arc::clone(&db)).with_address_enforcement(1);
+        assert!(
+            armed
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false)
+                .is_empty(),
+            "armed, the caught liar contributes no subnet, leaving 2 of the required 3"
+        );
+    }
+
+    /// The armed recomputation must agree with the aggregate it replaces, given nothing to filter.
+    ///
+    /// The dormant branch exists so an unwired build is bit-identical, and that argument only
+    /// holds if the two paths agree in the first place — otherwise ARMING would silently move the
+    /// node split for reasons unrelated to H-7, which is precisely the accident a dormant gate is
+    /// supposed to prevent. With no address failures recorded, the filtered path degenerates to
+    /// the unfiltered one and the triples must match exactly.
+    ///
+    /// ⚠ Asserting the gate's own behaviour does NOT cover this: a recomputation that disagreed
+    /// about, say, pass-majority rounding would still drop the liar's subnet correctly and look
+    /// right in every other test here.
+    #[test]
+    fn the_armed_recomputation_matches_the_aggregate_it_replaces() {
+        let target = hex_id(0xE9);
+        let cutoff = 2_000_000i64;
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        // A deliberately awkward shape: uneven verdict counts per challenger, a tie
+        // (1 pass / 1 fail, which `c_pass * 2 >= c_total` counts as a PASS), two challengers
+        // sharing a subnet, and one with an unparseable address contributing none.
+        let chs = [hex_id(0x41), hex_id(0x42), hex_id(0x43), hex_id(0x44)];
+        let addrs = [
+            "10.0.0.1:8080",
+            "10.0.0.2:8080",
+            "172.16.5.5:8080",
+            "not-an-ip",
+        ];
+        for (c, a) in chs.iter().zip(addrs.iter()) {
+            register_voter(&db, c, a);
+        }
+        let verdicts: [(&String, &[bool]); 4] = [
+            (&chs[0], &[true, true, false]),
+            (&chs[1], &[true, false]),
+            (&chs[2], &[false, false]),
+            (&chs[3], &[true]),
+        ];
+        for (c, results) in verdicts {
+            for (i, passed) in results.iter().enumerate() {
+                db.insert_verification_proof(VerificationProofInsert {
+                    challenger_id: c,
+                    target_node_id: &target,
+                    capability: "archive",
+                    passed: *passed,
+                    timestamp: cutoff - 100 - i as i64,
+                    proof: b"p",
+                    round_height: None,
+                })
+                .unwrap();
+            }
+        }
+
+        let aggregate = db
+            .ledger_voterset_challenger_stats(&target, "archive", 0, cutoff)
+            .unwrap();
+
+        // Armed, but with no address verdicts on record — nothing to filter.
+        let armed = QualifiedCapabilityProvider::new(Arc::clone(&db)).with_address_enforcement(1);
+        let recomputed = armed.voterset_stats_less_liars(&target, "archive", 0, cutoff);
+
+        assert_eq!(
+            recomputed, aggregate,
+            "the armed recomputation must reproduce the aggregate exactly when there is nothing \
+             to filter, or arming would move the node split for reasons unrelated to #605"
+        );
+    }
+
+    /// Armed enforcement must not strip a subnet on a MINORITY report.
+    ///
+    /// H-7 exists to stop a Sybil farm fabricating diversity. A rule where one hostile
+    /// challenger can strip an honest peer's `/24` would be a cheaper griefing primitive than
+    /// the one being closed, so the majority requirement is asserted here at the level that
+    /// actually decides payouts, not only in the SQL.
+    #[test]
+    fn address_enforcement_ignores_a_lone_accuser() {
+        let target = hex_id(0xE8);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64;
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        let chs = [hex_id(0x31), hex_id(0x32), hex_id(0x33), hex_id(0x34)];
+        let addrs = [
+            "10.0.0.1:8080",
+            "10.0.0.2:8080",
+            "172.16.5.5:8080",
+            "192.168.9.9:8080",
+        ];
+        for (c, a) in chs.iter().zip(addrs.iter()) {
+            register_voter(&db, c, a);
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &target,
+                capability: "archive",
+                passed: true,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
+        }
+
+        // One accuser against two defenders — not a majority.
+        for (c, passed) in [(&chs[0], false), (&chs[1], true), (&chs[3], true)] {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &chs[2],
+                capability: "address",
+                passed,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: Some(1_000),
+            })
+            .unwrap();
+        }
+
+        let armed = QualifiedCapabilityProvider::new(Arc::clone(&db)).with_address_enforcement(1);
+        assert_eq!(
+            armed.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false),
+            vec![(decode_node_id(&target).unwrap(), 5)],
+            "a lone accuser must not cost an honest challenger its subnet"
         );
     }
 
