@@ -211,14 +211,37 @@ impl ChannelManager {
                         self.aggregated_channel_state.set(AggregatedState::NoChannel);
                         break;
                     }
-                    res = self.clone().handle_upstream_frame() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#854).
+                    //
+                    // `async_channel::recv()` is cancellation-safe; everything after it is not,
+                    // because the message is off the queue by then. The handling therefore runs
+                    // in the branch BODY, which completes — a body is not a select branch and
+                    // cannot be cancelled by a sibling becoming ready.
+                    //
+                    // Previously both halves were the branch future. Under downstream share load
+                    // the downstream branch was ready on nearly every poll, so the upstream
+                    // future was dropped after its `recv()` had already taken a frame, and that
+                    // frame was lost silently. Measured: exactly four upstream messages handled
+                    // in a whole run, then nothing — including the `CloseChannel` that should
+                    // have triggered failover.
+                    frame = self.channel_state.upstream_receiver.recv() => {
+                        let res = match frame {
+                            Ok(f) => self.clone().process_upstream_frame(f).await,
+                            Err(e) => Err(TproxyError::fallback(e)),
+                        };
                         if let Err(e) = res {
                             if handle_error(&status_sender, e).await {
                                 break;
                             }
                         }
                     },
-                    res = self.clone().handle_downstream_message() => {
+                    msg = self.channel_state.sv1_server_receiver.recv() => {
+                        let res = match msg {
+                            Ok((message, tlv_fields)) => {
+                                self.clone().process_downstream_message(message, tlv_fields).await
+                            }
+                            Err(e) => Err(TproxyError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             if handle_error(&status_sender, e).await {
                                 break;
@@ -255,13 +278,34 @@ impl ChannelManager {
     /// * `Ok(())` - Message processed successfully
     /// * `Err(TproxyError)` - Error processing the message
     pub async fn handle_upstream_frame(self: Arc<Self>) -> TproxyResult<(), error::ChannelManager> {
-        let mut sv2_frame = self
+        let sv2_frame = self
             .channel_state
             .upstream_receiver
             .recv()
             .await
             .map_err(TproxyError::fallback)?;
+        self.process_upstream_frame(sv2_frame).await
+    }
 
+    /// Everything that happens to an upstream frame AFTER it has been taken off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties, and the
+    /// message loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and
+    /// nothing is lost. This is NOT — by the time it runs, the frame is already OFF the queue, so
+    /// dropping it loses the frame outright, with no error and nothing to retry.
+    ///
+    /// That is #854. With both halves inside `tokio::select!`, a downstream branch that was ready
+    /// on every poll cancelled this one before it finished, and the frame it had already consumed
+    /// went with it. Measured: a translator under minerd load processed exactly FOUR upstream
+    /// messages — all before the share flood began — and silently dropped every one after,
+    /// including the `CloseChannel` that was supposed to trigger failover. `NewExtendedMiningJob`
+    /// and `SetNewPrevHash` ride this same path, so the same loss leaves miners on a stale job.
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    pub async fn process_upstream_frame(
+        self: Arc<Self>,
+        mut sv2_frame: Sv2Frame,
+    ) -> TproxyResult<(), error::ChannelManager> {
         let mut channel_manager: ChannelManager = (*self).clone();
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
@@ -319,6 +363,19 @@ impl ChannelManager {
             .recv()
             .await
             .map_err(TproxyError::shutdown)?;
+        self.process_downstream_message(message, tlv_fields).await
+    }
+
+    /// Everything that happens to a downstream message AFTER it has been taken off the channel.
+    ///
+    /// ⛔ Same cancellation hazard as [`Self::process_upstream_frame`], in the other direction:
+    /// the message is already off the queue, so dropping this future loses it silently. Must be
+    /// called from a `select!` branch BODY, never as a branch future (#854).
+    pub async fn process_downstream_message(
+        self: Arc<Self>,
+        message: Mining<'static>,
+        tlv_fields: Option<Vec<Tlv>>,
+    ) -> TproxyResult<(), error::ChannelManager> {
         match message {
             Mining::OpenExtendedMiningChannel(m) => {
                 let mut open_channel_msg = m.clone();
