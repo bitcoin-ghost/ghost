@@ -230,7 +230,13 @@ async fn wallet_export(name: String, to_path: String) -> Result<serde_json::Valu
 /// a wallet of that name already exists on disk.
 #[tauri::command]
 async fn wallet_restore(name: String, from_path: String) -> Result<serde_json::Value, String> {
-    let resp = call_daemon(Request::WalletRestore { name, from_path }).await?;
+    let resp = call_daemon(Request::WalletRestore {
+        name,
+        from_path,
+        // The GUI restore flow has no field for it yet (#924).
+        birth_height: None,
+    })
+    .await?;
     to_value(&resp)
 }
 

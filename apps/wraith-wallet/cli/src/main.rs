@@ -666,6 +666,18 @@ enum WalletCommand {
         name: String,
         /// Source path of the backup file.
         from: String,
+        /// The chain height this seed was first used at.
+        ///
+        /// A keystore backup is an opaque encrypted file and carries no birth
+        /// height. Without one the scanner starts at the tip and everything this
+        /// wallet did before the restore is absent from its history — the coins
+        /// are still all found, which is what hides it.
+        ///
+        /// `wallet export` prints this number; keep it with the backup.
+        ///
+        /// Guessing low is safe and slow; guessing high loses history silently.
+        #[arg(long, value_name = "HEIGHT")]
+        birth_height: Option<u32>,
     },
 }
 
@@ -918,9 +930,14 @@ mod client {
                     Err(e) => return io_err(e),
                 },
                 WalletCommand::Export { name, to } => Request::WalletExport { name, to_path: to },
-                WalletCommand::Restore { name, from } => Request::WalletRestore {
+                WalletCommand::Restore {
+                    name,
+                    from,
+                    birth_height,
+                } => Request::WalletRestore {
                     name,
                     from_path: from,
+                    birth_height,
                 },
             },
             Command::Psbt { sub } => match sub {
@@ -1711,8 +1728,30 @@ mod client {
                 println!("{}\n", m.mnemonic);
                 std::process::ExitCode::SUCCESS
             }
-            Ok(Response::WalletExported { name, path, bytes }) => {
+            Ok(Response::WalletExported {
+                name,
+                path,
+                bytes,
+                birth_height,
+            }) => {
                 println!("exported wallet '{name}' → {path} ({bytes} bytes)");
+                // The backup is a byte-for-byte copy of the encrypted keystore, so it cannot
+                // carry the birth height. This is the only moment someone can write it down,
+                // and without it a restore silently starts at the tip (#924).
+                match birth_height {
+                    Some(h) => {
+                        println!("birth height: {h}");
+                        println!(
+                            "keep that with the backup — restore with \
+                             `wraith wallet restore <name> <file> --birth-height {h}` \
+                             or the restored wallet's history will start at the tip"
+                        );
+                    }
+                    None => println!(
+                        "no birth height recorded for this wallet — a restore from this backup \
+                         will start its history at the tip"
+                    ),
+                }
                 std::process::ExitCode::SUCCESS
             }
             Ok(Response::WalletRestored { name, path, bytes }) => {

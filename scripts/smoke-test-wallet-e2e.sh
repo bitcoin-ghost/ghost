@@ -1096,13 +1096,30 @@ echo "before recovery: balance=$ORIG_BAL history_entries=$ORIG_HIST"
 BACKUP="$DATADIR/smoke-keystore.bak"
 WRAITH wallet export smoke "$BACKUP" >/dev/null
 [ -s "$BACKUP" ] || fail "wallet export produced no backup file"
-WRAITH wallet restore restored-file "$BACKUP" >/dev/null
+# The backup is a byte-for-byte copy of the ENCRYPTED KEYSTORE, so it cannot carry a birth
+# height — `wallet export` prints it instead, to be kept alongside. Pass it here, because
+# otherwise this path recovers the coins and silently starts the history at the tip: the
+# balance comes from scantxoutset and stays correct, which is exactly what hid it (#924).
+WRAITH wallet restore restored-file "$BACKUP" --birth-height "$BIRTH_H" >/dev/null
 WRAITH wallet select restored-file <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
 WRAITH wallet unlock restored-file <<< 'smoke-pass-1234' >/dev/null 2>&1 || true
 R_ADDR=$(WRAITH --json light receive --index 0 | jq -r '.LightReceive.address // .address')
 [ "$R_ADDR" = "$ORIG_ADDR0" ] \
     || fail "the restored keystore derives $R_ADDR at index 0, not $ORIG_ADDR0 — it is a different wallet"
 pass "keystore backup restores the same wallet (index 0 derives $R_ADDR)"
+
+# ⚠ Deriving the same address proves only that it is the same SEED. Until #924 this arm
+# stopped there, and passed the whole time the keystore path was losing every history entry
+# it ever had. Assert the history too, exactly as the words arm does.
+F_HIST=0
+for _ in $(seq 1 60); do
+    F_HIST=$(WRAITH --json light history | jq -r '(.LightHistory.transactions // .transactions // []) | length')
+    [ "$F_HIST" -ge "$ORIG_HIST" ] && break
+    sleep 3
+done
+[ "$F_HIST" -eq "$ORIG_HIST" ] \
+    || fail "the keystore restore rebuilt $F_HIST of $ORIG_HIST history entries from birth height $BIRTH_H — the coins are found but what they did is lost (#924)"
+pass "the keystore backup rebuilt the whole history ($F_HIST of $ORIG_HIST entries)"
 
 # ---- (b) words + birth height ---------------------------------------------
 # The seed, as the owner would have written it down.
