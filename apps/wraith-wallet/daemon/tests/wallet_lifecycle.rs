@@ -443,7 +443,9 @@ async fn shroud_max_ms_surfaces_in_daemon_env() {
 /// unlocked wallets after ~10s of no user-facing IPC activity. Health and
 /// DaemonEnv should NOT count as activity (would defeat the feature).
 ///
-/// The threshold was 2s, which made this flaky (#502). The idle timer starts at wallet
+/// The threshold was 2s, which made this flaky (#502) — the create's KDF could outlast it and
+/// the wallet locked before the "still unlocked" check. Raising it fixed that but left the WAIT
+/// too close to the tick; see the comment on the sleep below. The idle timer starts at wallet
 /// CREATION, and creation runs a passphrase KDF — so on a loaded runner the KDF alone could
 /// outlast the window, and the very next call would find the wallet already locked. The test
 /// then failed on `fresh wallet must be unlocked`, i.e. it was asserting "under two seconds of
@@ -503,12 +505,27 @@ async fn idle_lock_locks_wallets_after_threshold() {
         other => panic!("list: {other:?}"),
     }
 
-    // Sleep past the idle threshold without sending any IPC traffic. Health
-    // wouldn't have counted, but to keep the test deterministic we just wait.
-    // Threshold = 2s, tick = min(30, 2/2) = 1s. 6s gives the auto-lock task
-    // Must exceed the 10s threshold with slack, for parallel-test CI hosts where the tokio
-    // scheduler doesn't always wake on the dot.
-    tokio::time::sleep(Duration::from_secs(14)).await;
+    // Sleep past the idle threshold without sending any IPC traffic.
+    //
+    // ⚠ The wait must exceed threshold + ONE FULL TICK, not just the threshold. `idle_lock_task`
+    // only re-checks every `min(30, threshold/2)` seconds and compares whole seconds, so a
+    // sub-second misalignment makes the tick ON the threshold read one short, skip, and lock a
+    // whole tick later.
+    //
+    // At the previous 10s threshold the tick was 5s, so locking could land at t=15 while this
+    // asserted at t=14 — a 4s margin against a 5s tick. It passed most of the time and failed on
+    // a loaded CI host (seen on #925, where two more daemon-spawning tests in this file were
+    // enough to surface it).
+    //
+    // The threshold stays at 10s — lowering it would buy margin here at the cost of the OTHER
+    // failure #502 hit, where a create whose KDF outlasts the threshold locks the wallet before
+    // the "still unlocked" check above. Both ends need headroom, so the WAIT grows instead:
+    // 10s threshold => 5s tick => locked by t=15 at worst, asserted at t=20. The slack is now
+    // larger than a tick, which is the property that was missing.
+    //
+    // Polling instead of sleeping is not an option: `is_activity` counts WalletList, so asking
+    // whether it has locked yet resets the very timer that is supposed to be running down.
+    tokio::time::sleep(Duration::from_secs(20)).await;
 
     // WalletList now: should show the wallet as locked. (The list call itself
     // re-bumps the timer, but the auto-lock has already happened.)
