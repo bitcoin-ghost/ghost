@@ -554,7 +554,7 @@ fn parse_hashrate_from_benchmark_line(line: &str) -> Option<f64> {
         if let Some(space_pos) = before_khash.rfind(' ') {
             let number_str = &before_khash[space_pos + 1..];
             if let Ok(hashrate) = number_str.parse::<f64>() {
-                return Some(hashrate);
+                return usable_hashrate(hashrate);
             }
         }
     }
@@ -566,12 +566,37 @@ fn parse_hashrate_from_benchmark_line(line: &str) -> Option<f64> {
             let number_str = &before_hash[space_pos + 1..];
             if let Ok(hashrate) = number_str.parse::<f64>() {
                 // Convert hash/s to khash/s
-                return Some(hashrate / 1000.0);
+                return usable_hashrate(hashrate / 1000.0);
             }
         }
     }
 
     None
+}
+
+/// A parsed number is only a MEASUREMENT if it could describe a real hashrate.
+///
+/// ⛔ minerd derives its rate from a wall-clock delta, so a clock that steps backwards makes it
+/// print a NEGATIVE one. Observed on WSL2: `Detected benchmark hashrate: -862.87 khash/s`. The
+/// caller fed that straight into `DownstreamDifficultyConfig`, and the translator then panicked
+/// on a tokio worker with `called Result::unwrap() on an Err value: NegativeInput` — a startup
+/// crash, from a test harness, that named neither the clock nor the setting (#854).
+///
+/// Treating it as a failed parse is the honest reading: the line is not a measurement. The
+/// caller keeps scanning, and if nothing usable arrives it gets `HashrateParseError` rather than
+/// a plausible-looking number that poisons everything downstream.
+///
+/// Zero is rejected for the same reason — a starting difficulty needs a positive hashrate — as
+/// are NaN and infinity, which arithmetic on a bad delta can also produce.
+fn usable_hashrate(khash_per_sec: f64) -> Option<f64> {
+    if khash_per_sec.is_finite() && khash_per_sec > 0.0 {
+        Some(khash_per_sec)
+    } else {
+        tracing::warn!(
+            "Ignoring an unusable benchmark hashrate of {khash_per_sec} khash/s — not a              measurement. A negative rate means minerd's clock went backwards."
+        );
+        None
+    }
 }
 
 /// Default SV1 username for the harness miner.
@@ -640,6 +665,45 @@ mod tests {
         let hashrate = minerd_process.measure_hashrate().await.unwrap();
         println!("Hashrate: {} hashes/s", hashrate);
         assert!(hashrate > 0.0);
+    }
+
+    /// ⛔ The line that broke a test run, taken verbatim from the log.
+    ///
+    /// minerd computes its rate from a wall-clock delta, so a clock that steps backwards makes
+    /// it print a negative one. This harness fed that number straight into the translator's
+    /// difficulty config, which panicked on a tokio worker with
+    /// `called Result::unwrap() on an Err value: NegativeInput` — a startup crash naming neither
+    /// the clock nor the setting (#854).
+    ///
+    /// A negative rate is not a measurement, so it must read as a FAILED parse: the caller then
+    /// keeps scanning and ends with `HashrateParseError` rather than a plausible-looking number.
+    #[test]
+    fn a_negative_hashrate_is_not_a_measurement() {
+        assert_eq!(
+            parse_hashrate_from_benchmark_line(
+                "[2026-09-23 08:11:01] thread 0: 8 hashes, -862.87 khash/s"
+            ),
+            None,
+            "a negative rate must not be accepted — it poisons the difficulty config"
+        );
+        // Zero is equally unusable as a starting difficulty.
+        assert_eq!(
+            parse_hashrate_from_benchmark_line("[2026-09-23 08:11:01] Total: 0 khash/s"),
+            None
+        );
+        // ...and the same holds for the un-prefixed form, which divides by 1000 on the way.
+        assert_eq!(
+            parse_hashrate_from_benchmark_line("[2026-09-23 08:11:01] Total: -5000 hash/s"),
+            None
+        );
+        // A positive rate on the same line shape still parses, so this rejects the VALUE and
+        // not the format — without that control the test would pass on a broken parser.
+        assert_eq!(
+            parse_hashrate_from_benchmark_line(
+                "[2026-09-23 08:11:01] thread 0: 8 hashes, 862.87 khash/s"
+            ),
+            Some(862.87)
+        );
     }
 
     #[test]

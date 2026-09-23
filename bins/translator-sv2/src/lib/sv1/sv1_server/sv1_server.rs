@@ -622,8 +622,24 @@ impl Sv1Server {
                 t
             }
         };
-        let first_target: Target =
-            snap(hash_rate_to_target(hobby_floor_hs as f64, shares_per_minute).unwrap());
+        // ⛔ Not `.unwrap()`. This is CONFIG arithmetic, so the input is whatever the operator
+        // wrote — and `hash_rate_to_target` rejects a non-positive hashrate with `NegativeInput`.
+        // Unwrapping turned a bad `min_individual_miner_hashrate` into a panic on a tokio worker
+        // at startup, reported only as `called Result::unwrap() on an Err value: NegativeInput`
+        // with no mention of the setting responsible (#854).
+        //
+        // Returning the error lets `start` fail the way every other startup problem here does,
+        // and names the value that has to change.
+        let first_target: Target = snap(
+            hash_rate_to_target(hobby_floor_hs as f64, shares_per_minute).map_err(|e| {
+                error!(
+                    "Cannot start the SV1 server: min_individual_miner_hashrate = {hobby_floor_hs}                      H/s with shares_per_minute = {shares_per_minute} is not a usable starting                      difficulty ({e:?}). It must be greater than zero."
+                );
+                TproxyError::shutdown(TproxyErrorKind::General(format!(
+                    "min_individual_miner_hashrate = {hobby_floor_hs} is not a usable starting                      difficulty ({e:?})"
+                )))
+            })?,
+        );
 
         // Optional farm/rental listener. `None` leaves the single-listener behaviour exactly
         // as it was, which is what every existing config produces.
@@ -635,9 +651,18 @@ impl Sv1Server {
                     error!("Failed to bind farm listener to {}: {}", addr, e);
                     TproxyError::shutdown(e)
                 })?;
+                // Same hazard as the hobby floor above: operator-supplied, so it is reported
+                // rather than unwrapped.
+                let floor = t.min_individual_miner_hashrate;
                 let target = snap(
-                    hash_rate_to_target(t.min_individual_miner_hashrate as f64, shares_per_minute)
-                        .unwrap(),
+                    hash_rate_to_target(floor as f64, shares_per_minute).map_err(|e| {
+                        error!(
+                            "Cannot start the farm/rental listener: min_individual_miner_hashrate                              = {floor} H/s with shares_per_minute = {shares_per_minute} is not a                              usable starting difficulty ({e:?}). It must be greater than zero."
+                        );
+                        TproxyError::shutdown(TproxyErrorKind::General(format!(
+                            "farm_tier.min_individual_miner_hashrate = {floor} is not a usable                              starting difficulty ({e:?})"
+                        )))
+                    })?,
                 );
                 info!(
                     "Translator Proxy: farm/rental listening on {} (floor {} H/s)",
