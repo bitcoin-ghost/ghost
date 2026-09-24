@@ -665,6 +665,36 @@ pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = u64::MAX;
 /// it drops the entire message without saying so. Margin buys room to roll back and re-roll.
 pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 
+/// H-7 ENFORCEMENT: at and above this height, a challenger whose own address proof FAILED stops
+/// counting toward a target's distinct-`/24` diversity floor (#605).
+///
+/// `ADDRESS_PROOF_HEIGHT` armed the probe, and it works — 108k nonce-bound, signature-verified
+/// proofs across the fleet at a 1.0000 pass rate. What it did not do is make the result matter:
+/// all three `/24` derivations read `nodes.public_address` unconditionally, and
+/// `qualification.rs` never mentions the address capability at all. So a node that is caught
+/// lying about where it lives keeps its subnet, and the Sybil floor those subnets feed stays
+/// exactly as fabricable as before the probe existed.
+///
+/// ⚖ Scope is the diversity COUNT only, not the challenger DRAW pool. A failing node can still
+/// be selected to challenge; it just stops contributing a distinct subnet. That is what
+/// `address_proof.rs` line 20 actually claims ("may that address's `/24` count toward
+/// diversity"), and it avoids the failure mode that module warns about at lines 93-95 — gating
+/// on a probe that cannot succeed would exclude every subnet and collapse the challenger pool to
+/// zero, which is worse than the bug being fixed. Excluding from the draw as well is a separate,
+/// later decision.
+///
+/// ⚠ Only a CRYPTOGRAPHIC failure counts. `Unreachable` and `NotSigned` already resolve to
+/// `None` in `address_verdict` and never reach the ledger as a FAIL, so a node that is merely
+/// down — or running a build with no signing identity — keeps its subnet. Measured 2026-08-21:
+/// 181 of 181 probe failures were `Unreachable`, against 9,681 passes.
+///
+/// ⚠ The filter is PER CHALLENGER, not per `/24`. A subnet still counts if any other challenger
+/// legitimately occupies it, so one bad actor cannot strip an honest neighbour's standing.
+///
+/// `u64::MAX` = never. Arming changes which nodes QUALIFY, so it is a separate, observed change
+/// that needs the whole fleet carrying it first.
+pub const ADDRESS_PROOF_ENFORCEMENT_HEIGHT: u64 = u64::MAX;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -758,6 +788,7 @@ mod gates {
     pub(super) static STRATUM_HANDSHAKE_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ARCHIVE_TX_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ADDRESS_PROOF: OnceLock<u64> = OnceLock::new();
+    pub(super) static ADDRESS_PROOF_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
@@ -839,6 +870,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     );
     let address_proof =
         gates::from_env("GHOST_ADDRESS_PROOF_HEIGHT", network, ADDRESS_PROOF_HEIGHT);
+    let address_proof_enforcement = gates::from_env(
+        "GHOST_ADDRESS_PROOF_ENFORCEMENT_HEIGHT",
+        network,
+        ADDRESS_PROOF_ENFORCEMENT_HEIGHT,
+    );
     let mesh_node_list_checkpoint = gates::from_env(
         "GHOST_MESH_NODE_LIST_CHECKPOINT_HEIGHT",
         network,
@@ -882,6 +918,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
     let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
     let _ = gates::ADDRESS_PROOF.set(address_proof);
+    let _ = gates::ADDRESS_PROOF_ENFORCEMENT.set(address_proof_enforcement);
     let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
     let _ = gates::CHECKPOINT_FROM_SHARD.set(checkpoint_from_shard);
     let _ = gates::PAYOUT_FROM_SHARD.set(payout_from_shard);
@@ -1099,6 +1136,12 @@ pub fn archive_tx_proof_height() -> u64 {
 /// Height at and above which a challenger broadcasts its H-7 address proof (#605).
 pub fn address_proof_height() -> u64 {
     *gates::ADDRESS_PROOF.get_or_init(|| ADDRESS_PROOF_HEIGHT)
+}
+
+/// Height at and above which a FAILED address proof costs a challenger its `/24` in the
+/// diversity count (#605). See [`ADDRESS_PROOF_ENFORCEMENT_HEIGHT`].
+pub fn address_proof_enforcement_height() -> u64 {
+    *gates::ADDRESS_PROOF_ENFORCEMENT.get_or_init(|| ADDRESS_PROOF_ENFORCEMENT_HEIGHT)
 }
 
 /// Height at and above which Public Mining is proved by a challenger-performed stratum handshake

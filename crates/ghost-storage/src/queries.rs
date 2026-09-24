@@ -7140,8 +7140,70 @@ impl Database {
         })
     }
 
+    /// H-7 ENFORCEMENT: nodes a MAJORITY of their own challengers caught lying about their
+    /// address, over `[since, until]` at or above `min_round_height` (#605).
+    ///
+    /// These are the nodes whose `/24` must stop counting toward anyone else's diversity floor.
+    /// Everything about the shape of this query is defensive:
+    ///
+    /// - **A majority of distinct challengers, not a single FAIL.** H-7 exists to stop a Sybil
+    ///   farm fabricating diversity; a rule where one verdict strips an honest node's subnet
+    ///   would hand the same farm a cheaper griefing primitive than the one being closed. The
+    ///   `2 *` comparison is the same strict majority the capability floors use.
+    /// - **Distinct challengers, not rows.** Otherwise one challenger repeating a verdict
+    ///   outvotes everyone else.
+    /// - **Only rows at or above the gate height.** Verdicts recorded before enforcement was
+    ///   armed were produced under a different rule and must not retroactively cost anyone a
+    ///   subnet. `round_height` is `NULL` on pre-A-2b rows, so those are excluded too.
+    /// - **Only `passed = 0` is a failure.** `address_verdict` already resolves `Unreachable`
+    ///   and `NotSigned` to "say nothing", so a node that is merely down, or running a build
+    ///   with no signing identity, never reaches the ledger as a FAIL. Measured 2026-08-21:
+    ///   181 of 181 probe failures were `Unreachable`, against 9,681 passes.
+    ///
+    /// Returns hex node ids. An empty set is the normal answer and means nobody was caught.
+    pub fn address_proof_failed_nodes(
+        &self,
+        since: i64,
+        until: i64,
+        min_round_height: u64,
+    ) -> GhostResult<std::collections::HashSet<String>> {
+        let floor = i64::try_from(min_round_height).unwrap_or(i64::MAX);
+        self.with_connection(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT target_node_id
+                     FROM verification_ledger
+                     WHERE capability = 'address'
+                       AND timestamp >= ?1 AND timestamp <= ?2
+                       AND round_height IS NOT NULL AND round_height >= ?3
+                     GROUP BY target_node_id
+                     HAVING 2 * COUNT(DISTINCT CASE WHEN passed = 0 THEN challenger_id END)
+                            > COUNT(DISTINCT challenger_id)",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since, until, floor], |row| {
+                    let id: String = row.get(0)?;
+                    Ok(id)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = std::collections::HashSet::new();
+            for r in rows {
+                out.insert(r.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })
+    }
+
     /// A-2b: the challenger draw pool — every voter-set node (a `nodes` row with a
     /// payout address) paired with its `/24` subnet (`None` if unknown/unparseable).
+    ///
+    /// ⚖ Deliberately NOT filtered by [`Self::address_proof_failed_nodes`]. A node caught lying
+    /// about its address loses its contribution to the diversity COUNT, and stays eligible to be
+    /// drawn as a challenger (#605). Excluding it from the draw as well is a stricter rule and a
+    /// separate decision: `address_proof.rs` lines 93-95 warn that gating the pool on a probe
+    /// that cannot succeed would exclude every subnet and collapse the draw to zero, which is
+    /// worse than the bug being fixed.
     /// This is the converged candidate set the consensus assignment draws from.
     pub fn voterset_assignment_pool(&self) -> GhostResult<Vec<(String, Option<String>)>> {
         self.with_connection(|conn| {
@@ -14542,6 +14604,195 @@ mod tests {
                 .len(),
             2,
             "both distinct records, deduped to two"
+        );
+    }
+
+    /// H-7 ENFORCEMENT (#605): who loses their `/24`, and — more importantly — who does not.
+    ///
+    /// The rule has to be a MAJORITY of distinct challengers, because the thing it protects
+    /// against is a Sybil farm fabricating diversity. A rule where one FAIL strips an honest
+    /// node's subnet would hand that same farm a cheaper griefing primitive than the one being
+    /// closed, which is why the single-FAIL case below is asserted as loudly as the caught-liar
+    /// case.
+    #[test]
+    fn address_proof_failure_needs_a_majority_of_distinct_challengers() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = b"signed".to_vec();
+        let now = chrono::Utc::now().timestamp();
+
+        let addr = |challenger: &str, target: &str, passed: bool, rh: i64| {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: challenger,
+                target_node_id: target,
+                capability: "address",
+                passed,
+                timestamp: now,
+                proof: &blob,
+                round_height: Some(rh),
+            })
+            .expect("insert");
+        };
+
+        // `liar`: 2 of 3 distinct challengers caught it. A majority — it loses its subnet.
+        addr("c1", "liar", false, 1_000);
+        addr("c2", "liar", false, 1_000);
+        addr("c3", "liar", true, 1_000);
+
+        // `griefed`: 1 of 3 says it failed. NOT a majority — it keeps its subnet. This is the
+        // case that matters: a lone hostile challenger must not be able to strip a peer.
+        addr("c1", "griefed", false, 1_000);
+        addr("c2", "griefed", true, 1_000);
+        addr("c3", "griefed", true, 1_000);
+
+        // `honest`: nobody caught it.
+        addr("c1", "honest", true, 1_000);
+        addr("c2", "honest", true, 1_000);
+
+        let failed = db.address_proof_failed_nodes(0, now + 1, 0).expect("query");
+
+        assert!(
+            failed.contains("liar"),
+            "a majority of distinct challengers caught it"
+        );
+        assert!(
+            !failed.contains("griefed"),
+            "one FAIL out of three is not a majority — a lone challenger must not be able to \
+             strip a peer's subnet, which would be a worse griefing primitive than the one H-7 closes"
+        );
+        assert!(!failed.contains("honest"));
+        assert_eq!(failed.len(), 1, "exactly one node was caught: {failed:?}");
+    }
+
+    /// One challenger repeating itself must not outvote the others.
+    ///
+    /// Without `COUNT(DISTINCT ...)` a single challenger could record the same FAIL a hundred
+    /// times and manufacture a "majority" on its own — the identity-stuffing this whole surface
+    /// exists to resist, reintroduced at the point meant to stop it.
+    #[test]
+    fn address_proof_failure_counts_distinct_challengers_not_rows() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = b"signed".to_vec();
+        let now = chrono::Utc::now().timestamp();
+
+        for i in 0..5 {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: "spammer",
+                target_node_id: "target",
+                capability: "address",
+                passed: false,
+                timestamp: now + i,
+                proof: &blob,
+                round_height: Some(1_000),
+            })
+            .expect("insert");
+        }
+        for c in ["h1", "h2", "h3"] {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: "target",
+                capability: "address",
+                passed: true,
+                timestamp: now,
+                proof: &blob,
+                round_height: Some(1_000),
+            })
+            .expect("insert");
+        }
+
+        let failed = db
+            .address_proof_failed_nodes(0, now + 100, 0)
+            .expect("query");
+        assert!(
+            !failed.contains("target"),
+            "5 rows from ONE challenger is still one vote against three"
+        );
+    }
+
+    /// Verdicts recorded below the gate height were produced under the old rule.
+    ///
+    /// Counting them would apply enforcement retroactively — a node could lose its subnet for
+    /// something recorded before the fleet agreed the rule was in force. `round_height` is NULL
+    /// on pre-A-2b rows, which must be excluded for the same reason.
+    #[test]
+    fn address_proof_failure_ignores_verdicts_below_the_gate() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = b"signed".to_vec();
+        let now = chrono::Utc::now().timestamp();
+
+        for c in ["c1", "c2"] {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: "old_liar",
+                capability: "address",
+                passed: false,
+                timestamp: now,
+                proof: &blob,
+                round_height: Some(500),
+            })
+            .expect("insert");
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: "null_height",
+                capability: "address",
+                passed: false,
+                timestamp: now,
+                proof: &blob,
+                round_height: None,
+            })
+            .expect("insert");
+        }
+
+        let failed = db
+            .address_proof_failed_nodes(0, now + 1, 1_000)
+            .expect("query");
+        assert!(
+            !failed.contains("old_liar"),
+            "a verdict at height 500 must not count against a gate armed at 1000"
+        );
+        assert!(
+            !failed.contains("null_height"),
+            "pre-A-2b rows carry no height and cannot be placed relative to the gate"
+        );
+
+        // Control: the SAME rows count once the gate sits at or below them, so this test
+        // rejects the height rather than the rows.
+        let failed_low = db
+            .address_proof_failed_nodes(0, now + 1, 500)
+            .expect("query");
+        assert!(
+            failed_low.contains("old_liar"),
+            "at a gate of 500 the height-500 verdicts do count"
+        );
+    }
+
+    /// Only the `address` capability decides this.
+    ///
+    /// A node failing Archive or Stratum has not been shown to be lying about WHERE IT LIVES,
+    /// and its `/24` still means what it claims. Conflating the two would make every capability
+    /// failure quietly cost a node its standing in the diversity floor as well.
+    #[test]
+    fn address_proof_failure_ignores_other_capabilities() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = b"signed".to_vec();
+        let now = chrono::Utc::now().timestamp();
+
+        for c in ["c1", "c2", "c3"] {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: "bad_at_archive",
+                capability: "archive",
+                passed: false,
+                timestamp: now,
+                proof: &blob,
+                round_height: Some(1_000),
+            })
+            .expect("insert");
+        }
+
+        let failed = db.address_proof_failed_nodes(0, now + 1, 0).expect("query");
+        assert!(
+            failed.is_empty(),
+            "archive failures say nothing about the address claim: {failed:?}"
         );
     }
 

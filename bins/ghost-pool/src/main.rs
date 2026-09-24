@@ -3633,7 +3633,12 @@ async fn main() -> Result<()> {
     // not just what they claim. The QualifiedCapabilityProvider checks challenge results.
     let qualification_provider_for_health = Arc::new(
         QualifiedCapabilityProvider::new(Arc::clone(&db))
-            .with_block_hash_oracle(Arc::new(block_hash_oracle.clone())),
+            .with_block_hash_oracle(Arc::new(block_hash_oracle.clone()))
+            // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT. EVERY construction site
+            // must wire this — one that missed it would compute a different qualified set from
+            // its peers once the gate fires, and the node-reward split would diverge. Guarded
+            // by scripts/check-address-enforcement-wiring.sh.
+            .with_address_enforcement(ghost_pool::address_proof_enforcement_height()),
     );
     let qp_for_verifier = Arc::clone(&qualification_provider_for_health);
     let capability_verifier: ghost_consensus::health_handler::CapabilityVerifierCallback =
@@ -3799,7 +3804,9 @@ async fn main() -> Result<()> {
                 return None;
             };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()))
+                // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
+                .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
             // A-2/A-2b: the checkpoint root must scope challengers to the voter set +
             // subnets AND to the consensus assignment at/above the gates, identically to
             // the coinbase node split, or the root and the paid split would disagree.
@@ -3845,7 +3852,9 @@ async fn main() -> Result<()> {
         let oracle_c = block_hash_oracle.clone();
         Arc::new(move |cutoff_ts, height| {
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()))
+                // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
+                .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
             let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
             let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
             let mut ids: Vec<ghost_common::types::NodeId> = qp
@@ -7426,7 +7435,9 @@ async fn main() -> Result<()> {
             let voter_set_scoped = block_height >= ghost_pool::voter_set_qualification_height();
             let assignment_scoped = block_height >= ghost_pool::challenger_assignment_height();
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()))
+                // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
+                .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
             let voters: Vec<ghost_common::types::NodeId> = qp
                 .get_all_qualified_nodes_at_cutoff_from_db(
                     cutoff,
@@ -7572,7 +7583,9 @@ async fn main() -> Result<()> {
                     db_c.get_mpc_elder_node_ids().ok()?.into_iter().collect();
                 elders.sort_unstable();
                 let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                    .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+                    .with_block_hash_oracle(Arc::new(oracle_c.clone()))
+                    // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
+                    .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
                 let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
                 let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
                 let mut active: Vec<ghost_common::types::NodeId> = qp
