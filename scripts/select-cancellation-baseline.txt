@@ -1,4 +1,4 @@
-# Known tokio::select! branches that consume a message they can lose (#926).
+# Known tokio::select! branches that consume a message they can lose (#926, tracked in #933).
 #
 # One line per instance, "path handler_name". Keyed by handler rather than line number so the
 # baseline survives edits above it.
