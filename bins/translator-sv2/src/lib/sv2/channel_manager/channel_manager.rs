@@ -107,6 +107,47 @@ pub struct ChannelManager {
     pub aggregated_channel_state: AtomicAggregatedState,
 }
 
+/// How long one turn of the ChannelManager message loop may take before it is worth a line.
+///
+/// The loop handles a message in the branch BODY, which runs to completion — so while it is in
+/// there it is not back at the `select!` and cannot pick up anything waiting on the other side.
+/// Every millisecond spent here is latency added to whatever the other branch is holding.
+///
+/// 250ms matches `SLOW_DB_CALL` in ghost-storage, for the same reason it was chosen there: it is
+/// far above anything a healthy message costs, so at normal rates this logs nothing at all.
+const SLOW_ITERATION: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Count of loop turns that ran past [`SLOW_ITERATION`], for anyone sampling it.
+pub static SLOW_ITERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Say so when one turn of the message loop blocks the other branch for a noticeable time.
+///
+/// ⛔ This exists because of a real, measured failure and not as general instrumentation. In
+/// #854 a `CloseChannel` arrived at 22:50:48.690 and was handled at 22:51:46.261 — **57.6
+/// seconds later**, against a 60s test deadline, which is why the failover test flaked at ~10%
+/// instead of failing outright. The same loop carries `NewExtendedMiningJob` and
+/// `SetNewPrevHash`, so the production consequence of that latency is miners left on a stale job
+/// for about a minute with nothing logged anywhere.
+///
+/// Nothing in the logs could distinguish "the loop is starved" from "the message never arrived",
+/// which is what made that bug take four wrong diagnoses to pin down. `tokio::select!` choosing
+/// randomly between two ready branches cannot produce 57s at sub-millisecond turns, so the open
+/// question is which turns are slow — and a node that answers it in its own journal beats
+/// re-deriving it from a 4.6M-line trace capture every time.
+fn report_slow_iteration(branch: &'static str, elapsed: std::time::Duration) {
+    if elapsed < SLOW_ITERATION {
+        return;
+    }
+    SLOW_ITERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    warn!(
+        branch,
+        held_ms = elapsed.as_millis(),
+        "ChannelManager message loop spent this long on one message — the other branch could \
+         not be polled for the duration, so anything waiting on it (CloseChannel, a new job, a \
+         prev-hash update) is delayed by at least this much (#854)"
+    );
+}
+
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl ChannelManager {
     /// Creates a new ChannelManager instance.
@@ -225,10 +266,12 @@ impl ChannelManager {
                     // in a whole run, then nothing — including the `CloseChannel` that should
                     // have triggered failover.
                     frame = self.channel_state.upstream_receiver.recv() => {
+                        let started = std::time::Instant::now();
                         let res = match frame {
                             Ok(f) => self.clone().process_upstream_frame(f).await,
                             Err(e) => Err(TproxyError::fallback(e)),
                         };
+                        report_slow_iteration("upstream", started.elapsed());
                         if let Err(e) = res {
                             if handle_error(&status_sender, e).await {
                                 break;
@@ -236,12 +279,14 @@ impl ChannelManager {
                         }
                     },
                     msg = self.channel_state.sv1_server_receiver.recv() => {
+                        let started = std::time::Instant::now();
                         let res = match msg {
                             Ok((message, tlv_fields)) => {
                                 self.clone().process_downstream_message(message, tlv_fields).await
                             }
                             Err(e) => Err(TproxyError::shutdown(e)),
                         };
+                        report_slow_iteration("downstream", started.elapsed());
                         if let Err(e) = res {
                             if handle_error(&status_sender, e).await {
                                 break;
@@ -994,5 +1039,36 @@ mod tests {
         let has_pending = manager.pending_downstream_channels.contains_key(&1);
 
         assert!(has_pending);
+    }
+
+    /// A fast turn must be silent, and a slow one must be counted.
+    ///
+    /// ⚠ The silent half is the one that matters. This runs per message on a loop that handled
+    /// 222k shares in a single test run, so a reporter firing on healthy traffic would be log
+    /// amplification under attacker control — the problem the eviction warning in
+    /// `noise_fragment` had to be rate-limited for.
+    #[test]
+    fn only_a_slow_turn_is_reported() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let before = SLOW_ITERATIONS.load(Ordering::Relaxed);
+
+        report_slow_iteration("downstream", Duration::from_millis(1));
+        assert_eq!(
+            SLOW_ITERATIONS.load(Ordering::Relaxed),
+            before,
+            "a 1ms turn is normal traffic and must not be counted"
+        );
+
+        // Exactly AT the threshold counts: the comparison is `>=`, so a boundary value is
+        // reported rather than silently dropped.
+        report_slow_iteration("downstream", SLOW_ITERATION);
+        report_slow_iteration("upstream", SLOW_ITERATION + Duration::from_secs(57));
+        assert_eq!(
+            SLOW_ITERATIONS.load(Ordering::Relaxed),
+            before + 2,
+            "both the boundary case and a 57s turn must be counted"
+        );
     }
 }
