@@ -14,9 +14,50 @@ interface OnboardingProps {
   onClose: () => void;
 }
 
+/// Bits per event, matching `ghost_entropy`. These are for the live counter
+/// only — `UserEntropy::digest` is the authority and refuses below the floor
+/// regardless of what this displays. They are duplicated rather than fetched
+/// because a progress bar must not need a round trip per keystroke.
+const BITS_PER_DIE_ROLL = 2.584962500721156;
+const BITS_PER_COIN_FLIP = 1.0;
+/// Least contribution accepted at all: 128 bits, i.e. 50 rolls or 128 flips.
+const MIN_USER_BITS = 128.0;
+/// A full-strength contribution, matching the 256-bit seed: 99 rolls.
+const RECOMMENDED_USER_BITS = 256.0;
+
+/// Count what the user has typed so far, and name the first character that is
+/// not a die face, a coin or whitespace.
+///
+/// Reports the offending character rather than dropping it, because the Rust
+/// parser refuses it: if this skipped what that rejects, the counter would say
+/// the user was finished and the create would then fail.
+function tallyRolls(input: string): {
+  dieRolls: number;
+  coinFlips: number;
+  bits: number;
+  badChar: string | null;
+} {
+  let dieRolls = 0;
+  let coinFlips = 0;
+  let badChar: string | null = null;
+  for (const ch of input) {
+    if (/\s/.test(ch)) continue;
+    if (ch >= "1" && ch <= "6") dieRolls++;
+    else if (ch === "h" || ch === "H" || ch === "t" || ch === "T") coinFlips++;
+    else if (badChar === null) badChar = ch;
+  }
+  return {
+    dieRolls,
+    coinFlips,
+    bits: dieRolls * BITS_PER_DIE_ROLL + coinFlips * BITS_PER_COIN_FLIP,
+    badChar,
+  };
+}
+
 type Step =
   | "welcome"
   | "name_pass"
+  | "dice"
   | "show_mnemonic"
   | "confirm_mnemonic"
   | "enter_mnemonic"
@@ -66,6 +107,11 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
     return all.slice(0, 3).sort((a, b) => a - b);
   }, [generatedMnemonic]);
   const [verifyInputs, setVerifyInputs] = useState<string[]>(["", "", ""]);
+  /// Opt-in, and off by default on purpose: mixing means no rolls costs the
+  /// user nothing, so the ordinary path must not be the one with extra steps.
+  const [useDice, setUseDice] = useState(false);
+  const [rolls, setRolls] = useState("");
+  const tally = useMemo(() => tallyRolls(rolls), [rolls]);
 
   const validateNamePass = (): string | null => {
     if (!name.trim()) return "Wallet name is required.";
@@ -89,20 +135,38 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
     }
     setErr(null);
     if (mode === "create") {
-      setBusy(true);
-      setStep("submitting");
-      try {
-        const r = await walletCreate(name.trim(), passphrase);
-        setGeneratedMnemonic(r.mnemonic);
-        setStep("show_mnemonic");
-      } catch (e) {
-        setErr((e as Error).message ?? String(e));
-        setStep("name_pass");
-      } finally {
-        setBusy(false);
+      if (useDice) {
+        setStep("dice");
+        return;
       }
+      await doCreate(undefined, "name_pass");
     } else {
       setStep("enter_mnemonic");
+    }
+  };
+
+  /// Create the wallet, returning the user to `backTo` if the daemon refuses.
+  ///
+  /// `rollsArg` is the raw sequence, never a digest — the Rust command hashes it
+  /// in-process so the construction exists once and the 128-bit floor stays
+  /// enforceable. An empty or absent value means the user declined, which is a
+  /// supported choice and not a degraded one.
+  const doCreate = async (rollsArg: string | undefined, backTo: Step) => {
+    setBusy(true);
+    setStep("submitting");
+    try {
+      const r = await walletCreate(name.trim(), passphrase, rollsArg);
+      // Clear the sequence as soon as it has been used. It reconstructs the
+      // contribution, so it is key material for as long as it is held; the Rust
+      // side zeroizes its own copy on drop.
+      setRolls("");
+      setGeneratedMnemonic(r.mnemonic);
+      setStep("show_mnemonic");
+    } catch (e) {
+      setErr((e as Error).message ?? String(e));
+      setStep(backTo);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -249,6 +313,29 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
               NOT replace your backup phrase — losing the passphrase
               means losing the wallet unless you have the mnemonic.
             </p>
+            {mode === "create" && (
+              <label
+                className="row"
+                style={{ gap: 8, alignItems: "flex-start", cursor: "pointer" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={useDice}
+                  onChange={(e) => setUseDice(e.target.checked)}
+                  disabled={busy}
+                  style={{ marginTop: 3 }}
+                />
+                <span style={{ fontSize: 12 }}>
+                  Mix in my own dice rolls
+                  <span className="muted">
+                    {" "}
+                    — optional. Your rolls are combined with this computer's
+                    randomness, never used instead of it, so skipping this
+                    costs you nothing.
+                  </span>
+                </span>
+              </label>
+            )}
             <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
               <button
                 className="btn-secondary"
@@ -263,6 +350,139 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
               >
                 Continue →
               </button>
+            </div>
+          </>
+        )}
+
+        {step === "dice" && (
+          <>
+            <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+              Your dice are <strong>mixed</strong> with the randomness this
+              computer produces — they are never used instead of it. So your
+              rolls can only help: if the operating system's random source were
+              ever weak, your rolls still stand between an attacker and your
+              coins, and if your rolls are poor the seed is exactly as strong as
+              it would have been.
+            </p>
+            <ul className="muted" style={{ margin: 0, fontSize: 12, paddingLeft: 18 }}>
+              <li>
+                Type <code>1</code>–<code>6</code> for dice, <code>h</code> or{" "}
+                <code>t</code> for coin flips. Spaces and newlines are ignored,
+                so group them however you like.
+              </li>
+              <li>
+                Enter <strong>every</strong> roll, including repeats. A run of
+                the same number is normal — discarding results you dislike is
+                what makes a sequence predictable.
+              </li>
+              <li>
+                Never use a sequence you can remember or that means something (a
+                birthday, a phone number). Anything memorable is guessable.
+              </li>
+              <li>
+                Nobody should be watching, and this screen should not be
+                recorded or screenshotted.
+              </li>
+            </ul>
+            <div className="col">
+              <label>Your rolls</label>
+              <textarea
+                value={rolls}
+                onChange={(e) => setRolls(e.target.value)}
+                disabled={busy}
+                rows={5}
+                autoFocus
+                spellCheck={false}
+                autoComplete="off"
+                placeholder="41325 66214 53121 …"
+                style={{ fontFamily: "monospace", letterSpacing: "0.08em" }}
+              />
+            </div>
+            <div className="col" style={{ gap: 4 }}>
+              <div
+                style={{
+                  height: 6,
+                  borderRadius: 3,
+                  background: "var(--border, #333)",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${Math.min(100, (tally.bits / RECOMMENDED_USER_BITS) * 100)}%`,
+                    background:
+                      tally.bits >= MIN_USER_BITS
+                        ? "var(--ok, #3fb950)"
+                        : "var(--warn, #d29922)",
+                    transition: "width 120ms linear",
+                  }}
+                />
+              </div>
+              <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+                {tally.bits.toFixed(0)} of {RECOMMENDED_USER_BITS} bits ·{" "}
+                {tally.dieRolls} rolls, {tally.coinFlips} flips
+                {tally.bits < MIN_USER_BITS ? (
+                  <>
+                    {" "}
+                    — {Math.ceil((MIN_USER_BITS - tally.bits) / BITS_PER_DIE_ROLL)}{" "}
+                    more rolls to reach the {MIN_USER_BITS}-bit minimum
+                  </>
+                ) : tally.bits < RECOMMENDED_USER_BITS ? (
+                  <>
+                    {" "}
+                    — enough to accept.{" "}
+                    {Math.ceil(
+                      (RECOMMENDED_USER_BITS - tally.bits) / BITS_PER_DIE_ROLL,
+                    )}{" "}
+                    more reaches full strength.
+                  </>
+                ) : (
+                  <> — full strength.</>
+                )}
+              </p>
+            </div>
+            {tally.badChar !== null && (
+              <p style={{ margin: 0, fontSize: 12, color: "var(--warn, #d29922)" }}>
+                "{tally.badChar}" is not a die face (1–6), a coin (h/t), or a
+                space. Remove it — it will be refused rather than skipped.
+              </p>
+            )}
+            <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+              <button
+                className="btn-secondary"
+                onClick={() => {
+                  setRolls("");
+                  setUseDice(false);
+                  setErr(null);
+                  void doCreate(undefined, "dice");
+                }}
+                disabled={busy}
+                title="Create the wallet from this computer's randomness alone"
+              >
+                Skip
+              </button>
+              <div className="row" style={{ gap: 8 }}>
+                <button
+                  className="btn-secondary"
+                  onClick={() => setStep("name_pass")}
+                  disabled={busy}
+                >
+                  Back
+                </button>
+                <button
+                  className="btn-primary"
+                  onClick={() => {
+                    setErr(null);
+                    void doCreate(rolls, "dice");
+                  }}
+                  disabled={
+                    busy || tally.bits < MIN_USER_BITS || tally.badChar !== null
+                  }
+                >
+                  Create wallet →
+                </button>
+              </div>
             </div>
           </>
         )}
@@ -428,6 +648,7 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
 function stepLabel(mode: "create" | "import", step: Step): string {
   if (mode === "create") {
     if (step === "name_pass") return "step 1 of 3";
+    if (step === "dice") return "optional · your own dice";
     if (step === "show_mnemonic") return "step 2 of 3 · backup";
     if (step === "confirm_mnemonic") return "step 3 of 3 · verify";
     return "";

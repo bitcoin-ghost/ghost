@@ -79,6 +79,8 @@ pub const RECOMMENDED_USER_BITS: f64 = 256.0;
 pub enum UserEntropyError {
     #[error("a die roll must be 1-6, got {0}")]
     DieOutOfRange(u8),
+    #[error("'{0}' is not a die face (1-6), a coin (h/t), or whitespace")]
+    UnexpectedChar(char),
     #[error(
         "only {supplied:.0} bits of user entropy supplied; at least {required:.0} is required \
          ({rolls} more die rolls, or {flips} more coin flips)"
@@ -212,6 +214,42 @@ pub fn mix_seed_entropy(os_bytes: &[u8; 32], user_digest: Option<&[u8; 32]>) -> 
     hasher.finalize().into()
 }
 
+/// Parse a typed roll sequence: `1`-`6` are die faces, `h`/`t` are coin flips
+/// (case-insensitive), and whitespace is ignored so a user may group their
+/// rolls however they like.
+///
+/// For a front-end holding a whole sequence at once, such as the GUI's textarea.
+/// The CLI does not use this: it reads line by line and reprints the running
+/// count after each, so it can afford to warn about an unrecognised character
+/// and carry on — the count the user sees still reflects exactly what was
+/// accepted. A front-end showing one editable field cannot make that trade,
+/// which is why this refuses instead.
+///
+/// Either way the part that must not diverge — [`UserEntropy`] and its digest
+/// construction — is shared, for the same reason [`guidance`] is: two readings
+/// of the same key material would both produce a valid digest of *something*,
+/// and nothing downstream could tell them apart.
+///
+/// ⛔ An unrecognised character is an error, not something to skip. Silently
+/// dropping it would mean the user's visible sequence and the sequence actually
+/// hashed differ, so a typo would quietly reduce the contribution while the
+/// on-screen count still said they were finished.
+pub fn parse_rolls(s: &str) -> Result<UserEntropy, UserEntropyError> {
+    let mut entropy = UserEntropy::new();
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        match ch {
+            '1'..='6' => entropy.push_die(ch as u8 - b'0')?,
+            'h' | 'H' => entropy.push_coin(true),
+            't' | 'T' => entropy.push_coin(false),
+            other => return Err(UserEntropyError::UnexpectedChar(other)),
+        }
+    }
+    Ok(entropy)
+}
+
 /// Plain-words guidance shown before a user starts rolling.
 ///
 /// Kept here rather than in each front-end so the CLI and the GUI cannot
@@ -238,6 +276,58 @@ pub fn guidance() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_rolls_reads_dice_coins_and_ignores_layout() {
+        let e = parse_rolls("123456 hHtT\n\t111").unwrap();
+        assert_eq!(e.die_rolls(), 9, "6 faces plus the three 1s");
+        assert_eq!(e.coin_flips(), 4, "h H t T, case-insensitively");
+    }
+
+    /// Whitespace must be free: a user grouping rolls in fives must get the same
+    /// seed contribution as one typing them in a single run.
+    #[test]
+    fn grouping_does_not_change_the_digest() {
+        let grouped = parse_rolls(&"12345 ".repeat(20)).unwrap();
+        let run = parse_rolls(&"12345".repeat(20)).unwrap();
+        assert_eq!(
+            grouped.digest().unwrap(),
+            run.digest().unwrap(),
+            "layout must not be part of the contribution"
+        );
+    }
+
+    /// ⛔ A typo must stop the parse, not be skipped. Skipping it would hash a
+    /// shorter sequence than the one on screen, so the count the user is
+    /// watching would overstate what they actually contributed.
+    #[test]
+    fn an_unrecognised_character_is_refused_not_dropped() {
+        let err = parse_rolls("111x111").unwrap_err();
+        assert!(
+            matches!(err, UserEntropyError::UnexpectedChar('x')),
+            "expected the offending character to be named, got {err}"
+        );
+        // 7 and 0 are the plausible slips on a d6 keypad, and both must refuse.
+        assert!(parse_rolls("1117111").is_err(), "7 is not a d6 face");
+        assert!(parse_rolls("1110111").is_err(), "0 is not a d6 face");
+    }
+
+    /// The parser must not become a way around the floor that `digest()` guards.
+    #[test]
+    fn parsed_rolls_still_face_the_minimum() {
+        let short = parse_rolls("123456").unwrap();
+        assert!(
+            short.digest().is_err(),
+            "six rolls is 15 bits and must not yield a digest"
+        );
+        let enough = parse_rolls(&"123456".repeat(9)).unwrap();
+        assert!(
+            enough.bits() >= MIN_USER_BITS,
+            "54 rolls should clear 128 bits, got {}",
+            enough.bits()
+        );
+        assert!(enough.digest().is_ok());
+    }
 
     fn rolled(n: usize) -> UserEntropy {
         let mut e = UserEntropy::new();

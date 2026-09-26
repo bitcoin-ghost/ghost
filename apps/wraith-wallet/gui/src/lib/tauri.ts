@@ -304,20 +304,26 @@ export interface WalletCreateResult {
 /**
  * Create a wallet.
  *
- * `userEntropyDigest` is the hex digest of dice or coin flips the user rolled,
- * mixed into the seed alongside the operating system's randomness and never
- * used instead of it — so supplying none costs nothing, and supplying some can
- * only raise the floor. Omitted until the dice screen lands (#705).
+ * `userEntropyRolls` is the raw sequence the user typed — `1`-`6` for die faces,
+ * `h`/`t` for coin flips, whitespace free — mixed into the seed alongside the
+ * operating system's randomness and never used instead of it. So supplying none
+ * costs nothing, and supplying some can only raise the floor.
+ *
+ * ⛔ Deliberately the raw sequence and not a digest. Hashing it here would put a
+ * second copy of `SHA256(tag ‖ len ‖ events)` in TypeScript, where a one-byte
+ * drift would still yield a valid digest of something and nothing could notice;
+ * and a digest carries no count, so the 128-bit floor could not be checked at
+ * all. The Rust command hashes it in-process and sends only the digest onward.
  */
 export async function walletCreate(
   name: string,
   passphrase: string,
-  userEntropyDigest?: string,
+  userEntropyRolls?: string,
 ): Promise<WalletCreateResult> {
   const resp = await invoke("wallet_create", {
     name,
     passphrase,
-    userEntropyDigest,
+    userEntropyRolls,
   });
   return unwrap<WalletCreateResult>(resp).payload;
 }
