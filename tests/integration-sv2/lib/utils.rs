@@ -515,20 +515,74 @@ pub fn into_static(m: AnyMessage<'_>) -> AnyMessage<'static> {
 }
 
 pub mod http {
-    use std::io::Read;
+    use std::{
+        io::Read,
+        time::{Duration, Instant},
+    };
+
+    /// Ceiling on establishing the connection.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+    /// Ceiling on any single socket read or write.
+    const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Ceiling on one attempt's whole body transfer.
+    ///
+    /// A read timeout alone does not bound this: a server dribbling one byte inside every
+    /// [`SOCKET_TIMEOUT`] window keeps the socket healthy for ever while making no progress.
+    const TRANSFER_TIMEOUT: Duration = Duration::from_secs(180);
+
+    /// Read `reader` to the end, giving up if the transfer is still going after `cap`.
+    ///
+    /// Returns the byte count in the error so a partial transfer can be told from a connection
+    /// that produced nothing — "0 bytes after 180s" and "18 MB after 180s" want different fixes.
+    fn read_body_capped(
+        mut reader: impl Read,
+        url: &str,
+        cap: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let started = Instant::now();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            if started.elapsed() > cap {
+                return Err(format!(
+                    "body from {url} still arriving after {:?} ({} bytes so far); abandoning this attempt",
+                    started.elapsed(),
+                    buf.len()
+                ));
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(buf),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(err) => return Err(format!("failed reading body from {url}: {err:?}")),
+            }
+        }
+    }
 
     // Uses `ureq` (rustls 0.23 / rustls-webpki 0.103) rather than `minreq`,
     // whose `https` feature pins the vulnerable rustls-webpki 0.101.
+    //
+    // ⚠ Every timeout here is load-bearing for the retry loop below, which without them cannot
+    // retry. `ureq::get(..).call()` with no timeout blocks for ever on a stalled connection: the
+    // call never returns, so `attempt` never increments and the closing `panic!` is never reached
+    // either. The loop reads as five attempts with backoff and is in fact one unbounded wait.
+    //
+    // On 2026-09-26 that spent the entire 420 s CI budget for `pool_solo_mining` inside a single
+    // Bitcoin Core download that takes ~11 s on a good day, and reported itself as
+    // "pool_solo_mining failed or exceeded 420s" — naming the test instead of the fetch. Four
+    // earlier runs were dismissed as SV2 flakes on the strength of that message.
     pub fn make_get_request(download_url: &str, retries: usize) -> Vec<u8> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(SOCKET_TIMEOUT)
+            .timeout_write(SOCKET_TIMEOUT)
+            .build();
+
         for attempt in 1..=retries {
-            match ureq::get(download_url).call() {
+            match agent.get(download_url).call() {
                 Ok(response) => {
-                    let mut buf = Vec::new();
-                    match response.into_reader().read_to_end(&mut buf) {
-                        Ok(_) => return buf,
-                        Err(err) => eprintln!(
-                            "Attempt {attempt}: failed reading body from {download_url}: {err:?}"
-                        ),
+                    match read_body_capped(response.into_reader(), download_url, TRANSFER_TIMEOUT) {
+                        Ok(buf) => return buf,
+                        Err(err) => eprintln!("Attempt {attempt}: {err}"),
                     }
                 }
                 Err(ureq::Error::Status(status_code, _)) => {
@@ -555,6 +609,58 @@ pub mod http {
         }
         // If all retries fail, panic with an error message
         panic!("Cannot reach URL {download_url} after {retries} attempts");
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Yields one byte per `pause`, for ever. Stands in for a server that keeps the socket
+        /// healthy while making no useful progress — the case a read timeout cannot catch.
+        struct Dribble {
+            pause: Duration,
+        }
+
+        impl Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(self.pause);
+                buf[0] = 0;
+                Ok(1)
+            }
+        }
+
+        #[test]
+        fn read_body_capped_returns_the_whole_body() {
+            let body = vec![7u8; 200_000];
+            let got = read_body_capped(body.as_slice(), "test://ok", Duration::from_secs(30))
+                .expect("a complete body must not be reported as a timeout");
+            assert_eq!(got, body, "the body must survive chunked reading intact");
+        }
+
+        #[test]
+        fn read_body_capped_gives_up_on_a_transfer_that_never_ends() {
+            let started = Instant::now();
+            let err = read_body_capped(
+                Dribble {
+                    pause: Duration::from_millis(5),
+                },
+                "test://dribble",
+                Duration::from_millis(100),
+            )
+            .expect_err("an endless transfer must not read as success");
+
+            // The point of the cap: it RETURNS. Before it existed this reader hung for ever, and
+            // so did the retry loop above it.
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "gave up only after {:?} — the cap did not bind",
+                started.elapsed()
+            );
+            assert!(
+                err.contains("bytes so far"),
+                "the error must say how much arrived, to tell a stall from a slow link: {err}"
+            );
+        }
     }
 }
 

@@ -355,6 +355,22 @@ jobs:
       - name: Compile all SV2 integration targets
         timeout-minutes: 20
         run: cargo test -p integration_tests_sv2 --no-run
+      # Keyed on template_provider.rs, which carries both pinned versions. That rotates the cache
+      # on any edit to the file rather than only on a version bump — wasteful, and the alternative
+      # is pinning the versions in this key, which is the drift the prefetch script exists to
+      # avoid. A needless refetch costs a minute; a stale one costs a confusing test failure.
+      - name: Cache the harness tarballs
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sv2-tarballs
+          key: sv2-tarballs-${{ runner.os }}-${{ hashFiles('tests/integration-sv2/lib/template_provider.rs') }}
+      # ⛔ Fetch BEFORE the test loop. The harness downloads Bitcoin Core and sv2-tp on first use,
+      # which puts an uncached external fetch inside the first target's `timeout 420`. Measured
+      # 2026-09-26: 11s on a green run, >418s on a red one, reported as "pool_solo_mining failed
+      # or exceeded 420s". Here a slow mirror costs this step's own timeout and names itself.
+      - name: Prefetch the harness tarballs
+        timeout-minutes: 12
+        run: .github/scripts/prefetch-sv2-tp-tarballs.sh
       # ⚠ Per-target `timeout` as well as the job cap. Without it one hung target eats the whole
       # budget and every target after it reports as "not run" rather than as something a reader
       # can act on — which is exactly how sv2_mining_device's hang first presented.
