@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Capabilities for the Wraith Wallet GUI — only the bare minimum needed to invoke our own commands from the static frontend.","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"Capabilities for the Ghost Wallet GUI — only the bare minimum needed to invoke our own commands from the static frontend.","local":true,"windows":["main"],"permissions":["core:default"]}}

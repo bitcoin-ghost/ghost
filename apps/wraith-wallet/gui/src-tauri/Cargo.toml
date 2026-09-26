@@ -20,6 +20,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 wraith-wallet-ipc = { workspace = true }
+# Roll parsing + the digest construction, so the GUI never reimplements either.
+ghost-entropy = { workspace = true }
 tokio = { workspace = true }
 # Cross-platform local IPC client (UDS on unix, named pipes on Windows).
 interprocess = { workspace = true }

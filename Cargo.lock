@@ -10698,6 +10698,7 @@ dependencies = [
 name = "wraith-wallet-gui"
 version = "1.11.43"
 dependencies = [
+ "ghost-entropy",
  "interprocess",
  "serde",
  "serde_json",

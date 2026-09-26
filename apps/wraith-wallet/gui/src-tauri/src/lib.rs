@@ -169,16 +169,45 @@ async fn wallet_delete(name: String) -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
-/// `user_entropy_digest` is the hex digest of dice or coin flips the user
-/// supplied, mixed into the seed alongside the OS source and never used
-/// instead of it. `None` is the ordinary case and costs the user nothing —
-/// see `wraith_wallet_core::user_entropy`.
+/// `user_entropy_rolls` is the raw sequence the user typed — `1`-`6` for die
+/// faces, `h`/`t` for coin flips — mixed into the seed alongside the OS source
+/// and never used instead of it. `None` is the ordinary case and costs the user
+/// nothing; see `ghost_entropy`.
+///
+/// ## Why this takes rolls and not a digest
+///
+/// The front-end could hash the sequence itself and send 32 bytes. It must not,
+/// for two reasons:
+///
+/// 1. **The digest construction would exist twice.** It is
+///    `SHA256(tag ‖ len ‖ events)` with a versioned domain tag, and a TypeScript
+///    copy that drifted by one byte would still produce a perfectly valid digest
+///    of *something*. Nothing downstream could notice.
+/// 2. **A digest cannot be checked against the floor.** 32 opaque bytes cannot
+///    tell six rolls from ninety-nine, so `MIN_USER_BITS` — the whole point of
+///    which is to stop someone believing six rolls bought them something —
+///    becomes advice the caller may ignore. `UserEntropy::digest` enforces it,
+///    and it can only do that while it still holds the sequence.
+///
+/// This command runs in the front-end's own process, so the rolls do not leave
+/// it: the IPC message to the daemon still carries only the digest, which is the
+/// property `Request::WalletCreate` documents.
 #[tauri::command]
 async fn wallet_create(
     name: String,
     passphrase: String,
-    user_entropy_digest: Option<String>,
+    user_entropy_rolls: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    // `UserEntropy` zeroizes the sequence on drop, so it is confined to this
+    // scope by construction.
+    let user_entropy_digest = match user_entropy_rolls.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(rolls) => {
+            let entropy = ghost_entropy::parse_rolls(rolls).map_err(|e| e.to_string())?;
+            let digest = entropy.digest().map_err(|e| e.to_string())?;
+            Some(hex_encode(&digest))
+        }
+    };
     let resp = call_daemon(Request::WalletCreate {
         name,
         passphrase,
@@ -186,6 +215,15 @@ async fn wallet_create(
     })
     .await?;
     to_value(&resp)
+}
+
+/// Lowercase hex, rather than pulling in a dependency for one 32-byte value.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[tauri::command]
