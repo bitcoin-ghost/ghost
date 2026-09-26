@@ -222,6 +222,37 @@ fn next_view(
 /// Constructed only when `wraith_election_enabled` is true. Holds the inputs it
 /// needs to (re)compute a `CoordinatorView` each time the epoch changes, and
 /// caches the latest view for the read-only accessors and the HTTP endpoint.
+/// Supplies the coordinator roster from the latest finalised node-list checkpoint.
+///
+/// `None` means there is nothing agreed to read — the gate is dormant, or no checkpoint has
+/// finalised yet — and the election falls back to live mesh state.
+pub type CheckpointRosterFn =
+    Arc<dyn Fn() -> Option<Vec<(CoordinatorNodeId, String)>> + Send + Sync>;
+
+/// Where the roster in force came from.
+///
+/// Surfaced in `status_json` because #710 is otherwise unfalsifiable from outside: a roster read
+/// from the checkpoint and a roster read from local mesh state look identical once computed, so
+/// without this an operator cannot tell whether arming the checkpoint actually moved the election
+/// off node-local state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterSource {
+    /// Derived from the ratified qualified set and self-signed adverts, and agreed by a
+    /// supermajority of the voter set. Every node with the same checkpoint has the same roster.
+    Checkpoint,
+    /// This node's own view of gossiped mesh state. Two honest nodes can differ.
+    LocalMesh,
+}
+
+impl RosterSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::LocalMesh => "local_mesh",
+        }
+    }
+}
+
 pub struct CoordinatorElection {
     /// This node's own id. `[u8; 32]`, matches `wraith_protocol`'s
     /// `CoordinatorNodeId`.
@@ -249,6 +280,17 @@ pub struct CoordinatorElection {
     /// refused" is the reading that ends an investigation, and it is exactly the
     /// one a change-triggered record cannot give.
     refusals: RwLock<Vec<(CoordinatorNodeId, Ineligible)>>,
+    /// The agreed roster, when a node-list checkpoint has finalised one.
+    ///
+    /// Optional because the checkpoint is gated: below the gate there is nothing to read, and the
+    /// election must still work. So this is the seam where #710 closes — arming the checkpoint is
+    /// what moves the election off node-local state, fleet-wide, in one step.
+    checkpoint_roster: Option<CheckpointRosterFn>,
+    /// Which source the roster in force came from, as of the last recompute.
+    ///
+    /// Outside [`Cached`] for the same reason `refusals` is: diagnostic only, and it must never be
+    /// able to affect the view or when the view is rebuilt.
+    roster_source: RwLock<RosterSource>,
 }
 
 impl CoordinatorElection {
@@ -269,7 +311,24 @@ impl CoordinatorElection {
             rpc,
             cached: RwLock::new(None),
             refusals: RwLock::new(Vec::new()),
+            checkpoint_roster: None,
+            // Until the first recompute the roster is whatever the fallback would give, so
+            // reporting `LocalMesh` is the honest default — claiming `Checkpoint` before anything
+            // has been read would assert the fix is in force when nothing has looked.
+            roster_source: RwLock::new(RosterSource::LocalMesh),
         }
+    }
+
+    /// Take the roster from the finalised node-list checkpoint when there is one.
+    ///
+    /// A roster read from live mesh state is node-local: it depends on who this node happens to
+    /// have heard from, so two honest nodes can hold different rosters, draw different leaders,
+    /// and send the same wallet to different coordinators. The checkpoint's roster is derived from
+    /// the ratified qualified set and self-signed adverts and agreed by a supermajority, so every
+    /// node holding that checkpoint draws from the same set.
+    pub fn with_checkpoint_roster(mut self, f: CheckpointRosterFn) -> Self {
+        self.checkpoint_roster = Some(f);
+        self
     }
 
     /// Construct the service iff `enabled`, else `None` (gated-off path). When
@@ -281,17 +340,16 @@ impl CoordinatorElection {
         self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
+        checkpoint_roster: Option<CheckpointRosterFn>,
     ) -> Option<Arc<Self>> {
         if !enabled {
             return None;
         }
-        Some(Arc::new(Self::new(
-            identity,
-            capabilities,
-            self_endpoint,
-            mesh,
-            rpc,
-        )))
+        let mut svc = Self::new(identity, capabilities, self_endpoint, mesh, rpc);
+        if let Some(f) = checkpoint_roster {
+            svc = svc.with_checkpoint_roster(f);
+        }
+        Some(Arc::new(svc))
     }
 
     /// The eligible coordinator roster for this epoch, plus the endpoint map.
@@ -331,7 +389,20 @@ impl CoordinatorElection {
         Vec<CoordinatorNodeId>,
         EndpointMap,
         Vec<(CoordinatorNodeId, Ineligible)>,
+        RosterSource,
     ) {
+        // Prefer the agreed roster. Nothing local is consulted on this path, deliberately:
+        // mixing one agreed input with one local one does not yield a mostly-agreed answer, it
+        // yields the local one's disagreement. Refusals come back empty because on this path this
+        // node refused nothing — the membership was not its decision. `roster_source` in
+        // `status_json` is what tells an operator which path ran; an empty refusal list must not
+        // be read as "nothing was refused anywhere".
+        if let Some((roster, endpoints)) =
+            roster_from_checkpoint(self.checkpoint_roster.as_ref().and_then(|f| f()))
+        {
+            return (roster, endpoints, Vec::new(), RosterSource::Checkpoint);
+        }
+
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let policy = EligibilityPolicy::default();
 
@@ -380,7 +451,12 @@ impl CoordinatorElection {
 
         let (roster, refusals) = eligible_roster_with_reasons(&facts, policy, now);
         endpoints.retain(|id, _| roster.contains(id));
-        (canonical_roster(&roster), endpoints, refusals)
+        (
+            canonical_roster(&roster),
+            endpoints,
+            refusals,
+            RosterSource::LocalMesh,
+        )
     }
 
     /// Fetch the beacon for `epoch` by anchoring on the epoch-start block hash
@@ -405,11 +481,12 @@ impl CoordinatorElection {
     /// poisons the cache with a partial view.
     pub async fn refresh_for_height(&self, current_height: u64) -> u64 {
         let epoch = epoch_for_height(current_height);
-        let (roster, endpoints, refusals) = self.roster_with_endpoints();
+        let (roster, endpoints, refusals, roster_source) = self.roster_with_endpoints();
         // Recorded before the early returns below. A refresh that cannot reach
         // the anchor, or that finds the roster unchanged, still learned exactly
         // why each absent node is absent, and that is the reading worth having.
         *self.refusals.write() = refusals;
+        *self.roster_source.write() = roster_source;
 
         let same_epoch = self
             .cached
@@ -476,8 +553,43 @@ impl CoordinatorElection {
     /// consumer recomputes it rather than trusting it. Pre-serialised so
     /// `ghost-verification` needn't depend on `wraith-protocol`.
     pub fn status_json(&self) -> serde_json::Value {
-        status_json_for(&self.cached, &self.self_id, &self.refusals.read())
+        status_json_for(
+            &self.cached,
+            &self.self_id,
+            &self.refusals.read(),
+            *self.roster_source.read(),
+        )
     }
+}
+
+/// The agreed roster and its endpoint map, when the checkpoint supplies a usable one.
+///
+/// Free of the service so it can be tested without a mesh or an RPC, the same reason
+/// [`status_json_for`] is.
+///
+/// ⛔ Returns `None` — meaning "fall back to live mesh state" — not only when there is no
+/// checkpoint, but when the one there is yields nobody dialable. An empty roster is not a valid
+/// answer: it would seat no coordinators at all, which is worse than a node-local roster and
+/// would look like a successful read of an agreed set. A checkpoint whose entries all carry blank
+/// endpoints is the case that reaches here.
+fn roster_from_checkpoint(
+    entries: Option<Vec<(CoordinatorNodeId, String)>>,
+) -> Option<(Vec<CoordinatorNodeId>, EndpointMap)> {
+    let entries = entries?;
+    let mut endpoints = EndpointMap::new();
+    let mut ids = Vec::with_capacity(entries.len());
+    for (node_id, endpoint) in entries {
+        if !endpoint.trim().is_empty() {
+            endpoints.insert(node_id, endpoint);
+            ids.push(node_id);
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    let roster = canonical_roster(&ids);
+    endpoints.retain(|id, _| roster.contains(id));
+    Some((roster, endpoints))
 }
 
 /// The body of [`CoordinatorElection::status_json`], free of the service so a
@@ -486,6 +598,7 @@ fn status_json_for(
     cached: &RwLock<Option<Cached>>,
     self_id: &CoordinatorNodeId,
     refusals: &[(CoordinatorNodeId, Ineligible)],
+    roster_source: RosterSource,
 ) -> serde_json::Value {
     let guard = cached.read();
     let Some(c) = guard.as_ref() else {
@@ -504,6 +617,7 @@ fn status_json_for(
             "roster_size": 0,
             "roster_commitment": serde_json::Value::Null,
             "ineligible": ineligible_json(refusals),
+            "roster_source": roster_source.as_str(),
             "degraded": true,
         });
     };
@@ -562,6 +676,7 @@ fn status_json_for(
         // heard of; this names the gate that refused it and the numbers behind
         // it, so a split is read off the endpoint rather than inferred.
         "ineligible": ineligible_json(refusals),
+        "roster_source": roster_source.as_str(),
         "degraded": roster_is_degraded(c.roster.len()),
     })
 }
@@ -612,6 +727,87 @@ pub fn disabled_status_json() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    fn nid(b: u8) -> CoordinatorNodeId {
+        [b; 32]
+    }
+
+    /// The agreed roster must be taken as given, and canonicalised so two nodes that read the
+    /// same checkpoint in different orders still draw from the same set.
+    #[test]
+    fn a_checkpoint_roster_is_used_verbatim_and_canonicalised() {
+        let (roster, endpoints) = roster_from_checkpoint(Some(vec![
+            (nid(9), "c.example:1".to_string()),
+            (nid(2), "a.example:1".to_string()),
+            (nid(5), "b.example:1".to_string()),
+        ]))
+        .expect("three dialable entries must yield a roster");
+
+        assert_eq!(
+            roster,
+            canonical_roster(&[nid(9), nid(2), nid(5)]),
+            "the roster must be canonical, not the order the checkpoint happened to list"
+        );
+        assert_eq!(
+            endpoints.len(),
+            3,
+            "every dialable entry keeps its endpoint"
+        );
+    }
+
+    /// ⛔ The case that matters most: an empty roster is NOT a valid agreed answer. Seating no
+    /// coordinators is worse than a node-local roster, and would look like a successful read.
+    #[test]
+    fn a_checkpoint_with_nobody_dialable_falls_back_instead_of_seating_nobody() {
+        assert!(
+            roster_from_checkpoint(Some(vec![
+                (nid(1), String::new()),
+                (nid(2), "   ".to_string()),
+            ]))
+            .is_none(),
+            "all-blank endpoints must fall back to live mesh, not return an empty roster"
+        );
+        assert!(
+            roster_from_checkpoint(Some(Vec::new())).is_none(),
+            "an empty checkpoint roster must fall back"
+        );
+        assert!(
+            roster_from_checkpoint(None).is_none(),
+            "no checkpoint at all must fall back — this is the dormant-gate path"
+        );
+    }
+
+    /// A partially-usable checkpoint keeps the usable part rather than discarding it, but must not
+    /// leave an endpoint-less node on the roster: a wallet would dial nothing.
+    #[test]
+    fn an_entry_without_an_endpoint_is_dropped_not_kept_undialable() {
+        let (roster, endpoints) = roster_from_checkpoint(Some(vec![
+            (nid(1), "good.example:1".to_string()),
+            (nid(2), String::new()),
+        ]))
+        .expect("one dialable entry is enough");
+        assert_eq!(roster, vec![nid(1)], "only the dialable node is seated");
+        assert!(
+            !endpoints.contains_key(&nid(2)),
+            "an endpoint-less node must not appear in the endpoint map"
+        );
+    }
+
+    /// #710 is unfalsifiable from outside without this: the two rosters look identical once
+    /// computed, so the served status has to say which path produced it.
+    #[test]
+    fn status_reports_which_roster_source_is_in_force() {
+        let lock = RwLock::new(None);
+        let me = &nid(7);
+        let local = status_json_for(&lock, me, &[], RosterSource::LocalMesh);
+        let agreed = status_json_for(&lock, me, &[], RosterSource::Checkpoint);
+        assert_eq!(local["roster_source"], "local_mesh");
+        assert_eq!(agreed["roster_source"], "checkpoint");
+        assert_ne!(
+            local["roster_source"], agreed["roster_source"],
+            "the two sources must be distinguishable, or arming the checkpoint cannot be verified"
+        );
+    }
     use super::*;
 
     fn node(i: u8) -> CoordinatorNodeId {
@@ -874,7 +1070,7 @@ mod tests {
     ) -> serde_json::Value {
         let svc = Cached::clone(c);
         let lock = RwLock::new(Some(svc));
-        status_json_for(&lock, me, refusals)
+        status_json_for(&lock, me, refusals, RosterSource::LocalMesh)
     }
 
     #[test]
