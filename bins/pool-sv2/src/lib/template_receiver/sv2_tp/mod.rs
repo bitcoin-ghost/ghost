@@ -275,7 +275,14 @@ impl Sv2Tp {
                         info!("Template Receiver: received shutdown signal");
                         break;
                     }
-                    res = self_clone_1.handle_template_provider_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933, same shape as #854).
+                    // The handling runs in the branch BODY, which completes and cannot be
+                    // cancelled by a sibling becoming ready.
+                    tp = self_clone_1.sv2_tp_channel.tp_receiver.recv() => {
+                        let res = match tp {
+                            Ok(f) => self_clone_1.process_template_provider_message(f).await,
+                            Err(e) => Err(PoolError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             error!("TemplateReceiver template provider handler failed: {e:?}");
                             match e.action {
@@ -307,7 +314,11 @@ impl Sv2Tp {
                             }
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message() => {
+                    cm = self_clone_2.sv2_tp_channel.channel_manager_receiver.recv() => {
+                        let res = match cm {
+                            Ok(m) => self_clone_2.process_channel_manager_message(m).await,
+                            Err(e) => Err(PoolError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             error!("TemplateReceiver channel manager handler failed: {e:?}");
                             match e.action {
@@ -329,21 +340,23 @@ impl Sv2Tp {
         Ok(())
     }
 
-    /// Handle inbound messages from the template provider.
+    /// Handle inbound messages from the template provider, once off the channel.
     ///
     /// Routes:
     /// - `Common` messages → handled locally
     /// - `TemplateDistribution` messages → forwarded to ChannelManager
     /// - Unsupported messages → logged and ignored
-    pub async fn handle_template_provider_message(
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the frame is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    pub async fn process_template_provider_message(
         &mut self,
+        mut sv2_frame: Sv2Frame,
     ) -> PoolResult<(), error::TemplateProvider> {
-        let mut sv2_frame = self
-            .sv2_tp_channel
-            .tp_receiver
-            .recv()
-            .await
-            .map_err(PoolError::shutdown)?;
         debug!("Received SV2 frame from Template provider.");
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
@@ -387,16 +400,19 @@ impl Sv2Tp {
         Ok(())
     }
 
-    /// Handle messages from channel manager → template provider.
+    /// Handle messages from channel manager → template provider, once off the channel.
     ///
-    /// Forwards outbound frames upstream
-    pub async fn handle_channel_manager_message(&self) -> PoolResult<(), error::TemplateProvider> {
-        let msg = self
-            .sv2_tp_channel
-            .channel_manager_receiver
-            .recv()
-            .await
-            .map_err(PoolError::shutdown)?;
+    /// Forwards outbound frames upstream.
+    ///
+    /// ⛔ Same cancellation hazard as [`Self::process_template_provider_message`], in the other
+    /// direction. It also MUTATES state — it records the coinbase constraints so a reconnected
+    /// session can be primed — so a cancelled future loses both the forward and the record (#933).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    pub async fn process_channel_manager_message(
+        &self,
+        msg: TemplateDistribution<'static>,
+    ) -> PoolResult<(), error::TemplateProvider> {
         // Remember the coinbase constraints so a reconnected session can be primed with them.
         if matches!(msg, TemplateDistribution::CoinbaseOutputConstraints(_)) {
             if let Ok(mut slot) = self.last_coinbase_constraints.lock() {

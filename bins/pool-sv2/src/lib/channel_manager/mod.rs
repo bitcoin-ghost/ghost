@@ -481,7 +481,11 @@ impl ChannelManager {
                     res = &mut vardiff_future => {
                         info!("Vardiff loop completed with: {res:?}");
                     }
-                    res = cm_template.handle_template_provider_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933, same shape as #854).
+                    // The handling runs in the branch BODY, which completes and cannot be
+                    // cancelled by a sibling becoming ready.
+                    tp = cm_template.channel_manager_channel.tp_receiver.recv() => {
+                        let res = cm_template.process_template_provider_message(tp).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Template Receiver message");
                             match e.action {
@@ -498,7 +502,8 @@ impl ChannelManager {
                             }
                         }
                     }
-                    res = cm_downstreams.handle_downstream_mining_message() => {
+                    dm = cm_downstreams.channel_manager_channel.downstream_receiver.recv() => {
+                        let res = cm_downstreams.process_downstream_mining_message(dm).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Downstreams message");
                             match e.action {
@@ -540,25 +545,51 @@ impl ChannelManager {
 
     // Handles messages received from the TP subsystem.
     //
-    // This method listens for incoming frames on the `tp_receiver` channel.
-    // - If the frame contains a TemplateDistribution message, it forwards it to the template
-    //   distribution message handler.
-    // - If the frame contains any unsupported message type, an error is returned.
-    async fn handle_template_provider_message(&mut self) -> PoolResult<(), error::ChannelManager> {
-        if let Ok(message) = self.channel_manager_channel.tp_receiver.recv().await {
+    /// Handles a template-distribution message once it is off the `tp_receiver` channel.
+    ///
+    /// - A `TemplateDistribution` message is forwarded to the template distribution handler.
+    /// - An unsupported message type returns an error.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the message is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// pool_sv2 is the `sri-pool` service on every node in the fleet, and this path carries new
+    /// templates, so a message lost here is work the pool never hands out.
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    ///
+    /// ⚠ A closed channel still resolves to `Ok(())`, exactly as before this split. That means
+    /// the loop can spin on a dead channel, which it already could — preserved rather than
+    /// changed here, because turning it into an error alters shutdown behaviour and deserves its
+    /// own consideration rather than riding a cancellation fix.
+    async fn process_template_provider_message(
+        &mut self,
+        received: Result<TemplateDistribution<'static>, async_channel::RecvError>,
+    ) -> PoolResult<(), error::ChannelManager> {
+        if let Ok(message) = received {
             self.handle_template_distribution_message_from_server(None, message, None)
                 .await?;
         }
         Ok(())
     }
 
-    async fn handle_downstream_mining_message(&mut self) -> PoolResult<(), error::ChannelManager> {
-        if let Ok((downstream_id, message, tlv_fields)) = self
-            .channel_manager_channel
-            .downstream_receiver
-            .recv()
-            .await
-        {
+    /// Everything that happens to a downstream mining message AFTER it is off the channel.
+    ///
+    /// ⛔ Same cancellation hazard as [`Self::process_template_provider_message`], in the other
+    /// direction: this carries share submissions from every connected miner (#933).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    #[allow(clippy::type_complexity)]
+    async fn process_downstream_mining_message(
+        &mut self,
+        received: Result<
+            (DownstreamId, Mining<'static>, Option<Vec<Tlv>>),
+            async_channel::RecvError,
+        >,
+    ) -> PoolResult<(), error::ChannelManager> {
+        if let Ok((downstream_id, message, tlv_fields)) = received {
             let tlv_slice = tlv_fields.as_deref();
             self.handle_mining_message_from_client(Some(downstream_id), message, tlv_slice)
                 .await?;
