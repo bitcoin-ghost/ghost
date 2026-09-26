@@ -168,7 +168,12 @@ impl Downstream {
                         break;
                     }
 
-                    res = self_clone_1.handle_message_from_downstream() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933).
+                    frame = self_clone_1.downstream_io.from_downstream_receiver.recv() => {
+                        let res = match frame {
+                            Ok(f) => self_clone_1.process_message_from_downstream(f).await,
+                            Err(e) => Err(error::JDSError::disconnect(e, downstream_id)),
+                        };
                         if let Err(e) = res {
                             error!(?e, "Error handling downstream message for {downstream_id}");
                             match e.action {
@@ -178,7 +183,8 @@ impl Downstream {
                             }
                         }
                     }
-                    res = self_clone_2.handle_job_declarator_message() => {
+                    jd = self_clone_2.downstream_io.from_job_declarator_receiver.recv() => {
+                        let res = self_clone_2.process_job_declarator_message(jd).await;
                         if let Err(e) = res {
                             error!(?e, "Error handling job declarator message for {downstream_id}");
                             match e.action {
@@ -265,11 +271,19 @@ impl Downstream {
     }
 
     // Handles messages from the job declarator to this downstream client.
-    async fn handle_job_declarator_message(&self) -> JDSResult<(), error::Downstream> {
-        let receiver = &self.downstream_io.from_job_declarator_receiver;
-
+    /// Everything that happens to a job-declarator message AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_job_declarator_message(
+        &self,
+        received: Result<JobDeclarationMessage, async_channel::RecvError>,
+    ) -> JDSResult<(), error::Downstream> {
         // todo: handle tlv fields?
-        let (msg, _tlv_fields) = match receiver.recv().await {
+        let (msg, _tlv_fields) = match received {
             Ok(msg) => msg,
             Err(e) => {
                 error!("Error receiving message: {:?}", e);
@@ -295,13 +309,17 @@ impl Downstream {
     }
 
     // Handles messages from this downstream client.
-    async fn handle_message_from_downstream(&mut self) -> JDSResult<(), error::Downstream> {
-        let mut sv2_frame = self
-            .downstream_io
-            .from_downstream_receiver
-            .recv()
-            .await
-            .map_err(|e| error::JDSError::disconnect(e, self.downstream_id))?;
+    /// Everything that happens to a downstream frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_message_from_downstream(
+        &mut self,
+        mut sv2_frame: Sv2Frame,
+    ) -> JDSResult<(), error::Downstream> {
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
             error::JDSError::disconnect(framing_sv2::Error::MissingHeader, self.downstream_id)

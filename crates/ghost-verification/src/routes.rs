@@ -11812,16 +11812,21 @@ async fn api_swarm_sync_post_handler(
     api_swarm_sync_handler(State(state)).await
 }
 
-/// API v1 Swarm: Update all nodes (POST variant)
+/// API v1 Swarm: update every node.
+///
+/// ⛔ Returns 501, like its per-node siblings. This was the LAST fleet-control route still
+/// reporting fabricated success — `{"message": "Update all command sent"}` with nothing sent
+/// (#403). An operator pressing "update all" was told it worked.
+///
+/// It cannot be real before the single-node update is: there is no authenticated node-to-node
+/// control RPC to fan out to. Reporting that plainly is the whole point — a success message for
+/// an action nobody performed is worse than an honest refusal, because it ends the operator's
+/// investigation.
 async fn api_swarm_update_all_post_handler(
-    State(state): State<Arc<VerificationState>>,
+    State(_state): State<Arc<VerificationState>>,
     Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _ = state;
-    Json(serde_json::json!({
-        "message": "Update all command sent",
-        "updated_count": 0
-    }))
+    swarm_not_implemented("all", "update all nodes")
 }
 
 /// Allowed services for watchdog control
@@ -12731,6 +12736,54 @@ mod tests {
                 "the message should point at the issue explaining why"
             );
         }
+    }
+
+    /// The REAL handlers must not report success without acting (#403).
+    ///
+    /// ⚠ The test above asserts `swarm_not_implemented` behaves — it exercises the HELPER, not
+    /// the routes. That is why `update-all` sat returning `{"message": "Update all command sent"}`
+    /// while that test stayed green: a route simply not calling the helper was invisible to it.
+    ///
+    /// This calls the handler itself, which is the only thing that proves what an operator gets.
+    #[tokio::test]
+    async fn swarm_update_all_handler_does_not_fabricate_success() {
+        use axum::response::IntoResponse;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use http_body_util::BodyExt;
+
+        let state = crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        );
+
+        let resp = api_swarm_update_all_post_handler(
+            axum::extract::State(std::sync::Arc::new(state)),
+            axum::Json(serde_json::json!({})),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "update-all must refuse, not claim it sent anything"
+        );
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "not_implemented");
+        assert_eq!(body["action"], "update all nodes");
+
+        // The exact lie this closes. Asserting its absence keeps the test meaningful if someone
+        // later re-adds a cheerful message alongside the 501.
+        let whole = body.to_string();
+        assert!(
+            !whole.contains("command sent"),
+            "no variant of \"command sent\" may appear: {whole}"
+        );
     }
 
     #[test]

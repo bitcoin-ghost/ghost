@@ -277,7 +277,9 @@ impl JobDeclarator {
                         info!("Job Declarator: cancellation token triggered");
                         break;
                     }
-                    res = self.handle_jdp_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933).
+                    jdp = self.job_declarator_io.job_declarator_receiver.recv() => {
+                        let res = self.process_jdp_message(jdp).await;
                         if let Err(e) = res {
                             error!(?e, "Error handling Job Declaration message");
                             match e.action {
@@ -342,9 +344,22 @@ impl JobDeclarator {
     }
 
     /// Receives and dispatches a single JDP message from the fan-in channel.
-    async fn handle_jdp_message(&mut self) -> JDSResult<(), error::JobDeclarator> {
-        let receiver = self.job_declarator_io.job_declarator_receiver.clone();
-        let (downstream_id, jd_message, tlv_fields) = match receiver.recv().await {
+    ///
+    /// Everything that happens to a job-declaration message from a client AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    ///
+    /// ⚠ This loop has ONE message branch plus a cancellation token, so the only future that can
+    /// cancel it is shutdown — a bounded loss compared with the two-branch loops, but a loss.
+    async fn process_jdp_message(
+        &mut self,
+        received: Result<DownstreamJobDeclarationMessage, async_channel::RecvError>,
+    ) -> JDSResult<(), error::JobDeclarator> {
+        let (downstream_id, jd_message, tlv_fields) = match received {
             Ok(msg) => msg,
             Err(e) => {
                 error!("Error receiving message: {:?}", e);

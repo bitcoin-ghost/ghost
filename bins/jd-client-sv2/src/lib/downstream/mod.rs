@@ -183,7 +183,7 @@ impl Downstream {
             let fallback_token = fallback_coordinator.token();
 
             loop {
-                let self_clone_1 = self.clone();
+                let mut self_clone_1 = self.clone();
                 let downstream_id = self_clone_1.downstream_id;
                 let self_clone_2 = self.clone();
                 tokio::select! {
@@ -195,7 +195,12 @@ impl Downstream {
                         debug!("Downstream {downstream_id}: received fallback signal");
                         break;
                     }
-                    res = self_clone_1.handle_downstream_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933).
+                    frame = self_clone_1.downstream_channel.downstream_receiver.recv() => {
+                        let res = match frame {
+                            Ok(f) => self_clone_1.process_downstream_message(f).await,
+                            Err(e) => Err(JDCError::disconnect(e, downstream_id)),
+                        };
                         if let Err(e) = res {
                             error!(?e, "Error handling downstream message for {downstream_id}");
                             if handle_error(&status_sender, e).await {
@@ -203,7 +208,8 @@ impl Downstream {
                             }
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message() => {
+                    cm = self_clone_2.downstream_channel.channel_manager_receiver.recv() => {
+                        let res = self_clone_2.clone().process_channel_manager_message(cm).await;
                         if let Err(e) = res {
                             error!(?e, "Error handling channel manager message for {downstream_id}");
                             if handle_error(&status_sender, e).await {
@@ -241,14 +247,20 @@ impl Downstream {
         ))
     }
 
+    /// Everything that happens to a channel-manager message AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    #[allow(clippy::type_complexity)]
     // Handles messages sent from the channel manager to this downstream.
-    async fn handle_channel_manager_message(self) -> JDCResult<(), error::Downstream> {
-        let (message, _tlv_fields) = match self
-            .downstream_channel
-            .channel_manager_receiver
-            .recv()
-            .await
-        {
+    async fn process_channel_manager_message(
+        self,
+        received: Result<(Mining<'static>, Option<Vec<Tlv>>), async_channel::RecvError>,
+    ) -> JDCResult<(), error::Downstream> {
+        let (message, _tlv_fields) = match received {
             Ok(msg) => msg,
             Err(e) => {
                 warn!(
@@ -278,13 +290,17 @@ impl Downstream {
     }
 
     // Handles incoming messages from the downstream peer.
-    async fn handle_downstream_message(mut self) -> JDCResult<(), error::Downstream> {
-        let mut sv2_frame = self
-            .downstream_channel
-            .downstream_receiver
-            .recv()
-            .await
-            .map_err(|error| JDCError::disconnect(error, self.downstream_id))?;
+    /// Everything that happens to a downstream frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_downstream_message(
+        &mut self,
+        mut sv2_frame: Sv2Frame,
+    ) -> JDCResult<(), error::Downstream> {
         let header = sv2_frame
             .get_header()
             .expect("frame header must be present");

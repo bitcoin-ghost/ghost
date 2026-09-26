@@ -169,7 +169,12 @@ impl JobDeclarator {
                         info!("Job Declarator: fallback triggered");
                         break;
                     }
-                    res = self_clone_1.handle_job_declarator_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933).
+                    jds = self_clone_1.job_declarator_channel.jds_receiver.recv() => {
+                        let res = match jds {
+                            Ok(f) => self_clone_1.process_job_declarator_message(f).await,
+                            Err(e) => Err(JDCError::fallback(e)),
+                        };
                         if let Err(e) = res {
                             error!(error = ?e, "Job Declarator message handling failed");
                             if handle_error(&status_sender, e).await {
@@ -177,7 +182,8 @@ impl JobDeclarator {
                             }
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message() => {
+                    cm = self_clone_2.job_declarator_channel.channel_manager_receiver.recv() => {
+                        let res = self_clone_2.process_channel_manager_message(cm).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Channel Manager message handling failed");
                             if handle_error(&status_sender, e).await {
@@ -243,13 +249,18 @@ impl JobDeclarator {
     }
 
     // Handles messages coming from the Channel Manager and forwards them to the Job Declarator.
-    async fn handle_channel_manager_message(&self) -> JDCResult<(), error::JobDeclarator> {
-        match self
-            .job_declarator_channel
-            .channel_manager_receiver
-            .recv()
-            .await
-        {
+    /// Everything that happens to a channel-manager message AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_channel_manager_message(
+        &self,
+        received: Result<JobDeclaration<'static>, async_channel::RecvError>,
+    ) -> JDCResult<(), error::JobDeclarator> {
+        match received {
             Ok(msg) => {
                 debug!("Forwarding message from channel manager to JDS.");
                 let message = AnyMessage::JobDeclaration(msg);
@@ -275,14 +286,17 @@ impl JobDeclarator {
     // - Forwards `JobDeclaration` messages to Channel Manager.
     // - Processes `Common` messages via handler.
     // - Rejects unsupported message types.
-    async fn handle_job_declarator_message(&mut self) -> JDCResult<(), error::JobDeclarator> {
-        let mut sv2_frame = self
-            .job_declarator_channel
-            .jds_receiver
-            .recv()
-            .await
-            .map_err(JDCError::fallback)?;
-
+    /// Everything that happens to a JDS frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_job_declarator_message(
+        &mut self,
+        mut sv2_frame: Sv2Frame,
+    ) -> JDCResult<(), error::JobDeclarator> {
         debug!("Received SV2 frame from JDS.");
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");

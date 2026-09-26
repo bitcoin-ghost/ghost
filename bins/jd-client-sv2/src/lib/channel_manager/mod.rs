@@ -635,7 +635,12 @@ impl ChannelManager {
                     res = &mut vardiff_future => {
                         info!("Vardiff loop completed with: {res:?}");
                     }
-                    res = cm_jds.handle_jds_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933, same shape as #854).
+                    // The handling runs in the branch BODY, which completes and cannot be
+                    // cancelled by a sibling becoming ready. Four competing message branches
+                    // here, so any of them could lose what it had already consumed.
+                    jds = cm_jds.channel_manager_channel.jd_receiver.recv() => {
+                        let res = cm_jds.process_jds_message(jds).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling JDS message");
                             if handle_error(&status_sender, e).await {
@@ -643,7 +648,8 @@ impl ChannelManager {
                             }
                         }
                     }
-                    res = cm_pool.handle_pool_message_frame() => {
+                    pool = cm_pool.channel_manager_channel.upstream_receiver.recv() => {
+                        let res = cm_pool.process_pool_message_frame(pool).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Pool message");
                             if handle_error(&status_sender, e).await {
@@ -651,7 +657,8 @@ impl ChannelManager {
                             }
                         }
                     }
-                    res = cm_template.handle_template_provider_message() => {
+                    tp = cm_template.channel_manager_channel.tp_receiver.recv() => {
+                        let res = cm_template.process_template_provider_message(tp).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Template Receiver message");
                             if handle_error(&status_sender, e).await {
@@ -659,7 +666,8 @@ impl ChannelManager {
                             }
                         }
                     }
-                    res = cm_downstreams.handle_downstream_message() => {
+                    dm = cm_downstreams.channel_manager_channel.downstream_receiver.recv() => {
+                        let res = cm_downstreams.process_downstream_message(dm).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Downstreams message");
                             if handle_error(&status_sender, e).await {
@@ -705,8 +713,23 @@ impl ChannelManager {
     /// - If the frame contains a JobDeclaration message, it forwards it to the   job declaration
     ///   message handler.
     /// - If the frame contains any unsupported message type, an error is returned.
-    async fn handle_jds_message(&mut self) -> JDCResult<(), error::ChannelManager> {
-        if let Ok(message) = self.channel_manager_channel.jd_receiver.recv().await {
+    ///
+    /// Everything that happens to a job-declaration message from the JDS AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the message is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    ///
+    /// ⚠ A closed channel still resolves to `Ok(())`, exactly as before this split — preserved
+    /// rather than changed, because turning it into an error alters shutdown behaviour.
+    async fn process_jds_message(
+        &mut self,
+        received: Result<JobDeclaration<'static>, async_channel::RecvError>,
+    ) -> JDCResult<(), error::ChannelManager> {
+        if let Ok(message) = received {
             self.handle_job_declaration_message_from_server(None, message, None)
                 .await?;
         }
@@ -719,8 +742,23 @@ impl ChannelManager {
     /// - If the frame contains a **Mining** message, it forwards it to the   mining message
     ///   handler.
     /// - If the frame contains any unsupported message type, an error is returned.
-    async fn handle_pool_message_frame(&mut self) -> JDCResult<(), error::ChannelManager> {
-        if let Ok(mut sv2_frame) = self.channel_manager_channel.upstream_receiver.recv().await {
+    ///
+    /// Everything that happens to a pool frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the message is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    ///
+    /// ⚠ A closed channel still resolves to `Ok(())`, exactly as before this split — preserved
+    /// rather than changed, because turning it into an error alters shutdown behaviour.
+    async fn process_pool_message_frame(
+        &mut self,
+        received: Result<Sv2Frame, async_channel::RecvError>,
+    ) -> JDCResult<(), error::ChannelManager> {
+        if let Ok(mut sv2_frame) = received {
             let header = sv2_frame.get_header().ok_or_else(|| {
                 error!("SV2 frame missing header");
                 JDCError::fallback(framing_sv2::Error::MissingHeader)
@@ -755,14 +793,40 @@ impl ChannelManager {
     // - If the frame contains a TemplateDistribution message, it forwards it to the   template
     //   distribution message handler.
     // - If the frame contains any unsupported message type, an error is returned.
-    async fn handle_template_provider_message(&mut self) -> JDCResult<(), error::ChannelManager> {
-        if let Ok(message) = self.channel_manager_channel.tp_receiver.recv().await {
+    /// Everything that happens to a template-distribution message AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the message is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    ///
+    /// ⚠ A closed channel still resolves to `Ok(())`, exactly as before this split — preserved
+    /// rather than changed, because turning it into an error alters shutdown behaviour.
+    async fn process_template_provider_message(
+        &mut self,
+        received: Result<TemplateDistribution<'static>, async_channel::RecvError>,
+    ) -> JDCResult<(), error::ChannelManager> {
+        if let Ok(message) = received {
             self.handle_template_distribution_message_from_server(None, message, None)
                 .await?;
         }
         Ok(())
     }
 
+    /// Everything that happens to a downstream mining message AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the message is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    ///
+    /// ⚠ A closed channel still resolves to `Ok(())`, exactly as before this split — preserved
+    /// rather than changed, because turning it into an error alters shutdown behaviour.
+    #[allow(clippy::type_complexity)]
     // Handles messages received from downstream clients and routes them appropriately.
     //
     // # Overview
@@ -796,13 +860,14 @@ impl ChannelManager {
     // - Only one upstream channel is created per JDC instance.
     // - After the upstream channel is established, all new downstream requests bypass the pending
     //   mechanism and are sent directly to the mining handler.
-    async fn handle_downstream_message(&mut self) -> JDCResult<(), error::ChannelManager> {
-        if let Ok((downstream_id, message, tlvs)) = self
-            .channel_manager_channel
-            .downstream_receiver
-            .recv()
-            .await
-        {
+    async fn process_downstream_message(
+        &mut self,
+        received: Result<
+            (DownstreamId, Mining<'static>, Option<Vec<Tlv>>),
+            async_channel::RecvError,
+        >,
+    ) -> JDCResult<(), error::ChannelManager> {
+        if let Ok((downstream_id, message, tlvs)) = received {
             match message {
                 Mining::OpenExtendedMiningChannel(downstream_channel_request) => {
                     let downstream_msg = downstream_channel_request.clone().into_static();
