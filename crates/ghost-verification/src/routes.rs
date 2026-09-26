@@ -11722,12 +11722,39 @@ async fn api_swarm_node_update_handler(
     swarm_not_implemented(&node_id, "update node metadata")
 }
 
-/// API v1 Swarm: Re-poll a node's status
+/// API v1 Swarm: re-poll a node's status.
+///
+/// Real, unlike its siblings below, because "re-poll" is something a node can do for itself: it
+/// collects and returns its own live status. It is the one fleet-control action that needed no
+/// new mechanism at all (#403).
+///
+/// No operator signature is required, deliberately. This serves exactly what
+/// `/api/v1/node/status` already serves unauthenticated — `get_health()` plus the public
+/// capability flags — so demanding a signature would be ceremony around data anyone can already
+/// read, and the first person to notice would be tempted to remove it.
+///
+/// ⛔ It does bind the path's node id to this node's own. Serving local status under a different
+/// node's id is #403's defect in a quieter register: the operator would get a healthy reading
+/// attributed to a node nobody asked about, and act on it. A mismatch says which node holds the
+/// answer instead of guessing on the caller's behalf.
 async fn api_swarm_node_refresh_handler(
-    State(_state): State<Arc<VerificationState>>,
+    State(state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
-    swarm_not_implemented(&node_id, "refresh node status")
+    let health = state.get_health().await;
+    if node_id != health.node_id {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "wrong_target",
+                "node_id": node_id,
+                "this_node": health.node_id,
+                "message": "a node reports only its own status; address that node's API directly",
+            })),
+        )
+            .into_response();
+    }
+    api_node_status_handler(State(state)).await.into_response()
 }
 
 /// API v1 Swarm: Configure a remote node
@@ -12710,14 +12737,17 @@ mod tests {
         use axum::response::IntoResponse;
         use http_body_util::BodyExt;
 
+        // ⚠ Only the actions that STILL route through the helper. `restart node` and
+        // `refresh node status` were listed here after they became real handlers that never call
+        // it, so this loop was asserting the helper echoes two strings nothing passes it — green,
+        // and describing code that no longer exists. Their real handlers are tested below.
         for action in [
-            "restart node",
             "configure node",
-            "refresh node status",
             "update node version",
             "update node metadata",
             "remove node",
             "add node",
+            "update all nodes",
         ] {
             let resp = swarm_not_implemented("deadbeef", action).into_response();
             assert_eq!(
@@ -12783,6 +12813,66 @@ mod tests {
         assert!(
             !whole.contains("command sent"),
             "no variant of \"command sent\" may appear: {whole}"
+        );
+    }
+
+    /// `refresh` is the one fleet-control action that is real (#403), so it gets the opposite
+    /// test: it must actually answer, and it must answer only for itself.
+    #[tokio::test]
+    async fn swarm_refresh_serves_live_status_for_this_node_only() {
+        use axum::response::IntoResponse;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use http_body_util::BodyExt;
+
+        let state = std::sync::Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        ));
+
+        // Addressed to this node: a real status body, not a 501.
+        let resp = api_swarm_node_refresh_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("test_node".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "refresh must answer for its own node, not refuse"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["node_id"], "test_node");
+        assert!(
+            body.get("block_height").is_some() && body.get("uptime_secs").is_some(),
+            "it must return the collected status, not an empty acknowledgement: {body}"
+        );
+
+        // Addressed to someone else: refuse, and say who holds the answer. Returning this node's
+        // status here would be #403's fabrication wearing another node's name.
+        let resp = api_swarm_node_refresh_handler(
+            axum::extract::State(state),
+            axum::extract::Path("some_other_node".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a node must not answer for a node it is not"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "wrong_target");
+        assert_eq!(body["this_node"], "test_node", "it must name itself");
+        let whole = body.to_string();
+        assert!(
+            !whole.contains("\"online\""),
+            "no status field may leak into the refusal, or the caller will read it as an answer: {whole}"
         );
     }
 
