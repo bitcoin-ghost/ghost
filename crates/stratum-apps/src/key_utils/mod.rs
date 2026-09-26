@@ -157,9 +157,18 @@ impl Secp256k1SecretKey {
     /// Generate a fresh secret key from the operating-system CSPRNG. Used by the
     /// pool role to mint a per-node SV2 authority keypair at install time, so no
     /// two nodes ship the same static Noise identity.
+    ///
+    /// ⛔ `OsRng`, not `thread_rng()`. The doc above said "operating-system CSPRNG" while the code
+    /// drew from `rand::thread_rng()` — a ChaCha12 generator seeded from the OS, which is sound in
+    /// practice but is not what was claimed, and is forbidden for key material by E-1 (#705).
+    ///
+    /// The same substitution was already fixed once in `Keystore::create` (`4d52543f0`) for being
+    /// the shape of the Coldcard failure: a seed drawn from a generator nobody audited. This one
+    /// mints the SV2 AUTHORITY keypair, which is the pool's signing identity, so the gap between
+    /// documentation and code mattered more here than anywhere.
     #[cfg(feature = "std")]
     pub fn generate() -> Self {
-        Secp256k1SecretKey(SecretKey::new(&mut rand::thread_rng()))
+        Secp256k1SecretKey(SecretKey::new(&mut rand::rngs::OsRng))
     }
 }
 
@@ -184,9 +193,11 @@ impl SignatureService {
         }
     }
 
+    /// ⛔ `OsRng`, not `thread_rng()`: this randomness goes into the signature, and
+    /// `sign_with_rng` is the seam that exists so a caller can supply its own. E-1 (#705).
     #[cfg(feature = "std")]
     pub fn sign(&self, message: Vec<u8>, private_key: SecretKey) -> Signature {
-        self.sign_with_rng(message, private_key, &mut rand::thread_rng())
+        self.sign_with_rng(message, private_key, &mut rand::rngs::OsRng)
     }
 
     #[inline]
