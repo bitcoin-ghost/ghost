@@ -15,7 +15,8 @@ use anyhow::{bail, Context, Result};
 use ghost_common::identity::verify_signature;
 use ghost_common::types::NodeId;
 use ghost_consensus::{
-    mesh_advert_set_root, mesh_node_list_root, mesh_signer_set_root, MeshEndpointAdvert,
+    coordinator_roster_from_adverts, mesh_advert_set_root, mesh_coordinator_roster_root,
+    mesh_node_list_root, mesh_signer_set_root, CoordinatorRosterEntry, MeshEndpointAdvert,
     MeshNodeEntry, MeshNodeListCheckpointMessage, MeshNodeListCheckpointVoteMessage,
     SignerSetDelta,
 };
@@ -41,6 +42,10 @@ pub(crate) struct CheckpointBlob {
     #[serde(default)]
     pub advert_root: String,
     pub list_root: String,
+    /// `mesh_coordinator_roster_root(roster)`. Inside `checkpoint_hash`, so like
+    /// `advert_root` the hash cannot be reconstructed without it.
+    #[serde(default)]
+    pub coordinator_roster_root: String,
     pub signer_set_root: String,
     #[serde(default)]
     pub signer_set_delta: BlobDelta,
@@ -58,6 +63,10 @@ pub(crate) struct BlobAdvert {
     pub sv1_port: u16,
     pub sv2_port: u16,
     pub public_mining: bool,
+    #[serde(default)]
+    pub coordinator: bool,
+    #[serde(default)]
+    pub coordinator_endpoint: String,
     pub seq: u64,
     pub signature: String,
 }
@@ -90,6 +99,18 @@ pub(crate) struct VerifiedNode {
     pub host: String,
     pub sv1_port: u16,
     pub sv2_port: u16,
+}
+
+/// Everything one verified checkpoint attests.
+///
+/// The miner proxy only reads `nodes`. `coordinator_roster` is carried because it was
+/// verified on the way past and discarding it would mean the next consumer — a wallet
+/// choosing which coordinator to trust for a Wraith round — re-implementing this
+/// verification rather than reusing it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VerifiedCheckpoint {
+    pub nodes: Vec<VerifiedNode>,
+    pub coordinator_roster: Vec<CoordinatorRosterEntry>,
 }
 
 fn hex32(s: &str) -> Result<[u8; 32]> {
@@ -129,7 +150,7 @@ fn hex64(s: &str) -> Result<[u8; 64]> {
 pub(crate) fn verify_and_advance(
     blob: &CheckpointBlob,
     trusted: &mut Vec<NodeId>,
-) -> Result<Vec<VerifiedNode>> {
+) -> Result<VerifiedCheckpoint> {
     let trusted_set: HashSet<NodeId> = trusted.iter().copied().collect();
     if trusted_set.is_empty() {
         bail!("empty trusted signer set (need a genesis anchor)");
@@ -187,6 +208,8 @@ pub(crate) fn verify_and_advance(
                 sv1_port: a.sv1_port,
                 sv2_port: a.sv2_port,
                 public_mining: a.public_mining,
+                coordinator: a.coordinator,
+                coordinator_endpoint: a.coordinator_endpoint.clone(),
                 seq: a.seq,
                 signature: hex64(&a.signature)?,
             })
@@ -218,6 +241,16 @@ pub(crate) fn verify_and_advance(
         bail!("the node list is not what its adverts derive to");
     }
 
+    // (1d) Same again for the coordinator roster. Re-derived from the same adverts rather
+    // than read from the blob, so a served roster that disagrees with what its own adverts
+    // say is refused — the roster decides which coordinator a wallet is sent to, and later
+    // which nodes are paid for coordinating, so "signed alongside" is not good enough.
+    let coordinator_roster = coordinator_roster_from_adverts(&adverts);
+    let coordinator_roster_root = hex32(&blob.coordinator_roster_root)?;
+    if mesh_coordinator_roster_root(&coordinator_roster) != coordinator_roster_root {
+        bail!("the coordinator roster is not what its adverts derive to");
+    }
+
     let msg = MeshNodeListCheckpointMessage {
         height: blob.height,
         cutoff_ts: blob.cutoff_ts,
@@ -225,6 +258,8 @@ pub(crate) fn verify_and_advance(
         adverts: adverts.clone(),
         advert_root,
         list_root,
+        coordinator_roster: coordinator_roster.clone(),
+        coordinator_roster_root,
         signer_set_delta: SignerSetDelta {
             added: added.clone(),
             removed: removed.clone(),
@@ -291,14 +326,17 @@ pub(crate) fn verify_and_advance(
 
     // Adopt.
     *trusted = new_vec;
-    Ok(entries
-        .into_iter()
-        .map(|e| VerifiedNode {
-            host: e.host,
-            sv1_port: e.sv1_port,
-            sv2_port: e.sv2_port,
-        })
-        .collect())
+    Ok(VerifiedCheckpoint {
+        nodes: entries
+            .into_iter()
+            .map(|e| VerifiedNode {
+                host: e.host,
+                sv1_port: e.sv1_port,
+                sv2_port: e.sv2_port,
+            })
+            .collect(),
+        coordinator_roster,
+    })
 }
 
 #[cfg(test)]
@@ -318,9 +356,20 @@ mod tests {
             sv1_port: 3333,
             sv2_port: 34255,
             public_mining,
+            coordinator: false,
+            coordinator_endpoint: String::new(),
             seq: 1,
             signature: [0u8; 64],
         };
+        a.signature = id.sign(&a.signing_bytes());
+        a
+    }
+
+    /// A node that also runs a coordinator.
+    fn coordinator_advert(id: &NodeIdentity, host: &str, endpoint: &str) -> MeshEndpointAdvert {
+        let mut a = advert(id, host, true);
+        a.coordinator = true;
+        a.coordinator_endpoint = endpoint.into();
         a.signature = id.sign(&a.signing_bytes());
         a
     }
@@ -332,9 +381,16 @@ mod tests {
             sv1_port: a.sv1_port,
             sv2_port: a.sv2_port,
             public_mining: a.public_mining,
+            coordinator: a.coordinator,
+            coordinator_endpoint: a.coordinator_endpoint.clone(),
             seq: a.seq,
             signature: hex::encode(a.signature),
         }
+    }
+
+    /// The roster, derived the one way production derives it.
+    fn roster_from(adverts: &[MeshEndpointAdvert]) -> Vec<CoordinatorRosterEntry> {
+        coordinator_roster_from_adverts(adverts)
     }
 
     /// The rendered list, derived the one way production derives it.
@@ -369,6 +425,8 @@ mod tests {
         removed.sort_unstable();
 
         let list_root = mesh_node_list_root(nodes);
+        let roster = roster_from(adverts);
+        let coordinator_roster_root = mesh_coordinator_roster_root(&roster);
         let signer_set_root = mesh_signer_set_root(new_signer_set);
         let proposer_id = prior[(height as usize) % prior.len()];
         let msg = MeshNodeListCheckpointMessage {
@@ -378,6 +436,8 @@ mod tests {
             adverts: adverts.to_vec(),
             advert_root,
             list_root,
+            coordinator_roster: roster.clone(),
+            coordinator_roster_root,
             signer_set_delta: SignerSetDelta {
                 added: added.clone(),
                 removed: removed.clone(),
@@ -423,6 +483,7 @@ mod tests {
             adverts: adverts.iter().map(blob_advert).collect(),
             advert_root: hex::encode(advert_root),
             list_root: hex::encode(list_root),
+            coordinator_roster_root: hex::encode(coordinator_roster_root),
             signer_set_root: hex::encode(signer_set_root),
             signer_set_delta: BlobDelta {
                 added: added.iter().map(hex::encode).collect(),
@@ -485,9 +546,9 @@ mod tests {
         let blob = build_blob(&signers, &adverts, &trusted, 100);
         let mut t = trusted.clone();
         let out = verify_and_advance(&blob, &mut t).expect("valid");
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].host, "203.0.113.1");
-        assert_eq!(out[0].sv1_port, 3333);
+        assert_eq!(out.nodes.len(), 2);
+        assert_eq!(out.nodes[0].host, "203.0.113.1");
+        assert_eq!(out.nodes[0].sv1_port, 3333);
         assert_eq!(t, trusted, "stable signer set unchanged");
     }
 
@@ -585,6 +646,59 @@ mod tests {
             .collect();
         blob.list_root = hex::encode(mesh_node_list_root(&tampered));
         refused_because(&blob, &trusted, "not what its adverts derive to");
+    }
+
+    /// A coordinator roster nobody attested is refused, exactly as an unattested host is.
+    ///
+    /// This is the roster's whole reason for being inside the checkpoint. A wallet asks
+    /// "which coordinator holds this tier's seat", and once the capability pays for
+    /// coordinating, the same list decides who is owed. A roster served *beside* a signed
+    /// document rather than *inside* one would let whoever answers name the winners.
+    #[test]
+    fn a_coordinator_roster_the_nodes_never_attested_is_rejected() {
+        let mut ids: Vec<NodeIdentity> = (0..2).map(|_| NodeIdentity::generate()).collect();
+        ids.sort_by_key(|i| i.node_id());
+        let adverts = vec![
+            coordinator_advert(&ids[0], "203.0.113.1", "203.0.113.1:9100"),
+            advert(&ids[1], "203.0.113.2", true),
+        ];
+        let trusted = signer_ids(&ids);
+        let mut blob = build_blob(&ids, &adverts, &trusted, 100);
+
+        // Enrol the second node as a coordinator it never claimed to be, and re-root so the
+        // root check passes — the derivation check is what must catch it.
+        let forged = vec![
+            CoordinatorRosterEntry {
+                node_id: ids[0].node_id(),
+                endpoint: "203.0.113.1:9100".into(),
+            },
+            CoordinatorRosterEntry {
+                node_id: ids[1].node_id(),
+                endpoint: "attacker.example:9100".into(),
+            },
+        ];
+        blob.coordinator_roster_root = hex::encode(mesh_coordinator_roster_root(&forged));
+        refused_because(&blob, &trusted, "not what its adverts derive to");
+    }
+
+    /// The honest path: a node that advertises a coordinator endpoint reaches the verified
+    /// roster, and one that does not is absent from it.
+    #[test]
+    fn a_verified_checkpoint_carries_the_coordinator_roster() {
+        let mut ids: Vec<NodeIdentity> = (0..2).map(|_| NodeIdentity::generate()).collect();
+        ids.sort_by_key(|i| i.node_id());
+        let adverts = vec![
+            coordinator_advert(&ids[0], "203.0.113.1", "203.0.113.1:9100"),
+            advert(&ids[1], "203.0.113.2", true),
+        ];
+        let mut trusted = signer_ids(&ids);
+        let blob = build_blob(&ids, &adverts, &trusted, 100);
+
+        let out = verify_and_advance(&blob, &mut trusted).expect("verifies");
+        assert_eq!(out.nodes.len(), 2, "both mine");
+        assert_eq!(out.coordinator_roster.len(), 1, "only one coordinates");
+        assert_eq!(out.coordinator_roster[0].node_id, ids[0].node_id());
+        assert_eq!(out.coordinator_roster[0].endpoint, "203.0.113.1:9100");
     }
 
     /// An advert signed by anyone other than its subject must not be usable, or the endpoint
