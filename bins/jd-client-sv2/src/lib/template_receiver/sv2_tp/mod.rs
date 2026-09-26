@@ -208,7 +208,12 @@ impl Sv2Tp {
                         info!("TemplateReceiver received shutdown signal");
                         break;
                     }
-                    res = self_clone_1.handle_template_provider_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933).
+                    tp = self_clone_1.sv2_tp_channel.tp_receiver.recv() => {
+                        let res = match tp {
+                            Ok(f) => self_clone_1.process_template_provider_message(f).await,
+                            Err(e) => Err(JDCError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             error!("TemplateReceiver template provider handler failed: {e:?}");
                             if handle_error(&status_sender, e).await {
@@ -216,7 +221,11 @@ impl Sv2Tp {
                             }
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message() => {
+                    cm = self_clone_2.sv2_tp_channel.channel_manager_receiver.recv() => {
+                        let res = match cm {
+                            Ok(m) => self_clone_2.process_channel_manager_message(m).await,
+                            Err(e) => Err(JDCError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             error!("TemplateReceiver channel manager handler failed: {e:?}");
                             if handle_error(&status_sender, e).await {
@@ -236,16 +245,18 @@ impl Sv2Tp {
     /// - `Common` messages → handled locally
     /// - `TemplateDistribution` messages → forwarded to channel manager
     /// - Unsupported messages → logged and ignored
-    pub async fn handle_template_provider_message(
+    ///
+    /// Everything that happens to a template-provider frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    pub async fn process_template_provider_message(
         &mut self,
+        mut sv2_frame: Sv2Frame,
     ) -> JDCResult<(), error::TemplateProvider> {
-        let mut sv2_frame = self
-            .sv2_tp_channel
-            .tp_receiver
-            .recv()
-            .await
-            .map_err(JDCError::shutdown)?;
-
         debug!("Received SV2 frame from Template provider.");
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
@@ -287,14 +298,19 @@ impl Sv2Tp {
     /// Handle messages from channel manager → template provider.
     ///
     /// Forwards outbound frames upstream
-    pub async fn handle_channel_manager_message(&self) -> JDCResult<(), error::TemplateProvider> {
-        let msg = AnyMessage::TemplateDistribution(
-            self.sv2_tp_channel
-                .channel_manager_receiver
-                .recv()
-                .await
-                .map_err(JDCError::shutdown)?,
-        );
+    ///
+    /// Everything that happens to a channel-manager message AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    pub async fn process_channel_manager_message(
+        &self,
+        received: TemplateDistribution<'static>,
+    ) -> JDCResult<(), error::TemplateProvider> {
+        let msg = AnyMessage::TemplateDistribution(received);
         debug!("Forwarding message from channel manager to outbound_tx");
         let sv2_frame: Sv2Frame = msg.try_into().map_err(JDCError::shutdown)?;
         self.sv2_tp_channel

@@ -291,7 +291,12 @@ impl Upstream {
                         info!("Upstream: fallback triggered");
                         break;
                     }
-                    res = self_clone_1.handle_pool_message_frame() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933).
+                    pool = self_clone_1.upstream_channel.upstream_receiver.recv() => {
+                        let res = match pool {
+                            Ok(f) => self_clone_1.process_pool_message_frame(f).await,
+                            Err(e) => Err(JDCError::fallback(e)),
+                        };
                         if let Err(e) = res {
                             error!(error = ?e, "Upstream: error handling pool message.");
                             if handle_error(&status_sender, e).await {
@@ -299,7 +304,8 @@ impl Upstream {
                             }
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message_frame() => {
+                    cm = self_clone_2.upstream_channel.channel_manager_receiver.recv() => {
+                        let res = self_clone_2.process_channel_manager_message_frame(cm).await;
                         if let Err(e) = res {
                             error!(error = ?e, "Upstream: error handling channel manager message.");
                             if handle_error(&status_sender, e).await {
@@ -323,14 +329,18 @@ impl Upstream {
     // - `Common` messages → handled locally
     // - `Mining` messages → forwarded to channel manager
     // - Unsupported → error
-    async fn handle_pool_message_frame(&mut self) -> JDCResult<(), error::Upstream> {
+    /// Everything that happens to a pool frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_pool_message_frame(
+        &mut self,
+        mut sv2_frame: Sv2Frame,
+    ) -> JDCResult<(), error::Upstream> {
         debug!("Received SV2 frame from upstream.");
-        let mut sv2_frame = self
-            .upstream_channel
-            .upstream_receiver
-            .recv()
-            .await
-            .map_err(JDCError::fallback)?;
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
             JDCError::fallback(framing_sv2::Error::MissingHeader)
@@ -364,8 +374,18 @@ impl Upstream {
     // Handle outbound frames from channel manager → upstream.
     //
     // Forwards messages upstream.
-    async fn handle_channel_manager_message_frame(&mut self) -> JDCResult<(), error::Upstream> {
-        match self.upstream_channel.channel_manager_receiver.recv().await {
+    /// Everything that happens to a channel-manager frame AFTER it is off the channel.
+    ///
+    /// ⛔ Split from the `recv()`: `async_channel::recv()` is cancellation-safe, this is not —
+    /// the message is already OFF the queue, so a cancelled future loses it outright with no
+    /// error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_channel_manager_message_frame(
+        &mut self,
+        received: Result<Sv2Frame, async_channel::RecvError>,
+    ) -> JDCResult<(), error::Upstream> {
+        match received {
             Ok(sv2_frame) => {
                 debug!("Received sv2 frame from channel manager, forwarding upstream.");
                 self.upstream_channel
