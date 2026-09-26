@@ -46,13 +46,44 @@ mkdir -p "$TMP/bin" "$TMP/state"
 
 # The REAL origin/main sha: every roll phase calls `assert_sha_still_current` first, so a bogus
 # one dies on the SHA gate and the ordering assertion never runs.
-( cd "$SRC_ROOT" && git rev-parse origin/main ) > "$TMP/state/v9.9.9.sha" 2>/dev/null
-order_out="$( cd "$SRC_ROOT" && GHOST_RELEASE_STATE="$TMP/state" \
-              ./scripts/release.sh 9.9.9 --from production --dry-run 2>&1 )"
-prod_line="$(printf '%s\n' "$order_out" | grep -m1 'would roll .* to ghost-vm' || true)"
+#
+# ⚠ That gate RE-FETCHES and compares against live `origin/main` (`release.sh:175-180`), while
+# this records the sha once. If anything touching `bins/` or `crates/` merges in between, the gate
+# refuses — correctly — and the dry-run prints a refusal instead of a roll order.
+#
+# That made main red for a merge that was fine (#930): the failure read "printed no roll order",
+# which points at the ordering logic, when the real cause was `origin/main` moving mid-run. The
+# gate was doing its job; the TEST was measuring a moving target.
+#
+# So: retry on exactly that refusal, re-recording the sha each time. This keeps the ordering
+# assertion intact — the alternative of accepting a refusal as a pass would make the test green
+# while checking nothing, which is the failure mode this file exists to avoid. A refusal that
+# persists across attempts is still a failure, and is reported as the SHA race rather than as
+# missing output.
+SHA_RACE_MARKER='no longer matches origin/main'
+order_out=""
+prod_line=""
+for attempt in 1 2 3; do
+    ( cd "$SRC_ROOT" && git rev-parse origin/main ) > "$TMP/state/v9.9.9.sha" 2>/dev/null
+    order_out="$( cd "$SRC_ROOT" && GHOST_RELEASE_STATE="$TMP/state" \
+                  ./scripts/release.sh 9.9.9 --from production --dry-run 2>&1 )"
+    prod_line="$(printf '%s\n' "$order_out" | grep -m1 'would roll .* to ghost-vm' || true)"
+    [ -n "$prod_line" ] && break
+    if printf '%s\n' "$order_out" | grep -qF "$SHA_RACE_MARKER"; then
+        echo "  .. attempt $attempt: origin/main moved mid-run, re-reading the sha and retrying"
+        ( cd "$SRC_ROOT" && git fetch -q origin 2>/dev/null ) || true
+        continue
+    fi
+    break   # a refusal for any OTHER reason is a real failure; stop and report it
+done
 
 if [ -z "$prod_line" ]; then
-    bad "production dry-run printed no roll order (got: $(printf '%s' "$order_out" | tail -1))"
+    if printf '%s\n' "$order_out" | grep -qF "$SHA_RACE_MARKER"; then
+        bad "origin/main kept moving across 3 attempts, so the ordering assertion never ran \
+(this is the #931 race, not an ordering fault)"
+    else
+        bad "production dry-run printed no roll order (got: $(printf '%s' "$order_out" | tail -1))"
+    fi
 else
     nodes="$(printf '%s\n' "$prod_line" | grep -oE 'ghost-vm[0-9]' | awk '!seen[$0]++' | tr '\n' ' ')"
     first="${nodes%% *}"
