@@ -130,8 +130,17 @@ impl Downstream {
                         break;
                     }
 
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#926, same shape as #854).
+                    //
+                    // `async_channel::recv()` is cancellation-safe; everything after it is not,
+                    // because the message is off the queue by then. Both branches therefore do
+                    // their work in the branch BODY, which completes and cannot be cancelled by
+                    // a sibling becoming ready. Two competing message branches means this can
+                    // lose in either direction.
+
                     // Handle downstream -> server message
-                    res = self.handle_downstream_message() => {
+                    msg = self.downstream_channel_state.downstream_sv1_receiver.recv() => {
+                        let res = self.process_downstream_message(msg).await;
                         if let Err(e) = res {
                             // A client closing its socket is not an error — the handler
                             // maps it to `action: Disconnect`, the expected outcome. Logging
@@ -154,7 +163,8 @@ impl Downstream {
                     }
 
                     // Handle server -> downstream message
-                    res = self.handle_sv1_server_message() => {
+                    srv = self.downstream_channel_state.sv1_server_receiver.recv() => {
+                        let res = self.process_sv1_server_message(srv).await;
                         if let Err(e) = res {
                             error!("Downstream {downstream_id}: error in server message handler: {e:?}");
                             if handle_error(&status_sender, e).await {
@@ -195,12 +205,33 @@ impl Downstream {
     /// - On handshake completion: sends cached messages in correct order (set_difficulty first,
     ///   then notify)
     pub async fn handle_sv1_server_message(&self) -> TproxyResult<(), error::Downstream> {
-        match self
+        let received = self
             .downstream_channel_state
             .sv1_server_receiver
             .recv()
-            .await
-        {
+            .await;
+        self.process_sv1_server_message(received).await
+    }
+
+    /// Everything that happens to an sv1-server message AFTER it has been taken off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and this
+    /// task's loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and
+    /// nothing is lost. This is NOT — the message is already OFF the queue, so dropping it loses
+    /// it outright, with no error and nothing to retry (#926, same shape as #854).
+    ///
+    /// This direction carries `mining.notify` and `mining.set_difficulty`, so a message lost
+    /// here is a miner left on stale work with nothing logged.
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    pub async fn process_sv1_server_message(
+        &self,
+        received: Result<
+            stratum_apps::stratum_core::sv1_api::json_rpc::Message,
+            async_channel::RecvError,
+        >,
+    ) -> TproxyResult<(), error::Downstream> {
+        match received {
             Ok(message) => {
                 let downstream_id = self.downstream_id;
                 let handshake_complete = self.sv1_handshake_complete.load(Ordering::SeqCst);
@@ -411,13 +442,30 @@ impl Downstream {
     /// Responses are sent back to the miner, while share submissions are forwarded
     /// to the SV1 server for upstream processing.
     pub async fn handle_downstream_message(&self) -> TproxyResult<(), error::Downstream> {
-        let downstream_id = self.downstream_id;
-        let message = match self
+        let received = self
             .downstream_channel_state
             .downstream_sv1_receiver
             .recv()
-            .await
-        {
+            .await;
+        self.process_downstream_message(received).await
+    }
+
+    /// Everything that happens to a downstream message AFTER it has been taken off the channel.
+    ///
+    /// ⛔ Same cancellation hazard as [`Self::process_sv1_server_message`], in the other
+    /// direction: the forward to `sv1_server_sender` is itself an `await`, so a cancelled future
+    /// drops a share submission that has already left the miner's queue (#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    pub async fn process_downstream_message(
+        &self,
+        received: Result<
+            stratum_apps::stratum_core::sv1_api::json_rpc::Message,
+            async_channel::RecvError,
+        >,
+    ) -> TproxyResult<(), error::Downstream> {
+        let downstream_id = self.downstream_id;
+        let message = match received {
             Ok(msg) => msg,
             Err(e) => {
                 // Redundant with the handler's own line, which carries the downstream id

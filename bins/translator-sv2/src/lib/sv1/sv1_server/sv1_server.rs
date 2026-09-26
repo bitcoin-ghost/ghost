@@ -884,7 +884,20 @@ impl Sv1Server {
                             }
                         }
                     }
-                    res = self.handle_downstream_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#926, same shape as #854).
+                    //
+                    // `async_channel::recv()` is cancellation-safe; everything after it is not,
+                    // because the message is off the queue by then. The handling therefore runs
+                    // in the branch BODY, which completes — a body is not a select branch and
+                    // cannot be cancelled by a sibling becoming ready.
+                    //
+                    // This loop also selects over a TCP accept and two timers, so the message
+                    // branches have more competition than most.
+                    msg = self.sv1_server_channel_state.downstream_to_sv1_server_receiver.recv() => {
+                        let res = match msg {
+                            Ok((id, m)) => self.process_downstream_message(id, m).await,
+                            Err(e) => Err(TproxyError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             if handle_error(&sv1_status_sender, e).await {
                                 self.cleanup();
@@ -892,9 +905,14 @@ impl Sv1Server {
                             }
                         }
                     }
-                    res = self.handle_upstream_message(
-                        first_target,
-                    ) => {
+                    up = self.sv1_server_channel_state.channel_manager_receiver.recv() => {
+                        let res = match up {
+                            Ok((message, tlv_fields)) => {
+                                self.process_upstream_message(first_target, message, tlv_fields)
+                                    .await
+                            }
+                            Err(e) => Err(TproxyError::shutdown(e)),
+                        };
                         if let Err(e) = res {
                             if handle_error(&sv1_status_sender, e).await {
                                 self.cleanup();
@@ -933,7 +951,23 @@ impl Sv1Server {
             .recv()
             .await
             .map_err(TproxyError::shutdown)?;
+        self.process_downstream_message(downstream_id, downstream_message)
+            .await
+    }
 
+    /// Everything that happens to a downstream message AFTER it has been taken off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// listener loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and
+    /// nothing is lost. This is NOT — the message is already OFF the queue, so dropping it loses
+    /// the message outright, with no error and nothing to retry (#926, same shape as #854).
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    pub async fn process_downstream_message(
+        &self,
+        downstream_id: DownstreamId,
+        downstream_message: stratum_apps::stratum_core::sv1_api::json_rpc::Message,
+    ) -> TproxyResult<(), error::Sv1Server> {
         let Some(downstream) = self
             .downstreams
             .get(&downstream_id)
@@ -1428,13 +1462,30 @@ impl Sv1Server {
         &self,
         first_target: Target,
     ) -> TproxyResult<(), error::Sv1Server> {
-        let (message, _tlv_fields) = self
+        let (message, tlv_fields) = self
             .sv1_server_channel_state
             .channel_manager_receiver
             .recv()
             .await
             .map_err(TproxyError::shutdown)?;
+        self.process_upstream_message(first_target, message, tlv_fields)
+            .await
+    }
 
+    /// Everything that happens to an upstream message AFTER it has been taken off the channel.
+    ///
+    /// ⛔ Same cancellation hazard as [`Self::process_downstream_message`], and this is the
+    /// direction that matters in production: downstream share traffic is continuous, so this is
+    /// the branch at risk of losing what it has already consumed. It carries the work updates —
+    /// an `OpenExtendedMiningChannelSuccess` or a target change dropped here is silent (#926).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    pub async fn process_upstream_message(
+        &self,
+        first_target: Target,
+        message: Mining<'static>,
+        _tlv_fields: Option<Vec<Tlv>>,
+    ) -> TproxyResult<(), error::Sv1Server> {
         match message {
             Mining::OpenExtendedMiningChannelSuccess(m) => {
                 debug!(

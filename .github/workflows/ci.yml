@@ -70,6 +70,12 @@ jobs:
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # A select! branch that recv()s AND THEN works is not cancellation-safe: when a sibling
+      # completes first, select! drops it along with the message it already took off the queue.
+      # Found five times (#854, #926) and baselined at 21 more across jd-client, jd-server and
+      # pool-sv2. A ratchet — the baseline may shrink, never grow.
+      - name: select! cancellation safety
+        run: ./scripts/check-select-cancellation-safety.sh
       # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
       # caught lying about its address stops counting toward the diversity floor, which changes
       # which nodes qualify and how the node-reward pool splits. There are FIVE construction
