@@ -7963,6 +7963,30 @@ async fn main() -> Result<()> {
         // ledger, which no two nodes share, so the roster could not converge
         // (`wraith_protocol::eligibility`, "Why qualification and archive are
         // not here").
+        //
+        // The agreed roster, when the node-list checkpoint has finalised one. Below the gate
+        // nothing is ever proposed, so the table is empty and this returns `None` — the election
+        // keeps its live-mesh roster. Arming the checkpoint is therefore what moves the election
+        // off node-local state, fleet-wide, in one step (#710).
+        {
+            let db = Arc::clone(&db);
+            Some(Arc::new(move || {
+                let rec = db.get_latest_mesh_node_list_checkpoint().ok().flatten()?;
+                let adverts =
+                    ghost_pool::mesh_node_checkpoint::adverts_from_json_public(&rec.adverts_json);
+                let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
+                if roster.is_empty() {
+                    return None;
+                }
+                Some(
+                    roster
+                        .into_iter()
+                        .map(|e| (e.node_id, e.endpoint))
+                        .collect::<Vec<_>>(),
+                )
+            })
+                as ghost_pool::coordinator_election::CheckpointRosterFn)
+        },
     );
     {
         let coord_for_api = coordinator_election.clone();
