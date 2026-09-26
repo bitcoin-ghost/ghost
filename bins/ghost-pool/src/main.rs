@@ -4221,9 +4221,11 @@ async fn main() -> Result<()> {
                         }) else {
                             continue;
                         };
+                        // OsRng, not thread_rng(): this is the §6 sampling challenge a peer
+                        // must answer, so its unpredictability is the whole point (#705, E-1).
                         let entropy: [u8; 32] = {
                             use rand::Rng;
-                            rand::thread_rng().gen()
+                            rand::rngs::OsRng.gen()
                         };
                         let req = match rt_c.sample_request_for(
                             &target,

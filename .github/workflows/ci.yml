@@ -70,6 +70,12 @@ jobs:
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # E-1 forbids key material from a generator other than the OS CSPRNG. `thread_rng()` has
+      # been substituted for `OsRng` three times here — once in the wallet seed, once minting the
+      # SV2 AUTHORITY keypair while the doc comment claimed OsRng (#705). E-5 rules out catching
+      # it by testing output, so reading the source is the only defence.
+      - name: Key-material RNG
+        run: ./scripts/check-key-material-rng.sh
       # A select! branch that recv()s AND THEN works is not cancellation-safe: when a sibling
       # completes first, select! drops it along with the message it already took off the queue.
       # Found five times (#854, #926) and baselined at 21 more across jd-client, jd-server and
