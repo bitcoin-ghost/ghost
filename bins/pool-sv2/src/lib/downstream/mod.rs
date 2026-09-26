@@ -224,7 +224,17 @@ impl Downstream {
                         debug!("Downstream {downstream_id}: received shutdown signal");
                         break;
                     }
-                    res = self_clone_1.handle_downstream_message() => {
+                    // ⛔ ONLY the `recv()` may sit in this `select!` (#933, same shape as #854).
+                    //
+                    // `async_channel::recv()` is cancellation-safe; everything after it is not,
+                    // because the message is off the queue by then. The handling runs in the
+                    // branch BODY, which completes and cannot be cancelled by a sibling becoming
+                    // ready. Two competing message branches means either direction can lose.
+                    frame = self_clone_1.downstream_channel.downstream_receiver.recv() => {
+                        let res = match frame {
+                            Ok(f) => self_clone_1.process_downstream_message(f).await,
+                            Err(e) => Err(PoolError::disconnect(e, downstream_id)),
+                        };
                         if let Err(e) = res {
                             error!(?e, "Error handling downstream message for {downstream_id}");
                             match e.action {
@@ -242,7 +252,11 @@ impl Downstream {
                             }
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message() => {
+                    cm = self_clone_2.downstream_channel.channel_manager_receiver.recv() => {
+                        let res = self_clone_2
+                            .clone()
+                            .process_channel_manager_message(cm)
+                            .await;
                         if let Err(e) = res {
                             error!(?e, "Error handling channel manager message for {downstream_id}");
                             match e.action {
@@ -300,14 +314,22 @@ impl Downstream {
         ))
     }
 
-    // Handles messages sent from the channel manager to this downstream.
-    async fn handle_channel_manager_message(self) -> PoolResult<(), error::Downstream> {
-        let (msg, _tlv_fields) = match self
-            .downstream_channel
-            .channel_manager_receiver
-            .recv()
-            .await
-        {
+    /// Handles messages sent from the channel manager to this downstream, once off the channel.
+    ///
+    /// ⛔ Split from the `recv()` because the two have opposite cancellation properties and the
+    /// loop selects over them. `async_channel::recv()` is cancellation-safe: drop it and nothing
+    /// is lost. This is NOT — the message is already OFF the queue, so dropping it loses it
+    /// outright, with no error and nothing to retry (#933, same shape as #854/#926).
+    ///
+    /// This is the direction that carries work to the miner, and pool_sv2 runs on every node in
+    /// the fleet, so a message lost here is a downstream left without the update.
+    ///
+    /// Keep this OUT of any `select!`: call it from a branch body, which runs to completion.
+    async fn process_channel_manager_message(
+        self,
+        received: Result<(Mining<'static>, Option<Vec<Tlv>>), async_channel::RecvError>,
+    ) -> PoolResult<(), error::Downstream> {
+        let (msg, _tlv_fields) = match received {
             Ok(msg) => msg,
             Err(e) => {
                 warn!(
@@ -336,14 +358,17 @@ impl Downstream {
         Ok(())
     }
 
-    // Handles incoming messages from the downstream peer.
-    async fn handle_downstream_message(&mut self) -> PoolResult<(), error::Downstream> {
-        let mut sv2_frame = self
-            .downstream_channel
-            .downstream_receiver
-            .recv()
-            .await
-            .map_err(|error| PoolError::disconnect(error, self.downstream_id))?;
+    /// Handles incoming messages from the downstream peer, once off the channel.
+    ///
+    /// ⛔ Same cancellation hazard as [`Self::process_channel_manager_message`], in the other
+    /// direction: this carries share submissions, so a frame dropped here is work the miner
+    /// believes it delivered (#933).
+    ///
+    /// Must be called from a `select!` branch BODY, never as a branch future.
+    async fn process_downstream_message(
+        &mut self,
+        mut sv2_frame: Sv2Frame,
+    ) -> PoolResult<(), error::Downstream> {
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
             PoolError::disconnect(framing_sv2::Error::MissingHeader, self.downstream_id)

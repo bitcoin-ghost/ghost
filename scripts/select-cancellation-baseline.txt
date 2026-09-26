@@ -27,9 +27,3 @@ bins/jd-client-sv2/src/lib/upstream/mod.rs handle_pool_message_frame
 bins/jd-server-sv2/src/lib/job_declarator/downstream/mod.rs handle_job_declarator_message
 bins/jd-server-sv2/src/lib/job_declarator/downstream/mod.rs handle_message_from_downstream
 bins/jd-server-sv2/src/lib/job_declarator/mod.rs handle_jdp_message
-bins/pool-sv2/src/lib/channel_manager/mod.rs handle_downstream_mining_message
-bins/pool-sv2/src/lib/channel_manager/mod.rs handle_template_provider_message
-bins/pool-sv2/src/lib/downstream/mod.rs handle_channel_manager_message
-bins/pool-sv2/src/lib/downstream/mod.rs handle_downstream_message
-bins/pool-sv2/src/lib/template_receiver/sv2_tp/mod.rs handle_channel_manager_message
-bins/pool-sv2/src/lib/template_receiver/sv2_tp/mod.rs handle_template_provider_message
