@@ -997,6 +997,10 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         stratum_handshake_proof = %h(stratum_proof),
         archive_tx_proof = %h(archive_tx),
         address_proof = %h(address_proof),
+        // #605. Resolved and stored since it was added, and never stated — so a node armed at
+        // 970,500 looked identical in its logs to one that was dormant. It is the gate that moves
+        // the node-reward split, which makes it the last one that should be invisible.
+        address_proof_enforcement = %h(address_proof_enforcement),
         mesh_node_list_checkpoint = %h(mesh_node_list_checkpoint),
         checkpoint_from_shard = %h(checkpoint_from_shard),
         payout_from_shard = %h(payout_from_shard),
