@@ -1305,6 +1305,47 @@ pub type RecordsCache = Arc<
     >,
 >;
 
+/// Everything a node would commit in a mesh node-list checkpoint, for comparison across the fleet.
+///
+/// ⛔ **Every root the vote path can reject on must be here.** Named fields rather than a tuple
+/// because this is the instrument that decides whether a consensus gate gets armed, and a
+/// positional `|(_, _, _, r, _)|` in the handler is the kind of thing that reads fine and is
+/// wrong.
+///
+/// The three derived from LOCAL state are the ones that can diverge between honest nodes:
+///
+/// * `list_root` and `coordinator_roster_root` — re-derived from the proposal's adverts and this
+///   node's ratified qualified set. Exact-set agreement, so one differing member is a reject.
+/// * `signer_set_root` — compared against this node's own voter set, so two nodes that disagree
+///   on the voter set disagree here and one of them rejects.
+///
+/// `advert_root` is a pure function of the adverts in the message, but a *proposer's* advert set
+/// is local (`store.covering`), so it is reported too.
+///
+/// #943 added `coordinator_roster_root` to the checkpoint and this endpoint did not learn about
+/// it, which would have let the pre-arming check report "converged" without ever comparing a root
+/// that every vote checks. A fleet agreeing on three of four finalises nothing, silently.
+#[derive(Debug, Clone)]
+pub struct MeshNodeListConvergence {
+    /// How many nodes are on the derived list.
+    pub listed: usize,
+    /// Root of the derived node list.
+    pub list_root: String,
+    /// Root of the advert set this node would adopt.
+    pub advert_root: String,
+    /// Root of the derived coordinator roster.
+    pub coordinator_roster_root: String,
+    /// Root of the voter set this node would commit as the signer set.
+    pub signer_set_root: String,
+    /// Qualified nodes whose signed endpoint this node has not seen. Empty = full coverage.
+    pub missing_adverts: Vec<String>,
+}
+
+/// What [`VerificationState::mesh_node_list_fn`] holds: given `(cutoff_ts, height)`, the checkpoint
+/// this node would commit, or `None` when it cannot derive one.
+pub type MeshNodeListConvergenceFn =
+    Arc<dyn Fn(i64, u64) -> Option<MeshNodeListConvergence> + Send + Sync>;
+
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -1454,9 +1495,7 @@ pub struct VerificationState {
     ///
     /// `missing_adverts` names the qualified nodes whose signed endpoint this node has not
     /// seen. A stalled checkpoint should say who is holding it up, not just fail.
-    #[allow(clippy::type_complexity)]
-    pub mesh_node_list_fn:
-        Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, String, Vec<String>)> + Send + Sync>>,
+    pub mesh_node_list_fn: Option<MeshNodeListConvergenceFn>,
     /// FEE coinbase reward-split convergence proof: given `(cutoff_ts, height)`, returns a hash of
     /// the GO-LIVE reward split (`miner_pool`, `treasury_amount`, `node_reward_pool`) — the
     /// `COINBASE_FEE_SPLIT` regime forced ON — computed from THIS node's `treasury_state` at the
@@ -2496,11 +2535,7 @@ impl VerificationState {
     }
 
     /// See [`VerificationState::mesh_node_list_fn`].
-    #[allow(clippy::type_complexity)]
-    pub fn with_mesh_node_list_fn(
-        mut self,
-        f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, String, Vec<String>)> + Send + Sync>,
-    ) -> Self {
+    pub fn with_mesh_node_list_fn(mut self, f: MeshNodeListConvergenceFn) -> Self {
         self.mesh_node_list_fn = Some(f);
         self
     }

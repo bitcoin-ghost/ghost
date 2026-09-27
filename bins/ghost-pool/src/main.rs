@@ -7580,12 +7580,25 @@ async fn main() -> Result<()> {
                 .collect();
             let adverts = store.covering(&qualified)?;
             let nodes = ghost_consensus::derive_mesh_node_list(&qualified, &adverts).ok()?;
-            Some((
-                nodes.len(),
-                hex::encode(ghost_consensus::mesh_node_list_root(&nodes)),
-                hex::encode(ghost_consensus::mesh_advert_set_root(&adverts)),
-                missing,
-            ))
+            // Derived the same way the proposer and the vote path derive them, from the same
+            // adverts — so a disagreement here is a real disagreement and not two spellings.
+            let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
+            // The voter set is this node's OWN view, and the vote path rejects on it
+            // (`mesh_signer_set_root(&voters) != msg.signer_set_root`). So it can diverge between
+            // honest nodes and belongs in the comparison, not in an assumption.
+            let mut voters = qualified.clone();
+            voters.sort_unstable();
+            voters.dedup();
+            Some(ghost_verification::server::MeshNodeListConvergence {
+                listed: nodes.len(),
+                list_root: hex::encode(ghost_consensus::mesh_node_list_root(&nodes)),
+                advert_root: hex::encode(ghost_consensus::mesh_advert_set_root(&adverts)),
+                coordinator_roster_root: hex::encode(
+                    ghost_consensus::mesh_coordinator_roster_root(&roster),
+                ),
+                signer_set_root: hex::encode(ghost_consensus::mesh_signer_set_root(&voters)),
+                missing_adverts: missing,
+            })
         })
     });
 

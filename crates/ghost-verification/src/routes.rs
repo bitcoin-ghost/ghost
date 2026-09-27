@@ -6441,8 +6441,8 @@ async fn api_qualification_scoped_set_handler(
         .as_ref()
         .and_then(|f| f(cutoff, cp.height));
     // MESH_NODE_LIST convergence: the node-list checkpoint this node would propose, with the
-    // gate ignored. Identical `list_root` AND `advert_root` on all nodes = #402's acceptance
-    // criterion met — the check to run BEFORE arming MESH_NODE_LIST_CHECKPOINT_HEIGHT, which
+    // gate ignored. Identical `list_root`, `advert_root`, `coordinator_roster_root` AND
+    // `signer_set_root` on all nodes = #402's acceptance criterion met — the check to run BEFORE arming MESH_NODE_LIST_CHECKPOINT_HEIGHT, which
     // could not be run at all until now (#625: nothing is proposed below the gate).
     let mesh_node_list = state
         .mesh_node_list_fn
@@ -6473,12 +6473,19 @@ async fn api_qualification_scoped_set_handler(
             "has_fn": state.fee_split_fn.is_some(),
         },
         "mesh_node_list": {
-            "listed": mesh_node_list.as_ref().map(|(c, _, _, _)| *c),
-            "list_root": mesh_node_list.as_ref().map(|(_, r, _, _)| r.clone()),
-            "advert_root": mesh_node_list.as_ref().map(|(_, _, a, _)| a.clone()),
+            "listed": mesh_node_list.as_ref().map(|c| c.listed),
+            "list_root": mesh_node_list.as_ref().map(|c| c.list_root.clone()),
+            "advert_root": mesh_node_list.as_ref().map(|c| c.advert_root.clone()),
+            // ⛔ EVERY root the vote path can reject on. With only some of them, this endpoint
+            // could report "converged" while a root every vote compares was never looked at, and
+            // a fleet agreeing on three of four finalises nothing at all, silently (#943).
+            "coordinator_roster_root": mesh_node_list
+                .as_ref()
+                .map(|c| c.coordinator_roster_root.clone()),
+            "signer_set_root": mesh_node_list.as_ref().map(|c| c.signer_set_root.clone()),
             // Empty = full coverage. Non-empty names who has not advertised, which is the
             // only reason a fleet that agrees on everything else still cannot checkpoint.
-            "missing_adverts": mesh_node_list.as_ref().map(|(_, _, _, m)| m.clone()),
+            "missing_adverts": mesh_node_list.as_ref().map(|c| c.missing_adverts.clone()),
             "has_fn": state.mesh_node_list_fn.is_some(),
         },
     }))
