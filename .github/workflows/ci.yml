@@ -82,6 +82,13 @@ jobs:
       # pool-sv2. A ratchet — the baseline may shrink, never grow.
       - name: select! cancellation safety
         run: ./scripts/check-select-cancellation-safety.sh
+      # The convergence endpoint is the instrument that decides whether the mesh node-list gate
+      # gets armed (#402). #943 added a third root to the checkpoint and made vote acceptance
+      # depend on it, without updating that endpoint — so it would have reported "converged"
+      # having never compared a root every vote checks, and a fleet agreeing on three roots of
+      # four finalises nothing, silently. Nothing connected the two files; this does.
+      - name: Convergence covers every committed root
+        run: ./scripts/check-convergence-covers-every-root.sh
       # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
       # caught lying about its address stops counting toward the diversity floor, which changes
       # which nodes qualify and how the node-reward pool splits. There are FIVE construction
