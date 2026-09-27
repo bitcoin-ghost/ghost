@@ -82,6 +82,13 @@ jobs:
       # pool-sv2. A ratchet — the baseline may shrink, never grow.
       - name: select! cancellation safety
         run: ./scripts/check-select-cancellation-safety.sh
+      # #780: a node must STATE which gates it enforces, or "is this node armed, and at what
+      # height?" has no answer short of reading the binary. ADDRESS_PROOF_ENFORCEMENT was
+      # resolved, stored and given an accessor — and never logged, so once armed at 970,500 an
+      # enforcing node looked identical to a dormant one. The existing test asserts that SOME
+      # armed height appears, which is a sample and cannot see a missing field.
+      - name: Every activation gate is logged
+        run: ./scripts/check-every-gate-is-logged.sh
       # The convergence endpoint is the instrument that decides whether the mesh node-list gate
       # gets armed (#402). #943 added a third root to the checkpoint and made vote acceptance
       # depend on it, without updating that endpoint — so it would have reported "converged"
