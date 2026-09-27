@@ -637,7 +637,7 @@ pub const STRATUM_HANDSHAKE_PROOF_HEIGHT: u64 = 962_000;
 /// `u64::MAX` = never. Arming requires the whole fleet to run a binary that ASKS for a transaction,
 /// because a node applying the tx check while its peers do not would compute a different qualified
 /// set and the node-reward split would diverge.
-pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = u64::MAX;
+pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = 970_500;
 
 /// H-7: height at and above which a challenger BROADCASTS the address proof it already
 /// performs, so the `/24` a node claims becomes a converged, majority-attested fact rather
@@ -696,7 +696,7 @@ pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 ///
 /// `u64::MAX` = never. Arming changes which nodes QUALIFY, so it is a separate, observed change
 /// that needs the whole fleet carrying it first.
-pub const ADDRESS_PROOF_ENFORCEMENT_HEIGHT: u64 = u64::MAX;
+pub const ADDRESS_PROOF_ENFORCEMENT_HEIGHT: u64 = 970_500;
 
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
@@ -793,7 +793,7 @@ const _: () = assert!(
      days, and this checkpoint needs exact-set agreement on a list derived from it"
 );
 
-pub const MESH_NODE_LIST_CHECKPOINT_HEIGHT: u64 = u64::MAX;
+pub const MESH_NODE_LIST_CHECKPOINT_HEIGHT: u64 = 970_500;
 
 /// Activation heights, resolved once at startup.
 ///
@@ -840,6 +840,21 @@ mod gates {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(default)
+    }
+}
+
+/// Render a gate height for the startup log: a dormant gate as `never`, an armed one as its
+/// height.
+///
+/// Module-level, not a closure inside [`init_activation_heights`], so the rule can be asserted
+/// directly. It used to be tested by checking the startup line contained the word `never` — which
+/// only held while SOME gate happened to be dormant. When the last three were armed that
+/// assertion failed, having never been about arming at all.
+fn render_gate_height(v: u64) -> String {
+    if v == u64::MAX {
+        "never".to_string()
+    } else {
+        v.to_string()
     }
 }
 
@@ -967,13 +982,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     //
     // Dormant gates print as `never` rather than 18446744073709551615, because a wall of
     // u64::MAX is exactly the sort of output people stop reading.
-    fn h(v: u64) -> String {
-        if v == u64::MAX {
-            "never".to_string()
-        } else {
-            v.to_string()
-        }
-    }
+    let h = render_gate_height;
     tracing::info!(
         network = ?network,
         cluster_enforcement = %h(enforcement),
@@ -1523,15 +1532,27 @@ mod activation_height_logging_tests {
             out.contains(&crate::FEE_DRIFT_MINER_SHARE_HEIGHT.to_string()),
             "the armed fee-drift height must be visible; got: {out}"
         );
-        // ...and a DORMANT one as `never`, not a wall of u64::MAX nobody reads.
-        assert!(
-            out.contains("never"),
-            "dormant gates must render as `never`; got: {out}"
-        );
+        // ⛔ The `never` rendering is asserted by `dormant_gates_render_as_never`, NOT here.
+        // This test used to check `out.contains("never")`, which only passed while some gate
+        // happened to be dormant — it was a property of the current gate values, not of the
+        // logging. Arming the last three dormant gates failed it, for no real reason.
+        //
+        // What DOES belong here is that no raw u64::MAX reaches the log, which stays true
+        // whether or not any gate is dormant.
         assert!(
             !out.contains("18446744073709551615"),
             "u64::MAX must never be printed raw; got: {out}"
         );
+    }
+
+    /// The rendering rule itself, independent of which gates happen to be armed today.
+    #[test]
+    fn dormant_gates_render_as_never() {
+        assert_eq!(crate::render_gate_height(u64::MAX), "never");
+        assert_eq!(crate::render_gate_height(970_500), "970500");
+        assert_eq!(crate::render_gate_height(0), "0");
+        // The point of the rule: the raw sentinel must not survive rendering.
+        assert_ne!(crate::render_gate_height(u64::MAX), u64::MAX.to_string());
     }
 }
 
