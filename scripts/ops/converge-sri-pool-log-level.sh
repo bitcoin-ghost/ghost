@@ -22,7 +22,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC="$REPO_ROOT/config/sri/sri-pool.service.d/debug.conf"
 DEST=/etc/systemd/system/sri-pool.service.d/debug.conf
-WANT_ENV='RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug'
+WANT_ENV='RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug,pool_sv2::share_webhook=debug'
 
 DRY=false
 if [ "${1:-}" = "--dry-run" ]; then DRY=true; shift; fi
