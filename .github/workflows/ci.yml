@@ -388,8 +388,22 @@ jobs:
       # ⚠ Per-target `timeout` as well as the job cap. Without it one hung target eats the whole
       # budget and every target after it reports as "not run" rather than as something a reader
       # can act on — which is exactly how sv2_mining_device's hang first presented.
+      # ⚠ Targeted debug for the SV1 server, NOT a global `debug`.
+      #
+      # #946: `jdc_receives_submit_shares_success` hung the full 420s on repeated
+      # `stratum_subscribe timed out` while the template provider stayed healthy. The miner's own
+      # stderr said it could not attach; nothing said what the translator's SV1 server was doing,
+      # so the occurrence was unattributable and all anyone could do was re-run it. The same shape
+      # showed up outside CI during vm5's pool_sv2 deploy ("smoke attempt 1 failed, retrying").
+      #
+      # Scoped to the two modules on the subscribe path. A global `debug` here produces millions
+      # of lines under a share flood (measured: 595 lines without one, 4.4M with), which buries
+      # the thing you came to read and is why the level was narrowed on the fleet in the first
+      # place.
       - name: Run the green SV2 integration targets
         timeout-minutes: 30
+        env:
+          RUST_LOG: info,translator_sv2::sv1::sv1_server=debug,translator_sv2::sv1::downstream=debug
         run: |
           for t in pool_solo_mining \
                    pool_integration \
