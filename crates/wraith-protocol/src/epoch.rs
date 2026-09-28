@@ -52,12 +52,41 @@ pub const fn snapshot_height_for_epoch(epoch: u64) -> u64 {
 /// Domain separator for the per-epoch beacon.
 const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
 
-/// How many consecutive block hashes the beacon combines.
+/// How many consecutive block hashes [`derive_beacon_multi`] combines.
 ///
-/// One hash gives the miner of that single block a free look: they see the
-/// beacon their block produces before publishing, and can discard it. Combining
-/// several means influencing the beacon requires mining several *specific
-/// consecutive* blocks, which multiplies the cost out of reach.
+/// ⛔ **This does NOT close the miner's free look, and the earlier comment here
+/// said it did.** Measured 2026-09-28, 3,000 trials against a roster of 8 — mean
+/// blocks a miner must find to land a CHOSEN tier leader:
+///
+/// ```text
+/// single-anchor      8.06   (median 6)
+/// multi-anchor(6)    7.92   (median 6)
+/// uniform expectation 8.00
+/// ```
+///
+/// Identical, because the miner of the LAST anchor already knows the other five
+/// — they are published. They compute the combined beacon from their candidate
+/// and decide whether to publish, exactly as with one hash. Folding in
+/// already-public hashes cannot reduce the control of the party who supplies the
+/// only unknown input.
+///
+/// The free look survives because a block hash is known to its miner before
+/// publication. No choice of anchor count changes that; only commit-reveal
+/// would, and [`crate::beacon`] documents why that is not worth its costs.
+///
+/// What combining hashes DOES buy is defence against *repeated* influence — more
+/// than one look needs several specific consecutive blocks. But one look was
+/// already the ceiling, since a second requires finding a second valid block at
+/// the same height while likely losing the height altogether.
+///
+/// ⚖ #712 is therefore answered by economics, not by this constant: one look is
+/// worth 1-in-`roster_size` of picking a chosen leader, bought by forfeiting a
+/// full block reward, for one tier's sessions for one epoch, with no input↔output
+/// linkage because outputs are blind-signed. Nobody pays that.
+///
+/// Left defined and unwired deliberately. Wiring it is a consensus change (it
+/// moves every tier leader) and would buy the many-looks case only — so if it is
+/// ever done, it must not be described as closing the free look.
 pub const BEACON_ANCHOR_BLOCKS: usize = 6;
 
 /// Derive an epoch's beacon from several consecutive block hashes.
@@ -76,11 +105,15 @@ pub const BEACON_ANCHOR_BLOCKS: usize = 6;
 /// link inputs to outputs because the outputs are blind-signed. Nobody pays
 /// that.
 ///
-/// The residual is that one free look, and combining `BEACON_ANCHOR_BLOCKS`
-/// hashes removes it for nothing: no new messages, no transport, no liveness
-/// dependency, and no last-revealer withholding weakness. `beacon::BeaconRound`
-/// stays unwired, because commit-reveal solves a problem that does not pay for
-/// itself and brings costs a block hash does not have.
+/// The residual is that one free look. ⛔ Combining `BEACON_ANCHOR_BLOCKS` hashes
+/// does **not** remove it — measured identical to the single-anchor form, because
+/// the miner of the last anchor already knows the others (see
+/// [`BEACON_ANCHOR_BLOCKS`] for the numbers). It removes only the ability to take
+/// MORE than one look, which the cost of a second block already prevented.
+///
+/// `beacon::BeaconRound` stays unwired because commit-reveal solves a problem
+/// that does not pay for itself and brings costs a block hash does not have. The
+/// free look is answered by its price, not by arithmetic on public hashes.
 ///
 /// # Order matters and is fixed
 ///
@@ -113,9 +146,10 @@ pub fn derive_beacon_multi(epoch: u64, anchor_hashes: &[[u8; 32]]) -> [u8; 32] {
 /// cannot be confused for one another by a caller that supplies the wrong
 /// number of anchors.
 ///
-/// Prefer `derive_beacon_multi` with [`BEACON_ANCHOR_BLOCKS`] hashes. See its
-/// documentation for why that closes the miner's one free look, and why
-/// commit-reveal is not the answer.
+/// ⚠ This is the form production uses, deliberately. `derive_beacon_multi` was
+/// once recommended here as closing the miner's free look; it does not (see
+/// [`BEACON_ANCHOR_BLOCKS`]), so there is no reason to switch a live election —
+/// which is a consensus change — for a property it would not deliver.
 pub fn derive_beacon(epoch: u64, anchor_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(BEACON_DOMAIN);
