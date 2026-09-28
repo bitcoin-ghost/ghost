@@ -22,6 +22,28 @@
 # republish every `MESH_ADVERT_REPUBLISH_SECS` (600s), so comparing vm1 at T and vm8 at T+30s can
 # show a difference that is only elapsed time. All eight requests are fired in parallel.
 #
+# ## ⛔ Do not run this straight after a roll
+#
+# The advert store is in-memory and refills from gossip, and peers republish every
+# `MESH_ADVERT_REPUBLISH_SECS` (600s). Until a restarted node holds a signed advert from every
+# QUALIFIED node, `store.covering()` returns nothing and the whole `mesh_node_list` tuple is
+# `None` — so all four roots read as null while the qualified sets still report fine.
+#
+# MEASURED 2026-09-27, after the arming roll (vm1..vm4 restarted 22:29-22:41, sampled 22:49):
+#
+#     vm4  restarted 21 min earlier  -> roots reported
+#     vm3  restarted 18 min earlier  -> all four null
+#     vm2  restarted 13 min earlier  -> all four null
+#     vm1  restarted  9 min earlier  -> all four null
+#
+# That is warm-up, not divergence, and this script deliberately calls it a failure rather than
+# comparing the nodes that happened to answer. Wait until every node has been up long enough to
+# have heard a full republish cycle from all peers, then sample.
+#
+# ⚠ The same property applies to the gate itself: a node restarted shortly before
+# `MESH_NODE_LIST_CHECKPOINT_HEIGHT` fires cannot propose or ratify a checkpoint until its advert
+# store covers the qualified set. Nothing breaks — no checkpoint finalises until coverage exists.
+#
 # **It refuses on a partial sample.** A node that does not answer is not a node that agrees. Eight
 # responses or INCONCLUSIVE — otherwise the check gets quieter exactly as the fleet gets sicker.
 #
@@ -41,8 +63,16 @@ echo "check-fleet-convergence: sampling ${#NODES[@]} node(s) in parallel at $(da
 
 for n in "${NODES[@]}"; do
     (
-        timeout 25 ssh -o ConnectTimeout=10 -o BatchMode=yes "$n" \
-            "curl -s --max-time 15 http://127.0.0.1:8080/api/v1/qualification/scoped-set" \
+        # ⛔ Generous on purpose. This endpoint derives the qualified set, the node list, the
+        # coordinator roster and the signer set from the database, and these are 2-CPU nodes
+        # (#537: "database connection held past the slow threshold ... parks a tokio worker").
+        # MEASURED 2026-09-27, minutes after a fleet-wide restart: 24s, 25s, 31s. The first
+        # version of this script allowed 15s, so it reported INCONCLUSIVE on six of eight nodes
+        # at the one moment the answer mattered most — straight after the arming roll. A probe
+        # whose budget is under the thing it measures fails when the fleet is busiest, which is
+        # when you are most likely to be asking.
+        timeout 120 ssh -o ConnectTimeout=10 -o BatchMode=yes "$n" \
+            "curl -s --max-time 90 http://127.0.0.1:8080/api/v1/qualification/scoped-set" \
             > "$TMP/$n.json" 2>/dev/null
     ) &
 done
