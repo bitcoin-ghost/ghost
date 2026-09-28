@@ -82,6 +82,13 @@ jobs:
       # pool-sv2. A ratchet — the baseline may shrink, never grow.
       - name: select! cancellation safety
         run: ./scripts/check-select-cancellation-safety.sh
+      # The 5-4-3-2-1 weights are protocol constants that the payout path reads — and the
+      # dashboard API open-codes the same ladder TWICE, plus `"max_shares"` three times. A reweight
+      # that misses a copy does not change anyone's payment (payouts divide by the sum of actual
+      # shares, never by MAX_NODE_SHARES), it just makes the dashboard quietly wrong. #736 will
+      # have to delete GHOST_PAY_SHARES from all of them.
+      - name: Capability ladder agrees with the constants
+        run: ./scripts/check-capability-ladder-agrees.sh
       # The deploy gate counts `batches delivered` by grepping sri-pool's journal for a line that
       # is `debug!` in a module the fleet's RUST_LOG does not enable — so it was structurally 0 on
       # every node for ever, while its own comment told the reader 0 meant "no batch accepted"
