@@ -11830,12 +11830,42 @@ async fn api_swarm_node_restart_handler(
 }
 
 /// API v1 Swarm: Update a remote node's version
+/// API v1 Swarm: update a remote node's binary — **refused by design, permanently**.
+///
+/// ⛔ This is not an unimplemented feature. It is a decision, and the 501 its siblings return
+/// would misrepresent it as a gap someone should helpfully fill.
+///
+/// A working remote "update this node's binary" endpoint is a second deploy path, and it bypasses
+/// every gate the first one has: `record-tests.sh` and the per-sha deployable record, the canary
+/// soak, one node at a time with a smoke test between each, genesis last. `deploy-node.sh` exists
+/// precisely to REFUSE deploys that skipped those — this would refuse nothing.
+///
+/// It is also the most attractive supply-chain target on the node once v1 is multi-operator: one
+/// compromised operator key becomes arbitrary code on every node that honours it. `restart` is
+/// safe by comparison because it restarts what is already there; it does not choose what runs.
+///
+/// 501 would say "not yet". 403 says "no", which is the truth, and the body names the supported
+/// path so an operator is not left guessing.
 async fn api_swarm_node_update_version_handler(
     State(_state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
     Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    swarm_not_implemented(&node_id, "update node version")
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "refused_by_design",
+            "action": "update node version",
+            "node_id": node_id,
+            "message":
+                "Remote binary updates are refused deliberately and permanently. They would be a \
+                 second deploy path that bypasses the test record, the canary soak and the \
+                 one-node-at-a-time roll that scripts/deploy-node.sh enforces, and in a \
+                 multi-operator pool an operator key would become arbitrary code on every node. \
+                 Use scripts/deploy-node.sh. See #403.",
+            "supported_path": "scripts/deploy-node.sh <node> <binary>",
+        })),
+    )
 }
 
 /// API v1 Swarm: Sync fleet from P2P peer list (POST variant)
@@ -11852,10 +11882,10 @@ async fn api_swarm_sync_post_handler(
 /// reporting fabricated success — `{"message": "Update all command sent"}` with nothing sent
 /// (#403). An operator pressing "update all" was told it worked.
 ///
-/// It cannot be real before the single-node update is: there is no authenticated node-to-node
-/// control RPC to fan out to. Reporting that plainly is the whole point — a success message for
-/// an action nobody performed is worse than an honest refusal, because it ends the operator's
-/// investigation.
+/// It cannot be real before the single-node update is — and the single-node update is refused by
+/// design, permanently (see `api_swarm_node_update_version_handler`), so this will not become
+/// real either. Reporting that plainly is the whole point: a success message for an action nobody
+/// performed is worse than an honest refusal, because it ends the operator's investigation.
 async fn api_swarm_update_all_post_handler(
     State(_state): State<Arc<VerificationState>>,
     Json(_body): Json<serde_json::Value>,
@@ -12750,7 +12780,6 @@ mod tests {
         // and describing code that no longer exists. Their real handlers are tested below.
         for action in [
             "configure node",
-            "update node version",
             "update node metadata",
             "remove node",
             "add node",
@@ -12820,6 +12849,52 @@ mod tests {
         assert!(
             !whole.contains("command sent"),
             "no variant of \"command sent\" may appear: {whole}"
+        );
+    }
+
+    /// `update version` is refused ON PURPOSE, so it must not look like a gap.
+    ///
+    /// A 501 "not implemented" invites someone to implement it. The whole point of #403's
+    /// conclusion is that a remote binary update should never exist: it is a second deploy path
+    /// around the test record, the canary soak and the one-node-at-a-time roll. This asserts the
+    /// refusal reads as a decision rather than a TODO.
+    #[tokio::test]
+    async fn swarm_update_version_is_refused_by_design_not_unimplemented() {
+        use axum::response::IntoResponse;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use http_body_util::BodyExt;
+
+        let state = std::sync::Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        ));
+        let resp = api_swarm_node_update_version_handler(
+            axum::extract::State(state),
+            axum::extract::Path("test_node".to_string()),
+            axum::Json(serde_json::json!({"version": "1.2.3"})),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a deliberate refusal is 403; 501 would say \"not yet\""
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "refused_by_design");
+        let whole = body.to_string();
+        assert!(
+            !whole.contains("not_implemented"),
+            "it must not read as unbuilt: {whole}"
+        );
+        assert!(
+            whole.contains("deploy-node.sh"),
+            "the refusal must name the supported path, or an operator is left guessing: {whole}"
         );
     }
 
