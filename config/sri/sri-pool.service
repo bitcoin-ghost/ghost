@@ -13,7 +13,7 @@ ExecStart=/opt/ghost/bin/pool_sv2 --config /etc/ghost/pool-config.toml
 # two weeks. The mining message handler stays at debug because those
 # OpenExtendedMiningChannel / CloseChannel lines are what diagnose channel faults --
 # they are what pinned down #898.
-Environment=RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug
+Environment=RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug,pool_sv2::share_webhook=debug
 Restart=always
 RestartSec=5
 [Install]

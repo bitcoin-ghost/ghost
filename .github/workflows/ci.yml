@@ -82,6 +82,13 @@ jobs:
       # pool-sv2. A ratchet — the baseline may shrink, never grow.
       - name: select! cancellation safety
         run: ./scripts/check-select-cancellation-safety.sh
+      # The deploy gate counts `batches delivered` by grepping sri-pool's journal for a line that
+      # is `debug!` in a module the fleet's RUST_LOG does not enable — so it was structurally 0 on
+      # every node for ever, while its own comment told the reader 0 meant "no batch accepted"
+      # (the #742 share-destroying signature). Nobody wrote a bug: a log level was narrowed in one
+      # file and a metric died in another, and nothing connected them (#947).
+      - name: Counted log lines are enabled
+        run: ./scripts/check-counted-log-lines-are-enabled.sh
       # #780: a node must STATE which gates it enforces, or "is this node armed, and at what
       # height?" has no answer short of reading the binary. ADDRESS_PROOF_ENFORCEMENT was
       # resolved, stored and given an accessor — and never logged, so once armed at 970,500 an
