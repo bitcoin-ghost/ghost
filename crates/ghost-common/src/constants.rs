@@ -100,6 +100,27 @@ pub const ELDER_STATUS_SHARES: i32 = 1;
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const MAX_NODE_SHARES: i32 = 15;
 
+/// `MAX_NODE_SHARES` must BE the sum, not a number that happens to match it today.
+///
+/// It is duplicated as a literal in the dashboard API (`"max_shares"`), so a capability weight
+/// changing without this moving would have the API reporting a denominator the payout path does
+/// not use. Payouts divide by the SUM of actual shares rather than by this, so the drift would be
+/// invisible in the money and visible only as a wrong-looking dashboard — which is the kind of
+/// discrepancy that gets explained away.
+///
+/// ⚠ This is the assertion to update when GhostPay is removed (#736): dropping
+/// `GHOST_PAY_SHARES` from the sum requires `MAX_NODE_SHARES` to become 11 in the same commit, and
+/// this makes that a compile error rather than a thing to remember.
+const _: () = assert!(
+    MAX_NODE_SHARES
+        == ARCHIVE_MODE_SHARES
+            + GHOST_PAY_SHARES
+            + PUBLIC_MINING_SHARES
+            + REAPER_SHARES
+            + ELDER_STATUS_SHARES,
+    "MAX_NODE_SHARES must equal the sum of the five capability weights"
+);
+
 /// MEDIUM-STOR-1: Compile-time assertion that max shares cannot overflow i32
 /// This ensures total_shares() can safely use checked arithmetic
 const _: () = {
