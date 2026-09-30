@@ -95,6 +95,20 @@ ghostmode=0
 hazemode=Hazed   # or FullArchive if you want to serve raw block data
 ```
 
+Create the service user and the data directory before starting anything. Both ghostd and
+ghost-pool run as this one user — that is what the reference fleet does, and what
+`install-node.sh` sets up:
+
+```bash
+sudo useradd --system --create-home --home-dir /home/ghost --shell /usr/sbin/nologin ghost
+sudo mkdir -p /var/lib/bitcoin /etc/ghost
+sudo chown -R ghost:ghost /var/lib/bitcoin /home/ghost
+sudo chmod 750 /var/lib/bitcoin
+```
+
+`--create-home` matters: ghost-pool keeps its database and MPC parameters under
+`/home/ghost/.ghost`, which the unit below references.
+
 Start it under systemd. A skeleton unit at `/etc/systemd/system/ghost-core.service`:
 
 ```ini
@@ -104,7 +118,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=bitcoin
+User=ghost
+Group=ghost
 ExecStart=/usr/local/bin/ghostd -conf=/etc/ghost/bitcoin.conf -datadir=/var/lib/bitcoin
 Restart=always
 RestartSec=5
@@ -112,6 +127,11 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+⚠ This unit ran as `User=bitcoin` for a long time, which was wrong twice over: nothing in
+this guide creates that user, and the reference fleet runs ghostd as `ghost` — the same
+user as ghost-pool below. If you built a node from an older copy of this guide, check with
+`systemctl show ghostd -p User --value` rather than reading the unit file.
 
 `sudo systemctl enable --now ghost-core` and let it sync. Initial Block Download takes ~3 minutes via snapshot sync (hazed mode) or several hours from genesis on a slow link.
 
