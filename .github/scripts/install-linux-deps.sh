@@ -63,15 +63,51 @@ if compgen -G "$DEB_CACHE/*.deb" > /dev/null 2>&1; then
 fi
 
 echo "apt cache MISS — fetching from the mirrors (bounded), then seeding the cache"
-sudo apt-get -o Acquire::Retries=3 \
-             -o Acquire::http::Timeout=20 \
-             -o Acquire::https::Timeout=20 \
-             update
 
-# Download without installing so the .debs land in apt's archive directory, where we can copy
-# them out to be cached. Packages already present on the image simply download nothing.
-# shellcheck disable=SC2086  # word splitting is intended: $PKGS is a package LIST
-sudo apt-get install -y --download-only $PKGS
+# ⛔ update AND download, together, retried as a PAIR.
+#
+# `apt-get update` refreshes the index from one mirror; the download then fetches .debs from the
+# pool. When a mirror is mid-sync the index can already name a version whose file is not published
+# yet, and the download dies on a hard 404:
+#
+#     E: Failed to fetch .../libevent-openssl-2.1-7t64_2.1.12-stable-9ubuntu2.1_amd64.deb 404
+#     E: Unable to fetch some archives
+#
+# That took out 7 of 13 jobs on 2026-09-30 — every job that installs Linux deps. `Acquire::Retries`
+# does not help: it retries the transfer, and a 404 is a successful answer meaning "not here". What
+# fixes it is asking again a little later, by which time the mirror has caught up, AND re-running
+# `update` so the index is re-read rather than reusing the stale one that named the missing file.
+#
+# Retrying the download alone would fail identically every time, because the index would still name
+# the file that is not there. The pair is the unit of work.
+apt_fetch() {
+  sudo apt-get -o Acquire::Retries=3 \
+               -o Acquire::http::Timeout=20 \
+               -o Acquire::https::Timeout=20 \
+               update || return 1
+  # Download without installing so the .debs land in apt's archive directory, where we can copy
+  # them out to be cached. Packages already present on the image simply download nothing.
+  # shellcheck disable=SC2086  # word splitting is intended: $PKGS is a package LIST
+  sudo apt-get -o Acquire::Retries=3 install -y --download-only $PKGS
+}
+
+fetched=no
+for attempt in 1 2 3; do
+  if apt_fetch; then
+    fetched=yes
+    break
+  fi
+  if [ "$attempt" -lt 3 ]; then
+    echo "apt fetch failed (attempt $attempt/3) — a mirror is likely mid-sync; retrying in 20s"
+    sleep 20
+  fi
+done
+if [ "$fetched" != yes ]; then
+  echo "REFUSING: apt could not fetch the packages after 3 attempts." >&2
+  echo "  This is the mirror, not the build. If it persists, the mirror is genuinely missing a" >&2
+  echo "  version the index names — check the failing URL before changing this script." >&2
+  exit 1
+fi
 
 mkdir -p "$DEB_CACHE"
 # `|| true`: if every package was already installed there are no .debs to copy, which is a
