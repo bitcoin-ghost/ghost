@@ -1369,6 +1369,11 @@ pub struct VerificationState {
     /// Operator-signed fleet control (#403). Disabled unless an operator public key is
     /// configured — a node nobody set up for remote control must not be controllable.
     pub fleet_auth: Arc<crate::fleet_auth::FleetAuth>,
+    /// Path to this node's `pool.toml`, when it was started with one.
+    ///
+    /// `None` disables the operator-signed config endpoint: a node that cannot say which file it
+    /// was configured from must not guess at one (#403).
+    pub pool_config_path: Option<std::path::PathBuf>,
     /// Server start time
     start_time: Instant,
     /// Block height getter (callback)
@@ -1866,6 +1871,7 @@ impl VerificationState {
                 node_id.clone(),
                 crate::fleet_auth::operator_pubkey_from_env(),
             )),
+            pool_config_path: None,
             node_id,
             version,
             // Defaults to Signet (the historical hardcoded value); production
@@ -2531,6 +2537,12 @@ impl VerificationState {
         f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>,
     ) -> Self {
         self.checkpoint_voter_set_fn = Some(f);
+        self
+    }
+
+    /// Tell this node where its `pool.toml` is, enabling the operator-signed config endpoint (#403).
+    pub fn with_pool_config_path(mut self, p: std::path::PathBuf) -> Self {
+        self.pool_config_path = Some(p);
         self
     }
 
