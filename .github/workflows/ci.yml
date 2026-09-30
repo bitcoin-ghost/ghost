@@ -616,7 +616,12 @@ jobs:
           # key would hand this job a cache holding none of the packages it needs.
           key: apt-debs-tauri-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}-${{ env.TAURI_DEPS }}
       - name: Install Linux deps
-        timeout-minutes: 10
+        # ⚠ 20, not the 6 the other jobs use, and not the 10 it was. TAURI_DEPS pulls ~212
+        # packages against their ~40, so a COLD apt cache takes far longer here. The cache key
+        # hashes install-linux-deps.sh, so any edit to that script rotates it and forces exactly
+        # that cold path on every job at once — which is how this job timed out at 10 minutes on
+        # 2026-09-30 mid-download, having fetched 212 packages and not finished.
+        timeout-minutes: 20
         env:
           LINUX_DEPS: ${{ env.TAURI_DEPS }}
         run: .github/scripts/install-linux-deps.sh
