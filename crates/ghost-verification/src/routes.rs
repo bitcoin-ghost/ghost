@@ -11686,6 +11686,16 @@ async fn api_swarm_node_add_handler(
 /// Deliberately NOT wired to a real action in this change: one node restarting another is a
 /// security-sensitive capability that needs an auth design of its own, and inventing one under
 /// time pressure is how the rest of this file grew stubs.
+/// One allowlisted config change, carried by an operator-signed command.
+#[derive(serde::Deserialize)]
+struct SwarmConfigBody {
+    #[serde(flatten)]
+    cmd: crate::fleet_auth::SignedCommand,
+    /// Dotted key, e.g. `alerts.events.low_disk` or `pool.max_miners`.
+    key: String,
+    value: serde_json::Value,
+}
+
 fn swarm_not_implemented(node_id: &str, action: &str) -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -11765,12 +11775,108 @@ async fn api_swarm_node_refresh_handler(
 }
 
 /// API v1 Swarm: Configure a remote node
+/// API v1 Swarm: change one allowlisted key in THIS node's `pool.toml` (#403).
+///
+/// Operator-signed, via the same `fleet_auth::SignedCommand` path `restart` uses — so a compromised
+/// peer cannot reconfigure anything, and a command for another node is refused with that node's id.
+///
+/// ⛔ Writes the file and does NOT restart. Nothing in `pool.toml` is re-read while the node runs,
+/// so the change takes effect at the next restart and rides the next binary roll. Every node is in
+/// the mining DNS, so a restart sheds that node's miners; CLAUDE.md's rule is one restart per node,
+/// carrying config and binary together.
+///
+/// ⛔ Capability claims are not settable. See [`crate::node_config`]: a capability is earned by
+/// passing its verification challenges, not granted by setting a flag.
 async fn api_swarm_node_config_handler(
-    State(_state): State<Arc<VerificationState>>,
+    State(state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
+    Json(body): Json<SwarmConfigBody>,
 ) -> impl IntoResponse {
-    swarm_not_implemented(&node_id, "configure node")
+    if body.cmd.target_node_id != node_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "target_mismatch",
+                "message": "path node_id does not match the signed target_node_id",
+            })),
+        )
+            .into_response();
+    }
+    if body.cmd.action != "configure" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "action_mismatch",
+                "message": format!("this route performs 'configure', command says '{}'", body.cmd.action),
+            })),
+        )
+            .into_response();
+    }
+    if let Err(e) = state
+        .fleet_auth
+        .verify(&body.cmd, crate::fleet_auth::now_secs())
+    {
+        warn!(node_id = %node_id, key = %body.key, error = %e, "fleet control: refused configure");
+        let status = match e {
+            crate::fleet_auth::FleetAuthError::NoOperatorKey => StatusCode::NOT_IMPLEMENTED,
+            _ => StatusCode::FORBIDDEN,
+        };
+        return (
+            status,
+            Json(serde_json::json!({ "error": "unauthorized", "message": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    let path = match state.pool_config_path.as_ref() {
+        Some(p) => p.clone(),
+        None => return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "not_implemented",
+                "message": "this node was started without a pool.toml path, so it cannot edit one",
+            })),
+        )
+            .into_response(),
+    };
+
+    // ⛔ The value is NEVER logged. `display_name` is harmless, but this handler must not become the
+    // reason a config value reaches a log line, because the next key added might not be.
+    match crate::node_config::write_change(&path, &body.key, &body.value) {
+        Ok(()) => {
+            info!(node_id = %node_id, key = %body.key, "fleet control: operator-authorised config change");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "written",
+                    "key": body.key,
+                    "node_id": node_id,
+                    "effective": "at this node's next restart",
+                    "message": "pool.toml updated. Nothing is re-read while the node runs, so this \
+                                takes effect when the node next restarts — deliberately, so it can \
+                                ride a binary roll instead of spending a restart of its own.",
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let refused = matches!(e, crate::node_config::ConfigError::NotSettable(_));
+            warn!(node_id = %node_id, key = %body.key, "fleet control: config change rejected");
+            (
+                if refused {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                Json(serde_json::json!({
+                    "error": if refused { "refused_by_design" } else { "invalid_change" },
+                    "key": body.key,
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// API v1 Swarm: restart a node.

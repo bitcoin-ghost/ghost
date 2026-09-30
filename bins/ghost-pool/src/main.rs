@@ -8078,6 +8078,9 @@ async fn main() -> Result<()> {
     // This allows the dashboard to modify settings via POST /api/internal/config/update
     verification_state =
         verification_state.with_full_node_config(config.clone(), args.config.clone());
+    // #403: the operator-signed config endpoint edits THIS file. Passed explicitly rather than
+    // guessed, so a node started with a non-default config cannot have a different one rewritten.
+    verification_state = verification_state.with_pool_config_path(args.config.clone());
 
     // Wire L2 submit callback if ZK consensus is enabled
     if let Some(l2_submit_fn) = l2_submit_fn_opt {
