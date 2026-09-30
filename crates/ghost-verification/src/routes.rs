@@ -12880,12 +12880,16 @@ mod tests {
         use axum::response::IntoResponse;
         use http_body_util::BodyExt;
 
-        // ⚠ Only the actions that STILL route through the helper. `restart node` and
-        // `refresh node status` were listed here after they became real handlers that never call
-        // it, so this loop was asserting the helper echoes two strings nothing passes it — green,
-        // and describing code that no longer exists. Their real handlers are tested below.
+        // ⚠ Only the actions that STILL route through the helper. `restart node`, `refresh node
+        // status`, `update node version` and `configure node` were each left listed here after
+        // becoming real handlers that never call it, so this loop sat asserting the helper echoes
+        // strings nothing passes it — green, and describing code that no longer exists. Their real
+        // handlers are tested separately.
+        //
+        // ⛔ That happened four times, and every time it was caught by hand. This list is now
+        // derived-checked by `scripts/check-swarm-refusal-test-is-current.sh` in CI: an entry with
+        // no matching `swarm_not_implemented(.., "<action>")` call site is a build failure.
         for action in [
-            "configure node",
             "update node metadata",
             "remove node",
             "add node",

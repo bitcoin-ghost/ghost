@@ -110,6 +110,15 @@ jobs:
       # four finalises nothing, silently. Nothing connected the two files; this does.
       - name: Convergence covers every committed root
         run: ./scripts/check-convergence-covers-every-root.sh
+      # The swarm-refusal test loops action strings through `swarm_not_implemented` to prove the
+      # fleet-control routes return an honest 501 rather than fabricating success. It tests the
+      # HELPER, so when a route becomes real its string stays in the loop and the test keeps
+      # passing — now asserting only that the helper echoes a string nothing passes it. That has
+      # happened four times in three days (restart, refresh, update-version, configure), each
+      # caught by hand. The test's own doc comment warns about exactly this and still could not
+      # see it happening to itself.
+      - name: Swarm-refusal test covers only live refusals
+        run: ./scripts/check-swarm-refusal-test-is-current.sh
       # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
       # caught lying about its address stops counting toward the diversity floor, which changes
       # which nodes qualify and how the node-reward pool splits. There are FIVE construction
