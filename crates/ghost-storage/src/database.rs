@@ -1494,12 +1494,20 @@ impl Database {
     /// Prune old rows from the converged `verification_ledger` (v42).
     ///
     /// The ledger accrues one signed proof per (challenger, target, capability,
-    /// timestamp) and otherwise grows without bound. `keep_days` MUST stay well
-    /// above the challenge-convergence window (7 days) and the qualification
-    /// window, so that (a) qualification never reads a pruned row and (b)
-    /// convergence — which only reconciles the last 7 days — never re-fetches a
-    /// pruned row from a peer that hasn't pruned it yet. The default retention
-    /// (`keep_challenge_days` = 30) leaves ample margin.
+    /// timestamp) and otherwise grows without bound. `keep_days` MUST stay above BOTH
+    /// seven-day windows — qualification reads `UPTIME_WINDOW_DAYS` (7) and convergence
+    /// separately reconciles the last 7 — so that (a) qualification never reads a pruned
+    /// row and (b) a peer that has not pruned yet cannot re-fetch a row this node already
+    /// dropped, which would make the two ledgers oscillate.
+    ///
+    /// The default is **18** (`MaintenanceConfig::default`), against a floor of 14.
+    /// `challenge_retention_never_drops_below_two_seven_day_windows` enforces both ends: at
+    /// least 2x the uptime window, and at most 3x that floor — a retention policy wide enough
+    /// never to delete anything is not a retention policy.
+    ///
+    /// ⚠ This said `= 30` until 2026-09-30, and it was never 30. A wrong number in a doc whose
+    /// whole job is to reason about safety margin is worse than no number: it invites someone to
+    /// "restore" a value the guard would then reject.
     pub fn prune_old_verification_ledger(&self, keep_days: u32) -> GhostResult<usize> {
         self.transaction(|tx| {
             let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86400);
