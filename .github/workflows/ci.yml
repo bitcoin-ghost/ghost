@@ -89,6 +89,14 @@ jobs:
       # have to delete GHOST_PAY_SHARES from all of them.
       - name: Capability ladder agrees with the constants
         run: ./scripts/check-capability-ladder-agrees.sh
+      # A capability is earned by passing its verification challenges, so the config endpoint (#403)
+      # must never let an operator set one. `apply()` enforces that by default-deny, and the test
+      # pinning it named four paths BY HAND — one of which (`pool.public_mining`) is not a field of
+      # any settings struct, while `network.mining_mode` and `coordinator.coordinator_enabled`, the
+      # two that actually drive a claim, went unmentioned (#963). This derives the field list from
+      # `NodeCapabilities` so a new capability cannot be added without the mapping being completed.
+      - name: Capability claims are not remotely settable
+        run: ./scripts/check-capability-claims-are-not-settable.sh
       # The deploy gate counts `batches delivered` by grepping sri-pool's journal for a line that
       # is `debug!` in a module the fleet's RUST_LOG does not enable — so it was structurally 0 on
       # every node for ever, while its own comment told the reader 0 meant "no batch accepted"
