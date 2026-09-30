@@ -118,6 +118,15 @@ jobs:
       # four finalises nothing, silently. Nothing connected the two files; this does.
       - name: Convergence covers every committed root
         run: ./scripts/check-convergence-covers-every-root.sh
+      # A miner-side shim rebuilds `checkpoint_hash` to check any signature at all, so every value
+      # that hash commits to must be in the blob the public endpoint serves. The hash has been
+      # bumped TWICE by ADDING a root (v2 advert_root, v3 coordinator_roster_root) and nothing
+      # connected it to the producer — the v2 bump shipped a blob with no `adverts`/`advert_root`,
+      # which no shim could verify, and it went unnoticed because the endpoint 404s below the gate
+      # (#970). The test written for that regression rebuilds the message from the RECORD, so it
+      # cannot see a field missing from the JSON.
+      - name: Served checkpoint carries everything the hash commits
+        run: ./scripts/check-served-checkpoint-carries-the-hash.sh
       # The swarm-refusal test loops action strings through `swarm_not_implemented` to prove the
       # fleet-control routes return an honest 501 rather than fabricating success. It tests the
       # HELPER, so when a route becomes real its string stays in the loop and the test keeps
