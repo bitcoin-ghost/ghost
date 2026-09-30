@@ -331,28 +331,77 @@ block_found = false
         assert_eq!(SAMPLE.lines().count(), out.lines().count());
     }
 
-    /// ⛔ The decision this module exists to enforce.
+    /// Every field of `NodeCapabilities`, and the config path an operator would have to set to
+    /// claim it. `None` means the claim is not operator-settable by construction.
+    ///
+    /// ⛔ Mirrors the `NodeCapabilities { .. }` initialiser in `bins/ghost-pool/src/main.rs`,
+    /// which is in a crate this one does not depend on — so the mapping cannot be read off a type
+    /// and has to be declared. What CAN be derived is its completeness, and
+    /// `scripts/check-capability-claims-are-not-settable.sh` does that in CI: every field of
+    /// `NodeCapabilities` must appear here, and nothing else may.
+    ///
+    /// It is derived-checked because the hand-written version had already drifted (#963). It named
+    /// `pool.public_mining` — not a field of any settings struct, removed when `mining_mode`
+    /// replaced it, and cited BY NAME in `config.rs` as the key that sat in live configs for
+    /// months meaning nothing — while omitting `network.mining_mode` and
+    /// `coordinator.coordinator_enabled`, the two paths that actually drive a claim.
+    pub(super) const CAPABILITY_CONFIG_PATHS: &[(&str, Option<&str>)] = &[
+        ("archive_mode", Some("storage.archive_mode")),
+        // Claimed via `config.ghost_pay_enabled()`, which reads `[ghost_pay] enabled`.
+        ("ghost_pay", Some("ghost_pay.enabled")),
+        // ⚠ NOT `pool.public_mining`. The claim is `matches!(mining_mode, MiningMode::PublicPool)`.
+        ("public_mining", Some("network.mining_mode")),
+        ("reaper", Some("reaper.enabled")),
+        // Registration order — the first 101 nodes. No config path exists to set it.
+        ("elder_status", None),
+        // Earns the Wraith mixing fee rather than 5-4-3-2-1 shares, but it is still a role an
+        // operator must not be able to switch on over HTTP.
+        ("coordinator", Some("coordinator.coordinator_enabled")),
+    ];
+
+    /// ⛔ The decision this module exists to enforce: a capability is earned by passing its
+    /// verification challenges, never by setting a flag.
     #[test]
     fn capability_claims_are_refused() {
-        for k in [
-            "storage.archive_mode",
-            "ghost_pay.enabled",
-            "reaper.enabled",
-            "pool.public_mining",
-        ] {
+        let mut checked = 0;
+        for (field, path) in CAPABILITY_CONFIG_PATHS {
+            let Some(k) = path else { continue };
             let e = apply(SAMPLE, k, &json!(true)).unwrap_err();
             assert!(
                 matches!(e, ConfigError::NotSettable(ref got) if got == k),
-                "{k} must be refused, got {e:?}"
+                "{field}: '{k}' must be refused, got {e:?}"
             );
             assert!(
                 e.to_string()
                     .contains("earned by passing its verification challenges"),
                 "the refusal must say WHY: {e}"
             );
+            checked += 1;
         }
+        // A table that lost its entries would pass every assertion above by running none of them.
+        assert!(
+            checked >= 5,
+            "only {checked} capability path(s) exercised — the table is too short to be the \
+             whole set"
+        );
         // And the file is untouched, because apply() returned Err before building anything.
         assert!(SAMPLE.contains("archive_mode = false"));
+    }
+
+    /// The allowlist is what does the refusing; the test above only samples it. Nothing in
+    /// `SETTABLE` may be a path that drives a capability claim.
+    #[test]
+    fn no_capability_path_is_on_the_allowlist() {
+        for (field, path) in CAPABILITY_CONFIG_PATHS {
+            let Some(k) = path else { continue };
+            let (section, key) = k.rsplit_once('.').expect("a dotted path");
+            assert!(
+                !SETTABLE
+                    .iter()
+                    .any(|(s, kk, _)| *s == section && *kk == key),
+                "{field}: '{k}' drives a capability claim and must never be in SETTABLE"
+            );
+        }
     }
 
     #[test]
