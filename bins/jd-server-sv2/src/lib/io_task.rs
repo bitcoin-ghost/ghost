@@ -41,12 +41,16 @@ pub fn spawn_io_tasks(
         task_manager.spawn(
             async move {
                 trace!("Reader task started");
-                loop {
+                // The error exits below each log an `error!`; the cancellation exit logs only
+                // `trace!`. Without a reason on the exit line, a deliberately cancelled reader
+                // was indistinguishable at INFO from one that simply vanished (#973).
+                // `break <value>` forces every exit to name itself or fail to compile.
+                let exit_reason = loop {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             trace!("Received shutdown");
                             inbound_tx.close();
-                            break;
+                            break "shutdown signal (cancellation token)";
                         }
                         res = reader.read_frame() => {
                             match res {
@@ -55,14 +59,14 @@ pub fn spawn_io_tasks(
                                         Frame::HandShake(frame) => {
                                             error!(?frame, "Received handshake frame");
                                             drop(frame);
-                                            break;
+                                            break "unexpected handshake frame";
                                         },
                                         Frame::Sv2(sv2_frame) => {
                                             trace!("Received inbound frame");
                                             if let Err(e) = inbound_tx.send(sv2_frame).await {
                                                 inbound_tx.close();
                                                 error!(error=?e, "Failed to forward inbound frame");
-                                                break;
+                                                break "inbound channel send failed";
                                             }
                                         },
                                     }
@@ -70,17 +74,17 @@ pub fn spawn_io_tasks(
                                 Err(e) => {
                                     error!(error=?e, "Reader error");
                                     inbound_tx.close();
-                                    break;
+                                    break "read_frame error";
                                 }
                             }
                         }
                     }
-                }
+                };
                 inbound_tx.close();
                 outbound_rx_clone.close();
                 drop(inbound_tx);
                 drop(outbound_rx_clone);
-                warn!("Reader task exited.");
+                warn!(reason = exit_reason, "Reader task exited.");
             }
             .instrument(tracing::trace_span!(
                 "reader_task",
@@ -94,12 +98,13 @@ pub fn spawn_io_tasks(
         task_manager.spawn(
             async move {
                 trace!("Writer task started");
-                loop {
+                // See the reader above (#973).
+                let exit_reason = loop {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             trace!("Received shutdown");
                             outbound_rx.close();
-                            break;
+                            break "shutdown signal (cancellation token)";
                         }
                         res = outbound_rx.recv() => {
                             match res {
@@ -108,23 +113,23 @@ pub fn spawn_io_tasks(
                                     if let Err(e) = writer.write_frame(frame.into()).await {
                                         error!(error=?e, "Writer error");
                                         outbound_rx.close();
-                                        break;
+                                        break "write_frame error";
                                     }
                                 }
                                 Err(_) => {
                                     outbound_rx.close();
                                     warn!("Outbound channel closed");
-                                    break;
+                                    break "outbound channel closed";
                                 }
                             }
                         }
                     }
-                }
+                };
                 outbound_rx.close();
                 inbound_tx_clone.close();
                 drop(outbound_rx);
                 drop(inbound_tx_clone);
-                warn!("Writer task exited.");
+                warn!(reason = exit_reason, "Writer task exited.");
             }
             .instrument(tracing::trace_span!(
                 "writer_task",
