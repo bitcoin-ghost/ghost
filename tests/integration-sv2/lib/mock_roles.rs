@@ -256,8 +256,8 @@ impl MockUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::get_available_address;
     use crate::{interceptor::MessageDirection, start_sniffer};
-    use std::net::TcpListener;
     use stratum_apps::stratum_core::{
         common_messages_sv2::{
             MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
@@ -298,12 +298,12 @@ mod tests {
     }
 
     async fn test_implicit_setup_connection_body() {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let upstream_socket_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // `get_available_address` keeps the probing listener alive in the RESERVED registry until
+        // `claim_listener` hands it over, so nothing else on the machine can take the port. These
+        // three tests used to bind "127.0.0.1:0", read the port and DROP the listener, which frees
+        // it again — and all three then failed on `claim_listener`'s bind under parallel load
+        // (#977). Same race #408 fixed for `MockUpstream::start`.
+        let upstream_socket_addr = get_available_address();
 
         let _mock_upstream = MockUpstream::new(
             upstream_socket_addr,
@@ -353,12 +353,12 @@ mod tests {
     /// `has_message_type` and `assert_message_not_present` — which is why hardening only the
     /// first one in #450 did not settle it.
     async fn test_assert_message_not_present_body() {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let upstream_socket_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // `get_available_address` keeps the probing listener alive in the RESERVED registry until
+        // `claim_listener` hands it over, so nothing else on the machine can take the port. These
+        // three tests used to bind "127.0.0.1:0", read the port and DROP the listener, which frees
+        // it again — and all three then failed on `claim_listener`'s bind under parallel load
+        // (#977). Same race #408 fixed for `MockUpstream::start`.
+        let upstream_socket_addr = get_available_address();
 
         let _mock_upstream = MockUpstream::new(
             upstream_socket_addr,
@@ -425,12 +425,12 @@ mod tests {
     }
 
     async fn test_setup_connection_wrong_protocol_body() {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let upstream_socket_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // `get_available_address` keeps the probing listener alive in the RESERVED registry until
+        // `claim_listener` hands it over, so nothing else on the machine can take the port. These
+        // three tests used to bind "127.0.0.1:0", read the port and DROP the listener, which frees
+        // it again — and all three then failed on `claim_listener`'s bind under parallel load
+        // (#977). Same race #408 fixed for `MockUpstream::start`.
+        let upstream_socket_addr = get_available_address();
 
         let _mock_upstream = MockUpstream::new(
             upstream_socket_addr,
