@@ -40,17 +40,21 @@ pub fn spawn_io_tasks(
                 let fallback_token = fallback_coordinator_clone.token();
 
                 trace!("Reader task started");
-                loop {
+                // The error exits below each log an `error!`; the two cancellation exits log
+                // only `trace!`. Without a reason on the exit line, a deliberately cancelled
+                // reader was indistinguishable at INFO from one that simply vanished (#973).
+                // `break <value>` forces every exit to name itself or fail to compile.
+                let exit_reason = loop {
                     tokio::select! {
                         _ = cancellation_token_clone.cancelled() => {
                             trace!("Received app shutdown signal");
                             inbound_tx.close();
-                            break;
+                            break "shutdown signal (cancellation token)";
                         }
                         _ = fallback_token.cancelled() => {
                             trace!("Received fallback signal");
                             inbound_tx.close();
-                            break;
+                            break "fallback signal (FallbackCoordinator)";
                         }
                         res = reader.read_frame() => {
                             match res {
@@ -59,14 +63,14 @@ pub fn spawn_io_tasks(
                                         Frame::HandShake(frame) => {
                                             error!(?frame, "Received handshake frame");
                                             drop(frame);
-                                            break;
+                                            break "unexpected handshake frame";
                                         },
                                         Frame::Sv2(sv2_frame) => {
                                             trace!("Received inbound frame");
                                             if let Err(e) = inbound_tx.send(sv2_frame).await {
                                                 inbound_tx.close();
                                                 error!(error=?e, "Failed to forward inbound frame");
-                                                break;
+                                                break "inbound channel send failed";
                                             }
                                         },
                                     }
@@ -74,12 +78,12 @@ pub fn spawn_io_tasks(
                                 Err(e) => {
                                     error!(error=?e, "Reader error");
                                     inbound_tx.close();
-                                    break;
+                                    break "read_frame error";
                                 }
                             }
                         }
                     }
-                }
+                };
                 inbound_tx.close();
                 outbound_rx_clone.close();
                 drop(inbound_tx);
@@ -87,7 +91,7 @@ pub fn spawn_io_tasks(
 
                 // signal fallback coordinator that this task has completed its cleanup
                 fallback_handler.done();
-                warn!("Reader task exited.");
+                warn!(reason = exit_reason, "Reader task exited.");
             }
             .instrument(tracing::trace_span!(
                 "reader_task",
@@ -108,17 +112,18 @@ pub fn spawn_io_tasks(
                 let fallback_token = fallback_coordinator_clone.token();
 
                 trace!("Writer task started");
-                loop {
+                // See the reader above (#973).
+                let exit_reason = loop {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             trace!("Received app shutdown signal");
                             inbound_tx_clone.close();
-                            break;
+                            break "shutdown signal (cancellation token)";
                         }
                         _ = fallback_token.cancelled() => {
                             trace!("Received fallback signal");
                             inbound_tx_clone.close();
-                            break;
+                            break "fallback signal (FallbackCoordinator)";
                         }
                         res = outbound_rx.recv() => {
                             match res {
@@ -127,18 +132,18 @@ pub fn spawn_io_tasks(
                                     if let Err(e) = writer.write_frame(frame.into()).await {
                                         error!(error=?e, "Writer error");
                                         outbound_rx.close();
-                                        break;
+                                        break "write_frame error";
                                     }
                                 }
                                 Err(_) => {
                                     outbound_rx.close();
                                     warn!("Outbound channel closed");
-                                    break;
+                                    break "outbound channel closed";
                                 }
                             }
                         }
                     }
-                }
+                };
                 outbound_rx.close();
                 inbound_tx_clone.close();
                 drop(outbound_rx);
@@ -146,7 +151,7 @@ pub fn spawn_io_tasks(
 
                 // signal fallback coordinator that this task has completed its cleanup
                 fallback_handler.done();
-                warn!("Writer task exited.");
+                warn!(reason = exit_reason, "Writer task exited.");
             }
             .instrument(tracing::trace_span!(
                 "writer_task",
