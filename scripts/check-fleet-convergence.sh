@@ -71,8 +71,27 @@ for n in "${NODES[@]}"; do
         # at the one moment the answer mattered most — straight after the arming roll. A probe
         # whose budget is under the thing it measures fails when the fleet is busiest, which is
         # when you are most likely to be asking.
-        timeout 120 ssh -o ConnectTimeout=10 -o BatchMode=yes "$n" \
-            "curl -s --max-time 90 http://127.0.0.1:8080/api/v1/qualification/scoped-set" \
+        #
+        # ⛔⛔ AND IT HAPPENED AGAIN. The 90s budget set from that 24-31s baseline was itself too
+        # tight. MEASURED 2026-10-01, quiet fleet, 3 sequential samples per node:
+        #
+        #     vm1  14.1 20.5 14.5   ->  14-21s
+        #     vm8  28.9 31.2 24.3   ->  24-31s
+        #     vm5  27.4 42.0 27.8   ->  27-42s
+        #     vm7  44.4 36.4 39.1   ->  36-44s
+        #
+        # Typical is 14-44s, but OUTLIERS of 131s and >150s were observed on vm7. Three
+        # consecutive 8-way samples each lost a DIFFERENT node (vm5, then vm8, then vm7) to a
+        # truncated response and a JSONDecodeError against the 90s budget. 240s clears the worst
+        # observed with margin.
+        #
+        # ⚠ Raising this treats the probe, not the endpoint. A 14-44s status endpoint — one that
+        # derives over the node set rather than scanning the chain — is its own problem (#979).
+        #
+        # ⛔ Measure this endpoint ONE NODE AT A TIME. Parallel probes inflate each other, and
+        # attributing that spread to nodes is how a bogus ">150s on vm7" reached #979.
+        timeout 300 ssh -o ConnectTimeout=10 -o BatchMode=yes "$n" \
+            "curl -s --max-time 240 http://127.0.0.1:8080/api/v1/qualification/scoped-set" \
             > "$TMP/$n.json" 2>/dev/null
     ) &
 done
