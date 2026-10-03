@@ -16,14 +16,23 @@ Ghost introduces no new token. All rewards come from Bitcoin block subsidies and
 
 ## Pool Fee Structure
 
-Ghost Pool charges a **fixed 1% fee on the block subsidy only**. Transaction fees are never touched.
+Ghost Pool charges a **fixed 1% fee on the whole block reward** — subsidy *and* transaction
+fees. Miners keep the other 99%.
 
 ### Fee Distribution
 
 ```text
-pool_fee = block_subsidy × 0.01
-Currently: 3.125 BTC × 0.01 = 0.03125 BTC per block
+total_reward = block_subsidy + block_tx_fees
+pool_fee     = total_reward × 0.01
+miner_pool   = total_reward − pool_fee      # 99%, shared proportionally by share work
 ```
+
+:::warning Changed at height 959,290
+Before that height the fee was levied on the subsidy alone and transaction fees went **100% to
+whichever miner found the block**. That gate fired on 2026-07-23, and the behaviour above is what
+the code does now (`bins/ghost-pool/src/treasury.rs`). There is **no block-finder bonus of any
+kind** any more.
+:::
 
 The 1% fee is split between Treasury and Node Reward Pool:
 
@@ -49,15 +58,21 @@ Where miner_shares = shares submitted by this miner this round
 
 ### Transaction Fees
 
-The miner whose share found the block receives **100% of transaction fees**:
+Transaction fees are **folded into the reward and shared proportionally**, exactly like the
+subsidy. There is no block-finder bonus:
 
 ```text
-winning_miner_total = miner_subsidy + block_tx_fees
-Only the block-finding miner gets block_tx_fees
+each_miner = (their_work / total_work) × (total_reward × 0.99)
 ```
 
-:::info Why TX fees to winning miner?
-The node that builds the template chooses which transactions to include. Giving them 100% of fees incentivizes building high-fee templates. This is unlike traditional pools that split fees across all miners.
+:::info Why fees are shared rather than paid to the finder
+Finding a block is luck; the work that made it findable is everyone's. Paying the fees to whoever
+happened to find it ties a miner's income to variance rather than contribution — punishing for
+small miners, who can contribute for months and find nothing.
+
+It also buys a structural property: with no finder-specific output, the coinbase is **fully
+determined before the block is found**, so it can be ratified at tip change rather than after the
+fact. The payout checkpoint depends on that.
 :::
 
 ## Node Share System
@@ -155,21 +170,23 @@ Governance is a liability. By designing Ghost to become governance-free, we elim
 A block is found with 3.125 BTC subsidy and 0.5 BTC in fees. The round had 10,000 miner shares.
 
 ```text
-Pool fee:         3.125 × 0.01     = 0.03125 BTC
-Treasury:         0.03125 × 0.5    = 0.015625 BTC  
-Node Reward Pool: 0.03125 × 0.5    = 0.015625 BTC
-Miner Pool:       3.125 × 0.99     = 3.09375 BTC
+Total reward:     3.125 + 0.5      = 3.625    BTC    # subsidy AND fees
+Pool fee:         3.625 × 0.01     = 0.03625  BTC
+Treasury:         0.03625 × 0.5    = 0.018125 BTC
+Node Reward Pool: 0.03625 × 0.5    = 0.018125 BTC
+Miner Pool:       3.625 × 0.99     = 3.58875  BTC
 
-Miner A (1000 shares, block finder):
-  Subsidy: (1000/10000) × 3.09375  = 0.309375 BTC
-  TX Fees: 0.5 BTC
-  Total:   0.809375 BTC
+Miner A (1000 shares):
+  (1000/10000) × 3.58875           = 0.358875 BTC
 
 Miner B (500 shares):
-  Subsidy: (500/10000) × 3.09375   = 0.1546875 BTC
-  TX Fees: 0 (not block finder)
-  Total:   0.1546875 BTC
+  (500/10000)  × 3.58875           = 0.1794375 BTC
 ```
+
+Whether a miner found the block makes no difference to what they are paid. Note Miner A earns
+*more* here than under the old subsidy-only split (0.358875 vs 0.309375) **when it does not find
+the block** — which is almost always. The old rule paid it 0.809375 on the rare block it found and
+0.309375 on every other, and that variance is precisely what was removed.
 
 ### Example 2: Node Rewards
 

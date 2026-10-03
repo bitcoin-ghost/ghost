@@ -72,6 +72,17 @@
       Point any SHA-256 ASIC at a Ghost node. 1% pool fee, ledger-style
       payouts, direct to your address. No registration, no KYC.
     </p>
+    <div style="border:1px solid #c9922c;background:rgba(201,146,44,.08);border-radius:8px;padding:14px 16px;margin:18px 0;font-size:.95rem;line-height:1.55">
+      <strong>⚠ Read this before pointing hashrate here.</strong>
+      This pool runs on Bitcoin <strong>mainnet</strong> with real funds and is under active
+      development. It is small: at its current hashrate the expected time to find a block is
+      measured in <strong>years</strong>, and it <strong>has never found one</strong>. Nothing has
+      been paid out yet, because nothing has been won yet.
+      <br><br>
+      Mining here is a contribution to decentralising pooled mining, not a way to earn predictably.
+      If you need steady income from your hashrate, use an established pool. Expected payout scales
+      with total pool hashrate, so this improves only as more miners and operators join.
+    </div>
     <div class="hero-actions">
       <a href="#quickstart" class="btn btn-primary">Connect a miner <span class="arrow">→</span></a>
       <a href="/pool.html#your-miner" class="btn btn-ghost">Your stats</a>
@@ -94,15 +105,15 @@
       <li>
         <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
         <div>
-          <div class="fl-name">1% fee, subsidy only</div>
-          <div class="fl-desc">The pool takes 1% of the block subsidy — split 50/50 between treasury and the node reward pool. Zero cut of transaction fees.</div>
+          <div class="fl-name">1% fee, you keep 99%</div>
+          <div class="fl-desc">The pool takes 1% of the whole block reward — subsidy and transaction fees — split 50/50 between treasury and the node reward pool. You keep the other 99%, shared proportionally by the work you did. Fees are not paid to whoever finds the block: finding one is luck, and tying your income to it would mean earning nothing for months at a time.</div>
         </div>
       </li>
       <li>
         <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
         <div>
-          <div class="fl-name">100% of TX fees to the winner</div>
-          <div class="fl-desc">When a block is found, transaction fees are paid in full to the node that built the winning template — no haircut to the pool, no hidden skim.</div>
+          <div class="fl-name">Fees shared, not raffled</div>
+          <div class="fl-desc">Transaction fees are folded into the block reward and shared proportionally by the work you did — not paid to whoever happens to find the block. Your income tracks your contribution instead of your luck, which matters most if you are small: a finder-takes-all rule means earning nothing for months.</div>
         </div>
       </li>
       <li>
@@ -190,6 +201,12 @@
       block; miners below that threshold carry forward until they clear
       the dust line. See the <a href="/pool.html">Pool</a> page's "In
       line to get paid" for the live queue.
+      <br><br>
+      <strong>The dust line is a per-node setting, not a protocol rule.</strong> Each operator
+      sets <code>min_payout_sats</code>, so it differs between nodes — ask the one you mine on.
+      On this pool it is currently <strong>10,000 sats</strong> (0.0001 BTC). The protocol floor
+      underneath it is Bitcoin's own 546-sat dust limit, which no operator can go below. Work
+      under the line is never lost: it carries forward until it clears.
     </div>
   </div>
 </section>
