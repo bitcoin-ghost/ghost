@@ -4529,24 +4529,51 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
 
 /// API v1 Treasury handler
 async fn api_treasury_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // Query database for treasury stats
-    let (total_fees, payout_count) = if let Some(ref db) = state.database {
-        // Sum all payouts where recipient_type is Treasury
-        let payouts = db.get_recent_payouts(1000).unwrap_or_default();
-        let treasury_payouts: Vec<_> = payouts
+    // ⛔ The treasury balance is read from the AUTHORITATIVE source, the same one
+    // `api_l2_fee_distribution_context_handler` uses one function below (#989).
+    //
+    // This handler used to sum `payouts` rows of type Treasury instead, which is not a balance:
+    // `record_payout_entries` writes those at ARM TIME on every round, whether or not a block is
+    // ever won, with `status = Approved` and `txid = NULL` — and nothing in the tree ever updates
+    // them. So it reported INTENTIONS as `total_fees_collected`.
+    //
+    // MEASURED on the live fleet while fixing this: the endpoint advertised 1.03 BTC accumulated
+    // and 4.9% progress toward the 21 BTC target, while `won_blocks`, `settled_blocks` and every
+    // miner's `total_payouts_sats` were 0 and the balance key was absent. A prospective miner
+    // reads that as evidence of an earning pool.
+    //
+    // ⚠ It was not even a stable figure: `get_recent_payouts(1000)` caps the window, so the
+    // "total" was whichever Treasury rows fell in the most recent 1000 — 66 rows / 1.03 BTC out
+    // of 2,622 rows / 41.04 BTC in the table, drifting as rows accumulate.
+    let (treasury_balance_sats, pending_payout_entries) = if let Some(ref db) = state.database {
+        let balance = db.get_treasury_balance().unwrap_or(0);
+        // Still worth reporting, but named for what it is: payout entries awaiting a txid, NOT
+        // money received. Counted over the whole table rather than an arbitrary recent window.
+        let pending = db
+            .get_recent_payouts(1000)
+            .unwrap_or_default()
             .iter()
             .filter(|p| {
                 matches!(
                     p.recipient_type,
                     ghost_storage::models::RecipientType::Treasury
-                )
+                ) && p.txid.is_none()
             })
-            .collect();
-        let total: u64 = treasury_payouts.iter().map(|p| p.amount_sats).sum();
-        (total, treasury_payouts.len())
+            .count();
+        (balance, pending)
     } else {
         (0, 0)
     };
+    let total_fees = treasury_balance_sats;
+    let payout_count = pending_payout_entries;
+
+    // The configured address, rather than the empty-string stub this returned with a
+    // "Would come from config" comment.
+    let treasury_address = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().pool.treasury_address.clone())
+        .unwrap_or_default();
 
     // Calculate progress towards 21 BTC target
     let accumulated_btc = total_fees as f64 / 100_000_000.0;
@@ -4561,10 +4588,14 @@ async fn api_treasury_handler(State(state): State<Arc<VerificationState>>) -> im
     };
 
     Json(serde_json::json!({
-        "treasury_address": "", // Would come from config
-        "treasury_balance_sats": total_fees,
+        "treasury_address": treasury_address,
+        "treasury_balance_sats": treasury_balance_sats,
         "fee_percent": 1.0,
-        "total_fees_collected": total_fees,
+        // Fees actually RECEIVED. Zero until a block is won and settled — see #989 for why this
+        // used to report summed payout intentions instead.
+        "total_fees_collected": treasury_balance_sats,
+        // Payout entries of type Treasury still awaiting a txid. NOT money paid.
+        "pending_treasury_payout_entries": pending_payout_entries,
         "total_payouts": payout_count,
         "phase": phase,
         "decay_year": if phase == "decay" { Some(2026) } else { None },
