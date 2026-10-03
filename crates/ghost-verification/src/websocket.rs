@@ -555,7 +555,17 @@ async fn handle_socket(socket: WebSocket, ws_state: Arc<WsState>, authenticated:
     // Spawn task to forward broadcast events to this client
     // AUTH4-M3: Filter events based on authentication status
     let mut send_task = tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
+        // `Lagged` is recoverable — a slow client that misses events should keep receiving the
+        // next ones, not have its stream silently end (#984). Only `Closed` is terminal.
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "WebSocket client lagged — events dropped");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             // Skip non-public events for unauthenticated connections
             if !authenticated && !event.is_public() {
                 continue;

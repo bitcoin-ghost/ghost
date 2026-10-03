@@ -10410,7 +10410,23 @@ async fn main() -> Result<()> {
 
         // Start block event handler for new blocks
         tokio::spawn(async move {
-            while let Ok(block_hash) = block_rx.recv().await {
+            // `Lagged` is recoverable; only `Closed` is terminal (#984). Exiting on a lag would
+            // stop this node reacting to new blocks at all, silently.
+            loop {
+                let block_hash = match block_rx.recv().await {
+                    Ok(h) => h,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            skipped,
+                            "ZMQ block consumer lagged — block notifications dropped; continuing"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("ZMQ block channel closed — block consumer stopping");
+                        break;
+                    }
+                };
                 info!(hash = %block_hash, "New block detected via ZMQ");
 
                 // End current round
@@ -10551,7 +10567,22 @@ async fn main() -> Result<()> {
         // refresh (~30s), but the tip only moves on a new block, and a payout is per-block.
         let mut last_proposed_height: u64 = 0;
 
-        while let Ok(event) = template_events_early.recv().await {
+        // `Lagged` is recoverable; only `Closed` is terminal (#984).
+        loop {
+            let event = match template_events_early.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "Template-event consumer lagged — template events dropped; continuing"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    warn!("Template-event channel closed — consumer stopping");
+                    break;
+                }
+            };
             match event {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
@@ -10937,9 +10968,40 @@ async fn main() -> Result<()> {
     let solo_payout_address_for_events = config.network.solo_payout_address.clone();
 
     // Subscribe to round events and handle block found
+    //
+    // ⛔ This loop CREATES THE PAYOUT PROPOSAL for a found block, and it must never exit on a
+    // recoverable error. It used to be `while let Ok(event) = ...`, which treats
+    // `RecvError::Lagged` — "you missed n events", a recoverable condition — as terminal. A single
+    // lag ended the task permanently, and nothing restarted it or logged that it was gone, so
+    // every subsequent block would be found and never proposed (#984).
+    //
+    // The overflow is reachable: `RoundEvent::ShareSubmitted` rides this same 1000-slot channel on
+    // every share (~6.6/sec measured on the live fleet, so ~150s of stall fills it), and the
+    // heaviest work in this loop is the `BlockFound` arm below. That makes the FIRST block the pool
+    // ever wins the moment of peak lag risk — the one event the pool exists for.
+    //
+    // `reorg.rs` and `template_provider.rs` already handle `Lagged` correctly; this is that shape.
     let mut round_events = round_manager.subscribe();
     tokio::spawn(async move {
-        while let Ok(event) = round_events.recv().await {
+        loop {
+            let event = match round_events.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Recoverable: keep consuming. A skipped BlockFound is serious, but the
+                    // remedy is to stay subscribed for the next one, not to stop listening.
+                    warn!(
+                        skipped,
+                        "Round-event consumer lagged — events were dropped. If a BlockFound was \
+                         among them, that block has no payout proposal; continuing to consume."
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    // Terminal, and only this is: every sender is gone.
+                    warn!("Round-event channel closed — payout-proposal consumer stopping");
+                    break;
+                }
+            };
             match event {
                 RoundEvent::BlockFound {
                     round_id,

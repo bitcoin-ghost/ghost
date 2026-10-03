@@ -28,7 +28,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use ghost_accounting::shares::{DifficultyCalculator, RoundShares};
 use ghost_common::config::MiningMode;
@@ -722,11 +722,26 @@ impl RoundManager {
                 "BLOCK FOUND!"
             );
 
-            let _ = self.event_tx.send(RoundEvent::BlockFound {
+            // ⛔ NOT `let _ =`. This is the single most important event the pool emits: the
+            // consumer in main.rs is what creates the payout proposal. `send` fails only when
+            // there are no subscribers, which means the proposal task is gone — exactly the
+            // condition that used to be invisible (#984). A found block that reaches nobody must
+            // be the loudest line in the log, not the quietest.
+            if let Err(e) = self.event_tx.send(RoundEvent::BlockFound {
                 round_id,
                 block_hash: share_hash,
                 miner_id: miner_id.to_string(),
-            });
+            }) {
+                error!(
+                    error = %e,
+                    round = round_id,
+                    miner = %miner_id,
+                    hash = %hex::encode(&share_hash[..8]),
+                    "BLOCK FOUND but no round-event subscriber received it — NO PAYOUT PROPOSAL \
+                     WILL BE CREATED for this block. The proposal consumer has stopped; restart \
+                     ghost-pool."
+                );
+            }
         }
 
         Ok(ShareSubmitResult {
