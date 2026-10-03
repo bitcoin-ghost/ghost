@@ -357,10 +357,32 @@ impl NodeIdentity {
 
     /// Save identity to a key file (44 bytes: 32 key + 12 PoW proof)
     ///
+    /// ⛔ REFUSES to overwrite an existing file (#985). `node.key` is not a cache: `node_id`
+    /// derives from it, its first 32 bytes ARE the TDP authority secret, and the Elder slot is
+    /// bound to it. Nothing backs it up. Generating over one does not recover an identity — it
+    /// mints a DIFFERENT node and destroys the old one irrecoverably.
+    ///
+    /// `scripts/install-node.sh` called `--generate-identity` unconditionally on every run, so
+    /// re-running the one-command installer — the most natural operator reflex there is — silently
+    /// destroyed the node. The installer now guards it, and this refuses as well, so no future
+    /// caller can reintroduce the same footgun.
+    ///
+    /// Callers that legitimately create a key check for absence first (see the `key_path.exists()`
+    /// branch in `bins/ghost-pool/src/main.rs`), so this costs them nothing.
+    ///
     /// Note: This only works for LocalSigner. HSM/KMS signers don't support
     /// exporting private keys.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> GhostResult<()> {
         let path = path.as_ref();
+
+        if path.exists() {
+            return Err(GhostError::InvalidKey(format!(
+                "refusing to overwrite an existing identity at {} — node.key is irreplaceable \
+                 (node_id, TDP authority secret and Elder slot all derive from it) and nothing \
+                 backs it up. Move it aside deliberately if you really intend a NEW node.",
+                path.display()
+            )));
+        }
 
         // For non-local signers, we can only save the PoW proof and public key reference
         // The actual key is managed by the HSM/KMS
@@ -712,6 +734,41 @@ mod tests {
 
         // Wrong message should fail
         assert!(!identity.verify(b"Wrong message", &signature));
+    }
+
+    /// ⛔ The property #985 exists for: a second `save` to the same path must REFUSE, not
+    /// overwrite. `node.key` carries `node_id`, the TDP authority secret and the Elder slot, and
+    /// nothing backs it up — so an overwrite is unrecoverable identity loss, not a retry.
+    ///
+    /// This is what made re-running `install-node.sh` destructive: it called
+    /// `--generate-identity` unconditionally, and the natural operator reflex of re-running an
+    /// installer silently minted a different node.
+    #[test]
+    fn save_refuses_to_overwrite_an_existing_identity() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("node.key");
+
+        let first = NodeIdentity::generate();
+        first.save(&key_path).expect("first save must succeed");
+        let first_id = first.node_id();
+
+        // A different identity, saved to the same path, must be refused.
+        let second = NodeIdentity::generate();
+        let err = second
+            .save(&key_path)
+            .expect_err("saving over an existing identity must be refused");
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "the refusal must say what it refused and why, got: {err}"
+        );
+
+        // And the original must still be on disk, byte for byte.
+        let reloaded = NodeIdentity::load(&key_path).expect("the original must survive");
+        assert_eq!(
+            reloaded.node_id(),
+            first_id,
+            "the identity on disk must be unchanged after a refused overwrite"
+        );
     }
 
     #[test]
