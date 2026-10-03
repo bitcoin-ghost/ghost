@@ -118,6 +118,14 @@ jobs:
       # four finalises nothing, silently. Nothing connected the two files; this does.
       - name: Convergence covers every committed root
         run: ./scripts/check-convergence-covers-every-root.sh
+      # `broadcast::Receiver::recv()` returns `Lagged(n)` — "you missed n events", RECOVERABLE —
+      # and `Closed`, the only terminal one. `while let Ok(..)` cannot tell them apart and exits on
+      # both. Four live loops shipped that way (#984), including the task that CREATES THE PAYOUT
+      # PROPOSAL for a found block: `ShareSubmitted` shares its 1000-slot channel at ~6.6/sec, so
+      # ~150s of stall ends payouts permanently with no log on either side. reorg.rs had it right,
+      # so this was never house style — which is why the four that differed went unnoticed.
+      - name: Broadcast receivers handle Lagged
+        run: ./scripts/check-broadcast-lag-is-handled.sh
       # A miner-side shim rebuilds `checkpoint_hash` to check any signature at all, so every value
       # that hash commits to must be in the blob the public endpoint serves. The hash has been
       # bumped TWICE by ADDING a root (v2 advert_root, v3 coordinator_roster_root) and nothing
