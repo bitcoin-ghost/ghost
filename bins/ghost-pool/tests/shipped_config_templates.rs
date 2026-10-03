@@ -207,3 +207,101 @@ fn no_shipped_template_contains_a_key_the_struct_ignores() {
         "no templates were checked — the glob found nothing"
     );
 }
+
+/// The `[alerts]` block `install-node.sh` writes must deserialize — in BOTH shapes.
+///
+/// `AlertsConfig` carries `#[serde(deny_unknown_fields)]`, so a single renamed key makes the
+/// generated `pool.toml` unparseable and the node refuses to start. The installer is fetched
+/// standalone and has no repo to read, so nothing otherwise connects its heredoc to the struct —
+/// the same gap that let all three shipped templates carry a removed `public_mining` key.
+///
+/// Both shapes matter. #985 was that the installer wrote NO `[alerts]` section at all, so
+/// `enabled` defaulted false and all fourteen detectors fired into nothing on a fresh node. The
+/// fix emits a real section either way: configured when `--alert-webhook` is given, and an honest
+/// `enabled = false` plus a commented template when it is not. A block claiming `enabled = true`
+/// with nowhere to deliver would be worse than either, because it reads as configured.
+///
+/// Extracted from the script rather than restated here, so the two cannot drift.
+#[test]
+fn the_installers_alerts_block_parses_in_both_shapes() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("scripts/install-node.sh");
+    let raw = std::fs::read_to_string(&script).expect("install-node.sh must be readable");
+
+    // Every `[alerts]` section the script writes, read line by line from the heredoc bodies.
+    //
+    // ⚠ A line that is EXACTLY `[alerts]` starts one. Matching the bare string also hit this
+    // file's own prose and the installer's comments, which is how the first two versions of this
+    // test failed on text that was never config.
+    let mut blocks: Vec<String> = Vec::new();
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].trim() != "[alerts]" {
+            i += 1;
+            continue;
+        }
+        let mut body = vec!["[alerts]".to_string()];
+        i += 1;
+        while i < lines.len() {
+            let l = lines[i];
+            // The heredoc terminator, or the start of the shell logic after it, ends the block.
+            if l.trim() == "ALERTS" || l.trim_start().starts_with("if [[") || l.trim() == ")" {
+                break;
+            }
+            // Commented-out template lines are part of the shape being offered.
+            let stripped = l.trim_start().trim_start_matches('#').trim_start();
+            body.push(stripped.to_string());
+            i += 1;
+        }
+        blocks.push(
+            body.join("\n")
+                .replace("${ALERT_WEBHOOK}", "https://ntfy.sh")
+                .replace("${ALERT_TOPIC}", "ghost-node"),
+        );
+    }
+
+    assert!(
+        !blocks.is_empty(),
+        "no `[alerts]` block found in install-node.sh — #985 was that it wrote none at all, so \
+         its absence is the regression this test exists to catch"
+    );
+
+    let mut saw_enabled_true = false;
+    for (i, body) in blocks.iter().enumerate() {
+        // The block is a NodeConfig FRAGMENT rooted at `[alerts]`, so parse it the way the node
+        // would see it rather than as a bare AlertsConfig.
+        #[derive(serde::Deserialize)]
+        struct Fragment {
+            alerts: ghost_common::config::AlertsConfig,
+        }
+        let cfg = toml::from_str::<Fragment>(body)
+            .map(|f| f.alerts)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "install-node.sh `[alerts]` block #{i} does not deserialize: {e}\n\
+                 AlertsConfig is deny_unknown_fields, so a renamed key here makes the generated \
+                 pool.toml unparseable and the node refuses to start.\n--- block ---\n{body}"
+                )
+            });
+        if cfg.enabled {
+            saw_enabled_true = true;
+            // An enabled block must be able to deliver, or it is a lie that reads as configured.
+            let ch = &cfg.channels;
+            assert!(
+                (ch.push.enabled && ch.push.webhook_url.is_some())
+                    || ch.email.enabled
+                    || ch.telegram.enabled,
+                "install-node.sh writes `[alerts] enabled = true` with no deliverable channel — \
+                 every alert would be computed and dropped, while reading as configured"
+            );
+        }
+    }
+
+    assert!(
+        saw_enabled_true,
+        "no `[alerts]` shape in install-node.sh ever sets `enabled = true` — the --alert-webhook \
+         path must produce a genuinely enabled block, or #985 is not fixed"
+    );
+}

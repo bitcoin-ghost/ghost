@@ -9,7 +9,7 @@
 | Feature | Traditional Pool | Ghost Pool |
 | --- | --- | --- |
 | Operator | Centralized company | You (your node) |
-| Pool Fee | 2-4% of everything | 1% of subsidy only |
+| Pool Fee | 2-4% of everything | 1% of subsidy + fees |
 | TX Fees | Pool keeps them | 100% to winning node |
 | Block Template | Pool decides contents | You decide contents |
 | Censorship | Pool can censor TXs | Impossible — your node, your rules |
@@ -147,10 +147,11 @@ Block Subsidy (e.g., 3.125 BTC)
 ```bash
 miner_subsidy_share = (miner_shares / total_round_shares) × miner_pool
 
-miner_pool = block_subsidy × 0.99
+miner_pool = (block_subsidy + block_tx_fees) × 0.99
 
-# If this miner's node found the block:
-total_payout = miner_subsidy_share + 100% of TX fees
+# Since height 959,290 there is no block-finder bonus. Fees are folded into the
+# reward and shared proportionally, so finding the block changes nothing:
+total_payout = miner_subsidy_share
 ```
 
 ### Node Reward Formula
