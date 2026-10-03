@@ -63,6 +63,8 @@ ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 # ─────────────────────────────── defaults ────────────────────────────────────
 PAYOUT_ADDRESS=""
 TREASURY_ADDRESS=""
+ALERT_WEBHOOK=""
+ALERT_TOPIC="ghost-node"
 NICKNAME="ghost-node"
 SYNC_MODE="ibd"            # ibd (trustless, default) | haze (IRREVERSIBLE)
 # Mining mode — the single source of truth for who can mine and how rewards are
@@ -107,6 +109,10 @@ Bitcoin Ghost node installer
 
 Required:
   --payout-address <bech32>   Where this node's reward share is paid.
+  --alert-webhook <url>       Push endpoint for node alerts (e.g. https://ntfy.sh). Without
+                                this, alerts are DISABLED and all fourteen detectors — low disk,
+                                node offline, behind tip, restart loop … — fire into nothing.
+  --alert-topic <name>        Push topic                        (default: ghost-node)
   --treasury-address <bech32> Where THIS node's pool fee accumulates. There is deliberately
                                 no default: a default would silently pay a stranger's fee to
                                 whoever shipped the installer (#982).
@@ -168,6 +174,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --payout-address) PAYOUT_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --treasury-address) TREASURY_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --alert-webhook)  ALERT_WEBHOOK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --alert-topic)    ALERT_TOPIC="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --pool-name)      POOL_NAME="${2:-}"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --sync)           SYNC_MODE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -429,6 +437,37 @@ fi
 # every third-party node silently accumulated ITS pool fee to someone else — while
 # ghost-web/docs/deployment.md told the operator it was "an address you control". Refusing is the
 # only safe behaviour: a wrong treasury address is invisible until someone audits a coinbase.
+# The [alerts] block. ⛔ Written with `enabled` reflecting whether a channel was actually given:
+# a section that says `enabled = true` with nowhere to deliver is worse than an honest false,
+# because it reads as configured (#985). ghost-pool warns loudly at every start in either case.
+# ⚠ AlertsConfig carries #[serde(deny_unknown_fields)] — these key names must match config.rs.
+if [[ -n "$ALERT_WEBHOOK" ]]; then
+  ALERTS_BLOCK=$(cat <<ALERTS
+[alerts]
+enabled = true
+
+[alerts.channels.push]
+enabled = true
+webhook_url = "${ALERT_WEBHOOK}"
+topic = "${ALERT_TOPIC}"
+ALERTS
+)
+else
+  ALERTS_BLOCK=$(cat <<'ALERTS'
+# ⛔ NO ALERT DELIVERY IS CONFIGURED. Fourteen detectors are wired and every one of them will
+# fire into nothing. Re-run the installer with --alert-webhook, or set a channel below and flip
+# `enabled` to true. ghost-pool warns about this at every start until you do.
+[alerts]
+enabled = false
+
+# [alerts.channels.push]
+# enabled = true
+# webhook_url = "https://ntfy.sh"
+# topic = "ghost-node"
+ALERTS
+)
+fi
+
 [[ -n "$TREASURY_ADDRESS" ]] || { usage; err "--treasury-address is required."; }
 [[ "$TREASURY_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Treasury address doesn't look like a mainnet bech32 address."
 
@@ -799,6 +838,8 @@ payout_interval_blocks = 100
 share_shard = true
 shard_arm_genesis = true
 shard_coinbase = true
+
+${ALERTS_BLOCK}
 
 # ⚠ The section name is historical. Ghost Pay is retired and `enabled` is
 # hard-false; what still lives here is `wraith_enabled`, which is where

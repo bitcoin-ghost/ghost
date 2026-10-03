@@ -9048,6 +9048,55 @@ async fn main() -> Result<()> {
     };
     let _ = alert_slot.set(Arc::clone(&alert_dispatcher));
 
+    // ⛔ Say so when nothing will ever be delivered (#985).
+    //
+    // There are fourteen AlertEvent variants and every one of them is really wired to a trigger —
+    // capability drift, low disk, node offline, behind tip, service restart loop, failed login,
+    // reorg, block found, and more. But `AlertsConfig.enabled` defaults FALSE and
+    // `dispatch_event` returns immediately when it is (alerts.rs:212), so on a node that was never
+    // explicitly configured all fourteen detectors fire into nothing and the only trace is a
+    // journal line nobody reads.
+    //
+    // That was invisible to us because our own fleet was configured by hand. It is total for a
+    // freshly installed node. An installer cannot invent a delivery endpoint for an operator, so
+    // the node itself has to be the thing that says it is deaf — and it has to say it at WARN,
+    // every start, because the whole failure mode is silence.
+    {
+        let alerts_cfg = verification_state
+            .full_node_config
+            .as_ref()
+            .map(|c| c.read().alerts.clone())
+            .unwrap_or_default();
+
+        if !alerts_cfg.enabled {
+            warn!(
+                "ALERTS ARE DISABLED — no node event will reach you. Fourteen detectors \
+                 (low disk, node offline, behind tip, capability drift, restart loop, failed \
+                 login, …) are wired and will fire into nothing. Set `[alerts] enabled = true` in \
+                 pool.toml and configure at least one channel under `[alerts.channels]`."
+            );
+        } else {
+            let ch = &alerts_cfg.channels;
+            let push_live = ch.push.enabled && ch.push.webhook_url.is_some();
+            let email_live = ch.email.enabled;
+            let telegram_live = ch.telegram.enabled;
+            if !(push_live || email_live || telegram_live) {
+                warn!(
+                    "ALERTS ARE ENABLED BUT NO CHANNEL CAN DELIVER — `[alerts] enabled = true` is \
+                     set, but no channel under `[alerts.channels]` is both enabled and configured. \
+                     Every alert will be computed and then dropped. Configure push                      (`webhook_url`), email, or telegram."
+                );
+            } else {
+                info!(
+                    push = push_live,
+                    email = email_live,
+                    telegram = telegram_live,
+                    "Alert delivery active"
+                );
+            }
+        }
+    }
+
     // Register the dispatcher on the verification state so the internal
     // failed-login endpoint (signalled by the dashboard login route) can
     // dispatch the `FailedLogin` alert through the same debouncing dispatcher.
