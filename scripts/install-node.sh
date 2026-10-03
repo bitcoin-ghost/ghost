@@ -19,7 +19,15 @@ set -euo pipefail
 # GitHub API is unreachable. The release tarball is GPG-verified below regardless
 # of how the version resolves, so auto-tracking never lowers the security bar.
 GHOST_VERSION="${GHOST_VERSION:-$(curl -fsSL --max-time 10 https://api.github.com/repos/bitcoin-ghost/ghost/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)}"
-GHOST_VERSION="${GHOST_VERSION:-v1.10.16}"
+# ⛔ No stale fallback. This used to pin v1.10.16 — roughly 27 releases behind current — so a
+# momentary GitHub API failure silently installed an ancient binary, GPG-verified and wrong.
+# "I could not determine the latest release" must stop, not guess: an operator can re-run, or pin
+# GHOST_VERSION deliberately.
+if [[ -z "${GHOST_VERSION}" ]]; then
+  echo "ERROR: could not determine the latest release from the GitHub API." >&2
+  echo "       Re-run when reachable, or pin one explicitly: GHOST_VERSION=v1.11.43 $0 ..." >&2
+  exit 1
+fi
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
@@ -54,6 +62,7 @@ ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
 # ─────────────────────────────── defaults ────────────────────────────────────
 PAYOUT_ADDRESS=""
+TREASURY_ADDRESS=""
 NICKNAME="ghost-node"
 SYNC_MODE="ibd"            # ibd (trustless, default) | haze (IRREVERSIBLE)
 # Mining mode — the single source of truth for who can mine and how rewards are
@@ -98,6 +107,9 @@ Bitcoin Ghost node installer
 
 Required:
   --payout-address <bech32>   Where this node's reward share is paid.
+  --treasury-address <bech32> Where THIS node's pool fee accumulates. There is deliberately
+                                no default: a default would silently pay a stranger's fee to
+                                whoever shipped the installer (#982).
 
 Options:
   --nickname <name>           Display name in the mesh        (default: ghost-node)
@@ -155,6 +167,7 @@ NON_INTERACTIVE="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --payout-address) PAYOUT_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --treasury-address) TREASURY_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --pool-name)      POOL_NAME="${2:-}"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --sync)           SYNC_MODE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -250,6 +263,18 @@ run_wizard() {
     read -rp "Payout address (mainnet bech32 — where your rewards are paid): " addr || true
     if [[ "$addr" =~ ^bc1[a-z0-9]{20,}$ ]]; then
       PAYOUT_ADDRESS="$addr"; break
+    fi
+    echo "  ✗ That doesn't look like a mainnet bech32 address (must start 'bc1…'). Try again."
+  done
+
+  # Treasury address — REQUIRED, no default (#982). Asked for, never inferred.
+  local taddr
+  echo
+  echo "The treasury address receives this node's pool fee. It must be yours."
+  while :; do
+    read -rp "Treasury address (mainnet bech32): " taddr || true
+    if [[ "$taddr" =~ ^bc1[a-z0-9]{20,}$ ]]; then
+      TREASURY_ADDRESS="$taddr"; break
     fi
     echo "  ✗ That doesn't look like a mainnet bech32 address (must start 'bc1…'). Try again."
   done
@@ -399,6 +424,13 @@ fi
 
 [[ -n "$PAYOUT_ADDRESS" ]] || { usage; err "--payout-address is required."; }
 [[ "$PAYOUT_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Payout address doesn't look like a mainnet bech32 address."
+
+# ⛔ Required, never defaulted (#982). This installer used to hardcode the author's address, so
+# every third-party node silently accumulated ITS pool fee to someone else — while
+# ghost-web/docs/deployment.md told the operator it was "an address you control". Refusing is the
+# only safe behaviour: a wrong treasury address is invisible until someone audits a coinbase.
+[[ -n "$TREASURY_ADDRESS" ]] || { usage; err "--treasury-address is required."; }
+[[ "$TREASURY_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Treasury address doesn't look like a mainnet bech32 address."
 
 # A coordinator's fee address is asked for, never inferred.
 #
@@ -755,9 +787,18 @@ prune_height = 0
 
 [pool]
 ${POOL_IDENTITY_BLOCK}
-treasury_address = "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k"
+treasury_address = "${TREASURY_ADDRESS}"
 min_payout_sats = 10000
 payout_interval_blocks = 100
+
+# The share shard IS the paying ledger (payout.rs:779). All three default to false in
+# NodeConfig, and this installer used to set none of them — so a freshly provisioned node ran
+# with the paying ledger OFF: create_proposal errors, no coinbase commitment is produced, and
+# the H-11 guard then REFUSES TO SUBMIT a block the node just found (#983). The one event the
+# pool exists for was the one that failed. All three are required together.
+share_shard = true
+shard_arm_genesis = true
+shard_coinbase = true
 
 # ⚠ The section name is historical. Ghost Pay is retired and `enabled` is
 # hard-false; what still lives here is `wraith_enabled`, which is where
@@ -871,9 +912,22 @@ chmod 600 /etc/bitcoin/bitcoin.conf /etc/ghost/pool.toml
 chown -R ghost:ghost /home/ghost /var/lib/ghost /var/lib/bitcoin
 
 # ─────────────────────────── 7. node identity ────────────────────────────────
-log "Generating node identity"
-sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" \
-  /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
+# ⛔ NEVER regenerate an identity that already exists (#985). node.key is not a cache: node_id
+# derives from it, its first 32 bytes ARE the TDP authority secret, and the Elder slot is bound to
+# it. `--generate-identity` does not recover an identity, it mints a DIFFERENT node — and nothing
+# backs this file up. Re-running an installer is the most natural operator reflex there is (to
+# upgrade, to repair a config, after a failed first attempt), and it used to destroy the one
+# artefact that cannot be recreated. Note this script already preserves internal_api_secret across
+# re-runs, so idempotency was considered for a regenerable value and not for the irreplaceable one.
+if [[ -s /home/ghost/.ghost/node.key ]]; then
+  log "Node identity already present — keeping it (node.key is irreplaceable; not regenerating)"
+  sudo -u ghost /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>&1 \
+    | grep -iE "Node ID" || true
+else
+  log "Generating node identity"
+  sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" \
+    /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
+fi
 
 # ───────────────────── 7b. SV2 stratum stack config ──────────────────────────
 # Generate the miner-facing SV2 config the same way ghost-pool's pool.toml is
