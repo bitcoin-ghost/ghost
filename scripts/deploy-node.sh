@@ -1278,3 +1278,27 @@ else
 fi
 
 info "OK: $BINARY @ $SHORT live on $NODE (backup: $BINARY.bak.$TS)"
+
+# State where this node now sits relative to main. `deploy-node.sh` is per-node and so cannot know
+# whether the ROLL is finished; what it can say is whether THIS node is now at main's tip, which is
+# the question nobody was asking. The fleet sat 22 commits behind main for a week with every check
+# green, because the eight nodes agreed with each other perfectly (#993).
+#
+# Best-effort and never fatal: deploying a deliberately older commit is legitimate, and a currency
+# report must not be what fails a deploy that passed its smoke test. It is also binary-only — the
+# unit comparison needs four ssh round-trips per node and belongs in the end-of-roll sweep.
+if [ "$BINARY" = "ghost-pool" ] && [ -x "$REPO_ROOT/scripts/ops/check-fleet-is-current.sh" ]; then
+    if CURRENT_OUT=$("$REPO_ROOT/scripts/ops/check-fleet-is-current.sh" --binary-only "$NODE" 2>&1); then
+        info "$NODE is at origin/main's tip"
+    else
+        BEHIND_N=$(printf '%s' "$CURRENT_OUT" | sed -nE 's/.*is ([0-9]+) commit\(s\) behind.*/\1/p' | head -1)
+        if [ -n "$BEHIND_N" ]; then
+            info "NOTE: $NODE is still $BEHIND_N commit(s) behind origin/main after this deploy"
+        else
+            info "NOTE: could not establish where $NODE sits relative to origin/main"
+        fi
+    fi
+    info "the ROLL is not finished until scripts/ops/check-fleet-is-current.sh (no --binary-only,"
+    info "  no node arguments) exits 0 — that is the only check that compares units, which"
+    info "  deploy-node.sh does not swap"
+fi

@@ -1802,6 +1802,47 @@ mod extranonce_allocation_tests {
         assert!(server_static_prefix(257).is_err());
     }
 
+    /// A single downstream must not be able to shut down the pool.
+    ///
+    /// ⛔⛔ `CancellationToken::clone` SHARES cancellation state — it is not a child. The accept
+    /// path passed a clone of the GLOBAL token into every per-connection task, and the
+    /// bootstrap-failure branch called `cancel()` on it, so one connection took down the listener
+    /// loop and every connected miner while logging "disconnecting downstream {id}" (#994).
+    ///
+    /// Both directions are asserted, because only one of them is the bug and a fix that broke the
+    /// other would be worse: a child that did NOT die with its parent would leave connection tasks
+    /// running through a shutdown.
+    #[test]
+    fn a_connection_token_cannot_cancel_the_pool_but_dies_with_it() {
+        use crate::channel_manager::connection_token;
+        use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
+
+        let global = CancellationToken::new();
+        let conn_a = connection_token(&global);
+        let conn_b = connection_token(&global);
+
+        conn_a.cancel();
+        assert!(
+            conn_a.is_cancelled(),
+            "a connection must be able to cancel itself"
+        );
+        assert!(
+            !global.is_cancelled(),
+            "one connection cancelled the GLOBAL token — this is #994: the listener loop and every \
+             other miner go down with it"
+        );
+        assert!(
+            !conn_b.is_cancelled(),
+            "one connection cancelled a SIBLING connection"
+        );
+
+        global.cancel();
+        assert!(
+            conn_b.is_cancelled(),
+            "a live connection survived global shutdown — its tasks would outlive the pool"
+        );
+    }
+
     /// The regression test for #744.
     ///
     /// A client that loops `OpenExtendedMiningChannel` with an identity the pool rejects must
