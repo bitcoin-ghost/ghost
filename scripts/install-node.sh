@@ -1390,6 +1390,19 @@ ExecStart=/opt/ghost/bin/pool_sv2 --config /etc/ghost/pool-config.toml
 # OpenExtendedMiningChannel / CloseChannel lines are what diagnose channel faults --
 # they are what pinned down #898.
 Environment=RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug,pool_sv2::share_webhook=debug
+# ⛔ pool_sv2 holds the world-open SV2 miner port (:34255) and was the ONLY one of the four units
+# without this, so it inherited the default SOFT limit of 1024 while ghostd, ghost-pool and
+# sri-translator all set 65536.
+#
+# MEASURED on the live fleet before this line existed:
+#   sri-pool    LimitNOFILE 524288  soft 1024
+#   ghost-pool  LimitNOFILE 65536   soft 65536
+#
+# A process is bounded by its SOFT limit unless it raises it itself, so the miner-facing process
+# capped near 1,000 descriptors against a configured ceiling of 1,000 miners — and a miner
+# connection costs more than one fd. ⚠ Note `capacity.rs` derives its ceiling from `getrlimit` in
+# GHOST-POOL, which holds almost no miner sockets, so the capacity model never saw this.
+LimitNOFILE=65536
 Restart=always
 RestartSec=5
 [Install]
