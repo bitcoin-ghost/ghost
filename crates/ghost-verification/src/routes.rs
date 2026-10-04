@@ -59,6 +59,16 @@ fn is_valid_hex_hash(s: &str) -> bool {
 /// Standard Bitcoin nodes reject transactions > 100KB
 const MAX_TX_HEX_SIZE: usize = 200_000; // 100KB in hex = 200k chars
 
+/// Window for the miner-facing hashrate figures (#981).
+///
+/// 10 minutes, matching `MESH_HASHRATE_WINDOW_SECS` in ghost-pool so the number a miner reads on
+/// their own lookup page is computed over the same span as the node's own reported hashrate.
+///
+/// ⛔ Bounded on purpose. These routes used to divide by `last_seen - first_seen`, the miner's
+/// entire lifetime, so the figure only ever fell as they kept connecting and described neither
+/// their current nor their past rate.
+const MINER_HASHRATE_WINDOW_SECS: i64 = 600;
+
 /// M-STOR-3: Safely read a /proc file if it's in the allowed list
 fn safe_read_proc_file(path: &str, allowed: &[String]) -> Option<String> {
     if is_safe_proc_path(path, allowed) {
@@ -2392,9 +2402,12 @@ async fn api_miners_search_internal_handler(
             Ok(miners) => miners
                 .iter()
                 .map(|m| {
-                    // Calculate estimated hashrate from work and time
-                    let duration_secs = (m.last_seen - m.first_seen).max(1) as f64;
-                    let hashrate_ths = (m.total_work * m.avg_difficulty) / duration_secs / 1e12;
+                    // #981: use the authoritative windowed calculation, not work×difficulty over
+                    // the miner's lifetime. `work == difficulty`, so the factor is 2^32 and
+                    // multiplying by avg_difficulty understated this by ~74,000x.
+                    let hashrate_ths = db
+                        .miner_hashrate_th(&m.miner_id, MINER_HASHRATE_WINDOW_SECS)
+                        .unwrap_or(0.0);
 
                     serde_json::json!({
                         "miner_id": m.miner_id,
@@ -2443,8 +2456,10 @@ async fn api_miner_stats_handler(
         match db.get_miner_stats(&miner_id) {
             Ok(Some(s)) => {
                 // Calculate estimated hashrate
-                let duration_secs = (s.last_seen - s.first_seen).max(1) as f64;
-                let hashrate_ths = (s.total_work * s.avg_difficulty) / duration_secs / 1e12;
+                // #981: authoritative windowed calculation — see the search route above.
+                let hashrate_ths = db
+                    .miner_hashrate_th(&s.miner_id, MINER_HASHRATE_WINDOW_SECS)
+                    .unwrap_or(0.0);
                 let acceptance_rate = if s.total_shares > 0 {
                     (s.valid_shares as f64 / s.total_shares as f64) * 100.0
                 } else {

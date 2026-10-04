@@ -19,7 +19,7 @@
 #
 # ## What it checks
 #
-# Every gate stored via `gates::<NAME>.set(...)` in `init_activation_heights` must appear as a
+# Every gate stored in `init_activation_heights` must appear as a
 # field in the `tracing::info!` that follows. The gate list is derived from the `.set()` calls
 # rather than written here, so a new gate cannot be added without this noticing.
 #
@@ -35,12 +35,33 @@ SRC="bins/ghost-pool/src/lib.rs"
 
 # The gates that are RESOLVED and stored. `NETWORK_TIER_FLOOR` is deliberately excluded: it is a
 # difficulty tier, not a height, and the log states it separately.
-GATES="$(grep -oE 'gates::[A-Z_]+\.set\(' "$SRC" \
-         | sed -E 's/gates::([A-Z_]+)\.set\(/\1/' \
-         | grep -v '^NETWORK_TIER_FLOOR$' | sort -u)"
+# ⚠ Matches BOTH spellings. The resolver originally used `gates::X.set(v)` directly; it now
+# goes through the checked `set_gate(&gates::X, "X", v)` helper, which refuses to discard a
+# dropped override silently. This check INCONCLUSIVE'd on that change rather than passing over an
+# empty list — working as intended — and supporting both forms means it survives the next reshape
+# too.
+# ⛔ Matched on `&gates::NAME`, NOT on the enclosing call. rustfmt wraps
+# `set_gate(&gates::X, "X", v)` across lines whenever it is long, so a pattern anchored to
+# `set_gate(&gates::` catches only the SHORT ones — it found 5 of 18 and reported "all 5 resolved
+# gates are stated", i.e. passed while examining a quarter of them. That is the exact
+# check-that-cannot-fail shape this script exists to prevent, reintroduced in the script itself.
+# `&gates::NAME` appears exactly once per resolution and nowhere else, in either spelling.
+GATES="$( { grep -oE 'gates::[A-Z_]+\.set\(' "$SRC" | sed -E 's/gates::([A-Z_]+)\.set\(/\1/'
+           grep -oE '&gates::[A-Z_]+' "$SRC" | sed -E 's/&gates::([A-Z_]+)/\1/'
+         } | grep -v '^NETWORK_TIER_FLOOR$' | sort -u)"
+
+# A floor, because "found almost none" and "found none" fail differently: the second is caught by
+# the emptiness check below, the first silently narrows what this guard covers.
+if [ "$(printf '%s\n' "$GATES" | grep -c .)" -lt 10 ]; then
+    echo "check-every-gate-is-logged: INCONCLUSIVE — only $(printf '%s\n' "$GATES" | grep -c .)"
+    echo "  gate resolution(s) found in $SRC. There are ~17; a number this low means the matcher"
+    echo "  no longer fits the source, not that the resolver shrank."
+    exit 2
+fi
 
 if [ -z "$GATES" ]; then
-    echo "check-every-gate-is-logged: INCONCLUSIVE — found no \`gates::X.set(\` calls in $SRC."
+    echo "check-every-gate-is-logged: INCONCLUSIVE — found no gate resolutions in $SRC"
+    echo "  (looked for both \`gates::X.set(\` and \`set_gate(&gates::X\`)."
     echo "  The resolver was reshaped; this examined nothing and must not report success."
     exit 2
 fi

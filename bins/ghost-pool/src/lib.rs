@@ -858,6 +858,48 @@ fn render_gate_height(v: u64) -> String {
     }
 }
 
+/// Resolve one activation gate, refusing to do it silently.
+///
+/// ⛔ `OnceLock::set` returns `Err` when the cell was already set OR already READ, and every one of
+/// these eighteen call sites used to discard that with `let _ =`. A gate whose value was dropped
+/// leaves the node running the shipped default while an operator believes their override is in
+/// force — i.e. a consensus fork with no log line anywhere (#984 audit).
+///
+/// Reading a gate before `init_activation_heights` runs is the realistic way this happens: the
+/// first reader seals the cell at the compiled-in default via `get_or_init`, and the resolver's
+/// later `set` then fails. That is a startup-ordering bug, and it has to be loud.
+///
+/// Generic over the cell's type because `NETWORK_TIER_FLOOR` is a `u32` difficulty tier rather
+/// than a `u64` height, and it is resolved by the same mechanism with the same failure mode.
+fn set_gate<T>(cell: &std::sync::OnceLock<T>, name: &str, value: T)
+where
+    T: Copy + PartialEq + std::fmt::Debug,
+{
+    if cell.set(value).is_err() {
+        let in_force = cell.get().copied();
+        if in_force == Some(value) {
+            // Same value — harmless, but it still means something read the gate first.
+            tracing::warn!(
+                gate = name,
+                height = ?value,
+                "activation gate was already resolved before the resolver ran (same value, so no \
+                 behavioural change) — something reads this gate during startup, which would \
+                 DISCARD a real override; fix the ordering"
+            );
+        } else {
+            tracing::error!(
+                gate = name,
+                attempted = ?value,
+                in_force = ?in_force,
+                "CONSENSUS GATE OVERRIDE DISCARDED — the gate was already resolved, so the value \
+                 this run intended is NOT in force. This node will enforce a different height from \
+                 one that applied it, which is a chain split. Do not run on mainnet until the \
+                 startup ordering is fixed."
+            );
+        }
+    }
+}
+
 /// Resolve the activation gates for this run. Call once, at startup, before anything reads them.
 pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let enforcement = gates::from_env(
@@ -953,23 +995,71 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         ghost_consensus::message::MESH_ENVELOPE_V2_HEIGHT,
     );
     ghost_consensus::message::set_mesh_envelope_v2_height(mesh_envelope_v2);
-    let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
-    let _ = gates::COINBASE_FEE_SPLIT.set(fee);
-    let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
-    let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
-    let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
-    let _ = gates::SHARE_TIER_BIND.set(share_tier_bind);
-    let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
-    let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
-    let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
-    let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
-    let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
-    let _ = gates::ADDRESS_PROOF.set(address_proof);
-    let _ = gates::ADDRESS_PROOF_ENFORCEMENT.set(address_proof_enforcement);
-    let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
-    let _ = gates::CHECKPOINT_FROM_SHARD.set(checkpoint_from_shard);
-    let _ = gates::PAYOUT_FROM_SHARD.set(payout_from_shard);
-    let _ = gates::FEE_DRIFT_MINER_SHARE.set(fee_drift_miner_share);
+    set_gate(
+        &gates::CLUSTER_ENFORCEMENT,
+        "CLUSTER_ENFORCEMENT",
+        enforcement,
+    );
+    set_gate(&gates::COINBASE_FEE_SPLIT, "COINBASE_FEE_SPLIT", fee);
+    set_gate(
+        &gates::VOTER_SET_QUALIFICATION,
+        "VOTER_SET_QUALIFICATION",
+        voter_set,
+    );
+    set_gate(
+        &gates::CHALLENGER_ASSIGNMENT,
+        "CHALLENGER_ASSIGNMENT",
+        challenger_assignment,
+    );
+    set_gate(
+        &gates::SHARE_POW_VERIFY,
+        "SHARE_POW_VERIFY",
+        share_pow_verify,
+    );
+    set_gate(&gates::SHARE_TIER_BIND, "SHARE_TIER_BIND", share_tier_bind);
+    set_gate(
+        &gates::ACTIVE_VOTER_SET,
+        "ACTIVE_VOTER_SET",
+        active_voter_set,
+    );
+    set_gate(&gates::SHARE_ADDR_BIND, "SHARE_ADDR_BIND", share_addr_bind);
+    set_gate(
+        &gates::PAYOUT_MEDIAN_ADOPTION,
+        "PAYOUT_MEDIAN_ADOPTION",
+        payout_median,
+    );
+    set_gate(
+        &gates::STRATUM_HANDSHAKE_PROOF,
+        "STRATUM_HANDSHAKE_PROOF",
+        stratum_proof,
+    );
+    set_gate(&gates::ARCHIVE_TX_PROOF, "ARCHIVE_TX_PROOF", archive_tx);
+    set_gate(&gates::ADDRESS_PROOF, "ADDRESS_PROOF", address_proof);
+    set_gate(
+        &gates::ADDRESS_PROOF_ENFORCEMENT,
+        "ADDRESS_PROOF_ENFORCEMENT",
+        address_proof_enforcement,
+    );
+    set_gate(
+        &gates::MESH_NODE_LIST_CHECKPOINT,
+        "MESH_NODE_LIST_CHECKPOINT",
+        mesh_node_list_checkpoint,
+    );
+    set_gate(
+        &gates::CHECKPOINT_FROM_SHARD,
+        "CHECKPOINT_FROM_SHARD",
+        checkpoint_from_shard,
+    );
+    set_gate(
+        &gates::PAYOUT_FROM_SHARD,
+        "PAYOUT_FROM_SHARD",
+        payout_from_shard,
+    );
+    set_gate(
+        &gates::FEE_DRIFT_MINER_SHARE,
+        "FEE_DRIFT_MINER_SHARE",
+        fee_drift_miner_share,
+    );
 
     // #780: state UNCONDITIONALLY what this run will enforce.
     //
@@ -1016,7 +1106,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         u64::from(ghost_common::share_shard::NETWORK_TIER_LOG2),
     );
     let tier_floor = clamp_tier_floor(tier_floor);
-    let _ = gates::NETWORK_TIER_FLOOR.set(tier_floor);
+    set_gate(&gates::NETWORK_TIER_FLOOR, "NETWORK_TIER_FLOOR", tier_floor);
     if tier_floor != ghost_common::share_shard::NETWORK_TIER_LOG2 {
         tracing::warn!(
             tier_floor,
@@ -1505,6 +1595,90 @@ mod activation_height_logging_tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// A DISCARDED gate override must be loud.
+    ///
+    /// `OnceLock::set` fails when the cell was already set or already READ, and all eighteen gate
+    /// resolutions used to throw that away with `let _ =`. A dropped value means the node enforces
+    /// the shipped default while an operator believes their override is in force — a chain split
+    /// with no log line anywhere.
+    ///
+    /// Asserted on captured output, not on the code's shape: "has an error! statement" and
+    /// "actually prints when it matters" are different claims, and only the second one helps at
+    /// 3am.
+    #[test]
+    fn a_discarded_gate_override_is_reported_loudly() {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        // A cell that is ALREADY resolved — the realistic case is something reading a gate during
+        // startup before init_activation_heights runs, which seals it at the compiled-in default.
+        static ALREADY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        ALREADY.set(111_111).expect("first set must succeed");
+
+        tracing::subscriber::with_default(sub, || {
+            // A DIFFERENT value — the dangerous case.
+            crate::set_gate(&ALREADY, "TEST_GATE_DIVERGENT", 999_999);
+        });
+
+        let out = String::from_utf8_lossy(&cap.0.lock().expect("capture lock").clone()).to_string();
+        assert!(
+            out.contains("TEST_GATE_DIVERGENT"),
+            "the discarded gate must be named in the output, got: {out}"
+        );
+        assert!(
+            out.contains("DISCARDED"),
+            "the output must say the value was discarded, got: {out}"
+        );
+        assert!(
+            out.contains("999999") || out.contains("999_999"),
+            "the attempted value must appear so the operator can see what was lost, got: {out}"
+        );
+        assert!(
+            out.contains("111111") || out.contains("111_111"),
+            "the value actually in force must appear, got: {out}"
+        );
+        // And it must be an ERROR, not a shrug.
+        assert!(
+            out.contains("ERROR"),
+            "a divergent discarded consensus gate must be ERROR level, got: {out}"
+        );
+    }
+
+    /// The same-value case is still worth a warning: nothing diverges, but something read the gate
+    /// before the resolver ran, which is the ordering bug that WOULD discard a real override.
+    #[test]
+    fn a_redundant_gate_resolution_warns_without_crying_fork() {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        static SAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        SAME.set(222_222).expect("first set must succeed");
+
+        tracing::subscriber::with_default(sub, || {
+            crate::set_gate(&SAME, "TEST_GATE_SAME", 222_222);
+        });
+
+        let out = String::from_utf8_lossy(&cap.0.lock().expect("capture lock").clone()).to_string();
+        assert!(
+            out.contains("TEST_GATE_SAME"),
+            "the gate must still be named, got: {out}"
+        );
+        assert!(
+            !out.contains("ERROR"),
+            "an identical value is not a fork and must not be reported as one, got: {out}"
+        );
+        assert!(
+            out.contains("WARN"),
+            "it must still warn — something reads this gate during startup, got: {out}"
+        );
     }
 
     /// #780: a node must STATE which gates it enforces.

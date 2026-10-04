@@ -4149,6 +4149,44 @@ impl Database {
     /// a miner present for only part of the window contributes proportionally,
     /// which is correct for a fleet rate and avoids the per-miner elapsed-clamp
     /// that over-reported bursty/transient miners under load-balancer churn.
+    /// Windowed hashrate for ONE miner, in TH/s.
+    ///
+    /// ⛔ Use this rather than open-coding the arithmetic. The two miner-facing API routes each
+    /// computed their own version as `total_work * avg_difficulty / (last_seen - first_seen)`, which
+    /// is wrong twice over (#981):
+    ///
+    ///   * `work == difficulty` in this codebase (`bins/ghost-pool/src/convergence.rs:815`, "the
+    ///     ABSOLUTE model: work == difficulty"), so a share of difficulty D is D × 2³² hashes. The
+    ///     correct factor is 2³², not the difficulty again — multiplying by `avg_difficulty`
+    ///     double-counts it AND omits 2³². MEASURED: at avg_difficulty 57,929 that understates by
+    ///     ~74,100x — 1,653 TH/s reported as 0.0223 TH/s.
+    ///   * `last_seen - first_seen` is the miner's whole LIFETIME, so even with the right constant
+    ///     it answers a question nobody asked: a miner who mined hard last month and lightly today
+    ///     sees a figure describing neither.
+    ///
+    /// Three copies of one calculation is how two of them came to disagree with the third, which is
+    /// why this exists alongside [`Self::local_hashrate_th`] rather than beside it in a route.
+    pub fn miner_hashrate_th(&self, miner_id: &str, window_secs: i64) -> GhostResult<f64> {
+        self.with_connection(|conn| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let cutoff = now - window_secs;
+            let total_work: f64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(work), 0.0)
+                     FROM shares_all
+                     WHERE timestamp >= ?1 AND valid = 1 AND miner_id = ?2",
+                    params![cutoff, miner_id],
+                    |row| row.get::<_, f64>(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let window = window_secs.max(1) as f64;
+            Ok(total_work * 4294967296.0 / window / 1e12)
+        })
+    }
+
     pub fn local_hashrate_th(&self, window_secs: i64, received_by: &str) -> GhostResult<f64> {
         self.with_connection(|conn| {
             let now = std::time::SystemTime::now()
@@ -11431,6 +11469,71 @@ mod tests {
             db.get_treasury_balance().expect("balance"),
             0,
             "payout entries are intentions, not receipts — summing them as a balance is #989"
+        );
+    }
+
+    /// #981: the per-miner figure must use 2^32 and a BOUNDED window.
+    ///
+    /// Two miner-facing routes computed `total_work * avg_difficulty / (last_seen - first_seen)`.
+    /// `work == difficulty` here, so that double-counts difficulty and omits 2^32 — MEASURED at
+    /// ~74,100x understatement on live data (1,653 TH/s shown as 0.0223 TH/s). A miner comparing
+    /// that to their own rig's display reads it as "this pool is not counting my work".
+    ///
+    /// The magnitude assertion is the point: a formula that is merely *a* number passes any
+    /// equality test written against itself, which is how three copies of this calculation came to
+    /// disagree. This pins the order of magnitude against an independent hand computation.
+    #[test]
+    fn miner_hashrate_uses_pow_scaling_and_a_bounded_window() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mk = |hash: &str, miner: &str, work: f64, age: i64| ShareRecord {
+            id: None,
+            round_id: 1,
+            miner_id: miner.to_string(),
+            difficulty: work,
+            work,
+            share_hash: hash.to_string(),
+            timestamp: now - age,
+            received_by: "fb71fee87bb05169".to_string(),
+            valid: true,
+        };
+        let window = 600i64;
+
+        // Inside the window, ours.
+        db.insert_share(&mk("a", "mine", 30_000.0, 60)).unwrap();
+        db.insert_share(&mk("b", "mine", 30_000.0, 120)).unwrap();
+        // Another miner — must not be counted.
+        db.insert_share(&mk("c", "theirs", 900_000.0, 60)).unwrap();
+        // Ours but OUTSIDE the window — must not be counted. This is the half that the
+        // lifetime-denominator version could never get right.
+        db.insert_share(&mk("d", "mine", 900_000.0, window + 300))
+            .unwrap();
+
+        let hr = db.miner_hashrate_th("mine", window).unwrap();
+        let expected = 60_000.0 * 4294967296.0 / window as f64 / 1e12;
+        assert!(
+            (hr - expected).abs() < 1e-9,
+            "per-miner hashrate wrong: {hr} vs {expected}"
+        );
+
+        // Independent sanity on the SCALE, not just the formula agreeing with itself:
+        // 60,000 difficulty-units of work in 600s is 60000*2^32/600 ≈ 4.295e8 H/s ≈ 0.4295 TH/s.
+        assert!(
+            (0.42..0.44).contains(&hr),
+            "expected ~0.43 TH/s by hand, got {hr} — the old work×avg_difficulty form gave ~74,000x less"
+        );
+
+        // And the defect itself: the pre-fix formula must NOT reproduce this.
+        let lifetime_secs = (window + 300) as f64;
+        let wrong = (960_000.0 * 30_000.0) / lifetime_secs / 1e12;
+        assert!(
+            (hr / wrong) > 1_000.0,
+            "the corrected value must differ from the old formula by orders of magnitude, \
+             got ratio {}",
+            hr / wrong
         );
     }
 
