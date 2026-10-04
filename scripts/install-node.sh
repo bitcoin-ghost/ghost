@@ -1108,7 +1108,15 @@ monitoring_address = "0.0.0.0:9092"
 min_individual_miner_hashrate = 1_000_000_000_000.0
 shares_per_minute = 6.0
 enable_vardiff = true
-idle_timeout_secs = 600
+# ⛔ REMOVED: `idle_timeout_secs`. It was set here and by install-node.sh, documented as
+# "disconnect miners with no shares" — and NO Rust struct reads it. `TranslatorConfig` carries no
+# `deny_unknown_fields`, so it parsed, was discarded, and produced no warning, while reading to
+# anyone opening this file exactly like a setting that was in force.
+#
+# ⚠ There is NO idle-miner reaper. A connection that opens a channel and then goes quiet holds
+# its socket indefinitely. The only reaper is CHANNELLESS_REAP_TIMEOUT (120s) in sv1_server.rs,
+# which catches scanners that never open a channel at all. Adding a real one is a behavioural
+# change to the component serving live miners and wants its own change, not a config line.
 
 # Keepalive interval for downstream miners (seconds)
 job_keepalive_interval_secs = 60

@@ -53,6 +53,13 @@ jobs:
       # and has no repo to read. They had silently diverged (#431).
       - name: Check stratum config agreement
         run: ./scripts/check-stratum-config-agreement.sh
+      # TranslatorConfig has no deny_unknown_fields, so a key the struct does not read parses, is
+      # discarded, and reads to an operator exactly like a setting in force. `idle_timeout_secs`
+      # sat in the shipped config AND the installer heredoc, commented "disconnect miners with no
+      # shares", read by nothing — and there is no idle reaper at all. Same defect
+      # shipped_config_templates.rs exists for, on the one config file it does not cover.
+      - name: Shipped translator config keys are read
+        run: ./scripts/check-translator-config-keys-are-read.sh
       # The pre-deploy SV1 smoke test's declared-difficulty case could not distinguish
       # "delivered late" from "never delivered" — both printed the floor — which is what
       # misdirected the #455 investigation. This runs that case against fake pools with known
