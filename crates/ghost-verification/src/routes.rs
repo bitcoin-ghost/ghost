@@ -4563,18 +4563,13 @@ async fn api_treasury_handler(State(state): State<Arc<VerificationState>>) -> im
     let (treasury_balance_sats, pending_payout_entries) = if let Some(ref db) = state.database {
         let balance = db.get_treasury_balance().unwrap_or(0);
         // Still worth reporting, but named for what it is: payout entries awaiting a txid, NOT
-        // money received. Counted over the whole table rather than an arbitrary recent window.
-        let pending = db
-            .get_recent_payouts(1000)
-            .unwrap_or_default()
-            .iter()
-            .filter(|p| {
-                matches!(
-                    p.recipient_type,
-                    ghost_storage::models::RecipientType::Treasury
-                ) && p.txid.is_none()
-            })
-            .count();
+        // money received.
+        //
+        // ⛔ Counted in SQL over the WHOLE table. This used to filter `get_recent_payouts(1000)`
+        // in Rust under a comment that already claimed it covered the whole table — the 1000-row
+        // cap WAS the arbitrary window the comment disowned, so the number drifted as rows
+        // accumulated and the comment made it look deliberate.
+        let pending = db.pending_treasury_payout_entry_count().unwrap_or(0) as usize;
         (balance, pending)
     } else {
         (0, 0)

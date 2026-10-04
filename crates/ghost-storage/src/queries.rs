@@ -5752,13 +5752,37 @@ impl Database {
         })
     }
 
-    /// Insert a payout record
+    /// Insert a payout record, replacing this round's earlier arming for the same recipient.
+    ///
+    /// ⛔ `record_payout_entries` runs on EVERY arming, not once per block, so a plain `INSERT`
+    /// here appended a full extra set of rows each time a round was re-armed — with different
+    /// amounts, because the later proposal had seen more accumulated work. MEASURED on ghost-vm5,
+    /// 2026-10-04: 752 duplicate `(round, recipient, type)` groups across 35,571 rows, up to 3
+    /// deep. Only one proposal is ever live (`approved_payout` is overwritten), so every earlier
+    /// set was superseded and nothing distinguished them — `get_recent_payouts` and
+    /// `get_node_payout_events` returned them interleaved (#995).
+    ///
+    /// The conflict target is the TRIPLE, including `recipient_type`. On `(round_id, recipient_id)`
+    /// alone this would clobber 1,284 legitimate rows: the tx-fees entry is written with
+    /// `recipient_id = proposer`, and that node is also a `node` recipient of the same round.
+    ///
+    /// ⚠ `DO UPDATE` rather than `INSERT OR REPLACE`: replace DELETEs the old row and inserts a
+    /// new one, which would burn a fresh `AUTOINCREMENT` id on every re-arm and break any
+    /// reference to the row's `id`.
     pub fn insert_payout(&self, payout: &PayoutRecord) -> GhostResult<i64> {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO payouts (round_id, recipient_id, recipient_type, address, amount_sats,
                                      txid, vout, status, created_at, confirmed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(round_id, recipient_id, recipient_type) DO UPDATE SET
+                     address      = excluded.address,
+                     amount_sats  = excluded.amount_sats,
+                     txid         = excluded.txid,
+                     vout         = excluded.vout,
+                     status       = excluded.status,
+                     created_at   = excluded.created_at,
+                     confirmed_at = excluded.confirmed_at",
                 params![
                     payout.round_id,
                     payout.recipient_id,
@@ -5773,7 +5797,47 @@ impl Database {
                 ],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(conn.last_insert_rowid())
+            // ⛔ NOT `last_insert_rowid()`. On the DO UPDATE path no row is inserted, so that
+            // returns whatever the connection inserted LAST — a different table's id, or a stale
+            // one from minutes ago. Read the id of the row this call actually settled on.
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM payouts
+                     WHERE round_id = ?1 AND recipient_id = ?2 AND recipient_type = ?3",
+                    params![
+                        payout.round_id,
+                        payout.recipient_id,
+                        payout.recipient_type.as_str()
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(id)
+        })
+    }
+
+    /// Count Treasury payout entries still awaiting a txid, over the WHOLE table.
+    ///
+    /// ⛔ The caller used to derive this by filtering `get_recent_payouts(1000)` in Rust, under a
+    /// comment claiming it counted "over the whole table rather than an arbitrary recent window".
+    /// It did not: the 1000-row cap is exactly the arbitrary window the comment disowned, and the
+    /// figure drifted as rows accumulated. Counted here in SQL so the claim and the code are the
+    /// same statement.
+    ///
+    /// ⚠ This counts ROWS, which is what it is named for. Before #995 a round armed more than once
+    /// held one Treasury row per arming, so the count over-reported — the upsert in
+    /// [`Self::insert_payout`] is what makes a row-count mean an entry.
+    pub fn pending_treasury_payout_entry_count(&self) -> GhostResult<u64> {
+        self.with_connection(|conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM payouts WHERE recipient_type = 'treasury' AND txid IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            i64_to_u64(count, "pending_treasury_payout_entry_count")
+                .map_err(|e| GhostError::Database(e.to_string()))
         })
     }
 
@@ -13888,6 +13952,71 @@ mod tests {
             subsidy_sats: Some(312_500_000),
             tx_fees_sats: Some(100_000),
         }
+    }
+
+    /// A re-arm must REPLACE this round's row for a recipient, not append a second one — and must
+    /// leave the same recipient's other `recipient_type` alone.
+    ///
+    /// ⛔ `record_payout_entries` runs on every arming, so before the upsert a round armed twice
+    /// held two full sets of rows with DIFFERENT amounts: 752 such groups across 35,571 rows on
+    /// ghost-vm5, up to 3 deep, with no way to tell the live set from the superseded one (#995).
+    ///
+    /// The tx_fees case is asserted because the obvious conflict target —
+    /// `(round_id, recipient_id)` — is wrong: the tx-fees entry carries `recipient_id = proposer`
+    /// and that node is also a `node` recipient of the round, so 1,284 legitimate rows on the
+    /// fleet would be clobbered by the narrower target.
+    #[test]
+    fn re_arming_a_round_replaces_its_payout_rows_per_recipient_type() {
+        let db = Database::in_memory().expect("Failed to create in-memory database");
+        db.upsert_round(&test_round_record(7, 7)).expect("round");
+
+        let mut first = test_payout_record(7);
+        first.recipient_type = RecipientType::Node;
+        first.amount_sats = 146_809;
+        first.created_at = 1_787_709_418;
+        let id1 = db.insert_payout(&first).expect("first arming");
+
+        // The same recipient under a DIFFERENT type: a separate row, by design.
+        let mut fees = test_payout_record(7);
+        fees.recipient_type = RecipientType::TxFees;
+        fees.amount_sats = 777;
+        db.insert_payout(&fees).expect("tx_fees entry");
+
+        // Second arming of the same round: more accumulated work, so a larger amount.
+        let mut second = test_payout_record(7);
+        second.recipient_type = RecipientType::Node;
+        second.amount_sats = 147_121;
+        second.created_at = 1_787_712_060;
+        let id2 = db.insert_payout(&second).expect("second arming");
+
+        assert_eq!(
+            id1, id2,
+            "the re-arm must settle on the SAME row — a new id means a second row was appended, \
+             or INSERT OR REPLACE burned a fresh AUTOINCREMENT id"
+        );
+
+        let rows = db.get_recent_payouts(100).expect("read back");
+        let node_rows: Vec<i64> = rows
+            .iter()
+            .filter(|p| p.round_id == 7 && matches!(p.recipient_type, RecipientType::Node))
+            .map(|p| p.amount_sats as i64)
+            .collect();
+        assert_eq!(
+            node_rows,
+            vec![147_121],
+            "exactly one node row must remain, carrying the LATEST amount"
+        );
+
+        let fee_rows: Vec<i64> = rows
+            .iter()
+            .filter(|p| p.round_id == 7 && matches!(p.recipient_type, RecipientType::TxFees))
+            .map(|p| p.amount_sats as i64)
+            .collect();
+        assert_eq!(
+            fee_rows,
+            vec![777],
+            "the tx_fees row shares its recipient_id with the node row and must survive untouched"
+        );
     }
 
     #[test]
