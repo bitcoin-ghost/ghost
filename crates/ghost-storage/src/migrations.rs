@@ -2734,6 +2734,23 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 fn migrate_v60(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v60: dedupe payouts and make the arming triple unique");
 
+    // ⛔ `payouts` may not exist. Migrations replay over partial schemas — several tests build a
+    // pre-v39 fixture with only the MPC tables and then run the whole chain, and five of them
+    // failed with "no such table: payouts" before this guard. v58 checks the same way, for the same
+    // reason. Asked of `sqlite_master` rather than caught from the error, because a `no such table`
+    // string is also what a typo in the table name produces.
+    let has_payouts: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='payouts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_payouts {
+        debug!("v60: no `payouts` table — nothing to dedupe");
+        return Ok(());
+    }
+
     // Settled rows win outright; among the rest the newest arming wins. Expressed as "delete
     // everything that is not the winner" rather than "keep the winner", because the winner is
     // picked per GROUP and SQLite has no DELETE ... USING.
