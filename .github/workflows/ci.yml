@@ -141,6 +141,13 @@ jobs:
       # so this was never house style — which is why the four that differed went unnoticed.
       - name: Broadcast receivers handle Lagged
         run: ./scripts/check-broadcast-lag-is-handled.sh
+      # `PRAGMA incremental_vacuum(N)` frees ONE page per `sqlite3_step`, so every rusqlite call
+      # that steps once — `execute_batch`, `execute`, `pragma_update` — returns `Ok` having handed
+      # back a single 4 KiB page. MEASURED: all three left 2,249 of a 2,250-page free list; ten
+      # `execute_batch` calls in a row left 2,240. There is no error on that path, so hourly
+      # maintenance logs success for ever while the database grows. Prepare it and drain the rows.
+      - name: Incremental vacuum is stepped
+        run: ./scripts/check-incremental-vacuum-is-stepped.sh
       # A miner-side shim rebuilds `checkpoint_hash` to check any signature at all, so every value
       # that hash commits to must be in the blob the public endpoint serves. The hash has been
       # bumped TWICE by ADDING a root (v2 advert_root, v3 coordinator_roster_root) and nothing

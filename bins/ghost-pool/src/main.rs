@@ -9690,6 +9690,12 @@ async fn main() -> Result<()> {
                                 verification_ledger = result.verification_ledger_deleted,
                                 verifications = result.verifications_deleted,
                                 checkpoints = result.checkpoints_pruned,
+                                // Without this the two numbers that matter cannot be paired.
+                                // MEASURED on vm1, 2026-10-04: two consecutive passes each
+                                // deleted ~5,280 rows and `db_size_mb` read 2433 both times —
+                                // pruning working perfectly and the file not shrinking by a byte.
+                                // `pages_reclaimed` is what tells those two states apart.
+                                pages_reclaimed = result.pages_reclaimed,
                                 db_size_mb = result.db_size_bytes / (1024 * 1024),
                                 "Database maintenance complete"
                             );
