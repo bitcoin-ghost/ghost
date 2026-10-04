@@ -53,6 +53,21 @@ jobs:
       # and has no repo to read. They had silently diverged (#431).
       - name: Check stratum config agreement
         run: ./scripts/check-stratum-config-agreement.sh
+      # TranslatorConfig has no deny_unknown_fields, so a key the struct does not read parses, is
+      # discarded, and reads to an operator exactly like a setting in force. `idle_timeout_secs`
+      # sat in the shipped config AND the installer heredoc, commented "disconnect miners with no
+      # shares", read by nothing — and there is no idle reaper at all. Same defect
+      # shipped_config_templates.rs exists for, on the one config file it does not cover.
+      - name: Shipped translator config keys are read
+        run: ./scripts/check-translator-config-keys-are-read.sh
+      # pool_sv2 holds the world-open SV2 miner port and was the only one of the four units without
+      # LimitNOFILE, so it inherited systemd's default SOFT limit of 1024 — MEASURED live at
+      # soft 1024 against ghost-pool's 65536. A process is bounded by its soft limit, so the
+      # miner-facing service could not reach a four-figure miner count, and the symptom would be
+      # accept() failures naming nothing. capacity.rs reads getrlimit in ghost-pool, which holds
+      # almost no miner sockets, so the capacity model never saw it.
+      - name: Socket-holding units raise LimitNOFILE
+        run: ./scripts/check-socket-units-raise-nofile.sh
       # The pre-deploy SV1 smoke test's declared-difficulty case could not distinguish
       # "delivered late" from "never delivered" — both printed the floor — which is what
       # misdirected the #455 investigation. This runs that case against fake pools with known
