@@ -49,6 +49,10 @@ echo "==> deploy-gate self-test"
 ./scripts/test-deploy-gate.sh \
     || { echo "FAILED: deploy-gate self-test" >&2; exit 1; }
 
+echo "==> pre-migration backup gate self-test"
+./scripts/test-migration-backup-gate.sh \
+    || { echo "FAILED: pre-migration backup gate self-test" >&2; exit 1; }
+
 echo "==> restart-watch self-test"
 ./scripts/test-restart-watch.sh \
     || { echo "FAILED: restart-watch self-test" >&2; exit 1; }

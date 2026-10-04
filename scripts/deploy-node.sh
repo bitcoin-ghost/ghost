@@ -1032,6 +1032,92 @@ if [ -r "$HARDEN_SRC" ]; then
     fi
 fi
 
+# ----------------------------------------- pre-migration database backup (#996)
+#
+# ⛔ The binary backup below does NOT cover a schema change. Restoring `$BINARY.bak.*` puts the old
+# code back; it does not put the old SCHEMA back, and a migration that deleted rows has already
+# deleted them. Nothing in this script has ever touched the database.
+#
+# That gap was theoretical until it was measured. On 2026-10-04 every node was at
+# `user_version = 59` and the fleet's entire backup inventory was TWO ceremony snapshots from
+# 2026-08-13 and 2026-08-18 — `ghost-backup.timer` is `not-found` on all eight and
+# `/var/backups/ghost/db` does not exist. The next roll carries v60, which DELETEs rows from
+# `payouts`.
+#
+# So: if the incoming binary would migrate the schema FORWARD, take a verified database copy first,
+# or refuse. Refusing is the point — "deploy anyway and hope" is what made the seven-week gap
+# invisible.
+#
+# ⚠ Only ghost-pool runs migrations; other binaries skip this entirely.
+# ⚠ `VACUUM INTO`, not `cp`: a copy of a live WAL database is not a consistent database, and it
+#   would look fine right up until something read it.
+#
+# The DECISION lives in scripts/lib/migration-backup-gate.sh so the refusals can be driven directly
+# by scripts/test-migration-backup-gate.sh. Reaching this line inside this script means satisfying
+# every earlier precondition first, which makes the bad cases untestable from out here.
+if [ "$BINARY" = "ghost-pool" ]; then
+    # shellcheck source=scripts/lib/migration-backup-gate.sh
+    . "$REPO_ROOT/scripts/lib/migration-backup-gate.sh"
+
+    # The version the INCOMING binary migrates to, read from the tree this commit builds from. The
+    # clean-tree and on-origin/main gates have already run, so the source and the binary agree.
+    WANT_SCHEMA="$(sed -nE 's/^const SCHEMA_VERSION: u32 = ([0-9]+);.*/\1/p' \
+                   "$REPO_ROOT/crates/ghost-storage/src/migrations.rs" 2>/dev/null | head -1)"
+
+    # One line per field, each a bare integer. ⛔ `df -Pk` prints a HEADER, so the available column
+    # is taken with `NR==2` on the far side rather than guessed from field offsets here — an earlier
+    # draft parsed the header row and would have compared the string "Capacity". `/var/backups` may
+    # not exist yet, so the question is about `/var`, which is the filesystem that will hold it.
+    #
+    # $SSH_BIN, not bare `ssh`: this is a GATE question, so it must be drivable by the self-test.
+    MIG_PROBE="$(timeout "$REMOTE_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
+db=/home/ghost/.ghost/ghost.db
+[ -f \$db ] || { echo NODB; exit 0; }
+echo VER \$(sudo -u ghost sqlite3 \"file:\$db?mode=ro\" 'PRAGMA user_version;' 2>/dev/null)
+echo DBKB \$(sudo du -k \$db | cut -f1)
+echo AVKB \$(df -Pk /var | awk 'NR==2{print \$4}')
+" 2>&1)" || MIG_PROBE="${MIG_PROBE:-}"
+
+    MIG_VERDICT="$(migration_backup_verdict "${WANT_SCHEMA:-}" "$MIG_PROBE")" || {
+        die "pre-migration backup gate REFUSED on $NODE: $MIG_VERDICT
+
+Refusing to deploy ghost-pool when it cannot be established whether the binary migrates the schema,
+or when there is no room for a copy. Restoring the binary does not restore the schema.
+  SCHEMA_VERSION in this tree: ${WANT_SCHEMA:-<unreadable>}
+  probe output:
+$(printf '%s\n' "$MIG_PROBE" | sed 's/^/        /')"
+    }
+
+    set -- $MIG_VERDICT
+    case "$1" in
+        NODB)      info "no database on $NODE yet — a fresh node migrates from empty, nothing to back up" ;;
+        NOMIGRATE) info "schema: $NODE is at v$2, this binary wants v$WANT_SCHEMA — no migration, no backup needed" ;;
+        BACKUP)
+            info "schema: $NODE is at v$2 and this binary migrates to v$WANT_SCHEMA — backing up first ($3KB needed, $4KB free)"
+            BK_OUT="$(timeout 600 "$SSH_BIN" "${SSH_OPTS[@]}" "$NODE" "
+set -e
+dir=/var/backups/ghost/db
+dest=\$dir/ghost-pre-v${WANT_SCHEMA}-${TS}.db
+sudo mkdir -p \$dir
+sudo chown ghost:ghost \$dir
+sudo -u ghost sqlite3 /home/ghost/.ghost/ghost.db \"VACUUM INTO '\$dest'\"
+# Verify the copy IS a database and carries the PRE-migration version. A zero-byte or truncated
+# file is still a file, and that is exactly what gets discovered during a restore.
+echo BACKUP \$dest ver=\$(sudo -u ghost sqlite3 \"file:\$dest?mode=ro\" 'PRAGMA user_version;') bytes=\$(sudo stat -c %s \$dest)
+" 2>&1)" || die "pre-migration backup FAILED on $NODE — refusing to migrate without one:
+$(printf '%s\n' "$BK_OUT" | sed 's/^/        /')"
+
+            BK_VER="$(printf '%s\n' "$BK_OUT" | sed -nE 's/.*ver=([0-9]+) .*/\1/p' | head -1)"
+            if [ "${BK_VER:-}" != "$2" ]; then
+                die "the pre-migration backup on $NODE reports user_version='${BK_VER:-}' but the live
+database is at v$2. A backup that does not round-trip its own schema version is not a backup:
+$(printf '%s\n' "$BK_OUT" | sed 's/^/        /')"
+            fi
+            info "pre-migration backup verified: $(printf '%s\n' "$BK_OUT" | /usr/bin/grep '^BACKUP ' | head -1)" ;;
+        *) die "pre-migration backup gate returned an unrecognised verdict on $NODE: $MIG_VERDICT" ;;
+    esac
+fi
+
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
 timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
 set -e
