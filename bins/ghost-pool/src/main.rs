@@ -4543,6 +4543,18 @@ async fn main() -> Result<()> {
                         deferred = r.deferred,
                         "shard: settlement did NOT complete its window"
                     ),
+                    // ⛔ An unresolvable payout tag outranks "we settled something", because it
+                    // means a block we may have WON cannot be settled and its balances will never
+                    // discharge. It was previously counted into the report and never logged at
+                    // all, so the one symptom was a weight ledger that quietly stopped decaying.
+                    Ok(r) if r.ours_but_unresolvable > 0 => warn!(
+                        tip,
+                        unresolvable = r.ours_but_unresolvable,
+                        settled = r.settled.len(),
+                        deferred = r.deferred,
+                        "shard: coinbase payout tag(s) matched NO proposal we hold — if any of \
+                         those blocks were ours, their balances will never discharge"
+                    ),
                     Ok(r) if !r.settled.is_empty() => info!(
                         tip,
                         blocks = r.settled.len(),

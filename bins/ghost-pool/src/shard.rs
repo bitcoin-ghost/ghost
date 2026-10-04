@@ -265,6 +265,22 @@ pub struct BlockSettlement {
 enum SettleBlockOutcome {
     /// No payout tag in the coinbase — someone else's block, the overwhelmingly common case.
     NotOurs,
+    /// A payout tag IS present, but no proposal of ours matches it.
+    ///
+    /// ⛔ This used to be folded into [`Self::NotOurs`], whose own doc says "someone else's
+    /// block" — so a block we may well have mined and cannot settle was counted as a stranger's
+    /// and never mentioned. The two need telling apart because they mean opposite things.
+    ///
+    /// It is reachable without anyone misbehaving: `PROPOSAL_RETENTION_SECS` is 24h against a
+    /// ~16.7h coinbase maturity, so the proposal for a block we won can legitimately be pruned
+    /// before the settlement walk reaches it. The consequence is that the weight ledger never
+    /// discharges for that block: departed miners keep drawing a share of every later block and
+    /// active miners are diluted, unbounded and undetected.
+    ///
+    /// ⚠ The cursor still advances past it. A foreign coinbase can coincidentally carry bytes that
+    /// parse as a tag, and refusing to advance would stall settlement permanently on someone
+    /// else's block — a worse failure. So this is recorded and reported loudly instead of retried.
+    OursButUnresolvable,
     /// Not yet [`COINBASE_MATURITY`] deep. Refused, never recorded: an immature block's payment
     /// can still be undone by a reorg, and the shard carries no undo.
     Immature,
@@ -280,8 +296,14 @@ enum SettleBlockOutcome {
 pub struct SettleReport {
     /// Blocks settled this call, in height order.
     pub settled: Vec<BlockSettlement>,
-    /// Blocks examined that carry no payout tag.
+    /// Blocks examined that carry no payout tag. Benign — almost every block on the chain.
     pub not_ours: usize,
+    /// Blocks whose coinbase carried a payout tag that resolved to no proposal we hold.
+    ///
+    /// ⛔ **Never benign.** Either a foreign coinbase coincidentally parsed, or a block we won
+    /// cannot be settled and its balances will never discharge. Reported so the second case is
+    /// visible; see `SettleBlockOutcome::OursButUnresolvable` (private to this module).
+    pub ours_but_unresolvable: usize,
     /// The height the walk could not read, if it stopped early. **A stall must be visible**: a
     /// settlement that has silently stopped looks exactly like one with nothing to do, and the
     /// difference is unpaid work accruing behind a cursor that never moves.
@@ -1973,6 +1995,7 @@ impl ShardRuntime {
                     break;
                 }
                 SettleBlockOutcome::NotOurs => report.not_ours += 1,
+                SettleBlockOutcome::OursButUnresolvable => report.ours_but_unresolvable += 1,
                 SettleBlockOutcome::AlreadySettled => report.already_settled += 1,
                 SettleBlockOutcome::Settled(s) => report.settled.push(s),
             }
@@ -2035,12 +2058,25 @@ impl ShardRuntime {
         };
         match self.db.get_proposal_by_hash_prefix(&payout_id) {
             Ok(Some(_)) => {}
-            Ok(None) => return Ok(SettleBlockOutcome::NotOurs),
+            Ok(None) => {
+                // A tag we cannot resolve. Possibly a foreign coinbase whose bytes happen to
+                // parse, possibly a block of OURS whose proposal was pruned — and the second
+                // means the ledger never discharges for it. Say so; do not file it as a
+                // stranger's block.
+                warn!(
+                    payout_id = %hex::encode(payout_id),
+                    height,
+                    "shard: coinbase carries a payout tag that matches NO proposal we hold — if \
+                     this block was ours its balances will never discharge (proposal retention is \
+                     24h against ~16.7h maturity, so a won block's proposal can be pruned first)"
+                );
+                return Ok(SettleBlockOutcome::OursButUnresolvable);
+            }
             Err(e) => {
                 // Cannot prove ownership => do not settle. Failing closed here costs a deferral;
                 // failing open would discharge real balances on an unproven block.
-                warn!(error = %e, "shard: payout id lookup failed — deferring, not settling");
-                return Ok(SettleBlockOutcome::NotOurs);
+                warn!(error = %e, height, "shard: payout id lookup failed — deferring, not settling");
+                return Ok(SettleBlockOutcome::OursButUnresolvable);
             }
         }
         // One spelling of the hash everywhere: the idempotence record only works if every
@@ -3740,6 +3776,55 @@ mod tests {
                 .expect("attempt"),
             SettleBlockOutcome::NotOurs
         );
+        assert_eq!(rt.owed().get(ADDR_A), Some(&micro_work(5.0)));
+        assert_eq!(settled_block_count(&db), 0);
+    }
+
+    /// An unresolvable payout tag must be REPORTED, not filed as a stranger's block.
+    ///
+    /// ⚠ The settlement DECISION here is correct and unchanged: a tag whose payout id matches no
+    /// proposal we hold must not settle, because discharging would credit our miners against money
+    /// this pool never received. `seed_owning_proposal`'s own doc makes that case and it is right.
+    ///
+    /// ⛔ What was wrong is that it was indistinguishable from a block with no tag at all. Both
+    /// returned `NotOurs` — whose doc says "someone else's block, the overwhelmingly common case" —
+    /// and `report.not_ours` was logged nowhere, so a block we may have WON and cannot settle was
+    /// counted as a stranger's and never mentioned. The only symptom was a weight ledger that
+    /// quietly stopped decaying: departed miners keep drawing a share of every later block while
+    /// active miners are diluted.
+    ///
+    /// Reachable with nobody misbehaving: `PROPOSAL_RETENTION_SECS` is 24h against a ~16.7h
+    /// coinbase maturity, so a won block's proposal can be pruned before settlement reaches it.
+    #[test]
+    fn an_unresolvable_payout_tag_is_distinguished_from_a_foreign_block() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+
+        // (a) No tag at all — genuinely someone else's block. Benign, and must stay benign.
+        let mut foreign = vec![0x03, 0x40, 0x1f, 0x0e];
+        foreign.extend_from_slice(b"/SomeOtherPool/");
+        assert_eq!(
+            rt.settle_block_from_coinbase(702, "00aa", 602, &foreign, &pay(&[(ADDR_A, 250_000)]))
+                .expect("attempt"),
+            SettleBlockOutcome::NotOurs,
+            "a coinbase with no payout tag is a foreign block"
+        );
+
+        // (b) A tag IS present, but for a payout id we hold no proposal for. `runtime()` seeds
+        // only 0xAB.., so 0xCD.. is well-formed and unresolvable.
+        let mut tagged = vec![0x03, 0x40, 0x1f, 0x0e];
+        tagged.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xCD; 16]));
+        tagged.extend_from_slice(b"GHOST PublicPool");
+        assert_eq!(
+            rt.settle_block_from_coinbase(703, "00bb", 603, &tagged, &pay(&[(ADDR_A, 250_000)]))
+                .expect("attempt"),
+            SettleBlockOutcome::OursButUnresolvable,
+            "a well-formed payout tag we cannot resolve must be reported distinctly, not filed as \
+             foreign — it may be a block we won whose balances will never discharge"
+        );
+
+        // Fail-closed is preserved: neither discharges anything, neither is recorded as settled.
         assert_eq!(rt.owed().get(ADDR_A), Some(&micro_work(5.0)));
         assert_eq!(settled_block_count(&db), 0);
     }

@@ -11356,6 +11356,84 @@ mod tests {
         );
     }
 
+    /// Payout ENTRIES are not a treasury BALANCE (#989).
+    ///
+    /// ⛔ `/api/v1/network/treasury` summed `payouts` rows of type Treasury and published the
+    /// result as `total_fees_collected` and `treasury_balance_sats`. Those rows are written at ARM
+    /// TIME on every round whether or not a block is ever won, with `status = Approved` and
+    /// `txid = NULL`, and nothing in the tree ever updates them — so the endpoint reported
+    /// intentions as money received.
+    ///
+    /// MEASURED live while fixing it: 1.03 BTC advertised and 4.9% progress toward a 21 BTC
+    /// target, while `won_blocks` was 0, no miner had ever been paid, and the balance key was
+    /// absent. A prospective miner reads that as an earning pool.
+    ///
+    /// This pins the distinction the bug rested on: writing payout entries must move NOTHING.
+    #[test]
+    fn payout_entries_do_not_move_the_treasury_balance() {
+        let db = Database::in_memory().expect("create in-memory db");
+
+        assert_eq!(
+            db.get_treasury_balance().expect("balance"),
+            0,
+            "a fresh node has a zero treasury balance"
+        );
+
+        // Arm-time entries, exactly as record_payout_entries writes them: approved, no txid.
+        // `payouts.round_id` is a foreign key, so the rounds must exist first.
+        for round in 1..=3u64 {
+            db.create_round(&crate::models::RoundRecord {
+                round_id: round,
+                block_height: 900_000 + round,
+                block_hash: None,
+                start_time: 0,
+                end_time: None,
+                total_shares: 0,
+                total_work: 0.0,
+                winning_miner: None,
+                found_by_node: None,
+                payout_status: crate::models::PayoutStatus::Active,
+                subsidy_sats: None,
+                tx_fees_sats: None,
+            })
+            .expect("create round");
+            db.insert_payout(&crate::models::PayoutRecord {
+                id: None,
+                round_id: round,
+                recipient_id: "treasury".to_string(),
+                recipient_type: crate::models::RecipientType::Treasury,
+                address: "bc1qtreasury".to_string(),
+                amount_sats: 500_000,
+                txid: None,
+                vout: None,
+                status: crate::models::PayoutStatus::Approved,
+                created_at: 0,
+                confirmed_at: None,
+            })
+            .expect("insert payout entry");
+        }
+
+        // 1.5M sats of ENTRIES exist — the figure the endpoint used to publish...
+        let entries: u64 = db
+            .get_recent_payouts(1000)
+            .expect("read payouts")
+            .iter()
+            .filter(|p| matches!(p.recipient_type, crate::models::RecipientType::Treasury))
+            .map(|p| p.amount_sats)
+            .sum();
+        assert_eq!(
+            entries, 1_500_000,
+            "the entries themselves must be recorded"
+        );
+
+        // ...and the treasury balance is STILL zero, because nothing was received.
+        assert_eq!(
+            db.get_treasury_balance().expect("balance"),
+            0,
+            "payout entries are intentions, not receipts — summing them as a balance is #989"
+        );
+    }
+
     #[test]
     fn test_local_hashrate_th_excludes_replicated_peer_shares() {
         // The mesh-wide pool hashrate sums each node's local_hashrate_th. For

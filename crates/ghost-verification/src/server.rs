@@ -2162,6 +2162,26 @@ impl VerificationState {
     /// Hashes are lower-cased before comparison. Hex is case-insensitive, so without that a
     /// replayer could re-send a captured batch with the hashes upper-cased and every share would
     /// look new — the dedup would be defeated by the shift key.
+    /// Give a claimed hash back.
+    ///
+    /// ⛔ Needed because claiming happens BEFORE the credit. If the recorder then fails — a rate
+    /// limit, or no active round during the startup window — the claim used to stay, so the share
+    /// was never written, never folded, and a resubmission was rejected as `DuplicateShare`. The
+    /// miner has already been sent `SubmitSharesSuccess` by that point, so the work was
+    /// irrecoverably burned while looking accepted from both ends.
+    ///
+    /// O(n) over the ring on the error path only. That is the right trade: the happy path stays a
+    /// single insert, and the alternative is losing paid work.
+    fn release_share_hash(&self, share_hash: &str) {
+        let key = share_hash.to_ascii_lowercase();
+        let mut seen = self.recent_share_hashes.lock();
+        if seen.0.remove(&key) {
+            if let Some(pos) = seen.1.iter().position(|k| k == &key) {
+                seen.1.remove(pos);
+            }
+        }
+    }
+
     fn claim_share_hash(&self, share_hash: &str) -> bool {
         let key = share_hash.to_ascii_lowercase();
         let mut seen = self.recent_share_hashes.lock();
@@ -2220,7 +2240,24 @@ impl VerificationState {
             return Err(GhostError::DuplicateShare(share.share_hash.clone()));
         }
 
-        recorder(share)
+        // ⛔ Claim first, but give it back if the credit fails. The miner was told
+        // `SubmitSharesSuccess` before we got here, so a kept claim on a failed record means the
+        // work is gone: not in `shares`, never folded, and any resubmission rejected as a
+        // duplicate. Releasing lets the retry be credited.
+        let share_hash = share.share_hash.clone();
+        match recorder(share) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.release_share_hash(&share_hash);
+                tracing::warn!(
+                    error = %e,
+                    share_hash = %share_hash,
+                    "share credit failed after the dedup claim — claim released so a resubmission \
+                     can still be credited"
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Record a batch of shares (called from HTTP endpoint for native SRI webhook)
@@ -3920,6 +3957,90 @@ mod tests {
     ///
     /// Drives `record_share`, the method that endpoint calls, through a recorder that counts what
     /// actually reached the ledger.
+    /// A share whose credit FAILS must stay resubmittable.
+    ///
+    /// ⛔ The dedup claim is consumed before the recorder runs, and used to be kept even when the
+    /// recorder failed — so a share rejected for a rate limit or no-active-round was never
+    /// written, never folded, and every resubmission was refused as `DuplicateShare`. The miner
+    /// has already been sent `SubmitSharesSuccess` by then, so the work was burned while looking
+    /// accepted from both ends.
+    ///
+    /// The second submission succeeding is the whole assertion: it can only do so if the claim was
+    /// released.
+    #[test]
+    fn a_share_whose_credit_fails_can_be_resubmitted() {
+        use bitcoin::consensus::Encodable;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Fail the first credit, accept every later one.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let state = VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_share_recorder(move |_| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Exactly what a rate limit or startup-window rejection looks like here.
+                Err(GhostError::Internal("no active round".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .with_callbacks(|| 960_000, || 1, || 1, || 1)
+        .with_share_pow_verify_height(959_030);
+
+        // A genuine share: the genesis header justifies its claimed work.
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut genesis_header = Vec::new();
+        genesis
+            .header
+            .consensus_encode(&mut genesis_header)
+            .unwrap();
+        let mk = || ShareNotification {
+            miner_id: "bc1qtest.worker".to_string(),
+            work: 2048.0,
+            share_hash: genesis.header.block_hash().to_string(),
+            job_id: 1,
+            timestamp: 0,
+            is_block: false,
+            payout_address: Some("bc1qtest".to_string()),
+            header: Some(hex::encode(&genesis_header)),
+            extranonce: None,
+            skeleton_id: None,
+            tier_log2: None,
+        };
+
+        // First submission: the credit fails, so this is an error.
+        assert!(
+            state.record_share(mk()).is_err(),
+            "the first credit must fail — that is the scenario under test"
+        );
+
+        // Second submission of the SAME share: must be credited, NOT refused as a duplicate.
+        match state.record_share(mk()) {
+            Ok(()) => {}
+            Err(GhostError::DuplicateShare(h)) => panic!(
+                "resubmission refused as a duplicate ({h}) — the dedup claim was not released, so \
+                 this miner's accepted work is permanently lost"
+            ),
+            Err(e) => panic!("resubmission failed for an unexpected reason: {e}"),
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the recorder must have been reached twice — once failing, once succeeding"
+        );
+
+        // And genuine duplicates are still refused: releasing on failure must not disable dedup.
+        assert!(
+            matches!(state.record_share(mk()), Err(GhostError::DuplicateShare(_))),
+            "a share that WAS credited must still be refused on replay"
+        );
+    }
+
     #[test]
     fn record_share_refuses_work_the_header_does_not_justify() {
         use bitcoin::consensus::Encodable;
