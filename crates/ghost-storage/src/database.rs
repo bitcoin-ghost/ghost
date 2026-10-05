@@ -619,6 +619,24 @@ impl Database {
         // H-5: Security hardening:
         // - synchronous = FULL: Ensures durability even on power loss (vs NORMAL)
         // - secure_delete = ON: Overwrites deleted data to prevent forensic recovery
+        //
+        // ⛔ `auto_vacuum = INCREMENTAL` is set HERE, before `run_migrations`, because SQLite only
+        // honours this pragma on a database with no tables yet. All three open paths call this
+        // before migrations, so a FRESH database gets it for free.
+        //
+        // Under the default `auto_vacuum = 0` a DELETE returns nothing to the filesystem: freed
+        // pages go on the free list and are reused internally, so the file never shrinks. That is
+        // why `run_maintenance` pruning eight tables hourly has never made the database smaller.
+        //
+        // ⚠ On an ALREADY-POPULATED database this is a silent no-op — switching takes effect only
+        // on the next VACUUM. Existing nodes therefore stay at 0 until
+        // `scripts/ops/enable-incremental-autovacuum.sh` is run against them, which is MEASURED at
+        // 79s on a 3.5 GB live database and refuses unless the filesystem has the database's size
+        // again free (VACUUM writes a complete second copy before swapping, and running it without
+        // that headroom took ghost-vm6 down once).
+        //
+        // So this change costs nothing and silently fixes every node provisioned from now on; the
+        // ops script remains the route for the eight that already exist.
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -628,6 +646,7 @@ impl Database {
             PRAGMA cache_size = -16000;
             PRAGMA wal_autocheckpoint = 1000;
             PRAGMA secure_delete = ON;
+            PRAGMA auto_vacuum = INCREMENTAL;
             ",
         )
         .map_err(|e| GhostError::Database(format!("Failed to initialize connection: {}", e)))?;
@@ -1023,6 +1042,89 @@ impl Database {
     /// 256MB means a rebuild only happens when it would actually recover a meaningful amount of
     /// disk, at which point paying the memory cost once is reasonable.
     const VACUUM_MIN_RECLAIMABLE_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Pages returned to the filesystem per maintenance pass by `incremental_vacuum`.
+    ///
+    /// 32,768 pages is 128 MiB at the 4 KiB page size this database uses. It is a bound on how
+    /// long the write connection is held, not a target: `PRAGMA incremental_vacuum(N)` stops as
+    /// soon as the free list is empty, so a node with nothing to reclaim pays nothing.
+    const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 32_768;
+
+    /// Return freed pages to the filesystem without rebuilding the database.
+    ///
+    /// Returns the number of pages actually released, which is 0 — not an error — when there is
+    /// nothing on the free list, or when the database predates `auto_vacuum = INCREMENTAL`.
+    ///
+    /// ⛔ This is a **no-op on every database created before** the pragma was added to
+    /// `initialize_connection`, because SQLite can only turn auto-vacuum on while the file has no
+    /// tables. Those files need `scripts/ops/enable-incremental-autovacuum.sh` once (MEASURED 79s
+    /// on a 3.5 GB node). The no-op is reported, not silent: a caller that cannot tell "nothing to
+    /// reclaim" from "this database can never reclaim" would read a permanently-growing file as
+    /// healthy.
+    ///
+    /// Why this exists rather than leaning on `optimize`: `optimize` reclaims by running a full
+    /// `VACUUM`, which streams the whole database through the page cache and OOM-killed ghost-pool
+    /// hourly on the 3.87 GB nodes. Driving the free list down here is what keeps that VACUUM from
+    /// being reached at all — it is bounded, incremental, and needs no second copy of the file.
+    pub fn incremental_vacuum(&self, max_pages: u32) -> GhostResult<i64> {
+        self.with_connection(|conn| {
+            let mode: i64 = conn
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            if mode == 0 {
+                debug!(
+                    "Skipping incremental vacuum — auto_vacuum is OFF on this database; run \
+                     scripts/ops/enable-incremental-autovacuum.sh once to enable it"
+                );
+                return Ok(0);
+            }
+
+            let before: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            if before <= 0 {
+                return Ok(0);
+            }
+
+            // ⛔⛔ `PRAGMA incremental_vacuum` MUST BE STEPPED. It is implemented as a statement
+            // that frees ONE page per `sqlite3_step`, so `execute_batch`, `execute` and
+            // `pragma_update` — all of which step it once — free exactly ONE page and return
+            // `Ok`. MEASURED: on a free list of 2,250 pages all three forms left 2,249, and
+            // calling `execute_batch` ten times in a row left 2,240. Draining it as a query
+            // leaves 0. There is no error and no warning on the one-page path; a maintenance
+            // task built on it reports success hourly while the file grows for ever.
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA incremental_vacuum({max_pages})"))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            while rows
+                .next()
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .is_some()
+            {}
+            drop(rows);
+            drop(stmt);
+
+            let after: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let released = (before - after).max(0);
+            if released > 0 {
+                let page_size: i64 = conn
+                    .query_row("PRAGMA page_size", [], |row| row.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                info!(
+                    pages_released = released,
+                    bytes_released = released.saturating_mul(page_size.max(0)),
+                    freelist_remaining = after,
+                    "Returned freed pages to the filesystem"
+                );
+            }
+            Ok(released)
+        })
+    }
 
     /// Optimize the database.
     ///
@@ -1554,6 +1656,18 @@ impl Database {
         // Checkpoint WAL
         self.checkpoint()?;
 
+        // Hand the pages those DELETEs freed back to the filesystem. Bounded, so this is a
+        // predictable cost per pass rather than the unbounded rebuild `optimize` would do — and
+        // running it BEFORE the optimize decision is the point: it drives `freelist_count` down,
+        // so the VACUUM threshold below stops being reached on a node that is merely pruning.
+        let pages_reclaimed = match self.incremental_vacuum(Self::INCREMENTAL_VACUUM_MAX_PAGES) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "Incremental vacuum failed");
+                0
+            }
+        };
+
         // Optimize if significant data was deleted
         let total_deleted = rounds_deleted
             + pings_deleted
@@ -1580,6 +1694,7 @@ impl Database {
             verifications_deleted,
             checkpoints_pruned,
             pending_shields_cleaned,
+            pages_reclaimed,
             db_size_mb = stats.size_mb(),
             "Database maintenance complete"
         );
@@ -1594,6 +1709,7 @@ impl Database {
             verifications_deleted,
             checkpoints_pruned,
             pending_shields_cleaned,
+            pages_reclaimed,
             db_size_bytes: stats.size_bytes,
         })
     }
@@ -1666,10 +1782,16 @@ impl Default for MaintenanceConfig {
             // table plus its indexes was 1,249 MB of a 5.0 GB database — the second largest
             // object in it after the frozen `shares_archive`.
             //
-            // At 18 days this prunes ~386,000 rows (~46%, ~540 MB). ⚠ That stops the growth; it
-            // does NOT shrink the file. `auto_vacuum=0` and `freelist_count=0`, so freed pages
-            // are reused internally and only VACUUM returns them to the OS — and VACUUM needs
-            // twice the database free, which took ghost-vm6 down once already.
+            // At 18 days this prunes ~386,000 rows (~46%, ~540 MB).
+            //
+            // ⚠ Whether that SHRINKS the file depends on when the database was created. Files made
+            // since `initialize_connection` gained `auto_vacuum = INCREMENTAL` have `run_maintenance`
+            // hand the freed pages straight back (`Database::incremental_vacuum`). Files made before
+            // it are stuck at `auto_vacuum = 0` — measured on ghost-vm8, 2026-08-24, with
+            // `freelist_count=0` — where pruning stops the growth and nothing returns a byte,
+            // because only VACUUM can, and VACUUM needs twice the database free, which took
+            // ghost-vm6 down once already. Those nodes need
+            // `scripts/ops/enable-incremental-autovacuum.sh` run once (MEASURED 79s on 3.5 GB).
             keep_challenge_days: 18,
             keep_verification_days: 30, // 30 days of verification records (STOR-6)
             keep_checkpoint_days: 90,   // 90 days of L2 checkpoint block_data
@@ -1690,6 +1812,9 @@ pub struct MaintenanceResult {
     pub verifications_deleted: usize,
     pub checkpoints_pruned: usize,
     pub pending_shields_cleaned: usize,
+    /// Pages handed back to the filesystem this pass. 0 on a database that predates
+    /// `auto_vacuum = INCREMENTAL` — see `Database::incremental_vacuum`.
+    pub pages_reclaimed: i64,
     pub db_size_bytes: i64,
 }
 
@@ -2298,6 +2423,107 @@ mod tests {
     /// `transaction` counted nothing, the delta could only reach `N` if concurrent tests
     /// happened to make N database calls inside this window, and N is chosen large enough that
     /// they do not.
+    /// Deleting rows must actually give the pages back, not just move them to the free list.
+    ///
+    /// ⛔ This is the half of #992 that `auto_vacuum = INCREMENTAL` does NOT do on its own.
+    /// INCREMENTAL only makes reclaiming *possible*; `PRAGMA incremental_vacuum` is what performs
+    /// it. Setting the pragma and calling nothing leaves the file exactly as large as before —
+    /// which is indistinguishable, from the outside, from never having set it.
+    ///
+    /// Asserted against SQLite's own `freelist_count` before and after, so the test measures pages
+    /// actually released rather than trusting the number the method returns.
+    #[test]
+    fn deleting_rows_returns_pages_to_the_filesystem() {
+        let db = Database::in_memory().expect("create in-memory db");
+
+        db.with_connection(|conn| {
+            conn.execute_batch("CREATE TABLE bulk (id INTEGER PRIMARY KEY, blob BLOB);")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let payload = vec![0xABu8; 4096];
+            let mut stmt = conn
+                .prepare("INSERT INTO bulk (blob) VALUES (?1)")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            for _ in 0..2000 {
+                stmt.execute([&payload])
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+            }
+            Ok(())
+        })
+        .expect("populate");
+
+        let freelist = |db: &Database| -> i64 {
+            db.with_connection(|conn| {
+                conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("read freelist_count")
+        };
+
+        db.with_connection(|conn| {
+            conn.execute_batch("DELETE FROM bulk;")
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("delete rows");
+
+        let before = freelist(&db);
+        assert!(
+            before > 0,
+            "expected the DELETE to leave pages on the free list, found {before} — without those \
+             there is nothing for incremental_vacuum to reclaim and this test proves nothing"
+        );
+
+        let released = db
+            .incremental_vacuum(Database::INCREMENTAL_VACUUM_MAX_PAGES)
+            .expect("incremental vacuum");
+        let after = freelist(&db);
+
+        assert_eq!(
+            released,
+            before - after,
+            "reported pages released ({released}) must equal the free-list delta ({before} -> \
+             {after}); a method that over-reports makes a growing database look like it is being \
+             maintained"
+        );
+        assert!(
+            released > 0,
+            "incremental_vacuum released nothing from a free list of {before} pages"
+        );
+        assert_eq!(
+            after, 0,
+            "the whole free list fits inside INCREMENTAL_VACUUM_MAX_PAGES, so it should be empty"
+        );
+    }
+
+    /// A fresh database must come up with INCREMENTAL auto_vacuum (#992).
+    ///
+    /// ⛔ SQLite honours `PRAGMA auto_vacuum` only on a database with no tables yet, so this is
+    /// entirely about ORDERING: `initialize_connection` must run before `run_migrations`. If a
+    /// future change creates a table first, the pragma becomes a silent no-op and the file goes
+    /// back to never shrinking — with no error anywhere.
+    ///
+    /// Under the default 0, a DELETE returns nothing to the filesystem: freed pages go on the free
+    /// list and are reused internally. That is why `run_maintenance` pruning eight tables hourly
+    /// has never made the database smaller.
+    ///
+    /// Asserted on the pragma SQLite actually reports, not on the text of the batch — "we execute
+    /// the statement" and "the database has the setting" are different claims, and only the second
+    /// one reclaims a byte.
+    #[test]
+    fn a_fresh_database_has_incremental_auto_vacuum() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let mode: i64 = db
+            .with_connection(|conn| {
+                conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("read auto_vacuum");
+        assert_eq!(
+            mode, 2,
+            "expected auto_vacuum = 2 (INCREMENTAL), got {mode}. 0 means the pragma was set after \
+             a table already existed, so SQLite ignored it and the file will never shrink."
+        );
+    }
+
     #[test]
     fn a_transaction_is_counted_like_any_other_connection_hold() {
         const N: u64 = 200;

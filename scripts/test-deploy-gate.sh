@@ -27,9 +27,19 @@ trap 'rm -rf "$TMP"' EXIT
 #
 # So: a throwaway repo, committed clean, with refs/remotes/origin/main pointed at that commit.
 REPO_ROOT="$TMP/repo"
-mkdir -p "$REPO_ROOT/scripts" "$REPO_ROOT/bins/translator-sv2/tests" "$REPO_ROOT/crates"
+mkdir -p "$REPO_ROOT/scripts/lib" "$REPO_ROOT/bins/translator-sv2/tests" \
+         "$REPO_ROOT/crates/ghost-storage/src"
 cp "$SRC_ROOT/scripts/deploy-node.sh" "$REPO_ROOT/scripts/deploy-node.sh"
 : > "$REPO_ROOT/crates/.keep"
+
+# The pre-migration backup gate (#996) sources this and reads SCHEMA_VERSION out of the tree, so
+# both have to exist here or deploy-node.sh dies before any case under test. The library is the
+# REAL one — its own refusals are driven by scripts/test-migration-backup-gate.sh, and copying it
+# rather than stubbing it means this harness cannot pass against a library that does not work.
+cp "$SRC_ROOT/scripts/lib/migration-backup-gate.sh" "$REPO_ROOT/scripts/lib/migration-backup-gate.sh"
+# A pinned version, deliberately not read from the real tree: these cases must not change verdict
+# every time a migration is added.
+echo 'const SCHEMA_VERSION: u32 = 42;' > "$REPO_ROOT/crates/ghost-storage/src/migrations.rs"
 
 # Stand-in for the SV1 smoke suite, which the soak gate now runs against a canary (#461).
 # Committed here rather than written mid-test, because creating a file later would dirty the

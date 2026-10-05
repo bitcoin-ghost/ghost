@@ -70,6 +70,33 @@ const CLIENT_SEARCH_SPACE_BYTES: usize = 16;
 /// prefix is still [`POOL_ALLOCATION_BYTES`] wide on the wire, so nothing downstream moves.
 const POOL_STATIC_PREFIX_BYTES: usize = 1;
 
+/// How long a downstream has to finish the Noise handshake before it is dropped.
+///
+/// The SV2 Noise handshake is two round trips. 30 seconds is generous for a miner on a bad link
+/// and still bounds what an idle peer can hold.
+///
+/// ⛔ Before this existed, `accept_noise_connection` raced only against cancellation, so a peer
+/// that completed the TCP handshake and then sent nothing held a task, a socket and a descriptor
+/// until the pool shut down. On a world-open port, against `sri-pool` measured at systemd's soft
+/// default of **1024** descriptors on all eight nodes (#993), that is a cheap way to fill the
+/// accept path with connections that never become miners.
+const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The token a single downstream connection is allowed to cancel.
+///
+/// ⛔⛔ This must return a CHILD, never a clone. `CancellationToken::clone` SHARES cancellation
+/// state, so cancelling a clone cancels the global token — and the accept path did exactly that on
+/// a bootstrap failure, logging "disconnecting downstream {id}" while shutting down the SV2 pool
+/// for every connected miner, the listener loop included (#994).
+///
+/// A child is still cancelled when its parent is, so global shutdown is unaffected. The asymmetry
+/// is the whole point and it is not visible at the call site — `clone()` and `child_token()` have
+/// the same type and the same shape — which is why this is a named function with a test rather
+/// than a method call inlined into a 100-line accept closure.
+fn connection_token(global: &CancellationToken) -> CancellationToken {
+    global.child_token()
+}
+
 /// Builds the allocator's static prefix from the configured server id.
 ///
 /// Single owner, called by the pool and by its tests, so the layout cannot drift between what
@@ -377,18 +404,52 @@ impl ChannelManager {
                                 let task_manager_inner = task_manager_clone.clone();
 
                                 task_manager_clone.spawn(async move {
-                                    let cancellation_token_clone = cancellation_token_inner.clone();
+                                    // ⛔ A CHILD token, not a clone. `CancellationToken::clone`
+                                    // SHARES cancellation state, so the bootstrap-failure branch
+                                    // below used to cancel the GLOBAL token: the log said
+                                    // "disconnecting downstream {id}" while the code shut down the
+                                    // SV2 pool for every connected miner, including the listener
+                                    // loop that would have accepted their reconnect (#994).
+                                    //
+                                    // A child is still cancelled when its parent is, so global
+                                    // shutdown is unchanged. `Downstream::new` already derived a
+                                    // child for its I/O tasks (`downstream/mod.rs`) — the pattern
+                                    // was there, it just was not applied one level up.
+                                    //
+                                    // Scope: this token covers the pre-`Downstream` part of the
+                                    // connection — the handshake and the bootstrap. `Downstream`
+                                    // itself still receives the global token on purpose, because
+                                    // `Action::Shutdown` reaching it genuinely means "pool-fatal";
+                                    // see the comment at that call.
+                                    let connection_token = connection_token(&cancellation_token_inner);
                                     let noise_stream = tokio::select! {
-                                        result = accept_noise_connection(stream, authority_public_key, authority_secret_key, cert_validity_sec) => {
+                                        // ⛔ The handshake needs a deadline of its own. Racing it
+                                        // against cancellation alone means a peer that completes
+                                        // the TCP handshake and then sends NOTHING holds a task, a
+                                        // socket and a descriptor until the pool shuts down — on a
+                                        // world-open port, with sri-pool measured at systemd's
+                                        // soft default of 1024 descriptors (#993).
+                                        result = tokio::time::timeout(
+                                            NOISE_HANDSHAKE_TIMEOUT,
+                                            accept_noise_connection(stream, authority_public_key, authority_secret_key, cert_validity_sec),
+                                        ) => {
                                             match result {
-                                                Ok(r) => r,
-                                                Err(e) => {
+                                                Ok(Ok(r)) => r,
+                                                Ok(Err(e)) => {
                                                     error!(error = ?e, "Noise handshake failed");
+                                                    return;
+                                                }
+                                                Err(_elapsed) => {
+                                                    warn!(
+                                                        %socket_address,
+                                                        timeout_secs = NOISE_HANDSHAKE_TIMEOUT.as_secs(),
+                                                        "Noise handshake did not complete in time - dropping connection"
+                                                    );
                                                     return;
                                                 }
                                             }
                                         }
-                                        _ = cancellation_token_inner.cancelled() => {
+                                        _ = connection_token.cancelled() => {
                                             info!("Shutdown received during handshake, dropping connection");
                                             return;
                                         }
@@ -404,7 +465,7 @@ impl ChannelManager {
                                         Some(group_channel) => group_channel,
                                         None => {
                                             error!("Failed to bootstrap group channel - disconnecting downstream {downstream_id}");
-                                            cancellation_token_clone.cancel();
+                                            connection_token.cancel();
                                             return;
                                         }
                                     };
@@ -418,6 +479,22 @@ impl ChannelManager {
                                         channel_manager_sender_inner,
                                         channel_manager_receiver,
                                         noise_stream,
+                                        // ⚠ The GLOBAL token, deliberately. `Downstream` derives
+                                        // its own child for I/O, and `Downstream::start` reaches
+                                        // this token only through `Action::Shutdown` — a
+                                        // classification that means "this error is pool-fatal" and
+                                        // is produced only by explicit `PoolError::shutdown` calls
+                                        // behind the `CanShutdown` bound. Narrowing it to the
+                                        // connection would silently downgrade every one of those
+                                        // to a disconnect. `Action::Disconnect` already uses
+                                        // `downstream_connection_token`, so the per-connection
+                                        // path exists and is separate.
+                                        //
+                                        // ⛔ That classification is sharp: #898 was a
+                                        // downstream-triggered `TemplateIdNotFound` wrongly marked
+                                        // `Shutdown`, and one stale miner frame took the pool down.
+                                        // The fix was to reclassify the error, not to re-point the
+                                        // token — which is the same reason this stays global.
                                         cancellation_token_inner.clone(),
                                         task_manager_inner.clone(),
                                         this.supported_extensions.clone(),

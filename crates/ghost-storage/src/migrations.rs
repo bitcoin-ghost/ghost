@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 59;
+const SCHEMA_VERSION: u32 = 60;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -136,6 +136,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (57, migrate_v57),
         (58, migrate_v58),
         (59, migrate_v59),
+        (60, migrate_v60),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2702,6 +2703,110 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v60: one payout row per `(round_id, recipient_id, recipient_type)` (#995).
+///
+/// `record_payout_entries` runs on **every arming**, and `insert_payout` was a plain `INSERT`.
+/// Arming happens per proposal, not per block, so a round armed twice accumulated a second full
+/// set of payout rows — with DIFFERENT amounts, because the later proposal saw more accumulated
+/// work. MEASURED on ghost-vm5, 2026-10-04: 35,571 rows over 2,417 rounds held **752** duplicate
+/// `(round, recipient, type)` groups, up to **3** rows deep, and in 455 of those groups the
+/// amounts differed. Only one proposal is ever live (`approved_payout` is overwritten), so every
+/// earlier set is superseded and nothing in the table said which was which.
+///
+/// ⛔ **`UNIQUE(round_id, recipient_id)` would be the WRONG constraint** and would have rejected
+/// 1,284 legitimate rows — the gap between 2,036 duplicate PAIRS and 752 duplicate TRIPLES. The
+/// tx-fees entry is written with `recipient_id = proposer`, and that same node is also a `node`
+/// recipient in the same round, so one node holds two rows per round under different
+/// `recipient_type`s by design.
+///
+/// **Dedupe rule: keep the newest, never touch a settled row.** Greatest `created_at`, tie-broken
+/// on greatest `id`, which is the arming that was actually live. A row with a `txid` records money
+/// that moved and is preserved whatever its age — there are **zero** such rows on the fleet today,
+/// which is precisely why the rule is written now instead of when there are some.
+///
+/// The index then makes the upsert in `insert_payout` possible, so a re-arm REPLACES its own
+/// earlier set. Without the index the upsert has no conflict target; without the dedupe the index
+/// cannot be created at all — `CREATE UNIQUE INDEX` fails outright on the 752 groups, so the
+/// order here is load-bearing.
+///
+/// Cheap: `payouts` plus its indexes measured **6.6 MB**. This was once deferred as needing "a
+/// 2.7 GB table rebuild" — that figure belonged to `shares_archive`.
+fn migrate_v60(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v60: dedupe payouts and make the arming triple unique");
+
+    // ⛔ `payouts` may not exist. Migrations replay over partial schemas — several tests build a
+    // pre-v39 fixture with only the MPC tables and then run the whole chain, and five of them
+    // failed with "no such table: payouts" before this guard. v58 checks the same way, for the same
+    // reason. Asked of `sqlite_master` rather than caught from the error, because a `no such table`
+    // string is also what a typo in the table name produces.
+    let has_payouts: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='payouts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_payouts {
+        debug!("v60: no `payouts` table — nothing to dedupe");
+        return Ok(());
+    }
+
+    // Settled rows win outright; among the rest the newest arming wins. Expressed as "delete
+    // everything that is not the winner" rather than "keep the winner", because the winner is
+    // picked per GROUP and SQLite has no DELETE ... USING.
+    let deleted = conn
+        .execute(
+            "DELETE FROM payouts
+             WHERE txid IS NULL
+               AND id NOT IN (
+                   SELECT id FROM (
+                       SELECT id,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY round_id, recipient_id, recipient_type
+                                  ORDER BY (txid IS NOT NULL) DESC, created_at DESC, id DESC
+                              ) AS rn
+                       FROM payouts
+                   )
+                   WHERE rn = 1
+               )",
+            [],
+        )
+        .map_err(|e| GhostError::Migration(format!("v60: cannot dedupe payouts: {e}")))?;
+
+    // Prove it. A dedupe that matched nothing because the window function was wrong looks exactly
+    // like a table that was already clean, and the CREATE UNIQUE INDEX below would then be the
+    // first thing to notice — as a migration failure on a live node.
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM payouts
+                 GROUP BY round_id, recipient_id, recipient_type
+                 HAVING COUNT(*) > 1
+             )",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| GhostError::Migration(format!("v60: cannot verify the dedupe: {e}")))?;
+    if left != 0 {
+        return Err(GhostError::Migration(format!(
+            "v60: {left} duplicate payout triple(s) remain after the dedupe — refusing to continue, \
+             because the unique index below would fail and leave the schema half-migrated"
+        )));
+    }
+
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_arming
+             ON payouts(round_id, recipient_id, recipient_type);",
+    )
+    .map_err(|e| GhostError::Migration(format!("v60: cannot create idx_payouts_arming: {e}")))?;
+
+    debug!(
+        deleted,
+        "v60: deduped payouts and created idx_payouts_arming"
+    );
+    Ok(())
+}
+
 /// v54: the shard's settlement record.
 ///
 /// ⚠ **This is a separate migration ON PURPOSE, and the reason is worth keeping.** It was first
@@ -4249,6 +4354,106 @@ mod tests {
             )
             .expect("count after");
         assert_eq!(after, 0, "every SBC object must be gone, {after} remain");
+    }
+
+    /// v60 must keep the NEWEST arming per triple, keep a settled row whatever its age, and leave
+    /// two rows that differ only by `recipient_type` alone.
+    ///
+    /// ⛔ That last case is the one a careless constraint breaks. The tx-fees entry is written with
+    /// `recipient_id = proposer` and that same node is also a `node` recipient of the round, so
+    /// `UNIQUE(round_id, recipient_id)` would have deleted 1,284 legitimate rows on the live fleet
+    /// — the gap between 2,036 duplicate PAIRS and 752 duplicate TRIPLES measured on vm5 (#995).
+    #[test]
+    fn v60_keeps_the_newest_arming_a_settled_row_and_both_recipient_types() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+
+        // Head already carries the unique index, so the duplicate fixture cannot be inserted
+        // through it. Drop it to recreate the pre-v60 shape, which is also what a real upgrade
+        // walks into.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_payouts_arming;
+             INSERT OR IGNORE INTO rounds (round_id, block_height, start_time) VALUES (1, 1, 0), (2, 2, 0);",
+        )
+        .expect("recreate the pre-v60 shape");
+
+        conn.execute_batch(
+            "INSERT INTO payouts (round_id, recipient_id, recipient_type, address, amount_sats, txid, status, created_at) VALUES
+                 -- round 1, same node armed three times: only amount 300 may survive
+                 (1, 'nodeA', 'node',    'a1', 100, NULL,   'approved', 10),
+                 (1, 'nodeA', 'node',    'a1', 300, NULL,   'approved', 30),
+                 (1, 'nodeA', 'node',    'a1', 200, NULL,   'approved', 20),
+                 -- round 1, SAME recipient id under a different type: must be untouched
+                 (1, 'nodeA', 'tx_fees', '',   777, NULL,   'approved', 10),
+                 -- round 2, an OLD settled row against a NEWER unsettled one: the settled one wins
+                 (2, 'nodeB', 'node',    'b1', 500, 'deadbeef', 'confirmed', 10),
+                 (2, 'nodeB', 'node',    'b1', 900, NULL,       'approved',  99);",
+        )
+        .expect("seed the duplicate fixture");
+
+        let dups_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM payouts GROUP BY round_id, recipient_id, recipient_type HAVING COUNT(*)>1)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count duplicate groups");
+        assert_eq!(
+            dups_before, 2,
+            "the fixture must actually contain duplicates, or this test proves nothing"
+        );
+
+        migrate_v60(&conn).expect("v60 must dedupe a populated payouts table");
+
+        let row = |rid: i64, recip: &str, ty: &str| -> Vec<(i64, Option<String>)> {
+            let mut stmt = conn
+                .prepare("SELECT amount_sats, txid FROM payouts WHERE round_id=?1 AND recipient_id=?2 AND recipient_type=?3")
+                .expect("prepare");
+            let out = stmt
+                .query_map(rusqlite::params![rid, recip, ty], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect");
+            out
+        };
+
+        assert_eq!(
+            row(1, "nodeA", "node"),
+            vec![(300, None)],
+            "the NEWEST arming (created_at 30, amount 300) must be the one left"
+        );
+        assert_eq!(
+            row(1, "nodeA", "tx_fees"),
+            vec![(777, None)],
+            "a row differing only by recipient_type was deleted — this is the 1,284-row mistake"
+        );
+        assert_eq!(
+            row(2, "nodeB", "node"),
+            vec![(500, Some("deadbeef".to_string()))],
+            "a SETTLED row must survive a newer unsettled one: it records money that moved"
+        );
+
+        // And the index the upsert needs must now exist and bite.
+        let err = conn.execute(
+            "INSERT INTO payouts (round_id, recipient_id, recipient_type, address, amount_sats, status, created_at)
+             VALUES (1, 'nodeA', 'node', 'a1', 1, 'approved', 40)",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "idx_payouts_arming must reject a second row for the same arming triple"
+        );
+    }
+
+    /// Re-running v60 must be a no-op on an already-deduped table.
+    #[test]
+    fn v60_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&conn).expect("migrate to head");
+        migrate_v60(&conn).expect("v60 must be safe to re-run");
+        migrate_v60(&conn).expect("v60 must be safe to re-run twice");
     }
 
     /// Re-running v59 must be a no-op, not an error — migrations replay.
