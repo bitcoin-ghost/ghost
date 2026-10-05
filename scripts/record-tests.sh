@@ -58,6 +58,8 @@ echo "==> backup retention + script self-tests"
     || { echo "FAILED: backup retention self-test" >&2; exit 1; }
 ./scripts/test-backup-databases.sh \
     || { echo "FAILED: backup script self-test" >&2; exit 1; }
+./scripts/test-backup-health.sh \
+    || { echo "FAILED: backup health self-test" >&2; exit 1; }
 
 echo "==> restart-watch self-test"
 ./scripts/test-restart-watch.sh \
