@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 use jd_server_sv2::job_declarator::JobDeclarator;
 
+use crate::connection_limit::{ConnectionLimiter, RefusedBecause};
 use crate::{
     config::PoolConfig,
     downstream::Downstream,
@@ -350,6 +351,7 @@ impl ChannelManager {
         task_manager: Arc<TaskManager>,
         cancellation_token: CancellationToken,
         channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+        connection_limiter: Arc<ConnectionLimiter>,
     ) -> PoolResult<(), error::ChannelManager> {
         // todo: let start_downstream_server accept Arc, instead of clone.
         let this = Arc::new(self);
@@ -375,7 +377,11 @@ impl ChannelManager {
             }
         }
 
-        info!("Starting downstream server at {listening_address}");
+        info!(
+            max_total = connection_limiter.max_total(),
+            max_per_ip = connection_limiter.max_per_ip(),
+            "Starting downstream server at {listening_address}"
+        );
         let server = TcpListener::bind(listening_address)
             .await
             .map_err(|e| {
@@ -396,7 +402,32 @@ impl ChannelManager {
                     res = server.accept() => {
                         match res {
                             Ok((stream, socket_address)) => {
-                                info!(%socket_address, "New downstream connection");
+                                // ⛔ The slot is taken HERE, in the accept loop, before anything is
+                                // spawned. Acquiring it inside the task means the task, its socket
+                                // and its descriptor already exist — which is most of what a cap on
+                                // a world-open port is for. Dropping `stream` closes the connection.
+                                let slot = match connection_limiter.try_acquire(socket_address.ip()) {
+                                    Ok(slot) => slot,
+                                    Err(RefusedBecause::TotalFull { limit }) => {
+                                        warn!(
+                                            %socket_address, limit,
+                                            "Refusing downstream connection: the pool is at its total connection limit"
+                                        );
+                                        continue;
+                                    }
+                                    Err(RefusedBecause::PerIpFull { limit, ip_active }) => {
+                                        warn!(
+                                            %socket_address, limit, ip_active,
+                                            "Refusing downstream connection: this address is at its per-address limit"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                info!(
+                                    %socket_address,
+                                    active = connection_limiter.active_total(),
+                                    "New downstream connection"
+                                );
 
                                 let this = Arc::clone(&this);
                                 let cancellation_token_inner = cancellation_token_clone.clone();
@@ -404,6 +435,17 @@ impl ChannelManager {
                                 let task_manager_inner = task_manager_clone.clone();
 
                                 task_manager_clone.spawn(async move {
+                                    // ⛔ Held, not released explicitly. `ConnectionSlot::drop`
+                                    // frees the slot on EVERY exit path — the four early `return`s
+                                    // below and the normal end after `downstream.start().await`.
+                                    //
+                                    // This is the TDP client slot counter's failure mode: that one
+                                    // decremented by hand, leaked on SIX early-return paths, and at
+                                    // ten leaked slots refused every pool_sv2 connection for ever
+                                    // until ghost-pool was restarted. A leak here would not weaken
+                                    // the cap, it would BECOME the outage the cap prevents — so an
+                                    // early return added tomorrow is safe by construction.
+                                    let _slot = slot;
                                     // ⛔ A CHILD token, not a clone. `CancellationToken::clone`
                                     // SHARES cancellation state, so the bootstrap-failure branch
                                     // below used to cancel the GLOBAL token: the log said

@@ -1217,6 +1217,26 @@ batch_size = 1
 batch_timeout_ms = 2000
 max_retries = 3
 
+# Bounds on concurrent downstream connections (#994).
+#
+# ⛔ Commented out = the built-in defaults apply, NOT unlimited. The SV2 port is world-open and had
+# no cap of any kind: a peer could complete the TCP handshake, send nothing, and hold a task, a
+# socket and a descriptor until the pool shut down. Uncomment only to override.
+#
+#   max_downstream_connections   default 512
+#       pool_sv2 normally holds ONE connection from the co-located translator plus any direct SV2
+#       miners. The node advertises capacity for ~1,000 miners and nearly all of them arrive through
+#       the translator's single upstream connection, so 512 is far above any legitimate shape.
+#
+#   max_connections_per_ip       default 64
+#       A farm behind one NAT address can legitimately open several. 64 is generous for that and
+#       still means one source cannot occupy the whole table.
+#
+# A value of 0 is clamped to 1 rather than honoured — a limiter set to zero would refuse the
+# co-located translator and the node would mine nothing while every service reported healthy.
+# max_downstream_connections = 512
+# max_connections_per_ip = 64
+
 # Template provider — this node's own ghost-pool TDP server. public_key is the
 # TDP authority key derived from node.key above.
 [template_provider_type.Sv2Tp]
