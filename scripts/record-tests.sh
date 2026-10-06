@@ -53,6 +53,14 @@ echo "==> pre-migration backup gate self-test"
 ./scripts/test-migration-backup-gate.sh \
     || { echo "FAILED: pre-migration backup gate self-test" >&2; exit 1; }
 
+echo "==> backup retention + script self-tests"
+./scripts/test-backup-retention.sh \
+    || { echo "FAILED: backup retention self-test" >&2; exit 1; }
+./scripts/test-backup-databases.sh \
+    || { echo "FAILED: backup script self-test" >&2; exit 1; }
+./scripts/test-backup-health.sh \
+    || { echo "FAILED: backup health self-test" >&2; exit 1; }
+
 echo "==> restart-watch self-test"
 ./scripts/test-restart-watch.sh \
     || { echo "FAILED: restart-watch self-test" >&2; exit 1; }

@@ -18,6 +18,13 @@ if [ ! -f "$BACKUP_SCRIPT" ]; then
     exit 1
 fi
 
+# ⛔ The backup script sources this and refuses to start without it. Checked here because the failure
+# otherwise appears days later as a timer that has been failing quietly since it was installed.
+if [ ! -f "$SCRIPT_DIR/lib/backup-retention.sh" ]; then
+    echo "ERROR: backup-databases.sh needs $SCRIPT_DIR/lib/backup-retention.sh and it is not there"
+    exit 1
+fi
+
 chmod +x "$BACKUP_SCRIPT"
 
 # Create systemd service unit
@@ -31,6 +38,17 @@ Type=oneshot
 ExecStart=$BACKUP_SCRIPT $GHOST_DIR
 User=ghost
 Group=ghost
+
+# ⛔ User=ghost is load-bearing, not tidiness. The databases are WAL mode with ghost-owned 0600
+# sidecars and \`sqlite3 .backup\` opens the source read-write; a root-run that has to recreate
+# -wal or -shm leaves them root-owned, after which the ghost user cannot write its own database.
+# backup-databases.sh also refuses to run as root, so these two agree.
+
+# A 2.6 GB read plus gzip competes with the pool for the same disk. Deprioritised so a backup can
+# never be the reason a share took too long to credit.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=multi-user.target
@@ -62,7 +80,9 @@ systemctl start ghost-backup.timer
 echo "Backup timer installed and started."
 echo "  Schedule: daily at 03:00 UTC (+/- 5 min jitter)"
 echo "  Backup dir: /var/backups/ghost/db"
-echo "  Retention: 7 days"
+echo "  Retention: older than 7 days AND beyond the newest 7 (both must agree)"
+echo "  Format: gzipped — ~850MB per copy against a 2.6GB database, so ~6GB for seven"
+echo "  Refuses rather than filling the disk if free space is under the database size + 1GiB"
 echo ""
 echo "Verify with: systemctl list-timers ghost-backup.timer"
 echo "Test now with: systemctl start ghost-backup.service"
