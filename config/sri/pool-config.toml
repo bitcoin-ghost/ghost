@@ -28,13 +28,33 @@ authority_public_key = "<GENERATE-WITH-pool_sv2---generate-key>"
 authority_secret_key = "<GENERATE-WITH-pool_sv2---generate-key>"
 cert_validity_sec = 3600
 
-# Listen for SV2 miners/translators (port 34256 - different from ghost-pool's native stratum on 34255)
-listen_address = "0.0.0.0:34256"
+# Listen for SV2 miners/translators.
+#
+# ⛔ 34255, and the comment here used to say 34256 "different from ghost-pool's native stratum on
+# 34255". Both halves were wrong. ghost-pool has no native stratum on 34255 — `pool_sv2` holds that
+# port, which `install-node.sh` says in its own words and which its firewall block opens
+# (`PORTS=(3333 34255)`). MEASURED on vm1/vm5/vm8 2026-10-06: the live config says 34255 and
+# `ss -ltnp` shows `pool_sv2` listening on `0.0.0.0:34255`.
+#
+# An operator provisioning from this file got an SV2 pool on 34256 while their translator, their
+# firewall and every doc pointed at 34255. Nothing would mine and nothing would say why. The port
+# is now compared against the installer key-by-key by
+# `scripts/check-stratum-config-agreement.sh` (#999).
+listen_address = "0.0.0.0:34255"
 
-# Coinbase reward destination (signet address)
-# This is where block rewards are paid out
-# Format: addr(<signet_address>)
-coinbase_reward_script = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)"
+# Coinbase reward destination — the installer substitutes this per node
+# (`install-node.sh`: `addr(${PAYOUT_ADDRESS})`).
+#
+# ⛔ A deliberately INVALID placeholder, the same shape as the keypair above, so a config copied
+# verbatim fails at startup instead of running with a value from this file. This carried a real
+# **signet** address (`addr(tb1q...)`) while the network is mainnet — a placeholder that parses is
+# one somebody pastes, and a signet-prefixed one in a mainnet reference is worse than one that
+# cannot work at all (#999).
+#
+# ⚠ Note this is not where block rewards actually go in any case: ghost-pool assembles the real
+# coinbase over TDP and sets `coinbase_tx_value_remaining = 0`, so pool_sv2 contributes no outputs
+# of its own. That is a reason the value is easy to get wrong unnoticed, not a reason to ship one.
+coinbase_reward_script = "addr(<YOUR-MAINNET-PAYOUT-ADDRESS>)"
 
 # Pool identification
 server_id = 1
@@ -43,8 +63,12 @@ pool_signature = "Ghost Network SRI Pool"
 # Difficulty settings
 # Shares per minute expected (used for vardiff calculation)
 shares_per_minute = 6.0
-# Batch size for share acknowledgments
-share_batch_size = 10
+# Batch size for share acknowledgments.
+#
+# ⛔ 1, not 10. This said 10 while `install-node.sh` writes 1 and every node measured
+# (vm1/vm5/vm8, 2026-10-06) runs 1. The pool side of this file had no agreement check until #999,
+# so the reference drifted from the thing that actually provisions nodes.
+share_batch_size = 1
 
 # Protocol extensions
 # Must SUPPORT what the translator REQUIRES (0x0002, worker-specific hashrate tracking).
@@ -68,7 +92,10 @@ url = "http://127.0.0.1:8080/api/internal/shares"
 # HMAC-SHA256 over `timestamp || body` under this secret.
 # There is no default: pool_sv2 refuses to start without it, rather than mining into 401s.
 secret = "${INTERNAL_API_SECRET}"
-batch_size = 50
+# ⛔ 1, not 50 — same drift as share_batch_size above. Measured live on vm1/vm5/vm8: 1.
+# At 50 a node would hold up to 50 shares before posting them, which is also the setting that made
+# the `batches delivered` deploy metric hard to reason about (#947).
+batch_size = 1
 batch_timeout_ms = 2000
 max_retries = 3
 

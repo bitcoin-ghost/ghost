@@ -88,6 +88,21 @@ FARM_SHARED = [
     "hobby_max_individual_miner_hashrate",
 ]
 
+def _norm(val):
+    """Strip a trailing TOML comment and any surrounding quotes.
+
+    ⛔ Both sides must normalise IDENTICALLY. The first version of the pool-side comparison kept the
+    closing quote while `values()` stripped it, so every quoted key "disagreed" — six false
+    positives including `listen_address`, which had just been made to agree. A comparison whose two
+    sides parse differently reports the parser, not the configs.
+    """
+    val = re.sub(r"\s+#.*$", "", val).strip()
+    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+        return val[1:-1]
+    # The installer builds some blocks as a shell assignment, so the LAST key of such a block
+    # carries the assignment's closing quote with no opening one.
+    return val.rstrip('"')
+
 def values(path):
     """Return (hobby_keys, farm_keys). Farm-tier keys are kept out of the hobby set."""
     out, farm = {}, {}
@@ -108,7 +123,7 @@ def values(path):
             # Strip a trailing TOML comment so `100.0  # ~232,827` compares as `100.0`, and the
             # closing quote of the installer's shell assignment so the last key of the block
             # is not `50_000_000_000_000.0"`.
-            val = re.sub(r"\s+#.*$", "", val).rstrip('"')
+            val = _norm(val)
             if in_farm:
                 if key in FARM_SHARED:
                     farm.setdefault(key, val)
@@ -177,6 +192,87 @@ def parse_ext_list(v):
     return out
 
 pool_vals, _ = values(POOL_REFERENCE)
+
+# ------------------------------------------------------------------ the POOL side, key by key
+#
+# ⛔ Until #999 this file was opened for `supported_extensions` and nothing else, so the pool
+# reference had NO agreement check at all. `listen_address` was present in both files the whole
+# time and never compared: the reference said `0.0.0.0:34256` while the installer wrote
+# `0.0.0.0:34255`, which is what every node actually listens on (measured on vm1/vm5/vm8).
+#
+# The exception list then absorbed the evidence — `NOT_COMPARED["port"]` cited "34256 (SV2)" as a
+# fact while explaining why a mismatch could be ignored. The wrong value was read directly and
+# written down.
+#
+# The installer writes THREE TOML files, and a flat parse of it keeps whichever occurrence of a key
+# comes first, so the pool heredoc is extracted on its own. Comparing the whole installer against
+# the pool reference would pair `shares_per_minute` from pool.toml against the pool-config one.
+POOL_HEREDOC_OPEN = re.compile(r"^cat > /etc/ghost/pool-config\.toml <<")
+
+def installer_pool_section(path):
+    """Keys from the installer's `cat > /etc/ghost/pool-config.toml` heredoc only."""
+    out, inside = {}, False
+    with open(path) as fh:
+        for line in fh:
+            if POOL_HEREDOC_OPEN.match(line):
+                inside = True
+                continue
+            if inside and re.match(r"^EOF\s*$", line):
+                break
+            if not inside:
+                continue
+            m = re.match(r"^\s*([a-z0-9_]+)\s*=\s*(.+?)\s*$", line)
+            if m:
+                out.setdefault(m.group(1), _norm(m.group(2)))
+    return out, inside
+
+pool_compared = 0
+pool_installer, pool_found = installer_pool_section(INSTALLER)
+if not pool_found:
+    problems.append(
+        f"could not find `cat > /etc/ghost/pool-config.toml` in {INSTALLER} — the pool side of "
+        f"this check examined NOTHING. It was renamed or removed."
+    )
+elif len(pool_installer) < 8:
+    # A floor, because an empty or near-empty extraction is indistinguishable from agreement.
+    problems.append(
+        f"only {len(pool_installer)} key(s) extracted from the pool-config heredoc in "
+        f"{INSTALLER}; expected at least 8. The heredoc shape changed and the pool side is "
+        f"now comparing almost nothing."
+    )
+else:
+    # Per-node substitutions and values the reference deliberately keeps as loud placeholders.
+    POOL_NOT_COMPARED = {
+        "authority_public_key": "per-node, installer substitutes ${SV2_AUTH_PUB}",
+        "authority_secret_key": "per-node, installer substitutes ${SV2_AUTH_SEC}",
+        "coinbase_reward_script": "per-node, installer substitutes ${PAYOUT_ADDRESS}; the "
+                                  "reference keeps an invalid placeholder on purpose",
+        "secret": "per-node, installer substitutes ${INTERNAL_API_SECRET}",
+        "public_key": "per-node TDP authority key",
+        "url": "the webhook URL carries a per-node port in the installer",
+        # Runtime-managed, so neither file's value is what a node runs. `update-pool-signature.sh`
+        # (sri-pool ExecStartPre) rewrites it from ghost-pool's coinbase_tag; the values in both
+        # files are only the fallback until ghost-pool has written that file. MEASURED on
+        # vm1/vm5/vm8 2026-10-06: live is "GHOST PublicPool", matching NEITHER file — which is
+        # correct, not drift, and is why comparing them would be permanent noise.
+        "pool_signature": "runtime-managed by update-pool-signature.sh from ghost-pool's coinbase_tag",
+    }
+    for k in sorted(set(pool_installer) & set(pool_vals)):
+        if k in POOL_NOT_COMPARED:
+            continue
+        pool_compared += 1
+        if pool_installer[k] != pool_vals[k]:
+            problems.append(
+                f"{k}: {INSTALLER} pool-config heredoc = {pool_installer[k]!r} but "
+                f"{POOL_REFERENCE} = {pool_vals[k]!r}"
+            )
+    # listen_address is the one this was written for, so its presence is asserted rather than
+    # left to the intersection — a key that vanishes from one file is unchecked, not in agreement.
+    for k in ("listen_address", "server_id", "cert_validity_sec"):
+        if k not in pool_installer or k not in pool_vals:
+            where = INSTALLER if k not in pool_installer else POOL_REFERENCE
+            problems.append(f"{k}: not found in {where} — cannot verify agreement")
+
 tran_required = parse_ext_list(b.get("required_extensions"))
 pool_supported = parse_ext_list(pool_vals.get("supported_extensions"))
 
@@ -218,10 +314,15 @@ NOT_COMPARED = {
     "authority_pubkey": "per-node, installer substitutes ${SV2_AUTH_PUB}",
     "user_identity": "per-node, installer substitutes ${PAYOUT_ADDRESS}",
     # ⚠ Ambiguous key name, not a real divergence. `port` appears in several TOML sections and
-    # this parser is section-blind outside [farm_tier], so it compares whichever `port` it saw
-    # first in each file — 8333 (P2P) against 34256 (SV2). The farm-tier port IS compared,
-    # section-aware, by the FARM_SHARED block above.
-    "port": "ambiguous across TOML sections; farm port is compared separately",
+    # this parser is section-blind outside [farm_tier], so it compares whichever bare `port` it saw
+    # first in each file. The farm-tier port IS compared, section-aware, by the FARM_SHARED block
+    # above, and the SV2 listen port is compared by the pool-side block below.
+    #
+    # ⛔ No number is quoted here any more. This note used to say the comparison was
+    # "8333 (P2P) against 34256 (SV2)" — and 34256 was the wrong port, stated as a fact in the very
+    # comment that explained why the mismatch could be ignored (#999). An exception list is where a
+    # real defect goes to be forgotten, so it says what is skipped and why, not what the values are.
+    "port": "ambiguous across TOML sections; farm and SV2 ports are compared separately",
 }
 
 for k in sorted(set(a) & set(b)):
@@ -329,6 +430,8 @@ if problems:
     sys.exit(1)
 
 checked = [k for k in sorted(set(a) & set(b)) if k not in NOT_COMPARED]
-print(f"check-stratum-config-agreement: {len(checked)} shared keys compared "
-      f"and in agreement, invariants hold")
+# Both counts, because the pool side existing is the whole point of #999 and a summary that only
+# ever mentioned the translator side is how its absence went unnoticed for as long as it did.
+print(f"check-stratum-config-agreement: {len(checked)} translator key(s) and "
+      f"{pool_compared} pool key(s) compared and in agreement, invariants hold")
 PY
