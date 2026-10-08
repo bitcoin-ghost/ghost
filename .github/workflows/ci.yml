@@ -148,6 +148,15 @@ jobs:
       # maintenance logs success for ever while the database grows. Prepare it and drain the rows.
       - name: Incremental vacuum is stepped
         run: ./scripts/check-incremental-vacuum-is-stepped.sh
+      # The SV2 port is world-open and had no connection cap at all (#994). Two properties of the
+      # fix are invisible to a unit test because both are about WHERE the code sits: the slot must
+      # be taken BEFORE the per-connection task is spawned (otherwise a flood still costs a task, a
+      # socket and a descriptor each), and it must be released only by `Drop`. The TDP client slot
+      # counter decremented by hand, leaked on SIX early-return paths, and at ten leaked slots
+      # refused every pool_sv2 connection for ever until ghost-pool was restarted — a leak becomes
+      # the outage the cap prevents. This accept task has four early returns plus a normal end.
+      - name: SV2 connection slot is taken before the spawn
+        run: ./scripts/check-connection-slot-is-taken-before-spawn.sh
       # A miner-side shim rebuilds `checkpoint_hash` to check any signature at all, so every value
       # that hash commits to must be in the blob the public endpoint serves. The hash has been
       # bumped TWICE by ADDING a root (v2 advert_root, v3 coordinator_roster_root) and nothing

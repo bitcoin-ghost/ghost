@@ -142,6 +142,17 @@ pub struct PoolConfig {
     share_webhook: Option<ShareWebhookConfig>,
     #[serde(default)]
     share_tier_binding: Option<ShareTierBindingConfig>,
+
+    /// Concurrent downstream connections allowed in total. `None` takes
+    /// [`crate::connection_limit::DEFAULT_MAX_DOWNSTREAM_CONNECTIONS`].
+    ///
+    /// ⛔ Absent means DEFAULTED, not unlimited. The SV2 port is world-open and had no cap at all
+    /// (#994), so an unset key must still bound the node.
+    max_downstream_connections: Option<u32>,
+
+    /// Concurrent connections allowed from one address. `None` takes
+    /// [`crate::connection_limit::DEFAULT_MAX_CONNECTIONS_PER_IP`].
+    max_connections_per_ip: Option<u32>,
 }
 
 impl PoolConfig {
@@ -195,6 +206,10 @@ impl PoolConfig {
             jds,
             share_webhook: None,
             share_tier_binding: None,
+            // `None` is DEFAULTED, not unlimited — see the field docs. This constructor is the
+            // programmatic path (tests, JDS); the TOML path gets the same defaults through serde.
+            max_downstream_connections: None,
+            max_connections_per_ip: None,
         }
     }
 
@@ -221,6 +236,16 @@ impl PoolConfig {
     /// Returns the certificate validity in seconds.
     pub fn cert_validity_sec(&self) -> u64 {
         self.cert_validity_sec
+    }
+
+    /// Total concurrent downstream connections allowed, or `None` for the default.
+    pub fn max_downstream_connections(&self) -> Option<u32> {
+        self.max_downstream_connections
+    }
+
+    /// Concurrent connections allowed from one address, or `None` for the default.
+    pub fn max_connections_per_ip(&self) -> Option<u32> {
+        self.max_connections_per_ip
     }
 
     /// Returns the Pool signature.

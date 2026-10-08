@@ -38,6 +38,7 @@ use crate::{
 pub mod binding;
 pub mod channel_manager;
 pub mod config;
+pub mod connection_limit;
 pub mod downstream;
 pub mod error;
 mod io_task;
@@ -301,6 +302,10 @@ impl PoolSv2 {
                 task_manager.clone(),
                 cancellation_token.clone(),
                 downstream_to_channel_manager_sender,
+                Arc::new(crate::connection_limit::ConnectionLimiter::new(
+                    self.config.max_downstream_connections(),
+                    self.config.max_connections_per_ip(),
+                )),
             )
             .await?;
 
