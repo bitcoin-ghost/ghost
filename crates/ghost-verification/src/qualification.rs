@@ -780,6 +780,37 @@ impl QualifiedCapabilityProvider {
             Vec::new()
         };
 
+        // H-7's liar set, resolved ONCE for the whole pass — same reason as the assignment pool
+        // above, and the same shape.
+        //
+        // ⛔ `address_proof_failed_nodes(since, until, height)` takes no node and no capability, so
+        // every call in the loop below returned the SAME set. It was being executed once per
+        // (node, capability): 8 nodes x 4 capabilities = 32 times. MEASURED on ghost-vm8
+        // 2026-10-08: 0.61s warm each, ~19.5s of a 23.6s `/api/v1/qualification/scoped-set`
+        // response (#1002). Cold it is 16.4s and I/O-bound (`user 0.48` against `real 16.4`),
+        // which is #690 — the 2.6 GB database does not fit in RAM.
+        //
+        // ⚖ This is memoisation, not recomputation: the same function with the same arguments,
+        // called once instead of 32 times, so it cannot change a result. That distinction matters
+        // here more than usual — this derivation feeds the node split, and the comment in
+        // `majority_capability_qualified` warns that "a recomputation that merely *ought* to agree
+        // is a way to change the node split by accident". Batching the per-node aggregates into a
+        // GROUP BY would be that kind of change; this is not.
+        //
+        // Computed only when the armed voter-set path will actually consult it, so the dormant and
+        // unscoped paths issue no query at all where they previously issued none either.
+        // Both scoped paths consult it — the voter-set one through `voterset_stats_less_liars` and
+        // the A-2b one through `assigned_challenger_stats`, which had the identical redundancy.
+        let liars: std::collections::HashSet<String> = if (voter_set_scoped || assignment_scoped)
+            && self.address_enforcement_height != u64::MAX
+        {
+            self.db
+                .address_proof_failed_nodes(since, cutoff_ts, self.address_enforcement_height)
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         let mut qualified = Vec::new();
         for hex_id in node_ids {
             let caps = self.qualified_caps_at_cutoff(
@@ -791,6 +822,7 @@ impl QualifiedCapabilityProvider {
                 voter_set_scoped,
                 assignment_scoped,
                 &assignment_pool,
+                &liars,
             );
             let shares = caps.total_shares();
             if shares > 0 {
@@ -848,6 +880,7 @@ impl QualifiedCapabilityProvider {
         voter_set_scoped: bool,
         assignment_scoped: bool,
         assignment_pool: &[crate::challenger_assignment::AssignmentCandidate],
+        liars: &std::collections::HashSet<String>,
     ) -> NodeCapabilities {
         // All four capabilities use a strict per-distinct-challenger MAJORITY over the converged
         // ledger + the C-2 unique-challenger floor. The ledger stores each challenger's own signed
@@ -864,6 +897,7 @@ impl QualifiedCapabilityProvider {
             voter_set_scoped,
             assignment_scoped,
             assignment_pool,
+            liars,
         );
         let reaper = self.majority_capability_qualified(
             node_id_hex,
@@ -875,6 +909,7 @@ impl QualifiedCapabilityProvider {
             voter_set_scoped,
             assignment_scoped,
             assignment_pool,
+            liars,
         );
         let public_mining = self.majority_capability_qualified(
             node_id_hex,
@@ -886,6 +921,7 @@ impl QualifiedCapabilityProvider {
             voter_set_scoped,
             assignment_scoped,
             assignment_pool,
+            liars,
         );
         let ghost_pay = self.majority_capability_qualified(
             node_id_hex,
@@ -897,6 +933,7 @@ impl QualifiedCapabilityProvider {
             voter_set_scoped,
             assignment_scoped,
             assignment_pool,
+            liars,
         );
 
         // Elder is registration order in the (converged) nodes table, unchanged.
@@ -942,6 +979,7 @@ impl QualifiedCapabilityProvider {
         voter_set_scoped: bool,
         assignment_scoped: bool,
         assignment_pool: &[crate::challenger_assignment::AssignmentCandidate],
+        liars: &std::collections::HashSet<String>,
     ) -> bool {
         if assignment_scoped {
             if let Some(oracle) = self.block_hash_oracle.as_deref() {
@@ -952,6 +990,7 @@ impl QualifiedCapabilityProvider {
                     until,
                     assignment_pool,
                     oracle,
+                    liars,
                 );
                 return chal_total >= min_challenges
                     && distinct_subnets >= min_unique
@@ -974,7 +1013,7 @@ impl QualifiedCapabilityProvider {
                     // challenger caught lying about its address can be dropped from the SUBNET
                     // count. It keeps its verdict — only its claim to a distinct `/24` is lost,
                     // because that claim is the thing the probe disproved.
-                    self.voterset_stats_less_liars(node_id_hex, capability, since, until)
+                    self.voterset_stats_less_liars(node_id_hex, capability, since, until, liars)
                 };
             // Count floor on voter-set challengers; Sybil floor on distinct SUBNETS
             // (not identities); strict majority of the voter-set challengers passed.
@@ -1017,16 +1056,16 @@ impl QualifiedCapabilityProvider {
         capability: &str,
         since: i64,
         until: i64,
+        // ⛔ Passed in, not queried. This set is invariant across the whole pass and was being
+        // re-derived once per (node, capability) — 32 identical queries, ~19.5s of a 23.6s
+        // response (#1002). The caller resolves it once.
+        liars: &std::collections::HashSet<String>,
     ) -> (u32, u32, u32) {
         use std::collections::{HashMap, HashSet};
 
         let rows = self
             .db
             .ledger_voterset_challenger_rows(node_id_hex, capability, since, until)
-            .unwrap_or_default();
-        let liars = self
-            .db
-            .address_proof_failed_nodes(since, until, self.address_enforcement_height)
             .unwrap_or_default();
 
         // challenger_id -> (pass_count, total_count, subnet)
@@ -1056,6 +1095,16 @@ impl QualifiedCapabilityProvider {
         (challengers_pass, challengers_total, distinct_subnets)
     }
 
+    // 8 arguments, one over clippy's limit, because `liars` is now a hoisted per-pass invariant
+    // rather than something this function resolves for itself (#1002). `qualified_caps_at_cutoff`
+    // carries the same allow for the same reason.
+    //
+    // ⚠ The tidier shape is a small struct bundling the per-pass invariants — `liars` and
+    // `assignment_pool` — which would drop the count in several signatures at once and say
+    // "resolved once per pass" in the type rather than in a comment. Deliberately not done here:
+    // this is the derivation that decides the node split, and widening a latency fix into a
+    // signature refactor across it buys nothing a reviewer of THIS change can check.
+    #[allow(clippy::too_many_arguments)]
     fn assigned_challenger_stats(
         &self,
         node_id_hex: &str,
@@ -1064,6 +1113,9 @@ impl QualifiedCapabilityProvider {
         until: i64,
         pool: &[crate::challenger_assignment::AssignmentCandidate],
         oracle: &dyn crate::challenger_assignment::BlockHashProvider,
+        // ⛔ Passed in, not queried — see `voterset_stats_less_liars`. This path had the same
+        // per-(node, capability) redundancy (#1002).
+        liars: &std::collections::HashSet<String>,
     ) -> (u32, u32, u32) {
         use crate::challenger_assignment::{assigned_challengers, ROUND_FANOUT_K, SEED_LAG};
         use std::collections::{HashMap, HashSet};
@@ -1110,15 +1162,9 @@ impl QualifiedCapabilityProvider {
             .filter(|(pass, total, _)| pass * 2 >= *total)
             .count() as u32;
         // H-7 ENFORCEMENT (#605): a challenger caught lying about its address contributes no
-        // subnet. Dormant unless armed, and it costs a DB read only then — `u64::MAX` short
-        // circuits before the query so the unarmed path is unchanged in cost as well as result.
-        let liars = if self.address_enforcement_height == u64::MAX {
-            HashSet::new()
-        } else {
-            self.db
-                .address_proof_failed_nodes(since, until, self.address_enforcement_height)
-                .unwrap_or_default()
-        };
+        // subnet. The set arrives from the caller, which resolves it once per pass and leaves it
+        // empty while the gate is dormant — so the unarmed path still issues no query, and the
+        // armed one issues one instead of 32 (#1002).
         let distinct_subnets = per_ch
             .iter()
             .filter(|(id, _)| !liars.contains(*id))
@@ -1899,12 +1945,148 @@ mod tests {
 
         // Armed, but with no address verdicts on record — nothing to filter.
         let armed = QualifiedCapabilityProvider::new(Arc::clone(&db)).with_address_enforcement(1);
-        let recomputed = armed.voterset_stats_less_liars(&target, "archive", 0, cutoff);
+        // The liar set is now resolved by the caller once per pass (#1002). Derived here the same
+        // way production does rather than passed as an empty set, so this test still exercises the
+        // real query — handing it `HashSet::new()` would assert the filter is inert by construction
+        // instead of because there is nothing on record to filter.
+        let liars = db.address_proof_failed_nodes(0, cutoff, 1).unwrap();
+        let recomputed = armed.voterset_stats_less_liars(&target, "archive", 0, cutoff, &liars);
 
         assert_eq!(
             recomputed, aggregate,
             "the armed recomputation must reproduce the aggregate exactly when there is nothing \
              to filter, or arming would move the node split for reasons unrelated to #605"
+        );
+    }
+
+    /// While the gate is dormant the liar query returns an empty set even with failing verdicts on
+    /// record — so the hoist's armed guard is a COST guard, not a correctness one.
+    ///
+    /// ⛔ Written because mutation testing said so. Removing
+    /// `self.address_enforcement_height != u64::MAX` from the hoist killed no test, and the
+    /// tempting conclusion was a coverage gap. It is not: `address_proof_failed_nodes` converts
+    /// `min_round_height` with `i64::try_from(u64::MAX).unwrap_or(i64::MAX)`, so dormant asks for
+    /// `round_height >= i64::MAX` and no real round satisfies it. Dormant is inert in the DATA, not
+    /// merely in the branch above it.
+    ///
+    /// That distinction is worth pinning. If someone later changes the dormant sentinel, or that
+    /// `try_from` fallback, a hoist that looks like a pure cost optimisation would start feeding a
+    /// non-empty set into the assignment-scoped path while the gate is still dormant — which WOULD
+    /// move the node split.
+    #[test]
+    fn a_dormant_gate_makes_the_liar_query_empty_in_the_data_not_just_the_branch() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let liar = hex_id(0x51);
+        let chs = [hex_id(0x52), hex_id(0x53), hex_id(0x54)];
+        for (i, c) in chs.iter().enumerate() {
+            register_voter(&db, c, &format!("10.0.{i}.1:8080"));
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &liar,
+                capability: "address",
+                passed: false,
+                timestamp: 1_000,
+                proof: b"p",
+                round_height: Some(1_000),
+            })
+            .unwrap();
+        }
+
+        // Armed at a real height: the fixture must actually convict, or the dormant assertion
+        // below would hold for the wrong reason.
+        let armed = db.address_proof_failed_nodes(0, 2_000_000, 1).unwrap();
+        assert!(
+            armed.contains(&liar),
+            "the fixture must convict the liar when ARMED, or this test proves nothing"
+        );
+
+        let dormant = db
+            .address_proof_failed_nodes(0, 2_000_000, u64::MAX)
+            .unwrap();
+        assert!(
+            dormant.is_empty(),
+            "a dormant height floor must match no rows, so the set is empty whatever the caller \
+             does with it: {dormant:?}"
+        );
+    }
+
+    /// The hoisted liar set must produce the SAME qualified split as resolving it per call.
+    ///
+    /// ⛔ This is the test that makes #1002 safe to ship. Lifting
+    /// `address_proof_failed_nodes` out of the per-(node, capability) loop removed 31 of 32
+    /// identical queries — but this derivation feeds the NODE SPLIT, and the comment in
+    /// `majority_capability_qualified` warns that a recomputation which merely ought to agree is a
+    /// way to change the split by accident. So the equivalence is asserted, not assumed.
+    ///
+    /// The fixture puts exactly 3 distinct `/24`s across 4 challengers — sitting ON the
+    /// `min_unique` floor — so losing one subnet is the difference between qualifying and not.
+    /// A hoist that passed an empty set would make the armed result equal the dormant one, and
+    /// that is precisely what this catches: the two results must DIFFER.
+    #[test]
+    fn the_hoisted_liar_set_gives_the_same_split_as_resolving_it_per_call() {
+        let target = hex_id(0xE9);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // min_challenges 4, min_unique 3
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        let chs = [hex_id(0x41), hex_id(0x42), hex_id(0x43), hex_id(0x44)];
+        let addrs = [
+            "10.0.0.1:8080",
+            "10.0.0.2:8080",
+            "172.16.5.5:8080",
+            "192.168.9.9:8080",
+        ];
+        for (c, a) in chs.iter().zip(addrs.iter()) {
+            register_voter(&db, c, a);
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &target,
+                capability: "archive",
+                passed: true,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
+        }
+        // chs[2] is caught lying: 2 of 3 distinct challengers say FAIL. Its /24 is the third one,
+        // so dropping it takes the target from 3 distinct subnets to 2 — below the floor.
+        for (c, passed) in [(&chs[0], false), (&chs[1], false), (&chs[3], true)] {
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &chs[2],
+                capability: "address",
+                passed,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: Some(1_000),
+            })
+            .unwrap();
+        }
+
+        let dormant = QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false);
+        let armed = QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .with_address_enforcement(1)
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false);
+
+        // The positive control. Without this, "armed drops the target" could be true because the
+        // fixture never qualified anyone.
+        assert!(
+            dormant
+                .iter()
+                .any(|(id, _)| *id == decode_node_id(&target).unwrap()),
+            "the fixture must qualify the target while DORMANT, or the armed assertion below \
+             proves nothing: dormant = {dormant:?}"
+        );
+        assert!(
+            !armed
+                .iter()
+                .any(|(id, _)| *id == decode_node_id(&target).unwrap()),
+            "ARMED, the liar's /24 must be dropped and the target must fall below the subnet \
+             floor. Equal results here mean the hoisted set arrived EMPTY and enforcement is \
+             silently inert — the one way this optimisation can change the node split: \
+             armed = {armed:?}"
         );
     }
 
