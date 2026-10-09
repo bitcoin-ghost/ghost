@@ -9321,7 +9321,9 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = interval.tick() => {
                     let now = chrono::Utc::now().timestamp();
-                    match db_for_uptime.record_uptime_sample(&node_id_for_uptime, now, true) {
+                    // Also refreshes our own `nodes.last_seen`: peers' rows are refreshed by
+                    // their pings, ours by nothing else (#1004).
+                    match db_for_uptime.record_self_liveness(&node_id_for_uptime, now) {
                         Ok(_) => {
                             sample_count += 1;
                             // Log every 360 samples (~1 hour) to confirm it's working

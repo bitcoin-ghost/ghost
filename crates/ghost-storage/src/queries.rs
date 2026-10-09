@@ -7348,6 +7348,19 @@ impl Database {
         })
     }
 
+    /// Record that THIS node is alive at `now`: an uptime sample plus a fresh `last_seen` on its
+    /// own `nodes` row.
+    ///
+    /// A peer's row is refreshed by every health ping received from it, but a node never
+    /// receives its own ping, so without this its own row keeps the `last_seen` written at
+    /// startup. Every reader that filters on recency then drops the node from its own view once
+    /// that timestamp ages out — `get_node_stats` reported 7 of 8 nodes active on a healthy
+    /// fleet a week after a restart (#1004).
+    pub fn record_self_liveness(&self, node_id: &str, now: i64) -> GhostResult<()> {
+        self.record_uptime_sample(node_id, now, true)?;
+        self.update_node_last_seen(node_id, now)
+    }
+
     /// GHOST-10: online fraction (0.0..=1.0) for the trailing window.
     ///
     /// Downtime manifests as MISSING `uptime_samples` rows (gaps), not
@@ -11139,6 +11152,48 @@ mod tests {
             2,
             "a second distinct win counts"
         );
+    }
+
+    /// #1004: a node counts itself as active for as long as it is running, not only for the
+    /// 7 days after it last started. The row is aged the way a long-running node's own row is
+    /// (stamped once at registration, never refreshed by a peer ping).
+    #[test]
+    fn a_running_node_stays_in_its_own_active_count() {
+        let db = Database::in_memory().expect("in-memory db");
+        let node_id = "aa".repeat(32);
+        db.register_node_with_elder_check_and_pow(&node_id, None, None, "{}", None)
+            .expect("register self");
+
+        let now = chrono::Utc::now().timestamp();
+        let eight_days_ago = now - 8 * 24 * 3600;
+        db.update_node_last_seen(&node_id, eight_days_ago)
+            .expect("age the row");
+        let (total, active_7d, _, _) = db.get_node_stats().expect("stats");
+        assert_eq!(
+            (total, active_7d),
+            (1, 0),
+            "fixture: a row last seen 8 days ago must be outside the window"
+        );
+
+        db.record_self_liveness(&node_id, now).expect("liveness");
+
+        let (total, active_7d, _, _) = db.get_node_stats().expect("stats");
+        assert_eq!(
+            (total, active_7d),
+            (1, 1),
+            "a node that just recorded its own liveness must count as active"
+        );
+        let samples: i64 = db
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM uptime_samples WHERE node_id = ?1 AND sample_time = ?2",
+                    params![node_id, now],
+                    |r| r.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("count samples");
+        assert_eq!(samples, 1, "the uptime sample must still be recorded");
     }
 
     /// Mesh node-list checkpoints persist and read back byte-identical, are idempotent by
