@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # backup-databases.sh — Automated backup for ghost.db and ghost-pay.db
 #
-# Gzipped `sqlite3 .backup` copies into /var/backups/ghost/db, pruned by BOTH age and count.
+# Gzipped `VACUUM INTO` copies into /var/backups/ghost/db, pruned by BOTH age and count.
 # Logs to syslog. Usage: backup-databases.sh [--ghost-dir /home/ghost/.ghost]
 #
 # ⛔ Run as the database's OWNER, not as root. The databases are WAL mode with `ghost:ghost` 0600
-# sidecars, and `sqlite3 .backup` opens the source read-write. Under the systemd unit this is fine
+# sidecars, and sqlite3 opens the source read-write. Under the systemd unit this is fine
 # because it sets `User=ghost`; a hand-run under sudo that has to recreate `-wal` or `-shm` leaves
 # them ROOT-owned, after which the `ghost` user cannot open its own database for writing. The pool
 # wedges and it reads as corruption. The guard below refuses rather than relying on anyone
@@ -60,7 +60,25 @@ root-run sqlite3 that recreates -wal or -shm leaves them root-owned, after which
 cannot write its own database. Run as the owning user (the systemd unit sets User=ghost)."
 fi
 
+# The live database is 0600. Its copies should not be readable by anyone who could not read it.
+umask 077
+
 mkdir -p "$BACKUP_DIR"
+
+# The uncompressed copy in flight, if any. Removed on EVERY exit path — `die`, the ERR trap, and a
+# `systemctl stop` or start timeout, which arrive as SIGTERM.
+PARTIAL=""
+discard_copy() {
+    rm -f -- "$1" "$1-wal" "$1-shm" "$1-journal"
+}
+cleanup_partial() {
+    [ -n "$PARTIAL" ] || return 0
+    discard_copy "$PARTIAL"
+    log "removed the incomplete copy at $PARTIAL"
+    PARTIAL=""
+}
+trap cleanup_partial EXIT
+trap 'cleanup_partial; exit 143' TERM INT
 
 # Back up one database: check there is room, copy, compress, verify the copy opens.
 backup_one() {
@@ -85,7 +103,19 @@ backup takes the node down for a reason unrelated to backups."
 
     local dest="$BACKUP_DIR/${prefix}-${TIMESTAMP}.db"
     log "$label: backing up to ${dest}.gz"
-    sqlite3 "$src" ".backup '$dest'" || die "$label: sqlite3 .backup failed"
+    # From here until the gzip lands, a failure must not leave the uncompressed copy behind: it is
+    # the full size of the database, on a filesystem this script was written to stop filling.
+    PARTIAL="$dest"
+    # `VACUUM INTO` refuses an existing destination, and a stale one can only be debris.
+    discard_copy "$dest"
+
+    # ⛔ `VACUUM INTO`, not `.backup`. The online backup API RESTARTS whenever another connection
+    # commits to the source, and the pool commits about 45 times a minute. Whether a pass over
+    # 2.4 GB fits between two commits depends on the node: vm5-vm7 got through in under four
+    # minutes, and on vm8 the same command sat at 84% of a CPU for 23 minutes with the destination
+    # fixed at 2,247,475,200 bytes until it was stopped by hand (#1009). `VACUUM INTO` reads inside
+    # ONE transaction, so a writer cannot restart it — on vm8 it finished in 11 seconds.
+    sqlite3 "$src" "VACUUM INTO '$dest'" || die "$label: sqlite3 VACUUM INTO failed"
 
     # Verify BEFORE compressing, while it is still a database. A truncated file is still a file, and
     # a gzip of one is still a valid gzip — the kind of backup whose problem surfaces at restore.
@@ -100,6 +130,10 @@ backup takes the node down for a reason unrelated to backups."
     [ "$integ" = "ok" ] || die "$label: quick_check on $dest said '$integ'"
 
     gzip -f "$dest" || die "$label: gzip failed"
+    PARTIAL=""
+    # Verifying a copy can leave `-wal`/`-shm` beside it. Nothing prunes those — retention matches
+    # `*.db.gz` only — so one pair per night would stay for ever.
+    rm -f -- "$dest-wal" "$dest-shm" "$dest-journal"
     log "$label: complete — $(du -h "${dest}.gz" | cut -f1) compressed from ${db_kb}KB, user_version=$ver, quick_check=ok"
 }
 

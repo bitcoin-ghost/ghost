@@ -40,12 +40,17 @@ User=ghost
 Group=ghost
 
 # ⛔ User=ghost is load-bearing, not tidiness. The databases are WAL mode with ghost-owned 0600
-# sidecars and \`sqlite3 .backup\` opens the source read-write; a root-run that has to recreate
+# sidecars and sqlite3 opens the source read-write; a root-run that has to recreate
 # -wal or -shm leaves them root-owned, after which the ghost user cannot write its own database.
 # backup-databases.sh also refuses to run as root, so these two agree.
 
 # A 2.6 GB read plus gzip competes with the pool for the same disk. Deprioritised so a backup can
 # never be the reason a share took too long to credit.
+# A healthy run is under four minutes. Type=oneshot has NO start timeout by default, so a copy
+# that cannot finish holds a CPU until someone notices — 23 minutes on vm8 before it was stopped
+# by hand (#1009). The script removes its partial copy when this fires.
+TimeoutStartSec=1800
+
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
