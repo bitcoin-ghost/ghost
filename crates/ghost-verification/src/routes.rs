@@ -6424,15 +6424,39 @@ async fn api_payout_checkpoint_handler(
 ///
 /// `assignment_scoped=false` here: A-2b (`CHALLENGER_ASSIGNMENT`) is a separate gate and its
 /// draw needs the block-hash oracle; this endpoint proves only the A-2 voter-set/subnet layer.
+///
+/// The derivation is synchronous database work costing seconds (4-6s on the fleet, MEASURED
+/// 2026-10-10), so it runs on the blocking pool, one at a time — see [`crate::single_flight`].
 async fn api_qualification_scoped_set_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
+    let for_task = Arc::clone(&state);
+    match state
+        .scoped_set_flight
+        .run(move || qualification_scoped_set_report(&for_task))
+        .await
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            warn!(error = %e, "scoped-set: derivation task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "scoped-set derivation failed" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// The body of `/api/v1/qualification/scoped-set`. Synchronous and slow by nature: call it from
+/// the blocking pool, never from an async worker.
+fn qualification_scoped_set_report(state: &VerificationState) -> serde_json::Value {
     use sha2::{Digest, Sha256};
     let Some(db) = state.database.as_ref() else {
-        return Json(serde_json::json!({ "error": "no database configured" }));
+        return serde_json::json!({ "error": "no database configured" });
     };
     let Some(cp) = db.get_latest_payout_ledger_checkpoint().ok().flatten() else {
-        return Json(serde_json::json!({ "error": "no finalised checkpoint yet" }));
+        return serde_json::json!({ "error": "no finalised checkpoint yet" });
     };
     let cutoff = cp.cutoff_ts;
     // `Database` is a cheap Clone (shares an inner `Arc<DatabaseInner>`); the provider
@@ -6489,7 +6513,7 @@ async fn api_qualification_scoped_set_handler(
         .mesh_node_list_fn
         .as_ref()
         .and_then(|f| f(cutoff, cp.height));
-    Json(serde_json::json!({
+    serde_json::json!({
         "cutoff_ts": cutoff,
         "checkpoint_height": cp.height,
         "unscoped": { "count": unscoped.len(), "hash": hash_set(&unscoped) },
@@ -6529,7 +6553,7 @@ async fn api_qualification_scoped_set_handler(
             "missing_adverts": mesh_node_list.as_ref().map(|c| c.missing_adverts.clone()),
             "has_fn": state.mesh_node_list_fn.is_some(),
         },
-    }))
+    })
 }
 
 // ============================================================================
@@ -13460,6 +13484,67 @@ mod tests {
             })
         });
         Arc::new(state)
+    }
+
+    /// #1002: the scoped-set derivation is seconds of synchronous database work, so it must not
+    /// run on the thread that is serving requests. On a current-thread runtime that thread is
+    /// this test's, which makes "ran somewhere else" directly observable.
+    #[tokio::test]
+    async fn the_scoped_set_derivation_runs_off_the_async_worker() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use ghost_storage::queries::PayoutLedgerCheckpointRecord;
+
+        let db = ghost_storage::Database::in_memory().expect("db");
+        db.upsert_payout_ledger_checkpoint(&PayoutLedgerCheckpointRecord {
+            height: 970_500,
+            cutoff_ts: 1_760_000_000,
+            ledger_root: [7u8; 32],
+            proposer_id: "aa".repeat(32),
+            active_node_count: 8,
+            miner_payouts: Vec::new(),
+            node_shares: Vec::new(),
+        })
+        .expect("checkpoint");
+
+        let ran_on = Arc::new(parking_lot::Mutex::new(None));
+        let seen = Arc::clone(&ran_on);
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_database(db)
+            .with_fee_split_fn(Arc::new(move |cutoff, height| {
+                *seen.lock() = Some(std::thread::current().id());
+                Some(format!("{cutoff}:{height}"))
+            })),
+        );
+
+        let resp = api_qualification_scoped_set_handler(axum::extract::State(state))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        // The report is the real one, derived from the checkpoint that was stored.
+        assert_eq!(json["checkpoint_height"], 970_500);
+        assert_eq!(json["fee_split"]["hash"], "1760000000:970500");
+        assert_eq!(json["unscoped"]["count"], 0);
+
+        let ran_on = ran_on
+            .lock()
+            .expect("the derivation never reached the fee-split closure");
+        assert_ne!(
+            ran_on,
+            std::thread::current().id(),
+            "the derivation ran on the async worker"
+        );
     }
 
     /// A node must attest to ITS OWN endpoint.
