@@ -85,8 +85,26 @@ for n in "${NODES[@]}"; do
         # truncated response and a JSONDecodeError against the 90s budget. 240s clears the worst
         # observed with margin.
         #
-        # ⚠ Raising this treats the probe, not the endpoint. A 14-44s status endpoint — one that
-        # derives over the node set rather than scanning the chain — is its own problem (#979).
+        # ⚠ Raising this treated the probe, not the endpoint. The endpoint was then fixed (#979):
+        # one invariant query was being run 32 times per pass (#1002, hoisted in #1003), and the
+        # derivation now runs off the async workers, one at a time (#1011).
+        #
+        # RE-MEASURED 2026-10-10 with the hoist deployed, 3 sequential samples per node:
+        #
+        #     vm1  3.4 3.0 2.9      vm5  6.3 6.2 5.6
+        #     vm2  3.6 4.5 4.2      vm6  5.1 6.8 5.1
+        #     vm3  3.6 3.9 3.4      vm7  6.0 7.3 5.7
+        #     vm4  4.3 4.0 3.2      vm8  4.9 5.1 4.8
+        #
+        # 3-7s on every node, and this script's own 8-way sample returned in 7.3s with all eight
+        # answering. The numbers above this note are history, kept because they are why the
+        # budget is what it is.
+        #
+        # ⚠ The 240s budget is deliberately NOT lowered. It is ~30x the worst of those 24
+        # samples, which is too few to rule out a rare outlier, and a generous budget costs
+        # nothing on a healthy fleet — the request returns when the node answers. This probe
+        # has been caught with too small a budget twice; if a node ever needs more than a
+        # fraction of it again, that is a regression in the endpoint, not a reason to raise it.
         #
         # ⛔ Measure this endpoint ONE NODE AT A TIME. Parallel probes inflate each other, and
         # attributing that spread to nodes is how a bogus ">150s on vm7" reached #979.
