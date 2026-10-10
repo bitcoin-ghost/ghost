@@ -137,8 +137,38 @@ backup takes the node down for a reason unrelated to backups."
     log "$label: complete — $(du -h "${dest}.gz" | cut -f1) compressed from ${db_kb}KB, user_version=$ver, quick_check=ok"
 }
 
-backup_one "ghost.db"     "$GHOST_DIR/ghost.db"                  "ghost"
-backup_one "ghost-pay.db" "$GHOST_DIR/ghost-pay/ghost-pay.db"    "ghost-pay"
+# Each database on its own, so one that cannot be copied does not take the others — or the prune
+# below — down with it. vm1-vm4 carry a `ghost-pay.db` that plain sqlite3 cannot open at all
+# ("file is not a database": it is encrypted, and its service is retired). When that aborted the
+# whole run, `ghost.db` had been copied but nothing was ever pruned, on every night, for ever.
+#
+# The run still FAILS if any database was not backed up, and says which. Carrying on is not the
+# same as calling it a success.
+#
+# ⛔ The subshell is deliberately not written `( ... ) || rc=$?` or `if ! ( ... )`. Either puts it
+# in a condition context, where bash ignores `set -e` for everything inside, and `backup_one`
+# relies on it. So the ERR trap is lifted, errexit is suspended out here, and re-armed in there.
+FAILED=""
+backup_isolated() {
+    local rc
+    trap - ERR
+    set +e
+    (
+        set -e
+        trap cleanup_partial EXIT
+        trap 'cleanup_partial; exit 143' TERM INT
+        backup_one "$@"
+    )
+    rc=$?
+    set -e
+    trap 'rc=$?; [ "$rc" -ne 0 ] && log "ERROR: aborted at line $LINENO with status $rc"; exit $rc' ERR
+    # Stopped, not failed: do not carry on to the next database after a SIGTERM.
+    [ "$rc" -ne 143 ] || exit 143
+    [ "$rc" -eq 0 ] || FAILED="$FAILED $1"
+}
+
+backup_isolated "ghost.db"     "$GHOST_DIR/ghost.db"                  "ghost"
+backup_isolated "ghost-pay.db" "$GHOST_DIR/ghost-pay/ghost-pay.db"    "ghost-pay"
 
 # Prune. Per prefix, so a missing ghost-pay.db cannot let ghost.db copies count towards its quota.
 #
@@ -175,5 +205,8 @@ for f in "$BACKUP_DIR"/ghost*.db.gz; do
 done
 log "  $found backup file(s) in $BACKUP_DIR, $(df -Pk "$BACKUP_DIR" | awk 'NR==2{print $4}')KB free"
 [ "$found" -gt 0 ] || die "no backup files present after a run that reported success"
+
+# The verdict, last, so it is the final line anyone reads in the journal.
+[ -z "$FAILED" ] || die "NOT backed up:$FAILED — every other database above was copied and pruned normally"
 
 exit 0

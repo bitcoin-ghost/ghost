@@ -228,13 +228,41 @@ else
         "$(/usr/bin/grep -nF '.backup' "$SCRIPT" | /usr/bin/grep -vE '^[0-9]+:[[:space:]]*#')"
 fi
 
+# ---------------------------------------------------------------- 3d. one unreadable database
+# vm1-vm4 carry a `ghost-pay.db` that sqlite3 cannot open (it is encrypted). That used to abort the
+# run after `ghost.db` had been copied and BEFORE the prune, so those nodes would never prune. The
+# other database must still be backed up, the prune must still run, and the run must still fail
+# and name the one it could not copy.
+C="$TMP/oneunreadable"; make_case "$C"
+head -c 8192 /dev/urandom > "$C/.ghost/ghost-pay/ghost-pay.db"
+for i in $(seq 1 9); do
+    printf 'x' > "$C/backups/ghost-20250101000$i.db.gz"
+    touch -d "@$(( $(date +%s) - (100 + i) * 86400 ))" "$C/backups/ghost-20250101000$i.db.gz"
+done
+out="$(run_case "$C")"; rc=$?
+fresh=$(find "$C/backups" -name 'ghost-20*.db.gz' ! -name 'ghost-pay-*' -newermt '-1 hour' | wc -l)
+old_left=$(find "$C/backups" -name 'ghost-2025*.db.gz' | wc -l)
+pay=$(find "$C/backups" -name 'ghost-pay-*' | wc -l)
+case "$out" in
+    *"NOT backed up: ghost-pay.db"*) named=1 ;;
+    *) named=0 ;;
+esac
+if [ "$rc" -ne 0 ] && [ "$fresh" -eq 1 ] && [ "$old_left" -lt 9 ] && [ "$pay" -eq 0 ] && [ "$named" -eq 1 ]; then
+    ok "one unreadable database: the other is still backed up and pruned, and the run fails naming it"
+else
+    bad "an unreadable database must not stop the others or the prune, and must fail the run by name" \
+        "exit $rc (expect non-zero)" "fresh ghost.db backups: $fresh (expect 1)" \
+        "old copies left: $old_left of 9 (expect fewer — the prune must have run)" \
+        "ghost-pay files left: $pay (expect 0)" "named the failed database: $named" "$out"
+fi
+
 # ---------------------------------------------------------------- 4. running as root is refused
 # Asserted by driving the guard directly rather than by becoming root, which a test must not do.
 if /usr/bin/grep -qF 'refusing to run as root' "$SCRIPT" \
    && /usr/bin/grep -qE '\[ "\$\(id -u\)" -eq 0 \]' "$SCRIPT"; then
     # And the guard must come BEFORE any backup work, or it refuses after writing.
     guard_line=$(/usr/bin/grep -nE '\[ "\$\(id -u\)" -eq 0 \]' "$SCRIPT" | head -1 | cut -d: -f1)
-    work_line=$(/usr/bin/grep -nF 'backup_one "ghost.db"' "$SCRIPT" | head -1 | cut -d: -f1)
+    work_line=$(/usr/bin/grep -nF 'backup_isolated "ghost.db"' "$SCRIPT" | head -1 | cut -d: -f1)
     if [ "$guard_line" -lt "$work_line" ]; then
         ok "the root guard exists and precedes any backup work (line $guard_line before $work_line)"
     else
