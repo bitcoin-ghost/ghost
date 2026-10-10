@@ -30,21 +30,15 @@ else
     cat > "$TMP/bin/sqlite3" <<'SHIM'
 #!/usr/bin/env python3
 # Stands in for the three sqlite3 CLI invocations backup-databases.sh makes:
-#   sqlite3 <src> ".backup '<dest>'"
+#   sqlite3 <src> "VACUUM INTO '<dest>'"
 #   sqlite3 "file:<path>?mode=ro" 'PRAGMA user_version;'
 #   sqlite3 "file:<path>?mode=ro" 'PRAGMA quick_check;'
-import sqlite3, sys, re
+import sqlite3, sys
 db, stmt = sys.argv[1], sys.argv[2]
 try:
-    m = re.match(r"\.backup\s+'(.+)'$", stmt.strip())
-    if m:
-        src = sqlite3.connect(db)
-        dst = sqlite3.connect(m.group(1))
-        src.backup(dst)
-        dst.close(); src.close()
-        sys.exit(0)
     uri = db.startswith("file:")
-    con = sqlite3.connect(db, uri=uri)
+    # isolation_level=None: VACUUM cannot run inside the transaction the module would open.
+    con = sqlite3.connect(db, uri=uri, isolation_level=None)
     rows = con.execute(stmt.rstrip(";")).fetchall()
     for r in rows:
         print(r[0])
@@ -116,6 +110,16 @@ else
         *"user_version=59"*"quick_check=ok"*) ok "happy path verifies the copy before compressing" ;;
         *) bad "happy path reports user_version and quick_check" "$out" ;;
     esac
+    # #1009: every run used to leave `<copy>.db-shm` and `<copy>.db-wal` behind, which retention
+    # never matches. And a copy of a 0600 database must not be world-readable.
+    stray=$(find "$C/backups" -type f ! -name '*.db.gz' | wc -l)
+    modes=$(find "$C/backups" -name '*.db.gz' -exec stat -c '%a' {} + | sort -u | tr '\n' ' ')
+    if [ "$stray" -eq 0 ] && [ "$modes" = "600 " ]; then
+        ok "happy path leaves only .gz files, owner-only (mode 600)"
+    else
+        bad "happy path leaves only owner-only .gz files" "non-.gz files: $stray" "modes: '$modes' (expect '600 ')" \
+            "$(find "$C/backups" -type f | sed 's|.*/||')"
+    fi
     case "$out" in
         *"backup file(s) in"*) ok "happy path reports a positive file count" ;;
         *) bad "happy path reports a count, not silence" "$out" ;;
@@ -142,9 +146,10 @@ C="$TMP/truncated"; make_case "$C"
 mkdir -p "$C/bin"
 cat > "$C/bin/sqlite3" <<'LIAR'
 #!/usr/bin/env bash
-# `.backup` "succeeds" and leaves 100 bytes of nonsense; the pragma reads then fail.
+# The copy "succeeds" and leaves 100 bytes of nonsense; the pragma reads then fail.
 case "$2" in
-    .backup*) dest="$(printf '%s' "$2" | sed -nE "s/^\.backup '(.+)'$/\1/p")"
+    "VACUUM INTO"*) dest="$(printf '%s' "$2" | sed -nE "s/^VACUUM INTO '(.+)'$/\1/p")"
+              [ -n "$dest" ] || { echo "liar shim could not parse: $2" >&2; exit 97; }
               head -c 100 /dev/urandom > "$dest"; exit 0 ;;
     *) echo "file is not a database" >&2; exit 1 ;;
 esac
@@ -159,11 +164,96 @@ case "$out" in
     *"backing up to"*) attempted=1 ;;
     *) attempted=0 ;;
 esac
-if [ "$rc" -ne 0 ] && [ "$gz" -eq 0 ] && [ "$attempted" -eq 1 ]; then
-    ok "a truncated copy is rejected before it is compressed"
+# #1009: the rejected copy must also be REMOVED. It is the full size of the database, and a failed
+# run that leaves it is how a backup fills the disk it was written to protect. `removed the
+# incomplete copy` is the positive half — it proves the file existed and the script deleted it,
+# where "no files left" alone is also true of a run that never wrote one.
+left=$(find "$C/backups" -type f | wc -l)
+case "$out" in
+    *"removed the incomplete copy"*) removed=1 ;;
+    *) removed=0 ;;
+esac
+if [ "$rc" -ne 0 ] && [ "$gz" -eq 0 ] && [ "$attempted" -eq 1 ] && [ "$left" -eq 0 ] && [ "$removed" -eq 1 ]; then
+    ok "a truncated copy is rejected before it is compressed, and removed"
 else
-    bad "a truncated copy must fail the run after attempting it, and not be gzipped" \
-        "exit $rc" "gz files: $gz" "reached the backup: $attempted" "$out"
+    bad "a truncated copy must fail the run after attempting it, not be gzipped, and not be left behind" \
+        "exit $rc" "gz files: $gz" "reached the backup: $attempted" "files left: $left" \
+        "said it removed the copy: $removed" "$out"
+fi
+
+# ---------------------------------------------------------------- 3b. a run that is STOPPED cleans up
+# `systemctl stop` and the unit's start timeout both arrive as SIGTERM to the whole control group.
+# The copy here never finishes: the shim writes a destination and then blocks, which is what the
+# vm8 run looked like from outside. Stopping it must leave nothing in the backup directory.
+C="$TMP/stopped"; make_case "$C"
+mkdir -p "$C/bin"
+cat > "$C/bin/sqlite3" <<'STUCK'
+#!/usr/bin/env bash
+case "$2" in
+    "VACUUM INTO"*) dest="$(printf '%s' "$2" | sed -nE "s/^VACUUM INTO '(.+)'$/\1/p")"
+              [ -n "$dest" ] || exit 97
+              head -c 4096 /dev/zero > "$dest"; : > "$dest-journal"
+              exec sleep 300 ;;
+    *) exit 1 ;;
+esac
+STUCK
+chmod +x "$C/bin/sqlite3"
+( cd "$C" && PATH="$C/bin:$PATH" exec setsid bash "$C/bk.sh" "$C/.ghost" ) > "$C/out.txt" 2>&1 &
+stuck_pid=$!
+appeared=0
+for _ in $(seq 1 100); do
+    if [ -n "$(find "$C/backups" -name '*.db' 2>/dev/null)" ]; then appeared=1; break; fi
+    sleep 0.1
+done
+# The whole process group, as systemd signals the whole control group.
+kill -TERM -- "-$stuck_pid" 2>/dev/null
+wait "$stuck_pid" 2>/dev/null; rc=$?
+left=$(find "$C/backups" -type f | wc -l)
+if [ "$appeared" -eq 1 ] && [ "$rc" -ne 0 ] && [ "$left" -eq 0 ]; then
+    ok "a stopped run removes its partial copy and its journal"
+else
+    bad "a run stopped mid-copy must leave nothing behind" "copy appeared before the stop: $appeared" \
+        "exit $rc" "files left: $left ($(find "$C/backups" -type f | sed 's|.*/||' | tr '\n' ' '))" "$(cat "$C/out.txt")"
+fi
+
+# ---------------------------------------------------------------- 3c. the copy cannot be restarted
+# The online backup API restarts whenever another connection commits, so against a busy pool
+# database it may never finish (#1009). Asserted on the script's text because the failure is a
+# race against a writer and a timing test of one would be a flaky test of the test machine.
+if /usr/bin/grep -qE "sqlite3 .*VACUUM INTO" "$SCRIPT" \
+   && ! /usr/bin/grep -vE '^[[:space:]]*#' "$SCRIPT" | /usr/bin/grep -qF '.backup'; then
+    ok "the copy is VACUUM INTO, and no .backup command remains"
+else
+    bad "the live database must be copied with VACUUM INTO, never .backup" \
+        "$(/usr/bin/grep -nF '.backup' "$SCRIPT" | /usr/bin/grep -vE '^[0-9]+:[[:space:]]*#')"
+fi
+
+# ---------------------------------------------------------------- 3d. one unreadable database
+# vm1-vm4 carry a `ghost-pay.db` that sqlite3 cannot open (it is encrypted). That used to abort the
+# run after `ghost.db` had been copied and BEFORE the prune, so those nodes would never prune. The
+# other database must still be backed up, the prune must still run, and the run must still fail
+# and name the one it could not copy.
+C="$TMP/oneunreadable"; make_case "$C"
+head -c 8192 /dev/urandom > "$C/.ghost/ghost-pay/ghost-pay.db"
+for i in $(seq 1 9); do
+    printf 'x' > "$C/backups/ghost-20250101000$i.db.gz"
+    touch -d "@$(( $(date +%s) - (100 + i) * 86400 ))" "$C/backups/ghost-20250101000$i.db.gz"
+done
+out="$(run_case "$C")"; rc=$?
+fresh=$(find "$C/backups" -name 'ghost-20*.db.gz' ! -name 'ghost-pay-*' -newermt '-1 hour' | wc -l)
+old_left=$(find "$C/backups" -name 'ghost-2025*.db.gz' | wc -l)
+pay=$(find "$C/backups" -name 'ghost-pay-*' | wc -l)
+case "$out" in
+    *"NOT backed up: ghost-pay.db"*) named=1 ;;
+    *) named=0 ;;
+esac
+if [ "$rc" -ne 0 ] && [ "$fresh" -eq 1 ] && [ "$old_left" -lt 9 ] && [ "$pay" -eq 0 ] && [ "$named" -eq 1 ]; then
+    ok "one unreadable database: the other is still backed up and pruned, and the run fails naming it"
+else
+    bad "an unreadable database must not stop the others or the prune, and must fail the run by name" \
+        "exit $rc (expect non-zero)" "fresh ghost.db backups: $fresh (expect 1)" \
+        "old copies left: $old_left of 9 (expect fewer — the prune must have run)" \
+        "ghost-pay files left: $pay (expect 0)" "named the failed database: $named" "$out"
 fi
 
 # ---------------------------------------------------------------- 4. running as root is refused
@@ -172,7 +262,7 @@ if /usr/bin/grep -qF 'refusing to run as root' "$SCRIPT" \
    && /usr/bin/grep -qE '\[ "\$\(id -u\)" -eq 0 \]' "$SCRIPT"; then
     # And the guard must come BEFORE any backup work, or it refuses after writing.
     guard_line=$(/usr/bin/grep -nE '\[ "\$\(id -u\)" -eq 0 \]' "$SCRIPT" | head -1 | cut -d: -f1)
-    work_line=$(/usr/bin/grep -nF 'backup_one "ghost.db"' "$SCRIPT" | head -1 | cut -d: -f1)
+    work_line=$(/usr/bin/grep -nF 'backup_isolated "ghost.db"' "$SCRIPT" | head -1 | cut -d: -f1)
     if [ "$guard_line" -lt "$work_line" ]; then
         ok "the root guard exists and precedes any backup work (line $guard_line before $work_line)"
     else
@@ -205,5 +295,6 @@ if [ "$fail" -gt 0 ]; then
     exit 1
 fi
 echo "test-backup-databases: all $pass check(s) pass — backs up and verifies before compressing,"
-echo "  refuses rather than filling the disk, rejects a truncated copy, refuses root, keeps the newest"
+echo "  refuses rather than filling the disk, rejects and removes a truncated or stopped copy,"
+echo "  refuses root, keeps the newest"
 exit 0
