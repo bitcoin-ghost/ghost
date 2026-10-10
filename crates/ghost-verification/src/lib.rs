@@ -62,6 +62,7 @@ pub mod pool_series;
 pub mod qualification;
 pub mod routes;
 pub mod server;
+pub mod single_flight;
 pub mod task;
 pub mod websocket;
 

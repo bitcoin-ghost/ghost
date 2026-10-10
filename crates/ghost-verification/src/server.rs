@@ -1466,6 +1466,10 @@ pub struct VerificationState {
     /// (a quiet window genuinely has no record), whereas an error must not be, or one transient
     /// failure would be served for the whole TTL.
     pub records_cache: RecordsCache,
+    /// Admits one `/api/v1/qualification/scoped-set` derivation at a time, off the async
+    /// workers. Deliberately NOT a TTL memo — see [`crate::single_flight`] for why a convergence
+    /// instrument must not answer from the past.
+    pub scoped_set_flight: crate::single_flight::SingleFlight<serde_json::Value>,
     /// Ghost Core RPC client (optional)
     pub rpc: Option<Arc<BitcoinRpc>>,
     /// A-2b block-hash oracle for the consensus challenger draw. Injected from
@@ -1885,6 +1889,7 @@ impl VerificationState {
             capabilities,
             start_time: Instant::now(),
             records_cache: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            scoped_set_flight: crate::single_flight::SingleFlight::default(),
             get_block_height: Box::new(|| 0),
             share_tier_bind_height: u64::MAX,
             share_pow_verify_height: u64::MAX,
