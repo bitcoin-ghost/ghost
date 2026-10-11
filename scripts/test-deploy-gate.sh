@@ -152,7 +152,7 @@ SHA="$(cd "$REPO_ROOT" && git rev-parse HEAD)"
 
 # Neither the clean-tree nor the on-main gate may be what we are measuring — if either fires,
 # every later assertion passes for the wrong reason.
-_probe="$(run_gate ghost-vm1 ghost-pool)"
+_probe="$(run_gate ghost-vm1 ghost-mining)"
 if grep -qiE "working tree is dirty|is not on origin/main" <<<"$_probe"; then
     echo "test harness bug: an earlier gate fires first, later assertions would be vacuous" >&2
     echo "  $(head -1 <<<"$_probe")" >&2
@@ -162,7 +162,7 @@ fi
 # ---------------------------------------------------------------------------
 # 1. No test record -> refuse. The most basic gate.
 # ---------------------------------------------------------------------------
-out="$(run_gate ghost-vm1 ghost-pool)"
+out="$(run_gate ghost-vm1 ghost-mining)"
 check "refuses with no passing test record" "no passing test record" "$out"
 
 # ---------------------------------------------------------------------------
@@ -175,11 +175,23 @@ out="$(run_gate ghost-vm1 translator_sv2)"
 check "refuses with no soak, naming the binary" "translator_sv2 @ .* has not soaked" "$out"
 
 # ---------------------------------------------------------------------------
+# 2b. The node binary's pre-rename name is still accepted, and means the SAME binary (#1018).
+#     What matters is that it is normalised before any record is looked up: soak and test
+#     records are named for the binary, so two spellings would be two sets of records, and a
+#     soak under one would not count for the other.
+# ---------------------------------------------------------------------------
+out="$(run_gate ghost-vm1 ghost-pool)"
+check "the pre-rename name is normalised before the soak lookup" "ghost-mining @ .* has not soaked" "$out"
+check "and says so" "ghost-pool is now ghost-mining" "$out"
+out="$(run_gate ghost-vm1 ghost-pol)"
+check "a name that is neither is still refused" "unknown binary 'ghost-pol'" "$out"
+
+# ---------------------------------------------------------------------------
 # 3. THE #459 CASE: a soak recorded for a DIFFERENT binary must not satisfy the
-#    gate for this one. Soaking ghost-pool alone used to green-light translator_sv2.
+#    gate for this one. Soaking ghost-mining alone used to green-light translator_sv2.
 # ---------------------------------------------------------------------------
 printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "deadbeef" \
-    > "$TMP/state/soaked-$SHA-ghost-vm5-ghost-pool"
+    > "$TMP/state/soaked-$SHA-ghost-vm5-ghost-mining"
 out="$(run_gate ghost-vm1 translator_sv2)"
 check "a soak of another binary does NOT satisfy this one" "translator_sv2 @ .* has not soaked" "$out"
 
@@ -289,7 +301,7 @@ fi
 # ---------------------------------------------------------------------------
 # 8. The share-webhook secret gate (3c), end to end.
 #
-#    Since #742 ghost-pool authenticates every share batch with an HMAC under the co-located
+#    Since #742 ghost-mining authenticates every share batch with an HMAC under the co-located
 #    pool_sv2's `[share_webhook] secret`, so the two must be brought up in one order: pool_sv2
 #    configured and restarted FIRST. Backwards, pool_sv2 gets a 401 — which it treats as
 #    PERMANENT, on purpose, because retrying cannot fix a credential — and drops the batch.
@@ -306,34 +318,34 @@ GOOD_CONF=$'[share_webhook]\nurl = "http://127.0.0.1:8080/api/internal/shares"\n
 # with url/batch_size/timeout/retries and no `secret` at all. This is the case that matters.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" \
       STUB_CONF=$'[share_webhook]\nurl = "http://127.0.0.1:8080/api/internal/shares"\nbatch_size = 1\nmax_retries = 3\n[template_provider_type.Sv2Tp]\naddress = "127.0.0.1:8442"\n' \
-      run_gate ghost-vm5 ghost-pool)"
-check "refuses ghost-pool when [share_webhook] has no secret" "cannot sign share batches" "$out"
+      run_gate ghost-vm5 ghost-mining)"
+check "refuses ghost-mining when [share_webhook] has no secret" "cannot sign share batches" "$out"
 
 # `grep -q secret` over the whole file would match `internal_api_secret` in [network], a
 # commented-out line, and `secret = \"\"`. All three are the shape this gate exists to refuse.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" \
       STUB_CONF=$'[network]\ninternal_api_secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"\n[share_webhook]\nurl = "u"\n# secret = "deadbeef"\n' \
-      run_gate ghost-vm5 ghost-pool)"
+      run_gate ghost-vm5 ghost-mining)"
 check "a secret in ANOTHER section, and a commented-out one, do not satisfy it" \
     "cannot sign share batches" "$out"
 
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF=$'[share_webhook]\nsecret = ""\n' \
-      run_gate ghost-vm5 ghost-pool)"
+      run_gate ghost-vm5 ghost-mining)"
 check "an empty secret is refused" "is empty" "$out"
 
 # config/sri/pool-config.toml and install-node.sh both ship this key as a shell placeholder.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF=$'[share_webhook]\nsecret = "${APISECRET}"\n' \
-      run_gate ghost-vm5 ghost-pool)"
+      run_gate ghost-vm5 ghost-mining)"
 check "an unexpanded install placeholder is refused" "unexpanded install placeholder" "$out"
 
 # FAIL CLOSED. A config that could not be read is not evidence that the secret is there, and the
 # cost of assuming it is is total, silent share loss.
-out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-pool)"
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-mining)"
 check "an unreadable config refuses rather than assuming the best" "could not be read" "$out"
 
 # The gate must PERMIT. Reaching "not built" means it cleared 3c and went on to the deploy stage.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
-      STUB_MTIME=1787036059 STUB_START=1787036059 run_gate ghost-vm5 ghost-pool)"
+      STUB_MTIME=1787036059 STUB_START=1787036059 run_gate ghost-vm5 ghost-mining)"
 check_absent "a node with a usable secret is NOT refused" "cannot sign share batches|was edited AFTER" "$out"
 check "a node with a usable secret proceeds to the deploy stage" "not built" "$out"
 
@@ -341,12 +353,12 @@ check "a node with a usable secret proceeds to the deploy stage" "not built" "$o
 # start, so in the healthy case its mtime always lands just before ActiveEnterTimestamp (measured
 # equal to the second on ghost-vm1 and ghost-vm5). An mtime AFTER it means nobody restarted.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
-      STUB_MTIME=1787036999 STUB_START=1787036059 run_gate ghost-vm5 ghost-pool)"
+      STUB_MTIME=1787036999 STUB_START=1787036059 run_gate ghost-vm5 ghost-mining)"
 check "a secret written but not loaded is refused, naming the restart" "was edited AFTER sri-pool last started" "$out"
 
 # Unreadable stamps are not evidence of staleness, and must not block a deploy on a measurement
 # that was never taken — but the gap must be STATED, not assumed away.
-out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" run_gate ghost-vm5 ghost-pool)"
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" run_gate ghost-vm5 ghost-mining)"
 check_absent "unreadable stamps do not block" "was edited AFTER" "$out"
 check "unreadable stamps are reported as unverified, not as satisfied" "is unverified" "$out"
 
@@ -367,7 +379,7 @@ done
 # Measured 2026-08-23: all eight nodes were in exactly that state and the gate said yes.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
       STUB_MTIME=1787036059 STUB_START=1787036059 \
-      STUB_SIGN_HITS=0 STUB_SIGN_CTRL=3 run_gate ghost-vm5 ghost-pool)"
+      STUB_SIGN_HITS=0 STUB_SIGN_CTRL=3 run_gate ghost-vm5 ghost-mining)"
 check "a pre-#742 pool_sv2 binary is refused despite a perfect config" "predates #742" "$out"
 check "the refusal names the remedy in the right order" "deploy-node.sh ghost-vm5 pool_sv2" "$out"
 
@@ -376,27 +388,27 @@ check "the refusal names the remedy in the right order" "deploy-node.sh ghost-vm
 # so a zero CONTROL must read as "the check did not run", never as a verdict about signing.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
       STUB_MTIME=1787036059 STUB_START=1787036059 \
-      STUB_SIGN_HITS=0 STUB_SIGN_CTRL=0 run_gate ghost-vm5 ghost-pool)"
+      STUB_SIGN_HITS=0 STUB_SIGN_CTRL=0 run_gate ghost-vm5 ghost-mining)"
 check "a zero control is a PROBE failure, not a signing verdict" "signing probe did not run" "$out"
 check_absent "a failed probe does not claim the binary predates #742" "predates #742" "$out"
 
 # An ssh that returns nothing at all is the same class of non-answer.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
       STUB_MTIME=1787036059 STUB_START=1787036059 \
-      STUB_SIGN_HITS= STUB_SIGN_CTRL= run_gate ghost-vm5 ghost-pool)"
+      STUB_SIGN_HITS= STUB_SIGN_CTRL= run_gate ghost-vm5 ghost-mining)"
 check "an empty probe refuses rather than assuming" "signing probe did not run" "$out"
 
 # And the mirror: a signing binary must be PERMITTED, or the gate is just a wall.
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" \
       STUB_MTIME=1787036059 STUB_START=1787036059 \
-      STUB_SIGN_HITS=1 STUB_SIGN_CTRL=3 run_gate ghost-vm5 ghost-pool)"
+      STUB_SIGN_HITS=1 STUB_SIGN_CTRL=3 run_gate ghost-vm5 ghost-mining)"
 check_absent "a signing pool_sv2 is not refused" "predates #742|signing probe did not run" "$out"
 check "a signing pool_sv2 is reported as carrying the code" "carries the share-batch signing code" "$out"
 
-# The escape hatch, which exists for exactly one thing: rolling back to a ghost-pool that
+# The escape hatch, which exists for exactly one thing: rolling back to a ghost-mining that
 # predates #742. It must work, and it must be impossible to miss in a transcript.
 out="$(GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 GHOST_DEPLOY_SSH="$SSH_STUB_BIN" \
-      STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-pool)"
+      STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-mining)"
 check_absent "the override skips the gate" "cannot sign share batches" "$out"
 check "the override announces itself loudly" "GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1" "$out"
 check "the override says what it is for" "predates #742" "$out"
@@ -620,16 +632,16 @@ prune_case() {  # label keep_from n_files want_remaining
     local d; d="$(mktemp -d)"
     local i
     for i in $(seq 1 "$n"); do
-        : > "$d/ghost-pool.bak.2026090100000$i"
-        touch -d "2026-09-01 00:00:0$i" "$d/ghost-pool.bak.2026090100000$i"
+        : > "$d/ghost-mining.bak.2026090100000$i"
+        touch -d "2026-09-01 00:00:0$i" "$d/ghost-mining.bak.2026090100000$i"
     done
     # the exact pipeline the deploy script sends
-    ls -1t "$d"/ghost-pool.bak.* 2>/dev/null | tail -n +"$keep_from" | while IFS= read -r f; do
+    ls -1t "$d"/ghost-mining.bak.* 2>/dev/null | tail -n +"$keep_from" | while IFS= read -r f; do
         rm -f -- "$f"
     done
-    local got; got=$(ls -1 "$d"/ghost-pool.bak.* 2>/dev/null | wc -l | tr -d ' ')
+    local got; got=$(ls -1 "$d"/ghost-mining.bak.* 2>/dev/null | wc -l | tr -d ' ')
     local newest_kept="no"
-    [ -e "$d/ghost-pool.bak.2026090100000$n" ] && newest_kept="yes"
+    [ -e "$d/ghost-mining.bak.2026090100000$n" ] && newest_kept="yes"
     rm -rf "$d"
     if [ "$got" = "$want" ]; then
         printf "  [ok ] %s (kept %s, newest survived: %s)\n" "$label" "$got" "$newest_kept"
@@ -671,4 +683,4 @@ if [ "$fail" -ne 0 ]; then
     echo "*** $fail of $((pass+fail)) deploy-gate checks FAILED — the gate is not refusing what it must ***"
     exit 1
 fi
-echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks; refuses ghost-pool on a node whose pool_sv2 cannot sign share batches, while leaving pool_sv2 and translator_sv2 free to fix it; and rolls back a deploy that stops crediting work; and prunes stale backups to N while never deleting the newest (#585)."
+echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks; refuses ghost-mining on a node whose pool_sv2 cannot sign share batches, while leaving pool_sv2 and translator_sv2 free to fix it; and rolls back a deploy that stops crediting work; and prunes stale backups to N while never deleting the newest (#585)."

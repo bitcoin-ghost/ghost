@@ -10,35 +10,40 @@
 #     share attribution.                                         -> requires canary soak
 #   * "It compiled" was treated as "it works".                   -> requires tests + smoke
 #   * Recovery was manual and improvised each time.              -> backup + auto-rollback
-#   * ghost-pool was deployed to a node whose pool_sv2 could not yet SIGN share batches,
+#   * ghost-mining was deployed to a node whose pool_sv2 could not yet SIGN share batches,
 #     so every batch 401'd and was destroyed rather than retried.  -> requires a webhook secret
 #
 # Usage:
 #   scripts/deploy-node.sh <node> <binary> [--canary]
 #
 #   <node>    ssh alias, e.g. ghost-vm5
-#   <binary>  one of: ghost-pool | pool_sv2 | translator_sv2
+#   <binary>  one of: ghost-mining | pool_sv2 | translator_sv2
 #   --canary  target is a canary node; relaxes the soak requirement but NOT the clean-tree
 #             or test requirements. ⛔ A canary is NOT free to restart: all eight nodes are
 #             in the mining DNS and canaries do carry miners (see CANARY_NODES below).
 #
-# Exit codes: 0 ok, 1 precondition failed, 2 deploy failed, 3 smoke failed (rolled back).
+# Exit codes: 0 ok, 1 precondition failed, 2 deploy failed, 3 smoke failed (rolled back),
+#             4 deployed and verified, but the node's unit rename was left incomplete (#1018).
+#
+# `ghost-mining` was `ghost-pool` until #1018, and the old name is still accepted here. The FIRST
+# ghost-mining deploy to a node that has not been renamed renames it — unit, drop-ins, binary —
+# inside this script's one restart, via scripts/ops/rename-node-unit.sh.
 #
 # Environment escape hatch:
 #
 #   GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1
-#       Skips the share-webhook secret precondition (gate 3c) for `ghost-pool` ONLY. It exists
-#       for exactly one situation: ROLLING BACK to a ghost-pool build that predates #742 and
+#       Skips the share-webhook secret precondition (gate 3c) for `ghost-mining` ONLY. It exists
+#       for exactly one situation: ROLLING BACK to a ghost-mining build that predates #742 and
 #       therefore does not require a signature. Anything newer will 401 and destroy shares, so
 #       do not reach for this to "get the deploy through". It prints a banner every time.
 #
 # A CALLER LOOPING OVER BINARIES MUST STOP ON ANY NON-ZERO EXIT. These three binaries talk
 # to each other and are not independently deployable. Rolling v1.11.18 to vm8, pool_sv2
 # failed its smoke test and rolled back correctly — but the surrounding `for` loop carried
-# on to translator_sv2, leaving the node on new ghost-pool + new translator + OLD pool_sv2.
+# on to translator_sv2, leaving the node on new ghost-mining + new translator + OLD pool_sv2.
 # A combination nobody chose, that happened to work. Write:
 #
-#   for b in ghost-pool pool_sv2 translator_sv2; do
+#   for b in ghost-mining pool_sv2 translator_sv2; do
 #       scripts/deploy-node.sh "$NODE" "$b" || break     # <- the `|| break` is not optional
 #   done
 #
@@ -91,8 +96,14 @@ die()  { echo "REFUSED: $*" >&2; exit 1; }
 info() { echo "  $*"; }
 
 [ -n "$NODE" ] && [ -n "$BINARY" ] || die "usage: deploy-node.sh <node> <binary> [--canary]"
+# Normalised BEFORE anything keys on it. The soak and test records are named for the binary, so
+# carrying both spellings through would let a soak recorded under one fail to satisfy the other.
+if [ "$BINARY" = "ghost-pool" ]; then
+    info "note: ghost-pool is now ghost-mining (#1018) — deploying ghost-mining"
+    BINARY=ghost-mining
+fi
 case "$BINARY" in
-  ghost-pool|pool_sv2|translator_sv2) ;;
+  ghost-mining|pool_sv2|translator_sv2) ;;
   *) die "unknown binary '$BINARY'" ;;
 esac
 
@@ -111,16 +122,24 @@ esac
 # Every binary shipped today is on the share path. The distinction is kept because the day it
 # stops being true is the day both gates above start lying, quietly.
 case "$BINARY" in
-  ghost-pool|pool_sv2|translator_sv2) SHARE_PATH_BINARY=yes ;;
+  ghost-mining|pool_sv2|translator_sv2) SHARE_PATH_BINARY=yes ;;
   *)                                  SHARE_PATH_BINARY=no  ;;
 esac
 
 # The systemd unit each binary runs as. Declared HERE rather than just before the restart,
 # because the soak gate below needs it to ask a canary whether it carries this binary at all.
 case "$BINARY" in
-  ghost-pool)      SERVICE=ghost-pool ;;
+  ghost-mining)    SERVICE=ghost-mining ;;
   pool_sv2)        SERVICE=sri-pool ;;
   translator_sv2)  SERVICE=sri-translator ;;
+esac
+
+# What this binary was called on a node that predates a rename, or empty. On such a node the
+# running build is at the OLD path, so that is what has to be backed up and what a rollback has
+# to be able to restore. Only ghost-mining has one (#1018).
+case "$BINARY" in
+  ghost-mining)    LEGACY_BINARY=ghost-pool ;;
+  *)               LEGACY_BINARY="" ;;
 esac
 
 # Binaries that NO canary node carries.
@@ -183,7 +202,7 @@ MARKER="$STATE_DIR/tested-$SHA"
 #     revert (or anything else) has moved them, the built binary no longer represents main.
 if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
     case "$BINARY" in
-        ghost-pool)      SRC_PATHS="bins/ghost-pool crates" ;;
+        ghost-mining)    SRC_PATHS="bins/ghost-pool crates" ;;
         pool_sv2)        SRC_PATHS="bins/pool-sv2 crates" ;;
         translator_sv2)  SRC_PATHS="bins/translator-sv2 crates" ;;
         *)               SRC_PATHS="" ;;
@@ -215,7 +234,7 @@ fi
 # Returns 0 if the submission path answered correctly.
 # Poll a TCP port until it accepts, or give up. Uses bash's /dev/tcp so it needs no `nc`.
 #
-# Polling beats sleeping: the dependency chain here is ghost-pool -> pool_sv2 resolving its node
+# Polling beats sleeping: the dependency chain here is ghost-mining -> pool_sv2 resolving its node
 # identity -> :34255 -> translator -> :3333, and only the last link is what the smoke test needs.
 # A fixed sleep is either too short on a slow node or wasted on a fast one.
 wait_for_tcp() {
@@ -245,7 +264,7 @@ exercise_submission_path() {
     host=$(ssh_host_for "$node") || return 1
     [ -n "$host" ] || return 1
 
-    # ⚠ Restarting ghost-pool makes pool_sv2 re-resolve its identity, and until it does it exits
+    # ⚠ Restarting ghost-mining makes pool_sv2 re-resolve its identity, and until it does it exits
     # with "share_tier_binding is configured but this node's identity could not ...". Measured on
     # ghost-vm6 during the v1.11.28 roll: 9 restarts and ~60s before :34255 bound, during which
     # the translator crash-looped on "All upstreams failed" and :3333 was CLOSED.
@@ -308,7 +327,7 @@ local_shares_since() {
 #   loglines - total sri-pool journal lines in the window. POSITIVE CONTROL: zero means the probe
 #              itself did not work (no sudo, journald rotated, ssh trouble), which is a different
 #              thing from "nothing happened" and must never be read as evidence.
-#   batches  - "Share batch sent successfully": pool_sv2 POSTed a batch and ghost-pool ACCEPTED the
+#   batches  - "Share batch sent successfully": pool_sv2 POSTed a batch and ghost-mining ACCEPTED the
 #              POST. Work provably crossed the boundary.
 #   submits  - "SubmitShares": work provably ARRIVED at pool_sv2 from a miner.
 #
@@ -338,7 +357,7 @@ webhook_activity_since() {
 # non-loopback stratum connections — the gate would have rolled back a deploy to it for nothing.
 #
 # `webhook_activity_since` now carries that decision, because it counts the EVENT (work arriving at
-# pool_sv2, batches crossing to ghost-pool) rather than a socket that might carry one.
+# pool_sv2, batches crossing to ghost-mining) rather than a socket that might carry one.
 miner_connections() {
     local out
     out=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
@@ -497,7 +516,7 @@ webhook_secret_verdict() {
         # config/sri/pool-config.toml and scripts/install-node.sh both ship this key as a shell
         # placeholder (`${INTERNAL_API_SECRET}`, `${APISECRET}`) to be substituted at install
         # time. A config where the substitution never happened has a non-empty `secret` that
-        # cannot possibly match ghost-pool's, which is the 401 case wearing a passing shape.
+        # cannot possibly match ghost-mining's, which is the 401 case wearing a passing shape.
         *'$'*) echo "'secret' under [share_webhook] is an unexpanded install placeholder"; return 1 ;;
     esac
     return 0
@@ -523,12 +542,12 @@ webhook_config_is_stale() {
     return 0
 }
 
-# 3c. ghost-pool may not be deployed to a node whose pool_sv2 cannot SIGN share batches.
+# 3c. ghost-mining may not be deployed to a node whose pool_sv2 cannot SIGN share batches.
 #
-#     Since #742 ghost-pool authenticates POST /api/internal/shares with an HMAC-SHA256 over
+#     Since #742 ghost-mining authenticates POST /api/internal/shares with an HMAC-SHA256 over
 #     `timestamp || body` under the co-located pool_sv2's `[share_webhook] secret`. So the two
 #     sides must be brought up in one order and one order only: pool_sv2 configured and
-#     RESTARTED first, ghost-pool second.
+#     RESTARTED first, ghost-mining second.
 #
 #     Backwards, the node does not merely lag. pool_sv2 treats a 401 as PERMANENT — deliberately,
 #     because retrying cannot fix a credential — so it drops the batch and forgets its skeletons
@@ -537,13 +556,13 @@ webhook_config_is_stale() {
 #     Nothing downstream objects: the unit is active, :8442 listens, /health answers, and the
 #     post-deploy throughput check below reads the node as simply having no traffic.
 #
-#     Only `ghost-pool` is gated. `pool_sv2` is how the secret reaches the node in the first
+#     Only `ghost-mining` is gated. `pool_sv2` is how the secret reaches the node in the first
 #     place, and `translator_sv2` never touches this path — gating either would deadlock the
 #     remedy this message prints.
 #
 #     Fails CLOSED. A config that cannot be read is not evidence that the secret is there, and
 #     the cost of assuming it is is total, silent share loss.
-if [ "$BINARY" = "ghost-pool" ]; then
+if [ "$BINARY" = "ghost-mining" ]; then
   if [ "${GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK:-}" = "1" ]; then
     echo "  ###############################################################################" >&2
     echo "  #  GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 — the share-webhook secret gate is" >&2
@@ -566,19 +585,19 @@ if [ "$BINARY" = "ghost-pool" ]; then
         die "pool_sv2 on $NODE cannot sign share batches — $WEBHOOK_WHY
        ($POOL_SV2_CONF)
 
-       ghost-pool has required an HMAC on every share batch since #742, and pool_sv2
-       treats a 401 as PERMANENT rather than retrying it. Deploying ghost-pool to this
+       ghost-mining has required an HMAC on every share batch since #742, and pool_sv2
+       treats a 401 as PERMANENT rather than retrying it. Deploying ghost-mining to this
        node now would make every batch it produces 401 and be DISCARDED. The mis-ordered
        window does not delay shares, it destroys them.
 
        Do this, in this order:
          1. set 'secret' under [share_webhook] in $POOL_SV2_CONF on $NODE to
-            ghost-pool's [network] internal_api_secret from /etc/ghost/pool.toml,
+            ghost-mining's [network] internal_api_secret from /etc/ghost/pool.toml,
             byte-for-byte (64 hex characters)
          2. scripts/deploy-node.sh $NODE pool_sv2      <- deliberately NOT gated on this
          3. re-run this command
 
-       Rolling BACK to a ghost-pool that predates #742 is the one case where this gate is
+       Rolling BACK to a ghost-mining that predates #742 is the one case where this gate is
        wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
     fi
 
@@ -625,14 +644,14 @@ S=\$(command -v sudo >/dev/null && echo sudo || echo)
        ($POOL_SV2_BIN carries no X-Ghost-Signature; the control matched $SIGN_CTRL times)
 
        The config is correct, but signing ships in the BINARY, not the config. Deploying
-       ghost-pool here now would make every batch this node's own pool_sv2 submits 401 — and
+       ghost-mining here now would make every batch this node's own pool_sv2 submits 401 — and
        pool_sv2 treats a 401 as PERMANENT, so those shares are DESTROYED, not delayed.
 
        Do this, in this order:
          1. scripts/deploy-node.sh $NODE pool_sv2      <- deliberately NOT gated on this
          2. re-run this command
 
-       Rolling BACK to a ghost-pool that predates #742 is the one case where this gate is
+       Rolling BACK to a ghost-mining that predates #742 is the one case where this gate is
        wrong. Set GHOST_DEPLOY_ALLOW_UNSIGNED_WEBHOOK=1 for that, and nothing else."
     fi
 
@@ -671,7 +690,7 @@ fi
 #    until a share was actually mined and its DB row inspected.
 #
 #    The marker is per-BINARY as well as per-commit. It used to be per-commit-per-node only,
-#    which meant soaking `ghost-pool` alone on a canary satisfied this gate for
+#    which meant soaking `ghost-mining` alone on a canary satisfied this gate for
 #    `translator_sv2` — a binary that had then never run on any canary (#459).
 #
 #    It also records the deployed binary's hash ON THE NODE. A soak asserts "this build ran
@@ -840,7 +859,7 @@ info "deploying $BINARY @ $SHORT to $NODE"
 # ConnectTimeout only bounds ESTABLISHING the connection. A session that stalls
 # mid-transfer hangs forever. That happened rolling v1.11.18 to vm3: the copy stopped
 # at 7,733,248 of 24,974,600 bytes and sat there — no progress, no error, no exit,
-# leaving the node with a new ghost-pool against an old pool_sv2 and nothing saying so.
+# leaving the node with a new ghost-mining against an old pool_sv2 and nothing saying so.
 #
 # ServerAliveInterval makes a dead peer detectable; the hard `timeout` bounds the rest.
 
@@ -891,7 +910,7 @@ fi
 # ⚠ The parse check runs the STAGED binary, not the installed one. Asking the old binary whether
 # the file is acceptable answers the wrong question: what matters is whether the node comes back
 # after the swap, and that is the new binary's opinion.
-if [ "$BINARY" = "ghost-pool" ]; then
+if [ "$BINARY" = "ghost-mining" ]; then
     info "config gate: checking /etc/ghost/pool.toml against the INCOMING $BINARY"
     cfg_out="$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
         S=$SUDO
@@ -1004,7 +1023,7 @@ fi
 # is no second copy to keep in step (check-inlined-copies.sh).
 #
 # ⚠ Deliberately BEFORE the swap, and it reconciles ownership too — chowning the whole set to
-# root would break ghost-pool, so the script carries a per-file owner table rather than one rule.
+# root would break ghost-mining, so the script carries a per-file owner table rather than one rule.
 HARDEN_SRC="$REPO_ROOT/scripts/ops/harden-secret-configs.sh"
 if [ -r "$HARDEN_SRC" ]; then
     harden_out="$(timeout 60 ssh "${SSH_OPTS[@]}" "$NODE" 'bash -s' < "$HARDEN_SRC" 2>&1)"; harden_rc=$?
@@ -1048,14 +1067,14 @@ fi
 # or refuse. Refusing is the point — "deploy anyway and hope" is what made the seven-week gap
 # invisible.
 #
-# ⚠ Only ghost-pool runs migrations; other binaries skip this entirely.
+# ⚠ Only ghost-mining runs migrations; other binaries skip this entirely.
 # ⚠ `VACUUM INTO`, not `cp`: a copy of a live WAL database is not a consistent database, and it
 #   would look fine right up until something read it.
 #
 # The DECISION lives in scripts/lib/migration-backup-gate.sh so the refusals can be driven directly
 # by scripts/test-migration-backup-gate.sh. Reaching this line inside this script means satisfying
 # every earlier precondition first, which makes the bad cases untestable from out here.
-if [ "$BINARY" = "ghost-pool" ]; then
+if [ "$BINARY" = "ghost-mining" ]; then
     # shellcheck source=scripts/lib/migration-backup-gate.sh
     . "$REPO_ROOT/scripts/lib/migration-backup-gate.sh"
 
@@ -1081,7 +1100,7 @@ echo AVKB \$(df -Pk /var | awk 'NR==2{print \$4}')
     MIG_VERDICT="$(migration_backup_verdict "${WANT_SCHEMA:-}" "$MIG_PROBE")" || {
         die "pre-migration backup gate REFUSED on $NODE: $MIG_VERDICT
 
-Refusing to deploy ghost-pool when it cannot be established whether the binary migrates the schema,
+Refusing to deploy ghost-mining when it cannot be established whether the binary migrates the schema,
 or when there is no room for a copy. Restoring the binary does not restore the schema.
   SCHEMA_VERSION in this tree: ${WANT_SCHEMA:-<unreadable>}
   probe output:
@@ -1119,10 +1138,22 @@ $(printf '%s\n' "$BK_OUT" | sed 's/^/        /')"
 fi
 
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
+#
+# ⚠ The backup is taken from wherever the RUNNING build is. On a node not yet renamed (#1018)
+# that is the legacy path, and the incoming build is installed beside it under the new name —
+# the old process keeps its file until the unit switch below stops it. Decided by "is the legacy
+# name a real file", not "does the new name exist": an earlier deploy that died between this
+# step and the switch leaves a new-named file behind, and backing THAT up would save the build
+# that never ran in place of the one that is serving.
 timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
 set -e
 S=$SUDO
-\$S cp /opt/ghost/bin/$BINARY /opt/ghost/bin/$BINARY.bak.$TS
+LIVE=/opt/ghost/bin/$BINARY
+LEGACY='$LEGACY_BINARY'
+if [ -n \"\$LEGACY\" ] && [ -f \"/opt/ghost/bin/\$LEGACY\" ] && [ ! -L \"/opt/ghost/bin/\$LEGACY\" ]; then
+    LIVE=/opt/ghost/bin/\$LEGACY
+fi
+\$S cp \$LIVE /opt/ghost/bin/$BINARY.bak.$TS
 \$S cp /tmp/$BINARY.new /opt/ghost/bin/$BINARY.staged
 \$S chmod 755 /opt/ghost/bin/$BINARY.staged
 \$S mv /opt/ghost/bin/$BINARY.staged /opt/ghost/bin/$BINARY
@@ -1134,7 +1165,55 @@ S=$SUDO
 " || exit 2
 
 SWAP_EPOCH=$(date +%s)
-timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
+RENAME_INCOMPLETE=""
+if [ "$BINARY" = "ghost-mining" ]; then
+    # The restart, and on a node that has not been renamed, the rename (#1018) — in the same
+    # stop/start, because these nodes carry miners and a restart is never free.
+    #
+    # Piped rather than installed, so there is no second copy to keep in step. The script
+    # reports one of three verdicts on its last line; they share an exit code and need different
+    # handling, so the VERDICT is read, never the exit status.
+    #
+    # 300s, not $REMOTE_TIMEOUT: the unit's stop alone may take systemd's full 90s, and a
+    # client that gives up mid-switch is the one way to interrupt it between the stop and the start.
+    RENAME_OUT="$(timeout 300 ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S bash -s" \
+                    < "$REPO_ROOT/scripts/ops/rename-node-unit.sh" 2>&1)" || true
+    printf '%s\n' "$RENAME_OUT" | /usr/bin/grep -v '^RENAME_' | sed 's/^/      /' || true
+    RENAME_VERDICT="$(printf '%s\n' "$RENAME_OUT" | /usr/bin/grep '^RENAME_' | tail -1 || true)"
+    case "$RENAME_VERDICT" in
+        "RENAME_OK flipped=yes "*)
+            info "$NODE renamed: ghost-pool.service -> ghost-mining.service, started in this restart" ;;
+        "RENAME_PARTIAL flipped=yes "*)
+            info "WARN: $NODE is serving under ghost-mining, but the rename's tidy-up is INCOMPLETE (above)"
+            RENAME_INCOMPLETE=1 ;;
+        "RENAME_OK flipped=no "*|"RENAME_PARTIAL flipped=no "*)
+            # Already renamed, so the script restarted nothing. The restart is still owed.
+            case "$RENAME_VERDICT" in RENAME_PARTIAL*)
+                info "WARN: $NODE was already renamed, but something is still under the old name (above)"
+                RENAME_INCOMPLETE=1 ;;
+            esac
+            timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2 ;;
+        "RENAME_UNDONE "*)
+            # The renamed unit did not come up and the node was put back: old unit, old drop-ins,
+            # old binary under the old name. The incoming build is still sitting under the new
+            # name, unused — remove it, or the next run's backup step has two candidates.
+            timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO
+                [ -f /opt/ghost/bin/$LEGACY_BINARY ] && [ ! -L /opt/ghost/bin/$LEGACY_BINARY ] && \$S rm -f /opt/ghost/bin/$BINARY" 2>/dev/null || true
+            echo "DEPLOY FAILED: $NODE did not come up as ghost-mining, and the unit rename was UNDONE." >&2
+            echo "  It is back on its PREVIOUS build under ghost-pool.service ($RENAME_VERDICT)." >&2
+            echo "  The backup $BINARY.bak.$TS is that same previous build. Nothing was soaked." >&2
+            exit 2 ;;
+        *)
+            echo "DEPLOY FAILED: the unit rename on $NODE gave no verdict — its state is UNKNOWN." >&2
+            echo "  The incoming build is installed as /opt/ghost/bin/$BINARY; whether anything was" >&2
+            echo "  restarted is not established. Check before re-running:" >&2
+            echo "    ssh $NODE 'systemctl is-active ghost-mining ghost-pool; ls -la /opt/ghost/bin | grep -E \"ghost-(pool|mining)\"'" >&2
+            echo "    ssh $NODE 'sudo bash -s -- --check' < scripts/ops/rename-node-unit.sh" >&2
+            exit 2 ;;
+    esac
+else
+    timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
+fi
 
 # Wait for the service to be SERVING, not merely started.
 #
@@ -1151,7 +1230,7 @@ timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl r
 #
 # So wait on the port the service is supposed to answer on.
 case "$BINARY" in
-  ghost-pool)      READY_PORT=8442 ;;   # TDP, what pool_sv2 connects to
+  ghost-mining)    READY_PORT=8442 ;;   # TDP, what pool_sv2 connects to
   pool_sv2)        READY_PORT=34255 ;;  # SV2, what the translator connects to
   translator_sv2)  READY_PORT=3333 ;;   # SV1, what miners connect to
 esac
@@ -1202,7 +1281,7 @@ if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "no" ]; then
     fi
 fi
 
-if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "yes" ] && [ "$BINARY" != "ghost-pool" ]; then
+if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "yes" ] && [ "$BINARY" != "ghost-mining" ]; then
     IP=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "hostname -I | awk '{print \$1}'")
     # Retry rather than judge on one attempt. A listening port means the process is accepting,
     # not that the whole SV1 -> SV2 -> TDP chain has settled — the translator can be listening
@@ -1225,16 +1304,16 @@ fi
 # Did work start being CREDITED again?
 #
 # This is the check the H-13 outage walked straight through, and it applies to all three binaries
-# — every one of them sits on the share path. `ghost-pool` in particular had no functional
+# — every one of them sits on the share path. `ghost-mining` in particular had no functional
 # verification at all before this: the smoke test above is explicitly skipped for it, so a
-# ghost-pool deploy was judged solely on "unit active" and "port listening", neither of which
+# ghost-mining deploy was judged solely on "unit active" and "port listening", neither of which
 # moves when shares are accepted and then thrown away.
 #
 # Only gates when the baseline proved there was traffic to lose. A node with no miners cannot
 # fail this, and must not be able to pass it either — silence there means "not measured", which
 # is stated rather than assumed.
 #
-# The settle delay is not politeness. ghost-pool bypasses its own PoW height gate while
+# The settle delay is not politeness. ghost-mining bypasses its own PoW height gate while
 # `current_height` is still 0, for roughly 90s after every restart, so a sample taken inside that
 # window can show shares flowing through a check that is not yet running. 180s clears it.
 if [ -z "${ROLLBACK:-}" ] && [ "$SHARE_PATH_BINARY" = "yes" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
@@ -1349,14 +1428,19 @@ fi
 #
 # Deliberately AFTER the soak record and the smoke test, and best-effort: this must never be what
 # fails a deploy that otherwise succeeded.
+#
+# Backups made under a binary's pre-rename name are the same series and are pruned with it —
+# otherwise the two newest `ghost-pool.bak.*` on every node would outlive the name for ever.
 PRUNE_KEEP=2
 PRUNE_FROM=$((PRUNE_KEEP + 1))
+PRUNE_GLOBS="/opt/ghost/bin/$BINARY.bak.*"
+[ -z "$LEGACY_BINARY" ] || PRUNE_GLOBS="$PRUNE_GLOBS /opt/ghost/bin/$LEGACY_BINARY.bak.*"
 if PRUNE_OUT=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
 S=$SUDO
-ls -1t /opt/ghost/bin/$BINARY.bak.* 2>/dev/null | tail -n +$PRUNE_FROM | while IFS= read -r f; do
+ls -1t $PRUNE_GLOBS 2>/dev/null | tail -n +$PRUNE_FROM | while IFS= read -r f; do
     \$S rm -f -- \"\$f\"
 done
-ls -1 /opt/ghost/bin/$BINARY.bak.* 2>/dev/null | wc -l
+ls -1 $PRUNE_GLOBS 2>/dev/null | wc -l
 " 2>&1); then
     info "pruned old backups: $BINARY.bak.* now $(printf '%s' "$PRUNE_OUT" | tail -1) file(s) on $NODE (keeping $PRUNE_KEEP)"
 else
@@ -1373,7 +1457,7 @@ info "OK: $BINARY @ $SHORT live on $NODE (backup: $BINARY.bak.$TS)"
 # Best-effort and never fatal: deploying a deliberately older commit is legitimate, and a currency
 # report must not be what fails a deploy that passed its smoke test. It is also binary-only — the
 # unit comparison needs four ssh round-trips per node and belongs in the end-of-roll sweep.
-if [ "$BINARY" = "ghost-pool" ] && [ -x "$REPO_ROOT/scripts/ops/check-fleet-is-current.sh" ]; then
+if [ "$BINARY" = "ghost-mining" ] && [ -x "$REPO_ROOT/scripts/ops/check-fleet-is-current.sh" ]; then
     if CURRENT_OUT=$("$REPO_ROOT/scripts/ops/check-fleet-is-current.sh" --binary-only "$NODE" 2>&1); then
         info "$NODE is at origin/main's tip"
     else
@@ -1387,4 +1471,12 @@ if [ "$BINARY" = "ghost-pool" ] && [ -x "$REPO_ROOT/scripts/ops/check-fleet-is-c
     info "the ROLL is not finished until scripts/ops/check-fleet-is-current.sh (no --binary-only,"
     info "  no node arguments) exits 0 — that is the only check that compares units, which"
     info "  deploy-node.sh does not swap"
+fi
+
+if [ -n "$RENAME_INCOMPLETE" ]; then
+    echo "DEPLOYED, BUT THE RENAME IS INCOMPLETE on $NODE (#1018)." >&2
+    echo "  $BINARY @ $SHORT is live and passed every check above. What is left is listed by:" >&2
+    echo "    ssh $NODE 'sudo bash -s -- --check' < scripts/ops/rename-node-unit.sh" >&2
+    echo "  Re-running that script without --check finishes it and restarts nothing." >&2
+    exit 4
 fi
