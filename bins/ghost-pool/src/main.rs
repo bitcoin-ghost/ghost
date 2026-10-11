@@ -1960,7 +1960,7 @@ fn reconcile_singleton_to_recorded_head(
 /// contribution-chain head (`mpc_contributions[MAX].new_params_hash`).
 ///
 /// If the manager already holds head parameters whose lineage
-/// [`hash_parameters`] equals the recorded head, this is a no-op (`Ok(true)`) —
+/// [`ghost_mpc::contribution::hash_parameters`] equals the recorded head, this is a no-op (`Ok(true)`) —
 /// the common case for both a fresh join (the generic params fetch already
 /// installed the head) and a node7-style restart (the head is on disk, only the
 /// singleton was missing). Otherwise the head is fetched BY ITS LINEAGE HASH
