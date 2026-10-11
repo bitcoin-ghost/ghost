@@ -1852,7 +1852,7 @@ dependencies = [
  "chrono",
  "ghost-common",
  "ghost-consensus",
- "ghost-pool",
+ "ghost-mining",
  "ghost-reconciliation",
  "ghost-zkp",
  "libfuzzer-sys",
@@ -1888,43 +1888,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-mpc"
-version = "0.1.0"
-dependencies = [
- "bellperson",
- "blstrs",
- "ff",
- "getrandom 0.2.17",
- "ghost-common",
- "ghost-storage",
- "ghost-zkp",
- "group",
- "hex",
- "pairing",
- "parking_lot",
- "rand 0.8.5",
- "rusqlite",
- "serde",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "ghost-policy"
-version = "1.11.44"
-dependencies = [
- "bitcoin",
- "ghost-buds",
- "ghost-common",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "ghost-pool"
+name = "ghost-mining"
 version = "1.11.44"
 dependencies = [
  "anyhow",
@@ -1973,6 +1937,42 @@ dependencies = [
  "tracing-subscriber",
  "wraith-coordinator",
  "wraith-protocol",
+]
+
+[[package]]
+name = "ghost-mpc"
+version = "0.1.0"
+dependencies = [
+ "bellperson",
+ "blstrs",
+ "ff",
+ "getrandom 0.2.17",
+ "ghost-common",
+ "ghost-storage",
+ "ghost-zkp",
+ "group",
+ "hex",
+ "pairing",
+ "parking_lot",
+ "rand 0.8.5",
+ "rusqlite",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "ghost-policy"
+version = "1.11.44"
+dependencies = [
+ "bitcoin",
+ "ghost-buds",
+ "ghost-common",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
