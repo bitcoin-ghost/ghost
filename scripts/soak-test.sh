@@ -199,9 +199,9 @@ phase0_preflight() {
             sleep 3
         done
         if [[ -n "$health" ]]; then
-            check_ok "ghost-pool health on $(vm_label $i)" "ok"
+            check_ok "ghost-mining health on $(vm_label $i)" "ok"
         else
-            check_ok "ghost-pool health on $(vm_label $i)" "unreachable"
+            check_ok "ghost-mining health on $(vm_label $i)" "unreachable"
             ((failures++))
         fi
     done
@@ -659,7 +659,7 @@ check_tree_consistency() {
 
 pool_hmac_sign() {
     # Compute HMAC-SHA256(secret_bytes, timestamp_le_bytes || body_bytes)
-    # for ghost-pool internal API authentication.
+    # for ghost-mining internal API authentication.
     local secret_hex="$1"
     local timestamp="$2"
     local body="$3"
@@ -696,7 +696,7 @@ inject_shields() {
         body=$(printf '{"commitment":"%s","note_index":%d,"block_height":0}' \
             "$commitment_hex" "$next_idx")
 
-        # Send the same commitment to ALL VMs via ghost-pool internal API (port 8080).
+        # Send the same commitment to ALL VMs via ghost-mining internal API (port 8080).
         # Uses HMAC auth — no SSH required.
         local vm_ok=0
         for vm_idx in $(seq 0 $((VM_COUNT - 1))); do
@@ -734,7 +734,7 @@ inject_shields() {
 
 # ── Ghost-Pay Authenticated API ──────────────────────────────────
 #
-# Ghost-pay uses a different HMAC scheme from ghost-pool:
+# Ghost-pay uses a different HMAC scheme from ghost-mining:
 #   HMAC-SHA256(secret_string_bytes, timestamp_string || body_bytes)
 # The secret is used as raw string (not hex-decoded).
 
@@ -913,9 +913,9 @@ run_l2_transaction_cycle() {
 # pending_nullifiers).
 
 inject_kill9_ghost_pool() {
-    # SIGKILL ghost-pool mid-operation, verify crash recovery
+    # SIGKILL ghost-mining mid-operation, verify crash recovery
     local vm_idx="$1" label="$2"
-    log "${YELLOW}  INJECT: $label — SIGKILL ghost-pool on $(vm_label $vm_idx)${RESET}"
+    log "${YELLOW}  INJECT: $label — SIGKILL ghost-mining on $(vm_label $vm_idx)${RESET}"
     log_event "fault-inject" "$label" "start"
 
     # Record pre-crash state
@@ -925,18 +925,18 @@ inject_kill9_ghost_pool() {
     pre_staging=$(ssh_cmd "$vm_idx" "sqlite3 /home/ghost/.ghost/ghost.db 'SELECT COUNT(*) FROM confirmed_pool_staging;'" 2>/dev/null)
 
     # SIGKILL (not SIGTERM — no graceful shutdown)
-    ssh_cmd "$vm_idx" "kill -9 \$(pgrep -f '/opt/ghost/bin/ghost-pool') 2>/dev/null; true"
+    ssh_cmd "$vm_idx" "kill -9 \$(pgrep -f '/opt/ghost/bin/ghost-mining') 2>/dev/null; true"
     sleep 2
 
     # Verify it's dead
     local pid_check
-    pid_check=$(ssh_cmd "$vm_idx" "pgrep -f '/opt/ghost/bin/ghost-pool'" 2>/dev/null)
+    pid_check=$(ssh_cmd "$vm_idx" "pgrep -f '/opt/ghost/bin/ghost-mining'" 2>/dev/null)
     if [[ -n "$pid_check" ]]; then
         log "  ${RED}Process survived SIGKILL!${RESET}"
     fi
 
     # Restart via systemd
-    ssh_cmd "$vm_idx" "systemctl start ghost-pool"
+    ssh_cmd "$vm_idx" "systemctl start ghost-mining"
     sleep 15  # allow recovery + tree rebuild
 
     # Verify recovery
@@ -948,10 +948,10 @@ inject_kill9_ghost_pool() {
     health=$(pool_api "$vm_idx" "/health" 2>/dev/null)
 
     if [[ -n "$health" ]]; then
-        log "  ${GREEN}RECOVERED${RESET}: ghost-pool on $(vm_label $vm_idx) (notes: $pre_notes→$post_notes, staging: $pre_staging→$post_staging)"
+        log "  ${GREEN}RECOVERED${RESET}: ghost-mining on $(vm_label $vm_idx) (notes: $pre_notes→$post_notes, staging: $pre_staging→$post_staging)"
         log_event "fault-inject" "$label" "recovered,notes_before=$pre_notes,notes_after=$post_notes"
     else
-        log "  ${RED}NOT RECOVERED${RESET}: ghost-pool on $(vm_label $vm_idx)"
+        log "  ${RED}NOT RECOVERED${RESET}: ghost-mining on $(vm_label $vm_idx)"
         log_event "fault-inject" "$label" "not-recovered"
     fi
 
@@ -1003,7 +1003,7 @@ inject_kill9_ghost_pay() {
 }
 
 inject_kill9_mid_finalization() {
-    # Wait for a checkpoint finalization, then SIGKILL ghost-pool mid-operation.
+    # Wait for a checkpoint finalization, then SIGKILL ghost-mining mid-operation.
     # This is the most dangerous edge case: interrupted atomic persist.
     local vm_idx="$1" label="$2"
     log "${YELLOW}  INJECT: $label — waiting for finalization then SIGKILL on $(vm_label $vm_idx)${RESET}"
@@ -1013,9 +1013,9 @@ inject_kill9_mid_finalization() {
     # Timeout after 120s if no finalization occurs (checkpoints are ~60s apart)
     ssh_cmd "$vm_idx" "
         timeout 120 bash -c '
-            journalctl -u ghost-pool -f --since now 2>/dev/null | while read -r line; do
+            journalctl -u ghost-mining -f --since now 2>/dev/null | while read -r line; do
                 if echo \"\$line\" | grep -qi \"finalize_checkpoint\\|checkpoint finalized\"; then
-                    kill -9 \$(pgrep -f /opt/ghost/bin/ghost-pool) 2>/dev/null
+                    kill -9 \$(pgrep -f /opt/ghost/bin/ghost-mining) 2>/dev/null
                     break
                 fi
             done
@@ -1025,7 +1025,7 @@ inject_kill9_mid_finalization() {
     sleep 3
 
     # Restart and verify
-    ssh_cmd "$vm_idx" "systemctl start ghost-pool"
+    ssh_cmd "$vm_idx" "systemctl start ghost-mining"
     sleep 20  # extra time for crash recovery from mid-finalization
 
     # Check crash recovery tables
@@ -1038,11 +1038,11 @@ inject_kill9_mid_finalization() {
     health=$(pool_api "$vm_idx" "/health" 2>/dev/null)
 
     if [[ -n "$health" ]]; then
-        log "  ${GREEN}RECOVERED${RESET}: ghost-pool after mid-finalization kill"
+        log "  ${GREEN}RECOVERED${RESET}: ghost-mining after mid-finalization kill"
         log "    staging=$staging_count, pending_shields=$pending_shields, pending_nullifiers=$pending_nullifiers"
         log_event "fault-inject" "$label" "recovered,staging=$staging_count,shields=$pending_shields,nullifiers=$pending_nullifiers"
     else
-        log "  ${RED}NOT RECOVERED${RESET}: ghost-pool after mid-finalization kill on $(vm_label $vm_idx)"
+        log "  ${RED}NOT RECOVERED${RESET}: ghost-mining after mid-finalization kill on $(vm_label $vm_idx)"
         log_event "fault-inject" "$label" "not-recovered"
     fi
 
@@ -1089,7 +1089,7 @@ inject_kill_service() {
 
     # Verify recovery
     local port
-    if [[ "$service" == "ghost-pool" ]]; then port=$POOL_PORT; else port=$PAY_PORT; fi
+    if [[ "$service" == "ghost-mining" ]]; then port=$POOL_PORT; else port=$PAY_PORT; fi
     local health
     health=$(curl -sf --connect-timeout 5 --max-time 15 \
         "http://${VM_IPS[$vm_idx]}:${port}/health" 2>/dev/null)
@@ -1140,8 +1140,8 @@ inject_rolling_restart() {
     log_event "fault-inject" "$label" "start"
 
     for i in $(seq 0 $((VM_COUNT - 1))); do
-        log "    Restarting ghost-pool on $(vm_label $i)..."
-        ssh_cmd "$i" "systemctl restart ghost-pool"
+        log "    Restarting ghost-mining on $(vm_label $i)..."
+        ssh_cmd "$i" "systemctl restart ghost-mining"
         sleep 30
     done
     sleep 15  # allow final node to stabilize
@@ -1164,14 +1164,14 @@ inject_rolling_restart() {
 
 inject_dual_kill() {
     local vm_a="$1" vm_b="$2" down_sec="$3" label="$4"
-    log "${YELLOW}  INJECT: $label — killing ghost-pool on $(vm_label $vm_a) + $(vm_label $vm_b) for ${down_sec}s${RESET}"
+    log "${YELLOW}  INJECT: $label — killing ghost-mining on $(vm_label $vm_a) + $(vm_label $vm_b) for ${down_sec}s${RESET}"
     log_event "fault-inject" "$label" "start"
 
-    ssh_cmd "$vm_a" "systemctl stop ghost-pool"
-    ssh_cmd "$vm_b" "systemctl stop ghost-pool"
+    ssh_cmd "$vm_a" "systemctl stop ghost-mining"
+    ssh_cmd "$vm_b" "systemctl stop ghost-mining"
     sleep "$down_sec"
-    ssh_cmd "$vm_a" "systemctl start ghost-pool"
-    ssh_cmd "$vm_b" "systemctl start ghost-pool"
+    ssh_cmd "$vm_a" "systemctl start ghost-mining"
+    ssh_cmd "$vm_b" "systemctl start ghost-mining"
     sleep 15  # allow recovery
 
     local all_ok=true
@@ -1285,7 +1285,7 @@ phase2_soak() {
             # Round-robin VM selection for simulations (prevents VM1 accumulation)
             local sim_vm=$(( (iter / 4) % VM_COUNT ))
 
-            # Wraith simulation (ghost-pay endpoint, not ghost-pool)
+            # Wraith simulation (ghost-pay endpoint, not ghost-mining)
             log "  Triggering wraith simulation on ${VM_NAMES[$sim_vm]}..."
             local wraith_resp
             wraith_resp=$(pay_api "$sim_vm" "/api/v1/admin/simulate-wraith-session" "POST")
@@ -1347,13 +1347,13 @@ phase2_soak() {
             inject_kill9_ghost_pay 1 "Hour-1: VM2 ghost-pay SIGKILL"
         fi
 
-        # Hour 2: Graceful kill ghost-pool on VM3 for 5 min
+        # Hour 2: Graceful kill ghost-mining on VM3 for 5 min
         if ! $injected_2 && (( elapsed >= inject_hour_2 )); then
             injected_2=true
-            inject_kill_service 2 "ghost-pool" 300 "Hour-2: VM3 ghost-pool kill 5min"
+            inject_kill_service 2 "ghost-mining" 300 "Hour-2: VM3 ghost-mining kill 5min"
         fi
 
-        # Hour 4: SIGKILL ghost-pool on VM1 mid-finalization (most dangerous edge case)
+        # Hour 4: SIGKILL ghost-mining on VM1 mid-finalization (most dangerous edge case)
         if ! $injected_4 && (( elapsed >= inject_hour_4 )); then
             injected_4=true
             inject_kill9_mid_finalization 0 "Hour-4: VM1 SIGKILL mid-finalization"
@@ -1365,10 +1365,10 @@ phase2_soak() {
             inject_kill_service 1 "ghost-pay" 600 "Hour-5: VM2 ghost-pay kill 10min"
         fi
 
-        # Hour 7: SIGKILL ghost-pool on VM4 (crash recovery without mid-finalization)
+        # Hour 7: SIGKILL ghost-mining on VM4 (crash recovery without mid-finalization)
         if ! $injected_7 && (( elapsed >= inject_hour_7 )); then
             injected_7=true
-            inject_kill9_ghost_pool 3 "Hour-7: VM4 ghost-pool SIGKILL"
+            inject_kill9_ghost_pool 3 "Hour-7: VM4 ghost-mining SIGKILL"
         fi
 
         # Hour 8: Network partition VM4 for 5 min
@@ -1392,10 +1392,10 @@ phase2_soak() {
             log "${YELLOW}  INJECT: Hour-11 — triggering wraith then killing VM3 mid-session${RESET}"
             pool_api 0 "/api/v1/admin/simulate-wraith-session" &
             sleep 2
-            inject_kill_service 2 "ghost-pool" 60 "Hour-11: VM3 kill mid-wraith"
+            inject_kill_service 2 "ghost-mining" 60 "Hour-11: VM3 kill mid-wraith"
         fi
 
-        # Hour 13: SIGKILL ghost-pool mid-finalization on VM3 (second mid-finalization test)
+        # Hour 13: SIGKILL ghost-mining mid-finalization on VM3 (second mid-finalization test)
         if ! $injected_13 && (( elapsed >= inject_hour_13 )); then
             injected_13=true
             inject_kill9_mid_finalization 2 "Hour-13: VM3 SIGKILL mid-finalization"
@@ -1407,11 +1407,11 @@ phase2_soak() {
             inject_rolling_restart "Hour-14: Rolling restart all VMs"
         fi
 
-        # Hour 16: SIGKILL both ghost-pool AND ghost-pay on VM2 simultaneously
+        # Hour 16: SIGKILL both ghost-mining AND ghost-pay on VM2 simultaneously
         if ! $injected_16 && (( elapsed >= inject_hour_16 )); then
             injected_16=true
-            log "${YELLOW}  INJECT: Hour-16 — dual SIGKILL ghost-pool+ghost-pay on VM2${RESET}"
-            inject_kill9_ghost_pool 1 "Hour-16: VM2 ghost-pool SIGKILL"
+            log "${YELLOW}  INJECT: Hour-16 — dual SIGKILL ghost-mining+ghost-pay on VM2${RESET}"
+            inject_kill9_ghost_pool 1 "Hour-16: VM2 ghost-mining SIGKILL"
             inject_kill9_ghost_pay 1 "Hour-16: VM2 ghost-pay SIGKILL"
         fi
 
@@ -1447,9 +1447,9 @@ phase3_validation() {
     log "Final health check..."
     for i in $(seq 0 $((VM_COUNT - 1))); do
         if pool_api "$i" "/health" > /dev/null 2>&1; then
-            check_ok "ghost-pool on $(vm_label $i)" "ok"
+            check_ok "ghost-mining on $(vm_label $i)" "ok"
         else
-            check_ok "ghost-pool on $(vm_label $i)" "unreachable"
+            check_ok "ghost-mining on $(vm_label $i)" "unreachable"
             ((failures++))
         fi
     done

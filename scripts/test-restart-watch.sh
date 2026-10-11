@@ -25,7 +25,7 @@ BIN="$TMP/bin"; mkdir -p "$BIN" "$TMP/state"
 cat > "$BIN/systemctl" <<'SC'
 #!/usr/bin/env bash
 case "$1" in
-  list-unit-files|cat) exit 0 ;;
+  list-unit-files|cat) case " ${STUB_MISSING_UNITS:-} " in *" ${2%.service} "*) exit 1 ;; esac; exit 0 ;;
   show) for a in "$@"; do case "$a" in NRestarts|-p) ;; esac; done
         echo "${STUB_RESTARTS:-0}" ;;
   is-active) echo "${STUB_ACTIVE:-active}" ;;
@@ -120,10 +120,23 @@ echo "== state file compatibility =="
 #    not crash or reset the restart counters — an upgrade that silently zeroes its own history
 #    would blind the crash-loop half for a full window.
 rm -f "$TMP/state"/*
-printf '7 %s 0\n' "$(date +%s)" > "$TMP/state/ghost-pool"
+printf '7 %s 0\n' "$(date +%s)" > "$TMP/state/ghost-mining"
 out=$(run 1 env STUB_ACTIVE=active STUB_PORTS="8442 34255 3333 8332" STUB_RESTARTS=7)
 check_absent "an old 3-field state file does not error" "unbound variable|integer expression|syntax error" "$out"
-check "and it is rewritten with five fields" "^7 [0-9]+ 0 0 0$" "$(cat "$TMP/state/ghost-pool")"
+check "and it is rewritten with five fields" "^7 [0-9]+ 0 0 0$" "$(cat "$TMP/state/ghost-mining")"
+
+echo "== the node unit under either name (#1018) =="
+# deploy-node.sh installs this script BEFORE it renames a node's unit, so for a while — and for
+# ever on a node nobody deploys to — the unit is still ghost-pool. Watching only the new name
+# would skip it without a word.
+rm -f "$TMP/state"/*
+out=$(run 3 env STUB_MISSING_UNITS="ghost-mining" STUB_ACTIVE=active STUB_PORTS="34255 3333 8332" STUB_RESTARTS=0)
+check "a node not yet renamed has ghost-pool watched" "ghost-pool is active but has not been listening on :8442" "$out"
+check_absent "and nothing is reported under the name it does not have" "ghost-mining is active" "$out"
+rm -f "$TMP/state"/*
+out=$(run 3 env STUB_ACTIVE=active STUB_PORTS="34255 3333 8332" STUB_RESTARTS=0)
+check "a renamed node has ghost-mining watched" "ghost-mining is active but has not been listening on :8442" "$out"
+check_absent "and the alias is not watched as a second unit" "ghost-pool is active" "$out"
 
 echo
 if [ "$fail" -eq 0 ]; then

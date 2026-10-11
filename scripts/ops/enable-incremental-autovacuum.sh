@@ -29,7 +29,7 @@
 # USAGE
 #   scripts/ops/enable-incremental-autovacuum.sh <node> [--dry-run]
 #
-# It stops `ghost-pool` (the only writer) for the duration. `ghostd` keeps running throughout, so
+# It stops `ghost-mining` (the only writer) for the duration. `ghostd` keeps running throughout, so
 # the node stays on the network and keeps its peers; it just stops accounting shares for ~90s.
 
 set -euo pipefail
@@ -71,8 +71,8 @@ if [ "$DRY_RUN" = "--dry-run" ]; then
 fi
 
 # ---------------------------------------------------------------- do it
-say "stopping ghost-pool (ghostd stays up; the node keeps its peers)"
-remote "sudo systemctl stop ghost-pool"
+say "stopping ghost-mining (ghostd stays up; the node keeps its peers)"
+remote "sudo systemctl stop ghost-mining"
 
 # Checkpoint first: a WAL holds committed pages the main file does not yet have, so a copy taken
 # without this is not a usable backup.
@@ -103,11 +103,11 @@ say "integrity check"
 INTEG=$(remote "sudo sqlite3 $DB 'PRAGMA integrity_check;' | head -1")
 [ "$INTEG" = "ok" ] || die "integrity_check said '$INTEG' — DO NOT restart the pool; restore $DB.pre-vacuum"
 
-say "restarting ghost-pool"
-remote "sudo systemctl start ghost-pool"
+say "restarting ghost-mining"
+remote "sudo systemctl start ghost-mining"
 sleep 20
-ACTIVE=$(remote "systemctl is-active ghost-pool")
-[ "$ACTIVE" = "active" ] || die "ghost-pool did not come back ($ACTIVE) — restore $DB.pre-vacuum"
+ACTIVE=$(remote "systemctl is-active ghost-mining")
+[ "$ACTIVE" = "active" ] || die "ghost-mining did not come back ($ACTIVE) — restore $DB.pre-vacuum"
 
 say "OK: $NODE on INCREMENTAL auto_vacuum, reclaimed $((DB_MB - NEW_MB))MB, pool active"
 say "backup left at $DB.pre-vacuum — remove it once you are satisfied"

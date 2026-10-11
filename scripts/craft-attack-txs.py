@@ -20,7 +20,7 @@ Attack types:
 Outputs raw tx hex to stdout. Caller submits via bitcoin-cli sendrawtransaction.
 
 Note: Most attack types craft a witness-bearing transaction. Bitcoin Core may
-reject some at mempool acceptance (which is fine — we're testing ghost-pool's
+reject some at mempool acceptance (which is fine — we're testing ghost-mining's
 template filtering, not mempool relay). For tests where Core rejects at mempool,
 we use the bitcoin-cli patching approach instead.
 """

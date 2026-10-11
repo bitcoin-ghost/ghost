@@ -16,8 +16,8 @@
 # that reason; reconciling only the live file leaves the copies behind.
 #
 # ⚠ Owner is per-file, not one blanket rule. pool-config.toml is read by sri-pool (root), while
-# pool.toml and bitcoin.conf are read by ghost-pool/ghostd (ghost). Chowning the whole set to
-# root would break ghost-pool at its next restart — a delayed failure, which is the worst kind.
+# pool.toml and bitcoin.conf are read by ghost-mining/ghostd (ghost). Chowning the whole set to
+# root would break ghost-mining at its next restart — a delayed failure, which is the worst kind.
 #
 # Usage:
 #   harden-secret-configs.sh              # apply, print what changed
@@ -53,7 +53,7 @@ done
 # ⚠ Owner is enforced on the LIVE files only, and deliberately not on the backups.
 #
 # A live config must be readable by the service that reads it, so its owner is load-bearing:
-# pool-config.toml is read by sri-pool (root), pool.toml and bitcoin.conf by ghost-pool/ghostd
+# pool-config.toml is read by sri-pool (root), pool.toml and bitcoin.conf by ghost-mining/ghostd
 # (ghost). A backup is read by nobody, so its owner carries no such requirement — and enforcing
 # one is actively harmful. The fleet proved it: pool.toml backups sit at root:root, and an
 # earlier version of this table demanded ghost:ghost for them, which would have LOOSENED every

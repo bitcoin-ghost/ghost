@@ -6,12 +6,12 @@
 #
 # `sri-pool.service` runs `pool_sv2`, which holds the world-open SV2 miner port (:34255). It was
 # the ONLY one of the four installer-written units without `LimitNOFILE`, so it inherited the
-# default SOFT limit of 1024 while ghostd, ghost-pool and sri-translator all set 65536.
+# default SOFT limit of 1024 while ghostd, ghost-mining and sri-translator all set 65536.
 #
 # MEASURED on the live fleet before the fix:
 #
 #     sri-pool    LimitNOFILE 524288  soft 1024
-#     ghost-pool  LimitNOFILE 65536   soft 65536
+#     ghost-mining  LimitNOFILE 65536   soft 65536
 #
 # A process is bounded by its SOFT limit unless it raises it itself, so the miner-facing process
 # capped near 1,000 descriptors against a configured ceiling of 1,000 miners — and a miner
@@ -20,17 +20,17 @@
 # ⚠ `capacity.rs` derives its ceiling from `getrlimit` in GHOST-POOL, which holds almost no miner
 # sockets. So the capacity model was measuring the wrong process and could never have seen this.
 #
-# MEASURED on vm5, 2026-10-04: ghost-pool held **197** descriptors, none of them a miner socket,
+# MEASURED on vm5, 2026-10-04: ghost-mining held **197** descriptors, none of them a miner socket,
 # and reported `fd=65536 -> fd_max=16384` as a bound on miner capacity.
 #
-# Rather than have ghost-pool probe other processes, this check makes its self-read SOUND: every
-# socket-holding unit must raise `LimitNOFILE` to **at least** ghost-pool's value. Then
-# `getrlimit` in ghost-pool can only ever UNDER-state the budget of the units that hold the miner
+# Rather than have ghost-mining probe other processes, this check makes its self-read SOUND: every
+# socket-holding unit must raise `LimitNOFILE` to **at least** ghost-mining's value. Then
+# `getrlimit` in ghost-mining can only ever UNDER-state the budget of the units that hold the miner
 # sockets, which is the safe direction. Without this the agreement is a coincidence — and it was
-# not one: sri-pool sat at a soft 1024 against ghost-pool's 65536 while the node advertised
+# not one: sri-pool sat at a soft 1024 against ghost-mining's 65536 while the node advertised
 # capacity for 1,000 miners (measured uniform across all eight nodes, 2026-10-04).
 #
-# Exit 0 = every socket-holding unit raises it to >= ghost-pool's, 1 = one does not,
+# Exit 0 = every socket-holding unit raises it to >= ghost-mining's, 1 = one does not,
 # 2 = INCONCLUSIVE.
 set -uo pipefail
 
@@ -42,7 +42,7 @@ SRC="scripts/install-node.sh"
 
 # The units that accept or hold network connections. Named explicitly: a unit that does NOT serve
 # sockets has no reason to raise the limit, and demanding it everywhere would make this noise.
-NEED=("Ghost Bitcoin Core" "Ghost Pool node" "SRI Pool" "SRI Translator")
+NEED=("Ghost Bitcoin Core" "Ghost Mining node" "SRI Pool" "SRI Translator")
 
 found=0
 missing=0
@@ -87,14 +87,14 @@ if [ "$missing" -gt 0 ]; then
     exit 1
 fi
 
-# The ordering assertion. `capacity.rs` reads `getrlimit(RLIMIT_NOFILE)` in ghost-pool and divides
+# The ordering assertion. `capacity.rs` reads `getrlimit(RLIMIT_NOFILE)` in ghost-mining and divides
 # by FD_BUDGET_DIVISOR to bound miner capacity — but miner sockets are held by sri-pool (:34255)
-# and sri-translator (:3333/:4444), not by ghost-pool. That self-read is only sound while the
-# acceptors' budgets are at least as large as ghost-pool's. Checked numerically, because "both set
+# and sri-translator (:3333/:4444), not by ghost-mining. That self-read is only sound while the
+# acceptors' budgets are at least as large as ghost-mining's. Checked numerically, because "both set
 # LimitNOFILE" was already true of a tree in which one of them set it to 1024.
-POOL_LIMIT="${LIMITS[Ghost Pool node]:-}"
+POOL_LIMIT="${LIMITS[Ghost Mining node]:-}"
 if [ -z "$POOL_LIMIT" ]; then
-    echo "check-socket-units-raise-nofile: INCONCLUSIVE — could not read the Ghost Pool node unit's"
+    echo "check-socket-units-raise-nofile: INCONCLUSIVE — could not read the Ghost Mining node unit's"
     echo "  LimitNOFILE, which is the value capacity.rs measures. Nothing to compare the acceptors to."
     exit 2
 fi
@@ -104,7 +104,7 @@ for acceptor in "SRI Pool" "SRI Translator"; do
     got="${LIMITS[$acceptor]:-}"
     [ -n "$got" ] || continue          # already counted as missing above
     if [ "$got" -lt "$POOL_LIMIT" ]; then
-        echo "  *** $acceptor — LimitNOFILE=$got is BELOW the Ghost Pool node's $POOL_LIMIT"
+        echo "  *** $acceptor — LimitNOFILE=$got is BELOW the Ghost Mining node's $POOL_LIMIT"
         acceptor_bad=$((acceptor_bad + 1))
     fi
 done
@@ -112,15 +112,15 @@ done
 if [ "$acceptor_bad" -gt 0 ]; then
     echo
     echo "check-socket-units-raise-nofile: $acceptor_bad miner-facing unit(s) have a SMALLER fd"
-    echo "budget than ghost-pool, whose budget is the one capacity.rs advertises."
+    echo "budget than ghost-mining, whose budget is the one capacity.rs advertises."
     echo
-    echo "  capacity.rs calls getrlimit in ghost-pool — a process that held 197 descriptors and no"
+    echo "  capacity.rs calls getrlimit in ghost-mining — a process that held 197 descriptors and no"
     echo "  miner socket when this was measured. The number it publishes is only a safe bound while"
     echo "  the units that DO hold miner sockets have at least as many descriptors available. Raise"
-    echo "  the acceptor to >= $POOL_LIMIT, or lower ghost-pool's to match what the acceptors get."
+    echo "  the acceptor to >= $POOL_LIMIT, or lower ghost-mining's to match what the acceptors get."
     exit 1
 fi
 
 echo "check-socket-units-raise-nofile: all $found socket-holding unit(s) raise LimitNOFILE,"
-echo "  and every miner-facing unit is >= the Ghost Pool node's $POOL_LIMIT (what capacity.rs reads)"
+echo "  and every miner-facing unit is >= the Ghost Mining node's $POOL_LIMIT (what capacity.rs reads)"
 exit 0

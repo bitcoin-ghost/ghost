@@ -2,7 +2,7 @@
 Description=Bitcoin Ghost opt-in node auto-update (verifies GPG signature before applying)
 Documentation=https://get.bitcoinghost.org
 # Only meaningful once the node is up; never block boot on it.
-After=network-online.target ghostd.service ghost-pool.service
+After=network-online.target ghostd.service ghost-mining.service
 Wants=network-online.target
 
 [Service]

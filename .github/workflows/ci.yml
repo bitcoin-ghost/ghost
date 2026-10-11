@@ -62,9 +62,9 @@ jobs:
         run: ./scripts/check-translator-config-keys-are-read.sh
       # pool_sv2 holds the world-open SV2 miner port and was the only one of the four units without
       # LimitNOFILE, so it inherited systemd's default SOFT limit of 1024 — MEASURED live at
-      # soft 1024 against ghost-pool's 65536. A process is bounded by its soft limit, so the
+      # soft 1024 against ghost-mining's 65536. A process is bounded by its soft limit, so the
       # miner-facing service could not reach a four-figure miner count, and the symptom would be
-      # accept() failures naming nothing. capacity.rs reads getrlimit in ghost-pool, which holds
+      # accept() failures naming nothing. capacity.rs reads getrlimit in ghost-mining, which holds
       # almost no miner sockets, so the capacity model never saw it.
       - name: Socket-holding units raise LimitNOFILE
         run: ./scripts/check-socket-units-raise-nofile.sh
@@ -79,6 +79,12 @@ jobs:
       # gate is driven against deliberately-bad state here. No ssh, no deploy.
       - name: Deploy-gate self-test
         run: ./scripts/test-deploy-gate.sh
+      # rename-node-unit.sh stops the unit a node mines through, moves its unit file and starts
+      # it under a new name (#1018). What needs proving is what a clean run never shows: a
+      # renamed unit that does not come up is put back exactly, running; and a second run
+      # changes nothing and restarts nothing. Stubbed systemctl, throwaway root.
+      - name: Node-unit rename self-test
+        run: ./scripts/test-rename-node-unit.sh
       # release.sh orchestrates the roll, and two of its steps failed silently in v1.11.38: it
       # reported a release "published" that was still a draft (#857), and it rolled genesis FIRST
       # against its own stated rule (#856). Both are the shape a self-test catches and a reader
@@ -153,7 +159,7 @@ jobs:
       # be taken BEFORE the per-connection task is spawned (otherwise a flood still costs a task, a
       # socket and a descriptor each), and it must be released only by `Drop`. The TDP client slot
       # counter decremented by hand, leaked on SIX early-return paths, and at ten leaked slots
-      # refused every pool_sv2 connection for ever until ghost-pool was restarted — a leak becomes
+      # refused every pool_sv2 connection for ever until ghost-mining was restarted — a leak becomes
       # the outage the cap prevents. This accept task has four early returns plus a normal end.
       - name: SV2 connection slot is taken before the spawn
         run: ./scripts/check-connection-slot-is-taken-before-spawn.sh
@@ -178,7 +184,7 @@ jobs:
       # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
       # caught lying about its address stops counting toward the diversity floor, which changes
       # which nodes qualify and how the node-reward pool splits. There are FIVE construction
-      # sites in ghost-pool; one that missed the gate would diverge from the fleet silently.
+      # sites in ghost-mining; one that missed the gate would diverge from the fleet silently.
       - name: Address-enforcement wiring
         run: ./scripts/check-address-enforcement-wiring.sh
       # install-node.sh hardens the secret-bearing configs at install time and nothing ever
@@ -312,7 +318,7 @@ jobs:
             --exclude ghost-mpc \
             --exclude mpc-xproc-harness \
             --exclude integration_tests_sv2
-      # Run the ghost-pool e2e targets against a REAL regtest node (#770).
+      # Run the ghost-mining e2e targets against a REAL regtest node (#770).
       #
       # Until now these reported green without ever executing. Nothing in CI started a regtest
       # ghostd, and the targets open with a skip-and-return, so they were compiled, run, printed
@@ -332,7 +338,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/regtest-node.sh start
-      - name: Run ghost-pool e2e tests against regtest
+      - name: Run ghost-mining e2e tests against regtest
         timeout-minutes: 15
         env:
           GHOST_REGTEST_REQUIRED: "1"

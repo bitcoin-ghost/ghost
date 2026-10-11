@@ -6,7 +6,7 @@
 # strict no-op unless the operator has opted in via /etc/ghost/auto-update.conf
 # (AUTO_UPDATE=true). When opted in, it resolves the latest published release,
 # and — ONLY if it is newer than what is installed — downloads the signed
-# release tarball (which now bundles ghostd alongside ghost-pool/ghost-pay),
+# release tarball (which now bundles ghostd alongside ghost-mining/ghost-pay),
 # verifies the detached GPG signature against the pinned release key and the
 # tarball's SHA256, backs up the current binaries, swaps them with a
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
@@ -91,14 +91,14 @@ EOF
 normver() { local v="$1"; echo "${v#v}"; }
 
 # Installed version: prefer the file we write on update, fall back to parsing
-# `ghost-pool --version` (clap prints "ghost-pool <semver>").
+# `ghost-mining --version` (clap prints "ghost-mining <semver>").
 read_installed_version() {
   if [[ -r "$VERSION_FILE" ]]; then
     local v; v="$(tr -d '[:space:]' < "$VERSION_FILE")"
     [[ -n "$v" ]] && { echo "$v"; return 0; }
   fi
-  if [[ -x "$BIN_DIR/ghost-pool" ]]; then
-    local out; out="$("$BIN_DIR/ghost-pool" --version 2>/dev/null || true)"
+  if [[ -x "$BIN_DIR/ghost-mining" ]]; then
+    local out; out="$("$BIN_DIR/ghost-mining" --version 2>/dev/null || true)"
     local v; v="$(echo "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
     [[ -n "$v" ]] && { echo "v$v"; return 0; }
   fi
@@ -175,17 +175,17 @@ health_ghost_pool() {
     resp="$(curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null || true)"
     pc="$(echo "$resp" | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
     if [[ -n "$pc" && "$pc" -gt 0 ]]; then
-      log "health: ghost-pool /health peer_count=$pc"
+      log "health: ghost-mining /health peer_count=$pc"
       return 0
     fi
     sleep 2
   done
-  err "health: ghost-pool /health peer_count not > 0 (last='${pc:-none}')"
+  err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}')"
   return 1
 }
 
 health_ghost_pay() {
-  # Only meaningful when ghost-pay is installed. Bond ledger serves TLS with an
+  # Only meaningful when ghost-pay is installed. It serves TLS with an
   # identity-derived cert, so -k (we are localhost, integrity is the binary swap
   # we just verified, not the transport).
   unit_present ghost-pay.service || { log "health: ghost-pay not installed — skipped"; return 0; }
@@ -249,6 +249,15 @@ main() {
   fi
   log "newer version available: $installed -> $latest"
 
+  # This updater stops and starts `ghost-mining.service`. A node still running the unit under
+  # its old name (#1018) has no such unit: the stop would be a no-op, the binary would be
+  # swapped under a live process, and the start would fail. Refuse before downloading anything.
+  if [[ ! -e /etc/systemd/system/ghost-mining.service && -e /etc/systemd/system/ghost-pool.service ]]; then
+    err "this node's unit is still ghost-pool.service — rename it first (scripts/ops/rename-node-unit.sh)"
+    write_status "error" "node unit not renamed to ghost-mining" "$latest"
+    exit 1
+  fi
+
   # 3. Download artefacts to an isolated temp dir.
   local tarball release_base tmp gnupg
   tarball="bitcoin-ghost-${latest}-x86_64-unknown-linux-gnu.tar.gz"
@@ -301,18 +310,18 @@ main() {
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
   local new_pool new_pay new_cli new_ghostd
-  new_pool="$(find "$tmp" -name ghost-pool -type f | head -1 || true)"
+  new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
   new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
-  [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-pool"; write_status "error" "tarball missing ghost-pool" "$latest"; exit 1; }
+  [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
   # Build the swap plan: (dest <- src), only for binaries currently installed
   # (so we never introduce ghost-pay onto a node that opted out of it).
   local -a SWAP_DEST=() SWAP_SRC=()
   SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$new_ghostd")
-  SWAP_DEST+=("$BIN_DIR/ghost-pool"); SWAP_SRC+=("$new_pool")
+  SWAP_DEST+=("$BIN_DIR/ghost-mining"); SWAP_SRC+=("$new_pool")
   if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")
   fi
@@ -346,7 +355,7 @@ main() {
   rollback() {
     err "rolling back to pre-update binaries"
     stop_and_wait ghost-pay.service || true
-    stop_and_wait ghost-pool.service || true
+    stop_and_wait ghost-mining.service || true
     stop_and_wait ghostd.service || true
     local j
     for j in "${!BACKUP_DEST[@]}"; do
@@ -354,14 +363,14 @@ main() {
     done
     $SYSTEMCTL start ghostd.service || true
     sleep 3
-    $SYSTEMCTL start ghost-pool.service || true
+    $SYSTEMCTL start ghost-mining.service || true
     unit_present ghost-pay.service && { $SYSTEMCTL start ghost-pay.service || true; }
     return 0  # never let the rollback's last status trip `set -e` in the caller
   }
 
   # 7. Stop services (reverse dependency order), verify inactive.
   stop_and_wait ghost-pay.service || true
-  stop_and_wait ghost-pool.service || { err "ghost-pool would not stop — rolling back"; rollback; write_status "rolled-back" "ghost-pool failed to stop" "$latest"; exit 1; }
+  stop_and_wait ghost-mining.service || { err "ghost-mining would not stop — rolling back"; rollback; write_status "rolled-back" "ghost-mining failed to stop" "$latest"; exit 1; }
   stop_and_wait ghostd.service    || { err "ghostd would not stop — rolling back"; rollback; write_status "rolled-back" "ghostd failed to stop" "$latest"; exit 1; }
 
   # 8. Swap the verified binaries into place atomically (install = temp+rename).
@@ -383,7 +392,7 @@ main() {
   # 9. Start services (dependency order).
   $SYSTEMCTL start ghostd.service || { err "ghostd failed to start — rolling back"; rollback; write_status "rolled-back" "ghostd failed to start" "$latest"; exit 1; }
   sleep 3
-  $SYSTEMCTL start ghost-pool.service || { err "ghost-pool failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-pool failed to start" "$latest"; exit 1; }
+  $SYSTEMCTL start ghost-mining.service || { err "ghost-mining failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-mining failed to start" "$latest"; exit 1; }
   if unit_present ghost-pay.service; then
     $SYSTEMCTL start ghost-pay.service || { err "ghost-pay failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-pay failed to start" "$latest"; exit 1; }
   fi

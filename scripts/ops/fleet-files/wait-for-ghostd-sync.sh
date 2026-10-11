@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Deployed to /opt/ghost/bin/wait-for-ghostd-sync.sh — the ExecStart of
-# ghost-pool-gate.service. ghost-pool and ghost-pay are BOTH disabled at boot;
+# ghost-mining-gate.service. ghost-mining and ghost-pay are BOTH disabled at boot;
 # this gate is what starts them, once ghostd reports it has left initial block
-# download. Starting ghost-pool against a syncing ghostd is what the gate exists
+# download. Starting ghost-mining against a syncing ghostd is what the gate exists
 # to prevent.
 #
 # This file is the canonical copy (#759). It used to exist only on the fleet, in
@@ -26,20 +26,25 @@ set -u
 CONF=/etc/bitcoin/bitcoin.conf
 RPCUSER=$(grep -m1 '^rpcuser=' "$CONF" | cut -d= -f2-)
 RPCPW=$(grep -m1 '^rpcpassword=' "$CONF" | cut -d= -f2-)
-echo "[ghost-pool-gate] waiting for ghostd to finish initial sync..."
+echo "[ghost-mining-gate] waiting for ghostd to finish initial sync..."
 while true; do
   RESP=$(curl -s --max-time 8 --user "$RPCUSER:$RPCPW" \
     --data '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
     http://127.0.0.1:8332/ 2>/dev/null)
   IBD=$(echo "$RESP" | grep -oE '"initialblockdownload":[[:space:]]*(true|false)' | grep -oE 'true|false')
   if [ "$IBD" = "false" ]; then
-    echo "[ghost-pool-gate] ghostd synced — starting ghost-pool"
-    systemctl start ghost-pool
-    # ghost-pay (when installed) also needs a live ghostd + ghost-pool, so the
-    # gate owns its first start too — mirrors ghost-pool, which is not enabled
+    # The node unit was `ghost-pool` until #1018, and this file reaches a node separately from
+    # that rename — deploy-fleet-file.sh before it, or the unit switch before this. Start
+    # whichever the node has, so neither order leaves a node that does not mine after a reboot.
+    UNIT=ghost-mining
+    [ -e /etc/systemd/system/ghost-mining.service ] || UNIT=ghost-pool
+    echo "[ghost-mining-gate] ghostd synced — starting $UNIT"
+    systemctl start "$UNIT"
+    # ghost-pay (when installed) also needs a live ghostd + ghost-mining, so the
+    # gate owns its first start too — mirrors ghost-mining, which is not enabled
     # at boot.
     if [ -f /etc/systemd/system/ghost-pay.service ]; then
-      echo "[ghost-pool-gate] starting ghost-pay"
+      echo "[ghost-mining-gate] starting ghost-pay"
       systemctl start ghost-pay
     fi
     exit 0

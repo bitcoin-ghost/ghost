@@ -251,11 +251,11 @@ else:
         "public_key": "per-node TDP authority key",
         "url": "the webhook URL carries a per-node port in the installer",
         # Runtime-managed, so neither file's value is what a node runs. `update-pool-signature.sh`
-        # (sri-pool ExecStartPre) rewrites it from ghost-pool's coinbase_tag; the values in both
-        # files are only the fallback until ghost-pool has written that file. MEASURED on
+        # (sri-pool ExecStartPre) rewrites it from ghost-mining's coinbase_tag; the values in both
+        # files are only the fallback until ghost-mining has written that file. MEASURED on
         # vm1/vm5/vm8 2026-10-06: live is "GHOST PublicPool", matching NEITHER file — which is
         # correct, not drift, and is why comparing them would be permanent noise.
-        "pool_signature": "runtime-managed by update-pool-signature.sh from ghost-pool's coinbase_tag",
+        "pool_signature": "runtime-managed by update-pool-signature.sh from ghost-mining's coinbase_tag",
     }
     for k in sorted(set(pool_installer) & set(pool_vals)):
         if k in POOL_NOT_COMPARED:
@@ -352,10 +352,10 @@ for k, check in INVARIANTS.items():
             problems.append(f"{k} = {v} in {path} — {why}")
 
 # ---------------------------------------------------------------------------
-# Cross-file: the farm port ghost-pool GOSSIPS must equal the one the translator LISTENS on.
+# Cross-file: the farm port ghost-mining GOSSIPS must equal the one the translator LISTENS on.
 #
-# translator_sv2 owns the listener (`[farm_tier] port`); ghost-pool owns the advertisement
-# (`[network] farm_port` in pool.toml), because they are different processes and ghost-pool
+# translator_sv2 owns the listener (`[farm_tier] port`); ghost-mining owns the advertisement
+# (`[network] farm_port` in pool.toml), because they are different processes and ghost-mining
 # must not read another service's config file. So the value is duplicated, and duplication
 # drifts.
 #

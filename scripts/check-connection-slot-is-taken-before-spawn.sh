@@ -14,7 +14,7 @@
 #
 # **2. The slot must be released by `Drop`, never by hand.** ⛔⛔ This is exactly how the TDP client
 # slot counter failed: it decremented explicitly, leaked a slot on **six** early-return paths, and at
-# ten leaked slots refused every `pool_sv2` connection for ever until ghost-pool was restarted. A
+# ten leaked slots refused every `pool_sv2` connection for ever until ghost-mining was restarted. A
 # leak does not weaken the cap, it becomes the outage the cap was added to prevent. The accept task
 # has four early `return`s plus a normal end, so any explicit release is a path that can be
 # forgotten — and a fifth return added tomorrow would forget it.

@@ -1,7 +1,7 @@
 name: Release Wraith Wallet
 
 # Triggered on Wraith-specific tags so the existing repo-wide v* tags
-# (which build ghost-pool / ghost-cli / etc.) don't accidentally cut a
+# (which build ghost-mining / ghost-cli / etc.) don't accidentally cut a
 # wallet release with a stale binary.
 on:
   push:

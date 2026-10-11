@@ -4,7 +4,7 @@
 #
 #   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
 #
-# Stands up a full Ghost node (ghostd + ghost-pool) on Ubuntu, joins the mesh,
+# Stands up a full Ghost node (ghostd + ghost-mining) on Ubuntu, joins the mesh,
 # and — while there are still Elder slots free (first 101 nodes) — registers as
 # an Elder. Mirrors the proven production setup; every per-node secret is
 # generated fresh on this machine and never leaves it.
@@ -33,7 +33,7 @@ GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # ghostd now ships INSIDE the signed release tarball (same SHA256SUMS + GPG chain
-# as ghost-pool), so it can never drift from the release version and
+# as ghost-mining), so it can never drift from the release version and
 # needs no separate checksum pin — its integrity rides the tarball signature we
 # already verify below. GHOSTD_URL is an OPTIONAL, unverified escape hatch (empty
 # by default) for transition/testing only; leave it unset in production so ghostd
@@ -261,7 +261,7 @@ prompt_yes_no() {
 run_wizard() {
   echo
   log "Bitcoin Ghost — guided node setup"
-  echo "This installs a full Ghost node (ghostd + ghost-pool), joins the mesh, and"
+  echo "This installs a full Ghost node (ghostd + ghost-mining), joins the mesh, and"
   echo "registers as an Elder while slots remain. Press Enter to accept each [default]."
   echo
 
@@ -439,7 +439,7 @@ fi
 # only safe behaviour: a wrong treasury address is invisible until someone audits a coinbase.
 # The [alerts] block. ⛔ Written with `enabled` reflecting whether a channel was actually given:
 # a section that says `enabled = true` with nowhere to deliver is worse than an honest false,
-# because it reads as configured (#985). ghost-pool warns loudly at every start in either case.
+# because it reads as configured (#985). ghost-mining warns loudly at every start in either case.
 # ⚠ AlertsConfig carries #[serde(deny_unknown_fields)] — these key names must match config.rs.
 if [[ -n "$ALERT_WEBHOOK" ]]; then
   ALERTS_BLOCK=$(cat <<ALERTS
@@ -456,7 +456,7 @@ else
   ALERTS_BLOCK=$(cat <<'ALERTS'
 # ⛔ NO ALERT DELIVERY IS CONFIGURED. Fourteen detectors are wired and every one of them will
 # fire into nothing. Re-run the installer with --alert-webhook, or set a channel below and flip
-# `enabled` to true. ghost-pool warns about this at every start until you do.
+# `enabled` to true. ghost-mining warns about this at every start until you do.
 [alerts]
 enabled = false
 
@@ -535,7 +535,7 @@ id ghost >/dev/null 2>&1 || useradd -r -m -d /home/ghost -s /bin/bash ghost
 mkdir -p /opt/ghost/bin /etc/ghost /etc/bitcoin /var/lib/bitcoin /var/lib/ghost /home/ghost/.ghost/data
 
 # Grant the operator read access to the service journals so that
-# `journalctl -u ghost-pool` works without sudo. When installed via `sudo bash`,
+# `journalctl -u ghost-mining` works without sudo. When installed via `sudo bash`,
 # $SUDO_USER is the human who invoked it; add them to systemd-journal (a
 # read-only group). Root operators already see everything; a non-root sudo user
 # would otherwise get empty output and mistake it for "no logs".
@@ -596,10 +596,16 @@ else
 fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
 tar -xzf "$POOL_TARBALL"
-install -m755 -o root -g root "$(find . -name ghost-pool -type f | head -1)" /opt/ghost/bin/ghost-pool
+# The node binary was `ghost-pool` up to and including v1.11.44 (#1018). A release that old is
+# refused rather than installed under the new name: that binary restarts itself and reads its own
+# journal as `ghost-pool`, a unit this installer does not create, so the dashboard's restart and
+# log pages would fail on a node that otherwise looked healthy.
+NODE_BIN_SRC="$(find . -name ghost-mining -type f | head -1)"
+[ -n "$NODE_BIN_SRC" ] || err "Release ${VERSION:-} does not contain ghost-mining — it predates the rename from ghost-pool. This installer needs a newer release."
+install -m755 -o root -g root "$NODE_BIN_SRC" /opt/ghost/bin/ghost-mining
 # ghost-cli (the ghostd RPC client, like bitcoin-cli) ships in the same signed
 # tarball. Install it so operators can query their node's ghostd directly — it is
-# not required for ghost-pool operation (ghost-pool talks to ghostd over RPC/ZMQ),
+# not required for ghost-mining operation (ghost-mining talks to ghostd over RPC/ZMQ),
 # but without it a node has no CLI to inspect its own daemon.
 cli_bin="$(find . -name ghost-cli -type f | head -1)"
 if [[ -n "$cli_bin" ]]; then
@@ -608,11 +614,11 @@ else
   log "ghost-cli not found in ${POOL_TARBALL} (older release?) — skipping."
 fi
 # The miner-facing SV2 stratum stack ships in the SAME signed tarball. Without
-# these two binaries a node has ghost-pool's Template Distribution Protocol
+# these two binaries a node has ghost-mining's Template Distribution Protocol
 # running but nothing for miners to connect to, so it can join the mesh yet never
 # serve a single hasher. translator_sv2 accepts Stratum V1 miners (e.g. BitAxe)
 # and translates to SV2; pool_sv2 is the SV2 pool that bridges those miners to
-# ghost-pool's TDP. Both are ALWAYS installed (a v1 node download must be a
+# ghost-mining's TDP. Both are ALWAYS installed (a v1 node download must be a
 # complete, miner-ready node); whether the ports are exposed is decided later by
 # the mining-mode firewall reconcile.
 translator_bin="$(find . -name translator_sv2 -type f | head -1)"
@@ -622,7 +628,7 @@ pool_sv2_bin="$(find . -name pool_sv2 -type f | head -1)"
 [[ -n "$pool_sv2_bin" ]] || err "pool_sv2 was not found in ${POOL_TARBALL}. This installer requires a release that bundles the SV2 stratum stack (translator_sv2 + pool_sv2). Upgrade GHOST_VERSION."
 install -m755 -o root -g root "$pool_sv2_bin" /opt/ghost/bin/pool_sv2
 # ghostd ships in the SAME signed tarball we just GPG- + checksum-verified, so it
-# is installed straight from the extracted tree exactly like ghost-pool — its
+# is installed straight from the extracted tree exactly like ghost-mining — its
 # integrity is covered by the release signature, with no separate download or
 # checksum pin to rot. GHOSTD_URL, if the operator explicitly set it, is an
 # unverified override for transition/testing.
@@ -640,7 +646,7 @@ cd /
 # ─────────────────────────── 4. fresh secrets ────────────────────────────────
 log "Generating fresh node secrets"
 RPCPW="$(openssl rand -hex 32)"
-# internal_api_secret: the shared HMAC secret between ghost-pool and the node
+# internal_api_secret: the shared HMAC secret between ghost-mining and the node
 # dashboard. Generate ONCE and REUSE any existing value on re-runs, so an
 # upgrade/re-provision never rotates it out from under the dashboard (a rotated
 # secret 401s every internal dashboard request).
@@ -653,7 +659,7 @@ fi
 SIGNKEY="$(openssl rand -hex 32)"
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 # Private-mining password. The private modes (private_pool, private_solo) require
-# a miner password — ghost-pool refuses to start without one — so we generate a
+# a miner password — ghost-mining refuses to start without one — so we generate a
 # strong one here (secure by default; well over the 8-char minimum) and surface
 # it to the operator at the end so they can configure their miners. public_pool
 # needs none, so it is left empty and never written to pool.toml.
@@ -690,7 +696,7 @@ dbcache=1024
 #
 # It also means the node contributes far less relay capacity than the hardware allows.
 #
-# Raise this only with the box's memory in mind. ghost-pool already holds a large working
+# Raise this only with the box's memory in mind. ghost-mining already holds a large working
 # set on the smaller nodes (#417/#418), and connections are not free.
 maxconnections=125
 fallbackfee=0.00001
@@ -740,13 +746,13 @@ fi
 log "Writing /etc/ghost/pool.toml"
 # Build the [network] mining block. public_pool emits exactly the historical
 # single line (byte-for-byte unchanged). The private modes append the fields
-# ghost-pool REQUIRES: a miner password for both, plus the operator's solo
+# ghost-mining REQUIRES: a miner password for both, plus the operator's solo
 # payout address for private_solo (99% subsidy + all fees route there).
 MINING_BLOCK="mining_mode = \"${MINING_MODE}\""
 # Tell peers about the farm listener, on exactly the nodes that run one.
 #
 # The listener itself is the translator's ([farm_tier] port, emitted below for public_pool
-# only); this is ghost-pool's advertisement of it. They are separate processes, so the port is
+# only); this is ghost-mining's advertisement of it. They are separate processes, so the port is
 # duplicated — `scripts/check-stratum-config-agreement.sh` keeps the two in step, because a node
 # advertising a port it does not listen on turns a routing decision into a dropped connection.
 #
@@ -873,7 +879,7 @@ enabled = ${REAPER}
 EOF
 
 # Change B: mirror internal_api_secret into the dashboard's INTERNAL_AUTH_KEY so
-# the dashboard always signs internal requests with the SAME secret ghost-pool
+# the dashboard always signs internal requests with the SAME secret ghost-mining
 # validates against. Written as a root-only systemd drop-in in a file SEPARATE
 # from the dashboard's DASHBOARD_PASSWORD override, so rewriting the auth key
 # never clobbers the password (or vice-versa). The dashboard may be installed
@@ -892,7 +898,7 @@ systemctl daemon-reload 2>/dev/null || true
 systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart ghost-dashboard || true
 
 # Wraith mixing coordinator — the `[coordinator]` (CoordinatorConfig) keys
-# ghost-pool reads.
+# ghost-mining reads.
 #
 # The section is written on EVERY node, not only coordinating ones, because an
 # operator cannot opt in to a setting they cannot see. Nodes installed before
@@ -962,21 +968,21 @@ chown -R ghost:ghost /home/ghost /var/lib/ghost /var/lib/bitcoin
 # re-runs, so idempotency was considered for a regenerable value and not for the irreplaceable one.
 if [[ -s /home/ghost/.ghost/node.key ]]; then
   log "Node identity already present — keeping it (node.key is irreplaceable; not regenerating)"
-  sudo -u ghost /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>&1 \
+  sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>&1 \
     | grep -iE "Node ID" || true
 else
   log "Generating node identity"
   sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" \
-    /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
+    /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
 fi
 
 # ───────────────────── 7b. SV2 stratum stack config ──────────────────────────
-# Generate the miner-facing SV2 config the same way ghost-pool's pool.toml is
+# Generate the miner-facing SV2 config the same way ghost-mining's pool.toml is
 # generated above: everything per-node is derived on THIS machine, and no
 # identity or secret from any other node is ever baked in.
 #
 # Data path:  BitAxe (SV1) -> translator_sv2 (:3333) -> pool_sv2 (SV2 :34255)
-#             -> ghost-pool TDP (:8442) -> ghostd
+#             -> ghost-mining TDP (:8442) -> ghostd
 #
 # Two keys tie the stack together, both minted here:
 #   • The SV2 pool AUTHORITY keypair (Noise static identity that pool_sv2 presents
@@ -984,17 +990,17 @@ fi
 #     ship a shared secret, or anyone could impersonate a node's SV2 endpoint to
 #     its miners. The translator pins the matching public half as its upstream
 #     authority_pubkey.
-#   • ghost-pool's TDP authority PUBLIC key, which pool_sv2 must pin to trust this
-#     node's own template server. ghost-pool derives it from the first 32 bytes of
+#   • ghost-mining's TDP authority PUBLIC key, which pool_sv2 must pin to trust this
+#     node's own template server. ghost-mining derives it from the first 32 bytes of
 #     the node identity key (node.key), so we derive the identical value here from
-#     the same file rather than having to scrape it from ghost-pool's logs (which
-#     only appear once ghost-pool is running, hours later after the sync gate).
+#     the same file rather than having to scrape it from ghost-mining's logs (which
+#     only appear once ghost-mining is running, hours later after the sync gate).
 log "Configuring SV2 stratum stack (translator + pool)"
 NODE_KEY_FILE="/home/ghost/.ghost/node.key"
 [[ -s "$NODE_KEY_FILE" ]] || err "Node identity key ${NODE_KEY_FILE} was not generated — cannot configure the SV2 pool."
 
-# ghost-pool's TDP authority public key, derived from THIS node's node.key exactly
-# as ghost-pool does at runtime (identical base58 secp256k1 encoding).
+# ghost-mining's TDP authority public key, derived from THIS node's node.key exactly
+# as ghost-mining does at runtime (identical base58 secp256k1 encoding).
 TDP_PUBKEY="$(/opt/ghost/bin/pool_sv2 --tdp-pubkey-from-keyfile "$NODE_KEY_FILE" 2>/dev/null)" \
   || err "Failed to derive the TDP authority public key. The installed pool_sv2 lacks --tdp-pubkey-from-keyfile; use a release that bundles the SV2 keygen support."
 [[ -n "$TDP_PUBKEY" ]] || err "Derived TDP authority public key is empty."
@@ -1042,7 +1048,7 @@ fi
 cat > /etc/ghost/translator-config.toml <<EOF
 # Bitcoin Ghost — SRI Translator (Stratum V1 -> V2). Generated by install-node.sh.
 #
-# BitAxe (SV1) -> translator (:3333) -> pool_sv2 (SV2 :34255) -> ghost-pool (TDP)
+# BitAxe (SV1) -> translator (:3333) -> pool_sv2 (SV2 :34255) -> ghost-mining (TDP)
 
 # Listen for SV1 miners (standard stratum port)
 downstream_address = "0.0.0.0"
@@ -1168,12 +1174,12 @@ ghost_pool_url = "127.0.0.1:8080"
 poll_interval_secs = 30
 EOF
 
-# pool_sv2 — SV2 pool bridging miners/translators to ghost-pool's TDP. Holds the
+# pool_sv2 — SV2 pool bridging miners/translators to ghost-mining's TDP. Holds the
 # secret half of the authority keypair, so this file is 0600 root-only.
 cat > /etc/ghost/pool-config.toml <<EOF
 # Bitcoin Ghost — SRI Pool (SV2). Generated by install-node.sh.
 #
-# ghost-pool (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333) -> BitAxe
+# ghost-mining (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333) -> BitAxe
 
 # Per-node SV2 authority keypair (Ed25519/secp256k1, generated fresh at install).
 authority_public_key = "${SV2_AUTH_PUB}"
@@ -1183,13 +1189,13 @@ cert_validity_sec = 3600
 # Listen for SV2 miners/translators.
 listen_address = "0.0.0.0:34255"
 
-# Coinbase reward destination. ghost-pool assembles the real coinbase via TDP
+# Coinbase reward destination. ghost-mining assembles the real coinbase via TDP
 # (it controls every output), so this mirrors the node payout address.
 coinbase_reward_script = "addr(${PAYOUT_ADDRESS})"
 
-# Pool identification. pool_signature is kept in step with ghost-pool's coinbase
+# Pool identification. pool_signature is kept in step with ghost-mining's coinbase
 # tag by update-pool-signature.sh (sri-pool ExecStartPre); this is the fallback
-# until ghost-pool has written its coinbase_tag file.
+# until ghost-mining has written its coinbase_tag file.
 server_id = 1
 pool_signature = "- G H O S T -"
 
@@ -1204,10 +1210,10 @@ required_extensions = []
 # Monitoring endpoint (localhost; the translator readiness gate polls it).
 monitoring_address = "127.0.0.1:9090"
 
-# Native share accounting into ghost-pool.
+# Native share accounting into ghost-mining.
 #
-# `secret` is mandatory (H-13) and must match ghost-pool's [network] internal_api_secret —
-# the same ${APISECRET} written into pool.toml above. ghost-pool now requires an HMAC on every
+# `secret` is mandatory (H-13) and must match ghost-mining's [network] internal_api_secret —
+# the same ${APISECRET} written into pool.toml above. ghost-mining now requires an HMAC on every
 # share batch: loopback alone authorised any process on the box to write the payout ledger, and
 # would authorise the internet if :8080 were ever put behind a reverse proxy.
 [share_webhook]
@@ -1237,19 +1243,19 @@ max_retries = 3
 # max_downstream_connections = 512
 # max_connections_per_ip = 64
 
-# Template provider — this node's own ghost-pool TDP server. public_key is the
+# Template provider — this node's own ghost-mining TDP server. public_key is the
 # TDP authority key derived from node.key above.
 [template_provider_type.Sv2Tp]
 address = "127.0.0.1:8442"
 public_key = "${TDP_PUBKEY}"
 EOF
 
-# update-pool-signature.sh keeps pool_signature in sync with ghost-pool's coinbase
-# tag (written by ghost-pool at startup to ~/.ghost/coinbase_tag). Runs as the
+# update-pool-signature.sh keeps pool_signature in sync with ghost-mining's coinbase
+# tag (written by ghost-mining at startup to ~/.ghost/coinbase_tag). Runs as the
 # sri-pool ExecStartPre (root) before each pool_sv2 start.
 cat > /opt/ghost/bin/update-pool-signature.sh <<'EOF'
 #!/bin/bash
-# Sync pool_sv2's pool_signature with ghost-pool's current coinbase tag.
+# Sync pool_sv2's pool_signature with ghost-mining's current coinbase tag.
 TAG=$(cat /home/ghost/.ghost/coinbase_tag 2>/dev/null || echo "- G H O S T -")
 sed -i "s/^pool_signature = .*/pool_signature = \"${TAG}\"/" /etc/ghost/pool-config.toml
 EOF
@@ -1265,35 +1271,73 @@ chown ghost:ghost /etc/ghost/translator-config.toml
 chmod 644 /etc/ghost/translator-config.toml
 
 # ───────────────────────── 8. sync gate (auto) ───────────────────────────────
-# Start ghost-pool only AFTER ghostd finishes its initial sync. An unsynced node
+# Start ghost-mining only AFTER ghostd finishes its initial sync. An unsynced node
 # participating in checkpoint consensus just spams "wrong proposer" and can't
 # vote — so we gate it. On a normal reboot ghostd is already synced, so the gate
 # returns almost immediately.
 log "Installing sync gate"
-cat > /opt/ghost/bin/wait-for-ghostd-sync.sh <<'EOF'
+# Inlined copy of scripts/ops/fleet-files/wait-for-ghostd-sync.sh, kept byte-identical by
+# scripts/check-inlined-copies.sh. It used to be a shorter variant of it, which is how the
+# fleet came to run three versions of this file (#759).
+cat > /opt/ghost/bin/wait-for-ghostd-sync.sh <<'WAIT_FOR_GHOSTD_SYNC_EOF'
 #!/usr/bin/env bash
+#
+# Deployed to /opt/ghost/bin/wait-for-ghostd-sync.sh — the ExecStart of
+# ghost-mining-gate.service. ghost-mining and ghost-pay are BOTH disabled at boot;
+# this gate is what starts them, once ghostd reports it has left initial block
+# download. Starting ghost-mining against a syncing ghostd is what the gate exists
+# to prevent.
+#
+# This file is the canonical copy (#759). It used to exist only on the fleet, in
+# three variants that no repo file governed:
+#
+#   * vm1-vm5  escaped-double-quote form — the signature of a payload pushed over
+#              ssh with its quotes eaten locally, and NO ghost-pay block
+#   * vm6-vm7  identical logic, single-quoted, still no ghost-pay block
+#   * vm8      this file — the only copy that starts ghost-pay, on the one node
+#              that has no ghost-pay installed
+#
+# The split was inert (vm1-vm4 start ghost-pay because ghost-gsp.service happens
+# to carry `Wants=ghost-pay.service`), but it was inert by accident. Drop that
+# Wants and ghost-pay silently stops coming back after a reboot, with nothing
+# reporting it. The gate owns the start explicitly instead.
+#
+# Change this file, then run scripts/ops/deploy-fleet-file.sh to converge the
+# fleet. check-fleet-uniformity.sh fails if any node drifts from what is here.
 set -u
 CONF=/etc/bitcoin/bitcoin.conf
 RPCUSER=$(grep -m1 '^rpcuser=' "$CONF" | cut -d= -f2-)
 RPCPW=$(grep -m1 '^rpcpassword=' "$CONF" | cut -d= -f2-)
-echo "[ghost-pool-gate] waiting for ghostd to finish initial sync..."
+echo "[ghost-mining-gate] waiting for ghostd to finish initial sync..."
 while true; do
   RESP=$(curl -s --max-time 8 --user "$RPCUSER:$RPCPW" \
     --data '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
     http://127.0.0.1:8332/ 2>/dev/null)
   IBD=$(echo "$RESP" | grep -oE '"initialblockdownload":[[:space:]]*(true|false)' | grep -oE 'true|false')
   if [ "$IBD" = "false" ]; then
-    echo "[ghost-pool-gate] ghostd synced — starting ghost-pool"
-    systemctl start ghost-pool
+    # The node unit was `ghost-pool` until #1018, and this file reaches a node separately from
+    # that rename — deploy-fleet-file.sh before it, or the unit switch before this. Start
+    # whichever the node has, so neither order leaves a node that does not mine after a reboot.
+    UNIT=ghost-mining
+    [ -e /etc/systemd/system/ghost-mining.service ] || UNIT=ghost-pool
+    echo "[ghost-mining-gate] ghostd synced — starting $UNIT"
+    systemctl start "$UNIT"
+    # ghost-pay (when installed) also needs a live ghostd + ghost-mining, so the
+    # gate owns its first start too — mirrors ghost-mining, which is not enabled
+    # at boot.
+    if [ -f /etc/systemd/system/ghost-pay.service ]; then
+      echo "[ghost-mining-gate] starting ghost-pay"
+      systemctl start ghost-pay
+    fi
     exit 0
   fi
   sleep 30
 done
-EOF
+WAIT_FOR_GHOSTD_SYNC_EOF
 chmod 755 /opt/ghost/bin/wait-for-ghostd-sync.sh
-cat > /etc/systemd/system/ghost-pool-gate.service <<'EOF'
+cat > /etc/systemd/system/ghost-mining-gate.service <<'EOF'
 [Unit]
-Description=Ghost Pool sync gate (starts ghost-pool once ghostd is synced)
+Description=Ghost Mining sync gate (starts ghost-mining once ghostd is synced)
 After=ghostd.service network-online.target
 Wants=network-online.target
 [Service]
@@ -1331,9 +1375,9 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-cat > /etc/systemd/system/ghost-pool.service <<EOF
+cat > /etc/systemd/system/ghost-mining.service <<EOF
 [Unit]
-Description=Ghost Pool node
+Description=Ghost Mining node
 After=network-online.target ghostd.service
 Wants=network-online.target
 [Service]
@@ -1341,7 +1385,7 @@ Type=simple
 User=ghost
 Group=ghost
 WorkingDirectory=/var/lib/ghost
-ExecStart=/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --tdp-enabled --tdp-port 8442 --stratum-port 3333
+ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --tdp-enabled --tdp-port 8442 --stratum-port 3333
 Environment=RUST_LOG=info
 Environment=ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params
 Restart=on-failure
@@ -1352,19 +1396,19 @@ WantedBy=multi-user.target
 EOF
 
 # MPC startup mode — GENESIS-ANCHORED (join path), written as a systemd drop-in
-# to match the fleet convention (ghost-pool.service.d/genesis-anchor.conf). A
+# to match the fleet convention (ghost-mining.service.d/genesis-anchor.conf). A
 # fresh community node joining a still-rolling ceremony must NOT carry a static
 # ZK_PARAMS_HASH pin (a stale pin makes it reject the ceremony's current params);
 # it runs genesis-anchored instead, validating the current params back to the
 # immutable mainnet genesis lineage anchor. `cat >` overwrites on every run, so
 # this is idempotent; the later `systemctl daemon-reload` picks it up.
-mkdir -p /etc/systemd/system/ghost-pool.service.d
-cat > /etc/systemd/system/ghost-pool.service.d/genesis-anchor.conf <<EOF
+mkdir -p /etc/systemd/system/ghost-mining.service.d
+cat > /etc/systemd/system/ghost-mining.service.d/genesis-anchor.conf <<EOF
 [Service]
 # ZK_GENESIS_PARAMS_HASH is the IMMUTABLE mainnet genesis MPC params hash — the
 # ceremony's trust root, baked into the installer exactly like a genesis block
 # hash is baked into a client. It is NEVER fetched from a peer (untrusted). With
-# this set and NO static ZK_PARAMS_HASH, ghost-pool accepts the ceremony's
+# this set and NO static ZK_PARAMS_HASH, ghost-mining accepts the ceremony's
 # current rolling params (verified to chain back to this anchor) and self-pins
 # once the ceremony ossifies at position 101 — correct for both states.
 Environment=ZK_GENESIS_PARAMS_HASH=${ZK_GENESIS_PARAMS_HASH}
@@ -1376,18 +1420,18 @@ EOF
 # Written as a sibling drop-in (merged with the base unit like genesis-anchor.conf
 # above) so it can ship to existing nodes without rewriting the whole unit; the
 # later `systemctl daemon-reload` picks it up and it takes effect on the next
-# ghost-pool restart. ghost-pool's own logs come from its in-process ring buffer
+# ghost-mining restart. ghost-mining's own logs come from its in-process ring buffer
 # and need no privilege.
-cat > /etc/systemd/system/ghost-pool.service.d/journal-access.conf <<EOF
+cat > /etc/systemd/system/ghost-mining.service.d/journal-access.conf <<EOF
 [Service]
 SupplementaryGroups=systemd-journal
 EOF
 
-# SV2 stratum stack units. sri-pool bridges ghost-pool's TDP to SV2 miners; the
+# SV2 stratum stack units. sri-pool bridges ghost-mining's TDP to SV2 miners; the
 # translator fronts it for SV1 miners. sri-pool runs as root (it rewrites its own
 # pool_signature via update-pool-signature.sh before each start); the translator
 # runs as the unprivileged ghost user. Both use Restart=always: at first boot
-# ghost-pool is still behind the sync gate, so the stack simply retries until the
+# ghost-mining is still behind the sync gate, so the stack simply retries until the
 # TDP server is up, then connects — no manual ordering needed. These are installed
 # in EVERY mining mode so any node can serve miners; the firewall (below) decides
 # whether the ports are reachable from off-box.
@@ -1396,8 +1440,8 @@ EOF
 cat > /etc/systemd/system/sri-pool.service <<'SRI_POOL_SERVICE_EOF'
 [Unit]
 Description=SRI Pool (SV2) - Ghost Network
-After=network.target ghost-pool.service
-Wants=ghost-pool.service
+After=network.target ghost-mining.service
+Wants=ghost-mining.service
 [Service]
 Type=simple
 User=root
@@ -1411,12 +1455,12 @@ ExecStart=/opt/ghost/bin/pool_sv2 --config /etc/ghost/pool-config.toml
 # they are what pinned down #898.
 Environment=RUST_LOG=info,pool_sv2::channel_manager::mining_message_handler=debug,pool_sv2::share_webhook=debug
 # ⛔ pool_sv2 holds the world-open SV2 miner port (:34255) and was the ONLY one of the four units
-# without this, so it inherited the default SOFT limit of 1024 while ghostd, ghost-pool and
+# without this, so it inherited the default SOFT limit of 1024 while ghostd, ghost-mining and
 # sri-translator all set 65536.
 #
 # MEASURED on the live fleet before this line existed:
 #   sri-pool    LimitNOFILE 524288  soft 1024
-#   ghost-pool  LimitNOFILE 65536   soft 65536
+#   ghost-mining  LimitNOFILE 65536   soft 65536
 #
 # A process is bounded by its SOFT limit unless it raises it itself, so the miner-facing process
 # capped near 1,000 descriptors against a configured ceiling of 1,000 miners — and a miner
@@ -1490,7 +1534,7 @@ PORTS=(3333 34255)
 # External miners are accepted in public_pool AND private_pool — both open the
 # Stratum ports (public_pool to anyone, private_pool to password-holders). Only
 # private_solo keeps them closed. mining_mode is the single source of truth: the
-# legacy public_mining bool was removed and is ignored by ghost-pool, so we key
+# legacy public_mining bool was removed and is ignored by ghost-mining, so we key
 # purely off mining_mode here to stay consistent with the running node.
 accept_miners="no"
 if [[ -r "$CONF" ]] \
@@ -1587,7 +1631,7 @@ cat > /opt/ghost/bin/ghost-auto-update.sh <<'GHOST_AUTOUPDATE_SH_EOF'
 # strict no-op unless the operator has opted in via /etc/ghost/auto-update.conf
 # (AUTO_UPDATE=true). When opted in, it resolves the latest published release,
 # and — ONLY if it is newer than what is installed — downloads the signed
-# release tarball (which now bundles ghostd alongside ghost-pool/ghost-pay),
+# release tarball (which now bundles ghostd alongside ghost-mining/ghost-pay),
 # verifies the detached GPG signature against the pinned release key and the
 # tarball's SHA256, backs up the current binaries, swaps them with a
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
@@ -1672,14 +1716,14 @@ EOF
 normver() { local v="$1"; echo "${v#v}"; }
 
 # Installed version: prefer the file we write on update, fall back to parsing
-# `ghost-pool --version` (clap prints "ghost-pool <semver>").
+# `ghost-mining --version` (clap prints "ghost-mining <semver>").
 read_installed_version() {
   if [[ -r "$VERSION_FILE" ]]; then
     local v; v="$(tr -d '[:space:]' < "$VERSION_FILE")"
     [[ -n "$v" ]] && { echo "$v"; return 0; }
   fi
-  if [[ -x "$BIN_DIR/ghost-pool" ]]; then
-    local out; out="$("$BIN_DIR/ghost-pool" --version 2>/dev/null || true)"
+  if [[ -x "$BIN_DIR/ghost-mining" ]]; then
+    local out; out="$("$BIN_DIR/ghost-mining" --version 2>/dev/null || true)"
     local v; v="$(echo "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
     [[ -n "$v" ]] && { echo "v$v"; return 0; }
   fi
@@ -1756,12 +1800,12 @@ health_ghost_pool() {
     resp="$(curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null || true)"
     pc="$(echo "$resp" | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
     if [[ -n "$pc" && "$pc" -gt 0 ]]; then
-      log "health: ghost-pool /health peer_count=$pc"
+      log "health: ghost-mining /health peer_count=$pc"
       return 0
     fi
     sleep 2
   done
-  err "health: ghost-pool /health peer_count not > 0 (last='${pc:-none}')"
+  err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}')"
   return 1
 }
 
@@ -1830,6 +1874,15 @@ main() {
   fi
   log "newer version available: $installed -> $latest"
 
+  # This updater stops and starts `ghost-mining.service`. A node still running the unit under
+  # its old name (#1018) has no such unit: the stop would be a no-op, the binary would be
+  # swapped under a live process, and the start would fail. Refuse before downloading anything.
+  if [[ ! -e /etc/systemd/system/ghost-mining.service && -e /etc/systemd/system/ghost-pool.service ]]; then
+    err "this node's unit is still ghost-pool.service — rename it first (scripts/ops/rename-node-unit.sh)"
+    write_status "error" "node unit not renamed to ghost-mining" "$latest"
+    exit 1
+  fi
+
   # 3. Download artefacts to an isolated temp dir.
   local tarball release_base tmp gnupg
   tarball="bitcoin-ghost-${latest}-x86_64-unknown-linux-gnu.tar.gz"
@@ -1882,18 +1935,18 @@ main() {
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
   local new_pool new_pay new_cli new_ghostd
-  new_pool="$(find "$tmp" -name ghost-pool -type f | head -1 || true)"
+  new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
   new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
-  [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-pool"; write_status "error" "tarball missing ghost-pool" "$latest"; exit 1; }
+  [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
   # Build the swap plan: (dest <- src), only for binaries currently installed
   # (so we never introduce ghost-pay onto a node that opted out of it).
   local -a SWAP_DEST=() SWAP_SRC=()
   SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$new_ghostd")
-  SWAP_DEST+=("$BIN_DIR/ghost-pool"); SWAP_SRC+=("$new_pool")
+  SWAP_DEST+=("$BIN_DIR/ghost-mining"); SWAP_SRC+=("$new_pool")
   if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")
   fi
@@ -1927,7 +1980,7 @@ main() {
   rollback() {
     err "rolling back to pre-update binaries"
     stop_and_wait ghost-pay.service || true
-    stop_and_wait ghost-pool.service || true
+    stop_and_wait ghost-mining.service || true
     stop_and_wait ghostd.service || true
     local j
     for j in "${!BACKUP_DEST[@]}"; do
@@ -1935,14 +1988,14 @@ main() {
     done
     $SYSTEMCTL start ghostd.service || true
     sleep 3
-    $SYSTEMCTL start ghost-pool.service || true
+    $SYSTEMCTL start ghost-mining.service || true
     unit_present ghost-pay.service && { $SYSTEMCTL start ghost-pay.service || true; }
     return 0  # never let the rollback's last status trip `set -e` in the caller
   }
 
   # 7. Stop services (reverse dependency order), verify inactive.
   stop_and_wait ghost-pay.service || true
-  stop_and_wait ghost-pool.service || { err "ghost-pool would not stop — rolling back"; rollback; write_status "rolled-back" "ghost-pool failed to stop" "$latest"; exit 1; }
+  stop_and_wait ghost-mining.service || { err "ghost-mining would not stop — rolling back"; rollback; write_status "rolled-back" "ghost-mining failed to stop" "$latest"; exit 1; }
   stop_and_wait ghostd.service    || { err "ghostd would not stop — rolling back"; rollback; write_status "rolled-back" "ghostd failed to stop" "$latest"; exit 1; }
 
   # 8. Swap the verified binaries into place atomically (install = temp+rename).
@@ -1964,7 +2017,7 @@ main() {
   # 9. Start services (dependency order).
   $SYSTEMCTL start ghostd.service || { err "ghostd failed to start — rolling back"; rollback; write_status "rolled-back" "ghostd failed to start" "$latest"; exit 1; }
   sleep 3
-  $SYSTEMCTL start ghost-pool.service || { err "ghost-pool failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-pool failed to start" "$latest"; exit 1; }
+  $SYSTEMCTL start ghost-mining.service || { err "ghost-mining failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-mining failed to start" "$latest"; exit 1; }
   if unit_present ghost-pay.service; then
     $SYSTEMCTL start ghost-pay.service || { err "ghost-pay failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-pay failed to start" "$latest"; exit 1; }
   fi
@@ -2072,7 +2125,15 @@ set -uo pipefail
 # the same class of problem as the hang it now looks for.
 CONF="${CONF:-/etc/ghost/restart-watch.conf}"
 STATE_DIR="${STATE_DIR:-/var/lib/ghost/restart-watch}"
-UNITS="ghost-pool sri-pool sri-translator ghostd"
+# The node unit was `ghost-pool` until #1018. deploy-node.sh converges THIS script before it
+# switches the unit, and a node that is never deployed to never switches — so watch whichever
+# name the node has. Naming only the new one would skip the unit silently on such a node (the
+# loop below `continue`s past a unit that does not exist), which is a watchdog watching three
+# things and reporting on four. Never both: after the switch the old name is an alias of the
+# same unit, and listing it too would raise every alert twice.
+NODE_UNIT=ghost-mining
+systemctl cat ghost-mining.service >/dev/null 2>&1 || NODE_UNIT=ghost-pool
+UNITS="$NODE_UNIT sri-pool sri-translator ghostd"
 
 NODE_API="127.0.0.1:8080"
 INTERNAL_AUTH_KEY=""
@@ -2090,14 +2151,14 @@ LIVENESS_RESTART="${LIVENESS_RESTART:-false}"
 # These are the SAME ports deploy-node.sh uses as its READY_PORT gate after a swap — that path
 # already treats "listening here" as the definition of a working unit, and it would be worse
 # than useless for the two to disagree about what healthy means. Measured on the fleet, not
-# assumed: ghost-pool also holds 8080/8443/8555-8563, sri-translator also holds 4444/9092; the
+# assumed: ghost-mining also holds 8080/8443/8555-8563, sri-translator also holds 4444/9092; the
 # port named here is the one whose absence means the unit is not doing its job.
 liveness_port_for() {
     case "$1" in
-        ghost-pool)      echo 8442 ;;   # TDP, what pool_sv2 connects to
+        ghost-mining|ghost-pool) echo 8442 ;;  # TDP, what pool_sv2 connects to
         sri-pool)        echo 34255 ;;  # SV2, what the translator connects to
         sri-translator)  echo 3333 ;;   # SV1, what miners connect to
-        ghostd)          echo 8332 ;;   # RPC, what ghost-pool depends on
+        ghostd)          echo 8332 ;;   # RPC, what ghost-mining depends on
         *)               echo "" ;;
     esac
 }
@@ -2107,7 +2168,7 @@ liveness_port_for() {
 # Fall back to the node's own configured secret so an operator does not have to copy it
 # into a second file — the whole point of this change is to stop duplicating config.
 if [ -z "$INTERNAL_AUTH_KEY" ]; then
-    # ⚠ The key is `internal_api_secret` under [network] — that is what ghost-pool reads
+    # ⚠ The key is `internal_api_secret` under [network] — that is what ghost-mining reads
     # (`config.network.internal_api_secret` -> `InternalAuth::from_hex`). This used to grep for
     # `internal_auth_key`, a name that exists nowhere in the codebase or any config, so the
     # lookup ALWAYS came back empty, the POST always went unsigned, and the endpoint always
@@ -2265,7 +2326,7 @@ cat > /etc/systemd/system/ghost-restart-watch.service <<'GHOST_RESTART_WATCH_SER
 Description=Bitcoin Ghost restart-loop watchdog
 Documentation=https://github.com/bitcoin-ghost/ghost/issues/412
 # Only meaningful once the node is up; never block boot on it.
-After=network-online.target ghostd.service ghost-pool.service
+After=network-online.target ghostd.service ghost-mining.service
 Wants=network-online.target
 
 [Service]
@@ -2386,7 +2447,7 @@ cat > /etc/systemd/system/ghost-auto-update.service <<'GHOST_AUTOUPDATE_SERVICE_
 Description=Bitcoin Ghost opt-in node auto-update (verifies GPG signature before applying)
 Documentation=https://get.bitcoinghost.org
 # Only meaningful once the node is up; never block boot on it.
-After=network-online.target ghostd.service ghost-pool.service
+After=network-online.target ghostd.service ghost-mining.service
 Wants=network-online.target
 
 [Service]
@@ -2448,33 +2509,33 @@ fi
 log "Starting services"
 systemctl daemon-reload
 systemctl enable --now ghostd >/dev/null 2>&1
-# ghost-pool is NOT started here — the gate starts it once ghostd is synced.
-# ghost-pool.service is installed but left disabled; the (enabled) gate owns it.
-systemctl enable --now ghost-pool-gate >/dev/null 2>&1
+# ghost-mining is NOT started here — the gate starts it once ghostd is synced.
+# ghost-mining.service is installed but left disabled; the (enabled) gate owns it.
+systemctl enable --now ghost-mining-gate >/dev/null 2>&1
 # The SV2 stratum stack is enabled now so it survives reboots and starts serving
-# the moment ghost-pool comes up behind the gate. Both units are Restart=always,
-# so starting them before ghost-pool is fine — they retry until the TDP server is
+# the moment ghost-mining comes up behind the gate. Both units are Restart=always,
+# so starting them before ghost-mining is fine — they retry until the TDP server is
 # reachable rather than failing the install.
 systemctl enable --now sri-pool >/dev/null 2>&1
 systemctl enable --now sri-translator >/dev/null 2>&1
 sleep 5
 
-NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
+NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
 cat <<EOF
 
   ✅ Bitcoin Ghost node installed.
      ${NODE_ID}
      ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
-     ghost-pool-gate: $(systemctl is-active ghost-pool-gate)  (waiting for sync, then auto-starts ghost-pool)
-     sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — connects to ghost-pool's TDP once it is up)
+     ghost-mining-gate: $(systemctl is-active ghost-mining-gate)  (waiting for sync, then auto-starts ghost-mining)
+     sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — connects to ghost-mining's TDP once it is up)
      sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — serves miners on port 3333)
 
-  ghost-pool starts AUTOMATICALLY once ghostd finishes syncing — then your node
+  ghost-mining starts AUTOMATICALLY once ghostd finishes syncing — then your node
   joins the mesh and registers as an Elder if slots remain (first 101). The SV2
   stratum stack (sri-pool + sri-translator) is already installed and will begin
-  serving miners on Stratum port 3333 (SV1) / 34255 (SV2) as soon as ghost-pool
+  serving miners on Stratum port 3333 (SV1) / 34255 (SV2) as soon as ghost-mining
   is up. Point a miner at:  stratum+tcp://${PUBIP}:3333
-  Watch the gate:    sudo journalctl -u ghost-pool-gate -f
+  Watch the gate:    sudo journalctl -u ghost-mining-gate -f
   Watch the stratum: sudo journalctl -u sri-pool -u sri-translator -f
 EOF
 

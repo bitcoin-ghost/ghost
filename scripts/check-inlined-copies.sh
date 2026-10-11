@@ -41,6 +41,16 @@ PAIRS = {
     # `RUST_LOG`, while all 8 production nodes run the installer's copy. The repo copy was
     # not merely stale, it was never deployed by anything -- so nothing contradicted it.
     "SRI_POOL_SERVICE_EOF":            "config/sri/sri-pool.service",
+    # Added with the ghost-mining rename (#1018). The installer carried a SHORTER variant of this
+    # script than the fleet's canonical one — no ghost-pay start — under an anonymous `EOF`, so
+    # a node installed today booted through different gate logic than the eight it joined.
+    "WAIT_FOR_GHOSTD_SYNC_EOF":        "scripts/ops/fleet-files/wait-for-ghostd-sync.sh",
+    # The auto-updater stops, swaps and starts the node unit BY NAME, so a copy that missed the
+    # rename would have updated nothing or everything wrongly. The pair had already drifted by
+    # one comment line when it was first compared.
+    "GHOST_AUTOUPDATE_SH_EOF":        "scripts/ghost-auto-update.sh",
+    "GHOST_AUTOUPDATE_SERVICE_EOF":   "scripts/systemd/ghost-auto-update.service",
+    "GHOST_AUTOUPDATE_TIMER_EOF":     "scripts/systemd/ghost-auto-update.timer",
 }
 
 src = open(INSTALLER).read()

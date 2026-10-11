@@ -11,7 +11,7 @@
 #
 # Every one of these counters has a way of reading healthy while nothing works:
 #
-# ⛔ `journalctl -u ghost-pool -p err` returns 0 FOREVER. ghost-pool logs everything at info,
+# ⛔ `journalctl -u ghost-mining -p err` returns 0 FOREVER. ghost-mining logs everything at info,
 #    including its own `ERROR` lines — severity is in the message text, not the priority. Measured
 #    2026-08-21: `-p err` = 0 while `grep " ERROR "` = 3.
 # ⛔ `grep -ci finalis` counts the FAILURE line, "no payout checkpoint has finalised for N blocks".
@@ -58,7 +58,7 @@ for node in $NODES; do
               "HOURS=$HOURS bash -s" <<'REMOTE' 2>/dev/null
 set -u
 S=$(command -v sudo >/dev/null && echo sudo || echo)
-log=$($S journalctl -u ghost-pool --since "${HOURS} hours ago" --no-pager 2>/dev/null)
+log=$($S journalctl -u ghost-mining --since "${HOURS} hours ago" --no-pager 2>/dev/null)
 
 # Positive control FIRST: if the journal yields nothing at all, every counter below is a zero
 # that means "not measured", and must not be read as "nothing happened".

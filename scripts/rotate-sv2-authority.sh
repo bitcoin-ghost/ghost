@@ -31,7 +31,7 @@ TRAN_READY_TIMEOUT=180
 restore() {
     cp -a "${POOL_CONF}.bak.${STAMP}" "$POOL_CONF"
     cp -a "${TRAN_CONF}.bak.${STAMP}" "$TRAN_CONF"
-    # pool.toml too, and ghost-pool below to reload it. A rollback that restores the
+    # pool.toml too, and ghost-mining below to reload it. A rollback that restores the
     # SERVED key but leaves the ADVERTISED one rolled forward is the exact drift this
     # script exists to prevent — the pool would answer on the old key while the API
     # told miners to pin the new one.
@@ -42,7 +42,7 @@ restore() {
         sleep 1
     done
     systemctl restart sri-translator || true
-    systemctl restart ghost-pool || true
+    systemctl restart ghost-mining || true
 }
 
 # REFUSE if anything outside this box is connected to the SV2 port.

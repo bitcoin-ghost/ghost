@@ -36,7 +36,7 @@
 # USAGE
 #   scripts/ops/clear-stranded-evidence.sh <node> [--dry-run]
 #
-# Stops `ghost-pool` for the delete. `ghostd` stays up throughout.
+# Stops `ghost-mining` for the delete. `ghostd` stays up throughout.
 
 set -euo pipefail
 
@@ -79,8 +79,8 @@ if [ "$DRY_RUN" = "--dry-run" ]; then
 fi
 [ "$N_SAFE" -gt 0 ] || { say "nothing to clear"; exit 0; }
 
-say "stopping ghost-pool (ghostd stays up)"
-remote "sudo systemctl stop ghost-pool"
+say "stopping ghost-mining (ghostd stays up)"
+remote "sudo systemctl stop ghost-mining"
 
 say "deleting $N_SAFE summarised rows"
 START=$(date +%s)
@@ -121,8 +121,8 @@ say "integrity check"
 INTEG=$(remote "sudo sqlite3 'file:$DB?mode=ro' 'PRAGMA integrity_check;' | head -1")
 [ "$INTEG" = "ok" ] || die "integrity_check said '$INTEG' — do NOT restart the pool"
 
-remote "sudo systemctl start ghost-pool"
+remote "sudo systemctl start ghost-mining"
 sleep 20
-ACTIVE=$(remote "systemctl is-active ghost-pool")
-[ "$ACTIVE" = "active" ] || die "ghost-pool did not come back ($ACTIVE)"
+ACTIVE=$(remote "systemctl is-active ghost-mining")
+[ "$ACTIVE" = "active" ] || die "ghost-mining did not come back ($ACTIVE)"
 say "OK: $NODE cleared, pool active"

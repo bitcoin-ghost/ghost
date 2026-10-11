@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Start / stop a regtest ghostd for the ghost-pool e2e targets (#770).
+# Start / stop a regtest ghostd for the ghost-mining e2e targets (#770).
 #
 # ## Why this exists
 #
-# Three ghost-pool e2e files return early when no regtest node is reachable. Nothing in CI
+# Three ghost-mining e2e files return early when no regtest node is reachable. Nothing in CI
 # ever started one, so they were built, run, printed SKIP, and reported green — seven tests
 # that had never executed. `GHOST_REGTEST_REQUIRED=1` makes an absent node a FAILURE rather
 # than a skip, and this script is what makes that requirement satisfiable.

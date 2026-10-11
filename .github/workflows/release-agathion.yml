@@ -1,7 +1,7 @@
 name: Release Agathion
 
 # Triggered on Agathion-specific tags so the repo-wide `v*` tags (which build
-# ghost-pool / ghost-cli / etc.) and the `wraith-v*` tags don't accidentally cut
+# ghost-mining / ghost-cli / etc.) and the `wraith-v*` tags don't accidentally cut
 # an Agathion Node release. Agathion Node is the operator dashboard and is a
 # SEPARATE download from the node binaries — packaged as a Next.js standalone
 # bundle, launched with its custom auth-relay `server.js`.

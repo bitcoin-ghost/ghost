@@ -18,7 +18,7 @@
 # ~1.8-2.4 GB per node of syslog alone, and vm1 reached 90% of a 79 GB disk. A full
 # root disk is not a logging problem: on 2026-08-01 it truncated
 # /var/lib/bitcoin/settings.json to 0 bytes and ghostd crash-looped 125 times for an
-# hour while ghost-pool kept answering /health on its existing RPC connection, so
+# hour while ghost-mining kept answering /health on its existing RPC connection, so
 # nothing looked wrong. See the incident notes on #582/#584.
 #
 # ## Why this edits the stock file rather than adding its own

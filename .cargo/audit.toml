@@ -16,7 +16,7 @@ ignore = [
     # --- Unmaintained: gtk3 / webkit desktop-GUI stack (Tauri on Linux). ---
     # Upstream gtk-rs abandoned gtk3 for gtk4; webkit2gtk/Tauri still require
     # gtk3, so there is no maintained replacement. GUI crates only — not in any
-    # shipped node binary (ghost-pool / translator_sv2 / pool_sv2 / ghost-pay / …).
+    # shipped node binary (ghost-mining / translator_sv2 / pool_sv2 / ghost-pay / …).
     "RUSTSEC-2024-0413",  # atk
     "RUSTSEC-2024-0416",  # atk-sys
     "RUSTSEC-2024-0412",  # gdk
@@ -70,7 +70,7 @@ ignore = [
     # Two DoS advisories (quadratic run time on duplicate start-tag attributes;
     # unbounded namespace-declaration allocation in NsReader). quick-xml is pulled
     # ONLY via `plist` (Apple .plist parsing) in the desktop / macOS app-bundling
-    # path — not in any shipped node binary (ghost-pool / translator_sv2 / pool_sv2
+    # path — not in any shipped node binary (ghost-mining / translator_sv2 / pool_sv2
     # / ghost-pay / ghostd; confirmed via cargo tree — no host-target dependents).
     # `plist` reads local, trusted property lists, never untrusted network input, so
     # the DoS is unreachable in ghost's usage. The fix (quick-xml >= 0.41) is

@@ -13,7 +13,7 @@ PORTS=(3333 34255)
 # External miners are accepted in public_pool AND private_pool — both open the
 # Stratum ports (public_pool to anyone, private_pool to password-holders). Only
 # private_solo keeps them closed. mining_mode is the single source of truth: the
-# legacy public_mining bool was removed and is ignored by ghost-pool, so we key
+# legacy public_mining bool was removed and is ignored by ghost-mining, so we key
 # purely off mining_mode here to stay consistent with the running node.
 accept_miners="no"
 if [[ -r "$CONF" ]] \

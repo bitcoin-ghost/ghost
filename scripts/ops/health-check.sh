@@ -77,7 +77,7 @@ check_node() {
     local name="${VM_NAMES[$idx]}"
     local out="$TMPDIR_HEALTH/$idx"
 
-    # 1. ghost-pool reachable
+    # 1. ghost-mining reachable
     if curl -sf --connect-timeout 3 "http://$ip:$POOL_PORT/health" >/dev/null 2>&1; then
         echo "pool_ok=1" >> "$out"
     else
@@ -100,7 +100,7 @@ check_node() {
     [[ -z "$block_height" ]] && block_height="?"
     echo "block_height=$block_height" >> "$out"
 
-    # 4. L2 block height (from ghost-pool's authoritative checkpoint state)
+    # 4. L2 block height (from ghost-mining's authoritative checkpoint state)
     local l2_height
     l2_height=$(curl -sf --connect-timeout 3 "http://$ip:$POOL_PORT/api/v1/l2/tree-state" 2>/dev/null \
         | jq -r '.checkpoint_height // "?"' 2>/dev/null) || l2_height="?"
@@ -123,7 +123,7 @@ check_node() {
 
     # 7. Service status via SSH
     local svc_status
-    svc_status=$(ssh $SSH_OPTS "root@$ip" "systemctl is-active ghost-pool" 2>/dev/null) || svc_status="unknown"
+    svc_status=$(ssh $SSH_OPTS "root@$ip" "systemctl is-active ghost-mining" 2>/dev/null) || svc_status="unknown"
     [[ -z "$svc_status" ]] && svc_status="unknown"
     echo "svc_status=$svc_status" >> "$out"
 }
@@ -185,7 +185,7 @@ for i in "${!VM_IPS[@]}"; do
 
     if [[ "${R_POOL_OK[$i]}" != "1" ]]; then
         HAS_PROBLEMS=true
-        ALERT_PARTS+=("$name ghost-pool DOWN")
+        ALERT_PARTS+=("$name ghost-mining DOWN")
     fi
 
     if [[ "${R_PAY_OK[$i]}" != "1" ]]; then
@@ -342,7 +342,7 @@ echo -e "└──────────┴─────────┴─�
 for i in "${!VM_IPS[@]}"; do
     svc="${R_SVC[$i]}"
     if [[ "$svc" != "active" ]]; then
-        echo -e "  ${RED}⚠${RESET}  ${VM_NAMES[$i]} ghost-pool.service: ${RED}${svc}${RESET}"
+        echo -e "  ${RED}⚠${RESET}  ${VM_NAMES[$i]} ghost-mining.service: ${RED}${svc}${RESET}"
     fi
 done
 

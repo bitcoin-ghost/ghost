@@ -44,7 +44,7 @@ nano mainnet.env
 ### 3. Start the Pool
 
 ```bash
-source mainnet.env && ghost-pool --config mainnet.toml
+source mainnet.env && ghost-mining --config mainnet.toml
 ```
 
 ## Mining Modes

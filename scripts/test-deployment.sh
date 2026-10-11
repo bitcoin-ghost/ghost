@@ -95,13 +95,13 @@ api_get() {
 check_logs() {
     local ip="$1" pattern="$2" since="${3:-5 minutes ago}"
     local count
-    count=$(ssh_cmd "$ip" "journalctl -u ghost-pool --since '$since' --no-pager 2>/dev/null | grep -ic '$pattern' 2>/dev/null || echo 0" 2>/dev/null)
+    count=$(ssh_cmd "$ip" "journalctl -u ghost-mining --since '$since' --no-pager 2>/dev/null | grep -ic '$pattern' 2>/dev/null || echo 0" 2>/dev/null)
     echo "${count:-0}" | tr -d '[:space:]'
 }
 
 get_logs() {
     local ip="$1" since="${2:-5 minutes ago}" lines="${3:-50}"
-    ssh_cmd "$ip" "journalctl -u ghost-pool --since '$since' --no-pager" 2>/dev/null | tail -n "$lines"
+    ssh_cmd "$ip" "journalctl -u ghost-mining --since '$since' --no-pager" 2>/dev/null | tail -n "$lines"
 }
 
 wait_for() {
@@ -741,7 +741,7 @@ phase_3() {
     # Helper: create an attack tx and check template presence
     # For attacks we need custom scriptPubKey/witness patterns.
     # Many of these will be rejected by Bitcoin Core's mempool policy before
-    # reaching ghost-pool's template. We check template absence on reaper nodes
+    # reaching ghost-mining's template. We check template absence on reaper nodes
     # and optionally presence on standard nodes.
 
     # 3.1 Ordinals inscription (OP_FALSE OP_IF "ord")
@@ -1269,17 +1269,17 @@ TXCOUNT_EOF
     tx_count=$(echo "$tx_count" | tail -1 | tr -d '[:space:]')
     # If mempool is empty we'd naturally be subsidy-only. Otherwise just verify
     # the code path exists by checking no errors in logs.
-    # Only count CRITICAL errors from the CURRENT ghost-pool process (not stale logs from before restart)
+    # Only count CRITICAL errors from the CURRENT ghost-mining process (not stale logs from before restart)
     local subsidy_errors
     subsidy_errors=$(ssh_cmd "$VM1_IP" bash -s <<'SUBSIDY_CHECK_EOF'
-        # Get current ghost-pool PID and its start time
-        PID=$(systemctl show ghost-pool --property=MainPID --value 2>/dev/null)
+        # Get current ghost-mining PID and its start time
+        PID=$(systemctl show ghost-mining --property=MainPID --value 2>/dev/null)
         if [[ -n "$PID" && "$PID" != "0" ]]; then
             START=$(date -d "$(ps -o lstart= -p "$PID" 2>/dev/null)" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
             if [[ -n "$START" ]]; then
-                journalctl -u ghost-pool --since "$START" --no-pager 2>/dev/null | grep -ic 'CRITICAL.*Adjusted proposal exceeds' 2>/dev/null || echo 0
+                journalctl -u ghost-mining --since "$START" --no-pager 2>/dev/null | grep -ic 'CRITICAL.*Adjusted proposal exceeds' 2>/dev/null || echo 0
             else
-                journalctl -u ghost-pool --since '10 minutes ago' --no-pager 2>/dev/null | grep -ic 'CRITICAL.*Adjusted proposal exceeds' 2>/dev/null || echo 0
+                journalctl -u ghost-mining --since '10 minutes ago' --no-pager 2>/dev/null | grep -ic 'CRITICAL.*Adjusted proposal exceeds' 2>/dev/null || echo 0
             fi
         else
             echo 0
@@ -1632,12 +1632,12 @@ phase_7() {
 
     # 7.1 Node restart mid-round
     run_test "7.1" "Node restart: VM2 rejoins mesh within 60s"
-    ssh_cmd "$VM2_IP" "systemctl restart ghost-pool" 2>/dev/null
+    ssh_cmd "$VM2_IP" "systemctl restart ghost-mining" 2>/dev/null
     local rejoined=false
     for attempt in $(seq 1 12); do
         sleep 5
         local status
-        status=$(ssh_cmd "$VM2_IP" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+        status=$(ssh_cmd "$VM2_IP" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
         if [[ "$status" == "active" ]]; then
             # Check if it has peers
             local peers
@@ -1699,13 +1699,13 @@ print(len(peers) if isinstance(peers, list) else 0)
             s/^enabled = .*/enabled = true/
             s/^mode = .*/mode = "strict"/
         }' /etc/ghost/pool.toml
-        systemctl restart ghost-pool
+        systemctl restart ghost-mining
 PATCH_VM3
     sleep 10
 
     # Check VM3 is back up
     local vm3_status
-    vm3_status=$(ssh_cmd "$VM3_IP" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+    vm3_status=$(ssh_cmd "$VM3_IP" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
     if [[ "$vm3_status" == "active" ]]; then
         pass
     else
@@ -1718,7 +1718,7 @@ PATCH_VM3
             s/^enabled = .*/enabled = false/
             s/^mode = .*/mode = "monitor"/
         }' /etc/ghost/pool.toml
-        systemctl restart ghost-pool
+        systemctl restart ghost-mining
 RESTORE_VM3
 
     # 7.5 No panics anywhere
@@ -1727,7 +1727,7 @@ RESTORE_VM3
     for i in "${!ALL_IPS[@]}"; do
         local ip="${ALL_IPS[$i]}"
         local c
-        c=$(ssh_cmd "$ip" "journalctl -u ghost-pool --since '1 hour ago' --no-pager 2>/dev/null | grep -ci 'panic' 2>/dev/null || echo 0" 2>/dev/null)
+        c=$(ssh_cmd "$ip" "journalctl -u ghost-mining --since '1 hour ago' --no-pager 2>/dev/null | grep -ci 'panic' 2>/dev/null || echo 0" 2>/dev/null)
         c=$(echo "${c:-0}" | tr -d '[:space:]')
         if [[ "$c" -gt 0 ]]; then
             total_panics=$((total_panics + c))
@@ -1757,7 +1757,7 @@ phase_8() {
     ssh_cmd "$VM4_IP" "echo 'GARBAGE_PING_DATA_12345' | nc -u -w1 $VM1_IP 8558 2>/dev/null || true" >/dev/null 2>&1
     sleep 3
     local vm1_active
-    vm1_active=$(ssh_cmd "$VM1_IP" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+    vm1_active=$(ssh_cmd "$VM1_IP" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
     local panic_count
     panic_count=$(check_logs "$VM1_IP" "panic" "1 minute ago")
     if [[ "$vm1_active" == "active" && "$panic_count" -eq 0 ]]; then
@@ -1771,7 +1771,7 @@ phase_8() {
     # Generate ~1MB payload and send to share propagation port
     ssh_cmd "$VM4_IP" "dd if=/dev/urandom bs=1024 count=1024 2>/dev/null | nc -w2 $VM1_IP 8555 2>/dev/null || true" >/dev/null 2>&1
     sleep 3
-    vm1_active=$(ssh_cmd "$VM1_IP" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+    vm1_active=$(ssh_cmd "$VM1_IP" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
     local oom_count
     oom_count=$(check_logs "$VM1_IP" "out.of.memory\|OOM\|oom" "1 minute ago")
     if [[ "$vm1_active" == "active" && "$oom_count" -eq 0 ]]; then
@@ -1812,13 +1812,13 @@ phase_8() {
 
     # 8.4 Node restart during voting
     run_test "8.4" "Node restart during active period — 3/4 still reach consensus"
-    ssh_cmd "$VM4_IP" "systemctl restart ghost-pool" 2>/dev/null
+    ssh_cmd "$VM4_IP" "systemctl restart ghost-mining" 2>/dev/null
     sleep 5
     # Check that the other 3 nodes are still operating normally
     local remaining_ok=true
     for ip in "$VM1_IP" "$VM2_IP" "$VM3_IP"; do
         local status
-        status=$(ssh_cmd "$ip" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+        status=$(ssh_cmd "$ip" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
         if [[ "$status" != "active" ]]; then
             remaining_ok=false
             break
@@ -1829,7 +1829,7 @@ phase_8() {
     for attempt in $(seq 1 12); do
         sleep 5
         local vm4_status
-        vm4_status=$(ssh_cmd "$VM4_IP" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+        vm4_status=$(ssh_cmd "$VM4_IP" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
         if [[ "$vm4_status" == "active" ]]; then
             local peers
             peers=$(api_get "$VM4_IP" "/api/v1/network/peers" 2>/dev/null)
@@ -1857,7 +1857,7 @@ print(len(peers) if isinstance(peers, list) else 0)
     # 8.5 Rapid reconnect flood
     run_test "8.5" "Rapid reconnect flood — 5 restarts in 60s, no crashes"
     for restart_num in $(seq 1 5); do
-        ssh_cmd "$VM4_IP" "systemctl restart ghost-pool" 2>/dev/null
+        ssh_cmd "$VM4_IP" "systemctl restart ghost-mining" 2>/dev/null
         sleep 10
     done
     # Wait for stabilization
@@ -1871,7 +1871,7 @@ print(len(peers) if isinstance(peers, list) else 0)
     done
     # Check VM4 eventually stabilized
     local vm4_stable
-    vm4_stable=$(ssh_cmd "$VM4_IP" "systemctl is-active ghost-pool" 2>/dev/null || echo "dead")
+    vm4_stable=$(ssh_cmd "$VM4_IP" "systemctl is-active ghost-mining" 2>/dev/null || echo "dead")
     if [[ $flood_panics -eq 0 && "$vm4_stable" == "active" ]]; then
         pass
     else

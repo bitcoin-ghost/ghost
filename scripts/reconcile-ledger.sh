@@ -59,7 +59,7 @@
 set -euo pipefail
 
 NODES=(ghost-vm1 ghost-vm2 ghost-vm3 ghost-vm4 ghost-vm5 ghost-vm6 ghost-vm7 ghost-vm8)
-BIN=/opt/ghost/bin/ghost-pool
+BIN=/opt/ghost/bin/ghost-mining
 CONF=/etc/ghost/pool.toml
 REMOTE_DIR=/tmp/ledger-reconcile
 WORK="$(mktemp -d)"

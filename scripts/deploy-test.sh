@@ -4,7 +4,7 @@
 #
 # If you want the deploy-gate SELF-TEST — the hermetic one `record-tests.sh` runs — you want
 # `scripts/test-deploy-gate.sh`. The names differ only by word order, and that has already cost
-# something: this script was run in mistake for it, stopped ghost-pool and sri-pool on
+# something: this script was run in mistake for it, stopped ghost-mining and sri-pool on
 # ghost-vm1 (a PRODUCTION node in the mining DNS), and closed :3333 and :34255 for ~50s while
 # pool_sv2 waited for its initial template and the translator crash-looped. The node self-healed,
 # but miners could not connect for the duration.
@@ -12,7 +12,7 @@
 #   deploy-test.sh       -> THIS. Deploys to real nodes. Destructive.
 #   test-deploy-gate.sh  -> the 76-check self-test. Hermetic. Safe.
 #
-# Deploy ghost-pool binary with role-specific configs for stress testing
+# Deploy ghost-mining binary with role-specific configs for stress testing
 #
 # VM1+VM2: Reaper strict (aggressive filtering)
 # VM3+VM4: Standard archive + permissive (Reaper disabled)
@@ -26,9 +26,9 @@ set -euo pipefail
 SSH_KEY="$HOME/.ssh/ghost_signet_ed25519"
 SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 BINARY="target/release/ghost-mining"
-REMOTE_BIN="/opt/ghost/bin/ghost-pool"
+REMOTE_BIN="/opt/ghost/bin/ghost-mining"
 REMOTE_CONFIG="/etc/ghost/pool.toml"
-SERVICE="ghost-pool"
+SERVICE="ghost-mining"
 
 # VM definitions: name IP role
 VM1_NAME="signet-1"; VM1_IP="83.136.251.162"; VM1_ROLE="reaper"
@@ -181,8 +181,8 @@ deploy_vm() {
 
     # Copy binary
     log_info "Copying binary..."
-    scp_file "$BINARY" "$ip" "/tmp/ghost-pool"
-    ssh_cmd "$ip" "cp /tmp/ghost-pool $REMOTE_BIN && chmod +x $REMOTE_BIN && rm /tmp/ghost-pool"
+    scp_file "$BINARY" "$ip" "/tmp/ghost-mining"
+    ssh_cmd "$ip" "cp /tmp/ghost-mining $REMOTE_BIN && chmod +x $REMOTE_BIN && rm /tmp/ghost-mining"
     log_ok "Binary deployed"
 
     # Patch config

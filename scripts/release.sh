@@ -25,7 +25,7 @@
 #     lesson is not.                                       -> every build verifies the ARTEFACT
 #
 #   * `--features ghost-mining/zk-production` is invalid when the selected packages do not
-#     include ghost-pool. Getting this wrong ships the random trusted setup.
+#     include ghost-mining. Getting this wrong ships the random trusted setup.
 #                                                          -> per-binary features in ONE table
 #
 # Usage:
@@ -54,10 +54,10 @@ cd "$REPO_ROOT" || exit 1
 # the L2 they served went with them. The list stays because the soak-on-first-production-node
 # path in `deploy-node.sh` is still the right shape for anything future that cannot canary.
 #
-# `pool_sv2` leads `ghost-pool` because of the #742 webhook hazard: the SENDER of the share
+# `pool_sv2` leads `ghost-mining` because of the #742 webhook hazard: the SENDER of the share
 # signature must be current before the VERIFIER is. Wrong order is not "shares are delayed",
 # it is a 401 per batch and the batch is DISCARDED.
-FLEET_BINARIES="pool_sv2 ghost-pool translator_sv2"
+FLEET_BINARIES="pool_sv2 ghost-mining translator_sv2"
 PRODUCTION_ONLY=""
 
 # cargo package name, where it differs from the binary name.
@@ -66,12 +66,12 @@ pkg_for() {
 }
 
 # Cargo feature required for a mainnet build of this binary, if any.
-# ⛔ Without this ghost-pool refuses to start on mainnet. A feature named for a package that
+# ⛔ Without this ghost-mining refuses to start on mainnet. A feature named for a package that
 # is not in the selected set is a hard cargo error, so these are grouped by build invocation,
 # never concatenated.
 features_for() {
     case "$1" in
-        ghost-pool|pool_sv2|translator_sv2) echo "ghost-mining/zk-production" ;;
+        ghost-mining|pool_sv2|translator_sv2) echo "ghost-mining/zk-production" ;;
         *)                                  echo "" ;;
     esac
 }
@@ -313,8 +313,8 @@ phase_build() {
     prod=$(grep -ac 'disabled in production builds' "$WORKTREE/target/release/ghost-mining")
     insecure=$(grep -ac 'Using random trusted setup' "$WORKTREE/target/release/ghost-mining")
     [ "$prod" -ge 1 ] && [ "$insecure" -eq 0 ] \
-        || die "ghost-pool zk-production check inconclusive (prod=$prod insecure=$insecure)"
-    info "zk-production confirmed in ghost-pool (prod=$prod insecure=$insecure)"
+        || die "ghost-mining zk-production check inconclusive (prod=$prod insecure=$insecure)"
+    info "zk-production confirmed in ghost-mining (prod=$prod insecure=$insecure)"
 }
 
 roll_node() {
@@ -355,11 +355,11 @@ phase_soak() {
     local bad=0 out
     for n in $CANARY_NODES; do
         out=$(timeout 60 ssh -o BatchMode=yes "$n" '
-            A=0; for s in ghost-pool sri-pool sri-translator ghostd; do
+            A=0; for s in ghost-mining sri-pool sri-translator ghostd; do
               systemctl is-active $s >/dev/null 2>&1 && A=$((A+1)); done
             printf "services=%s/4 restarts=%s ver=%s" "$A" \
               "$(systemctl show sri-pool -p NRestarts --value)" \
-              "$(/opt/ghost/bin/ghost-pool --version 2>/dev/null | head -1 | awk "{print \$2}")"' 2>/dev/null)
+              "$(/opt/ghost/bin/ghost-mining --version 2>/dev/null | head -1 | awk "{print \$2}")"' 2>/dev/null)
         echo "  $n  $out"
         echo "$out" | grep -q "services=4/4"   || bad=1
         echo "$out" | grep -q "ver=$VERSION"   || bad=1
@@ -491,7 +491,7 @@ roll_ghostd() {
         \$S systemctl restart ghostd
     " || return 1
 
-    # Verify it is SERVING, not merely started. A ghostd restart drops its RPC, so ghost-pool
+    # Verify it is SERVING, not merely started. A ghostd restart drops its RPC, so ghost-mining
     # may restart itself and read `activating` for a few seconds — that is normal, and is why
     # this waits on the RPC answering rather than on unit state.
     #

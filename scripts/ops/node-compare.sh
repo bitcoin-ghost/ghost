@@ -85,7 +85,7 @@ collect_node() {
         echo "network=?" >> "$out"
     fi
 
-    # L2 height from /api/v1/l2/tree-state (authoritative checkpoint height from ghost-pool)
+    # L2 height from /api/v1/l2/tree-state (authoritative checkpoint height from ghost-mining)
     local l2_height
     l2_height=$(curl -sf --connect-timeout 3 "$base/api/v1/l2/tree-state" 2>/dev/null \
         | jq -r '.checkpoint_height // "?"' 2>/dev/null) || l2_height="?"

@@ -8,7 +8,7 @@ Type=simple
 User=ghost
 Group=ghost
 # Readiness gate: After=/Wants= only orders *start*, not readiness. pool_sv2
-# listens before it has fetched its first template from ghost-pool, and the
+# listens before it has fetched its first template from ghost-mining, and the
 # translator gives up after 3 upstream retries (CouldNotInitiateSystem) if it
 # connects too early — relying on Restart=always to recover, which churns.
 # Wait (up to ~60s) for pool_sv2's monitoring API to answer, then a short

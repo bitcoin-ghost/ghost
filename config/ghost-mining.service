@@ -10,7 +10,7 @@ User=ghost
 Group=ghost
 
 # Main executable
-ExecStart=/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --data-dir /home/ghost/.ghost
+ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --data-dir /home/ghost/.ghost
 
 # Restart configuration
 # - always: restart on any exit (including clean shutdown)
@@ -20,7 +20,7 @@ RestartSec=5
 KillSignal=SIGTERM
 
 # Exit code 100 triggers forced restart (used by config update API)
-# When ghost-pool exits with 100, systemd treats it as success but still restarts
+# When ghost-mining exits with 100, systemd treats it as success but still restarts
 RestartForceExitStatus=100
 SuccessExitStatus=100
 

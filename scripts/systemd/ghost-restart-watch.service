@@ -2,7 +2,7 @@
 Description=Bitcoin Ghost restart-loop watchdog
 Documentation=https://github.com/bitcoin-ghost/ghost/issues/412
 # Only meaningful once the node is up; never block boot on it.
-After=network-online.target ghostd.service ghost-pool.service
+After=network-online.target ghostd.service ghost-mining.service
 Wants=network-online.target
 
 [Service]

@@ -67,7 +67,7 @@
 #
 # Read on 2026-08-03 from each node itself:
 #
-#   ssh <node> "sudo -u ghost /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity"
+#   ssh <node> "sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity"
 #
 # That is the ONLY method to trust. Do not read a node's own id from the `peers` table — it returns
 # the most-recently-seen peer instead, which produced a table that was wrong for vm1 and vm7. Do not

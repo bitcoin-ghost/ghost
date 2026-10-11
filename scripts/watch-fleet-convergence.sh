@@ -10,7 +10,7 @@
 #
 # `MESH_NODE_LIST_CHECKPOINT_HEIGHT = 970_500`. The margin between the tip and that height is the
 # whole reason it was picked: if the fleet stops agreeing on a root, the response is to roll
-# ghost-pool and push the height out, and that only works if someone NOTICES while blocks remain.
+# ghost-mining and push the height out, and that only works if someone NOTICES while blocks remain.
 #
 # ⛔ The failure mode is SILENCE. No node logs anything when the fleet's roots diverge — each is
 # happily computing its own answer. All four roots are vote-rejection conditions, so a fleet
@@ -74,7 +74,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 for n in "${NODES[@]}"; do
     (
         v="$(timeout 45 ssh -o ConnectTimeout=10 -o BatchMode=yes "$n" \
-             "systemctl show ghost-pool -p ActiveEnterTimestamp --value" 2>/dev/null)"
+             "systemctl show ghost-mining -p ActiveEnterTimestamp --value" 2>/dev/null)"
         if [ -n "$v" ]; then
             start_epoch="$(date -u -d "$v" +%s 2>/dev/null || echo "")"
             if [ -n "$start_epoch" ]; then

@@ -101,7 +101,7 @@ gsp-data/
 # Regtest-cluster binaries: build artifacts, never source.
 #
 # 44MB of compiled binaries were tracked here. Once pushed, a binary is in the history
-# permanently, and a tracked one goes stale silently — this copy of ghost-pool sat at
+# permanently, and a tracked one goes stale silently — this copy of ghost-mining sat at
 # v1.10.22 while the tree was v1.11.22, so a cluster run would have reported success
 # against code months older than the change under test.
 #

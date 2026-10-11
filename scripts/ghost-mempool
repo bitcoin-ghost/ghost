@@ -63,7 +63,7 @@ check_docker() {
   fi
 }
 
-# RAM in MB. Reads from /proc/meminfo (matches what ghost-pool's capacity
+# RAM in MB. Reads from /proc/meminfo (matches what ghost-mining's capacity
 # module uses — see bins/ghost-pool/src/capacity.rs).
 free_ram_mb() {
   local kb

@@ -221,14 +221,14 @@ preflight() {
             continue
         fi
 
-        # ghost-pool health
+        # ghost-mining health
         local pool_health
         pool_health=$(pool_api "$i" "/health")
         if [[ -z "$pool_health" ]]; then
             pool_health=$(ssh_cmd "$i" "curl -sf http://localhost:${POOL_PORT}/health" 2>/dev/null)
         fi
         if [[ -z "$pool_health" ]]; then
-            log "  ${RED}FAIL: ghost-pool on $label${RESET}"
+            log "  ${RED}FAIL: ghost-mining on $label${RESET}"
             failed=true
             continue
         fi
@@ -340,7 +340,7 @@ check_mining() {
 
     # Payout round status from VM1
     local payout_status
-    payout_status=$(ssh_cmd 0 "journalctl -u ghost-pool --since '30 min ago' --no-pager 2>/dev/null | grep -c 'payout.*round\|payout.*complete\|payout.*distributed'" 2>/dev/null)
+    payout_status=$(ssh_cmd 0 "journalctl -u ghost-mining --since '30 min ago' --no-pager 2>/dev/null | grep -c 'payout.*round\|payout.*complete\|payout.*distributed'" 2>/dev/null)
     log "    Payout events (30min): ${payout_status:-0}"
     log_metric "$iteration" "mining" "payout_events" "${payout_status:-0}"
 
@@ -798,7 +798,7 @@ check_health() {
     for i in $(seq 0 $((VM_COUNT - 1))); do
         local pool_ok=false pay_ok=false
 
-        # ghost-pool
+        # ghost-mining
         local pool_h
         pool_h=$(pool_api "$i" "/health" 2>/dev/null)
         [[ -z "$pool_h" ]] && pool_h=$(ssh_cmd "$i" "curl -sf http://localhost:${POOL_PORT}/health" 2>/dev/null)
@@ -819,7 +819,7 @@ check_health() {
 
     # Checkpoint pipeline — check for recent checkpoint activity
     local ckpt_count
-    ckpt_count=$(ssh_cmd 0 "journalctl -u ghost-pool --since '30 min ago' --no-pager 2>/dev/null | grep -c 'checkpoint\|Checkpoint'" 2>/dev/null)
+    ckpt_count=$(ssh_cmd 0 "journalctl -u ghost-mining --since '30 min ago' --no-pager 2>/dev/null | grep -c 'checkpoint\|Checkpoint'" 2>/dev/null)
     log "    Checkpoint events (30min): ${ckpt_count:-0}"
     log_metric "$iteration" "health" "checkpoint_events" "${ckpt_count:-0}"
 
@@ -839,7 +839,7 @@ check_health() {
     local panics=0
     for i in $(seq 0 $((VM_COUNT - 1))); do
         local p
-        p=$(ssh_cmd "$i" "journalctl -u ghost-pool -u ghost-pay --since '30 min ago' --no-pager 2>/dev/null | grep -ci 'panic\|PANIC'" 2>/dev/null)
+        p=$(ssh_cmd "$i" "journalctl -u ghost-mining -u ghost-pay --since '30 min ago' --no-pager 2>/dev/null | grep -ci 'panic\|PANIC'" 2>/dev/null)
         panics=$((panics + ${p:-0}))
     done
     if (( panics > 0 )); then
@@ -872,10 +872,10 @@ inject_fault() {
     local victim_idx=$((RANDOM % VM_COUNT))
     local label="${VM_NAMES[$victim_idx]}"
 
-    # Alternate between ghost-pool and ghost-pay kills
+    # Alternate between ghost-mining and ghost-pay kills
     local service
     if (( (iteration / 6) % 2 == 0 )); then
-        service="ghost-pool"
+        service="ghost-mining"
     else
         service="ghost-pay"
     fi
@@ -884,7 +884,7 @@ inject_fault() {
 
     # Get pre-state
     local pre_notes
-    if [[ "$service" == "ghost-pool" ]]; then
+    if [[ "$service" == "ghost-mining" ]]; then
         pre_notes=$(ssh_cmd "$victim_idx" "sqlite3 /home/ghost/.ghost/ghost.db 'SELECT COUNT(*) FROM l2_notes;'" 2>/dev/null)
     else
         pre_notes=$(ssh_cmd "$victim_idx" "sqlite3 /home/ghost/.ghost/ghost-pay/ghost-pay.db 'SELECT COUNT(*) FROM confidential_notes;'" 2>/dev/null)
@@ -905,7 +905,7 @@ inject_fault() {
         elapsed=$((elapsed + 5))
 
         local health
-        if [[ "$service" == "ghost-pool" ]]; then
+        if [[ "$service" == "ghost-mining" ]]; then
             health=$(ssh_cmd "$victim_idx" "curl -sf http://localhost:${POOL_PORT}/health" 2>/dev/null)
         else
             health=$(ssh_cmd "$victim_idx" "curl -sf http://localhost:${PAY_PORT}/health" 2>/dev/null)

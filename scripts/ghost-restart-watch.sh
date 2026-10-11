@@ -67,7 +67,15 @@ set -uo pipefail
 # the same class of problem as the hang it now looks for.
 CONF="${CONF:-/etc/ghost/restart-watch.conf}"
 STATE_DIR="${STATE_DIR:-/var/lib/ghost/restart-watch}"
-UNITS="ghost-pool sri-pool sri-translator ghostd"
+# The node unit was `ghost-pool` until #1018. deploy-node.sh converges THIS script before it
+# switches the unit, and a node that is never deployed to never switches — so watch whichever
+# name the node has. Naming only the new one would skip the unit silently on such a node (the
+# loop below `continue`s past a unit that does not exist), which is a watchdog watching three
+# things and reporting on four. Never both: after the switch the old name is an alias of the
+# same unit, and listing it too would raise every alert twice.
+NODE_UNIT=ghost-mining
+systemctl cat ghost-mining.service >/dev/null 2>&1 || NODE_UNIT=ghost-pool
+UNITS="$NODE_UNIT sri-pool sri-translator ghostd"
 
 NODE_API="127.0.0.1:8080"
 INTERNAL_AUTH_KEY=""
@@ -85,14 +93,14 @@ LIVENESS_RESTART="${LIVENESS_RESTART:-false}"
 # These are the SAME ports deploy-node.sh uses as its READY_PORT gate after a swap — that path
 # already treats "listening here" as the definition of a working unit, and it would be worse
 # than useless for the two to disagree about what healthy means. Measured on the fleet, not
-# assumed: ghost-pool also holds 8080/8443/8555-8563, sri-translator also holds 4444/9092; the
+# assumed: ghost-mining also holds 8080/8443/8555-8563, sri-translator also holds 4444/9092; the
 # port named here is the one whose absence means the unit is not doing its job.
 liveness_port_for() {
     case "$1" in
-        ghost-pool)      echo 8442 ;;   # TDP, what pool_sv2 connects to
+        ghost-mining|ghost-pool) echo 8442 ;;  # TDP, what pool_sv2 connects to
         sri-pool)        echo 34255 ;;  # SV2, what the translator connects to
         sri-translator)  echo 3333 ;;   # SV1, what miners connect to
-        ghostd)          echo 8332 ;;   # RPC, what ghost-pool depends on
+        ghostd)          echo 8332 ;;   # RPC, what ghost-mining depends on
         *)               echo "" ;;
     esac
 }
@@ -102,7 +110,7 @@ liveness_port_for() {
 # Fall back to the node's own configured secret so an operator does not have to copy it
 # into a second file — the whole point of this change is to stop duplicating config.
 if [ -z "$INTERNAL_AUTH_KEY" ]; then
-    # ⚠ The key is `internal_api_secret` under [network] — that is what ghost-pool reads
+    # ⚠ The key is `internal_api_secret` under [network] — that is what ghost-mining reads
     # (`config.network.internal_api_secret` -> `InternalAuth::from_hex`). This used to grep for
     # `internal_auth_key`, a name that exists nowhere in the codebase or any config, so the
     # lookup ALWAYS came back empty, the POST always went unsigned, and the endpoint always

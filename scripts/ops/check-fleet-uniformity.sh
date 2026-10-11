@@ -43,6 +43,14 @@ MIN_EXTRANONCE2_SIZE=7
 # Fields collected per node. Keep the remote side to one ssh round trip per node.
 COLLECT='
   SUDO=$(command -v sudo >/dev/null && echo sudo || echo)
+  # #1018: a node that has not been renamed has the unit, the boot gate and the binary under
+  # ghost-pool only. Resolved once here, so every field below is read off whichever this node
+  # has -- and reported as node_unit, so a half-rolled fleet shows as drift on a line that
+  # names the cause instead of as eight unrelated fields going empty.
+  GU=ghost-mining; systemctl cat ghost-mining.service >/dev/null 2>&1 || GU=ghost-pool
+  GG=ghost-mining-gate; systemctl cat ghost-mining-gate.service >/dev/null 2>&1 || GG=ghost-pool-gate
+  GM=/opt/ghost/bin/ghost-mining; [ -x "$GM" ] || GM=/opt/ghost/bin/ghost-pool
+  printf "node_unit=%s\n"     "$GU,$GG,$(basename "$(readlink -f "$GM")")"
   # The ghostd peer limit. Not a translator setting, but exactly the kind of per-node value
   # that drifts silently: the 2026-07-27 raise from 50 to 125 went to production only, and
   # vm5-vm8 sat at 50 -- pinned at 39/39 inbound, refusing peers -- for six weeks before anyone
@@ -54,7 +62,7 @@ COLLECT='
   # NB: no apostrophes anywhere in this block. COLLECT is a single-quoted shell string, so one
   # stray quote in a COMMENT terminates it and the whole script fails to parse.
   printf "maxconn=%s\n"       "$(grep -hE "^maxconnections" /etc/bitcoin/bitcoin.conf 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs)"
-  printf "gp_sha=%s\n"        "$(sha256sum /opt/ghost/bin/ghost-pool 2>/dev/null | cut -c1-12)"
+  printf "gp_sha=%s\n"        "$(sha256sum "$GM" 2>/dev/null | cut -c1-12)"
   printf "poolsv2_sha=%s\n"   "$(sha256sum /opt/ghost/bin/pool_sv2 2>/dev/null | cut -c1-12)"
   printf "trans_sha=%s\n"     "$(sha256sum /opt/ghost/bin/translator_sv2 2>/dev/null | cut -c1-12)"
   printf "vardiff=%s\n"       "$(grep -hE "^min_individual_miner_hashrate" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
@@ -65,7 +73,7 @@ COLLECT='
   printf "port=%s\n"          "$(grep -hE "^downstream_port" /etc/ghost/translator-config.toml 2>/dev/null | cut -d= -f2 | sed "s/#.*//" | xargs | tr "\n" " " | xargs)"
   printf "journal=%s\n"       "$([ -d /var/log/journal ] && echo persistent || echo volatile)"
   printf "watchdog=%s\n"      "$(systemctl is-active ghost-restart-watch.timer 2>/dev/null)"
-  printf "pool_svc=%s\n"      "$(systemctl is-active ghost-pool 2>/dev/null)"
+  printf "pool_svc=%s\n"      "$(systemctl is-active "$GU" 2>/dev/null)"
   printf "sripool_svc=%s\n"   "$(systemctl is-active sri-pool 2>/dev/null)"
   printf "trans_svc=%s\n"     "$(systemctl is-active sri-translator 2>/dev/null)"
 
@@ -81,7 +89,7 @@ COLLECT='
   nproc() { local c; c="$(pgrep -c -x "$1" 2>/dev/null)"; printf "%s" "${c:-0}"; }
   printf "procs_translator=%s,%s\n" "$(nproc translator_sv2)" "$(nproc translator)"
   printf "procs_poolsv2=%s,%s\n"    "$(nproc pool_sv2)" "$(nproc pool)"
-  printf "procs_ghostpool=%s\n"     "$(nproc ghost-pool)"
+  printf "procs_ghostpool=%s\n"     "$(nproc "$(basename "$(readlink -f "$GM")")")"
   # Who actually holds each load-bearing port. The binary NAME, not the unit that claims it.
   printf "owner_3333=%s\n"       "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":3333\s.*users:\(\(\"\K[^\"]+" | head -1)"
   printf "owner_34255=%s\n"      "$($SUDO ss -ltnp 2>/dev/null | grep -oP ":34255\s.*users:\(\(\"\K[^\"]+" | head -1)"
@@ -97,11 +105,11 @@ COLLECT='
   # A service that is active-but-disabled survives until the next reboot and no further, and no
   # health check that asks "is it running" will ever notice.
   printf "en_ghostd=%s\n"        "$(systemctl is-enabled ghostd 2>/dev/null | head -1)"
-  printf "en_ghostpool=%s\n"     "$(systemctl is-enabled ghost-pool 2>/dev/null | head -1)"
+  printf "en_ghostpool=%s\n"     "$(systemctl is-enabled "$GU" 2>/dev/null | head -1)"
   printf "en_sripool=%s\n"       "$(systemctl is-enabled sri-pool 2>/dev/null | head -1)"
   printf "en_sritrans=%s\n"      "$(systemctl is-enabled sri-translator 2>/dev/null | head -1)"
   printf "en_bitcoind=%s\n"      "$(systemctl is-enabled bitcoind 2>/dev/null | head -1)"
-  printf "en_poolgate=%s\n"      "$(systemctl is-enabled ghost-pool-gate 2>/dev/null | head -1)"
+  printf "en_poolgate=%s\n"      "$(systemctl is-enabled "$GG" 2>/dev/null | head -1)"
   printf "en_mining_fw=%s\n"     "$(systemctl is-enabled ghost-mining-firewall.path 2>/dev/null | head -1)"
   # #758: the farm tier was decided ON for every public mining node (#410, 2026-07-27) and reached
   # exactly ONE of eight. It was visible here only as `vardiff` drift, because vm8 returned two
@@ -144,8 +152,8 @@ COLLECT='
   fi
   printf "coord_fee_addr=%s\n" "$_fee_verdict"
   printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
-  printf "cfg_parses=%s\n"       "$(/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
-  # Ops scripts are deployed by NOTHING — `deploy-node.sh` handles ghost-pool, pool_sv2 and
+  printf "cfg_parses=%s\n"       "$("$GM" --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
+  # Ops scripts are deployed by NOTHING — `deploy-node.sh` handles ghost-mining, pool_sv2 and
   # translator_sv2 and nothing else. So these drift silently and stay drifted: the restart
   # watchdog sat on a pre-fix version on all eight for months, posting to an ALERT_WEBHOOK
   # from a config file that does not exist, and nobody could tell.
@@ -162,7 +170,7 @@ COLLECT='
   # The flag does not exist in binaries older than the #761 release. Distinguish "no unknown keys"
   # from "this binary cannot answer" — reporting the second as the first is how a check that
   # cannot fail gets built.
-  printf "cfg_unknown=%s\n"      "$(if ! /opt/ghost/bin/ghost-pool --help 2>&1 | grep -q -- "--check-config"; then echo unsupported; elif /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --check-config >/dev/null 2>&1; then echo none; else /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --check-config 2>&1 | sed -n "s/^  //p" | paste -sd, -; fi)"
+  printf "cfg_unknown=%s\n"      "$(if ! "$GM" --help 2>&1 | grep -q -- "--check-config"; then echo unsupported; elif "$GM" --config /etc/ghost/pool.toml --check-config >/dev/null 2>&1; then echo none; else "$GM" --config /etc/ghost/pool.toml --check-config 2>&1 | sed -n "s/^  //p" | paste -sd, -; fi)"
 '
 
 declare -A VALUES   # VALUES[node|field] = value
@@ -281,12 +289,14 @@ for n in "${REACHED[@]}"; do
     n_gp="${VALUES[$n|procs_ghostpool]:-0}"
     [ "${n_tsv2:-0}" -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_tsv2} translator_sv2 processes (expected 1)"; rc=1; }
     [ "${n_psv2:-0}" -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_psv2} pool_sv2 processes (expected 1)"; rc=1; }
-    [ "${n_gp:-0}"   -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_gp} ghost-pool processes (expected 1)"; rc=1; }
+    [ "${n_gp:-0}"   -le 1 ] 2>/dev/null || { echo "  FAIL $n ${n_gp} ghost-mining processes (expected 1)"; rc=1; }
     [ "${n_told:-0}" -eq 0 ] 2>/dev/null || { echo "  FAIL $n ${n_told} SUPERSEDED 'translator' process(es) running — this is the #756 outage"; rc=1; }
     [ "${n_pold:-0}" -eq 0 ] 2>/dev/null || { echo "  FAIL $n ${n_pold} SUPERSEDED 'pool' process(es) running"; rc=1; }
 
     # The port must be held by the binary we think serves it. An impostor answers happily.
-    for spec in "owner_3333:translator_sv2:SV1 miners" "owner_34255:pool_sv2:SV2 upstream" "owner_8442:ghost-pool:template provider"; do
+    # The node binary is named for whatever this node has (#1018) — the third part of node_unit.
+    gm_name="${VALUES[$n|node_unit]:-}"; gm_name="${gm_name##*,}"
+    for spec in "owner_3333:translator_sv2:SV1 miners" "owner_34255:pool_sv2:SV2 upstream" "owner_8442:${gm_name:-ghost-mining}:template provider"; do
         IFS=: read -r fld want what <<<"$spec"
         got="${VALUES[$n|$fld]:-}"
         if [ -z "$got" ]; then
@@ -305,19 +315,19 @@ for n in "${REACHED[@]}"; do
     stale_b="${VALUES[$n|stale_bins]:-}"
     [ -z "$stale_b" ] || { echo "  FAIL $n superseded binary/binaries in /opt/ghost/bin: $stale_b"; rc=1; }
 
-    # Running is not surviving. Measured 2026-08-23: ghost-pool was DISABLED on all eight nodes
+    # Running is not surviving. Measured 2026-08-23: ghost-mining was DISABLED on all eight nodes
     # and ghostd on all four production nodes — every one of them active, so every check that
     # asked `is-active` read green. A reboot would have taken the pool down fleet-wide and the
     # chain daemon with it on vm1-4, and nothing here would have said so first.
-    # ghost-pool is DELIBERATELY disabled where `ghost-pool-gate` owns its start: the gate is a
+    # ghost-mining is DELIBERATELY disabled where `ghost-mining-gate` owns its start: the gate is a
     # oneshot that blocks until ghostd leaves initial block download and only then starts the pool.
-    # Enabling ghost-pool directly there would race the gate and start it against an unsynced
+    # Enabling ghost-mining directly there would race the gate and start it against an unsynced
     # chain. So the invariant is "something brings it back", not "this unit is enabled".
     gate="${VALUES[$n|en_poolgate]:-}"
     case "$gate" in
         enabled|enabled-runtime|static) gp_units="en_sripool:sri-pool" ;;
-        *)                              gp_units="en_ghostpool:ghost-pool en_sripool:sri-pool"
-                                        echo "  WARN $n no ghost-pool-gate — ghost-pool must be enabled directly here" ;;
+        *)                              gp_units="en_ghostpool:ghost-mining en_sripool:sri-pool"
+                                        echo "  WARN $n no ghost-mining-gate — ghost-mining must be enabled directly here" ;;
     esac
     # ghost-mining-firewall.path is what makes a port follow its opt-in. Without it, flipping
     # mining_mode or coordinator_role_enabled changes nothing at the firewall.
@@ -392,7 +402,7 @@ for n in "${REACHED[@]}"; do
     case "${VALUES[$n|cfg_parses]:-}" in
         ok) ;;
         "") echo "  WARN $n could not run the config parse check" ;;
-        *)  echo "  FAIL $n pool.toml does NOT parse with the deployed ghost-pool — this node will not restart"; rc=1 ;;
+        *)  echo "  FAIL $n pool.toml does NOT parse with the deployed ghost-mining — this node will not restart"; rc=1 ;;
     esac
 
     eb="${VALUES[$n|en_bitcoind]:-}"

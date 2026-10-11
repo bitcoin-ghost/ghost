@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Converge the ghost-pool unit's installer-parity drop-in onto the fleet (#1007).
+# Converge the ghost-mining unit's installer-parity drop-in onto the fleet (#1007).
 #
 # `deploy-node.sh` swaps binaries and never touches a unit file, so a node keeps the unit it was
-# provisioned with. vm1-vm4 predate the installer's current ghost-pool unit and were missing four
+# provisioned with. vm1-vm4 predate the installer's current ghost-mining unit and were missing four
 # of its directives; `check-fleet-is-current.sh` reported them after every roll with no tool that
-# owned the fix. `config/ghost-pool.service` is NOT that fix -- it differs from the live unit in
+# owned the fix. `config/ghost-mining.service` is NOT that fix -- it differs from the live unit in
 # ExecStart and hardening, and installing it over a running node's unit would change far more than
 # the four lines in question.
 #
@@ -15,12 +15,12 @@
 # loaded, so `daemon-reload` is the whole change.
 #
 # Usage:
-#   scripts/ops/converge-ghost-pool-unit.sh [--dry-run] [<node> ...]   # defaults to all eight
+#   scripts/ops/converge-ghost-mining-unit.sh [--dry-run] [<node> ...]   # defaults to all eight
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SRC="$REPO_ROOT/config/ghost-pool.service.d/installer-parity.conf"
-DEST=/etc/systemd/system/ghost-pool.service.d/installer-parity.conf
+SRC="$REPO_ROOT/config/ghost-mining.service.d/installer-parity.conf"
+DEST=/etc/systemd/system/ghost-mining.service.d/installer-parity.conf
 INSTALLER="$REPO_ROOT/scripts/install-node.sh"
 
 DRY=false
@@ -37,14 +37,14 @@ WANT_N="$(printf '%s\n' "$WANT" | /usr/bin/grep -c . || true)"
 # this file would move it AWAY from what a fresh node gets, and the currency check would go on
 # reporting the difference -- so refuse, and say which line.
 UNIT_BODY="$(awk '
-    index($0, "Description=") && index($0, "Ghost Pool node") { on = 1 }
+    index($0, "Description=") && index($0, "Ghost Mining node") { on = 1 }
     on { print }
     on && /WantedBy=multi-user.target/ { exit }
 ' "$INSTALLER")"
-[ -n "$UNIT_BODY" ] || { echo "REFUSING: no ghost-pool unit found in $INSTALLER"; exit 2; }
+[ -n "$UNIT_BODY" ] || { echo "REFUSING: no ghost-mining unit found in $INSTALLER"; exit 2; }
 while IFS= read -r d; do
     printf '%s\n' "$UNIT_BODY" | /usr/bin/grep -qxF "$d" \
-        || { echo "REFUSING: '$d' is in the drop-in but not in the installer's ghost-pool unit"; exit 1; }
+        || { echo "REFUSING: '$d' is in the drop-in but not in the installer's ghost-mining unit"; exit 1; }
 done <<< "$WANT"
 
 NODES=("$@")
@@ -62,9 +62,9 @@ changed=0
 for n in "${NODES[@]}"; do
     printf '%-10s ' "$n"
 
-    live="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" 'systemctl cat ghost-pool 2>/dev/null' 2>/dev/null)"
+    live="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" 'systemctl cat ghost-mining 2>/dev/null' 2>/dev/null)"
     if [ -z "$live" ]; then
-        echo "UNREADABLE: \`systemctl cat ghost-pool\` returned nothing"; rc=1; continue
+        echo "UNREADABLE: \`systemctl cat ghost-mining\` returned nothing"; rc=1; continue
     fi
     missing=0
     while IFS= read -r d; do
@@ -84,15 +84,15 @@ for n in "${NODES[@]}"; do
         continue
     fi
 
-    if ! scp -q -o ConnectTimeout=15 -o BatchMode=yes "$SRC" "$n:/tmp/ghost-pool-installer-parity.conf" 2>/dev/null; then
+    if ! scp -q -o ConnectTimeout=15 -o BatchMode=yes "$SRC" "$n:/tmp/ghost-mining-installer-parity.conf" 2>/dev/null; then
         echo "SCP FAILED"; rc=1; continue
     fi
     out="$(ssh -o ConnectTimeout=20 -o BatchMode=yes "$n" \
         'S=$(command -v sudo >/dev/null && echo "sudo -n" || echo)
-         $S mkdir -p /etc/systemd/system/ghost-pool.service.d &&
-         $S cp /tmp/ghost-pool-installer-parity.conf '"$DEST"' &&
+         $S mkdir -p /etc/systemd/system/ghost-mining.service.d &&
+         $S cp /tmp/ghost-mining-installer-parity.conf '"$DEST"' &&
          $S chmod 0644 '"$DEST"' &&
-         rm -f /tmp/ghost-pool-installer-parity.conf &&
+         rm -f /tmp/ghost-mining-installer-parity.conf &&
          $S systemctl daemon-reload && echo RELOAD_OK' 2>&1)"
     if ! printf '%s\n' "$out" | /usr/bin/grep -q RELOAD_OK; then
         echo "FAILED: $(printf '%s\n' "$out" | tail -1)"; rc=1; continue
@@ -101,7 +101,7 @@ for n in "${NODES[@]}"; do
     # Positive check, from what systemd has LOADED rather than from the file just written: every
     # directive present, the restart delay in effect, and the service untouched by the reload.
     after="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$n" \
-        'systemctl cat ghost-pool 2>/dev/null; echo "@@RESTART_USEC=$(systemctl show ghost-pool -p RestartUSec --value)"; echo "@@ACTIVE=$(systemctl is-active ghost-pool)"' 2>/dev/null)"
+        'systemctl cat ghost-mining 2>/dev/null; echo "@@RESTART_USEC=$(systemctl show ghost-mining -p RestartUSec --value)"; echo "@@ACTIVE=$(systemctl is-active ghost-mining)"' 2>/dev/null)"
     still=0
     while IFS= read -r d; do
         printf '%s\n' "$after" | /usr/bin/grep -qxF "$d" || still=$((still + 1))
@@ -109,9 +109,9 @@ for n in "${NODES[@]}"; do
     usec="$(printf '%s\n' "$after" | sed -n 's/^@@RESTART_USEC=//p')"
     active="$(printf '%s\n' "$after" | sed -n 's/^@@ACTIVE=//p')"
     if [ "$still" -eq 0 ] && [ "$usec" = "15s" ] && [ "$active" = "active" ]; then
-        echo "updated+reloaded | all $WANT_N directives loaded, RestartSec=$usec, ghost-pool $active (not restarted)"
+        echo "updated+reloaded | all $WANT_N directives loaded, RestartSec=$usec, ghost-mining $active (not restarted)"
     else
-        echo "updated BUT NOT VERIFIED: $still directive(s) still missing, RestartSec='${usec:-?}', ghost-pool '${active:-?}'"
+        echo "updated BUT NOT VERIFIED: $still directive(s) still missing, RestartSec='${usec:-?}', ghost-mining '${active:-?}'"
         rc=1
     fi
 done

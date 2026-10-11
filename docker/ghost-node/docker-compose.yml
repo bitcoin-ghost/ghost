@@ -47,7 +47,7 @@ services:
   ghost-pool:
     build: .
     container_name: ghost-pool
-    entrypoint: ["ghost-pool"]
+    entrypoint: ["ghost-mining"]
     restart: unless-stopped
     ports:
       - "8080:8080"   # Pool API

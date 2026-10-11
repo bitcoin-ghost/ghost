@@ -15,7 +15,7 @@
 #
 # ## What it checks
 #
-#   1. Every node's running `ghost-pool` reports the same build sha (uniformity — still necessary).
+#   1. Every node's running `ghost-mining` reports the same build sha (uniformity — still necessary).
 #   2. That sha is an ANCESTOR of `origin/main`. A sha that is not means the fleet is running
 #      something that was never merged, which is a different and worse problem.
 #   3. Nothing is behind: `git log <sha>..origin/main` is empty. When it is not, every commit is
@@ -68,12 +68,13 @@ MAIN="$(git rev-parse origin/main)"
 declare -A BUILD
 unreachable=0
 for node in "${NODES[@]}"; do
-    # `--version` prints: ghost-pool 1.11.43 (95de37cfd built 2026-09-27T20:22:34Z)
+    # `--version` prints: ghost-mining 1.11.43 (95de37cfd built 2026-09-27T20:22:34Z)
+    # A node not yet renamed (#1018) has the binary under its old name only; ask whichever it has.
     line="$(ssh -o ConnectTimeout=15 -o BatchMode=yes "$node" \
-            "/opt/ghost/bin/ghost-pool --version 2>/dev/null" 2>/dev/null)"
+            'b=/opt/ghost/bin/ghost-mining; [ -x "$b" ] || b=/opt/ghost/bin/ghost-pool; "$b" --version 2>/dev/null' 2>/dev/null)"
     sha="$(printf '%s' "$line" | sed -nE 's/.*\(([0-9a-f]{7,40}) built .*/\1/p')"
     if [ -z "$sha" ]; then
-        echo "  ??? $node — could not read a build sha from \`ghost-pool --version\`"
+        echo "  ??? $node — could not read a build sha from \`ghost-mining --version\`"
         echo "      got: ${line:-<nothing>}"
         unreachable=$((unreachable + 1))
         continue
@@ -134,7 +135,7 @@ if [ "$BINARY_ONLY" = false ]; then
     # Derived from the installer rather than listed here: a hand-maintained list of directives is a
     # list of the ones someone remembered, which is how LimitNOFILE went missing in the first place.
     for pair in "ghostd.service:Ghost Bitcoin Core" \
-                "ghost-pool.service:Ghost Pool node" \
+                "ghost-mining.service:Ghost Mining node" \
                 "sri-pool.service:SRI Pool" \
                 "sri-translator.service:SRI Translator"; do
         unit="${pair%%:*}"

@@ -1,10 +1,10 @@
 # Ghost Network - SRI Pool Configuration
 #
-# This pool connects to ghost-pool's Template Distribution Protocol (TDP) server
+# This pool connects to ghost-mining's Template Distribution Protocol (TDP) server
 # and accepts SV2 connections from translators/miners.
 #
 # Architecture:
-#   ghost-pool (TDP:8442) -> SRI Pool (SV2:34255) -> SRI Translator (SV1:3333) -> BitAxe
+#   ghost-mining (TDP:8442) -> SRI Pool (SV2:34255) -> SRI Translator (SV1:3333) -> BitAxe
 
 # Pool identity keypair — GENERATE YOUR OWN. Do not use a value from this file.
 #
@@ -30,8 +30,8 @@ cert_validity_sec = 3600
 
 # Listen for SV2 miners/translators.
 #
-# ⛔ 34255, and the comment here used to say 34256 "different from ghost-pool's native stratum on
-# 34255". Both halves were wrong. ghost-pool has no native stratum on 34255 — `pool_sv2` holds that
+# ⛔ 34255, and the comment here used to say 34256 "different from ghost-mining's native stratum on
+# 34255". Both halves were wrong. ghost-mining has no native stratum on 34255 — `pool_sv2` holds that
 # port, which `install-node.sh` says in its own words and which its firewall block opens
 # (`PORTS=(3333 34255)`). MEASURED on vm1/vm5/vm8 2026-10-06: the live config says 34255 and
 # `ss -ltnp` shows `pool_sv2` listening on `0.0.0.0:34255`.
@@ -51,7 +51,7 @@ listen_address = "0.0.0.0:34255"
 # one somebody pastes, and a signet-prefixed one in a mainnet reference is worse than one that
 # cannot work at all (#999).
 #
-# ⚠ Note this is not where block rewards actually go in any case: ghost-pool assembles the real
+# ⚠ Note this is not where block rewards actually go in any case: ghost-mining assembles the real
 # coinbase over TDP and sets `coinbase_tx_value_remaining = 0`, so pool_sv2 contributes no outputs
 # of its own. That is a reason the value is easy to get wrong unnoticed, not a reason to ship one.
 coinbase_reward_script = "addr(<YOUR-MAINNET-PAYOUT-ADDRESS>)"
@@ -102,11 +102,11 @@ monitoring_address = "127.0.0.1:9090"
 # log_file = "/var/log/ghost/sri-pool.log"
 
 # Share Webhook Configuration
-# Native integration with ghost-pool for share accounting
+# Native integration with ghost-mining for share accounting
 [share_webhook]
 url = "http://127.0.0.1:8080/api/internal/shares"
-# MANDATORY (H-13). Must be byte-for-byte the co-located ghost-pool's
-# [network] internal_api_secret from pool.toml. ghost-pool authorised this webhook by
+# MANDATORY (H-13). Must be byte-for-byte the co-located ghost-mining's
+# [network] internal_api_secret from pool.toml. ghost-mining authorised this webhook by
 # "the TCP peer is 127.0.0.1" alone, which every process on the box satisfies — and which a
 # reverse proxy in front of :8080 hands to the whole internet. Each batch is now signed
 # HMAC-SHA256 over `timestamp || body` under this secret.
@@ -121,26 +121,26 @@ max_retries = 3
 
 # SHARE_TIER_BIND (difficulty-tier commitment) — pool_sv2's half of a DORMANT two-part gate.
 # LEAVE COMMENTED OUT until the gate arms. Enabling it requires, in the SAME release:
-#   - activation_height equal to ghost-pool's SHARE_TIER_BIND_HEIGHT (a real block height,
+#   - activation_height equal to ghost-mining's SHARE_TIER_BIND_HEIGHT (a real block height,
 #     currently dormant at u64::MAX),
-#   - node_id equal to THIS node's 32-byte identity (hex) — the one ghost-pool derives its
-#     coinbase node tags from (`ghost-pool --show-identity`),
+#   - node_id equal to THIS node's 32-byte identity (hex) — the one ghost-mining derives its
+#     coinbase node tags from (`ghost-mining --show-identity`),
 #   - the translator shipped with quantise_to_tiers = true (translator-config.toml).
 # At/above the height, jobs are built per channel, each coinbase committing to the channel's
 # power-of-two difficulty tier; below it, behaviour is byte-identical to today.
-# SHARE_TIER_BIND: ARMED at 962100. Must equal ghost-pool's SHARE_TIER_BIND_HEIGHT, and the
+# SHARE_TIER_BIND: ARMED at 962100. Must equal ghost-mining's SHARE_TIER_BIND_HEIGHT, and the
 # translator must ship quantise_to_tiers = true in the SAME release — all three flip together.
 #
 # node_id is deliberately NOT set: pool_sv2 reads this node's identity from the co-located
-# ghost-pool's /health at startup, so the tags it stamps and the tags ghost-pool verifies cannot
-# disagree. Set it only if ghost-pool is unreachable at startup; when set it is checked against
-# ghost-pool's answer and a mismatch refuses to start.
+# ghost-mining's /health at startup, so the tags it stamps and the tags ghost-mining verifies cannot
+# disagree. Set it only if ghost-mining is unreachable at startup; when set it is checked against
+# ghost-mining's answer and a mismatch refuses to start.
 [share_tier_binding]
 activation_height = 962100
 
 # Template Provider Configuration
-# Connects to ghost-pool's TDP server
+# Connects to ghost-mining's TDP server
 [template_provider_type.Sv2Tp]
 address = "127.0.0.1:8442"
-# ghost-pool's TDP authority public key (from --tdp-enabled startup logs)
+# ghost-mining's TDP authority public key (from --tdp-enabled startup logs)
 public_key = "9bWFgYocHgkMPKEu1y87CxuAa145YSFVkafJrf8L6hhRKrhLGTz"
