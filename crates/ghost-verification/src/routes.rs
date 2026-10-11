@@ -11513,9 +11513,9 @@ async fn api_shroud_configure_handler(
     )
 }
 
-/// POST /api/v1/node/restart — Restart ghost-pool service
+/// POST /api/v1/node/restart — Restart this node's mining service
 ///
-/// Triggers a graceful restart of the ghost-pool service via systemctl.
+/// Triggers a graceful restart of the `ghost-mining` service via systemctl.
 /// Requires the process to have appropriate permissions (typically via sudoers).
 async fn api_node_restart_handler(
     State(_state): State<Arc<VerificationState>>,
@@ -11523,7 +11523,7 @@ async fn api_node_restart_handler(
     // Spawn the restart command asynchronously
     // The service manager will handle graceful shutdown and restart
     let result = tokio::process::Command::new("sudo")
-        .args(["systemctl", "restart", "ghost-pool"])
+        .args(["systemctl", "restart", crate::journal::NODE_SERVICE])
         .output()
         .await;
 
@@ -12065,7 +12065,12 @@ async fn api_swarm_update_all_post_handler(
 }
 
 /// Allowed services for watchdog control
-const WATCHDOG_ALLOWED_SERVICES: &[&str] = &["ghost-pool", "ghost-core", "ghost-pay"];
+///
+/// Compared AFTER [`crate::journal::canonical_service`], so a dashboard still sending the
+/// pre-#1018 name is served rather than refused, and systemd is only ever asked for the
+/// current one.
+const WATCHDOG_ALLOWED_SERVICES: &[&str] =
+    &[crate::journal::NODE_SERVICE, "ghost-core", "ghost-pay"];
 
 /// Watchdog service control: start
 async fn api_watchdog_start_handler(
@@ -12093,6 +12098,7 @@ async fn api_watchdog_restart_handler(
 
 /// Execute a systemctl command for a whitelisted service
 async fn watchdog_service_control(service: &str, action: &str) -> axum::response::Response {
+    let service = crate::journal::canonical_service(service);
     if !WATCHDOG_ALLOWED_SERVICES.contains(&service) {
         return (
             StatusCode::BAD_REQUEST,

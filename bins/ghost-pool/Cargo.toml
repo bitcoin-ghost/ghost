@@ -21,19 +21,21 @@
 #|======================================================================================================================|
 
 [package]
-name = "ghost-pool"
+name = "ghost-mining"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Bitcoin Ghost mining pool node"
 
+# The lib keeps its original name on purpose (#1018): tracing targets are module paths, so
+# renaming it would change every log target and break any operator's RUST_LOG filter.
 [lib]
 name = "ghost_pool"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ghost-pool"
+name = "ghost-mining"
 path = "src/main.rs"
 
 [dependencies]

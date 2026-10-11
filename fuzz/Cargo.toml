@@ -34,7 +34,7 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
 # Local crates to fuzz
-ghost-pool = { path = "../bins/ghost-pool" }
+ghost-mining = { path = "../bins/ghost-pool" }
 ghost-consensus = { path = "../crates/ghost-consensus" }
 ghost-common = { path = "../crates/ghost-common" }
 ghost-zkp = { path = "../crates/ghost-zkp" }

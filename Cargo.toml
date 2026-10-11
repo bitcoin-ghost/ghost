@@ -105,7 +105,7 @@ ghost-policy = { path = "crates/ghost-policy" }
 ghost-storage = { path = "crates/ghost-storage" }
 ghost-consensus = { path = "crates/ghost-consensus" }
 ghost-accounting = { path = "crates/ghost-accounting" }
-ghost-pool = { path = "bins/ghost-pool" }
+ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 # Ghost Pay L2 crates
 ghost-keys = { path = "crates/ghost-keys" }
@@ -258,7 +258,7 @@ ghost-common = { workspace = true }
 ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-consensus = { workspace = true, features = ["test-utils", "zk-consensus"] }
-ghost-pool = { workspace = true }
+ghost-mining = { workspace = true }
 ghost-keys = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }

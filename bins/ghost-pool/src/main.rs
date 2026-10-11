@@ -664,9 +664,9 @@ enum HashrateSource {
     Unavailable,
 }
 
-/// Ghost Pool - Decentralized Bitcoin Mining Pool
+/// Ghost Mining - Decentralized Bitcoin Mining Pool
 #[derive(Parser, Debug)]
-#[command(name = "ghost-pool")]
+#[command(name = "ghost-mining")]
 // #759: the workspace number alone does not identify a build — see `ghost_build_info`.
 #[command(author, version, long_version = ghost_build_info::LONG_VERSION, about, long_about = None)]
 struct Args {
@@ -814,7 +814,7 @@ async fn handle_status_command(
                 println!("Status:      ○ NOT RUNNING (or API unreachable)");
                 println!("             {e}");
                 println!();
-                println!("Check: systemctl status ghost-pool");
+                println!("Check: systemctl status ghost-mining");
             }
         }
 

@@ -45,9 +45,9 @@ pub struct LogUnit {
 /// on ghost-vm1). Adding a binary here is the ONLY way to make it readable.
 pub const ALLOWLIST: &[LogUnit] = &[
     LogUnit {
-        key: "ghost-pool",
-        unit: "ghost-pool.service",
-        label: "Ghost Pool",
+        key: NODE_SERVICE,
+        unit: "ghost-mining.service",
+        label: "Ghost Mining",
         description: "Mining pool node (this process) — in-memory ring buffer",
         ring_buffer: true,
     },
@@ -88,12 +88,36 @@ pub const ALLOWLIST: &[LogUnit] = &[
     },
 ];
 
-/// The default unit key (ghost-pool ring buffer), used when `?unit=` is absent.
-pub const DEFAULT_UNIT: &str = "ghost-pool";
+/// The systemd unit this process runs as, without the `.service` suffix (#1018).
+///
+/// One definition, because the name appears in three places that must agree — the log
+/// selector, the restart handler and the watchdog allowlist — and a rename that reached two
+/// of the three would leave an endpoint asking systemd for a unit that does not exist.
+pub const NODE_SERVICE: &str = "ghost-mining";
+
+/// What [`NODE_SERVICE`] was called before #1018.
+///
+/// Still accepted as a KEY from callers, never used to name a unit. The dashboard is deployed
+/// separately from this binary, so for a while one of them will be saying the old name to the
+/// other; [`canonical_service`] is where that is absorbed.
+pub const LEGACY_NODE_SERVICE: &str = "ghost-pool";
+
+/// Map a service key a caller sent to the name systemd knows it by.
+pub fn canonical_service(key: &str) -> &str {
+    if key == LEGACY_NODE_SERVICE {
+        NODE_SERVICE
+    } else {
+        key
+    }
+}
+
+/// The default unit key (this process's ring buffer), used when `?unit=` is absent.
+pub const DEFAULT_UNIT: &str = NODE_SERVICE;
 
 /// Resolve a logical key from the allowlist. Returns `None` for any key not in
 /// [`ALLOWLIST`] — the caller MUST reject (HTTP 400) without executing anything.
 pub fn resolve_unit(key: &str) -> Option<&'static LogUnit> {
+    let key = canonical_service(key);
     ALLOWLIST.iter().find(|u| u.key == key)
 }
 
@@ -355,6 +379,32 @@ mod tests {
         assert!(!u.ring_buffer);
         let pool = resolve_unit("ghost-pool").unwrap();
         assert!(pool.ring_buffer);
+    }
+
+    /// #1018: the dashboard ships separately from this binary, so the old key has to keep
+    /// working — and it has to reach the SAME source, under the new unit name, not a second
+    /// entry that could drift from it.
+    #[test]
+    fn the_pre_rename_key_resolves_to_the_renamed_service() {
+        let new = resolve_unit(NODE_SERVICE).expect("the current name resolves");
+        let old = resolve_unit(LEGACY_NODE_SERVICE).expect("the old name still resolves");
+        assert!(std::ptr::eq(new, old), "two entries, not one aliased");
+        assert_eq!(new.unit, "ghost-mining.service");
+        assert_eq!(new.unit, format!("{NODE_SERVICE}.service"));
+        assert_eq!(resolve_unit(DEFAULT_UNIT).map(|u| u.unit), Some(new.unit));
+
+        assert_eq!(canonical_service("ghost-pool"), "ghost-mining");
+        assert_eq!(canonical_service("ghost-mining"), "ghost-mining");
+        // Only the one legacy name is rewritten; nothing else is touched or invented.
+        assert_eq!(canonical_service("ghost-core"), "ghost-core");
+        assert_eq!(
+            canonical_service("ghost-pool.service"),
+            "ghost-pool.service"
+        );
+        // The old name is never what systemd is asked for.
+        assert!(ALLOWLIST
+            .iter()
+            .all(|u| !u.unit.contains(LEGACY_NODE_SERVICE)));
     }
 
     #[test]
