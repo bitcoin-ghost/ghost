@@ -16630,13 +16630,13 @@ mod tests {
         }
 
         for bad in [
-            "",                          // nothing to report
-            "ghost pool",                // space
+            "",                            // nothing to report
+            "ghost pool",                  // space
             "ghost-mining\nX-Injected: 1", // header/line injection
             "<b>ghost-mining</b>",         // markup into an email body
-            "https://evil.example/x",    // a link into a push notification
+            "https://evil.example/x",      // a link into a push notification
             "ghost-mining; rm -rf /",      // shell-looking payload
-            "ghost\u{202E}loop",         // bidi override
+            "ghost\u{202E}loop",           // bidi override
         ] {
             assert!(
                 !super::is_plausible_unit_name(bad),
