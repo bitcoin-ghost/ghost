@@ -392,7 +392,7 @@ impl NodeConfig {
     /// run the ghost-pay daemon, so the block's mere presence must NOT be read
     /// as "ghost-pay is running here". This mirrors `validate_ghost_pay`, which
     /// likewise treats `enabled = false` as off, and is the single source of
-    /// truth for whether ghost-pool should talk to a local ghost-pay.
+    /// truth for whether ghost-mining should talk to a local ghost-pay.
     pub fn ghost_pay_enabled(&self) -> bool {
         self.ghost_pay.as_ref().is_some_and(|gp| gp.enabled)
     }
@@ -1097,7 +1097,7 @@ impl NodeConfig {
             file.sync_all()?; // Ensure data is on disk before rename
         }
 
-        // Config files may contain secrets; ghostd/ghost-pool refuse to start on
+        // Config files may contain secrets; ghostd/ghost-mining refuse to start on
         // mainnet unless the config is mode 0600 (H-11 security check). The temp
         // file is created with the process umask (typically 0644), so restrict it
         // to 0600 before the rename — otherwise every atomic save clobbers the
@@ -1324,8 +1324,8 @@ pub struct NetworkConfig {
     /// (#495). `None` = this node runs no farm tier and must never be sent farm connections.
     ///
     /// It duplicates the translator's `[farm_tier] port`, because the two live in different
-    /// processes: `translator_sv2` owns the listener, `ghost-pool` owns the gossip. Duplication
-    /// is the lesser evil against ghost-pool reading another service's config file, but it can
+    /// processes: `translator_sv2` owns the listener, `ghost-mining` owns the gossip. Duplication
+    /// is the lesser evil against ghost-mining reading another service's config file, but it can
     /// drift — and a node advertising a farm port it does not listen on turns a routing decision
     /// into a dropped connection. `scripts/check-stratum-config-agreement.sh` holds the two in
     /// step, in the same spirit as the extension-key invariant added for #480.
@@ -1335,7 +1335,7 @@ pub struct NetworkConfig {
     pub http_port: u16,
     /// HTTPS port for the inter-peer verification mesh.
     ///
-    /// When set (default 8443), ghost-pool also binds an HTTPS listener on
+    /// When set (default 8443), ghost-mining also binds an HTTPS listener on
     /// this port serving the same routes as `http_port` but with identity-
     /// derived TLS + cert pinning. The verification client uses this port
     /// for cross-VM peer challenges so the mesh traffic is encrypted while
@@ -1552,7 +1552,7 @@ impl Default for PolicyConfig {
 impl PolicyConfig {
     /// The ghostd (Bitcoin Core) CLI flags that carry this policy profile to the
     /// node's mempool-acceptance path (`-ghostpolicy-*`, parsed in ghost-core).
-    /// This is the node-mempool twin of ghost-pool's block-template tier gate:
+    /// This is the node-mempool twin of ghost-mining's block-template tier gate:
     /// the same profile now enforces at BOTH layers.
     ///
     /// Only *restrictive* flags are emitted. ghostd's inert default is

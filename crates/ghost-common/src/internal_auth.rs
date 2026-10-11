@@ -14,7 +14,7 @@
 //! While `pool_sv2` carried its own copy of that construction it also carried its own copy of the
 //! secret-validation rule, and the two drifted immediately: the verifier accepts a secret of 32
 //! bytes **or longer** and uses the first 32, while the emitter's copy demanded exactly 32. An
-//! operator with a 96-hex secret would have got a ghost-pool that authenticated happily and a
+//! operator with a 96-hex secret would have got a ghost-mining that authenticated happily and a
 //! `pool_sv2` that discarded every share it was asked to report. One implementation of both the
 //! rule and the construction makes that class of split impossible rather than merely unlikely.
 //!

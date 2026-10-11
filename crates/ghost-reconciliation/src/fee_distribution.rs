@@ -1,4 +1,4 @@
-//! Fee distribution logic shared between ghost-pool (L1) and ghost-pay (L2).
+//! Fee distribution logic shared between ghost-mining (L1) and ghost-pay (L2).
 //!
 //! Treasury decay schedule: Once treasury reaches 21 BTC, allocation decays over 5 years:
 //! - Pre-threshold: 50% treasury, 50% nodes

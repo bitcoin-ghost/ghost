@@ -119,7 +119,7 @@ pub const CANDIDATE_NOTE_SPEND_PREFIX: &str = "note_spend_params_candidate_";
 /// position-N's candidate gets the candidate while the contributor's own active
 /// params stay at the last BFT-applied head.
 ///
-/// SINGLE SOURCE OF TRUTH: the writer (`ghost-pool`) and the server
+/// SINGLE SOURCE OF TRUTH: the writer (`ghost-mining`) and the server
 /// (`ghost-verification`) both derive the name here so they can never drift.
 /// Keying the filename by the hex lineage hash lets the serving side answer a
 /// by-hash fetch with a direct filesystem lookup (no re-hashing of params), and

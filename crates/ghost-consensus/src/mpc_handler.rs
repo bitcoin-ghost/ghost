@@ -1210,7 +1210,7 @@ impl MpcHandler {
 /// Reconstruct the `ghost-mpc` contribution record from a wire message.
 ///
 /// `contribution_proof` is the `serde_json` encoding of [`ContributionProof`]
-/// (see the send path in `ghost-pool`); `timestamp` is seconds (matching what
+/// (see the send path in `ghost-mining`); `timestamp` is seconds (matching what
 /// `verify_contribution`'s skew window expects); `contributor` is the hex of the
 /// candidate node id (informational — not used by the crypto checks).
 #[cfg(feature = "mpc-ceremony")]

@@ -297,7 +297,7 @@ pub fn apply_pending_restore(db_path: &Path) -> GhostResult<bool> {
         .map_err(|e| GhostError::Database(format!("staged restore not openable: {}", e)))?;
     }
 
-    // Safety-copy the current live DB. ghost-pool checkpoints the WAL on shutdown
+    // Safety-copy the current live DB. ghost-mining checkpoints the WAL on shutdown
     // before exiting for a restart, so a plain file copy here is consistent.
     if db_path.exists() {
         let ts = std::time::SystemTime::now()
@@ -1037,7 +1037,7 @@ impl Database {
     ///
     /// `VACUUM` rebuilds the entire database through SQLite's page cache, so its peak memory is
     /// proportional to database size, not to the amount being reclaimed. Rebuilding 2.1GB to
-    /// recover a few MB of pruned rows is what OOM-killed ghost-pool hourly on 3.87GB nodes.
+    /// recover a few MB of pruned rows is what OOM-killed ghost-mining hourly on 3.87GB nodes.
     ///
     /// 256MB means a rebuild only happens when it would actually recover a meaningful amount of
     /// disk, at which point paying the memory cost once is reasonable.
@@ -1063,7 +1063,7 @@ impl Database {
     /// healthy.
     ///
     /// Why this exists rather than leaning on `optimize`: `optimize` reclaims by running a full
-    /// `VACUUM`, which streams the whole database through the page cache and OOM-killed ghost-pool
+    /// `VACUUM`, which streams the whole database through the page cache and OOM-killed ghost-mining
     /// hourly on the 3.87 GB nodes. Driving the free list down here is what keeps that VACUUM from
     /// being reached at all — it is bounded, incremental, and needs no second copy of the file.
     pub fn incremental_vacuum(&self, max_pages: u32) -> GhostResult<i64> {
@@ -1138,7 +1138,7 @@ impl Database {
     /// by streaming it through SQLite's page cache, so on a 2.1GB SQLCipher file it took
     /// ~2.8GB resident, every hour, to reclaim a few MB of freed rows.
     ///
-    /// On 3.87GB nodes that was fatal: the kernel OOM-killed ghost-pool on the hour, every
+    /// On 3.87GB nodes that was fatal: the kernel OOM-killed ghost-mining on the hour, every
     /// hour. Because an OOM kill is SIGKILL, it also never got to checkpoint, so the WAL grew
     /// to the size of the database and stayed there. Heap profiling attributed 96.9% of all
     /// allocation in the process to this one call.

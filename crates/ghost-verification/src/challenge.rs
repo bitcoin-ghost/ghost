@@ -116,7 +116,7 @@ pub struct TxData {
 ///
 /// This is the single source of truth for archive verdict comparison. It is
 /// called both by the CHALLENGER (`task.rs`, against its own RPC at challenge
-/// time) and by RECIPIENTS of a broadcast result (`ghost-pool`'s
+/// time) and by RECIPIENTS of a broadcast result (`ghost-mining`'s
 /// `ChainReVerifier`, against their own RPC when re-deriving the verdict). Both
 /// paths run identical logic so there is zero divergence between the verdict a
 /// challenger records and the verdict a recipient re-derives.
@@ -268,7 +268,7 @@ pub struct PolicyResponse {
 /// This is the single source of truth for policy verdict comparison, mirroring
 /// [`validate_archive_response`]. It is called both by the CHALLENGER (`task.rs`,
 /// against its own [`ghost_policy::PolicyEngine`] at challenge time) and by
-/// RECIPIENTS of a broadcast result (`ghost-pool`'s `ChainReVerifier`, against
+/// RECIPIENTS of a broadcast result (`ghost-mining`'s `ChainReVerifier`, against
 /// their own engine when re-deriving the verdict). Both paths run identical
 /// logic, so there is zero divergence between the verdict a challenger records
 /// and the verdict a recipient re-derives.

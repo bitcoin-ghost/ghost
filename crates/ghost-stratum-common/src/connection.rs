@@ -336,7 +336,7 @@ pub fn extract_response(msg: json_rpc::Message) -> Result<json_rpc::Response> {
 ///
 /// The full implementation requires integration with noise_sv2 for
 /// encrypted connections. See the stratum-apps crate in the original
-/// ghost-pool for the complete implementation.
+/// ghost-mining for the complete implementation.
 ///
 /// Key components needed:
 /// - `NoiseTcpStream` - Noise-encrypted TCP stream

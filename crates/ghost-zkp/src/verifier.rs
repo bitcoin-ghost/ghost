@@ -213,7 +213,7 @@ impl BlockVerifier {
             #[cfg(not(test))]
             {
                 // L-18 FIX: Check if we're on mainnet - simulated proofs NEVER allowed on mainnet
-                // GHOST_NETWORK env var is set by ghost-pool and other binaries
+                // GHOST_NETWORK env var is set by ghost-mining and other binaries
                 let is_mainnet = std::env::var("GHOST_NETWORK")
                     .map(|v| v.to_lowercase() == "mainnet" || v.to_lowercase() == "bitcoin")
                     .unwrap_or(false);

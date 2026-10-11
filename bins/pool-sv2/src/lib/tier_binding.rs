@@ -1,12 +1,12 @@
 //! pool_sv2's half of the difficulty-tier commitment (SHARE_TIER_BIND).
 //!
-//! ghost-pool gates by block height (`SHARE_TIER_BIND_HEIGHT`, dormant at `u64::MAX`); this
+//! ghost-mining gates by block height (`SHARE_TIER_BIND_HEIGHT`, dormant at `u64::MAX`); this
 //! binary has no chain view, so its half is the `[share_tier_binding]` config section — but the
-//! per-template decision is derived from the BIP34 height ghost-pool stamps into every
+//! per-template decision is derived from the BIP34 height ghost-mining stamps into every
 //! template's `coinbase_prefix`, so with the SAME height configured both binaries flip at the
 //! same block rather than at whichever moment this process restarted. The remaining desync
 //! surface is a mis-copied height — the identity is no longer transcribed at all, but read from
-//! the co-located ghost-pool at startup ([`TierBinding::resolve`]), which is the process that
+//! the co-located ghost-mining at startup ([`TierBinding::resolve`]), which is the process that
 //! derives and verifies the tags, so the two cannot disagree.
 //!
 //! ## What tiered mode changes
@@ -68,19 +68,19 @@ impl TierBinding {
         })
     }
 
-    /// Pull `response.node_id` out of ghost-pool's health document.
+    /// Pull `response.node_id` out of ghost-mining's health document.
     pub fn node_id_from_health_json(body: &str) -> Result<[u8; 32], String> {
         let v: serde_json::Value = serde_json::from_str(body)
-            .map_err(|e| format!("ghost-pool health is not JSON: {e}"))?;
+            .map_err(|e| format!("ghost-mining health is not JSON: {e}"))?;
         let id = v
             .get("response")
             .and_then(|r| r.get("node_id"))
             .and_then(|n| n.as_str())
-            .ok_or_else(|| "ghost-pool health has no response.node_id".to_string())?;
+            .ok_or_else(|| "ghost-mining health has no response.node_id".to_string())?;
         Self::parse_node_id(id)
     }
 
-    /// Resolve this node's identity, preferring **ghost-pool's own answer** over anything
+    /// Resolve this node's identity, preferring **ghost-mining's own answer** over anything
     /// transcribed into config.
     ///
     /// `pool_sv2` cannot derive the raw id itself: the template prefix carries
@@ -103,7 +103,7 @@ impl TierBinding {
             .map(Self::parse_node_id)
             .transpose()?;
 
-        // ghost-pool may still be starting; the deploy order restarts it first.
+        // ghost-mining may still be starting; the deploy order restarts it first.
         let mut fetched: Result<[u8; 32], String> = Err("not attempted".into());
         for attempt in 1..=5u32 {
             fetched = async {
@@ -112,10 +112,10 @@ impl TierBinding {
                     .timeout(std::time::Duration::from_secs(5))
                     .send()
                     .await
-                    .map_err(|e| format!("cannot reach ghost-pool at {url}: {e}"))?
+                    .map_err(|e| format!("cannot reach ghost-mining at {url}: {e}"))?
                     .text()
                     .await
-                    .map_err(|e| format!("cannot read ghost-pool health: {e}"))?;
+                    .map_err(|e| format!("cannot read ghost-mining health: {e}"))?;
                 Self::node_id_from_health_json(&body)
             }
             .await;
@@ -132,10 +132,10 @@ impl TierBinding {
             // supposed to guard against, so it stops the node rather than picking a winner.
             (Ok(f), Some(p)) if f != p => {
                 return Err(format!(
-                    "share_tier_binding.node_id ({}) does not match the identity ghost-pool \
-                     reports ({}). ghost-pool stamps and verifies the coinbase node tags, so the \
+                    "share_tier_binding.node_id ({}) does not match the identity ghost-mining \
+                     reports ({}). ghost-mining stamps and verifies the coinbase node tags, so the \
                      configured value would reject every tier-era share on this node. Remove the \
-                     pin to use ghost-pool's own identity.",
+                     pin to use ghost-mining's own identity.",
                     hex::encode(&p[..8]),
                     hex::encode(&f[..8]),
                 ))
@@ -146,7 +146,7 @@ impl TierBinding {
             (Err(e), Some(p)) => {
                 warn!(
                     error = %e,
-                    "SHARE_TIER_BIND: could not verify node_id against ghost-pool — using the \
+                    "SHARE_TIER_BIND: could not verify node_id against ghost-mining — using the \
                      configured value UNVERIFIED. If it is wrong, this node's tier-era shares \
                      will all fail their binding check."
                 );
@@ -157,7 +157,7 @@ impl TierBinding {
             (Err(e), None) => {
                 return Err(format!(
                     "share_tier_binding is configured but this node's identity could not be read \
-                     from ghost-pool ({e}). Start ghost-pool first, or pin node_id explicitly."
+                     from ghost-mining ({e}). Start ghost-mining first, or pin node_id explicitly."
                 ))
             }
         };
@@ -174,7 +174,7 @@ impl TierBinding {
     /// activation height.
     ///
     /// An unparseable height fails toward DORMANT, loudly. Dormant is the recoverable direction:
-    /// ghost-pool's verifier rejects above-gate shares that lack a tier (`missing_tier`, a
+    /// ghost-mining's verifier rejects above-gate shares that lack a tier (`missing_tier`, a
     /// counted, visible reject), whereas emitting tier stamps below the gate would put unexpected
     /// bytes in mined coinbases.
     pub fn template_is_tiered(&self, template: &NewTemplate<'_>) -> bool {
@@ -242,7 +242,7 @@ pub fn tier_credit(tier_log2: u32) -> f64 {
 
 /// Parse the BIP34 height push at the head of a coinbase scriptSig prefix.
 ///
-/// ghost-pool builds this with `TemplateProcessor::encode_height`: one push opcode (1..=4 here;
+/// ghost-mining builds this with `TemplateProcessor::encode_height`: one push opcode (1..=4 here;
 /// 8 allowed for robustness) followed by that many little-endian bytes.
 pub fn bip34_height(coinbase_prefix: &[u8]) -> Option<u64> {
     let len = *coinbase_prefix.first()? as usize;
@@ -275,7 +275,7 @@ fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> usize {
 ///
 /// This is what makes the tier stamp cost zero bytes: the plain 25-byte tag comes OUT of the
 /// prefix and the tier-bound 25-byte tag goes IN as the factory's extra push. The layout is the
-/// one ghost-pool's `template_provider.rs` emits — height, then optionally `GHPP`, then
+/// one ghost-mining's `template_provider.rs` emits — height, then optionally `GHPP`, then
 /// optionally `GHNT` — detected exactly as that code detects it, not assumed.
 ///
 /// A template with no node tag (a treasury-only coinbase, or a foreign TP) passes through
@@ -332,7 +332,7 @@ mod tests {
     }
 
     fn ghost_prefix(with_node_tag: bool) -> Vec<u8> {
-        // BIP34 height 960_000 quantised as ghost-pool encodes it: 0x03 push + 3 LE bytes.
+        // BIP34 height 960_000 quantised as ghost-mining encodes it: 0x03 push + 3 LE bytes.
         let mut p = vec![0x03, 0x00, 0xa6, 0x0e];
         p.extend_from_slice(&encode_payout_tag(&[0xC3; 16]));
         if with_node_tag {
@@ -359,7 +359,7 @@ mod tests {
         }
     }
 
-    /// The height ghost-pool encodes must read back exactly, for each encoding width it emits.
+    /// The height ghost-mining encodes must read back exactly, for each encoding width it emits.
     #[test]
     fn bip34_height_round_trips_ghost_pools_encodings() {
         // The widths `TemplateProcessor::encode_height` produces.
@@ -377,7 +377,7 @@ mod tests {
     }
 
     /// The gate: strictly below → untiered; at and above → tiered. Same boundary sense as
-    /// ghost-pool's `binds_difficulty_tier`.
+    /// ghost-mining's `binds_difficulty_tier`.
     #[test]
     fn the_template_gate_flips_at_the_activation_height() {
         let binding = a_binding(960_000);
@@ -473,7 +473,7 @@ mod tests {
         }
     }
 
-    /// The identity is read from ghost-pool's real health document, so the manual per-node
+    /// The identity is read from ghost-mining's real health document, so the manual per-node
     /// transcription that arming used to require is gone. Shaped exactly as the endpoint answers,
     /// including the fields around it, so a change to that document fails here rather than at a
     /// height on mainnet.

@@ -80,7 +80,7 @@ export interface TorToggleResult {
 
 // Toggle ghostd Tor mode (-tormode). Persists [node_launch].tor_mode to
 // pool.toml, regenerates ghostd's launch-flag drop-in and restarts ghostd, then
-// bounces ghost-pool. Requires a restart because -tormode is a startup flag.
+// bounces ghost-mining. Requires a restart because -tormode is a startup flag.
 export async function setTor(enabled: boolean): Promise<TorToggleResult> {
   return fetchApi<TorToggleResult>('/api/v1/config/tor', {
     method: 'POST',
@@ -131,7 +131,7 @@ export async function getDaemonSettings(): Promise<DaemonConfigResponse> {
 }
 
 // Persist [node_launch] daemon settings and apply them: ghostd's launch-flag
-// drop-in is regenerated and ghostd is RESTARTED, then ghost-pool bounces.
+// drop-in is regenerated and ghostd is RESTARTED, then ghost-mining bounces.
 export async function setDaemonSettings(settings: DaemonSettings): Promise<DaemonUpdateResponse> {
   return fetchApi<DaemonUpdateResponse>('/api/v1/config/daemon', {
     method: 'POST',
@@ -424,7 +424,7 @@ export async function setGhostPay(enabled: boolean): Promise<NodeConfig> {
 }
 
 // Wraith mixing toggle — persists `[ghost_pay] wraith_enabled` to the node
-// config. A ghost-pool restart applies the change on a live node.
+// config. A ghost-mining restart applies the change on a live node.
 export async function setWraith(
   enabled: boolean,
 ): Promise<{ success: boolean; enabled: boolean; persisted: boolean; restart_required: boolean; message: string }> {

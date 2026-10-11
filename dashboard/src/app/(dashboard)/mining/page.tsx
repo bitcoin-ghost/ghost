@@ -132,7 +132,7 @@ function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | 
 }
 
 // Human-readable names for the self-check capabilities, used in the drift
-// warning banner. Keys mirror ghost-pool's `SelfCheckState` fields.
+// warning banner. Keys mirror ghost-mining's `SelfCheckState` fields.
 const CAPABILITY_LABELS: Record<keyof SelfCheckState, string> = {
   public_mining: "Public Mining",
   archive: "Archive Mode",

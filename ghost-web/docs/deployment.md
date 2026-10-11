@@ -1,6 +1,6 @@
 # Deployment
 
-*How to stand up a Ghost node from scratch on Linux. Covers the full stack: ghost-core (the validating node), ghost-pool (the mining-pool daemon), and optionally ghost-pay (the L2 payment network). Targets operators who want their node visibly participating in the mesh, not someone trying out the software in dev mode.*
+*How to stand up a Ghost node from scratch on Linux. Covers the full stack: ghost-core (the validating node), ghost-mining (the mining-pool daemon), and optionally ghost-pay (the L2 payment network). Targets operators who want their node visibly participating in the mesh, not someone trying out the software in dev mode.*
 
 ## What you're deploying
 
@@ -15,7 +15,7 @@ Three binaries that talk to each other:
               ┌─────────────┴─────────────┐
               │                           │
    ┌──────────▼──────────┐     ┌─────────▼─────────┐
-   │     ghost-pool      │     │     ghost-pay     │
+   │     ghost-mining      │     │     ghost-pay     │
    │  decentralised pool │◄────┤    L2 daemon      │
    │  Stratum + BFT mesh │     │   (optional)      │
    │  (ports 3333/8080…) │     │   (port 8800)     │
@@ -28,7 +28,7 @@ Three binaries that talk to each other:
         └──────────┘
 ```
 
-You always need ghost-core. You almost always want ghost-pool — it's what makes the node a mining-pool participant and earns capability shares. ghost-pay is optional: it adds the L2 payments network and qualifies the node for the +4 GhostPay capability share if you also pass the verification challenges.
+You always need ghost-core. You almost always want ghost-mining — it's what makes the node a mining-pool participant and earns capability shares. ghost-pay is optional: it adds the L2 payments network and qualifies the node for the +4 GhostPay capability share if you also pass the verification challenges.
 
 ## Hardware
 
@@ -45,7 +45,7 @@ The disk requirement depends on archive mode. A hazed node sits around 195 GB; a
 
 - **OS:** Ubuntu 22.04 LTS or Debian 12. Other distributions work but aren't tested first.
 - **Rust:** 1.75+ (only required if building from source).
-- **SQLite 3.35+** — bundled with ghost-pool, no separate install.
+- **SQLite 3.35+** — bundled with ghost-mining, no separate install.
 - **SQLCipher** — required for ghost-pay if you run it. Available as `libsqlcipher-dev` on Debian-family.
 
 A minimal apt install:
@@ -64,7 +64,7 @@ source $HOME/.cargo/env
 
 ## Install ghost-core
 
-ghost-core is a fork of Bitcoin Core with the haze, Reaper, and Shroud features added. Build it first so it's ready to validate the chain while you set up ghost-pool.
+ghost-core is a fork of Bitcoin Core with the haze, Reaper, and Shroud features added. Build it first so it's ready to validate the chain while you set up ghost-mining.
 
 ```bash
 git clone https://github.com/bitcoin-ghost/ghost-core.git
@@ -85,7 +85,7 @@ rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
 rpcport=8332
 
-# ZMQ — ghost-pool reads new-block notifications via these
+# ZMQ — ghost-mining reads new-block notifications via these
 zmqpubhashblock=tcp://127.0.0.1:28332
 zmqpubhashtx=tcp://127.0.0.1:28333
 
@@ -96,7 +96,7 @@ hazemode=Hazed   # or FullArchive if you want to serve raw block data
 ```
 
 Create the service user and the data directory before starting anything. Both ghostd and
-ghost-pool run as this one user — that is what the reference fleet does, and what
+ghost-mining run as this one user — that is what the reference fleet does, and what
 `install-node.sh` sets up:
 
 ```bash
@@ -106,7 +106,7 @@ sudo chown -R ghost:ghost /var/lib/bitcoin /home/ghost
 sudo chmod 750 /var/lib/bitcoin
 ```
 
-`--create-home` matters: ghost-pool keeps its database and MPC parameters under
+`--create-home` matters: ghost-mining keeps its database and MPC parameters under
 `/home/ghost/.ghost`, which the unit below references.
 
 Start it under systemd. A skeleton unit at `/etc/systemd/system/ghost-core.service`:
@@ -130,12 +130,12 @@ WantedBy=multi-user.target
 
 ⚠ This unit ran as `User=bitcoin` for a long time, which was wrong twice over: nothing in
 this guide creates that user, and the reference fleet runs ghostd as `ghost` — the same
-user as ghost-pool below. If you built a node from an older copy of this guide, check with
+user as ghost-mining below. If you built a node from an older copy of this guide, check with
 `systemctl show ghostd -p User --value` rather than reading the unit file.
 
 `sudo systemctl enable --now ghost-core` and let it sync. Initial Block Download takes ~3 minutes via snapshot sync (hazed mode) or several hours from genesis on a slow link.
 
-## Install ghost-pool
+## Install ghost-mining
 
 Either build from source or download a release.
 
@@ -153,9 +153,9 @@ Binary lands at `target/release/ghost-mining`. Move it into place:
 
 ```bash
 sudo mkdir -p /opt/ghost/bin
-sudo cp target/release/ghost-mining /opt/ghost/bin/ghost-pool
-sudo chown root:root /opt/ghost/bin/ghost-pool
-sudo chmod 755 /opt/ghost/bin/ghost-pool
+sudo cp target/release/ghost-mining /opt/ghost/bin/ghost-mining
+sudo chown root:root /opt/ghost/bin/ghost-mining
+sudo chmod 755 /opt/ghost/bin/ghost-mining
 ```
 
 ### Pre-built binaries
@@ -163,12 +163,12 @@ sudo chmod 755 /opt/ghost/bin/ghost-pool
 ```bash
 wget https://github.com/bitcoin-ghost/ghost/releases/latest/download/ghost-pool-linux-amd64.tar.gz
 tar -xzf ghost-pool-linux-amd64.tar.gz
-sudo cp ghost-pool /opt/ghost/bin/ghost-pool
+sudo cp ghost-mining /opt/ghost/bin/ghost-mining
 ```
 
 Verify the signature (see [Security](/security.html) for the disclosure flow's GPG fingerprint).
 
-## Configure ghost-pool
+## Configure ghost-mining
 
 The minimum config that runs on mainnet, at `/etc/ghost/pool.toml`:
 
@@ -227,7 +227,7 @@ min_payout_sats   = 10000
 
 - `bitcoin.rpc_password` — match what's in `bitcoin.conf`.
 - `network.public_address` — your reachable hostname or IP. Leave blank only if not running public mining.
-- `network.internal_api_secret` — generate with `openssl rand -hex 32`. Required on mainnet; ghost-pool refuses to start without it.
+- `network.internal_api_secret` — generate with `openssl rand -hex 32`. Required on mainnet; ghost-mining refuses to start without it.
 - `pool.treasury_address` — a P2TR (`bc1p…`) address you control. The pool fee accumulates here until the treasury threshold is reached.
 
 **Items the deploy fails on if missing:**
@@ -245,16 +245,16 @@ These are deliberate hard fails. Don't try to work around them.
 
 ## Generate keys
 
-Two keys per node, both managed by `ghost-pool` itself:
+Two keys per node, both managed by `ghost-mining` itself:
 
 ```bash
 # Ed25519 node identity. Writes to <data_dir>/node.key (default
 # ~/.ghost/node.key for the running user). No --output flag — the path
 # is derived from --data-dir / config. The PoW step takes a few seconds.
-sudo -u ghost /opt/ghost/bin/ghost-pool --generate-identity
+sudo -u ghost /opt/ghost/bin/ghost-mining --generate-identity
 
 # Inspect the generated identity (Node ID, signer type)
-sudo -u ghost /opt/ghost/bin/ghost-pool --show-identity
+sudo -u ghost /opt/ghost/bin/ghost-mining --show-identity
 
 # Tighten permissions on the resulting key file
 sudo chmod 600 /home/ghost/.ghost/node.key
@@ -267,9 +267,9 @@ sudo chmod 600 /home/ghost/.ghost/node.key
 
 The node identity is your peer ID forever. Lose it and you lose your peer slot, your verification history, and (if you're an Elder) your Elder position. Back it up.
 
-## Systemd unit for ghost-pool
+## Systemd unit for ghost-mining
 
-`/etc/systemd/system/ghost-pool.service`:
+`/etc/systemd/system/ghost-mining.service`:
 
 ```ini
 [Unit]
@@ -281,7 +281,7 @@ Wants=ghost-core.service
 Type=simple
 User=ghost
 Group=ghost
-ExecStart=/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml
+ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml
 Restart=always
 RestartSec=10
 LimitNOFILE=65536
@@ -299,7 +299,7 @@ Two environment variables matter on mainnet:
 - `ZK_PARAMS_PATH` — directory containing the current MPC ceremony params and verifying keys (`note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`). The ceremony is rolling, so these are the current chain head, not necessarily a final ossified set.
 - `ZK_PARAMS_HASH` — SHA256 of the params used to verify the binary loaded the right ones. The release notes for each version include the expected hash.
 
-If the params don't match the hash, ghost-pool refuses to start. This protects against a node accidentally running with stale or test params.
+If the params don't match the hash, ghost-mining refuses to start. This protects against a node accidentally running with stale or test params.
 
 ## First-time mainnet checklist
 
@@ -326,7 +326,7 @@ Before flipping the service on, walk this checklist. Every item must pass:
 
 - [ ] All three VK files present: `note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`.
 - [ ] MPC params match the cluster you're joining (the current rolling-ceremony chain head, not test params).
-- [ ] `ZK_PARAMS_HASH` env matches the published hash for your ghost-pool version.
+- [ ] `ZK_PARAMS_HASH` env matches the published hash for your ghost-mining version.
 
 **Database:**
 
@@ -353,8 +353,8 @@ These are all on by default in the `--features zk-production` build. The checkli
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now ghost-pool
-sudo journalctl -u ghost-pool -f
+sudo systemctl enable --now ghost-mining
+sudo journalctl -u ghost-mining -f
 ```
 
 What healthy startup logs look like, in order:
@@ -386,7 +386,7 @@ If the log stops at `MAINNET SECURITY: …` — fix the mainnet hard-fail and re
 Within 1-2 minutes the node should:
 
 1. **Appear in `/api/v1/mesh/status`** on a peer node, with `last_seen` updating every 10 seconds.
-2. **Be receiving health pings** — `sudo journalctl -u ghost-pool | grep "Received HealthPing"` should show entries.
+2. **Be receiving health pings** — `sudo journalctl -u ghost-mining | grep "Received HealthPing"` should show entries.
 3. **Have a registered Elder slot** if it's among the first 101 — visible via `/api/v1/mesh/elders`.
 
 Run `curl -s http://localhost:8080/api/v1/mining/status | jq` to see the local view. Run the same against any peer's public IP to compare.
@@ -414,7 +414,7 @@ The capability is verified by random L2-block-lookup challenges from peers. Pass
 
 | Symptom | First check |
 |---|---|
-| ghost-pool exits at startup | `sudo journalctl -u ghost-pool -n 50` — most config errors are explicit |
+| ghost-mining exits at startup | `sudo journalctl -u ghost-mining -n 50` — most config errors are explicit |
 | Stuck at "Connecting to seed nodes" | Outbound 8559 not allowed by firewall, or seed nodes unreachable |
 | Mesh count = 0 | Inbound 8563 (Noise) or 8559 (discovery) blocked, or peer reachability problem |
 | Verification challenges all failing | HTTP API not reachable from peers, or `internal_api_secret` mismatch between this node and its peers |

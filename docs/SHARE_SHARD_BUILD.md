@@ -650,7 +650,7 @@ rehomed. Do not extract them into a shared module first; that only adds a module
 ## Hazards to design against, not discover
 
 - **The share webhook drops a batch after max retries.** Today the sweep is the backstop; once it is
-  gone, a ghost-pool restart becomes permanently unpaid miner work with **no reconciliation path and
+  gone, a ghost-mining restart becomes permanently unpaid miner work with **no reconciliation path and
   no symptom**. Needs a spool on the `pool-sv2` side or an explicit accepted-loss decision with an
   alarm at zero.
 - **Solo-mode suppression must extend to epoch summaries**, or a solo node's work enters the shared

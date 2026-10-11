@@ -7,7 +7,7 @@
 //! (`tasks/plan_mpc_rolling_resume.md`).
 //!
 //! Each node holds a real long-lived [`ghost_mpc::CeremonyManager`] over its own
-//! params dir (exactly like the mainnet `ghost-pool` process), and:
+//! params dir (exactly like the mainnet `ghost-mining` process), and:
 //!   * (contributor) generates a real phase-2 candidate, writes it to the
 //!     SEPARATE serving file `note_spend_params_candidate_<hash>.bin` (NEVER the
 //!     active `note_spend_params_current.bin`), and serves it via the EXACT
@@ -127,7 +127,7 @@ async fn run_node(argv: &[String]) {
     let ossified = args.has("ossified");
     let node_id = args.get("node-id").unwrap_or("xnode").to_string();
 
-    // Rebuild the manager exactly as ghost-pool does at startup: state from the
+    // Rebuild the manager exactly as ghost-mining does at startup: state from the
     // (simulated) DB singleton, params loaded from disk.
     let state = CeremonyState {
         contribution_count: count,

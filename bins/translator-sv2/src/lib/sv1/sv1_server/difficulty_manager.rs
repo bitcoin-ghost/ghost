@@ -31,7 +31,7 @@ enum AggregatedSnapshot {
 /// literal because this crate is an SRI fork that deliberately does not link the ghost workspace
 /// crates. If the authority moves (it is re-derived against the live vardiff floor before the
 /// gate arms), this constant MUST move with it — the arming checklist on
-/// `SHARE_TIER_BIND_HEIGHT` (ghost-pool `lib.rs`) is what enforces the coupling.
+/// `SHARE_TIER_BIND_HEIGHT` (ghost-mining `lib.rs`) is what enforces the coupling.
 pub(crate) const MIN_DIFFICULTY_TIER_LOG2: u32 = 10;
 
 /// Ceiling tier exponent, clamping the shift below. Mirrors

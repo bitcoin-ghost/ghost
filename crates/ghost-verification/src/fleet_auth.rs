@@ -287,7 +287,7 @@ mod tests {
         let mut cmd = SignedCommand {
             target_node_id: target.to_string(),
             action: action.to_string(),
-            params: serde_json::json!({"service": "ghost-pool"}),
+            params: serde_json::json!({"service": "ghost-mining"}),
             nonce: nonce.to_string(),
             expires_at: expires,
             signature: String::new(),

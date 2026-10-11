@@ -11,7 +11,7 @@ import type { LogEntry, LogUnit } from "@/types/api";
 const LEVELS = ["all", "error", "warn", "info", "debug", "trace"] as const;
 type Level = (typeof LEVELS)[number];
 
-const DEFAULT_UNIT = "ghost-pool";
+const DEFAULT_UNIT = "ghost-mining";
 
 const LEVEL_COLOR: Record<LogEntry["level"], string> = {
   error: "#f85149",

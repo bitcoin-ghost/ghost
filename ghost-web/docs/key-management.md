@@ -23,7 +23,7 @@ An Ed25519 keypair plus a 12-byte proof-of-work that prevents Sybil attacks. Onc
 ### Generate
 
 ```bash
-ghost-pool --generate-identity
+ghost-mining --generate-identity
 ```
 
 Creates `~/.ghost/node.key`:
@@ -35,7 +35,7 @@ The PoW takes a few seconds on commodity hardware. If you see the process churni
 ### Inspect
 
 ```bash
-ghost-pool --show-identity
+ghost-mining --show-identity
 ```
 
 Output:
@@ -65,7 +65,7 @@ Things you must not do:
 
 ### HSM-backed storage (production)
 
-For nodes that need stronger guarantees against key extraction, ghost-pool supports PKCS#11 HSMs.
+For nodes that need stronger guarantees against key extraction, ghost-mining supports PKCS#11 HSMs.
 
 ```toml
 [identity.signer]
@@ -98,12 +98,12 @@ pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
   --keypairgen --key-type EC:ed25519 \
   --label "ghost-node-key"
 
-# 4. Configure ghost-pool to use it
+# 4. Configure ghost-mining to use it
 export HSM_PIN=1234
-ghost-pool --config /etc/ghost/pool.toml
+ghost-mining --config /etc/ghost/pool.toml
 ```
 
-The private key never leaves the HSM. ghost-pool sends signing requests over PKCS#11 and gets back signatures.
+The private key never leaves the HSM. ghost-mining sends signing requests over PKCS#11 and gets back signatures.
 
 ### KMS-backed storage (cloud)
 
@@ -137,7 +137,7 @@ The mainnet validator rejects any non-mainnet treasury address (a `tb1...` or `b
 ## Noise keypair
 
 X25519 used for encrypted P2P traffic on the mesh. There is no dedicated
-generation subcommand — ghost-pool creates `<data_dir>/noise.key` on first
+generation subcommand — ghost-mining creates `<data_dir>/noise.key` on first
 start if the file is missing, and reuses it thereafter. Tighten permissions
 once it exists:
 
@@ -147,11 +147,11 @@ chmod 600 /home/ghost/.ghost/noise.key
 
 Lower-stakes than the node identity — the noise key only encrypts the transport, it doesn't sign votes or messages. Compromise is contained: an attacker who steals it can decrypt that node's mesh traffic but can't impersonate the node (the identity Ed25519 is what signs).
 
-Rotate any time without consensus impact: stop ghost-pool, delete `noise.key`, restart. A fresh keypair is generated and picked up automatically.
+Rotate any time without consensus impact: stop ghost-mining, delete `noise.key`, restart. A fresh keypair is generated and picked up automatically.
 
 ## Internal API secret
 
-Used to authenticate internal API calls between ghost-pool and the dashboard, and between dashboard and admin clients. Generate with:
+Used to authenticate internal API calls between ghost-mining and the dashboard, and between dashboard and admin clients. Generate with:
 
 ```bash
 openssl rand -hex 32
@@ -221,23 +221,23 @@ cp ~/.ghost/node.key ~/.ghost/node.key.backup-$(date +%Y%m%d)
 chmod 600 ~/.ghost/node.key.backup-*
 
 # 2. Record current node_id (you'll need it for handoff)
-ghost-pool --show-identity > /tmp/old-identity.txt
+ghost-mining --show-identity > /tmp/old-identity.txt
 
 # 3. Stop the node
-sudo systemctl stop ghost-pool
+sudo systemctl stop ghost-mining
 
 # 4. Move old key out of the way
 mv ~/.ghost/node.key ~/.ghost/node.key.retired-$(date +%Y%m%d)
 
 # 5. Generate new identity
-ghost-pool --generate-identity
+ghost-mining --generate-identity
 
 # 6. Verify the new key
-ghost-pool --show-identity
+ghost-mining --show-identity
 
 # 7. Start the node
-sudo systemctl start ghost-pool
-sudo journalctl -u ghost-pool -f --since "1 min ago"
+sudo systemctl start ghost-mining
+sudo journalctl -u ghost-mining -f --since "1 min ago"
 ```
 
 Within ~60 seconds the new identity should appear in peer mesh databases. Check from a peer:
@@ -277,7 +277,7 @@ The treasury seed is the disaster-recovery scenario you really care about. If ev
 - **Multisig orchestration software.** If you run a 3-of-5 treasury with hardware wallets across operators, the coordination tooling (Specter, Sparrow, Caravan) is whatever your team already uses. Ghost-pool just consumes the resulting bech32m address.
 - **HSM vendor specifics.** Each HSM has its own initialisation, backup, and audit story. The PKCS#11 layer is the standard interface; what's behind it varies.
 - **Per-jurisdiction compliance.** Some operators have to file specific paperwork around HSM custody. That's outside this doc's scope.
-- **Wallet seed management.** This is operator-side ghost-pool keys, not user-side wallet keys. Wallets (Ghost Tap, Light Wallet) have their own backup model — see [Wallets](#wallets).
+- **Wallet seed management.** This is operator-side ghost-mining keys, not user-side wallet keys. Wallets (Ghost Tap, Light Wallet) have their own backup model — see [Wallets](#wallets).
 
 ## Source
 

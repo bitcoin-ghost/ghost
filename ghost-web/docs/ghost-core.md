@@ -31,7 +31,7 @@ All differences are in policy — what your node chooses to relay, store, and bu
 
 ## BUDS Classification
 
-**BUDS (Bitcoin Unified Data Standard)** is Ghost's system for classifying transaction data into tiers based on importance. The T0-T3 tier classification is active in production, used by the ghost-pool template processor for transaction filtering and block construction.
+**BUDS (Bitcoin Unified Data Standard)** is Ghost's system for classifying transaction data into tiers based on importance. The T0-T3 tier classification is active in production, used by the ghost-mining template processor for transaction filtering and block construction.
 
 ### Tier Definitions
 

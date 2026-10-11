@@ -119,7 +119,7 @@ export function ReaperControls() {
       <Card>
         <CardHeader title="Adjust reaper" subtitle="Per-vector controls" />
         <p className="t-body" style={{ color: "var(--dim)" }}>
-          Could not load the reaper configuration from ghost-pool. The controls are unavailable until
+          Could not load the reaper configuration from ghost-mining. The controls are unavailable until
           the node responds.
         </p>
       </Card>
@@ -156,7 +156,7 @@ export function ReaperControls() {
       toast.success(
         "Reaper settings saved",
         res.persisted
-          ? "Both reapers are updating automatically: the pool template reaper on the imminent ghost-pool restart, and the ghostd mempool reaper is being applied now (ghostd briefly restarts). No manual step needed."
+          ? "Both reapers are updating automatically: the pool template reaper on the imminent ghost-mining restart, and the ghostd mempool reaper is being applied now (ghostd briefly restarts). No manual step needed."
           : "Settings received but no node config path is configured — nothing was persisted."
       );
     } catch (e) {
@@ -235,7 +235,7 @@ export function ReaperControls() {
         />
         <VectorGroup
           title="Pool template reaper only"
-          note="Strips dead weight from the blocks this node builds. Applied automatically when ghost-pool restarts."
+          note="Strips dead weight from the blocks this node builds. Applied automatically when ghost-mining restarts."
           vectors={POOL_VECTORS}
           data={form}
           onChange={patch}
@@ -313,7 +313,7 @@ export function ReaperControls() {
           <p className="t-label" style={{ color: "var(--fg)", lineHeight: "1.6" }}>
             Saving writes these settings to the node config (<code>pool.toml [reaper]</code>) and applies
             them to <strong>both</strong> reapers automatically. The pool template reaper picks them up when{" "}
-            <strong style={{ color: "var(--accent)" }}>ghost-pool restarts</strong>, and the ghostd{" "}
+            <strong style={{ color: "var(--accent)" }}>ghost-mining restarts</strong>, and the ghostd{" "}
             <strong>mempool</strong> reaper is regenerated for you — the node rewrites its{" "}
             <code>-ghostreaper</code> reject flags and <strong>briefly restarts ghostd</strong>. No manual{" "}
             <code>ghost-setup apply-reaper</code> step is needed.

@@ -104,7 +104,7 @@ pub type Groth16Params = bellperson::groth16::Parameters<blstrs::Bls12>;
 /// can walk genesis → contributions → ossification in seconds instead of needing
 /// 101 multi-hundred-megabyte Groth16 contributions. The feature is:
 ///   * NOT in `default` features,
-///   * never enabled by `ghost-pool`, `ghost-consensus`, or any shipping crate,
+///   * never enabled by `ghost-mining`, `ghost-consensus`, or any shipping crate,
 ///   * only ever turned on by an explicit `--features mpc-test-cap` on a targeted
 ///     `-p ghost-mpc` test invocation.
 ///

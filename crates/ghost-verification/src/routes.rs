@@ -61,7 +61,7 @@ const MAX_TX_HEX_SIZE: usize = 200_000; // 100KB in hex = 200k chars
 
 /// Window for the miner-facing hashrate figures (#981).
 ///
-/// 10 minutes, matching `MESH_HASHRATE_WINDOW_SECS` in ghost-pool so the number a miner reads on
+/// 10 minutes, matching `MESH_HASHRATE_WINDOW_SECS` in ghost-mining so the number a miner reads on
 /// their own lookup page is computed over the same span as the node's own reported hashrate.
 ///
 /// ⛔ Bounded on purpose. These routes used to divide by `last_seen - first_seen`, the miner's
@@ -165,7 +165,7 @@ fn get_system_resources(proc_paths_allowed: &[String]) -> (f64, f64, f64) {
 /// Create verification router
 pub fn create_router(state: Arc<VerificationState>) -> Router {
     // Resume watching any one-shot ghostd flags (-reindex / -exorcist) that are
-    // still armed in pool.toml — e.g. ghost-pool restarted while a pruned→archive
+    // still armed in pool.toml — e.g. ghost-mining restarted while a pruned→archive
     // resync or a retroactive Haze conversion was in flight. This guarantees the
     // one-shot flags are always eventually cleared from the drop-in.
     resume_pending_ghostd_oneshots(&state);
@@ -2037,7 +2037,7 @@ async fn api_mining_status_handler(
     // is !Send, so we must not hold any await-points after acquiring it.
     //
     // `health.block_height` is the TEMPLATE height (tip + 1 — the block
-    // ghost-pool is currently building). Calling getblockhash(that)
+    // ghost-mining is currently building). Calling getblockhash(that)
     // returns "out of range" because Bitcoin Core doesn't have it yet.
     // `getbestblockhash` returns the actual confirmed tip.
     let last_block_time: Option<u64> = if let Some(ref rpc) = state.rpc {
@@ -2655,7 +2655,7 @@ async fn api_pool_next_payout_handler(
     // so the displayed top-N matches the post-gate coinbase behaviour
     // (one slot per address, multi-rig users no longer monopolise).
     // The constant is duplicated here rather than imported because
-    // ghost-verification doesn't depend on ghost-pool — keep the two
+    // ghost-verification doesn't depend on ghost-mining — keep the two
     // in sync if the gate ever moves.
     const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 
@@ -3934,7 +3934,7 @@ async fn api_pool_leaderboard_handler(
 /// Returns 0.0 for a hash that isn't 32 bytes of hex (treated as "unknown").
 /// Achieved difficulty for a 64-char internal-order hex share hash
 /// (`diff1_target / hash_value`). Returns 0.0 for malformed input. `pub` so the
-/// ping builder in ghost-pool derives the same score it would here.
+/// ping builder in ghost-mining derives the same score it would here.
 pub fn share_difficulty_from_hash_hex(share_hash_hex: &str) -> f64 {
     let bytes = match hex::decode(share_hash_hex) {
         Ok(b) if b.len() == 32 => b,
@@ -3976,7 +3976,7 @@ fn is_system_miner(miner_id: &str) -> bool {
 
 /// Redact a `address.worker` miner_id for public display: first 6 + ellipsis +
 /// last 4 of the address portion, worker kept intact. `pub` so the ping builder
-/// in ghost-pool redacts gossiped records identically to this endpoint.
+/// in ghost-mining redacts gossiped records identically to this endpoint.
 pub fn redact_miner_id(id: &str) -> String {
     let (addr, worker) = match id.find('.') {
         Some(i) => (&id[..i], &id[i..]), // worker has leading '.'
@@ -4405,7 +4405,7 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
     );
 
     // THIS node's own L2 (Ghost Pay) virtual-block height. `check_ghostpay_local`
-    // reads the in-process handler, which production ghost-pool does NOT wire —
+    // reads the in-process handler, which production ghost-mining does NOT wire —
     // ghost-pay runs as a separate service on :8800 — so it returns `None` and
     // the self row's L2 showed "—". Mirror the ghostpay status endpoint: on that
     // `None`, fall back to querying the local :8800 service. `Some(disabled)`
@@ -5196,7 +5196,7 @@ async fn api_watchdog_status_handler(
 ) -> impl IntoResponse {
     let health = state.get_health().await;
 
-    // Check ghost-pool status (we're running, so it's up)
+    // Check ghost-mining status (we're running, so it's up)
     let ghost_pool_status = serde_json::json!({
         "status": "running",
         "uptime_secs": health.uptime_secs,
@@ -7151,7 +7151,7 @@ async fn api_config_public_mining_post_handler(
                 "enabled": payload.enabled,
                 "restart_pending": changed,
                 "message": if changed {
-                    "Public mining updated. ghost-pool will restart to apply the new mining mode."
+                    "Public mining updated. ghost-mining will restart to apply the new mining mode."
                 } else {
                     "Public mining already in the requested state."
                 }
@@ -7224,7 +7224,7 @@ pub fn run_ghostd_apply_reaper() -> Result<String, String> {
 /// Spawn the automatic ghostd apply in the background and, once it settles,
 /// trigger the pool restart. Sequencing the pool restart *after* the ghostd
 /// apply is deliberate: the pool depends on ghostd's RPC, so we let ghostd
-/// finish restarting (or fail) before ghost-pool bounces and reconnects to the
+/// finish restarting (or fail) before ghost-mining bounces and reconnects to the
 /// freshly-flagged daemon. If the ghostd apply fails, the pool side still
 /// applies from the persisted config — the node is never left half-configured.
 fn spawn_ghostd_reaper_apply(state: Arc<VerificationState>) {
@@ -7338,7 +7338,7 @@ pub fn read_ghostd_enforced_profile() -> Option<String> {
 }
 
 /// Reconcile ghostd's enforced tier policy to `pool.toml` (the MASTER) at
-/// ghost-pool startup, so the two can never silently drift.
+/// ghost-mining startup, so the two can never silently drift.
 ///
 /// `pool.toml [policy] profile` is the single source of truth the operator edits
 /// (directly or via the dashboard); ghostd's `-ghostpolicy-allowtiers` is a
@@ -7433,7 +7433,7 @@ async fn clear_oneshot_and_reapply(
 /// for the operation to complete, then clears the marker and re-applies the
 /// drop-in so the one-shot flag is dropped (and, for the exorcist, the node is
 /// brought back up hazed). Resumed on startup for any marker still set in
-/// pool.toml, so it survives a ghost-pool restart mid-operation.
+/// pool.toml, so it survives a ghost-mining restart mid-operation.
 fn spawn_ghostd_oneshot_watcher(state: Arc<VerificationState>, kind: GhostdOneShot) {
     // Test hook: never poll systemd/RPC or shell out from unit tests.
     if std::env::var("GHOST_REAPER_APPLY_TEST_MODE").is_ok() {
@@ -7563,7 +7563,7 @@ fn spawn_ghostd_oneshot_watcher(state: Arc<VerificationState>, kind: GhostdOneSh
 }
 
 /// On startup, resume watching any one-shot ghostd flags that are still armed in
-/// pool.toml (e.g. ghost-pool restarted while a reindex/conversion was running).
+/// pool.toml (e.g. ghost-mining restarted while a reindex/conversion was running).
 fn resume_pending_ghostd_oneshots(state: &Arc<VerificationState>) {
     let (reindex, exorcist) = match state.full_node_config {
         Some(ref full) => {
@@ -7589,7 +7589,7 @@ fn resume_pending_ghostd_oneshots(state: &Arc<VerificationState>) {
 /// the same ghostd-flag drop-in path as the reaper: `spawn_ghostd_reaper_apply`
 /// runs `ghost-setup apply-reaper` (which now regenerates the combined
 /// reaper + launch-flag drop-in and restarts ghostd) and afterwards bounces
-/// ghost-pool. The response returns promptly with the apply *initiated*; the
+/// ghost-mining. The response returns promptly with the apply *initiated*; the
 /// terminal result lands on the reaper GET endpoint's `ghostd_apply`.
 async fn api_config_tor_post_handler(
     State(state): State<Arc<VerificationState>>,
@@ -7783,7 +7783,7 @@ fn validate_daemon_settings(req: &DaemonSettingsRequest) -> Result<(), String> {
 /// the `-ghostreaper` flags — this persists `[node_launch]` to pool.toml and
 /// then reuses `spawn_ghostd_reaper_apply`, which runs `ghost-setup apply-reaper`
 /// to regenerate the combined managed drop-in and RESTART ghostd, then bounces
-/// ghost-pool. The response returns promptly with the apply *initiated*; the
+/// ghost-mining. The response returns promptly with the apply *initiated*; the
 /// terminal result lands on the `/config/daemon` GET endpoint's `ghostd_apply`.
 async fn api_config_daemon_post_handler(
     State(state): State<Arc<VerificationState>>,
@@ -7883,7 +7883,7 @@ async fn api_config_daemon_post_handler(
 /// API v1 Config reaper POST handler — accepts the full per-vector reaper
 /// settings, persists them to the node config (pool.toml `[reaper]`), and then
 /// applies them to BOTH reapers automatically: the pool block-template reaper
-/// (via a ghost-pool restart) and the ghostd mempool reaper (by running
+/// (via a ghost-mining restart) and the ghostd mempool reaper (by running
 /// `ghost-setup apply-reaper` in the background, which regenerates the
 /// `-ghostreaper` drop-in and restarts ghostd). No manual CLI step is needed.
 ///
@@ -7903,7 +7903,7 @@ struct PolicyProfileRequest {
 ///
 /// This is the REAL lever for which BUDS tiers get mined: it writes
 /// `[policy].profile` into the node config (pool.toml) and persists it, then
-/// requests a graceful ghost-pool restart so the new profile is resolved at
+/// requests a graceful ghost-mining restart so the new profile is resolved at
 /// startup. Unlike the cosmetic `mempool_profile`/`template_profile` dashboard
 /// mirrors, changing this actually alters template construction.
 async fn api_config_policy_profile_post_handler(
@@ -7981,7 +7981,7 @@ async fn api_config_policy_profile_post_handler(
         }
     }
 
-    // Apply the new profile at BOTH layers: ghost-pool (block template) and
+    // Apply the new profile at BOTH layers: ghost-mining (block template) and
     // ghostd (mempool acceptance). `spawn_ghostd_reaper_apply` regenerates the
     // combined managed drop-in — which now includes the `-ghostpolicy-*` flags
     // from `PolicyConfig::ghostd_flags()` — restarts ghostd, then bounces the
@@ -8007,7 +8007,7 @@ struct BlockPriorityRequest {
 /// API v1 Config block_priority POST handler.
 ///
 /// Writes `[pool].block_priority` into the node config (pool.toml) via
-/// `save_atomic`, then requests a graceful ghost-pool restart. The lever is
+/// `save_atomic`, then requests a graceful ghost-mining restart. The lever is
 /// resolved once at startup into `TemplateConfig` (`main.rs`), so — like the
 /// tier policy — a restart is what actually applies the new ordering to block
 /// templates. This is a per-node economic policy, not a consensus rule.
@@ -8321,7 +8321,7 @@ async fn api_config_policy_custom_post_handler(
         }
     }
 
-    // Apply the custom policy at BOTH layers: ghost-pool (block template) and
+    // Apply the custom policy at BOTH layers: ghost-mining (block template) and
     // ghostd (mempool acceptance). `spawn_ghostd_reaper_apply` regenerates the
     // combined managed drop-in — which now includes the `-ghostpolicy-*` flags
     // (allowed tiers + per-field limits) from `PolicyConfig::ghostd_flags()` —
@@ -8458,7 +8458,7 @@ async fn api_config_reaper_post_handler(
         // applied automatically. Kept as `false` for older dashboards.
         "ghostd_restart_required": false,
         "ghostd_apply": apply,
-        "message": "Reaper settings saved. The pool template reaper applies on the imminent ghost-pool restart, and the ghostd mempool reaper is being applied automatically (ghostd will briefly restart).",
+        "message": "Reaper settings saved. The pool template reaper applies on the imminent ghost-mining restart, and the ghostd mempool reaper is being applied automatically (ghostd will briefly restart).",
     }))
 }
 
@@ -8794,7 +8794,7 @@ async fn api_alerts_failed_login_post_handler(
 /// act: which unit, what went wrong, over what window. No paths, no logs.
 #[derive(Debug, Deserialize)]
 struct ServiceRestartSignal {
-    /// systemd unit the signal is about, e.g. `ghost-pool`.
+    /// systemd unit the signal is about, e.g. `ghost-mining`.
     unit: String,
     /// Restarts observed within the window. Zero for a signal that is not about restarts.
     restarts: u32,
@@ -8948,7 +8948,7 @@ async fn api_config_wraith_handler(
 
 /// API v1 Config wraith POST handler — sets `[ghost_pay] wraith_enabled` in the
 /// node config (pool.toml) and persists it, mirroring the reaper/ghost_pay
-/// toggles. The wraith flag is read at startup, so a ghost-pool restart applies
+/// toggles. The wraith flag is read at startup, so a ghost-mining restart applies
 /// the change. Enabling lets any L2 participant initiate a CoinJoin session;
 /// disabling means this node won't participate in mixing.
 async fn api_config_wraith_post_handler(
@@ -8978,7 +8978,7 @@ async fn api_config_wraith_post_handler(
         "enabled": payload.enabled,
         "restart_required": true,
         "message": if persisted {
-            "Wraith mixing updated; ghost-pool will restart to apply."
+            "Wraith mixing updated; ghost-mining will restart to apply."
         } else {
             "Wraith setting received but no node config path is configured — changes were not persisted."
         },
@@ -9692,7 +9692,7 @@ async fn api_backup_import_handler(
             "success": true,
             "restart_required": true,
             "staged_path": staged.to_string_lossy(),
-            "message": "Backup verified and staged. Restart ghost-pool to apply the restore; \
+            "message": "Backup verified and staged. Restart ghost-mining to apply the restore; \
                         the current database is copied to a timestamped .pre-restore backup \
                         automatically before the swap."
         })),
@@ -10297,7 +10297,7 @@ async fn api_config_update_handler(
 /// POST /api/internal/share
 ///
 /// This endpoint is called by SRI Pool when it receives a valid share from a miner.
-/// ghost-pool uses this to track miner work for payout calculations.
+/// ghost-mining uses this to track miner work for payout calculations.
 async fn share_notification_handler(
     State(state): State<Arc<VerificationState>>,
     Json(share): Json<ShareNotification>,
@@ -10450,7 +10450,7 @@ async fn api_l2_submit_handler(
 /// POST /api/v1/l2/sync-commitment — Sync a commitment to the L2 tree
 ///
 /// Called by ghost-pay after shielding a note or applying a transfer.
-/// Inserts the commitment into the ghost-pool epoch tree and broadcasts to mesh.
+/// Inserts the commitment into the ghost-mining epoch tree and broadcasts to mesh.
 async fn api_l2_sync_commitment_handler(
     State(state): State<Arc<VerificationState>>,
     Json(body): Json<serde_json::Value>,
@@ -11559,14 +11559,14 @@ async fn api_node_restart_handler(
 struct LogsQuery {
     limit: Option<usize>,
     level: Option<String>,
-    /// Logical binary key (see `crate::journal::ALLOWLIST`). Absent → ghost-pool
+    /// Logical binary key (see `crate::journal::ALLOWLIST`). Absent → ghost-mining
     /// ring buffer (unchanged default behaviour).
     unit: Option<String>,
 }
 
 /// API v1 Logs handler — returns recent log entries for the selected binary.
 ///
-/// `unit=ghost-pool` (the default) short-circuits to ghost-pool's in-process
+/// `unit=ghost-mining` (the default) short-circuits to ghost-mining's in-process
 /// ring buffer (`crate::log_buffer`): its `tracing` layer mirrors every emitted
 /// event into the buffer so each entry carries the real structured message,
 /// target and level, with no host log daemon or elevated privileges required.
@@ -11603,7 +11603,7 @@ async fn api_logs_handler(
             .into_response();
     };
 
-    // ghost-pool → in-process ring buffer (unchanged behaviour).
+    // ghost-mining → in-process ring buffer (unchanged behaviour).
     if unit.ring_buffer {
         let entries = crate::log_buffer::recent(limit, level);
         return Json(serde_json::json!({
@@ -11636,7 +11636,7 @@ async fn api_logs_handler(
 
 /// API v1 Logs Units handler — lists the binaries whose logs this node can
 /// serve, so the dashboard builds its selector from what is actually allowlisted
-/// AND present on this host. ghost-pool is always available (ring buffer); other
+/// AND present on this host. ghost-mining is always available (ring buffer); other
 /// units report `available` from their systemd `LoadState`.
 async fn api_logs_units_handler(State(_state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let mut units = Vec::with_capacity(crate::journal::ALLOWLIST.len());
@@ -12339,7 +12339,7 @@ struct PoolNameBody {
 /// Set name to null/empty to clear.
 ///
 /// Persists to the REAL config: `[pool] pool_name` in pool.toml via
-/// `save_atomic`, then requests a graceful ghost-pool restart. The coinbase tag
+/// `save_atomic`, then requests a graceful ghost-mining restart. The coinbase tag
 /// is resolved once at startup from `pool.pool_name` (`main.rs`), so the block
 /// tag only changes after the restart applies the new name. The dashboard
 /// mirror is kept in sync for immediate in-session display.
@@ -12400,7 +12400,7 @@ async fn api_mining_pool_name_post_handler(
         "success": true,
         "pool_name": new_name,
         "restart_pending": true,
-        "message": "Pool name saved. ghost-pool will restart to apply the new coinbase tag."
+        "message": "Pool name saved. ghost-mining will restart to apply the new coinbase tag."
     }))
     .into_response()
 }
@@ -12607,7 +12607,7 @@ async fn pool_nodes_handler(State(state): State<Arc<VerificationState>>) -> impl
 /// Return the Reaper observability snapshot (cumulative txs evaluated /
 /// reaped / accepted, dead bytes total, per-DeadCodeType counters). Read by
 /// the dashboard `/reaper` page. Counters are process-lived — they reset on
-/// ghost-pool restart, matching the rest of the operator metric surface.
+/// ghost-mining restart, matching the rest of the operator metric surface.
 async fn api_reaper_status_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
@@ -12712,7 +12712,7 @@ fn filtering_activity_json(
 }
 
 /// Return the capability self-check snapshot (per-capability
-/// claimed/passed/reason) computed by the background loop in ghost-pool. The
+/// claimed/passed/reason) computed by the background loop in ghost-mining. The
 /// dashboard reads this to warn an operator when they have CLAIMED a capability
 /// (e.g. `public_mining`) whose prerequisite is missing (e.g. no stratum
 /// listening on port 3333), so they don't silently fail to earn its shares.
@@ -16615,7 +16615,7 @@ mod tests {
     #[test]
     fn service_restart_unit_names_are_restricted_to_real_units() {
         for ok in [
-            "ghost-pool",
+            "ghost-mining",
             "sri-pool",
             "sri-translator",
             "ghostd",
@@ -16632,10 +16632,10 @@ mod tests {
         for bad in [
             "",                          // nothing to report
             "ghost pool",                // space
-            "ghost-pool\nX-Injected: 1", // header/line injection
-            "<b>ghost-pool</b>",         // markup into an email body
+            "ghost-mining\nX-Injected: 1", // header/line injection
+            "<b>ghost-mining</b>",         // markup into an email body
             "https://evil.example/x",    // a link into a push notification
-            "ghost-pool; rm -rf /",      // shell-looking payload
+            "ghost-mining; rm -rf /",      // shell-looking payload
             "ghost\u{202E}loop",         // bidi override
         ] {
             assert!(

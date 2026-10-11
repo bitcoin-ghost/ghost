@@ -1,6 +1,6 @@
 //! Live Integration Tests for GhostTap
 //!
-//! These tests exercise the wallet → ghost-pay → ghost-pool pipeline end-to-end.
+//! These tests exercise the wallet → ghost-pay → ghost-mining pipeline end-to-end.
 //! They require a running ghost-pay instance with ZK verifiers loaded.
 //!
 //! Gated behind `#[cfg(feature = "live-tests")]` so CI doesn't require infrastructure.

@@ -10,7 +10,7 @@
 [![Version](https://img.shields.io/github/v/release/bitcoin-ghost/ghost?label=version)](https://github.com/bitcoin-ghost/ghost/releases/latest)
 
 Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
-(`ghostd`) and a decentralised mining pool (`ghost-pool`). Nodes form a
+(`ghostd`) and a decentralised mining pool (`ghost-mining`). Nodes form a
 peer-to-peer mesh, reach BFT consensus on payouts, and are rewarded for the
 infrastructure they actually provide — full-node storage, mining, and mempool
 filtering — through a verified-capability share system. It also includes a
@@ -26,7 +26,7 @@ No separate token, no altcoin — it settles in Bitcoin.
 | Component | Path | Description |
 |-----------|------|-------------|
 | `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
-| `ghost-pool` | `bins/ghost-pool/` | Decentralised mining pool node. Runs the P2P consensus mesh, tracks shares, and computes coinbase payouts. |
+| `ghost-mining` | `bins/ghost-pool/` | Decentralised mining pool node. Runs the P2P consensus mesh, tracks shares, and computes coinbase payouts. |
 | Ghost Lock | `crates/ghost-lock/` | Four-lane Taproot accounts with escape, inheritance and quorum co-signing. |
 | Wraith wallet | `apps/wraith-wallet/` | Self-custody wallet — daemon, CLI and desktop app — talking to your own node. |
 | Wraith | `crates/wraith-protocol/` | Blind-signature CoinJoin mixing. |
@@ -92,7 +92,7 @@ selects its own transactions according to its configured mempool policy.
 
 ## Running a node
 
-The install script provisions `ghostd` and `ghost-pool`, writes a config, and
+The install script provisions `ghostd` and `ghost-mining`, writes a config, and
 sets up the systemd services. Supply the Bitcoin address your node rewards
 should be paid to:
 
@@ -133,7 +133,7 @@ Requirements:
 ```sh
 git clone https://github.com/bitcoin-ghost/ghost.git
 cd ghost
-cargo build --release            # builds the Rust workspace (ghost-pool, wallets, ...)
+cargo build --release            # builds the Rust workspace (ghost-mining, wallets, ...)
 ```
 
 `ghost-core` has its own build; see [`ghost-core/INSTALL.md`](ghost-core/INSTALL.md).

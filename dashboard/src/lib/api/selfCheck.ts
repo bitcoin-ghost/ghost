@@ -1,5 +1,5 @@
 // Capability self-check — per-capability prerequisite probes computed by
-// ghost-pool's background loop and read from `/api/v1/system/self-check`.
+// ghost-mining's background loop and read from `/api/v1/system/self-check`.
 //
 // For every capability the node CLAIMS in its config, the node probes whether
 // the prerequisite is actually satisfied (e.g. `public_mining` requires the

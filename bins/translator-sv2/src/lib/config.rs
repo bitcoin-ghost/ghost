@@ -101,7 +101,7 @@ pub struct TranslatorConfig {
     monitoring_cache_refresh_secs: Option<u64>,
     /// Optional load balancer for distributing miners across pool nodes.
     /// When configured, the translator will proxy incoming connections to
-    /// less-loaded peers discovered via the local ghost-pool mesh.
+    /// less-loaded peers discovered via the local ghost-mining mesh.
     #[serde(default)]
     pub load_balancer: Option<crate::load_balancer::LoadBalancerConfig>,
     /// Optional port for an opt-in TLS stratum listener.
@@ -228,7 +228,7 @@ pub struct DownstreamDifficultyConfig {
     pub job_keepalive_interval_secs: u16,
     /// Quantise every assigned difficulty to a power-of-two tier (SHARE_TIER_BIND).
     ///
-    /// The emitting half of ghost-pool's `SHARE_TIER_BIND_HEIGHT`: a share can only commit to
+    /// The emitting half of ghost-mining's `SHARE_TIER_BIND_HEIGHT`: a share can only commit to
     /// its difficulty tier inside the hashed coinbase if the difficulty it was ASSIGNED is a
     /// tier — `2^n`, floored at `2^10` (the authority for both numbers is
     /// `ghost_common::coinbase_tags`, see `difficulty_manager::MIN_DIFFICULTY_TIER_LOG2`).

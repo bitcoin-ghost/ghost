@@ -40,9 +40,9 @@ pub struct Args {
     pub generate_key: bool,
     /// Derive the base58 authority public key for the node identity key stored at
     /// PATH (the first 32 bytes are used as the secp256k1 secret, matching how
-    /// ghost-pool derives its TDP authority key) and print it, then exit. Used by
+    /// ghost-mining derives its TDP authority key) and print it, then exit. Used by
     /// the installer to fill `[template_provider_type.Sv2Tp] public_key` so the
-    /// pool trusts this node's own ghost-pool TDP server.
+    /// pool trusts this node's own ghost-mining TDP server.
     #[arg(
         long = "tdp-pubkey-from-keyfile",
         value_name = "PATH",
@@ -52,9 +52,9 @@ pub struct Args {
 }
 
 /// Read the first 32 bytes of a node identity key file and return them as a
-/// secp256k1 secret key. Mirrors ghost-pool's TDP key loading (the file holds a
+/// secp256k1 secret key. Mirrors ghost-mining's TDP key loading (the file holds a
 /// 32-byte secret optionally followed by a PoW proof), so the derived public key
-/// is byte-identical to the one ghost-pool advertises for its TDP server.
+/// is byte-identical to the one ghost-mining advertises for its TDP server.
 fn secret_from_keyfile(path: &std::path::Path) -> Result<Secp256k1SecretKey, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?;

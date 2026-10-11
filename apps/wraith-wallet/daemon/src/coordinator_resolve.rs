@@ -190,7 +190,7 @@ mod tests {
     use wraith_protocol::{derive_beacon, snapshot_height_for_epoch};
 
     /// Build an election document that verifies, by running the real draw —
-    /// the same shape `ghost-pool` publishes.
+    /// the same shape `ghost-mining` publishes.
     fn honest_election(epoch: u64, roster_size: u8) -> serde_json::Value {
         use wraith_protocol::EpochCoordinators;
         let beacon = [9u8; 32];

@@ -30,7 +30,7 @@
 //! (`MAX_CEREMONY_CONTRIBUTORS` = 4 instead of 101). Because the feature is not
 //! a default feature and is enabled ONLY by an explicit
 //! `--features mpc-test-cap` on a targeted `-p ghost-mpc` test run, it can never
-//! be unified into the production `ghost-pool` build, and there is no env var or
+//! be unified into the production `ghost-mining` build, and there is no env var or
 //! runtime knob (a consensus constant must not be runtime-tunable). See
 //! `MAX_CEREMONY_CONTRIBUTORS` in `crates/ghost-mpc/src/lib.rs`.
 //!

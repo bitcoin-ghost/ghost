@@ -47,7 +47,7 @@ impl CoinbaseSkeleton {
     /// Content address: `sha256("CoinbaseSkeleton/v1" ‖ each field, length-prefixed)`.
     ///
     /// Lives here, beside the type, because **two programs must agree on it**: `pool_sv2` stamps
-    /// the id onto every share it reports, and `ghost-pool` looks the skeleton up by that id. Two
+    /// the id onto every share it reports, and `ghost-mining` looks the skeleton up by that id. Two
     /// implementations of a content address is two chances for a share to reference a skeleton
     /// nobody can find.
     ///

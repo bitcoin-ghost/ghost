@@ -332,7 +332,7 @@ impl SignedVerificationBroadcast {
 
 /// Transform a host:port address to use GhostPay port (8800)
 ///
-/// GhostPay runs on port 8800, separate from ghost-pool on port 8080.
+/// GhostPay runs on port 8800, separate from ghost-mining on port 8080.
 /// This function transforms "host:8080" to "host:8800" for GhostPay verification.
 fn transform_to_ghostpay_port(address: &str) -> String {
     // Handle IPv6 addresses: [::1]:8080 -> [::1]:8800
@@ -1957,7 +1957,7 @@ impl VerificationTask {
     ///
     /// Returns (passed, validation_details). Delegates to the shared
     /// [`crate::challenge::validate_archive_response`] free function so the
-    /// challenger path and the recipient re-derivation path (`ghost-pool`'s
+    /// challenger path and the recipient re-derivation path (`ghost-mining`'s
     /// `ChainReVerifier`) run byte-identical comparison logic.
     fn validate_archive_response(
         &self,
@@ -2373,7 +2373,7 @@ impl VerificationTask {
         })
         .to_string();
 
-        // GhostPay runs on port 8800, not 8080 (ghost-pool)
+        // GhostPay runs on port 8800, not 8080 (ghost-mining)
         // Transform the http_address from host:8080 to host:8800
         let ghostpay_address = transform_to_ghostpay_port(&peer.http_address);
 

@@ -180,7 +180,7 @@ fn is_envelope_v1(version: &u8) -> bool {
 /// has every one of its messages rejected as `InvalidSignature` by that peer — silently, from the
 /// sender's point of view, because rejection happens at the far end. `CapabilityType` already
 /// taught this fleet the cost of emitting before every receiver tolerates (see
-/// `ghost-pool`'s `ADDRESS_PROOF_HEIGHT`). A height makes the flip simultaneous across eight nodes
+/// `ghost-mining`'s `ADDRESS_PROOF_HEIGHT`). A height makes the flip simultaneous across eight nodes
 /// that do not coordinate restarts.
 ///
 /// The order is fixed and cannot be shortened:
@@ -215,10 +215,10 @@ fn is_envelope_v1(version: &u8) -> bool {
 /// and the only way back is to upgrade it.
 pub const MESH_ENVELOPE_V2_HEIGHT: u64 = 966_400;
 
-/// `ghost-pool`'s `ADDRESS_PROOF_HEIGHT`, mirrored so the separation between the two gates armed
+/// `ghost-mining`'s `ADDRESS_PROOF_HEIGHT`, mirrored so the separation between the two gates armed
 /// in v1.11.34 can be asserted here.
 ///
-/// A mirror, not an import: `ghost-consensus` sits BELOW `ghost-pool` in the dependency graph and
+/// A mirror, not an import: `ghost-consensus` sits BELOW `ghost-mining` in the dependency graph and
 /// cannot reach it. Duplicating a consensus height is normally how the two drift apart, so this
 /// exists only to be asserted against and is checked by
 /// `bins/ghost-pool`'s `the_mirror_in_ghost_consensus_matches`.
@@ -2162,7 +2162,7 @@ pub fn derive_mesh_node_list(
 /// The coordinator roster: who a wallet may be sent to for a Wraith round.
 ///
 /// **The same derivation as [`derive_mesh_node_list`], filtered differently.** That is the
-/// entire point of it living here. ghost-pool's live coordinator election builds its roster
+/// entire point of it living here. ghost-mining's live coordinator election builds its roster
 /// from mesh state — its own comment calls that "the defect this value exposes rather than
 /// repairs" — so two nodes can legitimately disagree about who was eligible. Everything a
 /// roster needs to stop being node-local is already true of this derivation: membership from

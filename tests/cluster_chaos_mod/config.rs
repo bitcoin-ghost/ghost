@@ -60,7 +60,7 @@ impl ClusterConfig {
             recovery_timeout: Duration::from_secs(90),
             retry_count: 3,
             retry_backoff: Duration::from_secs(2),
-            service_name: "ghost-pool",
+            service_name: "ghost-mining",
         }
     }
 

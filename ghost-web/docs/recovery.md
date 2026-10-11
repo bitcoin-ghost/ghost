@@ -25,9 +25,9 @@ A peer with `last_seen` more than 60 seconds old isn't pinging the mesh. More th
 **Recover (VM is recoverable):**
 
 ```bash
-sudo systemctl restart ghost-pool
+sudo systemctl restart ghost-mining
 sudo systemctl restart ghost-pay
-sudo journalctl -u ghost-pool -f --since "1 min ago" | grep -i "peer\|connect"
+sudo journalctl -u ghost-mining -f --since "1 min ago" | grep -i "peer\|connect"
 ```
 
 Watch for "connected to peer" lines. If they appear, the node has rejoined the mesh.
@@ -40,12 +40,12 @@ Watch for "connected to peer" lines. If they appear, the node has rejoined the m
 
 **Detect:**
 
-- Repeated `VotingSession timed out` in `ghost-pool` logs.
+- Repeated `VotingSession timed out` in `ghost-mining` logs.
 - `get_connected_peers(60)` returns < 3.
 
 **Immediate steps:**
 
-1. Identify which VMs are offline: `systemctl status ghost-pool` on each.
+1. Identify which VMs are offline: `systemctl status ghost-mining` on each.
 2. Check VM-to-VM connectivity: `ping <other-vm-ip>`, `traceroute`.
 3. Check the hosting provider's status page.
 
@@ -53,11 +53,11 @@ Watch for "connected to peer" lines. If they appear, the node has rejoined the m
 
 ```bash
 # On each offline VM:
-sudo systemctl restart ghost-pool
+sudo systemctl restart ghost-mining
 sudo systemctl restart ghost-pay
 
 # Verify quorum restored:
-sudo journalctl -u ghost-pool -f | grep -i "voting\|quorum\|payout"
+sudo journalctl -u ghost-mining -f | grep -i "voting\|quorum\|payout"
 ```
 
 Within ~30 seconds you should see voting sessions completing. Pending payouts will fire on the next confirmed block.
@@ -66,10 +66,10 @@ Within ~30 seconds you should see voting sessions completing. Pending payouts wi
 
 ```bash
 # 1. Provision replacement VM (same OS, same specs)
-# 2. Install ghost-pool + ghost-pay binaries (see /docs/#deployment)
+# 2. Install ghost-mining + ghost-pay binaries (see /docs/#deployment)
 
 # 3. Restore database from backup
-sudo systemctl stop ghost-pool ghost-pay
+sudo systemctl stop ghost-mining ghost-pay
 cp /var/backups/ghost/db/ghost-latest.db /home/ghost/.ghost/ghost.db
 cp /var/backups/ghost/db/ghost-pay-latest.db \
    /home/ghost/.ghost/ghost-pay/ghost-pay.db
@@ -87,8 +87,8 @@ ls /home/ghost/.ghost/mpc_params/unshield_vk.bin
 #    one in the restored DB. The seed_nodes list should still be valid.
 
 # 7. Start services
-sudo systemctl start ghost-pool ghost-pay
-sudo journalctl -u ghost-pool -f | grep -i "peer\|connect\|elder"
+sudo systemctl start ghost-mining ghost-pay
+sudo journalctl -u ghost-mining -f | grep -i "peer\|connect\|elder"
 ```
 
 The replacement node uses the same node_id as the lost one, so its Elder slot is preserved. The mesh discovery protocol reconnects it within ~60 seconds.
@@ -110,7 +110,7 @@ The most common recovery scenario. SQLite + WAL mode is robust, but ungraceful s
 **Detect:**
 
 ```bash
-sudo systemctl stop ghost-pool
+sudo systemctl stop ghost-mining
 sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA integrity_check"
 ```
 
@@ -131,10 +131,10 @@ sqlite3 /tmp/ghost-recovery.db "PRAGMA wal_checkpoint(TRUNCATE)"
 sqlite3 /tmp/ghost-recovery.db "PRAGMA integrity_check"
 
 # If integrity passes, swap in the recovered DB
-sudo systemctl stop ghost-pool
+sudo systemctl stop ghost-mining
 cp /tmp/ghost-recovery.db /home/ghost/.ghost/ghost.db
 rm -f /home/ghost/.ghost/ghost.db-wal /home/ghost/.ghost/ghost.db-shm
-sudo systemctl start ghost-pool
+sudo systemctl start ghost-mining
 ```
 
 In the WAL-recovery flow, no data is lost — the WAL just hadn't been checkpointed when the corruption surfaced.
@@ -142,10 +142,10 @@ In the WAL-recovery flow, no data is lost — the WAL just hadn't been checkpoin
 **Recover (WAL also corrupt):**
 
 ```bash
-sudo systemctl stop ghost-pool ghost-pay
+sudo systemctl stop ghost-mining ghost-pay
 cp /var/backups/ghost/db/ghost-YYYYMMDDHHMM.db /home/ghost/.ghost/ghost.db
 rm -f /home/ghost/.ghost/ghost.db-wal /home/ghost/.ghost/ghost.db-shm
-sudo systemctl start ghost-pool
+sudo systemctl start ghost-mining
 ```
 
 **State re-sync after backup restore:**
@@ -168,7 +168,7 @@ The same procedure applies to `ghost-pay.db`, just with substituted paths.
 **Reset procedure (every node):**
 
 ```bash
-sudo systemctl stop ghost-pool ghost-pay
+sudo systemctl stop ghost-mining ghost-pay
 
 sqlite3 /home/ghost/.ghost/ghost.db "DELETE FROM mpc_contributions"
 rm -rf /home/ghost/.ghost/mpc_params/
@@ -182,13 +182,13 @@ sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA wal_checkpoint(TRUNCATE)"
 **Re-bootstrap (one node only — pick the genesis):**
 
 ```bash
-ghost-pool --genesis
+ghost-mining --genesis
 ```
 
 **Re-bootstrap (every other node, no `--genesis`):**
 
 ```bash
-ghost-pool
+ghost-mining
 ```
 
 The other nodes discover the new genesis via `seed_nodes` and begin contributing to a fresh ceremony chain. After 101 contributions (or whatever cap is set), the new params ossify.
@@ -214,10 +214,10 @@ The blast radius of this scenario is the reason MPC backups should be the most p
 
 ```bash
 # Count voting timeouts in the last 30 min
-sudo journalctl -u ghost-pool --since "30 min ago" | grep -c "VotingSession timed out"
+sudo journalctl -u ghost-mining --since "30 min ago" | grep -c "VotingSession timed out"
 
 # Check connected peer count (in a full mesh this is total elders minus 1)
-sudo journalctl -u ghost-pool --since "1 min ago" | grep "connected_peers"
+sudo journalctl -u ghost-mining --since "1 min ago" | grep "connected_peers"
 ```
 
 **Recover (short partition <1 h):**
@@ -318,11 +318,11 @@ sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA integrity_check"
 sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA wal_checkpoint(TRUNCATE)"
 
 # Recent logs
-sudo journalctl -u ghost-pool -f --since "5 min ago"
+sudo journalctl -u ghost-mining -f --since "5 min ago"
 sudo journalctl -u ghost-pay  -f --since "5 min ago"
 
 # Service control
-sudo systemctl restart ghost-pool
+sudo systemctl restart ghost-mining
 sudo systemctl restart ghost-pay
 
 # Manual backup

@@ -150,7 +150,7 @@ fn every_mining_mode_has_a_template() {
 
 /// ⛔ Syntactically-valid TOML that the BINARY REJECTS.
 ///
-/// `every_shipped_template_parses_as_toml` reads green on a file `ghost-pool` will not start with,
+/// `every_shipped_template_parses_as_toml` reads green on a file `ghost-mining` will not start with,
 /// because "parses" there means TOML grammar and nothing more. Measured 2026-08-23: BOTH
 /// `mainnet-solo.toml` and `mainnet-private-pool.toml` were valid TOML and failed to deserialize —
 /// their `[ghost_pay]` sections omitted `virtual_block_secs`, `epoch_blocks` and `wraith_enabled`,

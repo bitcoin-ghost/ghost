@@ -708,7 +708,7 @@ impl VerificationClient {
     /// the SIGNED response (it does NOT pass `unsigned=true`). The raw signed
     /// JSON is threaded into the broadcast so that every recipient can RE-DERIVE
     /// the verdict from the target's own signature instead of trusting the
-    /// challenger's `passed` flag (see `ghost-pool` `ChainReVerifier`).
+    /// challenger's `passed` flag (see `ghost-mining` `ChainReVerifier`).
     pub async fn verify_archive(
         &self,
         node_address: &str,

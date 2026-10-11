@@ -276,7 +276,7 @@ pub struct Metrics {
     // Fragment Reassembly Metrics (#913)
     // =========================================================================
     // Mirrors of `ghost_consensus::noise_fragment::ReassemblyBudget`, published by a sampler in
-    // ghost-pool because this crate cannot depend on ghost-consensus.
+    // ghost-mining because this crate cannot depend on ghost-consensus.
     //
     // The budget's failure mode is quiet BY DESIGN: a refusal or eviction drops the message and
     // never tells the sender, because erroring would tear the connection down. The visible

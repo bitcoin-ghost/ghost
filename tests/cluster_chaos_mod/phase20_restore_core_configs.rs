@@ -55,7 +55,7 @@ async fn core_restore_02_restart_ghost_core() {
     assert!(active, "VM3 ghost-core not active after config restore");
     println!("  VM3 ghost-core active");
 
-    // Wait for all ghost-pool nodes to be healthy
+    // Wait for all ghost-mining nodes to be healthy
     // (ghost-pay auto-restarts with ghostd via BindsTo + Wants relationship)
     for node in &config.nodes {
         let healthy = client
@@ -63,10 +63,10 @@ async fn core_restore_02_restart_ghost_core() {
             .await;
         assert!(
             healthy,
-            "{} ghost-pool not healthy after ghost-core config restore",
+            "{} ghost-mining not healthy after ghost-core config restore",
             node.name
         );
-        println!("  {} ghost-pool healthy", node.name);
+        println!("  {} ghost-mining healthy", node.name);
     }
 }
 

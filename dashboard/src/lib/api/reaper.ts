@@ -1,8 +1,8 @@
 // Reaper observability — cumulative counters from the pool's block-template
-// reaper, read from ghost-pool via `/api/v1/reaper/status`.
+// reaper, read from ghost-mining via `/api/v1/reaper/status`.
 import { fetchApi } from "./client";
 
-// Per-DeadCodeType hit counters. Keys mirror ghost-pool's `DeadCodeType`
+// Per-DeadCodeType hit counters. Keys mirror ghost-mining's `DeadCodeType`
 // variants; a single reaped transaction can trip more than one, so the sum of
 // `by_type` may exceed `txs_reaped`.
 export interface ReaperByType {
@@ -37,11 +37,11 @@ export interface ReaperStats {
 
 /**
  * Fetch the cumulative reaper counters. Returns `null` (rather than throwing)
- * when ghost-pool hasn't wired the observability callback yet, or on any
+ * when ghost-mining hasn't wired the observability callback yet, or on any
  * transport error, so callers can degrade to a "no counters yet" state.
  *
  * Routed through `fetchApi` so the HMAC-signed internal request actually
- * reaches ghost-pool; a bare `fetch` hits the Next server and 404s.
+ * reaches ghost-mining; a bare `fetch` hits the Next server and 404s.
  */
 export async function getReaperStatus(): Promise<ReaperStats | null> {
   try {

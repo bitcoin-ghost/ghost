@@ -61,7 +61,7 @@ export default function WraithPage() {
   const handleWraithToggle = async (enabled: boolean) => {
     try {
       await setWraith.mutateAsync(enabled);
-      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-pool to apply`);
+      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-mining to apply`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -143,7 +143,7 @@ export default function WraithPage() {
               <div>
                 <div className="t-title" style={{ color: "var(--fg)" }}>Wraith mixing</div>
                 <div className="t-caption" style={{ color: "var(--dim)", marginTop: "2px", maxWidth: "36rem" }}>
-                  When enabled, any L2 participant can initiate a CoinJoin session through this node. Off means the node won&apos;t coordinate mixing. A ghost-pool restart applies the change.
+                  When enabled, any L2 participant can initiate a CoinJoin session through this node. Off means the node won&apos;t coordinate mixing. A ghost-mining restart applies the change.
                 </div>
               </div>
               <Toggle

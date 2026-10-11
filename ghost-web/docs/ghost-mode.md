@@ -87,7 +87,7 @@ GET  /api/v1/config/ghost_mode      → returns current state
 POST /api/v1/config/ghost_mode      → toggle (admin auth required)
 ```
 
-**ghost-pool (mesh forwarding):**
+**ghost-mining (mesh forwarding):**
 
 ```toml
 [network]

@@ -1,9 +1,9 @@
 //! Multi-binary log source backed by `journalctl`.
 //!
-//! The dashboard Logs console reads ghost-pool's own output from the in-process
+//! The dashboard Logs console reads ghost-mining's own output from the in-process
 //! ring buffer (`crate::log_buffer`). This module extends that console to the
 //! *other* node binaries — ghostd, ghost-pay, the dashboard and the SV2 stack —
-//! whose logs live in the systemd journal rather than in ghost-pool's address
+//! whose logs live in the systemd journal rather than in ghost-mining's address
 //! space.
 //!
 //! ## Security model (STRICT allowlist + argv, zero injection)
@@ -35,7 +35,7 @@ pub struct LogUnit {
     pub label: &'static str,
     /// One-line description of what this binary is.
     pub description: &'static str,
-    /// `true` for ghost-pool, which is served from the in-process ring buffer
+    /// `true` for ghost-mining, which is served from the in-process ring buffer
     /// rather than journald.
     pub ring_buffer: bool,
 }
@@ -143,9 +143,9 @@ impl JournalError {
                     .to_string()
             }
             JournalError::PermissionDenied => {
-                "Permission denied reading this binary's journal. The ghost-pool service needs to \
+                "Permission denied reading this binary's journal. The ghost-mining service needs to \
                  be in the systemd-journal group (SupplementaryGroups=systemd-journal); this takes \
-                 effect on the next ghost-pool restart."
+                 effect on the next ghost-mining restart."
                     .to_string()
             }
             JournalError::Command(stderr) => {
@@ -333,7 +333,7 @@ pub async fn read_journal(
 }
 
 /// Check whether a systemd unit is loaded on this host, so the dashboard only
-/// offers selectors for binaries that actually exist here. ghost-pool (ring
+/// offers selectors for binaries that actually exist here. ghost-mining (ring
 /// buffer) is always available. Errors/absence are reported as `false`, never
 /// as a hard failure of the units listing.
 pub async fn unit_is_present(u: &LogUnit) -> bool {

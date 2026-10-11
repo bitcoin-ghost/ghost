@@ -574,7 +574,7 @@ export default function DaemonSettingsPage() {
           <Card>
             <div className="flex items-center justify-between gap-4">
               <div className="text-sm text-[color:var(--dim)]">
-                Applying these changes restarts ghostd and briefly bounces ghost-pool.
+                Applying these changes restarts ghostd and briefly bounces ghost-mining.
               </div>
               <Button
                 variant="primary"
@@ -594,7 +594,7 @@ export default function DaemonSettingsPage() {
         onClose={() => setConfirmOpen(false)}
         onConfirm={handleApply}
         title="Apply daemon settings & restart ghostd?"
-        message="ghostd will restart with the new launch flags and ghost-pool will bounce once it settles. Mining pauses for a few seconds during the restart. Continue?"
+        message="ghostd will restart with the new launch flags and ghost-mining will bounce once it settles. Mining pauses for a few seconds during the restart. Continue?"
         confirmLabel="Apply & restart"
         variant="danger"
         loading={setDaemon.isPending}

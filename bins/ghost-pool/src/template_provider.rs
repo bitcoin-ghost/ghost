@@ -23,10 +23,10 @@
 //! Template Distribution Protocol (TDP) Server with Noise Encryption
 //!
 //! Implements the SV2 Template Distribution Protocol, allowing SRI pool to connect
-//! and receive block templates from ghost-pool. Uses Noise NX protocol for encryption.
+//! and receive block templates from ghost-mining. Uses Noise NX protocol for encryption.
 //!
 //! ```text
-//! Bitcoin Core → ghost-pool (TDP Server) → SRI Pool → SRI Translator → Miners
+//! Bitcoin Core → ghost-mining (TDP Server) → SRI Pool → SRI Translator → Miners
 //! ```
 //!
 //! # Protocol Messages
@@ -435,14 +435,14 @@ impl TemplateDistributionServer {
 /// SetupConnection read, an unexpected handshake frame, a missing frame header,
 /// building SetupConnectionSuccess, a closed channel, and the first
 /// `send_new_template` / `send_set_new_prev_hash`), and each of them leaked the
-/// slot for the life of the ghost-pool process.
+/// slot for the life of the ghost-mining process.
 ///
 /// That is worse than it sounds. `max_connections` is 10 while the fleet only
 /// ever needs one TDP client, so nine leaks were invisible and the tenth refused
 /// every future `pool_sv2` with `TDP connection limit reached`. Since systemd
 /// restarts a failing `sri-pool` every few seconds, one bad setup becomes ten in
 /// under a minute: the node stops serving miners and cannot recover until
-/// ghost-pool itself is restarted. A deploy rollback cannot repair it, because
+/// ghost-mining itself is restarted. A deploy rollback cannot repair it, because
 /// the leak is HERE and not in the binary being rolled back — measured on
 /// ghost-vm4, 2026-09-12, where the restored known-good `pool_sv2` was refused
 /// exactly as the new one had been.
@@ -1278,7 +1278,7 @@ fn create_new_template(
     // the TDP coinbase_prefix, because SRI Pool's channels_sv2 independently
     // stamps the scriptSig with its own `pool_tag_string` via the
     // `/pool_tag_string//` delimiter injection in `JobFactory::coinbase`. The
-    // tag flows from ghost-pool to sri-pool via the `coinbase_tag` file
+    // tag flows from ghost-mining to sri-pool via the `coinbase_tag` file
     // (written at startup in main.rs) and the systemd ExecStartPre step,
     // so it still lands in the final scriptSig — but only once. Including it
     // here as well produces a double-stamp that bitaxe miners display as
@@ -1535,7 +1535,7 @@ mod tests {
     /// the read loop, so a setup that failed early never released its slot: ten
     /// failures — under a minute, since systemd restarts `sri-pool` every few
     /// seconds — and every later `pool_sv2` was refused with `TDP connection
-    /// limit reached`, for the life of the ghost-pool process. The node stopped
+    /// limit reached`, for the life of the ghost-mining process. The node stopped
     /// serving miners and a deploy rollback could not repair it, because the leak
     /// is here rather than in the binary being rolled back (ghost-vm4,
     /// 2026-09-12).

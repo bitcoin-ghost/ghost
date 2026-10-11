@@ -17,7 +17,7 @@ Two layers do the work:
 | Layer | Where | Speed | Catches |
 |---|---|---|---|
 | **Layer 1** | C++ inside `ghost-core/src/policy/ghost_reaper.cpp` (invoked from `validation.cpp`) | Fast pattern match, runs before the tx enters the mempool | Five most common patterns (see below) |
-| **Layer 2** | Rust inside `ghost-pool` template builder | Full analysis, runs on every tx that reaches block-template construction | Eight detection vectors with a taint-tracking stack simulator |
+| **Layer 2** | Rust inside `ghost-mining` template builder | Full analysis, runs on every tx that reaches block-template construction | Eight detection vectors with a taint-tracking stack simulator |
 
 If a transaction is rejected at Layer 1, it never enters this node's mempool and is never relayed to peers. If it slips past Layer 1 (e.g. an unusual obfuscation), Layer 2 catches it before it lands in a block this node mines.
 
@@ -106,7 +106,7 @@ Reaper's analysis:
 
 Set in `ghost.conf` or via CLI. Rejection reason: `TX_NOT_STANDARD` with a `ghost-reaper-*` reason string in logs.
 
-### ghost-pool (Layer 2)
+### ghost-mining (Layer 2)
 
 ```toml
 [reaper]

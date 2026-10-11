@@ -312,7 +312,7 @@ mod tests {
 
 /// What the **whole fleet's** coinbase scriptSig actually costs, end to end.
 ///
-/// The bytes are assembled by two programs that never see each other's arithmetic. `ghost-pool`
+/// The bytes are assembled by two programs that never see each other's arithmetic. `ghost-mining`
 /// serves `coinbase_prefix` over the template-distribution protocol (BIP34 height, payout tag, node
 /// tag); `pool_sv2`'s job factory then appends its own pool tag and the extranonce. Each side checks
 /// only its own contribution against the 100-byte consensus limit, and neither one can see the
@@ -336,7 +336,7 @@ mod script_sig_budget {
     const BIP34_AT_960K: usize = 4;
 
     fn total_script_sig(pool_signature: &str, with_payout_tag: bool) -> usize {
-        // ghost-pool's half: what the template provider puts in `coinbase_prefix`.
+        // ghost-mining's half: what the template provider puts in `coinbase_prefix`.
         let payout = if with_payout_tag {
             encode_payout_tag(&[0u8; PAYOUT_ID_LEN]).len()
         } else {

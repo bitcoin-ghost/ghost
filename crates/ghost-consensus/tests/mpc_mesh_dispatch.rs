@@ -519,7 +519,7 @@ async fn mpc_crossnode_votes_aggregate_to_quorum_and_apply() {
 /// that map. Therefore cross-node approve votes that reach quorum find NO pending
 /// entry on the contributor and drive NO apply — the contributor's `current.bin`
 /// + singleton stay behind even though the voters advanced. This is exactly why
-/// `ghost-pool` must SELF-ADOPT (from its local candidate, once the applied row
+/// `ghost-mining` must SELF-ADOPT (from its local candidate, once the applied row
 /// gossips back) rather than relying on the handler.
 ///
 /// This is the negative counterpart to
@@ -632,7 +632,7 @@ async fn contributor_own_contribution_not_applied_by_handler_via_votes() {
         assert!(
             db.get_mpc_contribution(5).ok().flatten().is_none(),
             "gap: the contributor applied its OWN position 5 purely from cross-node votes \
-             (handler has no pending self-entry) — ghost-pool self-adopt is what must close this"
+             (handler has no pending self-entry) — ghost-mining self-adopt is what must close this"
         );
     }
 }

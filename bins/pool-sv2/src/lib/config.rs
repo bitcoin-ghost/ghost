@@ -42,9 +42,9 @@ pub struct ShareWebhookConfig {
     /// URL to POST share batches to.
     pub url: String,
     /// Shared secret for signing each batch, hex (64 chars = 32 bytes). Must equal the
-    /// co-located ghost-pool's `[network] internal_api_secret` (H-13).
+    /// co-located ghost-mining's `[network] internal_api_secret` (H-13).
     ///
-    /// **Mandatory when this section is present, and deliberately has no default.** ghost-pool
+    /// **Mandatory when this section is present, and deliberately has no default.** ghost-mining
     /// authorised this webhook by `is_loopback()` alone, so every process on the box could write
     /// to the payout ledger; it now requires an HMAC-SHA256 over `timestamp || body` under this
     /// secret.
@@ -57,7 +57,7 @@ pub struct ShareWebhookConfig {
     /// runtime symptom is total share loss behind an SV2 acknowledgement the miner already has.
     ///
     /// The acceptance rule is `InternalAuthKey`'s — at least 32 bytes of hex, first 32 used —
-    /// which is the same code ghost-pool verifies with, so "acceptable" cannot mean two different
+    /// which is the same code ghost-mining verifies with, so "acceptable" cannot mean two different
     /// things on the two ends of the socket.
     pub secret: String,
     /// Number of shares to accumulate before sending a batch.
@@ -74,40 +74,40 @@ pub struct ShareWebhookConfig {
 /// Configuration for the difficulty-tier commitment (SHARE_TIER_BIND) — pool_sv2's half of the
 /// two-part gate.
 ///
-/// ghost-pool's half is the height constant `SHARE_TIER_BIND_HEIGHT` (dormant at `u64::MAX`);
+/// ghost-mining's half is the height constant `SHARE_TIER_BIND_HEIGHT` (dormant at `u64::MAX`);
 /// this binary has no chain view of its own, so its half is configured here and derives the
-/// per-template decision from the BIP34 height ghost-pool stamps into every template's
+/// per-template decision from the BIP34 height ghost-mining stamps into every template's
 /// `coinbase_prefix` — both binaries then flip at the same BLOCK, not at a restart.
 ///
 /// **Absent (the default, and the only shipped state) = dormant**: one group job per template,
 /// plain node tag, byte-identical to today. Both fields are mandatory when the section is
 /// present, so a half-written section fails config parse loudly instead of running half-armed.
 ///
-/// Arming requires, in ONE release: this section with `activation_height` equal to ghost-pool's
-/// `SHARE_TIER_BIND_HEIGHT`, `node_id` equal to the identity ghost-pool stamps and verifies, and
+/// Arming requires, in ONE release: this section with `activation_height` equal to ghost-mining's
+/// `SHARE_TIER_BIND_HEIGHT`, `node_id` equal to the identity ghost-mining stamps and verifies, and
 /// the translator shipped with `quantise_to_tiers = true`. A desync is detected and logged, not
 /// silently absorbed — see `tier_binding.rs`.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ShareTierBindingConfig {
     /// This node's 32-byte identity, hex (64 chars).
     ///
-    /// **Normally omit this.** Left unset, the identity is read from the co-located ghost-pool at
+    /// **Normally omit this.** Left unset, the identity is read from the co-located ghost-mining at
     /// startup (see `ghost_pool_health_url`), which is the process that actually derives and
     /// verifies the coinbase node tags — so the two cannot disagree.
     ///
-    /// It exists only as an override for a node whose ghost-pool cannot be reached at startup.
+    /// It exists only as an override for a node whose ghost-mining cannot be reached at startup.
     /// Transcribing it by hand is the highest-risk step in arming: `pool_sv2` cannot recover the
     /// raw id from the template prefix (that carries `sha256(node_id)[..20]`, one-way), so a
     /// mistyped value is not detectable from the coinbase — it simply makes every tier-era share
     /// fail its binding check, silently, for that node's miners only. When set, it is CHECKED
-    /// against ghost-pool's own answer and a mismatch refuses startup.
+    /// against ghost-mining's own answer and a mismatch refuses startup.
     #[serde(default)]
     pub node_id: Option<String>,
-    /// Where to read this node's identity from. Defaults to the co-located ghost-pool's health
+    /// Where to read this node's identity from. Defaults to the co-located ghost-mining's health
     /// endpoint on loopback.
     #[serde(default)]
     pub ghost_pool_health_url: Option<String>,
-    /// Block height at/above which per-tier jobs are emitted. MUST equal ghost-pool's
+    /// Block height at/above which per-tier jobs are emitted. MUST equal ghost-mining's
     /// `SHARE_TIER_BIND_HEIGHT` in the same release.
     pub activation_height: u64,
 }

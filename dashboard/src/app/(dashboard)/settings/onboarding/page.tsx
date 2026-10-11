@@ -79,7 +79,7 @@ export default function OnboardingPage() {
   const handleWraithToggle = async (enabled: boolean) => {
     try {
       await setWraith.mutateAsync(enabled);
-      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-pool to apply`);
+      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-mining to apply`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
     }

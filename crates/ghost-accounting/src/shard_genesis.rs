@@ -150,7 +150,7 @@ pub fn pinned_anchor() -> GenesisAnchor {
 /// The adopted `canonical_payout` blob the pin was taken over, reconstructed byte-for-byte.
 ///
 /// Feature-gated so it never reaches a production binary, but deliberately NOT inside a `#[cfg(test)]`
-/// module: `ghost-pool`'s arming tests need the same bytes, and a second copy over there went stale
+/// module: `ghost-mining`'s arming tests need the same bytes, and a second copy over there went stale
 /// the first time the anchor was re-pinned — six tests failing for no reason but duplication. One
 /// spelling, two crates.
 ///

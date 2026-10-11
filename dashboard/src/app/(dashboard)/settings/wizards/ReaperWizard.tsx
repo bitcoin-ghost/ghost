@@ -62,7 +62,7 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
         toast.success(
           'Ghost Reaper Updated',
           res.persisted
-            ? 'Applied to both reapers automatically — the pool template reaper on the ghost-pool restart and the ghostd mempool reaper (ghostd briefly restarts). No manual step needed.'
+            ? 'Applied to both reapers automatically — the pool template reaper on the ghost-mining restart and the ghostd mempool reaper (ghostd briefly restarts). No manual step needed.'
             : 'Reaper settings received but nothing was persisted.'
         );
         onClose();
@@ -203,7 +203,7 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
               <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
                 <p className="text-sm text-[color:var(--accent)]">
                   Click Finish to save. Both reapers apply automatically: the pool reaper on the next
-                  ghost-pool restart, and the ghostd mempool reaper is regenerated for you (ghostd briefly
+                  ghost-mining restart, and the ghostd mempool reaper is regenerated for you (ghostd briefly
                   restarts). No manual <code>ghost-setup apply-reaper</code> step is needed.
                 </p>
               </div>

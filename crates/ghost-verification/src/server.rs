@@ -1378,18 +1378,18 @@ pub struct VerificationState {
     start_time: Instant,
     /// Block height getter (callback)
     get_block_height: Box<dyn Fn() -> u64 + Send + Sync>,
-    /// `SHARE_TIER_BIND_HEIGHT`, injected by ghost-pool at startup (`with_share_tier_bind_height`).
+    /// `SHARE_TIER_BIND_HEIGHT`, injected by ghost-mining at startup (`with_share_tier_bind_height`).
     ///
-    /// A copy rather than a call into ghost-pool because the dependency points the other way —
-    /// ghost-pool links this crate. The authority stays `ghost_pool::share_tier_bind_height()`;
+    /// A copy rather than a call into ghost-mining because the dependency points the other way —
+    /// ghost-mining links this crate. The authority stays `ghost_pool::share_tier_bind_height()`;
     /// this field only carries the resolved value across the crate boundary, defaulting to the
     /// dormant `u64::MAX` so an unwired caller can never turn the tier requirement on early.
     share_tier_bind_height: u64,
-    /// `SHARE_POW_VERIFY_HEIGHT`, injected by ghost-pool at startup
+    /// `SHARE_POW_VERIFY_HEIGHT`, injected by ghost-mining at startup
     /// (`with_share_pow_verify_height`).
     ///
     /// Carried the same way, and for the same reason, as `share_tier_bind_height` above. At and
-    /// above this height a locally-submitted share MUST carry its 80-byte header: ghost-pool has
+    /// above this height a locally-submitted share MUST carry its 80-byte header: ghost-mining has
     /// attached the header to every `ShareProof` since this gate armed, so a header-less share is
     /// already unverifiable at peers — recording one only puts work in the ledger that no peer
     /// will ever ratify. Defaults to the dormant `u64::MAX` so an unwired embedder (regtest,
@@ -1473,14 +1473,14 @@ pub struct VerificationState {
     /// Ghost Core RPC client (optional)
     pub rpc: Option<Arc<BitcoinRpc>>,
     /// A-2b block-hash oracle for the consensus challenger draw. Injected from
-    /// ghost-pool's warm `CachedBlockHashOracle` so the scoped-set endpoint can
+    /// ghost-mining's warm `CachedBlockHashOracle` so the scoped-set endpoint can
     /// compute the assignment-scoped qualified set (to prove its convergence
     /// before arming `CHALLENGER_ASSIGNMENT`).
     pub block_hash_oracle: Option<Arc<dyn crate::challenger_assignment::BlockHashProvider>>,
     /// FEE convergence proof: given a height, returns a hash of the FEE-armed node-reward
     /// split (adopted `node_shares` distributed over a normalised pool) so the scoped-set
     /// endpoint can prove the coinbase node-split converges fleet-wide BEFORE arming
-    /// `COINBASE_FEE_SPLIT`. Injected from ghost-pool (owns the `PayoutHandler` split math).
+    /// `COINBASE_FEE_SPLIT`. Injected from ghost-mining (owns the `PayoutHandler` split math).
     #[allow(clippy::type_complexity)]
     pub fee_node_split_fn: Option<Arc<dyn Fn(u64) -> Option<String> + Send + Sync>>,
     /// ACTIVE_VOTER_SET convergence proof: given `(cutoff_ts, height)`, returns the
@@ -1488,7 +1488,7 @@ pub struct VerificationState {
     /// `(count, hash-of-sorted-node-ids, floored)` where `floored` = the superset floor
     /// engaged (active set not a superset of elders → fell back to the elder set). Ignores
     /// the gate height itself so the value that goes live can be proven identical fleet-wide
-    /// BEFORE arming. Injected from ghost-pool (owns `widen_voter_set`).
+    /// BEFORE arming. Injected from ghost-mining (owns `widen_voter_set`).
     #[allow(clippy::type_complexity)]
     pub checkpoint_voter_set_fn:
         Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>>,
@@ -1511,7 +1511,7 @@ pub struct VerificationState {
     /// CONVERGED checkpoint cutoff. Identical across all nodes = the coinbase reward split (miners
     /// 99% of subsidy+fees; treasury/node the decaying 1%) converges before the gate is armed;
     /// the adopted lists (checkpoint) and node distribution (`fee_node_split`) are already proven.
-    /// Injected from ghost-pool.
+    /// Injected from ghost-mining.
     #[allow(clippy::type_complexity)]
     pub fee_split_fn: Option<Arc<dyn Fn(i64, u64) -> Option<String> + Send + Sync>>,
     /// Dashboard config (mutable settings)
@@ -1556,7 +1556,7 @@ pub struct VerificationState {
     /// and we don't want a reverse dep from ghost-verification.
     get_self_check: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Coordinator-election snapshot callback (pre-serialized JSON to avoid a
-    /// reverse-dependency on the `wraith-protocol`/`ghost-pool` election types).
+    /// reverse-dependency on the `wraith-protocol`/`ghost-mining` election types).
     /// Returns `{enabled, epoch, tiers, coordinators, my_tiers, my_endpoint, …}` when the feature is
     /// on, or `{enabled:false}` when off / not wired. Read-only.
     get_coordinator_status: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
@@ -1592,14 +1592,14 @@ pub struct VerificationState {
     template_refresh_ms: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Provider returning a JSON snapshot of the pool's current block template
     /// (height, tx count, fees, subsidy, weight, ntime) for the dashboard
-    /// visualiser. A closure so this crate needn't depend on ghost-pool's
+    /// visualiser. A closure so this crate needn't depend on ghost-mining's
     /// `WorkState` type. `None` (or a `None` result) means no template yet.
     #[allow(clippy::type_complexity)]
     template_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
     /// Provider returning a JSON snapshot of how the coinbase for the block
     /// currently being built splits across recipients (miner pool, node reward
     /// pool, treasury, tx fees to finder) plus per-recipient entries. A closure
-    /// so this crate needn't depend on ghost-pool's payout types. `None` (or a
+    /// so this crate needn't depend on ghost-mining's payout types. `None` (or a
     /// `None` result) means no payout has been agreed for the current round yet.
     #[allow(clippy::type_complexity)]
     coinbase_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
@@ -1661,7 +1661,7 @@ pub struct VerificationState {
     /// against this node's true hardware ceiling. Set via `set_max_capacity`
     /// at startup; 0 = not yet configured.
     max_capacity: AtomicU32,
-    /// Prometheus metrics (optional - only present when running as ghost-pool)
+    /// Prometheus metrics (optional - only present when running as ghost-mining)
     pub metrics: Option<Arc<Metrics>>,
     /// Callback to submit L2 NoteSpend transactions to the consensus mesh
     pub l2_submit_fn: Option<L2SubmitFn>,
@@ -1797,7 +1797,7 @@ const RECENT_SHARE_HASHES: usize = 50_000;
 /// `SHARE_POW_VERIFY_HEIGHT` the header is mandatory and every one of those escapes rejects
 /// instead.
 ///
-/// Requiring it is not a new rule, only a newly-enforced one: ghost-pool has attached the header
+/// Requiring it is not a new rule, only a newly-enforced one: ghost-mining has attached the header
 /// to every `ShareProof` since that gate armed at 959_030, so a header-less share already fails
 /// verification at every peer. Below the gate (regtest, and any embedder that never wires the
 /// height) the old lenient behaviour is kept, so nothing that works today starts refusing shares.
@@ -1879,9 +1879,9 @@ impl VerificationState {
             node_id,
             version,
             // Defaults to Signet (the historical hardcoded value); production
-            // ghost-pool overrides this via `with_network` from pool.toml.
+            // ghost-mining overrides this via `with_network` from pool.toml.
             network: ghost_common::config::BitcoinNetwork::Signet,
-            // Defaults to off; production ghost-pool overrides this via
+            // Defaults to off; production ghost-mining overrides this via
             // `with_wraith_enabled` from the `[ghost_pay]` config block.
             wraith_enabled: false,
             identity: None,
@@ -2079,8 +2079,8 @@ impl VerificationState {
 
     /// Inject the resolved `SHARE_TIER_BIND_HEIGHT` (SHARE_TIER_BIND).
     ///
-    /// ghost-pool calls this at startup with `ghost_pool::share_tier_bind_height()`, which stays
-    /// the single authority; this only carries the value across the crate boundary (ghost-pool
+    /// ghost-mining calls this at startup with `ghost_pool::share_tier_bind_height()`, which stays
+    /// the single authority; this only carries the value across the crate boundary (ghost-mining
     /// links this crate, so this crate cannot ask it). Left unset, the default `u64::MAX` keeps
     /// the tier requirement off — an unwired embedder can never arm it by accident.
     pub fn with_share_tier_bind_height(mut self, height: u64) -> Self {
@@ -2090,7 +2090,7 @@ impl VerificationState {
 
     /// Inject the resolved `SHARE_POW_VERIFY_HEIGHT` (H-13).
     ///
-    /// Same carrier pattern as [`Self::with_share_tier_bind_height`]: ghost-pool owns the value
+    /// Same carrier pattern as [`Self::with_share_tier_bind_height`]: ghost-mining owns the value
     /// (`ghost_pool::share_pow_verify_height()`) and this crate cannot ask for it, because the
     /// dependency points the other way. Left unset, the dormant `u64::MAX` keeps header-less
     /// shares acceptable, which is what regtest and unit tests need.
@@ -2790,7 +2790,7 @@ impl VerificationState {
     }
 
     /// Set the Reaper-stats callback (pre-serialized JSON to avoid a
-    /// reverse-dependency on ghost-pool).
+    /// reverse-dependency on ghost-mining).
     pub fn with_reaper_stats(
         mut self,
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
@@ -2812,7 +2812,7 @@ impl VerificationState {
     }
 
     /// Set the self-check callback (pre-serialized JSON to avoid a
-    /// reverse-dependency on ghost-pool's `SelfCheckState`).
+    /// reverse-dependency on ghost-mining's `SelfCheckState`).
     pub fn with_self_check(
         mut self,
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
@@ -2831,7 +2831,7 @@ impl VerificationState {
     }
 
     /// Set the coordinator-election snapshot callback (pre-serialized JSON to
-    /// avoid a reverse-dependency on `wraith-protocol`/`ghost-pool`).
+    /// avoid a reverse-dependency on `wraith-protocol`/`ghost-mining`).
     pub fn with_coordinator_status(
         mut self,
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,

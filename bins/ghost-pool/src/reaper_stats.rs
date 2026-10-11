@@ -6,7 +6,7 @@
 //! how often Reaper is firing and against what.
 //!
 //! Counters survive across template builds (atomics are process-lived) but
-//! reset on ghost-pool restart — matching the rest of the metric surface.
+//! reset on ghost-mining restart — matching the rest of the metric surface.
 
 use ghost_reaper::{DeadCodeType, ReaperVerdict};
 use serde::Serialize;

@@ -103,7 +103,7 @@ async fn core_chaos_02_kill_tor_node_core() {
     SshController::stop_ghost_core(vm3).expect("failed to stop ghost-core on VM3");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // VM3's ghost-pool should detect the disconnection — /health may degrade
+    // VM3's ghost-mining should detect the disconnection — /health may degrade
     // VM1, VM2, VM4 should continue serving
     let survivor_ips: Vec<String> = ["VM1", "VM2", "VM4"]
         .iter()
@@ -158,15 +158,15 @@ async fn core_chaos_03_restore_tor_node_core() {
         "VM3 ghost-core not active after restore (90s timeout)"
     );
 
-    // Wait for ghost-pool to become healthy
+    // Wait for ghost-mining to become healthy
     let healthy = client
         .wait_for_node_healthy(vm3.ip, Duration::from_secs(120))
         .await;
     assert!(
         healthy,
-        "VM3 ghost-pool not healthy after ghost-core restore"
+        "VM3 ghost-mining not healthy after ghost-core restore"
     );
-    println!("  VM3 ghost-core restored, ghost-pool reconnected");
+    println!("  VM3 ghost-core restored, ghost-mining reconnected");
 }
 
 // --- Test 04: Kill ghost-core on clearnet node (VM2) ---
@@ -229,7 +229,7 @@ async fn core_chaos_04_kill_clearnet_node_core() {
         .await;
     assert!(
         healthy,
-        "VM2 ghost-pool not healthy after ghost-core restore"
+        "VM2 ghost-mining not healthy after ghost-core restore"
     );
     println!("  VM2 ghost-core restored");
 }
@@ -279,7 +279,7 @@ async fn core_chaos_05_partition_tor_vs_clearnet() {
     println!("  Waiting 20s for partition to take effect...");
     tokio::time::sleep(Duration::from_secs(20)).await;
 
-    // All nodes should still serve API (ghost-pool doesn't need mesh for /health)
+    // All nodes should still serve API (ghost-mining doesn't need mesh for /health)
     for node in &config.nodes {
         let r = client.get_with_retry(node.ip, "/health").await;
         let status = r.status.unwrap_or(0);
@@ -345,7 +345,7 @@ async fn core_chaos_07_full_recovery() {
     }
     println!("  All ghost-core daemons active");
 
-    // All ghost-pool nodes healthy
+    // All ghost-mining nodes healthy
     for node in &config.nodes {
         let r = client.get_with_retry(node.ip, "/health").await;
         assert!(
@@ -355,7 +355,7 @@ async fn core_chaos_07_full_recovery() {
             r.error
         );
     }
-    println!("  All ghost-pool nodes healthy");
+    println!("  All ghost-mining nodes healthy");
 
     // Heights consistent
     let mut heights = Vec::new();
@@ -392,17 +392,17 @@ async fn core_chaos_08_post_chaos_consistency() {
 
     println!("\n=== Ghost Core Chaos: Post-Chaos Consistency ===");
 
-    // Zero panics in ghost-pool
+    // Zero panics in ghost-mining
     for node in &config.nodes {
         let panics =
             SshController::count_log_matches(node, config.service_name, "panic", "30 min ago")
                 .unwrap_or(0);
         assert_eq!(
             panics, 0,
-            "Post-chaos: {} had {} ghost-pool panics",
+            "Post-chaos: {} had {} ghost-mining panics",
             node.name, panics
         );
-        println!("  {} ghost-pool — zero panics", node.name);
+        println!("  {} ghost-mining — zero panics", node.name);
     }
 
     // Zero panics/crashes in ghost-core

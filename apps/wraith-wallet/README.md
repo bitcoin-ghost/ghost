@@ -394,7 +394,7 @@ Tests as of latest: 64 across the wraith-wallet workspace
   submitted to ghost-pay. Breaks the timing seam between the wallet's
   HTTP POST and the eventual P2P broadcast that an observer with both
   vantage points could otherwise correlate. Stacks with ghost-core's
-  own Shroud and ghost-pool's mesh-forwarding shroud — three independent
+  own Shroud and ghost-mining's mesh-forwarding shroud — three independent
   random delays compose. Bypass per-call with `wraith light send …
   --immediate` or override with `--shroud-max-ms <ms>`.
 - Mainnet readiness: when `WRAITHD_NETWORK=mainnet`, the daemon refuses

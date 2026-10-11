@@ -30,7 +30,7 @@
 //!
 //! Internal endpoints (`/api/internal/*`, `/admin/*`) are protected by HMAC-SHA256.
 //! The shared secret must be configured at startup and shared between:
-//! - ghost-pool (the pool server)
+//! - ghost-mining (the pool server)
 //! - ghost-verification (this service)
 //! - Any other internal services that need to communicate
 //!

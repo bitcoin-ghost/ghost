@@ -1,4 +1,4 @@
-//! Telling ghost-pool which coinbase a share was mined against.
+//! Telling ghost-mining which coinbase a share was mined against.
 //!
 //! A share's proof of work is over a header, and that header commits to a merkle root that commits
 //! to the coinbase — which carries the node tag. So a validator can establish, from the share

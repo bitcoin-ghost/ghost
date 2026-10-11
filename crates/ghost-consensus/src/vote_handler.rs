@@ -1388,7 +1388,7 @@ impl VoteHandler {
 
         // 7. Loose sanity bound on the timestamp — reject only obvious garbage. PRECISE,
         // gate-aware timestamp validation is owned by the injected proposal validator (see
-        // ghost-pool `make_proposal_validator`): AT/ABOVE the fee gate the timestamp must EQUAL
+        // ghost-mining `make_proposal_validator`): AT/ABOVE the fee gate the timestamp must EQUAL
         // a fleet-finalised checkpoint cutoff, which legitimately lags the tip by the checkpoint
         // anchor depth (~LAG blocks, minutes-to-hours old). The previous tight 30-min symmetric
         // window wrongly rejected that lagged-but-valid cutoff and broke the FEE activation.
@@ -1971,7 +1971,7 @@ mod tests {
         // vote handler's built-in check must be a LOOSE sanity bound only — a cutoff is never in
         // the future, and a generous past bound tolerates the anchor lag. The previous tight
         // 30-min symmetric window rejected every post-gate proposal and broke FEE activation.
-        // Precise, gate-aware validation lives in ghost-pool's injected proposal validator.
+        // Precise, gate-aware validation lives in ghost-mining's injected proposal validator.
         let identity = create_test_identity();
         let voting_manager = Arc::new(VotingManager::new(100));
         let handler = VoteHandler::new(identity, voting_manager);

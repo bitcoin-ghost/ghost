@@ -215,7 +215,7 @@ function ledTone(status: string): Tone {
 }
 
 // Trim the noisy prefixes/suffixes so labels stay legible in the compact row
-// (e.g. "ghost-pool" → "pool", "sri-translator" → "translator").
+// (e.g. "ghost-mining" → "pool", "sri-translator" → "translator").
 function shortName(name: string): string {
   const trimmed = name
     .replace(/^ghost[-_]?/i, '')

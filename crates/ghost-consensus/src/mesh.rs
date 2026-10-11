@@ -1665,7 +1665,7 @@ impl MeshNetwork {
 
     /// Set the provider reporting whether this node's own Ghost Core is reachable (#778).
     ///
-    /// Wired from ghost-pool, which owns the RPC liveness probe. If it is never set, every ping
+    /// Wired from ghost-mining, which owns the RPC liveness probe. If it is never set, every ping
     /// carries `None` and peers keep routing to this node as before — the safe direction, since
     /// assuming the worst would divert traffic away from a perfectly healthy node whose only
     /// fault is running an older binary.

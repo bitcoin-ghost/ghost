@@ -2974,7 +2974,7 @@ mod server {
     /// election over a subset it prefers. Closing that needs the qualified set
     /// to come from consensus, and it cannot come from the mesh node-list
     /// checkpoint: that one carries *public-mining* nodes and their stratum
-    /// ports, while this draws from *coordinator*-opted-in nodes. ghost-pool
+    /// ports, while this draws from *coordinator*-opted-in nodes. ghost-mining
     /// builds the coordinator roster from live mesh state and says so —
     /// "the roster comes from live mesh state, which is the defect this value
     /// exposes rather than repairs" — so two nodes can legitimately disagree,

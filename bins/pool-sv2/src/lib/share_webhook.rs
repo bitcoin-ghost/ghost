@@ -67,7 +67,7 @@ pub struct ShareData {
     /// i.e. `[share_tier_binding]` is configured AND the template height is at/above the
     /// activation height. `None` below the gate (the only shipped state), and
     /// `skip_serializing_if` keeps those payloads byte-identical to the pre-tier wire format.
-    /// When `Some`, `share_work` is exactly `2^tier_log2` — ghost-pool's verifier enforces that
+    /// When `Some`, `share_work` is exactly `2^tier_log2` — ghost-mining's verifier enforces that
     /// equality at/above its gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_log2: Option<u32>,
@@ -227,11 +227,11 @@ impl ShareWebhookWorker {
     /// # Errors
     ///
     /// Fails when `share_webhook.secret` is not a usable internal-API secret. This is deliberately
-    /// fatal to startup: an unsigned or wrongly-signed batch is rejected by ghost-pool, so a pool
+    /// fatal to startup: an unsigned or wrongly-signed batch is rejected by ghost-mining, so a pool
     /// that starts without a valid secret cannot report a single share. Failing here costs a
     /// restart; failing later costs every share mined until somebody notices.
     ///
-    /// The rule applied is `InternalAuthKey`'s, which is the same code ghost-pool verifies with —
+    /// The rule applied is `InternalAuthKey`'s, which is the same code ghost-mining verifies with —
     /// so "this secret is acceptable" cannot mean two different things on the two ends of the
     /// socket.
     pub fn new(
@@ -240,7 +240,7 @@ impl ShareWebhookWorker {
     ) -> Result<(ShareWebhookSender, Self), PoolErrorKind> {
         let secret = InternalAuthKey::from_hex(&config.secret).map_err(|e| {
             PoolErrorKind::ShareWebhookConfig(format!(
-                "share_webhook.secret is unusable ({e}). It must be the co-located ghost-pool's \
+                "share_webhook.secret is unusable ({e}). It must be the co-located ghost-mining's \
                  [network] internal_api_secret — at least 32 bytes of hex, generated with \
                  `openssl rand -hex 32`. Without it every share batch is rejected."
             ))
@@ -406,7 +406,7 @@ impl ShareWebhookWorker {
         loop {
             attempts += 1;
 
-            // Signed per attempt, not once: the timestamp is inside the MAC and ghost-pool only
+            // Signed per attempt, not once: the timestamp is inside the MAC and ghost-mining only
             // accepts a 30-second window, so a batch that backs off past that window would fail
             // authentication for ever if it carried the original stamp.
             let timestamp = now_secs();
@@ -436,12 +436,12 @@ impl ShareWebhookWorker {
                     // retry budget sized for a refused connection. Retrying cannot help — the
                     // secret, the clock or the deploy order is wrong — so three attempts and
                     // ~700 ms later the batch would simply be destroyed, and the operator would
-                    // see a "failed after max retries" line indistinguishable from ghost-pool
+                    // see a "failed after max retries" line indistinguishable from ghost-mining
                     // being briefly down. Before H-13 this endpoint could not fail auth at all,
                     // so this is a loss channel the signing requirement introduced; it deserves
                     // its own unmistakable message rather than the generic one.
                     //
-                    // Whole-fleet triggers: pool_sv2 restarted with a secret ghost-pool does not
+                    // Whole-fleet triggers: pool_sv2 restarted with a secret ghost-mining does not
                     // share, a rotation applied to one side only, or clock drift past the 30 s
                     // window. Every one of them discards 100% of shares until it is fixed.
                     if is_auth_failure(status) {
@@ -450,9 +450,9 @@ impl ShareWebhookWorker {
                             share_count,
                             status = %status,
                             consecutive = self.auth_failures.fetch_add(1, Ordering::Relaxed) + 1,
-                            "SHARE LOSS: ghost-pool REJECTED this batch's signature. Every share \
+                            "SHARE LOSS: ghost-mining REJECTED this batch's signature. Every share \
                              is being discarded. Check that share_webhook.secret matches \
-                             ghost-pool's [network] internal_api_secret and that both clocks are \
+                             ghost-mining's [network] internal_api_secret and that both clocks are \
                              NTP-synchronised, then restart. Not retried — retrying cannot fix a \
                              credential."
                         );
@@ -502,7 +502,7 @@ impl ShareWebhookWorker {
 
 /// Is this status a refusal of our credentials rather than a transport or server problem?
 ///
-/// Only 401 and 403 — the two ghost-pool's share-ingest middleware returns for a bad signature
+/// Only 401 and 403 — the two ghost-mining's share-ingest middleware returns for a bad signature
 /// and for an off-box peer. A 5xx is the server having a bad day and IS worth retrying; treating
 /// it as permanent would throw away shares over a restart.
 fn is_auth_failure(status: reqwest::StatusCode) -> bool {
@@ -574,7 +574,7 @@ mod tests {
 
     /// H-13, the two halves of the share-webhook signature meeting.
     ///
-    /// The emitter here and the verifier in ghost-pool have to agree on bytes that appear
+    /// The emitter here and the verifier in ghost-mining have to agree on bytes that appear
     /// nowhere on the wire: the timestamp is hashed as LITTLE-ENDIAN u64, and hashed BEFORE the
     /// body. Nothing in either function signature says so, and getting it wrong produces a pool
     /// that mines happily while every batch is rejected `401` — silent, and paid for in miners'
@@ -591,7 +591,7 @@ mod tests {
         let signature = key.sign(ts, body);
         assert!(
             key.verify(&signature, ts, body).is_ok(),
-            "ghost-pool must accept the signature this emitter produces"
+            "ghost-mining must accept the signature this emitter produces"
         );
 
         // Negative controls, so the assertion above cannot be passing for a trivial reason.
@@ -638,7 +638,7 @@ mod tests {
     /// The emitter must accept exactly what the verifier accepts.
     ///
     /// `InternalAuthKey` takes a secret of 32 bytes OR LONGER and uses the first 32. An emitter
-    /// that demanded exactly 32 would leave an operator with a 96-hex secret running a ghost-pool
+    /// that demanded exactly 32 would leave an operator with a 96-hex secret running a ghost-mining
     /// that authenticates and a pool_sv2 that refuses to start — a disagreement about the same
     /// config value, on two ends of a loopback socket.
     #[test]
@@ -646,7 +646,7 @@ mod tests {
         let long = hex::encode((0u8..96).map(|i| i.wrapping_add(0x42)).collect::<Vec<u8>>());
         assert!(
             a_worker_with_secret(&long).is_ok(),
-            "a 96-byte secret must build here, because ghost-pool accepts it"
+            "a 96-byte secret must build here, because ghost-mining accepts it"
         );
     }
 
@@ -734,7 +734,7 @@ mod tests {
     ///
     /// Retrying cannot fix a wrong secret, a one-sided rotation, or a clock past the 30 s window
     /// — it just spends ~700 ms and then destroys the batch with a message indistinguishable
-    /// from "ghost-pool was briefly down". Before H-13 this endpoint could not fail auth at all,
+    /// from "ghost-mining was briefly down". Before H-13 this endpoint could not fail auth at all,
     /// so this is a loss channel the signing requirement introduced.
     ///
     /// Asserts the OUTCOME — how many times the batch is actually put on the wire — rather than

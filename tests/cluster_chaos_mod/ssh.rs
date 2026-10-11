@@ -39,7 +39,7 @@ impl SshController {
         }
     }
 
-    /// Stop the ghost-pool service. Refuses if node is genesis.
+    /// Stop the ghost-mining service. Refuses if node is genesis.
     pub fn stop_node(node: &NodeInfo, service: &str) -> Result<String, String> {
         if node.is_genesis {
             return Err(format!(
@@ -51,7 +51,7 @@ impl SshController {
         Self::run(node, &format!("sudo systemctl stop {}", service))
     }
 
-    /// Start the ghost-pool service.
+    /// Start the ghost-mining service.
     pub fn start_node(node: &NodeInfo, service: &str) -> Result<String, String> {
         println!("  [SSH] Starting {} on {}", service, node.name);
         Self::run(node, &format!("sudo systemctl start {}", service))

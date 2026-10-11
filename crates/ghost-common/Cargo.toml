@@ -44,7 +44,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 # ZMQ block/tx feed for Bitcoin Core notifications. Optional + on by default so
-# node crates (ghost-pool, ghost-gsp, …) are unaffected, but wallet crates can
+# node crates (ghost-mining, ghost-gsp, …) are unaffected, but wallet crates can
 # opt out with `default-features = false` — `tmq` is UNIX-only and won't build
 # for the Windows target the Wraith Wallet ships to.
 tmq = { workspace = true, optional = true }

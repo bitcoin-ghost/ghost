@@ -1,5 +1,5 @@
 // Automatic scheduled encrypted backups — configuration persisted to pool.toml
-// `[backup]` by ghost-pool. The scheduled task reuses the same encrypted-backup
+// `[backup]` by ghost-mining. The scheduled task reuses the same encrypted-backup
 // routine the manual backup uses. These calls route through the HMAC-signed
 // proxy like the operator-alerts config.
 import { fetchApi } from "./client";

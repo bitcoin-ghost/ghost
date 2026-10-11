@@ -182,10 +182,10 @@ def _tier_floor(d):
     ~2,328 is served as 2^11 = 2,048.
 
     That is the request being MET, not ignored — the share must hash against exactly the tier its
-    coinbase commits to, or ghost-pool rejects it as `tier_credit_mismatch`. But it is up to 47%
+    coinbase commits to, or ghost-mining rejects it as `tier_credit_mismatch`. But it is up to 47%
     below the number asked for, so the pre-gate equality checks below read correct behaviour as a
     refusal. On 2026-08-12 that failed `default-diff`, `pw-difficulty` and `suggest-diff` on a
-    canary and REFUSED the deploy — blocking every ghost-pool roll fleet-wide, hotfixes included.
+    canary and REFUSED the deploy — blocking every ghost-mining roll fleet-wide, hotfixes included.
     """
     if d <= 0:
         return d

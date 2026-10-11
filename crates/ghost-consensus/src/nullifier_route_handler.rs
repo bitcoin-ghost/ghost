@@ -412,7 +412,7 @@ impl NullifierRouteHandler {
 
     /// Submit an externally-verified L2 transaction for consensus processing.
     ///
-    /// Called by ghost-pool's HTTP API when ghost-pay forwards a verified NoteSpend
+    /// Called by ghost-mining's HTTP API when ghost-pay forwards a verified NoteSpend
     /// transaction. Always validates locally (bypasses deterministic routing) since
     /// ghost-pay already verified the proof. Broadcasts signed confirmation + transfer
     /// to the network. Other nodes verify the proof via handle_transfer_broadcast().

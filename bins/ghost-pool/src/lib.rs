@@ -46,7 +46,7 @@ pub mod block_hash_oracle;
 /// Coinbase transaction verification against payout commitments.
 pub mod coinbase_verifier;
 
-/// `tracing` layer that feeds ghost-pool's log tail into the dashboard `/logs`
+/// `tracing` layer that feeds ghost-mining's log tail into the dashboard `/logs`
 /// ring buffer.
 pub mod log_ring;
 
@@ -234,7 +234,7 @@ pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = 959_290;
 /// identical `signing_bytes` and identical ledgers during the roll. SET comfortably past
 /// the roll window once every node AND the SRI layer (pool_sv2) emit the header.
 ///
-/// ARMED at 959_030 (v1.11.1, 2026-07-21): the fleet ships ghost-pool + pool_sv2 v1.11.0
+/// ARMED at 959_030 (v1.11.1, 2026-07-21): the fleet ships ghost-mining + pool_sv2 v1.11.0
 /// (pool_sv2 emits the 80-byte header on the share webhook); this arms the recipient-side
 /// re-verification. Bounded blast radius — COINBASE_FEE_SPLIT is still dormant, so this only
 /// gates cross-node share-gossip verification (no coinbase/fund impact), and it is
@@ -298,7 +298,7 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// `[share_tier_binding]` config section (ABSENT by default — the only shipped state — which
 /// keeps the single group-broadcast job and today's bytes exactly):
 ///
-/// - pool_sv2 derives its per-template gate from the BIP34 height ghost-pool stamps into the
+/// - pool_sv2 derives its per-template gate from the BIP34 height ghost-mining stamps into the
 ///   TDP `coinbase_prefix` (`tier_binding.rs::bip34_height`), against the configured
 ///   `activation_height` — so with the same height configured, both binaries flip at the same
 ///   BLOCK, not at a restart;
@@ -323,7 +323,7 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// KNOWN LIMIT: Job-Declaration custom work (`SetCustomMiningJob`) carries the declaring
 /// client's own coinbase and cannot commit to a tier — above the gate its shares would be
 /// rejected (`missing_tier`). No JD client exists on the fleet today; resolve before arming if
-/// one does. (The old direct-SV1 path in ghost-pool is gone — SRI is the only mining path.)
+/// one does. (The old direct-SV1 path in ghost-mining is gone — SRI is the only mining path.)
 ///
 /// **ARMED at 962_100.**
 ///
@@ -1007,7 +1007,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         CHECKPOINT_FROM_SHARD_HEIGHT,
     );
     // The mesh envelope gate lives with the format it governs, in `ghost-consensus` — this crate
-    // cannot own it, because `ghost-consensus` does not depend on `ghost-pool`. Resolving it here
+    // cannot own it, because `ghost-consensus` does not depend on `ghost-mining`. Resolving it here
     // and pushing it down keeps ONE value: the env override, the mainnet lock and the "what did
     // this run actually enforce" report all stay in the same place as every other gate, and the
     // predicate stays next to the preimage it selects.
@@ -1816,7 +1816,7 @@ mod address_proof_gate_tests {
 
     /// The mirrored copy in `ghost-consensus` must equal the real constant.
     ///
-    /// `ghost-consensus` sits below `ghost-pool` in the dependency graph and cannot import this,
+    /// `ghost-consensus` sits below `ghost-mining` in the dependency graph and cannot import this,
     /// so `ADDRESS_PROOF_SEPARATION_REFERENCE` mirrors it to assert the two v1.11.34 gates do not
     /// share a height. A duplicated consensus height is exactly the kind of thing that drifts, so
     /// it is asserted from the side that owns the original.

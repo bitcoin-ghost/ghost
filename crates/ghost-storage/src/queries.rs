@@ -13649,7 +13649,7 @@ mod tests {
     /// proves nothing about older ones, which is why the sweep is bounded at BOTH ends.
     ///
     /// The first version of this reaper deleted every row `block_height <= hi` and was caught by
-    /// `evidence_past_retention_is_dropped_and_evidence_inside_it_is_kept` in ghost-pool. Pinned
+    /// `evidence_past_retention_is_dropped_and_evidence_inside_it_is_kept` in ghost-mining. Pinned
     /// here as well, at the layer where the mistake actually lives.
     #[test]
     fn reaping_never_reaches_below_the_expired_epoch() {

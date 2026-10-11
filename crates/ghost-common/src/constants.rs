@@ -262,7 +262,7 @@ pub const SV2_STRATUM_PORT: u16 = 34255;
 /// SV1 Stratum port (translator)
 pub const SV1_STRATUM_PORT: u16 = 3333;
 
-/// Template Distribution Protocol port, served by ghost-pool and consumed by pool_sv2.
+/// Template Distribution Protocol port, served by ghost-mining and consumed by pool_sv2.
 ///
 /// Matches the `--tdp-port` default. Shared here so health checks can reason about the
 /// provider without duplicating the literal.
@@ -484,7 +484,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 140;
 ///
 /// This value is coupled to `min_individual_miner_hashrate` in the translator config, and
 /// nothing enforces that coupling automatically — the floor lives in the translator's TOML
-/// and this count lives in ghost-pool. Raise the floor materially and this window must be
+/// and this count lives in ghost-mining. Raise the floor materially and this window must be
 /// re-checked against the arithmetic above, or the same bug returns silently.
 pub const ACTIVE_MINER_WINDOW_SECS: i64 = 900;
 

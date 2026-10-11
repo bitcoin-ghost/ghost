@@ -106,7 +106,7 @@ gpg --verify install.sh.sig install.sh
 
 The stats page at `https://bitcoinghost.org/stats.html` fetches data from
 `https://pool.bitcoinghost.org/api/v1/stats`. You need to configure nginx
-on the Pool VM to proxy these requests to ghost-pool.
+on the Pool VM to proxy these requests to ghost-mining.
 
 Add this to your Pool VM nginx configuration:
 
@@ -158,8 +158,8 @@ curl https://pool.bitcoinghost.org/api/v1/network/public-nodes
 ## Troubleshooting
 
 ### Stats page shows placeholders
-- Check if ghost-pool is running: `systemctl status ghost-pool`
-- Check pool logs: `journalctl -u ghost-pool -f`
+- Check if ghost-mining is running: `systemctl status ghost-mining`
+- Check pool logs: `journalctl -u ghost-mining -f`
 - Verify nginx proxy: `curl -v https://pool.bitcoinghost.org/api/v1/stats`
 
 ### CORS errors in browser console

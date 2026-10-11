@@ -1678,7 +1678,7 @@ window.__ghostPool.onBlockEvent = function (kind, height) {
 // every refreshPool tick. Previous one-shot `tipTimeSynced` flag meant the
 // clock only ever seeded once on page load, then relied on height-increment
 // detection to reset it when a block landed. If that detection missed (e.g.
-// ghost-pool's template lagged the real tip, or a poll got rate-limited
+// ghost-mining's template lagged the real tip, or a poll got rate-limited
 // across a transition), the clock drifted forever and eventually showed
 // 30+ minutes even though the chain had moved on.
 //

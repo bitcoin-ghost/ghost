@@ -150,16 +150,16 @@ install_ghost() {
     cd ghost
 
     echo -e "${CYAN}Building Ghost (this may take a few minutes)...${NC}"
-    cargo build --release -p ghost-pool -p ghost-coordinator -p ghost-translator -p ghost-light-wallet-cli
+    cargo build --release -p ghost-mining -p ghost-coordinator -p ghost-translator -p ghost-light-wallet-cli
 
     # Install binaries
-    $SUDO cp target/release/ghost-pool /opt/ghost/
+    $SUDO cp target/release/ghost-mining /opt/ghost/
     $SUDO cp target/release/ghost-coordinator /opt/ghost/
     $SUDO cp target/release/ghost-translator /opt/ghost/
     $SUDO cp target/release/ghost-light-wallet-cli /opt/ghost/
 
     # Create symlinks
-    $SUDO ln -sf /opt/ghost/ghost-pool /usr/local/bin/ghost-pool
+    $SUDO ln -sf /opt/ghost/ghost-mining /usr/local/bin/ghost-mining
     $SUDO ln -sf /opt/ghost/ghost-coordinator /usr/local/bin/ghost-coordinator
     $SUDO ln -sf /opt/ghost/ghost-translator /usr/local/bin/ghost-translator
     $SUDO ln -sf /opt/ghost/ghost-light-wallet-cli /usr/local/bin/ghost-wallet
@@ -250,7 +250,7 @@ create_services() {
     echo -e "\n${CYAN}Creating systemd services...${NC}"
 
     # Ghost Pool service
-    cat << 'EOF' | $SUDO tee /etc/systemd/system/ghost-pool.service > /dev/null
+    cat << 'EOF' | $SUDO tee /etc/systemd/system/ghost-mining.service > /dev/null
 [Unit]
 Description=Bitcoin Ghost Pool
 After=network.target bitcoind.service
@@ -260,7 +260,7 @@ Wants=bitcoind.service
 Type=simple
 User=ghost
 Group=ghost
-ExecStart=/opt/ghost/ghost-pool --config /etc/ghost/pool.toml
+ExecStart=/opt/ghost/ghost-mining --config /etc/ghost/pool.toml
 Restart=always
 RestartSec=10
 LimitNOFILE=65535
@@ -273,8 +273,8 @@ EOF
     cat << 'EOF' | $SUDO tee /etc/systemd/system/ghost-translator.service > /dev/null
 [Unit]
 Description=Bitcoin Ghost Stratum Translator (SV1 to SV2)
-After=network.target ghost-pool.service
-Wants=ghost-pool.service
+After=network.target ghost-mining.service
+Wants=ghost-mining.service
 
 [Service]
 Type=simple
@@ -292,7 +292,7 @@ EOF
     cat << 'EOF' | $SUDO tee /etc/systemd/system/ghost-coordinator.service > /dev/null
 [Unit]
 Description=Bitcoin Ghost Coordinator (Fire Ping)
-After=network.target ghost-pool.service
+After=network.target ghost-mining.service
 
 [Service]
 Type=simple
@@ -337,7 +337,7 @@ print_summary() {
     echo -e "==================================================${NC}"
     echo ""
     echo -e "${CYAN}Installed components:${NC}"
-    echo "  - ghost-pool      (Mining pool daemon)"
+    echo "  - ghost-mining      (Mining pool daemon)"
     echo "  - ghost-translator (SV1→SV2 translator)"
     echo "  - ghost-coordinator (Fire Ping load balancer)"
     echo "  - ghost-wallet    (Light wallet CLI)"
@@ -353,12 +353,12 @@ print_summary() {
     echo "  3. Update your payout address in the config"
     echo "  4. Start the services:"
     echo ""
-    echo -e "     ${YELLOW}sudo systemctl enable --now ghost-pool${NC}"
+    echo -e "     ${YELLOW}sudo systemctl enable --now ghost-mining${NC}"
     echo -e "     ${YELLOW}sudo systemctl enable --now ghost-translator${NC}"
     echo ""
     echo -e "${CYAN}Useful commands:${NC}"
-    echo "  - Check status:  sudo systemctl status ghost-pool"
-    echo "  - View logs:     sudo journalctl -u ghost-pool -f"
+    echo "  - Check status:  sudo systemctl status ghost-mining"
+    echo "  - View logs:     sudo journalctl -u ghost-mining -f"
     echo "  - Test health:   curl http://localhost:8080/health"
     echo ""
     echo -e "${CYAN}Documentation:${NC}"

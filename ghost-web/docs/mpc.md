@@ -54,7 +54,7 @@ Two reasons:
 ### Position 1: genesis
 
 ```
-ghost-pool --genesis
+ghost-mining --genesis
 ```
 
 The genesis node generates fresh trusted-setup parameters from scratch (the so-called "Powers of Tau" prelude) and auto-approves its own contribution locally. There's no BFT vote because there are no other contributors yet.

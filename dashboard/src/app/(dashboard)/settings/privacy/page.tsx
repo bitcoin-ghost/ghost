@@ -45,7 +45,7 @@ export default function PrivacySettingsPage() {
       await setWraith.mutateAsync(enabled);
       success(
         "Saved",
-        `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-pool to apply`
+        `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-mining to apply`
       );
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
@@ -171,7 +171,7 @@ export default function PrivacySettingsPage() {
           {gpRunning ? (
             <ToggleRow
               label="Wraith Protocol"
-              description="CoinJoin mixing on the L2 network — lets any L2 participant initiate a mixing session through this node. Restart ghost-pool to apply."
+              description="CoinJoin mixing on the L2 network — lets any L2 participant initiate a mixing session through this node. Restart ghost-mining to apply."
               enabled={wraithEnabled}
               onChange={handleWraithToggle}
               disabled={setWraith.isPending}

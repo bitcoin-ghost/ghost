@@ -78,12 +78,12 @@ function sweepExpired(now: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// Failed-login alert signal (cross-layer: dashboard -> ghost-pool)
+// Failed-login alert signal (cross-layer: dashboard -> ghost-mining)
 // ---------------------------------------------------------------------------
-// Dashboard password auth lives here in the Next.js layer, not in ghost-pool.
+// Dashboard password auth lives here in the Next.js layer, not in ghost-mining.
 // To surface a brute-force attempt as an operator alert, we count CONSECUTIVE
 // failed password checks in-process and, when the streak first crosses
-// FAILED_LOGIN_ALERT_THRESHOLD within FAILED_LOGIN_WINDOW_MS, signal ghost-pool
+// FAILED_LOGIN_ALERT_THRESHOLD within FAILED_LOGIN_WINDOW_MS, signal ghost-mining
 // to dispatch a `FailedLogin` alert. The signal carries ONLY the attempt count
 // (never the attempted password). We edge-trigger (the `alerted` flag) so a
 // single burst pages once; a successful login clears the streak.
@@ -123,7 +123,7 @@ function clearFailedLogins(key: string): void {
 }
 
 /**
- * Signal ghost-pool to dispatch a `FailedLogin` alert. Runs pre-session (no
+ * Signal ghost-mining to dispatch a `FailedLogin` alert. Runs pre-session (no
  * operator cookie exists on a failed login), so it cannot use the authenticated
  * dashboard proxy; it signs the call directly with the shared internal-auth
  * secret (the same HMAC the proxy uses). No-ops when INTERNAL_AUTH_KEY is
@@ -177,7 +177,7 @@ export async function POST(request: NextRequest) {
 
   if (!timingSafeEqualStr(password ?? "", dashboardPassword)) {
     // Track the consecutive-failure streak and, on crossing the threshold,
-    // signal ghost-pool to raise a `FailedLogin` operator alert. Awaited (a
+    // signal ghost-mining to raise a `FailedLogin` operator alert. Awaited (a
     // fast loopback call, guarded by a timeout) so the signal completes before
     // the response returns; it never carries or logs the attempted password.
     const { count, shouldAlert } = recordFailedLogin(key);

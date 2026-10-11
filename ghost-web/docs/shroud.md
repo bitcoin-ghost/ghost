@@ -82,7 +82,7 @@ Set in `ghost.conf`:
 shroud=0
 ```
 
-**ghost-pool (P2P mesh forwarding):**
+**ghost-mining (P2P mesh forwarding):**
 
 ```toml
 [network]

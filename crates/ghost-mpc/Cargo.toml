@@ -11,7 +11,7 @@ default = []
 test-utils = []
 # TEST-ONLY: shrink MAX_CEREMONY_CONTRIBUTORS so the Stage D regtest lifecycle
 # harness can walk genesis -> contributions -> ossification in seconds. NOT a
-# default feature; never enabled by any shipping crate (ghost-pool / ghost-
+# default feature; never enabled by any shipping crate (ghost-mining / ghost-
 # consensus). The mainnet binary keeps the 101 cap. See crates/ghost-mpc/src/
 # lib.rs MAX_CEREMONY_CONTRIBUTORS and tests/mpc_lifecycle.rs.
 mpc-test-cap = []

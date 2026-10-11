@@ -241,7 +241,7 @@ impl ChannelManager {
                 warn!(
                     activation_height = tb.activation_height(),
                     "SHARE_TIER_BIND: per-tier job generation is CONFIGURED. This is one half of \
-                     a two-part gate: ghost-pool's SHARE_TIER_BIND_HEIGHT must equal this height \
+                     a two-part gate: ghost-mining's SHARE_TIER_BIND_HEIGHT must equal this height \
                      and the translator must run with quantise_to_tiers = true, all in the same \
                      release — a desync means rejected shares (pool-on/translator-off) or \
                      unchecked tier-shaped difficulties (translator-on/pool-off)"
@@ -299,7 +299,7 @@ impl ChannelManager {
             }
         };
 
-        // External-TP / ghost-pool mode: when the Template Provider sets
+        // External-TP / ghost-mining mode: when the Template Provider sets
         // `coinbase_tx_value_remaining == 0`, it is declaring that it has
         // already allocated the entire subsidy + fees into the outputs it
         // supplied in `template.coinbase_tx_outputs`. The pool must then
@@ -442,7 +442,7 @@ impl ChannelManager {
                                     // This is the TDP client slot counter's failure mode: that one
                                     // decremented by hand, leaked on SIX early-return paths, and at
                                     // ten leaked slots refused every pool_sv2 connection for ever
-                                    // until ghost-pool was restarted. A leak here would not weaken
+                                    // until ghost-mining was restarted. A leak here would not weaken
                                     // the cap, it would BECOME the outage the cap prevents — so an
                                     // early return added tomorrow is safe by construction.
                                     let _slot = slot;

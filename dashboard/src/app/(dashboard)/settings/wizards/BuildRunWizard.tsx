@@ -8,7 +8,7 @@ import { useToast } from '@/components/ui/Toast';
 import { useStartService, useStopService, useRestartService } from '@/hooks/queries';
 import { fetchApi } from '@/lib/api/client';
 
-const NODE_SERVICE = 'ghost-pool';
+const NODE_SERVICE = 'ghost-mining';
 
 interface PreflightCheck {
   label: string;

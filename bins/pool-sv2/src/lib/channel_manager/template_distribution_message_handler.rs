@@ -35,8 +35,8 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
 
         // SHARE_TIER_BIND: is this template at/above the configured activation height? Decided
-        // per TEMPLATE from the BIP34 height ghost-pool stamps into `coinbase_prefix`, so this
-        // binary flips at the same block as ghost-pool's height gate rather than at a restart.
+        // per TEMPLATE from the BIP34 height ghost-mining stamps into `coinbase_prefix`, so this
+        // binary flips at the same block as ghost-mining's height gate rather than at a restart.
         // `None` (unconfigured — the only shipped state) keeps the group-broadcast path below,
         // byte-identical to today.
         let tiering = self
@@ -56,7 +56,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
 
             let mut messages: Vec<RouteMessageTo> = Vec::new();
 
-            // External-TP / ghost-pool mode: when the Template Provider sets
+            // External-TP / ghost-mining mode: when the Template Provider sets
             // `coinbase_tx_value_remaining == 0`, it is declaring that it has
             // already allocated the entire subsidy + fees into the outputs it
             // supplied in `template.coinbase_tx_outputs`. In that case we must

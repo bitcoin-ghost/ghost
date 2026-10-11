@@ -82,7 +82,7 @@ pub enum ReVerdict {
 /// recipient's own ground truth, so a node never stores a challenger-supplied
 /// `passed` verbatim for a capability it can independently check.
 ///
-/// Implemented by `ghost-pool` (which has the Bitcoin Core RPC + policy engine);
+/// Implemented by `ghost-mining` (which has the Bitcoin Core RPC + policy engine);
 /// `ghost-consensus` only owns the trait so it stays free of those dependencies.
 #[async_trait]
 pub trait ResultReVerifier: Send + Sync {

@@ -75,7 +75,7 @@ async fn core_mode_deploy_02_enable_tormode_vm3() {
     println!("  VM3 ghost-core active with tormode");
 }
 
-// --- Test 03: Verify ghost-pool reconnects ---
+// --- Test 03: Verify ghost-mining reconnects ---
 
 #[tokio::test]
 #[ignore]
@@ -93,10 +93,10 @@ async fn core_mode_deploy_03_pool_reconnects() {
             .await;
         assert!(
             healthy,
-            "{} ghost-pool not healthy after ghost-core restart",
+            "{} ghost-mining not healthy after ghost-core restart",
             node.name
         );
-        println!("  {} ghost-pool healthy", node.name);
+        println!("  {} ghost-mining healthy", node.name);
     }
 }
 

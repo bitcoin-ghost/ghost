@@ -29,7 +29,7 @@ The dashboard provides:
 
 ```
 +------------------+     +------------------+     +------------------+
-|    Dashboard     |     |   ghost-node     |     |   ghost-pool     |
+|    Dashboard     |     |   ghost-node     |     |   ghost-mining     |
 |    (Next.js)     | --> |   (Rust API)     | --> |   (Pool DB)      |
 |    Port 3000     |     |   Port 8080      |     |   SQLite         |
 +------------------+     +------------------+     +------------------+
@@ -37,7 +37,7 @@ The dashboard provides:
 
 The dashboard queries the ghost-node REST API, which in turn:
 - Reads node configuration and status directly
-- Queries the ghost-pool SQLite database for challenge stats and payouts
+- Queries the ghost-mining SQLite database for challenge stats and payouts
 - Connects to ghost-pay-node for L2 status
 - Aggregates data from configured swarm nodes
 

@@ -31,7 +31,7 @@
 //! - P2P mesh network for share propagation
 //! - 67% BFT consensus for payouts
 //!
-//! Run with: ghost-pool --config ghost.toml
+//! Run with: ghost-mining --config ghost.toml
 
 #![deny(unreachable_pub)]
 
@@ -351,7 +351,7 @@ fn mpc_next_contribution_position(authoritative_count: u32, max_position: u32) -
 /// candidate parameters and vote on them. Start too early and the voters cannot
 /// resolve the new node's address, every vote abstains, and — under the old
 /// fixed 15-attempt cap — the node wrongly concluded it "will not be an elder"
-/// and needed a manual `ghost-pool` restart to re-trigger the loop once the mesh
+/// and needed a manual `ghost-mining` restart to re-trigger the loop once the mesh
 /// had caught up (the node7/node8 onboarding bug this gate eliminates).
 ///
 /// "Ready" iff BOTH hold:
@@ -2248,8 +2248,8 @@ async fn ensure_mpc_params_present(
 ///
 /// ```text
 /// MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:30,prof_prefix:/tmp/gp-heap \
-///     /opt/ghost/bin/ghost-pool ...
-/// jeprof --show_bytes --text /opt/ghost/bin/ghost-pool /tmp/gp-heap.*.heap | head -40
+///     /opt/ghost/bin/ghost-mining ...
+/// jeprof --show_bytes --text /opt/ghost/bin/ghost-mining /tmp/gp-heap.*.heap | head -40
 /// ```
 ///
 /// `lg_prof_sample:19` samples every ~512KB allocated (cheap), and `lg_prof_interval:30`
@@ -2331,7 +2331,7 @@ async fn main() -> Result<()> {
         .with_file(false)
         .with_line_number(false);
 
-    // Ring-buffer layer feeds the dashboard `/logs` endpoint with ghost-pool's
+    // Ring-buffer layer feeds the dashboard `/logs` endpoint with ghost-mining's
     // own structured log tail (real message + target + level per event).
     let subscriber = tracing_subscriber::registry()
         .with(log_filter)
@@ -3114,7 +3114,7 @@ async fn main() -> Result<()> {
     template_processor.restore_from_db();
 
     // Note: Native stratum server removed - using SRI (Stratum Reference Implementation) via TDP
-    // SRI pool connects to ghost-pool's TDP server for templates
+    // SRI pool connects to ghost-mining's TDP server for templates
     // SRI translator handles SV1 miners on port 3333
 
     // Initialize P2P mesh with actual node capabilities for health pings
@@ -4989,7 +4989,7 @@ async fn main() -> Result<()> {
         });
     glyph_handler.set_broadcast_fn(glyph_broadcast);
 
-    // Wire glyph relay callbacks for ghost-pay → ghost-pool localhost relay
+    // Wire glyph relay callbacks for ghost-pay → ghost-mining localhost relay
     let gh_for_claim = Arc::clone(&glyph_handler);
     let glyph_claim_relay_fn: ghost_verification::GlyphClaimRelayFn =
         Arc::new(move |data: Vec<u8>| gh_for_claim.relay_claim(data));
@@ -7512,7 +7512,7 @@ async fn main() -> Result<()> {
     verification_state = verification_state.with_network(config.bitcoin.network);
     // SHARE_TIER_BIND: hand the webhook ingest the resolved tier gate so its H-13 check can
     // switch to tier-credit judging at the same block as everything else. The authority stays
-    // `share_tier_bind_height()` here in ghost-pool; verification only receives the value
+    // `share_tier_bind_height()` here in ghost-mining; verification only receives the value
     // (its default is the dormant u64::MAX, so an unwired embedder cannot arm early).
     verification_state =
         verification_state.with_share_tier_bind_height(ghost_pool::share_tier_bind_height());
@@ -8065,7 +8065,7 @@ async fn main() -> Result<()> {
     }
 
     // Note: GhostPay verification is now handled directly by ghost-pay on port 8800.
-    // The verification client routes GhostPay challenges to ghost-pay instead of ghost-pool,
+    // The verification client routes GhostPay challenges to ghost-pay instead of ghost-mining,
     // so no stub handler is needed here. Ghost-pay queries its own L2 database for real state.
 
     // Wire GSP handler if GSP service URL is configured or default (port 8900)
@@ -9404,7 +9404,7 @@ async fn main() -> Result<()> {
             //
             // ⚠ The initial delay is a `sleep`, NOT the previous tick-and-discard. With a 24-hour
             // period that older pattern would mean a node restarting more often than daily NEVER
-            // runs the check — and ghost-pool restarts well inside a day during a deploy or a
+            // runs the check — and ghost-mining restarts well inside a day during a deploy or a
             // config roll, so the feature would have gone silently dead. The delay lets the peer
             // table populate: `detect_offline_elders` skips an elder absent from the peer table
             // entirely ("no evidence of how long offline"), so a cold start cannot manufacture an
@@ -10040,7 +10040,7 @@ async fn main() -> Result<()> {
         if key_bytes.len() < 32 {
             return Err(anyhow::anyhow!(
                 "Node key file '{}' is too short: expected at least 32 bytes, got {}. \
-                 Generate a new key with: ghost-pool --generate-identity",
+                 Generate a new key with: ghost-mining --generate-identity",
                 key_path.display(),
                 key_bytes.len()
             ));
@@ -10054,7 +10054,7 @@ async fn main() -> Result<()> {
             anyhow::anyhow!(
                 "L-26: Invalid TDP secret key from node key file '{}': {}. \
                  The key may be all zeros or outside the valid secp256k1 scalar range. \
-                 Regenerate with: ghost-pool --generate-identity",
+                 Regenerate with: ghost-mining --generate-identity",
                 key_path.display(),
                 e
             )
@@ -11261,7 +11261,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Note: Stratum events now come from SRI, not ghost-pool
+    // Note: Stratum events now come from SRI, not ghost-mining
     // WebSocket broadcast for miner events would need SRI integration
 
     // Print startup summary

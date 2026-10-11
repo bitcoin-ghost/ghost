@@ -315,7 +315,7 @@ export default function SystemPage() {
       success(
         "Restore Staged",
         result.message ??
-          "Backup verified and staged. Restart ghost-pool to apply the restore.",
+          "Backup verified and staged. Restart ghost-mining to apply the restore.",
       );
     } catch (err) {
       toastError("Import Failed", err instanceof Error ? err.message : "Unknown error");
@@ -645,7 +645,7 @@ export default function SystemPage() {
                 <div className="text-[color:var(--fg)] font-medium mb-1">Import Backup</div>
                 <p className="text-[color:var(--dim)] text-sm mb-3">
                   Restore from a backup file. The artifact is verified, then staged and applied
-                  atomically on the next ghost-pool restart (your current database is copied to a
+                  atomically on the next ghost-mining restart (your current database is copied to a
                   safety backup first).
                 </p>
                 <Button variant="secondary" onClick={() => setImportDialogOpen(true)}>
@@ -943,7 +943,7 @@ export default function SystemPage() {
           {!restartRequired && verifyResult?.valid && (
             <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded">
               <p className="text-[color:var(--accent)] text-sm">
-                Restoring stages this artifact and applies it on the next ghost-pool restart.
+                Restoring stages this artifact and applies it on the next ghost-mining restart.
                 Your current database is copied to a timestamped safety backup first, then
                 replaced. Restart the node to complete the restore.
               </p>
@@ -957,7 +957,7 @@ export default function SystemPage() {
                 <span className="text-[color:var(--blue)]">Restore staged</span>
               </div>
               <p className="text-sm text-[color:var(--dim)]">
-                The backup was verified and staged. Restart ghost-pool (System &gt; Restart, or
+                The backup was verified and staged. Restart ghost-mining (System &gt; Restart, or
                 the node&apos;s service manager) to apply it. The current database is copied to a
                 <span className="font-mono"> .pre-restore-*.db </span> safety backup automatically
                 before the swap.

@@ -3,7 +3,7 @@
 //! dashboard `GET /api/v1/logs` endpoint.
 //!
 //! Installing this alongside the console `fmt` layer means the dashboard shows
-//! ghost-pool's own structured log tail (real message + target + level per line)
+//! ghost-mining's own structured log tail (real message + target + level per line)
 //! without shelling out to `journalctl`.
 
 use std::time::{SystemTime, UNIX_EPOCH};

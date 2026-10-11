@@ -5,18 +5,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Downloads · Bitcoin Ghost</title>
-  <meta name="description" content="Download Bitcoin Ghost: the node package (ghostd, ghost-pool, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, open source, MIT license.">
+  <meta name="description" content="Download Bitcoin Ghost: the node package (ghostd, ghost-mining, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, open source, MIT license.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Downloads · Bitcoin Ghost">
-  <meta property="og:description" content="The node package (ghostd, ghost-pool, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, MIT license.">
+  <meta property="og:description" content="The node package (ghostd, ghost-mining, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, MIT license.">
   <meta property="og:url" content="https://bitcoinghost.org/downloads.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
   <meta name="twitter:title" content="Downloads · Bitcoin Ghost">
-  <meta name="twitter:description" content="The node package (ghostd, ghost-pool, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, MIT license.">
+  <meta name="twitter:description" content="The node package (ghostd, ghost-mining, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, MIT license.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -90,7 +90,7 @@
     <p class="section-lead">
       The node package is a single signed tarball containing every binary a
       node runs: <code>ghostd</code> (a clean Bitcoin Core v30 fork),
-      <code>ghost-pool</code> (mining pool + BFT payout consensus), and
+      <code>ghost-mining</code> (mining pool + BFT payout consensus), and
       <code>ghost-pay</code> (the optional L2 daemon). The command-line tools
       — <code>ghost-cli</code>, <code>ghost-light-wallet-cli</code> and
       <code>ghost-light-wallet-tui</code> — ship in the same tarball. See the
@@ -115,7 +115,7 @@
           <code>&nbsp;&nbsp;--payout-address bc1q…</code>
         </div>
         <div class="sub" style="margin-top:14px;">
-          Downloads and installs <code>ghostd</code>, <code>ghost-pool</code>
+          Downloads and installs <code>ghostd</code>, <code>ghost-mining</code>
           and <code>ghost-pay</code> with systemd units. It verifies the GPG
           release signature before writing any binary. Add <code>--sync fast</code>
           to load a verified assumeUTXO snapshot (height 910000) instead of a
@@ -155,7 +155,7 @@
         </svg>
         <div>
           <div class="fl-name">systemd units included <span class="fl-badge">one-shot install</span></div>
-          <div class="fl-desc">The installer writes and enables <code>ghostd</code>, <code>ghost-pool</code> and <code>ghost-pay</code> services, plus a sync gate so the pool only starts once the node is ready.</div>
+          <div class="fl-desc">The installer writes and enables <code>ghostd</code>, <code>ghost-mining</code> and <code>ghost-pay</code> services, plus a sync gate so the pool only starts once the node is ready.</div>
         </div>
       </li>
       <li>

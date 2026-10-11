@@ -4,7 +4,7 @@
 //!
 //! ⛔⛔ This is the same shape of code as the TDP client slot counter, which leaked a slot on **six
 //! early-return paths**. At ten leaked slots that node refused *every* `pool_sv2` connection for
-//! ever and needed `systemctl restart ghost-pool` to clear — so a leak does not weaken the defence,
+//! ever and needed `systemctl restart ghost-mining` to clear — so a leak does not weaken the defence,
 //! it becomes the outage the defence was added to prevent.
 //!
 //! The per-connection task in `channel_manager` has **four** early `return`s (handshake timeout,

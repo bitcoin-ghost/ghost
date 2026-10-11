@@ -53,7 +53,7 @@ pub const HEADROOM_MB: u64 = 512;
 
 /// Share of MemTotal the node's own services hold, and which is therefore not available to peers.
 ///
-/// Measured across two node sizes on 2026-09-01, summing RSS of `ghostd`, `ghost-pool` and the
+/// Measured across two node sizes on 2026-09-01, summing RSS of `ghostd`, `ghost-mining` and the
 /// dashboard `node` process:
 ///
 /// | node | MemTotal | services | share |

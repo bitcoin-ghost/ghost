@@ -55,7 +55,7 @@
 //! The night all eight mainnet nodes opted in (2026-09-10, epoch 6711) the
 //! rosters read 6/7/5/5/2/2/4/5 and the fleet elected two different
 //! coordinators for one epoch. Most of that was the pool freezing whatever
-//! roster it saw first (fixed alongside this, in `ghost-pool`). But a fix for
+//! roster it saw first (fixed alongside this, in `ghost-mining`). But a fix for
 //! the freeze alone would still leave an input that disagrees for ever, and
 //! one such input is enough to split a draw that is otherwise deterministic.
 //!

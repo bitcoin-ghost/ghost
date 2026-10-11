@@ -217,7 +217,7 @@ fn next_view(
     })
 }
 
-/// Live coordinator-election service for ghost-pool.
+/// Live coordinator-election service for ghost-mining.
 ///
 /// Constructed only when `wraith_election_enabled` is true. Holds the inputs it
 /// needs to (re)compute a `CoordinatorView` each time the epoch changes, and

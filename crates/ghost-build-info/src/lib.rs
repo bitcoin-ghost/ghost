@@ -1,13 +1,13 @@
 //! What commit a running binary was built from.
 //!
 //! A version number does not identify a build. Measured on the live fleet on 2026-09-01: every
-//! node reported `ghost-pool 1.11.32` and `translator_sv2 1.11.32`, and the two binaries had been
-//! built from different commits a day apart — `ghost-pool` from the `v1.11.32` release commit
+//! node reported `ghost-mining 1.11.32` and `translator_sv2 1.11.32`, and the two binaries had been
+//! built from different commits a day apart — `ghost-mining` from the `v1.11.32` release commit
 //! `09fa48823`, `translator_sv2` from something later that carried #796's `core_healthy` field.
 //! Both were correct about their version and neither could say what it actually was.
 //!
 //! Establishing that took probing `/proc/<MainPID>/exe`, grepping the binaries for a marker
-//! string against a control, and comparing mtimes — because only `ghost-pool` exposed a git hash
+//! string against a control, and comparing mtimes — because only `ghost-mining` exposed a git hash
 //! (through `ghost-verification`), and the SV2 binaries exposed nothing at all. #759 is about a
 //! release being able to state what it produced; a binary that cannot name its own commit cannot
 //! take part in that.

@@ -265,7 +265,7 @@ impl CrossRoundToleranceTracker {
 /// Manages mining rounds and share accounting
 /// How often the PoW-rejection summary may be emitted, in seconds.
 ///
-/// One line per rejected share was **59% of all ghost-pool log volume** measured on 2026-08-02
+/// One line per rejected share was **59% of all ghost-mining log volume** measured on 2026-08-02
 /// (2,811 of 4,704 lines in 20 minutes, ~39 MB/day before the rsyslog duplicate) — the growth that
 /// filled vm7's disk and took ghostd down for an hour. A warning that fires thousands of times an
 /// hour is not a warning, it is a metric, so it is accumulated and summarised.
@@ -739,7 +739,7 @@ impl RoundManager {
                     hash = %hex::encode(&share_hash[..8]),
                     "BLOCK FOUND but no round-event subscriber received it — NO PAYOUT PROPOSAL \
                      WILL BE CREATED for this block. The proposal consumer has stopped; restart \
-                     ghost-pool."
+                     ghost-mining."
                 );
             }
         }
@@ -1535,7 +1535,7 @@ impl RoundManager {
     }
 
     /// Record a share forwarded from SRI (already validated by SRI)
-    /// Used when ghost-pool runs in TDP-only mode without direct stratum access
+    /// Used when ghost-mining runs in TDP-only mode without direct stratum access
     ///
     /// H6 security fix: Adds rate limiting and anomaly detection
     /// L-8: Automatic cleanup every RATE_LIMIT_CLEANUP_INTERVAL shares

@@ -35,13 +35,13 @@ const MINERS_PER_CORE: u32 = 500;
 /// The other 75% goes to ZMQ mesh, internal HTTP clients, RPC pools, DB
 /// connections, log files, and so on.
 ///
-/// ⚠ The limit this divides is **ghost-pool's own**, and ghost-pool does not hold miner sockets:
-/// miners land on `sri-translator` (:3333/:4444) and `sri-pool` (:34255), and ghost-pool speaks
-/// TDP to sri-pool over a single connection. MEASURED on vm5, 2026-10-04: ghost-pool held **197**
+/// ⚠ The limit this divides is **ghost-mining's own**, and ghost-mining does not hold miner sockets:
+/// miners land on `sri-translator` (:3333/:4444) and `sri-pool` (:34255), and ghost-mining speaks
+/// TDP to sri-pool over a single connection. MEASURED on vm5, 2026-10-04: ghost-mining held **197**
 /// descriptors in total while publishing `fd=65536 → fd_max=16384` as a bound on miner capacity.
 ///
 /// It is a **proxy**, and it is only a sound one because every socket-holding unit is required to
-/// set `LimitNOFILE` to at least ghost-pool's — enforced numerically by
+/// set `LimitNOFILE` to at least ghost-mining's — enforced numerically by
 /// `scripts/check-socket-units-raise-nofile.sh`. Under that rule a self-read can only ever
 /// UNDER-state the acceptors' budget, which is the safe direction. Without the rule the agreement
 /// is a coincidence, and it was not one: sri-pool shipped with no `LimitNOFILE` at all and so sat
@@ -51,7 +51,7 @@ const MINERS_PER_CORE: u32 = 500;
 /// all eight nodes. The unit fix is merged but not yet rolled, so until that config reaches the
 /// nodes `fd_max` over-states the SV2 acceptor's real budget by ~16x.
 ///
-/// The alternative — having ghost-pool probe the acceptors' `/proc/<pid>/limits` — was rejected:
+/// The alternative — having ghost-mining probe the acceptors' `/proc/<pid>/limits` — was rejected:
 /// it makes the capacity model depend on resolving other units' PIDs at runtime, and the
 /// invariant the guard enforces gives the same safety with nothing to go wrong at run time.
 const FD_BUDGET_DIVISOR: u64 = 4;

@@ -36,7 +36,7 @@ use crate::{
 };
 
 /// Builds the `user_identity` string the share_webhook should report to the downstream
-/// accounting service (ghost-pool).
+/// accounting service (ghost-mining).
 ///
 /// Two shapes of channel identity reach this function:
 ///
@@ -841,7 +841,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         // SHARE_TIER_BIND: the tier this share's JOB committed to in its
                         // coinbase, captured at build time (never re-derived from the target
                         // map, which binds at activation). When present, the reported work IS
-                        // the tier's exact credit — ghost-pool's verifier requires
+                        // the tier's exact credit — ghost-mining's verifier requires
                         // difficulty == 2^tier at/above the gate.
                         let tier_log2 = standard_channel.job_tier_log2(msg.job_id);
                         let share_work = match tier_log2 {
@@ -1100,7 +1100,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 // The UserIdentity TLV (Worker-Specific Hashrate Tracking, ext 0x0002) is read
                 // out into the local `user_identity` binding above. It's consumed below at the
                 // share_webhook send sites via `build_webhook_user_identity`, which splices the
-                // TLV's worker name onto the channel address so ghost-pool sees the per-miner
+                // TLV's worker name onto the channel address so ghost-mining sees the per-miner
                 // `<addr>.<worker>` form instead of one collapsed identity per channel.
 
                 let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
@@ -1112,7 +1112,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 // Worker-Specific Hashrate Tracking TLV: when present, splice the per-miner
                 // worker name onto the channel address for the share_webhook payload so
-                // ghost-pool sees `<addr>.<worker>` and can distinguish individual miners
+                // ghost-mining sees `<addr>.<worker>` and can distinguish individual miners
                 // sharing one aggregated channel.
                 let tlv_worker: Option<&str> =
                     user_identity.as_ref().and_then(|ui| ui.as_str());
@@ -1168,7 +1168,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         // SHARE_TIER_BIND: the tier this share's JOB committed to in its
                         // coinbase, captured at build time (never re-derived from the target
                         // map, which binds at activation). When present, the reported work IS
-                        // the tier's exact credit — ghost-pool's verifier requires
+                        // the tier's exact credit — ghost-mining's verifier requires
                         // difficulty == 2^tier at/above the gate.
                         let tier_log2 = extended_channel.job_tier_log2(msg.job_id);
                         let share_work = match tier_log2 {

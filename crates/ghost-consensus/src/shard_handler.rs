@@ -1099,7 +1099,7 @@ mod tests {
     /// vm5–8 held 6, byte-identical within each group, with zero refusals logged. The missing
     /// node folded `share_count = 0` every epoch, so its summaries carried no cells and no amount
     /// of listening could have closed the gap. `ShardTableSync` existed and was tested, but
-    /// nothing in `ghost-pool` sent, served or applied it.
+    /// nothing in `ghost-mining` sent, served or applied it.
     #[test]
     fn a_quiet_nodes_summary_cannot_repair_a_missed_column_but_a_table_sync_can() {
         let worker = identity();

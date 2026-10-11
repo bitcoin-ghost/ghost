@@ -1,5 +1,5 @@
 // Operator alerts — email / push / Telegram notifications for node events.
-// Config is persisted to pool.toml `[alerts]` by ghost-pool; these calls route
+// Config is persisted to pool.toml `[alerts]` by ghost-mining; these calls route
 // through the HMAC-signed proxy like the reaper config.
 import { fetchApi } from "./client";
 

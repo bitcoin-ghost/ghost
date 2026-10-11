@@ -158,7 +158,7 @@ impl PoolSv2 {
         };
 
         // Optional ghost-style share webhook: when configured, spawn a worker that
-        // batches validated shares and POSTs them to a downstream service (ghost-pool).
+        // batches validated shares and POSTs them to a downstream service (ghost-mining).
         let share_webhook_sender = if let Some(webhook_cfg) = self.config.share_webhook() {
             info!(
                 "Share webhook enabled: POST to {} (batch={}, timeout={}ms)",

@@ -1,6 +1,6 @@
 //! Capacity-aware load balancer for the SV1 stratum endpoint.
 //!
-//! Polls the colocated ghost-pool's `/api/internal/pool-nodes` endpoint,
+//! Polls the colocated ghost-mining's `/api/internal/pool-nodes` endpoint,
 //! which now reports per-peer hardware-derived `max_capacity`. New miner
 //! connections are routed to the peer with the lowest *utilisation*
 //! (`miner_count / max_capacity`), so a small Pi at 80% loses to a beefy
@@ -107,22 +107,22 @@ struct PoolNodesResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct ThisNode {
     miner_count: u32,
-    /// 0 = peer (ghost-pool) hasn't reported capacity yet (very early boot).
+    /// 0 = peer (ghost-mining) hasn't reported capacity yet (very early boot).
     #[serde(default)]
     max_capacity: u32,
     /// Whether this node's own Ghost Core is reachable (#778).
     ///
-    /// Defaults to TRUE when absent, which is the opposite of how ghost-pool computes it — and
-    /// deliberately so. Absence here means the colocated ghost-pool predates the field, not that
+    /// Defaults to TRUE when absent, which is the opposite of how ghost-mining computes it — and
+    /// deliberately so. Absence here means the colocated ghost-mining predates the field, not that
     /// Core is down; assuming the worst would make every translator divert all of its miners the
-    /// moment it out-ran the pool binary in a rolling deploy. ghost-pool, which can actually see
+    /// moment it out-ran the pool binary in a rolling deploy. ghost-mining, which can actually see
     /// the probe, treats unknown as unhealthy.
     #[serde(default = "default_core_healthy")]
     core_healthy: bool,
 }
 
 /// serde default for [`ThisNode::core_healthy`] — see the field's note on why absence is trusted
-/// here but not in ghost-pool.
+/// here but not in ghost-mining.
 fn default_core_healthy() -> bool {
     true
 }

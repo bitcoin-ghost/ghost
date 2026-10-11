@@ -86,7 +86,7 @@
     <h2 class="section-title">Ghost's own node — forked from Bitcoin Core, built well beyond it.</h2>
     <p class="section-lead">
       A Ghost node runs <code>ghostd</code> — Ghost's own daemon, forked from
-      Bitcoin Core v30 — with <code>ghost-pool</code> and <code>ghost-pay</code>
+      Bitcoin Core v30 — with <code>ghost-mining</code> and <code>ghost-pay</code>
       alongside it on the same box. It validates Bitcoin mainnet like any full
       node, then adds a mesh layer, an incentive layer, and a privacy layer that
       stock Bitcoin Core doesn't have — every feature below is built into the
@@ -368,7 +368,7 @@
         <div class="qs-n">1</div>
         <div class="qs-body">
           <div class="qs-title">Run the installer</div>
-          <div class="qs-desc">One command installs <code>ghostd</code>, <code>ghost-pool</code> and <code>ghost-pay</code> with signed binaries and systemd units:<br><code>curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q…</code><br>The script verifies the GPG release signature before writing anything. Prefer to do it by hand? Grab the tarball from the <a href="/downloads.html">downloads page</a> and verify it yourself.</div>
+          <div class="qs-desc">One command installs <code>ghostd</code>, <code>ghost-mining</code> and <code>ghost-pay</code> with signed binaries and systemd units:<br><code>curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q…</code><br>The script verifies the GPG release signature before writing anything. Prefer to do it by hand? Grab the tarball from the <a href="/downloads.html">downloads page</a> and verify it yourself.</div>
         </div>
       </li>
       <li>
@@ -389,7 +389,7 @@
         <div class="qs-n">4</div>
         <div class="qs-body">
           <div class="qs-title">Add seed peers + start</div>
-          <div class="qs-desc">Drop a few mainnet seed nodes into <code>seed_nodes</code> and run <code>systemctl start ghost-pool</code>. The mesh does peer discovery from there.</div>
+          <div class="qs-desc">Drop a few mainnet seed nodes into <code>seed_nodes</code> and run <code>systemctl start ghost-mining</code>. The mesh does peer discovery from there.</div>
         </div>
       </li>
       <li>
