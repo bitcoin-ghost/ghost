@@ -27,8 +27,8 @@ x-pool-common: &pool-common
     # Bind-mount the binary rather than baking it into the image. The image's own
     # copy silently goes stale — it was v1.10.22 while the tree was v1.11.22, so a
     # cluster run "passed" against code months older than the change under test.
-    # Refresh with: cargo build --release -p ghost-pool && cp
-    # target/release/ghost-pool docker/regtest-cluster/bin/ghost-pool
+    # Refresh with: cargo build --release -p ghost-mining && cp
+    # target/release/ghost-mining docker/regtest-cluster/bin/ghost-pool
     - ./bin/ghost-pool:/usr/local/bin/ghost-pool:ro
 
 services:

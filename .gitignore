@@ -106,7 +106,7 @@ gsp-data/
 # against code months older than the change under test.
 #
 # docker-compose.yml bind-mounts these, so they must still EXIST on disk; rebuild with:
-#   cargo build --release -p ghost-pool && cp target/release/ghost-pool docker/regtest-cluster/bin/
+#   cargo build --release -p ghost-mining && cp target/release/ghost-mining docker/regtest-cluster/bin/
 docker/regtest-cluster/bin/
 
 # SV2 integration-test fixtures, downloaded and extracted at run time (#617).

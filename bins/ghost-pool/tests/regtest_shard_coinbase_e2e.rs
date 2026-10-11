@@ -34,7 +34,7 @@
 //! `docker-compose.yml` defaults; see `common/mod.rs`. `docker start rc-bitcoind` is enough.
 //!
 //! ```text
-//! GHOST_REGTEST_REQUIRED=1 cargo test -p ghost-pool --test regtest_shard_coinbase_e2e
+//! GHOST_REGTEST_REQUIRED=1 cargo test -p ghost-mining --test regtest_shard_coinbase_e2e
 //! ```
 
 use std::collections::BTreeMap;

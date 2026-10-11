@@ -24,7 +24,7 @@
 #     all; the "successful" build would have failed at deploy. That crate is gone, but the
 #     lesson is not.                                       -> every build verifies the ARTEFACT
 #
-#   * `--features ghost-pool/zk-production` is invalid when the selected packages do not
+#   * `--features ghost-mining/zk-production` is invalid when the selected packages do not
 #     include ghost-pool. Getting this wrong ships the random trusted setup.
 #                                                          -> per-binary features in ONE table
 #
@@ -71,7 +71,7 @@ pkg_for() {
 # never concatenated.
 features_for() {
     case "$1" in
-        ghost-pool|pool_sv2|translator_sv2) echo "ghost-pool/zk-production" ;;
+        ghost-pool|pool_sv2|translator_sv2) echo "ghost-mining/zk-production" ;;
         *)                                  echo "" ;;
     esac
 }
@@ -302,7 +302,7 @@ phase_build() {
     $DRY_RUN && { info "[dry-run] would build: $FLEET_BINARIES $PRODUCTION_ONLY"; return 0; }
     # Grouped by feature set: a feature naming a package outside the selected set is a hard error.
     (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
-        --features ghost-pool/zk-production -p ghost-pool -p pool_sv2 -p translator_sv2) \
+        --features ghost-mining/zk-production -p ghost-mining -p pool_sv2 -p translator_sv2) \
         || die "mining-stack build failed"
 
     for b in $FLEET_BINARIES $PRODUCTION_ONLY; do assert_binary "$WORKTREE" "$b" "$VERSION"; done
@@ -310,8 +310,8 @@ phase_build() {
     # zk-production, checked so it can FAIL in both directions. Absence of the insecure marker
     # alone proves nothing — the symbol may simply have been optimised away.
     local prod insecure
-    prod=$(grep -ac 'disabled in production builds' "$WORKTREE/target/release/ghost-pool")
-    insecure=$(grep -ac 'Using random trusted setup' "$WORKTREE/target/release/ghost-pool")
+    prod=$(grep -ac 'disabled in production builds' "$WORKTREE/target/release/ghost-mining")
+    insecure=$(grep -ac 'Using random trusted setup' "$WORKTREE/target/release/ghost-mining")
     [ "$prod" -ge 1 ] && [ "$insecure" -eq 0 ] \
         || die "ghost-pool zk-production check inconclusive (prod=$prod insecure=$insecure)"
     info "zk-production confirmed in ghost-pool (prod=$prod insecure=$insecure)"

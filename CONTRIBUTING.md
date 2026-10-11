@@ -43,7 +43,7 @@ cargo test --workspace
 For specific crates:
 
 ```bash
-cargo test -p ghost-pool --lib
+cargo test -p ghost-mining --lib
 cargo test -p ghost-verification
 ```
 

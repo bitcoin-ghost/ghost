@@ -144,16 +144,16 @@ Either build from source or download a release.
 ```bash
 git clone https://github.com/bitcoin-ghost/ghost.git
 cd ghost
-cargo build --release -p ghost-pool --features zk-production
+cargo build --release -p ghost-mining --features zk-production
 ```
 
 The `--features zk-production` flag is **required for mainnet** — it bakes in the requirement that real MPC ceremony parameters be present at runtime. Without it, the binary will refuse to start on mainnet with: `MAINNET SECURITY: ZK consensus on mainnet requires trusted setup parameters`. There are no exceptions to this rule.
 
-Binary lands at `target/release/ghost-pool`. Move it into place:
+Binary lands at `target/release/ghost-mining`. Move it into place:
 
 ```bash
 sudo mkdir -p /opt/ghost/bin
-sudo cp target/release/ghost-pool /opt/ghost/bin/ghost-pool
+sudo cp target/release/ghost-mining /opt/ghost/bin/ghost-pool
 sudo chown root:root /opt/ghost/bin/ghost-pool
 sudo chmod 755 /opt/ghost/bin/ghost-pool
 ```

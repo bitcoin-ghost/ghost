@@ -25,7 +25,7 @@ set -euo pipefail
 
 SSH_KEY="$HOME/.ssh/ghost_signet_ed25519"
 SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-BINARY="target/release/ghost-pool"
+BINARY="target/release/ghost-mining"
 REMOTE_BIN="/opt/ghost/bin/ghost-pool"
 REMOTE_CONFIG="/etc/ghost/pool.toml"
 SERVICE="ghost-pool"
@@ -68,7 +68,7 @@ if [[ "${SKIP_BUILD:-}" == "1" ]]; then
     log_info "Skipping build (SKIP_BUILD=1)"
 else
     log_info "Building release binary..."
-    cargo build --release -p ghost-pool 2>&1 | tail -3
+    cargo build --release -p ghost-mining 2>&1 | tail -3
     if [[ ! -f "$BINARY" ]]; then
         log_fail "Binary not found at $BINARY"
         exit 1

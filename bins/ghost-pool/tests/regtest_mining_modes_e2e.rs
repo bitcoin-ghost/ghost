@@ -31,7 +31,7 @@
 //! environment with the shipped `docker-compose.yml` defaults — see `common/mod.rs`.
 //!
 //! ```text
-//! GHOST_REGTEST_REQUIRED=1 cargo test -p ghost-pool --test regtest_mining_modes_e2e
+//! GHOST_REGTEST_REQUIRED=1 cargo test -p ghost-mining --test regtest_mining_modes_e2e
 //! ```
 
 use std::sync::Arc;

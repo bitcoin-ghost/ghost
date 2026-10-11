@@ -342,7 +342,7 @@ jobs:
         run: |
           for t in regtest_mining_modes_e2e empty_template_e2e regtest_shard_coinbase_e2e; do
             echo "::group::$t"
-            cargo test -p ghost-pool --test "$t"
+            cargo test -p ghost-mining --test "$t"
             echo "::endgroup::"
           done
       - name: Stop regtest ghostd

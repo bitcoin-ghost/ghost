@@ -34,7 +34,7 @@
 //! ghostd -regtest -datadir=<dir> -rpcport=18999 -rpcuser=rt -rpcpassword=rt
 //! GHOST_REGTEST_RPC=127.0.0.1:18999 \
 //! GHOST_REGTEST_TAGGED_HEIGHT=<height of a pool-tagged block> \
-//!   cargo test -p ghost-pool --test regtest_shard_settlement -- --ignored --nocapture
+//!   cargo test -p ghost-mining --test regtest_shard_settlement -- --ignored --nocapture
 //! ```
 
 use std::sync::Arc;

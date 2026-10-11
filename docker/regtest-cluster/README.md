@@ -42,7 +42,7 @@ docker build -f docker/Dockerfile --target ghost-pool \
   -t bitcoin-ghost/ghost-pool:regtest .
 ```
 (Confirm the Dockerfile's `ghost-pool` target accepts a features build-arg; if
-not, build the binary locally `cargo build --release -p ghost-pool` and COPY it.)
+not, build the binary locally `cargo build --release -p ghost-mining` and COPY it.)
 
 ## 3. Bring the cluster up (genesis-ordered)
 ```bash
@@ -153,7 +153,7 @@ code months older than the change under test. `docker-compose.yml` now
 bind-mounts it; rebuild before every run:
 
 ```bash
-cargo build --release -p ghost-pool && cp target/release/ghost-pool docker/regtest-cluster/bin/ghost-pool
+cargo build --release -p ghost-mining && cp target/release/ghost-mining docker/regtest-cluster/bin/ghost-pool
 ```
 
 The **in-process harness** (`tests/integration_tests/mesh_cluster.rs`) remains the

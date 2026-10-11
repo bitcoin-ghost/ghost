@@ -146,8 +146,8 @@ jobs:
           # is a compile-time flag with no build-time artefacts (params load at
           # runtime), so this is safe.
           cargo build --release --target ${{ matrix.target }} \
-            --features ghost-pool/zk-production \
-            -p ghost-pool -p ghost-cli \
+            --features ghost-mining/zk-production \
+            -p ghost-mining -p ghost-cli \
             -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
 
       # Build ghostd (the C++ Bitcoin Core daemon) so the node binaries ship in

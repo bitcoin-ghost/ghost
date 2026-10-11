@@ -23,7 +23,7 @@ COPY bins ./bins
 
 # Build release binaries
 RUN cargo build --release \
-    --bin ghost-pool \
+    --bin ghost-mining \
     --bin translator \
     --bin ghost-pay \
     --bin ghost-coordinator
@@ -47,7 +47,7 @@ RUN mkdir -p /etc/ghost /var/lib/ghost/data /var/log/ghost \
     && chown -R ghost:ghost /etc/ghost /var/lib/ghost /var/log/ghost
 
 # Copy binary
-COPY --from=builder /build/target/release/ghost-pool /usr/local/bin/ghost-pool
+COPY --from=builder /build/target/release/ghost-mining /usr/local/bin/ghost-pool
 
 # Copy default config
 COPY docker/config/ghost-pool.toml /etc/ghost/config.toml

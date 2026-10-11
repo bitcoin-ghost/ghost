@@ -108,7 +108,7 @@ pub type Groth16Params = bellperson::groth16::Parameters<blstrs::Bls12>;
 ///   * only ever turned on by an explicit `--features mpc-test-cap` on a targeted
 ///     `-p ghost-mpc` test invocation.
 ///
-/// So the production build (`cargo build -p ghost-pool --features zk-production`)
+/// So the production build (`cargo build -p ghost-mining --features zk-production`)
 /// and a default `cargo build` both compile this as 101. A compile-time test
 /// (`cap_tests::test_cap_is_mainnet_value_without_feature`) locks the invariant.
 #[cfg(not(feature = "mpc-test-cap"))]

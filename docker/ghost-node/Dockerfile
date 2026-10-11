@@ -47,7 +47,7 @@ COPY bins/ghost-cli ./bins/ghost-cli
 
 # Build node components only
 RUN cargo build --release \
-    -p ghost-pool \
+    -p ghost-mining \
     -p ghost-pay \
     -p ghost-coordinator \
     -p ghost-gsp-bin \
@@ -62,7 +62,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only node binaries
-COPY --from=builder /build/target/release/ghost-pool /usr/local/bin/
+COPY --from=builder /build/target/release/ghost-mining /usr/local/bin/
 COPY --from=builder /build/target/release/ghost-pay /usr/local/bin/
 COPY --from=builder /build/target/release/ghost-coordinator /usr/local/bin/
 COPY --from=builder /build/target/release/ghost-gsp /usr/local/bin/
