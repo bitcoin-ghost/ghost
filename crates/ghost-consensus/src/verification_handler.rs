@@ -968,6 +968,20 @@ impl VerificationResultHandler {
                 // shipped. Anti-grief is the distinct-challenger majority applied at
                 // qualification, as described above the ledger insert.
             }
+            CapabilityType::Coordinator => {
+                // #736. Ledger only, like `Address`: there is no legacy `*_challenges` table
+                // for a capability that postdates them, and nothing reads one.
+                //
+                // No re-derivation either. The verdict rests on a liveness probe the
+                // challenger made and on the challenger's own roster, neither of which a
+                // third party can reproduce from a stored artifact — and the challenge
+                // deliberately forwards no signed response, because the attestation names an
+                // endpoint in the clear (S-7). Anti-grief is the distinct-challenger
+                // majority at qualification.
+                //
+                // ⚠ Recorded, and consumed by NOTHING yet. These rows carry no share weight
+                // until a separate height gate moves GhostPay's +4 here.
+            }
         }
 
         debug!(

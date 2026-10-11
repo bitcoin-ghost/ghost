@@ -914,67 +914,64 @@ impl VerificationClient {
 
     /// Challenge a peer for the Wraith coordinator capability (#736).
     ///
-    /// Returns the probe result and the target's raw signed attestation, so the
-    /// caller can store it as `target_signed_response` and let a third party
-    /// re-derive the verdict rather than trust this challenger — the same shape
-    /// the other capabilities use.
-    ///
     /// The nonce is bound into the target's signature, so a reply captured from
     /// an earlier challenge cannot be replayed at this one.
+    ///
+    /// ⛔ The signature is VERIFIED here, against `target_node_id_hex` and `nonce`.
+    /// This used to read the wrapper's `signed: true` and take it as given — a flag
+    /// set by the party being challenged, so "signed" meant "says it is signed".
     pub async fn verify_coordinator(
         &self,
         node_address: &str,
         nonce: &str,
         target_node_id_hex: &str,
         our_election_view: &serde_json::Value,
-    ) -> GhostResult<(CoordinatorProbe, Option<String>)> {
-        let url = self.build_url(
+    ) -> CoordinatorOutcome {
+        use crate::address_proof::{verify_signed_reply, SignedReplyFailure};
+        use crate::routes::CoordinatorAttestation;
+
+        let url = match self.build_url(
             node_address,
             &format!("/verify/coordinator?nonce={}", urlencoding::encode(nonce)),
-        )?;
+        ) {
+            Ok(url) => url,
+            Err(_) => return CoordinatorOutcome::Unverifiable("address refused before dialling"),
+        };
         debug!(url = %url, "Challenging Wraith coordinator capability");
 
-        let wrapper: serde_json::Value = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
+        let body = match self.client.get(&url).send().await {
+            Ok(response) => match response.text().await {
+                Ok(body) => body,
+                Err(e) => {
+                    debug!("coordinator attestation body unreadable: {}", e);
+                    return CoordinatorOutcome::Unverifiable("attestation unreadable");
+                }
+            },
+            Err(e) => {
                 debug!("coordinator attestation request failed: {}", e);
-                GhostError::VerificationTimeout("coordinator attestation request failed".into())
-            })?
-            .json()
-            .await
-            .map_err(|e| {
-                debug!("coordinator attestation parse error: {}", e);
-                GhostError::InvalidVerificationResponse("invalid coordinator attestation".into())
-            })?;
-
-        let signed = wrapper.get("signed").and_then(|v| v.as_bool()) == Some(true);
-        let inner = wrapper.get("response").ok_or_else(|| {
-            GhostError::InvalidVerificationResponse("missing 'response' field".into())
-        })?;
-        // When signed, the payload sits inside the SignedResponse envelope.
-        let payload = inner.get("payload").unwrap_or(inner);
-
-        // An UNSIGNED attestation is not evidence, whatever it says. Anything can
-        // serve this JSON — that is #605's Stratum finding — so treat it as a
-        // failed challenge rather than a claim worth probing.
-        let attested_serving = if signed {
-            payload.get("serving").and_then(|v| v.as_bool()) == Some(true)
-        } else {
-            debug!("coordinator attestation was unsigned; not evidence");
-            false
+                return CoordinatorOutcome::Unverifiable("attestation request failed");
+            }
         };
-        let endpoint = payload
-            .get("advertised_endpoint")
-            .and_then(|v| v.as_str())
-            .filter(|e| !e.is_empty())
-            .map(String::from);
+
+        let attestation: CoordinatorAttestation =
+            match verify_signed_reply(&body, target_node_id_hex, nonce) {
+                Ok(attestation) => attestation,
+                // An unsigned reply is also what a peer with no signing identity sends,
+                // so it is not evidence of anything.
+                Err(SignedReplyFailure::NotSigned | SignedReplyFailure::Unreachable) => {
+                    return CoordinatorOutcome::Unverifiable("attestation was not signed")
+                }
+                Err(failure) => return CoordinatorOutcome::Forged(failure),
+            };
+
+        let endpoint = attestation
+            .advertised_endpoint
+            .clone()
+            .filter(|e| !e.is_empty());
 
         // Probe what it named. A node that attests to serving but answers
         // nothing there has not shown it coordinates.
-        let endpoint_answered = match (attested_serving, endpoint.as_deref()) {
+        let endpoint_answered = match (attestation.serving, endpoint.as_deref()) {
             (true, Some(ep)) => self.coordinator_answers_at(ep).await,
             _ => false,
         };
@@ -988,16 +985,15 @@ impl VerificationClient {
             None => false,
         };
 
-        let raw_signed = signed.then(|| inner.to_string());
-        Ok((
-            CoordinatorProbe {
-                attested_serving,
+        CoordinatorOutcome::Attested {
+            epoch: attestation.epoch,
+            probe: CoordinatorProbe {
+                attested_serving: attestation.serving,
                 endpoint,
                 endpoint_answered,
                 endpoint_is_theirs,
             },
-            raw_signed,
-        ))
+        }
     }
 
     /// Does a Wraith coordinator answer at `endpoint`?
@@ -1328,7 +1324,7 @@ impl VerificationClient {
 /// Looked up by node id rather than by anything the target claims about its
 /// role: that claim is the thing under test, so trusting it to find the
 /// endpoint would let the answer be chosen by the party being challenged.
-fn endpoint_owned_by(view: &serde_json::Value, node_id_hex: &str) -> Option<String> {
+pub(crate) fn endpoint_owned_by(view: &serde_json::Value, node_id_hex: &str) -> Option<String> {
     let want = node_id_hex.trim().to_ascii_lowercase();
     view.get("coordinators")?
         .as_array()?
@@ -1343,6 +1339,56 @@ fn endpoint_owned_by(view: &serde_json::Value, node_id_hex: &str) -> Option<Stri
         .and_then(|e| e.as_str())
         .filter(|e| !e.is_empty())
         .map(String::from)
+}
+
+/// How a Wraith coordinator challenge ended (#736).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorOutcome {
+    /// Nothing was learned: the node could not be reached, or answered unsigned. The reason
+    /// is for the log only.
+    Unverifiable(&'static str),
+    /// The node answered the challenge with a reply that fails verification — signed by
+    /// someone else, bound to another nonce, or not validly signed at all.
+    Forged(crate::address_proof::SignedReplyFailure),
+    /// A valid attestation, signed by the target and bound to our nonce, and what probing
+    /// the endpoint it named found.
+    Attested {
+        /// The election epoch the target computed when it signed.
+        epoch: Option<u64>,
+        probe: CoordinatorProbe,
+    },
+}
+
+/// What a coordinator challenge is allowed to ASSERT to the rest of the fleet.
+///
+/// `Some(true)` = broadcast a PASS, `Some(false)` = broadcast a FAIL, `None` = say nothing.
+/// The rule is the one the address proof uses: never a false FAIL, never an unverified PASS.
+///
+/// - [`CoordinatorOutcome::Unverifiable`] says nothing. Unreachable is overwhelmingly
+///   transient, and unsigned is also what a peer with no signing identity looks like.
+/// - [`CoordinatorOutcome::Forged`] is a FAIL: something answered as this node and could not
+///   prove it was.
+/// - A valid attestation that says **not serving** says nothing. The node is not claiming to
+///   coordinate this epoch, so there is no claim to refute — and with no PASS it earns
+///   nothing, which is the only consequence that matters.
+/// - A valid attestation from a **different epoch** than ours says nothing. `endpoint_is_theirs`
+///   is judged against OUR roster, and across an epoch boundary two honest nodes hold
+///   different rosters. Judging then would fail honest nodes on timing.
+/// - Otherwise the three probe checks decide.
+pub fn coordinator_verdict(outcome: &CoordinatorOutcome, our_epoch: Option<u64>) -> Option<bool> {
+    match outcome {
+        CoordinatorOutcome::Unverifiable(_) => None,
+        CoordinatorOutcome::Forged(_) => Some(false),
+        CoordinatorOutcome::Attested { epoch, probe } => {
+            if !probe.attested_serving {
+                return None;
+            }
+            match (epoch, our_epoch) {
+                (Some(theirs), Some(ours)) if *theirs == ours => Some(probe.passed()),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// What a Wraith coordinator challenge found (#736).
@@ -1950,6 +1996,161 @@ mod tests {
             !probe(true, true, false).passed(),
             "the neighbour attack: a real signature and a real coordinator answering, but the \
              address belongs to somebody else"
+        );
+    }
+
+    fn attested(
+        epoch: Option<u64>,
+        serving: bool,
+        answered: bool,
+        theirs: bool,
+    ) -> CoordinatorOutcome {
+        CoordinatorOutcome::Attested {
+            epoch,
+            probe: CoordinatorProbe {
+                attested_serving: serving,
+                endpoint: serving.then(|| "10.0.0.2:9100".to_string()),
+                endpoint_answered: answered,
+                endpoint_is_theirs: theirs,
+            },
+        }
+    }
+
+    /// What a challenge may tell the fleet: never a false FAIL, never an unverified PASS.
+    #[test]
+    fn a_coordinator_verdict_is_only_cast_on_evidence() {
+        use crate::address_proof::SignedReplyFailure;
+        let ours = Some(6742);
+
+        assert_eq!(
+            coordinator_verdict(&attested(ours, true, true, true), ours),
+            Some(true)
+        );
+        // Serving, same epoch, and one of the checks fails: that is a refuted claim.
+        assert_eq!(
+            coordinator_verdict(&attested(ours, true, false, true), ours),
+            Some(false),
+            "attests to serving and nothing answers there"
+        );
+        assert_eq!(
+            coordinator_verdict(&attested(ours, true, true, false), ours),
+            Some(false),
+            "the neighbour attack"
+        );
+        // Something answered as this node and could not prove it was.
+        for forged in [
+            SignedReplyFailure::WrongSigner,
+            SignedReplyFailure::NonceMismatch,
+            SignedReplyFailure::BadSignature,
+        ] {
+            assert_eq!(
+                coordinator_verdict(&CoordinatorOutcome::Forged(forged), ours),
+                Some(false),
+                "{forged:?}"
+            );
+        }
+
+        // Not evidence, so nothing is said.
+        assert_eq!(
+            coordinator_verdict(&CoordinatorOutcome::Unverifiable("unreachable"), ours),
+            None
+        );
+        assert_eq!(
+            coordinator_verdict(&attested(ours, false, false, false), ours),
+            None,
+            "a node that says it is not serving has made no claim to refute"
+        );
+        assert_eq!(
+            coordinator_verdict(&attested(Some(6741), true, true, false), ours),
+            None,
+            "across an epoch boundary two honest nodes hold different rosters"
+        );
+        assert_eq!(
+            coordinator_verdict(&attested(None, true, true, true), ours),
+            None,
+            "an attestation with no epoch cannot be placed against our roster"
+        );
+        assert_eq!(
+            coordinator_verdict(&attested(ours, true, true, true), None),
+            None,
+            "nor can we judge without an epoch of our own"
+        );
+    }
+
+    /// The wire shape `/verify/coordinator?nonce=…` returns, really signed.
+    fn coordinator_body(identity: &ghost_common::identity::NodeIdentity, nonce: &str) -> String {
+        let signed = SignedResponse::new(
+            crate::routes::CoordinatorAttestation {
+                enabled: true,
+                serving: true,
+                advertised_endpoint: Some("10.0.0.2:9100".to_string()),
+                epoch: Some(6742),
+                my_tiers: vec!["1m_sats".to_string()],
+            },
+            identity.node_id_hex(),
+            |msg| identity.sign(msg),
+            Some(nonce.to_owned()),
+        );
+        serde_json::json!({"signed": true, "response": signed}).to_string()
+    }
+
+    /// A genuine attestation verifies and yields what the node signed.
+    #[test]
+    fn a_coordinator_attestation_signed_by_the_target_over_our_nonce_verifies() {
+        use crate::address_proof::verify_signed_reply;
+        let node = ghost_common::identity::NodeIdentity::generate();
+        let got: crate::routes::CoordinatorAttestation =
+            verify_signed_reply(&coordinator_body(&node, "n1"), &node.node_id_hex(), "n1")
+                .expect("a genuine attestation must verify");
+        assert!(got.serving);
+        assert_eq!(got.advertised_endpoint.as_deref(), Some("10.0.0.2:9100"));
+        assert_eq!(got.epoch, Some(6742));
+    }
+
+    /// The defect this replaces: the challenge read the wrapper's `signed: true` and believed
+    /// it. Each of these replies says `signed: true`, and none of them is.
+    #[test]
+    fn saying_signed_is_not_being_signed() {
+        use crate::address_proof::{verify_signed_reply, SignedReplyFailure};
+        type A = crate::routes::CoordinatorAttestation;
+        let node = ghost_common::identity::NodeIdentity::generate();
+        let neighbour = ghost_common::identity::NodeIdentity::generate();
+        let id = node.node_id_hex();
+
+        // The payload changed after signing: not serving -> serving.
+        let honest_no = {
+            let signed = SignedResponse::new(
+                A {
+                    enabled: true,
+                    serving: false,
+                    advertised_endpoint: None,
+                    epoch: Some(6742),
+                    my_tiers: vec![],
+                },
+                id.clone(),
+                |msg| node.sign(msg),
+                Some("n1".to_owned()),
+            );
+            let mut v = serde_json::json!({"signed": true, "response": signed});
+            v["response"]["payload"]["serving"] = serde_json::json!(true);
+            v["response"]["payload"]["advertised_endpoint"] = serde_json::json!("10.0.0.9:9100");
+            v.to_string()
+        };
+        assert_eq!(
+            verify_signed_reply::<A>(&honest_no, &id, "n1").err(),
+            Some(SignedReplyFailure::BadSignature),
+            "an edited payload under the original signature"
+        );
+
+        assert_eq!(
+            verify_signed_reply::<A>(&coordinator_body(&neighbour, "n1"), &id, "n1").err(),
+            Some(SignedReplyFailure::WrongSigner),
+            "a neighbour's genuine attestation presented as this node's"
+        );
+        assert_eq!(
+            verify_signed_reply::<A>(&coordinator_body(&node, "earlier"), &id, "n1").err(),
+            Some(SignedReplyFailure::NonceMismatch),
+            "a replay of an earlier challenge"
         );
     }
 

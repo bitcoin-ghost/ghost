@@ -868,6 +868,12 @@ pub enum CapabilityType {
     /// address it dialled. Convergence therefore rests entirely on the
     /// distinct-challenger majority, exactly as it does for a backfilled verdict.
     Address,
+    /// #736: the node proved it runs a Wraith coordinator at the endpoint the roster assigns
+    /// it — a signed, nonce-bound attestation plus a live answer at that endpoint.
+    ///
+    /// Recorded in the convergence ledger and, by itself, worth nothing: no share weight
+    /// attaches until a separate gate moves GhostPay's +4 here.
+    Coordinator,
     /// A capability this binary does not know about.
     ///
     /// ⛔ **This exists so a newer peer cannot silence an older one.** Without
@@ -899,6 +905,7 @@ impl CapabilityType {
             Self::Stratum => "stratum",
             Self::GhostPay => "ghostpay",
             Self::Address => "address",
+            Self::Coordinator => "coordinator",
             // Reachable only from a log or a diagnostic; never sent as a verdict
             // of ours. Named rather than panicking, so an observability path
             // cannot take the node down.
@@ -914,6 +921,7 @@ impl CapabilityType {
             "stratum" => Some(Self::Stratum),
             "ghostpay" => Some(Self::GhostPay),
             "address" => Some(Self::Address),
+            "coordinator" => Some(Self::Coordinator),
             // Deliberately does not parse "unknown" back into a variant: a
             // capability nobody recognises must not become a real one by being
             // written down and read back.
@@ -3103,6 +3111,17 @@ mod tests {
     /// An unrecognised capability must not become a real one by being written
     /// down and read back — otherwise "unknown" would round-trip into a variant
     /// and be stored in the convergence ledger as though it meant something.
+    /// #736: the string is a stored and gossiped format — it is the `capability` column of the
+    /// convergence ledger and the value peers on older binaries see (and, since #871, ignore).
+    #[test]
+    fn the_coordinator_capability_is_spelled_coordinator_on_the_wire() {
+        assert_eq!(CapabilityType::Coordinator.as_str(), "coordinator");
+        assert_eq!(
+            serde_json::to_string(&CapabilityType::Coordinator).unwrap(),
+            "\"coordinator\""
+        );
+    }
+
     #[test]
     fn an_unknown_capability_cannot_be_resurrected_from_text() {
         assert_eq!(CapabilityType::Unknown.as_str(), "unknown");
@@ -3120,6 +3139,7 @@ mod tests {
             CapabilityType::Stratum,
             CapabilityType::GhostPay,
             CapabilityType::Address,
+            CapabilityType::Coordinator,
         ] {
             assert_eq!(CapabilityType::parse(c.as_str()), Some(c), "{c:?}");
             let wire = serde_json::to_string(&c).expect("serialise");

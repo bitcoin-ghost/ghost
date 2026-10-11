@@ -152,6 +152,26 @@ pub fn verify_address_proof(
     expected_node_id: &str,
     expected_nonce: &str,
 ) -> Result<(), AddressProofFailure> {
+    verify_signed_reply::<HealthResponse>(body, expected_node_id, expected_nonce).map(|_| ())
+}
+
+/// The same failure classes apply to any nonce-bound signed reply, not only `/health`.
+pub type SignedReplyFailure = AddressProofFailure;
+
+/// Verify a `{"signed": bool, "response": SignedResponse<T>}` reply was signed by exactly
+/// `expected_node_id` and bound to `expected_nonce`, and hand back what it signed.
+///
+/// Factored out of [`verify_address_proof`] so the coordinator challenge (#736) checks a
+/// signature the same way instead of trusting the wrapper's `signed` flag — which is set by
+/// the party being challenged.
+pub fn verify_signed_reply<T>(
+    body: &str,
+    expected_node_id: &str,
+    expected_nonce: &str,
+) -> Result<T, SignedReplyFailure>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
     let wrapper: serde_json::Value =
         serde_json::from_str(body).map_err(|_| AddressProofFailure::NotSigned)?;
 
@@ -173,7 +193,7 @@ pub fn verify_address_proof(
     // `serde_json::Value` reproduces the shape but not necessarily the bytes, and fails with
     // `BadSignature` against a genuinely valid proof. Found by testing against a real reply
     // from vm5; every hand-built fixture passed.
-    let signed: SignedResponse<HealthResponse> =
+    let signed: SignedResponse<T> =
         serde_json::from_value(inner.clone()).map_err(|_| AddressProofFailure::NotSigned)?;
 
     // The signer must be the node that CLAIMED this address. Anything else means
@@ -203,7 +223,8 @@ pub fn verify_address_proof(
             };
             verify_signature(&pk, message_hash, &sig).unwrap_or(false)
         })
-        .map_err(|_| AddressProofFailure::BadSignature)
+        .map_err(|_| AddressProofFailure::BadSignature)?;
+    Ok(signed.payload)
 }
 
 #[cfg(test)]

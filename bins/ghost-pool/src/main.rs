@@ -10301,6 +10301,18 @@ async fn main() -> Result<()> {
                 // #605 H-7: broadcast the address proof at/above the gate, so a claimed
                 // `/24` becomes a majority-attested fact instead of a self-report.
                 .with_address_proof_gate(ghost_pool::address_proof_height())
+                // #736: challenge peers on OUR roster for the Wraith coordinator capability.
+                // Logged on every rotation; broadcast only at/above the gate. Carries no
+                // share weight.
+                .with_coordinator_proof(ghost_pool::coordinator_proof_height(), {
+                    let coord_for_challenges = coordinator_election.clone();
+                    Arc::new(move || {
+                        coord_for_challenges
+                            .as_ref()
+                            .map(|c| c.status_json())
+                            .unwrap_or_else(ghost_pool::coordinator_election::disabled_status_json)
+                    })
+                })
                 .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
@@ -10351,6 +10363,8 @@ async fn main() -> Result<()> {
                 // H-7. Emitted only at/above `address_proof_height()`; the task will not
                 // hand one over below the gate, so reaching here means the gate is live.
                 "address" => CapabilityType::Address,
+                // #736. Emitted only at/above `coordinator_proof_height()`.
+                "coordinator" => CapabilityType::Coordinator,
                 other => {
                     warn!(capability = %other, "Unknown capability type, skipping broadcast");
                     continue;
