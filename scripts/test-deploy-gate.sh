@@ -175,18 +175,6 @@ out="$(run_gate ghost-vm1 translator_sv2)"
 check "refuses with no soak, naming the binary" "translator_sv2 @ .* has not soaked" "$out"
 
 # ---------------------------------------------------------------------------
-# 2b. The node binary's pre-rename name is still accepted, and means the SAME binary (#1018).
-#     What matters is that it is normalised before any record is looked up: soak and test
-#     records are named for the binary, so two spellings would be two sets of records, and a
-#     soak under one would not count for the other.
-# ---------------------------------------------------------------------------
-out="$(run_gate ghost-vm1 ghost-pool)"
-check "the pre-rename name is normalised before the soak lookup" "ghost-mining @ .* has not soaked" "$out"
-check "and says so" "ghost-pool is now ghost-mining" "$out"
-out="$(run_gate ghost-vm1 ghost-pol)"
-check "a name that is neither is still refused" "unknown binary 'ghost-pol'" "$out"
-
-# ---------------------------------------------------------------------------
 # 3. THE #459 CASE: a soak recorded for a DIFFERENT binary must not satisfy the
 #    gate for this one. Soaking ghost-mining alone used to green-light translator_sv2.
 # ---------------------------------------------------------------------------
@@ -361,6 +349,18 @@ check "a secret written but not loaded is refused, naming the restart" "was edit
 out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF="$GOOD_CONF" run_gate ghost-vm5 ghost-mining)"
 check_absent "unreadable stamps do not block" "was edited AFTER" "$out"
 check "unreadable stamps are reported as unverified, not as satisfied" "is unverified" "$out"
+
+# The node binary's pre-rename name is still accepted, and means the SAME binary (#1018). What
+# matters is that it is normalised before anything keys on it: this gate applies to ghost-mining
+# ONLY, and the soak and test records are named for the binary — so an un-normalised `ghost-pool`
+# would skip this gate and then look up records nobody wrote. Driven through the ssh stub like
+# every case here; an earlier draft asserted on the soak refusal instead, which passed locally
+# only because this machine can reach the real vm1, and failed in CI.
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-pool)"
+check "the pre-rename name is gated as ghost-mining" "cannot sign share batches" "$out"
+check "and says it was renamed" "ghost-pool is now ghost-mining" "$out"
+out="$(GHOST_DEPLOY_SSH="$SSH_STUB_BIN" STUB_CONF_UNREADABLE=1 run_gate ghost-vm5 ghost-pol)"
+check "a name that is neither is still refused" "unknown binary 'ghost-pol'" "$out"
 
 # SCOPE. pool_sv2 is how the secret REACHES the node, so gating it would deadlock the remedy the
 # refusal above prints; translator_sv2 never touches this path. Both are driven against the most

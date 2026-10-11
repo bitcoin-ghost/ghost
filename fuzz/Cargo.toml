@@ -29,6 +29,12 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+# `ghost-mining` is the package in bins/ghost-pool, whose LIBRARY is still `ghost_pool` (#1018).
+# cargo-machete matches a dependency to imports by the package name, so it sees no
+# `ghost_mining::` anywhere and reports this one unused. It is used, as `ghost_pool::`.
+[package.metadata.cargo-machete]
+ignored = ["ghost-mining"]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
