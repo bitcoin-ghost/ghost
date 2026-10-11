@@ -668,6 +668,22 @@ pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = 970_500;
 /// it drops the entire message without saying so. Margin buys room to roll back and re-roll.
 pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 
+/// #736: at and above this height a Wraith coordinator challenge's verdict is BROADCAST and
+/// recorded in the convergence ledger, rather than only logged.
+///
+/// Dormant. Below it the challenge already runs on every rotation and logs its outcome at INFO,
+/// which is what arming should be decided from: the pass rate on the live fleet, per outcome
+/// class, over at least one full qualification window.
+///
+/// ⚠ Arming this pays nothing. It makes `coordinator` rows appear in `verification_ledger`;
+/// the +4 does not move from GhostPay until a separate gate says so, and that gate must not be
+/// armed until these rows have been observed clean.
+///
+/// Gated because the ledger is a stored format nodes reconcile on, so a new capability's rows
+/// must begin on every node at one height. The wire itself is safe either way: every node has
+/// carried `CapabilityType::Unknown` tolerance since #871.
+pub const COORDINATOR_PROOF_HEIGHT: u64 = u64::MAX;
+
 /// H-7 ENFORCEMENT: at and above this height, a challenger whose own address proof FAILED stops
 /// counting toward a target's distinct-`/24` diversity floor (#605).
 ///
@@ -820,6 +836,7 @@ mod gates {
     pub(super) static STRATUM_HANDSHAKE_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ARCHIVE_TX_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ADDRESS_PROOF: OnceLock<u64> = OnceLock::new();
+    pub(super) static COORDINATOR_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ADDRESS_PROOF_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
@@ -959,6 +976,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     );
     let address_proof =
         gates::from_env("GHOST_ADDRESS_PROOF_HEIGHT", network, ADDRESS_PROOF_HEIGHT);
+    let coordinator_proof = gates::from_env(
+        "GHOST_COORDINATOR_PROOF_HEIGHT",
+        network,
+        COORDINATOR_PROOF_HEIGHT,
+    );
     let address_proof_enforcement = gates::from_env(
         "GHOST_ADDRESS_PROOF_ENFORCEMENT_HEIGHT",
         network,
@@ -1036,6 +1058,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     set_gate(&gates::ARCHIVE_TX_PROOF, "ARCHIVE_TX_PROOF", archive_tx);
     set_gate(&gates::ADDRESS_PROOF, "ADDRESS_PROOF", address_proof);
     set_gate(
+        &gates::COORDINATOR_PROOF,
+        "COORDINATOR_PROOF",
+        coordinator_proof,
+    );
+    set_gate(
         &gates::ADDRESS_PROOF_ENFORCEMENT,
         "ADDRESS_PROOF_ENFORCEMENT",
         address_proof_enforcement,
@@ -1087,6 +1114,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         stratum_handshake_proof = %h(stratum_proof),
         archive_tx_proof = %h(archive_tx),
         address_proof = %h(address_proof),
+        coordinator_proof = %h(coordinator_proof),
         // #605. Resolved and stored since it was added, and never stated — so a node armed at
         // 970,500 looked identical in its logs to one that was dormant. It is the gate that moves
         // the node-reward split, which makes it the last one that should be invisible.
@@ -1271,6 +1299,11 @@ pub fn archive_tx_proof_height() -> u64 {
 /// Height at and above which a challenger broadcasts its H-7 address proof (#605).
 pub fn address_proof_height() -> u64 {
     *gates::ADDRESS_PROOF.get_or_init(|| ADDRESS_PROOF_HEIGHT)
+}
+
+/// Height at and above which a Wraith coordinator verdict is broadcast and recorded (#736).
+pub fn coordinator_proof_height() -> u64 {
+    *gates::COORDINATOR_PROOF.get_or_init(|| COORDINATOR_PROOF_HEIGHT)
 }
 
 /// Height at and above which a FAILED address proof costs a challenger its `/24` in the
@@ -1731,6 +1764,18 @@ mod activation_height_logging_tests {
         assert_eq!(crate::render_gate_height(0), "0");
         // The point of the rule: the raw sentinel must not survive rendering.
         assert_ne!(crate::render_gate_height(u64::MAX), u64::MAX.to_string());
+    }
+}
+
+#[cfg(test)]
+mod coordinator_proof_gate_tests {
+    /// #736: shipped dormant on purpose. Arming is a deliberate edit to this assertion, made
+    /// after the challenge's logged pass rate has been read off the live fleet — not something
+    /// a refactor or a merge should be able to do in passing.
+    #[test]
+    fn the_coordinator_proof_gate_ships_dormant() {
+        assert_eq!(crate::COORDINATOR_PROOF_HEIGHT, u64::MAX);
+        assert_eq!(crate::coordinator_proof_height(), u64::MAX);
     }
 }
 

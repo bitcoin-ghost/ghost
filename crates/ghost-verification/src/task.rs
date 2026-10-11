@@ -72,6 +72,9 @@ pub struct VerificationTaskConfig {
     pub archive_tx_gate_height: u64,
     /// H-7: height at and above which an address proof is BROADCAST rather than only logged.
     pub address_proof_gate_height: u64,
+    /// #736: height at and above which a Wraith coordinator verdict is BROADCAST rather than
+    /// only logged. `u64::MAX` (default) is report-only.
+    pub coordinator_proof_gate_height: u64,
 }
 
 impl Default for VerificationTaskConfig {
@@ -91,6 +94,7 @@ impl Default for VerificationTaskConfig {
             stratum_proof_port: 3333,
             archive_tx_gate_height: u64::MAX,
             address_proof_gate_height: u64::MAX,
+            coordinator_proof_gate_height: u64::MAX,
         }
     }
 }
@@ -671,7 +675,13 @@ pub struct VerificationTask {
     policy: PolicyProfile,
     /// LOW-VER-3: Track challenges per target for even distribution
     challenge_tracker: std::sync::Mutex<ChallengeTracker>,
+    /// #736: this node's own Wraith coordinator election view (`epoch`, `coordinators`), the
+    /// roster a coordinator challenge is judged against. `None` = no challenge is issued.
+    coordinator_view: Option<CoordinatorViewFn>,
 }
+
+/// Source of the challenger's own election view — see [`VerificationTask::with_coordinator_proof`].
+pub type CoordinatorViewFn = Arc<dyn Fn() -> serde_json::Value + Send + Sync>;
 
 /// C-3: Error type for verification task creation
 #[derive(Debug, thiserror::Error)]
@@ -710,6 +720,7 @@ impl VerificationTask {
             rpc: None,
             policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
+            coordinator_view: None,
         })
     }
 
@@ -755,6 +766,7 @@ impl VerificationTask {
             rpc: None,
             policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
+            coordinator_view: None,
         })
     }
 
@@ -797,6 +809,7 @@ impl VerificationTask {
             rpc: None,
             policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
+            coordinator_view: None,
         })
     }
 
@@ -822,6 +835,7 @@ impl VerificationTask {
             rpc: None,
             policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
+            coordinator_view: None,
         })
     }
 
@@ -893,6 +907,23 @@ impl VerificationTask {
     /// the fleet is uniform would spend every probe on peers that discard it.
     pub fn with_address_proof_gate(mut self, height: u64) -> Self {
         self.config.address_proof_gate_height = height;
+        self
+    }
+
+    /// #736: challenge peers for the Wraith coordinator capability, judged against `view` —
+    /// this node's OWN election view — and broadcast the verdict at and above `height`.
+    ///
+    /// Below `height` the challenge still runs and is logged at INFO, so the pass rate on a
+    /// live fleet can be read before anything depends on it. Nothing is paid on this
+    /// capability by this change: a recorded verdict carries no share weight until a separate
+    /// gate says so.
+    ///
+    /// Gated for the reason every ledger-affecting change is: `verification_ledger` is a
+    /// stored format nodes reconcile on, so rows of a new capability must start appearing on
+    /// every node at the same height, not one node at a time across a roll.
+    pub fn with_coordinator_proof(mut self, height: u64, view: CoordinatorViewFn) -> Self {
+        self.config.coordinator_proof_gate_height = height;
+        self.coordinator_view = Some(view);
         self
     }
 
@@ -1264,6 +1295,10 @@ impl VerificationTask {
         self.probe_claimed_address_of(peer, &peer_id_hex, short_id)
             .await;
 
+        // #736: challenge the Wraith coordinator capability. Rides the same rotation.
+        self.probe_coordinator_of(peer, &peer_id_hex, short_id)
+            .await;
+
         // Verify each claimed capability
         // CRIT-VER-3: Log DB errors but continue with other capabilities
         if capabilities.archive_mode {
@@ -1412,6 +1447,100 @@ impl VerificationTask {
         self.broadcast_result(
             peer.node_id,
             "address",
+            passed,
+            challenge_data,
+            None,
+            timestamp,
+            None,
+        )
+        .await;
+    }
+
+    /// #736: challenge this peer for the Wraith coordinator capability and report the verdict.
+    ///
+    /// Who is challenged is decided from OUR election view, not from anything the peer says
+    /// about itself: a node our roster does not list has no endpoint we would accept as its
+    /// own, so it cannot pass and there is nothing to ask. That roster is derived from signed
+    /// adverts, which makes it a better statement of "claims to coordinate" than a flag in
+    /// the peer's own health reply.
+    async fn probe_coordinator_of(&self, peer: &VerifiablePeer, peer_id_hex: &str, short_id: &str) {
+        let Some(view_fn) = self.coordinator_view.as_ref() else {
+            return;
+        };
+        let view = view_fn();
+        if crate::client::endpoint_owned_by(&view, peer_id_hex).is_none() {
+            debug!(peer = %short_id, "coordinator: peer is not on our roster - nothing to challenge");
+            return;
+        }
+
+        let mut nonce_bytes = [0u8; 16];
+        if getrandom::getrandom(&mut nonce_bytes).is_err() {
+            warn!("coordinator: no randomness for a challenge nonce - skipping");
+            return;
+        }
+        let nonce = hex::encode(nonce_bytes);
+
+        let outcome = self
+            .client
+            .verify_coordinator(&peer.http_address, &nonce, peer_id_hex, &view)
+            .await;
+        let our_epoch = view.get("epoch").and_then(|e| e.as_u64());
+        let verdict = crate::client::coordinator_verdict(&outcome, our_epoch);
+
+        // INFO on every challenge, pass or not, so the rate of each outcome is readable from
+        // a production journal without a log-level change — that rate is what decides when
+        // this capability can carry weight.
+        info!(
+            peer = %short_id,
+            outcome = ?outcome,
+            our_epoch = ?our_epoch,
+            verdict = ?verdict,
+            "coordinator challenge"
+        );
+
+        let Some(passed) = verdict else { return };
+
+        let tip_at_or_above_gate = match self.rpc.as_ref() {
+            Some(rpc) => match rpc.get_block_count().await {
+                Ok(tip) => tip >= self.config.coordinator_proof_gate_height,
+                // Cannot read the tip - do not guess the gate is active.
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !tip_at_or_above_gate {
+            return;
+        }
+
+        // S-7: no cleartext address in a gossiped verdict. The endpoint is bound by hash,
+        // exactly as the address proof binds its address.
+        use sha2::{Digest, Sha256};
+        let endpoint_hash = match &outcome {
+            crate::client::CoordinatorOutcome::Attested { probe, .. } => probe
+                .endpoint
+                .as_deref()
+                .map(|e| hex::encode(Sha256::digest(e.as_bytes()))),
+            _ => None,
+        };
+        let challenge_data = serde_json::json!({
+            "nonce": nonce,
+            "epoch": our_epoch,
+            "endpoint_hash": endpoint_hash,
+        })
+        .to_string();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // No `target_signed_response`: the attestation names the endpoint in the clear, and
+        // forwarding it would put an address into every peer's ledger (S-7). Third-party
+        // re-derivation of this verdict is the same open question as for stratum and address
+        // (#920), not something to half-answer here.
+        self.broadcast_result(
+            peer.node_id,
+            "coordinator",
             passed,
             challenge_data,
             None,
