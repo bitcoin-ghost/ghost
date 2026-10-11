@@ -13486,6 +13486,59 @@ mod tests {
         Arc::new(state)
     }
 
+    /// #1014: a node with GhostPay disabled in its config reported `ghost_pay: true` and counted
+    /// the +4, so the fleet's dashboards said 10 shares on nodes ratified at 6.
+    #[tokio::test]
+    async fn node_shares_counts_ghostpay_only_when_the_node_config_enables_it() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        async fn shares(cfg: FullNodeConfig) -> serde_json::Value {
+            let state = Arc::new(
+                crate::server::VerificationState::new(
+                    "test_node".to_string(),
+                    "1.0.0".to_string(),
+                    PolicyProfile::default(),
+                    NodeCapabilities::default(),
+                )
+                .with_full_node_config(cfg, std::path::PathBuf::from("/nonexistent/pool.toml")),
+            );
+            let resp = api_node_shares_handler(axum::extract::State(state))
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            serde_json::from_slice(&body).expect("json")
+        }
+
+        // What every fleet node carries: a `[ghost_pay]` block that is present and disabled.
+        let disabled = FullNodeConfig {
+            ghost_pay: Some(ghost_common::config::GhostPayConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let off = shares(disabled).await;
+        assert_eq!(off["ghost_pay"], false);
+
+        let enabled = FullNodeConfig {
+            ghost_pay: Some(ghost_common::config::GhostPayConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let on = shares(enabled).await;
+        assert_eq!(on["ghost_pay"], true);
+
+        // The +4 is the whole difference between the two, so it is counted exactly when claimed.
+        let total = |v: &serde_json::Value| v["total"].as_i64().expect("total");
+        assert_eq!(total(&on) - total(&off), 4, "off={off} on={on}");
+    }
+
     /// #1002: the scoped-set derivation is seconds of synchronous database work, so it must not
     /// run on the thread that is serving requests. On a current-thread runtime that thread is
     /// this test's, which makes "ran somewhere else" directly observable.

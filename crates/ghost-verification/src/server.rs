@@ -2457,6 +2457,11 @@ impl VerificationState {
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.archive_mode = config.storage.archive_mode;
+            // Same rule for GhostPay (#1014). The default is `true`, and with nothing
+            // overwriting it every node reported the +4 as claimed and `/api/v1/node/shares`
+            // answered 10 on a fleet ratified at 6. `ghost_pay_enabled()` is what the
+            // advertised capability is built from, so the display now matches the claim.
+            dashboard.ghost_pay = config.ghost_pay_enabled();
         }
         self.full_node_config = Some(parking_lot::RwLock::new(config));
         self.full_node_config_path = Some(path);
