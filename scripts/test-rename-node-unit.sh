@@ -248,6 +248,38 @@ is  "--check on a legacy node: exit 1" 1 "$rc"
 has "and it lists the gate, a dependent and sudoers" 'gate: .*dependent: sri-pool.service.*sudoers: 3 rule' "$(printf '%s' "$out" | tr '\n' ' ')"
 is  "--check changed nothing" ghost-pool.service "$(cat "$R/stub/active")"
 
+echo "11. rules that share one line, comma-separated (ghost-vm2, vm3 and vm4 are written this way, #1021)"
+one_line_sudoers() {
+    printf '%s\n' 'ghost ALL=(ALL) NOPASSWD: /bin/systemctl start ghost-pay, /bin/systemctl start ghost-pool, /bin/systemctl stop ghost-pool, /bin/systemctl restart ghost-pool, /bin/systemctl start ghost-pool-gate, /bin/systemctl restart sv2-translator' \
+        > "$1/etc/sudoers.d/ghost-services"
+}
+S=etc/sudoers.d/ghost-services
+R="$TMP/n13"; make_node "$R" staged; one_line_sudoers "$R"
+out="$(run "$R" -- --check)"
+has "--check sees the three rules on a legacy node" 'sudoers: 3 rule' "$out"
+out="$(run "$R")"; rc=$?
+is  "exits 0" 0 "$rc"
+has "says it added three rules" 'sudoers gained 3 ghost-mining rule' "$out"
+is  "one twin line per verb, each a complete rule of its own" 3 "$($G -cE '^ghost ALL=\(ALL\) NOPASSWD: /bin/systemctl (start|stop|restart) ghost-mining$' "$R/$S")"
+is  "the original line is still the first line, unedited" 'ghost ALL=(ALL) NOPASSWD: /bin/systemctl start ghost-pay, /bin/systemctl start ghost-pool, /bin/systemctl stop ghost-pool, /bin/systemctl restart ghost-pool, /bin/systemctl start ghost-pool-gate, /bin/systemctl restart sv2-translator' "$(sed -n 1p "$R/$S")"
+is  "a rule for ghost-pool-gate got no twin (it is not the node unit)" 0 "$($G -c 'ghost-mining-gate' "$R/$S" || true)"
+want="$(sha256sum < "$R/$S")"
+out="$(run "$R")"; rc=$?
+is  "a second run exits 0" 0 "$rc"
+is  "and adds nothing" "$want" "$(sha256sum < "$R/$S")"
+out="$(run "$R" -- --check)"; is "--check is then clean" 0 "$?"
+
+echo "12. a rule naming the node unit in a line this script cannot extend is reported, never passed over"
+R="$TMP/n14"; make_node "$R" staged
+printf '%s\n' 'Cmnd_Alias GHOSTSVC = /bin/systemctl restart ghost-pool' 'ghost ALL=(ALL) NOPASSWD: GHOSTSVC' > "$R/$S"
+want="$(sha256sum < "$R/$S")"
+out="$(run "$R")"; rc=$?
+is  "exits 1" 1 "$rc"
+has "names the line it could not extend" 'cannot extend.*Cmnd_Alias GHOSTSVC' "$(printf '%s' "$out" | tr '\n' ' ')"
+is  "the file is untouched" "$want" "$(sha256sum < "$R/$S")"
+has "the unit switch stands" '^RENAME_PARTIAL flipped=yes active=active$' "$(printf '%s\n' "$out" | tail -1)"
+out="$(run "$R" -- --check)"; is "--check is not clean either" 1 "$?"
+
 echo
 echo "rename-node-unit self-test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

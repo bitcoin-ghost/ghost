@@ -116,12 +116,30 @@ dependents_naming_old() {
     return 0
 }
 
+# One line per rule the file lacks, as a complete rule of its own. A line starting `UNPARSED ` is
+# a line that names the node unit in a form this cannot extend.
+#
+# Rules are found wherever they sit in a line, not only at its end: vm1 writes one rule per line,
+# vm2-vm4 write every rule on ONE comma-separated line. Anchoring on the line end matched vm1
+# alone, so on the other three this added nothing, said nothing, and `--check` called the node
+# clean (#1021).
+#
+# `$OLD` must be followed by a comma or the line end, so `ghost-pool-gate` is not the node unit.
 sudoers_lines_missing() {
     [ -f "$SUDOERS" ] || return 0
-    local line twin
-    /usr/bin/grep -E "systemctl (start|stop|restart) $OLD\$" "$SUDOERS" 2>/dev/null | while IFS= read -r line; do
-        twin="${line%"$OLD"}$NEW"
-        /usr/bin/grep -qxF -- "$twin" "$SUDOERS" || printf '%s\n' "$twin"
+    local line prefix cmd twin end='[[:space:]]*(,|$)'
+    /usr/bin/grep -E "systemctl (start|stop|restart) $OLD$end" "$SUDOERS" 2>/dev/null \
+        | /usr/bin/grep -v '^[[:space:]]*#' | while IFS= read -r line; do
+        # Everything up to the tag is the "who, where, as whom" the twin has to repeat.
+        prefix="$(printf '%s\n' "$line" | sed -nE 's/^([^=]+=[[:space:]]*(\([^)]*\))?[[:space:]]*NOPASSWD:).*/\1/p')"
+        case "$line" in *\\) prefix="" ;; esac
+        if [ -z "$prefix" ]; then printf 'UNPARSED %s\n' "$line"; continue; fi
+        printf '%s\n' "$line" | /usr/bin/grep -oE "[^[:space:],:]*systemctl (start|stop|restart) $OLD$end" \
+            | sed -E 's/[[:space:]]*,?$//' | while IFS= read -r cmd; do
+            twin="${cmd%"$OLD"}$NEW"
+            /usr/bin/grep -v '^[[:space:]]*#' "$SUDOERS" | /usr/bin/grep -qE "(^|[[:space:],:])$twin$end" \
+                || printf '%s %s\n' "$prefix" "$twin"
+        done
     done
     return 0
 }
@@ -335,7 +353,13 @@ if [ "$reload" = yes ]; then sc daemon-reload || tail_rc=1; fi
 # ⛔ Validated with visudo BEFORE it replaces anything. A sudoers file that does not parse locks
 # sudo for everyone, and on vm1-vm4 sudo is how the next deploy gets in.
 missing="$(sudoers_lines_missing)"
-if [ -n "$missing" ]; then
+unparsed="$(printf '%s\n' "$missing" | /usr/bin/grep '^UNPARSED ' || true)"
+if [ -n "$unparsed" ]; then
+    # Nothing is appended at all: a file extended for some rules and not others would read as done.
+    echo "rename-node-unit: FAILED — cannot extend this sudoers line, add its $NEW rule by hand:" >&2
+    printf '%s\n' "$unparsed" | sed 's/^UNPARSED /    /' >&2
+    tail_rc=1
+elif [ -n "$missing" ]; then
     tmp="$SUDOERS.rename.$$"
     if { cat "$SUDOERS"; printf '%s\n' "$missing"; } > "$tmp" && chmod 0440 "$tmp" \
        && $VISUDO -cf "$tmp" >/dev/null 2>&1; then
