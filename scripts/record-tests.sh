@@ -32,6 +32,7 @@ echo "==> workflow line continuations"
 
 echo "==> inlined installer copies"
 ./scripts/check-inlined-copies.sh || { echo "FAILED: inlined copies drifted" >&2; exit 1; }
+./scripts/check-heredoc-comments-are-inert.sh || { echo "FAILED: an unquoted heredoc would run its own text" >&2; exit 1; }
 
 # Every Shard message type must be dispatched by some handler. Four times on 2026-08-16 a piece of
 # ghost-consensus was complete, unit-tested, and wired to nothing — the tests could not see it

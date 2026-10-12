@@ -847,9 +847,9 @@ shard_coinbase = true
 
 ${ALERTS_BLOCK}
 
-# ⚠ The section name is historical. Ghost Pay is retired and `enabled` is
-# hard-false; what still lives here is `wraith_enabled`, which is where
-# `NodeConfig::wraith_enabled()` reads the operator's mixing choice from.
+# ⚠ The section name is historical. Ghost Pay is retired and \`enabled\` is
+# hard-false; what still lives here is \`wraith_enabled\`, which is where
+# \`NodeConfig::wraith_enabled()\` reads the operator's mixing choice from.
 # Moving it to a section of its own is a config-schema change and therefore a
 # gated fleet roll, not an installer edit.
 [ghost_pay]
@@ -859,7 +859,7 @@ epoch_blocks = 100
 wraith_enabled = ${WRAITH}
 
 # NOTE (#760): the keys removed from the blocks above and below were read by NOTHING. There is no
-# `#[serde(deny_unknown_fields)]` on NodeConfig, so they parsed, were discarded, and produced no
+# \`#[serde(deny_unknown_fields)]\` on NodeConfig, so they parsed, were discarded, and produced no
 # warning — while reading, to anyone opening the file, exactly like settings that were in force:
 #
 #   pool.treasury_fee_percent      no such field on PoolConfig; the split is a constant
@@ -870,8 +870,8 @@ wraith_enabled = ${WRAITH}
 #   reaper.mode                    no such field on ReaperSettings; the controls are reject_*
 #
 # The whole [tdp] section went with them. TDP is configured on the COMMAND LINE, not in this file:
-# the unit runs `--tdp-enabled --tdp-port 8442`, and `main.rs` sets `tdp_config.port =
-# args.tdp_port`. Putting `port = 8442` here looked like configuration and did nothing, so editing
+# the unit runs \`--tdp-enabled --tdp-port 8442\`, and \`main.rs\` sets \`tdp_config.port =
+# args.tdp_port\`. Putting \`port = 8442\` here looked like configuration and did nothing, so editing
 # it and restarting changed nothing, silently.
 
 [reaper]
@@ -1075,14 +1075,14 @@ aggregate_channels = false
 # response instead of a placeholder that makes every share they build invalid.
 # ROLLOUT GATE, default false: pool_sv2 must understand a provisional channel identity on
 # every node before this is turned on anywhere.
-# ⚠ The rollout gate is SATISFIED and this is now ON. `pool_sv2` understands a provisional
+# ⚠ The rollout gate is SATISFIED and this is now ON. \`pool_sv2\` understands a provisional
 # channel identity on every node (fleet-wide since #783/#784/#785, all eight verified), so the
 # ordering hazard above is spent.
 #
-# It must stay `true` here or a freshly provisioned node gets the pre-#783 behaviour: a
+# It must stay \`true\` here or a freshly provisioned node gets the pre-#783 behaviour: a
 # serialising client (a proxy, or a rented-hashrate marketplace like Braiins) is answered with
 # an 8-byte placeholder extranonce while the real prefix is 12, builds a 4-byte-short coinbase,
-# and has EVERY share rejected. `mining.set_extranonce` cannot rescue it — that is an optional
+# and has EVERY share rejected. \`mining.set_extranonce\` cannot rescue it — that is an optional
 # extension those clients never negotiate.
 open_channel_on_subscribe = true
 
@@ -1114,9 +1114,9 @@ monitoring_address = "0.0.0.0:9092"
 min_individual_miner_hashrate = 1_000_000_000_000.0
 shares_per_minute = 6.0
 enable_vardiff = true
-# ⛔ REMOVED: `idle_timeout_secs`. It was set here and by install-node.sh, documented as
-# "disconnect miners with no shares" — and NO Rust struct reads it. `TranslatorConfig` carries no
-# `deny_unknown_fields`, so it parsed, was discarded, and produced no warning, while reading to
+# ⛔ REMOVED: \`idle_timeout_secs\`. It was set here and by install-node.sh, documented as
+# "disconnect miners with no shares" — and NO Rust struct reads it. \`TranslatorConfig\` carries no
+# \`deny_unknown_fields\`, so it parsed, was discarded, and produced no warning, while reading to
 # anyone opening this file exactly like a setting that was in force.
 #
 # ⚠ There is NO idle-miner reaper. A connection that opens a channel and then goes quiet holds
@@ -1142,7 +1142,7 @@ authority_pubkey = "${SV2_AUTH_PUB}"
 # looks dead — which is what made the dashboard flap after the floor was raised.
 #
 # Uncomment to run a SECOND listener for farm/rental traffic. The hobby tier keeps
-# `downstream_port`, so every miner already pointed here stays put and nobody has
+# \`downstream_port\`, so every miner already pointed here stays put and nobody has
 # to be told to move; only large miners need the new port advertised to them.
 #
 # BEFORE ENABLING: open the farm port on the firewall and the load balancer on
@@ -1157,7 +1157,7 @@ authority_pubkey = "${SV2_AUTH_PUB}"
 # 233,672 on this fleet without prompting — the pool has already measured the right starting
 # difficulty for that size of miner, so the tier simply starts there instead of climbing.
 #
-# `hobby_max_individual_miner_hashrate` only logs a warning when a miner on the
+# \`hobby_max_individual_miner_hashrate\` only logs a warning when a miner on the
 # hobby port measures above it. It is a CAPACITY control, not anti-fraud: payout
 # is proportional to work and a share's work IS its difficulty, so the same
 # hashrate earns the same on either port. A large miner on the hobby port is not
@@ -1212,7 +1212,7 @@ monitoring_address = "127.0.0.1:9090"
 
 # Native share accounting into ghost-mining.
 #
-# `secret` is mandatory (H-13) and must match ghost-mining's [network] internal_api_secret —
+# \`secret\` is mandatory (H-13) and must match ghost-mining's [network] internal_api_secret —
 # the same ${APISECRET} written into pool.toml above. ghost-mining now requires an HMAC on every
 # share batch: loopback alone authorised any process on the box to write the payout ledger, and
 # would authorise the internet if :8080 were ever put behind a reverse proxy.
