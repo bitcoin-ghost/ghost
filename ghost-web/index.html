@@ -555,12 +555,12 @@
       return out;
     }
 
-    // Bootstrap seeds = the original four load-balancer proxies. New mesh
-    // nodes have NO per-node proxy, so we always enter through one of these
-    // seeds; the /api/v1/pool/mesh-nodes endpoint then returns the WHOLE mesh
-    // (self + every connected peer) from that single node, so nodes 5, 6, …
-    // appear automatically without a hard-coded list.
-    var VMS = ['vm1', 'vm2', 'vm3', 'vm4'];
+    // Bootstrap seeds = the nodes that have a per-node proxy on this site
+    // (/api/pool/vmN/). Any one of them is enough: /api/v1/pool/mesh-nodes
+    // returns the WHOLE mesh (self + every connected peer) from that single
+    // node, so a node with no proxy here still appears. All eight fleet nodes
+    // have a proxy; listing all eight only adds fallbacks.
+    var VMS = ['vm1', 'vm2', 'vm3', 'vm4', 'vm5', 'vm6', 'vm7', 'vm8'];
 
     // Try each seed in order; the first that answers returns the live mesh
     // node list. Returns null if every seed is unreachable so the caller can
