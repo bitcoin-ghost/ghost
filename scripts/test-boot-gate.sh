@@ -51,12 +51,13 @@ if [ "$1" = start ]; then
 fi
 exit 0
 SC
-# The gate sleeps between polls. A `forever` run is ended here (SIGPIPE: bash reports no death
-# by it), after enough polls to show it
-# would have gone on, rather than by a timeout whose length says nothing.
+# The gate sleeps between polls. A `forever` run is ended here, after enough polls to show it
+# would have gone on, rather than by a timeout whose length says nothing. SIGKILL, because it is
+# the one signal a CI runner cannot have set to "ignore" for every child: this used SIGPIPE to
+# keep bash quiet about the death, the runner ignores SIGPIPE, and the test spun for ever.
 cat > "$BIN/sleep" <<'SL'
 #!/usr/bin/env bash
-[ "$(cat "$STUB_DIR/polls" 2>/dev/null || echo 0)" -ge "${STUB_MAX_POLLS:-50}" ] && kill -PIPE "$PPID"
+[ "$(cat "$STUB_DIR/polls" 2>/dev/null || echo 0)" -ge "${STUB_MAX_POLLS:-50}" ] && kill -KILL "$PPID"
 exit 0
 SL
 chmod +x "$BIN"/*
@@ -72,9 +73,9 @@ run_gate() {
   mkdir -p "$d/units"; printf 'rpcuser=u\nrpcpassword=p\n' > "$d/bitcoin.conf"
   for u in $units; do : > "$d/units/$u.service"; done
   CALLS="$d/calls"; : > "$CALLS"
-  env PATH="$BIN:$PATH" STUB_DIR="$d" CALLS="$CALLS" GHOST_BITCOIN_CONF="$d/bitcoin.conf" \
-      GHOST_UNIT_DIR="$d/units" "$@" bash "$GATE" >"$d/out" 2>&1
-  RC=$?
+  # The group's stderr is discarded so bash's own "Killed" notice for a `forever` run is too.
+  { env PATH="$BIN:$PATH" STUB_DIR="$d" CALLS="$CALLS" GHOST_BITCOIN_CONF="$d/bitcoin.conf" \
+        GHOST_UNIT_DIR="$d/units" "$@" bash "$GATE" >"$d/out" 2>&1; RC=$?; } 2>/dev/null
   STARTS="$($G -E '^start ' "$CALLS" | tr '\n' ',' || true)"
 }
 
