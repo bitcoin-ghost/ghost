@@ -47,7 +47,7 @@ fn confirm(prompt: &str) -> bool {
 
 /// Ghost CLI - Bitcoin Ghost Administration Tool
 #[derive(Parser)]
-#[command(name = "ghost-cli")]
+#[command(name = "ghost-admin")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Pool API URL (required, or set GHOST_POOL_URL env var)

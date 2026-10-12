@@ -210,6 +210,19 @@ done
 err() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo -e "\033[36m==>\033[0m $*"; }
 
+# is_core_rpc_client PATH — true only if PATH is the Ghost Core RPC client (#1028).
+# Two programs have been called `ghost-cli`: the Core RPC client, which is what the name means
+# on every node and in every runbook, and the Rust administration tool, which release tarballs
+# up to v1.11.45 shipped under that name (it is `ghost-admin` from then on). A file name in a
+# tarball therefore proves nothing, so ask the binary. The admin tool answers `-version` with
+# a usage error on stderr; a binary that hangs is cut off and refused.
+is_core_rpc_client() {
+  [[ -f "$1" && -x "$1" ]] || return 1
+  local out
+  out="$(timeout "${CLI_IDENTITY_TIMEOUT:-10}" "$1" -version 2>/dev/null)" || return 1
+  [[ "${out%%$'\n'*}" == *"RPC client"* ]]
+}
+
 # One-line human label for a mining_mode value (summary + final output).
 mining_mode_label() {
   case "$1" in
@@ -607,11 +620,20 @@ install -m755 -o root -g root "$NODE_BIN_SRC" /opt/ghost/bin/ghost-mining
 # tarball. Install it so operators can query their node's ghostd directly — it is
 # not required for ghost-mining operation (ghost-mining talks to ghostd over RPC/ZMQ),
 # but without it a node has no CLI to inspect its own daemon.
+#
+# Releases up to v1.11.45 carry the Rust administration tool under this name instead
+# (#1028), so the binary is asked what it is before it is given the RPC client's path.
+# The admin tool is installed as ghost-admin, whichever name the release used for it.
 cli_bin="$(find . -name ghost-cli -type f | head -1)"
-if [[ -n "$cli_bin" ]]; then
+admin_bin="$(find . -name ghost-admin -type f | head -1)"
+if [[ -n "$cli_bin" ]] && is_core_rpc_client "$cli_bin"; then
   install -m755 -o root -g root "$cli_bin" /opt/ghost/bin/ghost-cli
 else
-  log "ghost-cli not found in ${POOL_TARBALL} (older release?) — skipping."
+  [[ -n "$admin_bin" ]] || admin_bin="$cli_bin"
+  log "${GHOST_VERSION} does not ship the ghostd RPC client — no ghost-cli installed. Query ghostd over RPC on 127.0.0.1:8332 until a newer release is out."
+fi
+if [[ -n "$admin_bin" ]]; then
+  install -m755 -o root -g root "$admin_bin" /opt/ghost/bin/ghost-admin
 fi
 # The miner-facing SV2 stratum stack ships in the SAME signed tarball. Without
 # these two binaries a node has ghost-mining's Template Distribution Protocol
@@ -1709,6 +1731,19 @@ log()  { echo "[$TAG] $*" >&2; logger -t "$TAG" -- "$*" 2>/dev/null || true; }
 warn() { echo "[$TAG] WARNING: $*" >&2; logger -t "$TAG" -p user.warning -- "$*" 2>/dev/null || true; }
 err()  { echo "[$TAG] ERROR: $*" >&2; logger -t "$TAG" -p user.err -- "$*" 2>/dev/null || true; }
 
+# is_core_rpc_client PATH — true only if PATH is the Ghost Core RPC client (#1028).
+# Two programs have been called `ghost-cli`: the Core RPC client, which is what the name means
+# on every node and in every runbook, and the Rust administration tool, which release tarballs
+# up to v1.11.45 shipped under that name (it is `ghost-admin` from then on). A file name in a
+# tarball therefore proves nothing, so ask the binary. The admin tool answers `-version` with
+# a usage error on stderr; a binary that hangs is cut off and refused.
+is_core_rpc_client() {
+  [[ -f "$1" && -x "$1" ]] || return 1
+  local out
+  out="$(timeout "${CLI_IDENTITY_TIMEOUT:-10}" "$1" -version 2>/dev/null)" || return 1
+  [[ "${out%%$'\n'*}" == *"RPC client"* ]]
+}
+
 # write_status RESULT MESSAGE [LATEST]
 # Records the outcome of this run as JSON for the dashboard to surface. Always
 # best-effort — a missing directory or read-only fs never affects the update.
@@ -1953,10 +1988,11 @@ main() {
   # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli new_ghostd
+  local new_pool new_pay new_cli new_admin new_ghostd
   new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
   new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
+  new_admin="$(find "$tmp" -name ghost-admin -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
@@ -1969,8 +2005,20 @@ main() {
   if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")
   fi
-  if [[ -x "$BIN_DIR/ghost-cli" && -n "$new_cli" ]]; then
+  # ghost-cli is the Core RPC client. A release up to v1.11.45 carries the admin tool under
+  # that name; swapping it in would replace a working RPC client with a different program, so
+  # the installed one is kept and the tarball's is treated as the admin tool it is.
+  if [[ -n "$new_cli" ]] && ! is_core_rpc_client "$new_cli"; then
+    [[ -n "$new_admin" ]] || new_admin="$new_cli"
+    new_cli=""
+    log "release $latest carries the admin tool as ghost-cli — the installed RPC client is left as it is"
+  fi
+  if [[ -x "$BIN_DIR/ghost-cli" && -n "$new_cli" ]] \
+     && is_core_rpc_client "$new_cli"; then
     SWAP_DEST+=("$BIN_DIR/ghost-cli"); SWAP_SRC+=("$new_cli")
+  fi
+  if [[ -x "$BIN_DIR/ghost-admin" && -n "$new_admin" ]]; then
+    SWAP_DEST+=("$BIN_DIR/ghost-admin"); SWAP_SRC+=("$new_admin")
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then

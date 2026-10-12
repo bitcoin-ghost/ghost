@@ -28,8 +28,11 @@ authors.workspace = true
 license.workspace = true
 description = "Bitcoin Ghost administration CLI tool"
 
+# The binary is `ghost-admin`; the package and directory keep their names. `ghost-cli` is the
+# Ghost Core RPC client on every node and in the release tarball (#1028), and two programs
+# under one name meant a fresh install got this one at the RPC client's path.
 [[bin]]
-name = "ghost-cli"
+name = "ghost-admin"
 path = "src/main.rs"
 
 [dependencies]

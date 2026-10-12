@@ -15,10 +15,10 @@
 # taken from the published release tarball, which ships it alongside the pool binaries.
 # Pinned rather than "latest": CI should not change behaviour because someone cut a release.
 #
-# ⚠ The `ghost-cli` in that same tarball is the POOL ADMINISTRATION cli (`ghost-cli status`,
-# `miner`, `payout`, …), NOT a Core-style RPC client. It shares its name with the Core-style
-# ghost-cli deployed at /opt/ghost/bin/ghost-cli on the fleet and takes entirely different
-# arguments. So RPC here is driven with curl, deliberately.
+# ⚠ The `ghost-cli` in the pinned tarball is the POOL ADMINISTRATION cli (`ghost-cli status`,
+# `miner`, `payout`, …), NOT a Core-style RPC client: releases up to v1.11.45 shipped the admin
+# tool under that name (#1028; it is `ghost-admin` afterwards, and `ghost-cli` is the RPC
+# client). So RPC here is driven with curl, deliberately, and works with either.
 set -uo pipefail
 
 GHOSTD_VERSION="${GHOSTD_VERSION:-v1.11.28}"

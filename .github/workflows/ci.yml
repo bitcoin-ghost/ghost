@@ -98,6 +98,13 @@ jobs:
       # nothing behind the gate.
       - name: Boot gate self-test
         run: ./scripts/test-boot-gate.sh
+      # Two programs were called `ghost-cli`: the Core RPC client on every node, and the Rust
+      # admin tool in the release tarball. A fresh install got the admin tool at the RPC
+      # client's path and no RPC client (#1028). Asserts the installer and updater ask a
+      # binary what it is before installing it under that name, and that the release build
+      # takes `ghost-cli` from ghost-core and `ghost-admin` from cargo.
+      - name: ghost-cli identity self-test
+        run: ./scripts/test-cli-identity.sh
       # release.sh orchestrates the roll, and two of its steps failed silently in v1.11.38: it
       # reported a release "published" that was still a draft (#857), and it rolled genesis FIRST
       # against its own stated rule (#856). Both are the shape a self-test catches and a reader
