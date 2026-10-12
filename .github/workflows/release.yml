@@ -165,7 +165,14 @@ jobs:
       # keep their defaults (ON) to match the fleet's reference binary; their
       # deps (capnproto, libsqlite3) are already installed above.
       #
-      # We build only the `ghostd` target and disable tests/bench/gui/tx/util/
+      # `ghost-cli` — the Core RPC client, the `bitcoin-cli` of this fork — is built with it and
+      # ships in the same tarball (#1028). It was not built here at all: the tarball's
+      # `ghost-cli` was the Rust administration tool, which answers `ghost-cli -conf=…
+      # getblockcount` with "unexpected argument '-c'". A fresh install had no RPC client, and an
+      # auto-updating node would have had its working one replaced. The admin tool now ships as
+      # `ghost-admin`. BUILD_CLI is ON by default; do not switch it off.
+      #
+      # We build only the `ghostd` and `ghost-cli` targets and disable tests/bench/gui/tx/util/
       # wallet-tool to keep the release build tractable (a Core build is ~20-40
       # min on the 4-core runner). If the runner ever OOMs, cap `-j"$(nproc)"` at
       # -j2 and/or add -DCMAKE_CXX_FLAGS="--param ggc-min-expand=1 --param
@@ -183,9 +190,10 @@ jobs:
             -DBUILD_TX=OFF \
             -DBUILD_UTIL=OFF \
             -DBUILD_WALLET_TOOL=OFF
-          cmake --build ghost-core/build --target ghostd -j"$(nproc)"
-          # Fail loudly here (not at packaging time) if the daemon didn't build.
+          cmake --build ghost-core/build --target ghostd ghost-cli -j"$(nproc)"
+          # Fail loudly here (not at packaging time) if either did not build.
           test -x ghost-core/build/bin/ghostd
+          test -x ghost-core/build/bin/ghost-cli
 
       # Package binaries
       # Fail the build if the Linux artifact demands a newer glibc than we target.
@@ -200,7 +208,7 @@ jobs:
           mkdir -p dist
 
           # Copy binaries (check actual names from target directory)
-          for bin in ghost-mining ghost-cli translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
+          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
             if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi
@@ -228,6 +236,10 @@ jobs:
           # existing SHA256SUMS + GPG signature over the tarball.
           if [ -f "ghost-core/build/bin/ghostd" ]; then
             cp "ghost-core/build/bin/ghostd" dist/
+            # The Core RPC client, under the name it has on every node (#1028). Nothing built
+            # by cargo is called ghost-cli any more, so this cannot overwrite the admin tool.
+            [ ! -e dist/ghost-cli ] || { echo "::error::dist/ghost-cli already exists — two programs are being shipped under one name again"; exit 1; }
+            cp "ghost-core/build/bin/ghost-cli" dist/
           fi
 
           # Create archive only if dist has files
@@ -266,6 +278,17 @@ jobs:
             done
             cmp "$check/ghost-mining" "$check/ghost-pool" || { echo "::error::ghost-pool is not the same build as ghost-mining"; exit 1; }
             echo "archive extracts ghost-mining and ghost-pool, identical"
+            # Where ghostd ships, so does its RPC client — and under that name it must BE the
+            # RPC client. Asked of the extracted binary, not inferred from how it was built.
+            if [ -f "$check/ghostd" ]; then
+              # Captured, not piped into `grep -q`: this step runs under pipefail, and a reader
+              # that exits at its first match kills the writer with SIGPIPE.
+              cli_says="$("$check/ghost-cli" -version 2>&1 || true)"     # must say: RPC client
+              admin_says="$("$check/ghost-admin" --help 2>&1 || true)"
+              case "$cli_says" in *"RPC client"*) ;; *) echo "::error::the archive's ghost-cli is not the Ghost Core RPC client: ${cli_says%%$'\n'*}"; exit 1 ;; esac
+              case "$admin_says" in *"administration"*) ;; *) echo "::error::the archive does not carry the admin tool as ghost-admin"; exit 1 ;; esac
+              echo "archive's ghost-cli is the Core RPC client; the admin tool is ghost-admin"
+            fi
             rm -rf "$check"
           fi
 
@@ -302,7 +325,7 @@ jobs:
             # `|| true` is REQUIRED on both. Under `set -e` with `pipefail`, a grep that
             # matches nothing fails the whole substitution and kills the step — and a pure-Rust
             # binary legitimately has NO GLIBCXX_ symbols at all. Without this the guard died on
-            # the first such binary (ghost-cli, alphabetically first in dist/) after 20ms with no
+            # the first such binary (the admin tool, then named ghost-cli and alphabetically first in dist/) after 20ms with no
             # output, which looks identical to a real floor violation.
             g=$(printf '%s' "$syms"  | grep -oE 'GLIBC_[0-9.]+'   | sed 's/GLIBC_//'   | sort -V | tail -1 || true)
             gx=$(printf '%s' "$syms" | grep -oE 'GLIBCXX_[0-9.]+' | sed 's/GLIBCXX_//' | sort -V | tail -1 || true)

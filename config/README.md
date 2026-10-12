@@ -17,7 +17,7 @@ Configuration files for Bitcoin Ghost pool nodes.
 
 ```bash
 # Generate node identity key
-ghost-cli key generate --output /etc/ghost/node.key
+ghost-admin key generate --output /etc/ghost/node.key
 
 # Generate signing key (64 hex chars)
 export SIGNING_KEY=$(openssl rand -hex 32)

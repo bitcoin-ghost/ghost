@@ -8,7 +8,7 @@
 # =============================================================================
 [identity]
 # Path to Ed25519 private key file
-# Generate with: ghost-cli key generate --output ~/.ghost/node.key
+# Generate with: ghost-admin key generate --output ~/.ghost/node.key
 key_path = "~/.ghost/node.key"
 
 # Optional display name for this node
