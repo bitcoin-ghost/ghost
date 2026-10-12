@@ -1,7 +1,10 @@
 [Unit]
 Description=SRI Pool (SV2) - Ghost Network
+# Ordering only, deliberately no `Wants=ghost-mining.service` (#1020). With it, starting this
+# unit started the node, so the node came up ahead of ghost-mining-gate at every boot and on a
+# fresh install joined the mesh at chain height 0. The gate starts the node and then this unit;
+# neither this unit nor sri-translator is enabled at boot.
 After=network.target ghost-mining.service
-Wants=ghost-mining.service
 [Service]
 Type=simple
 User=root

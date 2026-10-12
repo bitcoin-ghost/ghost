@@ -20,10 +20,20 @@
 # Wants and ghost-pay silently stops coming back after a reboot, with nothing
 # reporting it. The gate owns the start explicitly instead.
 #
+# The gate owns the stratum stack's start too (#1020). `sri-pool.service` used to carry
+# `Wants=ghost-mining.service`, which made systemd start the node whenever sri-pool started —
+# at boot, and on the installer's first `enable --now sri-pool`. So the node came up ahead of
+# this script every time, and on a fresh install it joined the live mesh at chain height 0 and
+# broadcast an MPC contribution while this script was still printing "waiting". sri-pool and
+# sri-translator now order themselves after the node without pulling it in, are not enabled at
+# boot, and are started here, after the node, once ghostd is synced.
+#
 # Change this file, then run scripts/ops/deploy-fleet-file.sh to converge the
 # fleet. check-fleet-uniformity.sh fails if any node drifts from what is here.
 set -u
-CONF=/etc/bitcoin/bitcoin.conf
+# Overridable so scripts/test-boot-gate.sh can run this against a throwaway directory.
+CONF="${GHOST_BITCOIN_CONF:-/etc/bitcoin/bitcoin.conf}"
+UNIT_DIR="${GHOST_UNIT_DIR:-/etc/systemd/system}"
 RPCUSER=$(grep -m1 '^rpcuser=' "$CONF" | cut -d= -f2-)
 RPCPW=$(grep -m1 '^rpcpassword=' "$CONF" | cut -d= -f2-)
 echo "[ghost-mining-gate] waiting for ghostd to finish initial sync..."
@@ -37,17 +47,24 @@ while true; do
     # that rename — deploy-fleet-file.sh before it, or the unit switch before this. Start
     # whichever the node has, so neither order leaves a node that does not mine after a reboot.
     UNIT=ghost-mining
-    [ -e /etc/systemd/system/ghost-mining.service ] || UNIT=ghost-pool
+    [ -e "$UNIT_DIR/ghost-mining.service" ] || UNIT=ghost-pool
     echo "[ghost-mining-gate] ghostd synced — starting $UNIT"
-    systemctl start "$UNIT"
+    # Without the node there is nothing for the stratum stack to serve; it would only restart
+    # in a loop. Fail instead, so the unit shows as failed (and is retried where it has Restart=).
+    systemctl start "$UNIT" || { echo "[ghost-mining-gate] $UNIT did not start"; exit 1; }
     # ghost-pay (when installed) also needs a live ghostd + ghost-mining, so the
     # gate owns its first start too — mirrors ghost-mining, which is not enabled
-    # at boot.
-    if [ -f /etc/systemd/system/ghost-pay.service ]; then
-      echo "[ghost-mining-gate] starting ghost-pay"
-      systemctl start ghost-pay
-    fi
-    exit 0
+    # at boot. Its failure is not the gate's: it is masked on nodes that keep the unit file.
+    rc=0
+    for SVC in ghost-pay sri-pool sri-translator; do
+      [ -f "$UNIT_DIR/$SVC.service" ] || continue
+      echo "[ghost-mining-gate] starting $SVC"
+      if ! systemctl start "$SVC"; then
+        echo "[ghost-mining-gate] $SVC did not start"
+        [ "$SVC" = ghost-pay ] || rc=1
+      fi
+    done
+    exit "$rc"
   fi
   sleep 30
 done

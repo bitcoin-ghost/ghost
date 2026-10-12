@@ -1302,10 +1302,20 @@ cat > /opt/ghost/bin/wait-for-ghostd-sync.sh <<'WAIT_FOR_GHOSTD_SYNC_EOF'
 # Wants and ghost-pay silently stops coming back after a reboot, with nothing
 # reporting it. The gate owns the start explicitly instead.
 #
+# The gate owns the stratum stack's start too (#1020). `sri-pool.service` used to carry
+# `Wants=ghost-mining.service`, which made systemd start the node whenever sri-pool started —
+# at boot, and on the installer's first `enable --now sri-pool`. So the node came up ahead of
+# this script every time, and on a fresh install it joined the live mesh at chain height 0 and
+# broadcast an MPC contribution while this script was still printing "waiting". sri-pool and
+# sri-translator now order themselves after the node without pulling it in, are not enabled at
+# boot, and are started here, after the node, once ghostd is synced.
+#
 # Change this file, then run scripts/ops/deploy-fleet-file.sh to converge the
 # fleet. check-fleet-uniformity.sh fails if any node drifts from what is here.
 set -u
-CONF=/etc/bitcoin/bitcoin.conf
+# Overridable so scripts/test-boot-gate.sh can run this against a throwaway directory.
+CONF="${GHOST_BITCOIN_CONF:-/etc/bitcoin/bitcoin.conf}"
+UNIT_DIR="${GHOST_UNIT_DIR:-/etc/systemd/system}"
 RPCUSER=$(grep -m1 '^rpcuser=' "$CONF" | cut -d= -f2-)
 RPCPW=$(grep -m1 '^rpcpassword=' "$CONF" | cut -d= -f2-)
 echo "[ghost-mining-gate] waiting for ghostd to finish initial sync..."
@@ -1319,17 +1329,24 @@ while true; do
     # that rename — deploy-fleet-file.sh before it, or the unit switch before this. Start
     # whichever the node has, so neither order leaves a node that does not mine after a reboot.
     UNIT=ghost-mining
-    [ -e /etc/systemd/system/ghost-mining.service ] || UNIT=ghost-pool
+    [ -e "$UNIT_DIR/ghost-mining.service" ] || UNIT=ghost-pool
     echo "[ghost-mining-gate] ghostd synced — starting $UNIT"
-    systemctl start "$UNIT"
+    # Without the node there is nothing for the stratum stack to serve; it would only restart
+    # in a loop. Fail instead, so the unit shows as failed (and is retried where it has Restart=).
+    systemctl start "$UNIT" || { echo "[ghost-mining-gate] $UNIT did not start"; exit 1; }
     # ghost-pay (when installed) also needs a live ghostd + ghost-mining, so the
     # gate owns its first start too — mirrors ghost-mining, which is not enabled
-    # at boot.
-    if [ -f /etc/systemd/system/ghost-pay.service ]; then
-      echo "[ghost-mining-gate] starting ghost-pay"
-      systemctl start ghost-pay
-    fi
-    exit 0
+    # at boot. Its failure is not the gate's: it is masked on nodes that keep the unit file.
+    rc=0
+    for SVC in ghost-pay sri-pool sri-translator; do
+      [ -f "$UNIT_DIR/$SVC.service" ] || continue
+      echo "[ghost-mining-gate] starting $SVC"
+      if ! systemctl start "$SVC"; then
+        echo "[ghost-mining-gate] $SVC did not start"
+        [ "$SVC" = ghost-pay ] || rc=1
+      fi
+    done
+    exit "$rc"
   fi
   sleep 30
 done
@@ -1430,18 +1447,20 @@ EOF
 # SV2 stratum stack units. sri-pool bridges ghost-mining's TDP to SV2 miners; the
 # translator fronts it for SV1 miners. sri-pool runs as root (it rewrites its own
 # pool_signature via update-pool-signature.sh before each start); the translator
-# runs as the unprivileged ghost user. Both use Restart=always: at first boot
-# ghost-mining is still behind the sync gate, so the stack simply retries until the
-# TDP server is up, then connects — no manual ordering needed. These are installed
-# in EVERY mining mode so any node can serve miners; the firewall (below) decides
-# whether the ports are reachable from off-box.
+# runs as the unprivileged ghost user. Neither is enabled at boot or started by
+# this installer: ghost-mining-gate starts them, after ghost-mining, once ghostd is
+# synced (#1020). These are installed in EVERY mining mode so any node can serve
+# miners; the firewall (below) decides whether the ports are reachable from off-box.
 # Canonical source: config/sri/sri-pool.service — kept byte-identical by
 # scripts/check-inlined-copies.sh, which is why this heredoc has a named marker.
 cat > /etc/systemd/system/sri-pool.service <<'SRI_POOL_SERVICE_EOF'
 [Unit]
 Description=SRI Pool (SV2) - Ghost Network
+# Ordering only, deliberately no `Wants=ghost-mining.service` (#1020). With it, starting this
+# unit started the node, so the node came up ahead of ghost-mining-gate at every boot and on a
+# fresh install joined the mesh at chain height 0. The gate starts the node and then this unit;
+# neither this unit nor sri-translator is enabled at boot.
 After=network.target ghost-mining.service
-Wants=ghost-mining.service
 [Service]
 Type=simple
 User=root
@@ -2509,15 +2528,12 @@ fi
 log "Starting services"
 systemctl daemon-reload
 systemctl enable --now ghostd >/dev/null 2>&1
-# ghost-mining is NOT started here — the gate starts it once ghostd is synced.
-# ghost-mining.service is installed but left disabled; the (enabled) gate owns it.
+# Nothing else is started or enabled here. The gate is the ONLY thing that starts
+# ghost-mining and the SV2 stratum stack, once ghostd has left initial block
+# download; all three units are installed and left disabled. Starting sri-pool from
+# here used to start ghost-mining with it, which put a node at chain height 0 on the
+# live mesh seconds into the install (#1020). scripts/test-boot-gate.sh holds this.
 systemctl enable --now ghost-mining-gate >/dev/null 2>&1
-# The SV2 stratum stack is enabled now so it survives reboots and starts serving
-# the moment ghost-mining comes up behind the gate. Both units are Restart=always,
-# so starting them before ghost-mining is fine — they retry until the TDP server is
-# reachable rather than failing the install.
-systemctl enable --now sri-pool >/dev/null 2>&1
-systemctl enable --now sri-translator >/dev/null 2>&1
 sleep 5
 
 NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
@@ -2527,14 +2543,15 @@ cat <<EOF
      ${NODE_ID}
      ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
      ghost-mining-gate: $(systemctl is-active ghost-mining-gate)  (waiting for sync, then auto-starts ghost-mining)
-     sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — connects to ghost-mining's TDP once it is up)
-     sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — serves miners on port 3333)
+     ghost-mining:    $(systemctl is-active ghost-mining)  (started by the gate)
+     sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — started by the gate, after ghost-mining)
+     sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — started by the gate; serves miners on port 3333)
 
-  ghost-mining starts AUTOMATICALLY once ghostd finishes syncing — then your node
-  joins the mesh and registers as an Elder if slots remain (first 101). The SV2
-  stratum stack (sri-pool + sri-translator) is already installed and will begin
-  serving miners on Stratum port 3333 (SV1) / 34255 (SV2) as soon as ghost-mining
-  is up. Point a miner at:  stratum+tcp://${PUBIP}:3333
+  "inactive" is expected for the last three until ghostd finishes syncing. The gate
+  then starts ghost-mining AUTOMATICALLY — your node joins the mesh and registers as
+  an Elder if slots remain (first 101) — followed by the SV2 stratum stack
+  (sri-pool + sri-translator), which serves miners on Stratum port 3333 (SV1) /
+  34255 (SV2). Point a miner at:  stratum+tcp://${PUBIP}:3333
   Watch the gate:    sudo journalctl -u ghost-mining-gate -f
   Watch the stratum: sudo journalctl -u sri-pool -u sri-translator -f
 EOF

@@ -110,6 +110,9 @@ COLLECT='
   printf "en_sritrans=%s\n"      "$(systemctl is-enabled sri-translator 2>/dev/null | head -1)"
   printf "en_bitcoind=%s\n"      "$(systemctl is-enabled bitcoind 2>/dev/null | head -1)"
   printf "en_poolgate=%s\n"      "$(systemctl is-enabled "$GG" 2>/dev/null | head -1)"
+  # What would START the node unit other than the gate. `is-enabled` cannot answer this: the
+  # node read `disabled` on every node while a `Wants=` in sri-pool started it at each boot (#1020).
+  printf "node_pulled_by=%s\n"   "$(systemctl show "$GU" -p WantedBy -p RequiredBy -p BoundBy -p UpheldBy --value 2>/dev/null | tr -s " \n" "," | sed -e "s/^,//" -e "s/,\$//")"
   printf "en_mining_fw=%s\n"     "$(systemctl is-enabled ghost-mining-firewall.path 2>/dev/null | head -1)"
   # #758: the farm tier was decided ON for every public mining node (#410, 2026-07-27) and reached
   # exactly ONE of eight. It was visible here only as `vardiff` drift, because vm8 returned two
@@ -325,13 +328,15 @@ for n in "${REACHED[@]}"; do
     # chain. So the invariant is "something brings it back", not "this unit is enabled".
     gate="${VALUES[$n|en_poolgate]:-}"
     case "$gate" in
-        enabled|enabled-runtime|static) gp_units="en_sripool:sri-pool" ;;
-        *)                              gp_units="en_ghostpool:ghost-mining en_sripool:sri-pool"
+        enabled|enabled-runtime|static) gate_owns=true ;;
+        *)                              gate_owns=false
                                         echo "  WARN $n no ghost-mining-gate — ghost-mining must be enabled directly here" ;;
     esac
     # ghost-mining-firewall.path is what makes a port follow its opt-in. Without it, flipping
     # mining_mode or coordinator_role_enabled changes nothing at the firewall.
-    for spec in "en_ghostd:ghostd" $gp_units "en_sritrans:sri-translator" "en_mining_fw:ghost-mining-firewall.path"; do
+    boot_units="en_ghostd:ghostd en_mining_fw:ghost-mining-firewall.path"
+    $gate_owns || boot_units="$boot_units en_ghostpool:ghost-mining en_sripool:sri-pool en_sritrans:sri-translator"
+    for spec in $boot_units; do
         IFS=: read -r fld unit <<<"$spec"
         e="${VALUES[$n|$fld]:-}"
         case "$e" in
@@ -341,6 +346,28 @@ for n in "${REACHED[@]}"; do
             *)         echo "  FAIL $n $unit is $e — running now, will NOT come back after a reboot"; rc=1 ;;
         esac
     done
+    # Where the gate is enabled it is the ONLY thing that may start the node and the stratum
+    # stack (#1020). Two ways that stops being true, both invisible to `is-active`:
+    #   * another unit pulls the node in — sri-pool's `Wants=` did, at every boot, and on a fresh
+    #     install it put a node at chain height 0 on the mesh;
+    #   * a stratum unit is enabled, so it starts at boot ahead of the node and restarts in a
+    #     loop until the gate gets there — for the whole of an initial sync on a new node.
+    # What brings the stack BACK is the gate script, which must be the canonical one: an older
+    # copy starts the node only. That is the `ops_wait_sync` comparison above, not repeated here.
+    if $gate_owns; then
+        pulled="${VALUES[$n|node_pulled_by]:-}"
+        [ -z "$pulled" ] || { echo "  FAIL $n the node unit is started by $pulled — the gate is bypassed (#1020)"; rc=1; }
+        for spec in "en_sripool:sri-pool" "en_sritrans:sri-translator"; do
+            IFS=: read -r fld unit <<<"$spec"
+            e="${VALUES[$n|$fld]:-}"
+            case "$e" in
+                disabled)  ;;
+                "")        echo "  WARN $n could not read is-enabled for $unit — cannot tell who starts it" ;;
+                not-found) echo "  FAIL $n $unit unit is MISSING"; rc=1 ;;
+                *)         echo "  FAIL $n $unit is $e — it starts at boot ahead of the gate; the gate owns its start (#1020)"; rc=1 ;;
+            esac
+        done
+    fi
     # The superseded chain unit must not be enabled anywhere; on vm1 it was enabled AND
     # crash-looping while the real ghostd ran disabled beside it.
     # The farm tier: config, listener and firewall must agree. An open ufw rule with no listener

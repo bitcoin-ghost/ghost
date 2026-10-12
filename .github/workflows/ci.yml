@@ -85,6 +85,13 @@ jobs:
       # changes nothing and restarts nothing. Stubbed systemctl, throwaway root.
       - name: Node-unit rename self-test
         run: ./scripts/test-rename-node-unit.sh
+      # ghost-mining-gate holds the node back until ghostd has synced — unless something else
+      # starts the node first. `sri-pool` did, through a `Wants=`, at every boot; on a fresh
+      # install that put a node at chain height 0 on the live mesh (#1020). This asserts the gate
+      # script's start order, that no unit pulls the node in, and that the installer starts
+      # nothing behind the gate.
+      - name: Boot gate self-test
+        run: ./scripts/test-boot-gate.sh
       # release.sh orchestrates the roll, and two of its steps failed silently in v1.11.38: it
       # reported a release "published" that was still a draft (#857), and it rolled genesis FIRST
       # against its own stated rule (#856). Both are the shape a self-test catches and a reader
