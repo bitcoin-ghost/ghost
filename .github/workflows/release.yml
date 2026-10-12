@@ -206,6 +206,22 @@ jobs:
             fi
           done
 
+          # The node binary ships under its old name as well (#1024).
+          #
+          # The installer published at get.bitcoinghost.org, and the auto-updater it lays
+          # down, resolve `releases/latest` and then `find . -name ghost-pool -type f`. A
+          # tarball holding only `ghost-mining` makes that print nothing, so the first
+          # release after the rename (#1018) would have broken every fresh install and every
+          # self-updating node the moment it became Latest. With both names present a release
+          # does not depend on when the installer is republished.
+          #
+          # A hard link, so the archive stores the bytes once; it extracts as two regular
+          # files, which is what `find -type f` needs. Drop it once the published installer
+          # and the updaters in the field look for `ghost-mining`.
+          if [ -f "dist/ghost-mining${{ matrix.suffix }}" ] && [ "${{ runner.os }}" != "Windows" ]; then
+            ln "dist/ghost-mining${{ matrix.suffix }}" "dist/ghost-pool${{ matrix.suffix }}"
+          fi
+
           # ghostd (C++) is built only on the Linux target (step above). Stage it
           # into the SAME dist/ so it lands inside the linux tarball alongside
           # ghost-mining and is covered — with zero extra signing logic — by the
@@ -235,6 +251,22 @@ jobs:
           else
             echo "No binaries found to package"
             exit 1
+          fi
+          cd ..
+
+          # Read the ARCHIVE back, not dist/: the claim is about what an installer extracts.
+          # Extracted somewhere empty and looked up exactly as the published installer does.
+          if [ "${{ runner.os }}" != "Windows" ] && [ -f "dist/ghost-mining${{ matrix.suffix }}" ]; then
+            check="$(mktemp -d)"
+            tar -xzf "bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.tar.gz" -C "$check"
+            for name in ghost-mining ghost-pool; do
+              found="$(cd "$check" && find . -name "$name" -type f | head -1)"
+              [ -n "$found" ] || { echo "::error::the archive does not extract a regular file named $name"; exit 1; }
+              [ -x "$check/$found" ] || { echo "::error::$name extracted without its executable bit"; exit 1; }
+            done
+            cmp "$check/ghost-mining" "$check/ghost-pool" || { echo "::error::ghost-pool is not the same build as ghost-mining"; exit 1; }
+            echo "archive extracts ghost-mining and ghost-pool, identical"
+            rm -rf "$check"
           fi
 
       # The floor check MUST run here, after Package, and MUST read dist/.
