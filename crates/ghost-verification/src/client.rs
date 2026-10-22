@@ -482,6 +482,12 @@ impl VerificationClient {
     /// - The host is a known internal hostname (localhost, metadata, etc.)
     /// - The host resolves (via DNS) to an internal/private IP address
     fn build_url(&self, host: &str, path: &str) -> GhostResult<String> {
+        Self::build_url_with_scheme(self.scheme(), host, path)
+    }
+
+    /// [`Self::build_url`] for a service whose scheme is its own, not the verification
+    /// API's. Same SSRF checks.
+    fn build_url_with_scheme(scheme: &str, host: &str, path: &str) -> GhostResult<String> {
         // M-11 FIX: First validate the host string isn't a known internal address
         if Self::is_internal_address(host) {
             return Err(GhostError::Config(format!(
@@ -494,7 +500,20 @@ impl VerificationClient {
         // This prevents DNS rebinding attacks
         Self::resolve_and_check_host(host)?;
 
-        Ok(format!("{}://{}{}", self.scheme(), host, path))
+        Ok(format!("{}://{}{}", scheme, host, path))
+    }
+
+    /// The liveness URL for a Wraith coordinator at `endpoint`.
+    ///
+    /// ⛔ Always `http`, whatever [`Self::scheme`] says (#1033). The coordinator is served
+    /// plain HTTP (`axum::serve` on a bare listener, `coordinator_supervisor.rs`) and every
+    /// wallet reaches it that way. Built with the API scheme, the fleet's pinned-HTTPS
+    /// client asked for `https://<ep>/health`, no handshake ever completed, and every real
+    /// coordinator was judged `Some(false)`. Plain HTTP loses nothing here: this request
+    /// only shows something answers, and identity comes from the signed attestation and
+    /// `endpoint_is_theirs`.
+    fn coordinator_health_url(&self, endpoint: &str) -> GhostResult<String> {
+        Self::build_url_with_scheme("http", endpoint, "/health")
     }
 
     /// Extract the bare host (no port) from a `host:port` style address.
@@ -1003,7 +1022,7 @@ impl VerificationClient {
     /// it — see the note on [`CoordinatorProbe::passed`]. What it does prove is
     /// that the address the node signed for is not empty air.
     async fn coordinator_answers_at(&self, endpoint: &str) -> bool {
-        let Ok(url) = self.build_url(endpoint, "/health") else {
+        let Ok(url) = self.coordinator_health_url(endpoint) else {
             debug!(
                 endpoint,
                 "refusing to probe an internal or unresolvable address"
@@ -1967,6 +1986,104 @@ mod tests {
                 "{addr} must be refused as Unreachable, not treated as a failed proof"
             );
         }
+    }
+
+    /// #1033: the coordinator serves plain HTTP (`axum::serve` on a bare listener at
+    /// :9100), so it must be probed over `http://` whatever scheme the verification API
+    /// uses. The fleet's client is identity-pinned HTTPS; it built
+    /// `https://<ep>/health`, every handshake failed, and 7 days of challenges on the
+    /// live fleet (~13,500 per node) judged every real coordinator `Some(false)`.
+    #[test]
+    fn the_coordinator_is_probed_over_plain_http_whatever_the_api_scheme() {
+        let https_api = VerificationClient::with_config(VerificationClientConfig {
+            use_https: true,
+            timeout: std::time::Duration::from_millis(200),
+            danger_accept_invalid_certs: false,
+            is_mainnet: false,
+        })
+        .expect("client");
+        let pinned = VerificationClient::with_pinning(
+            VerificationClientConfig::mainnet(),
+            Arc::new(|_: &[u8; 32]| false),
+        )
+        .expect("pinned client");
+
+        for client in [&https_api, &pinned] {
+            assert_eq!(
+                client
+                    .coordinator_health_url("93.184.216.34:9100")
+                    .expect("public endpoint"),
+                "http://93.184.216.34:9100/health"
+            );
+            assert_eq!(
+                client.build_url("93.184.216.34:8443", "/health").unwrap(),
+                "https://93.184.216.34:8443/health",
+                "the verification API keeps its own scheme"
+            );
+        }
+    }
+
+    /// The endpoint is the target's own claim, so the SSRF guard still applies to it.
+    #[test]
+    fn the_coordinator_probe_still_refuses_internal_addresses() {
+        let client = VerificationClient::with_pinning(
+            VerificationClientConfig::mainnet(),
+            Arc::new(|_: &[u8; 32]| false),
+        )
+        .expect("pinned client");
+        for ep in [
+            "127.0.0.1:9100",
+            "10.0.0.2:9100",
+            "192.168.1.1:9100",
+            "localhost:9100",
+        ] {
+            assert!(
+                client.coordinator_health_url(ep).is_err(),
+                "{ep} must be refused before any request is made"
+            );
+        }
+    }
+
+    /// The premise of the fix: the identity-pinned client the fleet runs speaks plain
+    /// HTTP — pinning only governs TLS, so it does not get in the way. A local server
+    /// stands in for the coordinator (the SSRF guard keeps `coordinator_answers_at`
+    /// itself off localhost, so this drives the same client directly).
+    #[tokio::test]
+    async fn the_pinned_client_reaches_a_plain_http_coordinator() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"service":"wraith-coordinator","network":"mainnet"}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let client = VerificationClient::with_pinning(
+            VerificationClientConfig::mainnet(),
+            Arc::new(|_: &[u8; 32]| false),
+        )
+        .expect("pinned client");
+        let v: serde_json::Value = client
+            .client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .expect("plain HTTP through the pinned client")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(v["service"], "wraith-coordinator");
+        server.await.unwrap();
     }
 
     /// All three checks are required, and each assertion names the lie the
