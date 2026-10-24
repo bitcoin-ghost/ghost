@@ -70,12 +70,18 @@ jobs:
       # would let one workflow restore the other's .debs and install the wrong set. The
       # `-release-` segment keeps them apart; hashing this file rotates the key whenever
       # the package list below changes.
+      - name: Runner image (apt cache key)
+        id: runner-image
+        if: runner.os == 'Linux'
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages (Linux)
         if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
-          key: apt-debs-release-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh', '.github/workflows/release.yml') }}
+          key: apt-debs-release-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh', '.github/workflows/release.yml') }}
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         timeout-minutes: 10

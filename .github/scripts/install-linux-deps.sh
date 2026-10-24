@@ -56,10 +56,21 @@ install_from_cache() {
   sudo dpkg -i "$DEB_CACHE"/*.deb || sudo apt-get -f install -y
 }
 
+# ⛔ A cache is only valid on the runner image it was resolved on. The download pulls in
+# whatever DEPENDENCIES the mirror had newer than that image, and `dpkg -i` of those onto a
+# different image breaks apt: on 2026-10-24 the Tauri job installed a cached systemd 259.9 /
+# udev onto a 259.5 image and `apt-get -f install` could not reconcile it. The workflows key
+# the cache on the image too; this marker catches a cache restored under any other key.
+IMAGE_ID="${ImageOS:-unknown}-${ImageVersion:-unknown}"
 if compgen -G "$DEB_CACHE/*.deb" > /dev/null 2>&1; then
-  echo "apt cache HIT — installing $(find "$DEB_CACHE" -name "*.deb" | wc -l) cached .deb(s), no download"
-  install_from_cache
-  exit 0
+  CACHED_ID=$(cat "$DEB_CACHE/.image" 2>/dev/null || echo none)
+  if [ "$CACHED_ID" = "$IMAGE_ID" ]; then
+    echo "apt cache HIT — installing $(find "$DEB_CACHE" -name "*.deb" | wc -l) cached .deb(s), no download"
+    install_from_cache
+    exit 0
+  fi
+  echo "apt cache was seeded on image '$CACHED_ID', this runner is '$IMAGE_ID' — discarding it"
+  rm -rf "$DEB_CACHE"
 fi
 
 echo "apt cache MISS — fetching from the mirrors (bounded), then seeding the cache"
@@ -114,6 +125,7 @@ mkdir -p "$DEB_CACHE"
 # legitimate outcome and must not fail the step.
 sudo cp /var/cache/apt/archives/*.deb "$DEB_CACHE"/ 2>/dev/null || true
 sudo chown -R "$(id -u):$(id -g)" "$DEB_CACHE" 2>/dev/null || true
+echo "$IMAGE_ID" > "$DEB_CACHE/.image"
 
 if compgen -G "$DEB_CACHE/*.deb" > /dev/null 2>&1; then
   install_from_cache
