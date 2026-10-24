@@ -47,8 +47,8 @@ http-body-util = { version = "0.1", optional = true }
 # Monitoring optional dependencies
 axum = { version = "0.8.7", optional = true }
 prometheus = { version = "0.14", optional = true }
-utoipa = { version = "5.4.0", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"], optional = true }
+utoipa = { version = "6", features = ["axum_extras"], optional = true }
+utoipa-swagger-ui = { version = "10", features = ["axum"], optional = true }
 
 # Common external dependencies that roles always need
 ext-config = { version = "0.14.0", features = ["toml"], package = "config" }

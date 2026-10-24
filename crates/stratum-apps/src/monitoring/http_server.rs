@@ -1553,4 +1553,48 @@ mod tests {
         assert!(!body.contains("sv2_server_channels"));
         assert!(!body.contains("sv2_clients_total"));
     }
+
+    /// The docs routes, mounted exactly as `run()` mounts them: the spec must list
+    /// every API route and the bundled Swagger UI must be served. Guards the
+    /// utoipa / utoipa-swagger-ui majors, which replace the code behind both.
+    #[tokio::test]
+    async fn swagger_ui_and_openapi_spec_are_served() {
+        let docs = || {
+            Router::<()>::new().merge(
+                SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),
+            )
+        };
+
+        let response = docs()
+            .oneshot(make_request("/api-docs/openapi.json"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let spec: serde_json::Value = serde_json::from_str(&get_body(response).await).unwrap();
+        let mut paths: Vec<&str> = spec["paths"]
+            .as_object()
+            .expect("spec has paths")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "/api/v1/clients",
+                "/api/v1/clients/{client_id}",
+                "/api/v1/clients/{client_id}/channels",
+                "/api/v1/global",
+                "/api/v1/health",
+                "/api/v1/server",
+                "/api/v1/server/channels",
+                "/api/v1/sv1/clients",
+                "/api/v1/sv1/clients/{client_id}",
+            ]
+        );
+
+        let response = docs().oneshot(make_request("/swagger-ui/")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(get_body(response).await.contains("swagger-ui"));
+    }
 }
