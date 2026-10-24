@@ -1,0 +1,17 @@
+# Cargo settings for every build in this repo, release included.
+
+[env]
+# libzmq (vendored by zeromq-src, statically linked into every binary that uses the mesh)
+# declares `command_t` `aligned(64)` but, built by zeromq-src, never defines
+# HAVE_POSIX_MEMALIGN, so its queue chunks come from plain malloc (16-byte aligned).
+# Baseline x86-64 copies them with 16-byte SSE stores, which happen to fit. GCC targeting
+# x86-64-v3 (Ubuntu 26.04's amd64v3 image) uses 32-byte aligned AVX stores, which fault
+# on the first zmq_bind: mesh_onboarding_fanout SIGSEGV'd at `vmovdqa %ymm0,(%rax)` in
+# ypipe_t<command_t,16>::write. Defining it makes the chunks 64-aligned, as libzmq's own
+# CMake build does. ZMQ_CACHELINE_SIZE must come with it (CMake provides it too) and is
+# 64 to match the hard-coded alignment.
+#
+# libzmq is the only C++ this workspace compiles; `cc` reads CXXFLAGS_<target> for it.
+# Linux only: posix_memalign does not exist on Windows.
+CXXFLAGS_x86_64_unknown_linux_gnu = "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"
