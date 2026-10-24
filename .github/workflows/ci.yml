@@ -230,13 +230,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
@@ -322,13 +327,18 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
@@ -460,11 +470,16 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
@@ -539,13 +554,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
@@ -581,6 +601,12 @@ jobs:
           df -h /
 
       # Install system dependencies (Linux)
+      - name: Runner image (apt cache key)
+        id: runner-image
+        if: runner.os == 'Linux'
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         if: runner.os == 'Linux'
         uses: actions/cache@v4
@@ -588,7 +614,7 @@ jobs:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         timeout-minutes: 6
@@ -652,13 +678,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
@@ -698,6 +729,11 @@ jobs:
         run: npx vite build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
@@ -705,7 +741,7 @@ jobs:
           # Keyed on the install script AND this job's package list, because the list is passed
           # in through `LINUX_DEPS` rather than living in the script. Sharing the pure-Rust jobs'
           # key would hand this job a cache holding none of the packages it needs.
-          key: apt-debs-tauri-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}-${{ env.TAURI_DEPS }}
+          key: apt-debs-tauri-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}-${{ env.TAURI_DEPS }}
       - name: Install Linux deps
         # ⚠ 20, not the 6 the other jobs use, and not the 10 it was. TAURI_DEPS pulls ~212
         # packages against their ~40, so a COLD apt cache takes far longer here. The cache key
@@ -760,13 +796,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
@@ -796,13 +837,18 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
+      - name: Runner image (apt cache key)
+        id: runner-image
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /tmp/apt-debs
           # Keyed on the install script, which carries the canonical package list. Change the
           # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
       - name: Install Linux deps
         timeout-minutes: 6
         run: .github/scripts/install-linux-deps.sh
