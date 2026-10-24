@@ -395,6 +395,29 @@ mod tests {
         );
     }
 
+    /// The Ghost-specific paths have no published vector, so pin them: a
+    /// `bip32`/`k256` bump that moved one would strand every wallet's notes.
+    #[test]
+    fn ghost_paths_for_the_zero_seed_are_pinned() {
+        let ks = Keystore::from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let got: Vec<String> = ["m/352'/0'/0'/0'", "m/352'/0'/0'/1'", "m/86'/531'/0'/0/0"]
+            .iter()
+            .map(|p| hex::encode(ks.derive_xprv(p).unwrap().to_bytes()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "1d24468ba2954007a01f7b95a63402aeb22cd59ab5205bd815b20839929e815a",
+                "88736678a40adcab701e03f199620c61ba1c1eeea7af99586aecf96afa8544fb",
+                // Same key as ghost-lock's index 0: the Lock path, derived independently.
+                "813da8e834415018d484a57a0f57bc056e00d4384c53f4644111289cf3eec9e8",
+            ]
+        );
+    }
+
     #[test]
     fn export_xpub_testnet_uses_tpub_prefix() {
         let ks = Keystore::from_mnemonic(

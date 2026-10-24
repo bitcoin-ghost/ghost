@@ -316,4 +316,46 @@ mod tests {
     fn the_path_is_bip86_under_the_wallet_s_coin_type() {
         assert_eq!(derivation_path(7), "m/86'/531'/0'/0/7");
     }
+
+    /// BIP32 test vector 1, so a `bip32`/`k256` bump cannot move the derivation
+    /// off the standard without a red test.
+    #[test]
+    fn bip32_matches_test_vector_1() {
+        use std::str::FromStr;
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let master = bip32::XPrv::new(&seed).unwrap();
+        assert_eq!(
+            master.to_string(bip32::Prefix::XPRV).as_str(),
+            "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
+        );
+        let mut child = master;
+        for c in bip32::DerivationPath::from_str("m/0'/1/2'/2/1000000000").unwrap() {
+            child = child.derive_child(c).unwrap();
+        }
+        assert_eq!(
+            child.public_key().to_string(bip32::Prefix::XPUB),
+            "xpub6H1LXWLaKsWFhvm6RVpEL9P4KfRZSW7abD2ttkWP3SSQvnyA8FSVqNTEcYFgJS2UaFcxupHiYkro49S8yGasTvXEYBVPamhGW6cFJodrTHy"
+        );
+    }
+
+    /// The Lock's own keys, pinned so a dependency bump cannot silently move them:
+    /// a moved key is an owner who can no longer sign for their Lock.
+    #[test]
+    fn lock_keys_for_the_test_phrase_are_pinned() {
+        let got: Vec<String> = (0..3)
+            .map(|i| hex::encode(secret_key(PHRASE, "", i).unwrap().secret_bytes()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "813da8e834415018d484a57a0f57bc056e00d4384c53f4644111289cf3eec9e8",
+                "a16f6363410a6edaae843efd11854f19ca9572aa78781c84303e1c860e10e86b",
+                "271512810bf52009be81e9ee24e6dbefe21de3e6312658da8f779458272516b9",
+            ]
+        );
+        assert_eq!(
+            hex::encode(secret_key(PHRASE, "TREZOR", 0).unwrap().secret_bytes()),
+            "85e96aaa13812a527b8ec9227ff11f12d787bcc643eebfd096972955619abc12"
+        );
+    }
 }
