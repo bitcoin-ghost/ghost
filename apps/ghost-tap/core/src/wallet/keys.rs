@@ -386,4 +386,27 @@ mod tests {
         let addr2 = derive_address_at_path(&seed, 0, 0, 5).unwrap();
         assert_eq!(addr1, addr2);
     }
+
+    /// Pinned outputs for the zero seed, so a `bip32`/`k256` bump that moved a
+    /// key fails here instead of in a user's wallet.
+    #[test]
+    fn keys_for_the_zero_seed_are_pinned() {
+        let mnemonic = SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into());
+        let seed = derive_seed_from_mnemonic(&mnemonic, None).unwrap();
+        let got = vec![
+            hex::encode(*derive_key_at_path(&seed, 0, 0, 0).unwrap()),
+            derive_address_at_path(&seed, 0, 0, 5).unwrap(),
+            hex::encode(*derive_l2_spending_key(&seed).unwrap()),
+            hex::encode(derive_l2_scan_pubkey(&seed).unwrap().serialize()),
+        ];
+        assert_eq!(
+            got,
+            [
+                "e284129cc0922579a535bbf4d1a3b25773090d28c909bc0fed73b5e0222cc372",
+                "19a7HGg32ecPQo49rDeM2NSFJHPqrwSJto",
+                "3b5d44955d4789e8f41ba43dee876ba02414b941cdde7ff6979345fda6b15c34",
+                "03ff366d357c8e4e7d0e70c280c605b28e7309551dfd4101ffe36f23ff0c3fb481",
+            ]
+        );
+    }
 }
