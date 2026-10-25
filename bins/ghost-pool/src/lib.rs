@@ -1807,7 +1807,10 @@ mod coordinator_proof_gate_tests {
     /// compiled constant.
     #[test]
     fn the_accessor_agrees_with_the_constant() {
-        assert_eq!(crate::coordinator_proof_height(), crate::COORDINATOR_PROOF_HEIGHT);
+        assert_eq!(
+            crate::coordinator_proof_height(),
+            crate::COORDINATOR_PROOF_HEIGHT
+        );
     }
 }
 
