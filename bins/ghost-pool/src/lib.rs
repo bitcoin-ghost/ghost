@@ -671,9 +671,21 @@ pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 /// #736: at and above this height a Wraith coordinator challenge's verdict is BROADCAST and
 /// recorded in the convergence ledger, rather than only logged.
 ///
-/// Dormant. Below it the challenge already runs on every rotation and logs its outcome at INFO,
-/// which is what arming should be decided from: the pass rate on the live fleet, per outcome
-/// class, over at least one full qualification window.
+/// Below it the challenge still runs on every rotation and logs its outcome at INFO, which is
+/// what arming was decided from: the pass rate on the live fleet, per outcome class.
+///
+/// ARMED at 973_120 on 2026-10-25. Read off the running fleet first, not the source tree:
+///
+/// 1. **Every node knows the variant.** All eight run v1.11.46 at `880c45240`, whose receive
+///    path stores a `coordinator` verdict into the ledger.
+/// 2. **A live pass rate.** From the v1.11.46 roll (12:50 UTC) to 16:07 UTC: **2,089 challenges,
+///    every one `Attested` with `endpoint_answered: true`**, across all eight, zero of any other
+///    outcome. Before v1.11.46 the probe used https against a plain-http endpoint and could not
+///    pass at all (#1033).
+///
+/// 973_120 is ~27 blocks past the tip when this was written (973,093), so it lands within hours.
+/// Armed first on ONE canary to watch the flip and the other seven storing its rows; nothing
+/// reads these rows yet, so a node emitting them early costs nothing but the rows.
 ///
 /// ⚠ Arming this pays nothing. It makes `coordinator` rows appear in `verification_ledger`;
 /// the +4 does not move from GhostPay until a separate gate says so, and that gate must not be
@@ -682,7 +694,7 @@ pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 /// Gated because the ledger is a stored format nodes reconcile on, so a new capability's rows
 /// must begin on every node at one height. The wire itself is safe either way: every node has
 /// carried `CapabilityType::Unknown` tolerance since #871.
-pub const COORDINATOR_PROOF_HEIGHT: u64 = u64::MAX;
+pub const COORDINATOR_PROOF_HEIGHT: u64 = 973_120;
 
 /// H-7 ENFORCEMENT: at and above this height, a challenger whose own address proof FAILED stops
 /// counting toward a target's distinct-`/24` diversity floor (#605).
@@ -1769,13 +1781,33 @@ mod activation_height_logging_tests {
 
 #[cfg(test)]
 mod coordinator_proof_gate_tests {
-    /// #736: shipped dormant on purpose. Arming is a deliberate edit to this assertion, made
-    /// after the challenge's logged pass rate has been read off the live fleet — not something
-    /// a refactor or a merge should be able to do in passing.
+    /// #736: the armed height starts `coordinator` rows in the ledger and must not drift
+    /// silently. Moving it is a deliberate edit to this assertion plus a fleet roll.
     #[test]
-    fn the_coordinator_proof_gate_ships_dormant() {
-        assert_eq!(crate::COORDINATOR_PROOF_HEIGHT, u64::MAX);
-        assert_eq!(crate::coordinator_proof_height(), u64::MAX);
+    fn the_armed_height_is_pinned() {
+        assert_eq!(
+            crate::COORDINATOR_PROOF_HEIGHT,
+            973_120,
+            "changing an armed consensus height requires a fleet roll — see the const's docs"
+        );
+    }
+
+    /// Guards arming being UNDONE: a revert to `u64::MAX` would leave every test that merely
+    /// checks "the gate exists" passing while the gate silently never fires again.
+    #[test]
+    fn the_gate_is_armed_not_dormant() {
+        assert_ne!(
+            crate::COORDINATOR_PROOF_HEIGHT,
+            u64::MAX,
+            "COORDINATOR_PROOF_HEIGHT is dormant again — arming was reverted"
+        );
+    }
+
+    /// On mainnet `gates::from_env` ignores the environment, so the accessor must return the
+    /// compiled constant.
+    #[test]
+    fn the_accessor_agrees_with_the_constant() {
+        assert_eq!(crate::coordinator_proof_height(), crate::COORDINATOR_PROOF_HEIGHT);
     }
 }
 
