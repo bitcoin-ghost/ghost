@@ -21,8 +21,8 @@
 # ("already the newest version"), so it costs nothing but is kept for the case where a future
 # image drops it.
 #
-# So: cache the .deb files. On a cache hit nothing is downloaded at all and install is a local
-# `dpkg` — the mirrors cannot stall what we never ask them for. On a miss we fall back to a
+# So: cache the .deb files. On a cache hit no PACKAGE is downloaded: a bounded index refresh
+# (~3 MB), then apt installs the cached files with `--no-download`. On a miss we fall back to a
 # BOUNDED apt (`Acquire::*::Timeout` per fetch, `Retries` for a transient failure), and seed the
 # cache for next time.
 #
@@ -50,10 +50,35 @@ PKGS=${LINUX_DEPS:-"libsqlite3-dev capnproto libcapnp-dev"}
 # dev package names are stable across releases and pull the right runtime libs as dependencies.
 PKGS="$PKGS libevent-dev libzmq3-dev"
 
-# `dpkg -i` on a partial set can leave unmet dependencies; `apt-get -f install` repairs it.
-# That repair CAN touch the network, so it is a fallback and never the happy path.
+# ⛔ apt, not `dpkg -i`. Seeding the cache downloads whatever DEPENDENCIES the mirror has newer
+# than the image — for the Tauri set that includes systemd/udev/libsystemd-shared. `dpkg -i`
+# takes the files in glob order and cannot honour PreDepends across them, so systemd 259.9
+# was unpacked against libsystemd-shared 259.5, failed, and `apt-get -f install` could not
+# reconcile the half-upgraded state (Desktop red on every PR from 2026-10-24, same image key on
+# both sides, so this is NOT the stale-image case the marker below handles). Given the files as
+# with the files placed in its own archive directory, apt orders the whole set itself.
+#
+# ⛔ Not `apt-get install /path/*.deb` either: handed the files as arguments, apt still fetched
+# 72.3 of 82.5 MB from the mirror on a full cache HIT, which puts the mirrors back on the
+# critical path this script exists to remove. Copied into /var/cache/apt/archives, apt finds
+# the exact files it would have downloaded, and `--no-download` makes a gap a failure instead
+# of a silent fetch — the caller then takes the bounded download path below.
+#
+# The index has to be refreshed first: a fresh runner's lists are older than the ones the cache
+# was seeded against, so apt does not recognise the cached files and asks for the mirror
+# ("Unable to fetch some archives"). Measured on the 26.04 Tauri cache: the update fetched
+# 3 MB, then `Need to get 0 B/82.5 MB` — every package came from the cache.
+apt_index_update() {
+  sudo apt-get -o Acquire::Retries=3 \
+               -o Acquire::http::Timeout=20 \
+               -o Acquire::https::Timeout=20 \
+               update
+}
 install_from_cache() {
-  sudo dpkg -i "$DEB_CACHE"/*.deb || sudo apt-get -f install -y
+  sudo cp "$DEB_CACHE"/*.deb /var/cache/apt/archives/
+  apt_index_update || return 1
+  # shellcheck disable=SC2086  # word splitting is intended: PKGS is a package list
+  sudo apt-get install -y --no-download $PKGS
 }
 
 # ⛔ A cache is only valid on the runner image it was resolved on. The download pulls in
@@ -66,10 +91,13 @@ if compgen -G "$DEB_CACHE/*.deb" > /dev/null 2>&1; then
   CACHED_ID=$(cat "$DEB_CACHE/.image" 2>/dev/null || echo none)
   if [ "$CACHED_ID" = "$IMAGE_ID" ]; then
     echo "apt cache HIT — installing $(find "$DEB_CACHE" -name "*.deb" | wc -l) cached .deb(s), no download"
-    install_from_cache
-    exit 0
+    if install_from_cache; then
+      exit 0
+    fi
+    echo "apt cache could not satisfy the install offline — fetching instead"
   fi
-  echo "apt cache was seeded on image '$CACHED_ID', this runner is '$IMAGE_ID' — discarding it"
+  [ "$CACHED_ID" = "$IMAGE_ID" ] \
+    || echo "apt cache was seeded on image '$CACHED_ID', this runner is '$IMAGE_ID' — discarding it"
   rm -rf "$DEB_CACHE"
 fi
 
@@ -92,10 +120,7 @@ echo "apt cache MISS — fetching from the mirrors (bounded), then seeding the c
 # Retrying the download alone would fail identically every time, because the index would still name
 # the file that is not there. The pair is the unit of work.
 apt_fetch() {
-  sudo apt-get -o Acquire::Retries=3 \
-               -o Acquire::http::Timeout=20 \
-               -o Acquire::https::Timeout=20 \
-               update || return 1
+  apt_index_update || return 1
   # Download without installing so the .debs land in apt's archive directory, where we can copy
   # them out to be cached. Packages already present on the image simply download nothing.
   # shellcheck disable=SC2086  # word splitting is intended: $PKGS is a package LIST
