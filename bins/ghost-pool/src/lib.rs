@@ -716,6 +716,13 @@ pub const COORDINATOR_PROOF_HEIGHT: u64 = 973_120;
 /// node that proves a coordinator. With all eight proving one, the split stays an even 1/8.
 pub const COORDINATOR_SHARES_HEIGHT: u64 = 974_500;
 
+/// The shares may not move before the verdicts they are paid on exist. A constant, so it is
+/// checked when the binary is built rather than in a test.
+const _: () = assert!(
+    COORDINATOR_SHARES_HEIGHT > COORDINATOR_PROOF_HEIGHT,
+    "the +4 cannot move to coordinators before coordinator verdicts are recorded"
+);
+
 /// H-7 ENFORCEMENT: at and above this height, a challenger whose own address proof FAILED stops
 /// counting toward a target's distinct-`/24` diversity floor (#605).
 ///
@@ -1862,12 +1869,6 @@ mod coordinator_shares_gate_tests {
             974_500,
             "changing an armed consensus height requires a fleet roll — see the const's docs"
         );
-    }
-
-    /// The shares may not move before the verdicts they are paid on exist.
-    #[test]
-    fn shares_move_only_after_the_verdicts_are_recorded() {
-        assert!(crate::COORDINATOR_SHARES_HEIGHT > crate::COORDINATOR_PROOF_HEIGHT);
     }
 
     #[test]
