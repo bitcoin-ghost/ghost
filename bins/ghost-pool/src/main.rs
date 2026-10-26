@@ -3806,7 +3806,10 @@ async fn main() -> Result<()> {
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()))
                 // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
+                .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
+                // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
+                // address enforcement: every paid or ratified derivation wires it identically.
+                .with_coordinator_shares(height >= ghost_pool::coordinator_shares_height());
             // A-2/A-2b: the checkpoint root must scope challengers to the voter set +
             // subnets AND to the consensus assignment at/above the gates, identically to
             // the coinbase node split, or the root and the paid split would disagree.
@@ -3854,7 +3857,10 @@ async fn main() -> Result<()> {
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()))
                 // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
+                .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
+                // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
+                // address enforcement: every paid or ratified derivation wires it identically.
+                .with_coordinator_shares(height >= ghost_pool::coordinator_shares_height());
             let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
             let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
             let mut ids: Vec<ghost_common::types::NodeId> = qp
@@ -7465,7 +7471,10 @@ async fn main() -> Result<()> {
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()))
                 // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
+                .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
+                // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
+                // address enforcement: every paid or ratified derivation wires it identically.
+                .with_coordinator_shares(block_height >= ghost_pool::coordinator_shares_height());
             let voters: Vec<ghost_common::types::NodeId> = qp
                 .get_all_qualified_nodes_at_cutoff_from_db(
                     cutoff,
@@ -7626,7 +7635,10 @@ async fn main() -> Result<()> {
                 let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                     .with_block_hash_oracle(Arc::new(oracle_c.clone()))
                     // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                    .with_address_enforcement(ghost_pool::address_proof_enforcement_height());
+                    .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
+                    // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
+                    // address enforcement: every paid or ratified derivation wires it identically.
+                    .with_coordinator_shares(height >= ghost_pool::coordinator_shares_height());
                 let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
                 let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
                 let mut active: Vec<ghost_common::types::NodeId> = qp

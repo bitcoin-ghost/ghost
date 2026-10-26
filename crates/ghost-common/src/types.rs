@@ -116,6 +116,28 @@ impl NodeCapabilities {
         shares
     }
 
+    /// Shares for a capability set that QUALIFICATION produced, where `coordinator` is a proven
+    /// verdict rather than a self-report (#736).
+    ///
+    /// ⛔ Never call this on capabilities a peer reported about itself. `total_shares()` leaves
+    /// `coordinator` out precisely because a health ping's flag proves nothing; this method is the
+    /// one place it counts, and only `QualifiedCapabilityProvider` sets it from ledger verdicts.
+    pub fn proven_shares(&self) -> i32 {
+        let mut shares = self.total_shares();
+        if self.coordinator {
+            debug_assert!(
+                !self.ghost_pay,
+                "the +4 slot pays GhostPay OR coordinator, never both"
+            );
+            shares = shares
+                .checked_add(crate::constants::COORDINATOR_SHARES)
+                .expect(
+                    "BUG: share calculation overflow - max possible shares verified < i32::MAX",
+                );
+        }
+        shares
+    }
+
     /// Check if node has any capabilities
     pub fn has_any(&self) -> bool {
         self.archive_mode
@@ -1233,6 +1255,25 @@ mod tests {
         caps.ghost_pay = true;
         caps.elder_status = true;
         assert_eq!(caps.total_shares(), 15); // 5 + 3 + 2 + 4 + 1
+    }
+
+    /// #736: `total_shares` never counts a coordinator — the flag there is a self-report — and
+    /// `proven_shares` counts it as the +4 slot GhostPay held.
+    #[test]
+    fn only_proven_shares_counts_a_coordinator() {
+        let caps = NodeCapabilities {
+            public_mining: true,
+            reaper: true,
+            elder_status: true,
+            coordinator: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            caps.total_shares(),
+            6,
+            "a self-reported coordinator earns nothing"
+        );
+        assert_eq!(caps.proven_shares(), 10, "a proven one earns the +4 slot");
     }
 
     #[test]

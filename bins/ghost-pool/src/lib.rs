@@ -696,6 +696,26 @@ pub const ADDRESS_PROOF_HEIGHT: u64 = 966_000;
 /// carried `CapabilityType::Unknown` tolerance since #871.
 pub const COORDINATOR_PROOF_HEIGHT: u64 = 973_120;
 
+/// #736: at and above this height the +4 slot is earned by a PROVEN Wraith coordinator instead of
+/// GhostPay. ⚖ Decided 2026-10-11: the weight moves, it is not dropped, and it is paid on proof —
+/// a majority of distinct, assigned challengers whose probe reached the node's advertised
+/// coordinator endpoint (`COORDINATOR_PROOF_HEIGHT` records those verdicts) — never on the
+/// self-reported `coordinator` flag.
+///
+/// This moves the node-reward split, so every node must switch at one height: the qualification
+/// derivation feeds the payout checkpoint root, and nodes deriving different sets reject each
+/// other's checkpoints. Set from the running fleet on 2026-10-26:
+///
+/// - Coordinator verdicts began at 973,120 (2026-10-25 20:03 UTC) on all eight nodes. In the
+///   first ~10 h after the roll: ~6,050 rows per node from all eight challengers, 1 failure (a
+///   real one: vm4 → vm6 when vm6's endpoint missed a probe). Every challenge `Attested`.
+/// - 974,500 is ~1,380 blocks past 973,120 — about 7.7 days at the ~180 blocks/day measured that
+///   week — so the whole 7-day qualification window at the gate holds coordinator verdicts.
+///
+/// GhostPay pays nobody today (no node claims it since 2026-09-11), so the change is +4 to every
+/// node that proves a coordinator. With all eight proving one, the split stays an even 1/8.
+pub const COORDINATOR_SHARES_HEIGHT: u64 = 974_500;
+
 /// H-7 ENFORCEMENT: at and above this height, a challenger whose own address proof FAILED stops
 /// counting toward a target's distinct-`/24` diversity floor (#605).
 ///
@@ -849,6 +869,7 @@ mod gates {
     pub(super) static ARCHIVE_TX_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ADDRESS_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static COORDINATOR_PROOF: OnceLock<u64> = OnceLock::new();
+    pub(super) static COORDINATOR_SHARES: OnceLock<u64> = OnceLock::new();
     pub(super) static ADDRESS_PROOF_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
@@ -993,6 +1014,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         COORDINATOR_PROOF_HEIGHT,
     );
+    let coordinator_shares = gates::from_env(
+        "GHOST_COORDINATOR_SHARES_HEIGHT",
+        network,
+        COORDINATOR_SHARES_HEIGHT,
+    );
     let address_proof_enforcement = gates::from_env(
         "GHOST_ADDRESS_PROOF_ENFORCEMENT_HEIGHT",
         network,
@@ -1075,6 +1101,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         coordinator_proof,
     );
     set_gate(
+        &gates::COORDINATOR_SHARES,
+        "COORDINATOR_SHARES",
+        coordinator_shares,
+    );
+    set_gate(
         &gates::ADDRESS_PROOF_ENFORCEMENT,
         "ADDRESS_PROOF_ENFORCEMENT",
         address_proof_enforcement,
@@ -1127,6 +1158,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         archive_tx_proof = %h(archive_tx),
         address_proof = %h(address_proof),
         coordinator_proof = %h(coordinator_proof),
+        coordinator_shares = %h(coordinator_shares),
         // #605. Resolved and stored since it was added, and never stated — so a node armed at
         // 970,500 looked identical in its logs to one that was dormant. It is the gate that moves
         // the node-reward split, which makes it the last one that should be invisible.
@@ -1316,6 +1348,12 @@ pub fn address_proof_height() -> u64 {
 /// Height at and above which a Wraith coordinator verdict is broadcast and recorded (#736).
 pub fn coordinator_proof_height() -> u64 {
     *gates::COORDINATOR_PROOF.get_or_init(|| COORDINATOR_PROOF_HEIGHT)
+}
+
+/// Height at and above which a proven Wraith coordinator earns the +4 slot GhostPay held (#736).
+/// See [`COORDINATOR_SHARES_HEIGHT`].
+pub fn coordinator_shares_height() -> u64 {
+    *gates::COORDINATOR_SHARES.get_or_init(|| COORDINATOR_SHARES_HEIGHT)
 }
 
 /// Height at and above which a FAILED address proof costs a challenger its `/24` in the
@@ -1810,6 +1848,33 @@ mod coordinator_proof_gate_tests {
         assert_eq!(
             crate::coordinator_proof_height(),
             crate::COORDINATOR_PROOF_HEIGHT
+        );
+    }
+}
+
+#[cfg(test)]
+mod coordinator_shares_gate_tests {
+    /// #736: the height the node-reward split changes at. Moving it is a fleet roll.
+    #[test]
+    fn the_armed_height_is_pinned() {
+        assert_eq!(
+            crate::COORDINATOR_SHARES_HEIGHT,
+            974_500,
+            "changing an armed consensus height requires a fleet roll — see the const's docs"
+        );
+    }
+
+    /// The shares may not move before the verdicts they are paid on exist.
+    #[test]
+    fn shares_move_only_after_the_verdicts_are_recorded() {
+        assert!(crate::COORDINATOR_SHARES_HEIGHT > crate::COORDINATOR_PROOF_HEIGHT);
+    }
+
+    #[test]
+    fn the_accessor_agrees_with_the_constant() {
+        assert_eq!(
+            crate::coordinator_shares_height(),
+            crate::COORDINATOR_SHARES_HEIGHT
         );
     }
 }

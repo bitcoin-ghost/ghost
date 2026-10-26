@@ -84,6 +84,15 @@ pub const ARCHIVE_MODE_SHARES: i32 = 5;
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const GHOST_PAY_SHARES: i32 = 4;
 
+/// Wraith coordinator capability shares: the +4 slot GhostPay held, MOVED, not added (#736).
+///
+/// Paid only on a PROVEN coordinator — a majority of distinct, assigned challengers who reached
+/// the node's advertised coordinator endpoint — and only at/above `COORDINATOR_SHARES_HEIGHT`,
+/// where GhostPay stops earning. The two never pay together, which is why this is not a sixth
+/// term in `MAX_NODE_SHARES`.
+/// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
+pub const COORDINATOR_SHARES: i32 = GHOST_PAY_SHARES;
+
 /// Public mining capability shares
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const PUBLIC_MINING_SHARES: i32 = 3;

@@ -149,6 +149,11 @@ pub struct QualifiedCapabilityProvider {
     /// path below is the original aggregate query, untouched, so a build that forgets to wire
     /// this cannot change what qualifies.
     address_enforcement_height: u64,
+    /// #736: the +4 slot is earned by a proven Wraith coordinator instead of GhostPay. Set by
+    /// the caller from `height >= ghost_pool::coordinator_shares_height()`; `false` (the
+    /// default) keeps the GhostPay derivation bit-identical, so an unwired caller cannot change
+    /// what qualifies.
+    coordinator_shares: bool,
 }
 
 impl QualifiedCapabilityProvider {
@@ -161,6 +166,7 @@ impl QualifiedCapabilityProvider {
             cached_network_size: parking_lot::RwLock::new(None),
             block_hash_oracle: None,
             address_enforcement_height: u64::MAX,
+            coordinator_shares: false,
         }
     }
 
@@ -173,6 +179,16 @@ impl QualifiedCapabilityProvider {
     /// then safe rather than dangerous.
     pub fn with_address_enforcement(mut self, height: u64) -> Self {
         self.address_enforcement_height = height;
+        self
+    }
+
+    /// #736: earn the +4 slot from `coordinator` verdicts instead of `ghostpay` ones. Pass
+    /// `height >= ghost_pool::coordinator_shares_height()` for the height being derived.
+    ///
+    /// Every caller deriving a set that is paid or ratified must pass the same answer for the
+    /// same height, or nodes compute different node splits — the same rule as the other gates.
+    pub fn with_coordinator_shares(mut self, armed: bool) -> Self {
+        self.coordinator_shares = armed;
         self
     }
 
@@ -195,6 +211,7 @@ impl QualifiedCapabilityProvider {
             cached_network_size: parking_lot::RwLock::new(None),
             block_hash_oracle: None,
             address_enforcement_height: u64::MAX,
+            coordinator_shares: false,
         }
     }
 
@@ -824,7 +841,9 @@ impl QualifiedCapabilityProvider {
                 &assignment_pool,
                 &liars,
             );
-            let shares = caps.total_shares();
+            // `proven_shares`, not `total_shares`: here `coordinator` is a ledger verdict, and
+            // at/above the #736 gate it is what earns the +4 slot.
+            let shares = caps.proven_shares();
             if shares > 0 {
                 if let Some(node_id) = decode_node_id(hex_id) {
                     qualified.push((node_id, shares));
@@ -923,9 +942,19 @@ impl QualifiedCapabilityProvider {
             assignment_pool,
             liars,
         );
-        let ghost_pay = self.majority_capability_qualified(
+        // #736: ONE capability earns the +4 slot. Below the gate it is GhostPay, exactly as
+        // before; at/above it, a proven coordinator — the same majority rule over the
+        // `coordinator` verdicts, which are recorded only from a challenger that reached the
+        // target's advertised endpoint. GhostPay stops earning at the gate rather than paying
+        // alongside, so the slot moves instead of growing the maximum.
+        let slot_capability = if self.coordinator_shares {
+            "coordinator"
+        } else {
+            "ghostpay"
+        };
+        let slot = self.majority_capability_qualified(
             node_id_hex,
-            "ghostpay",
+            slot_capability,
             since,
             until,
             min_challenges,
@@ -935,6 +964,11 @@ impl QualifiedCapabilityProvider {
             assignment_pool,
             liars,
         );
+        let (ghost_pay, coordinator) = if self.coordinator_shares {
+            (false, slot)
+        } else {
+            (slot, false)
+        };
 
         // Elder is registration order in the (converged) nodes table, unchanged.
         let elder_status = self.db.is_node_elder(node_id_hex).unwrap_or(false);
@@ -945,7 +979,7 @@ impl QualifiedCapabilityProvider {
             public_mining,
             reaper,
             elder_status,
-            coordinator: false,
+            coordinator,
         }
     }
 
@@ -1606,6 +1640,87 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    /// Seed `n` distinct challengers each recording one `capability` verdict for `target`.
+    fn seed_capability(
+        db: &Database,
+        target: &str,
+        capability: &str,
+        first_challenger: u8,
+        n: u8,
+        passed: bool,
+        ts: i64,
+    ) {
+        for i in 0..n {
+            let challenger = hex_id(first_challenger + i);
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: &challenger,
+                target_node_id: target,
+                capability,
+                passed,
+                timestamp: ts,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
+        }
+    }
+
+    /// #736: at the gate the +4 slot is earned by `coordinator` verdicts, and `ghostpay`
+    /// verdicts stop earning it. Below the gate, exactly the reverse — bit-identical to before.
+    #[test]
+    fn the_plus_four_slot_moves_from_ghostpay_to_a_proven_coordinator() {
+        let pays = hex_id(0xC1); // proves GhostPay only
+        let coords = hex_id(0xC2); // proves a coordinator only
+        let node_ids = vec![
+            pays.clone(),
+            coords.clone(),
+            hex_id(1),
+            hex_id(2),
+            hex_id(3),
+        ];
+        let cutoff = 2_000_000i64; // network_size 5 → min_challenges 4
+        let db = Arc::new(Database::in_memory().unwrap());
+        seed_capability(&db, &pays, "ghostpay", 0x10, 4, true, cutoff - 100);
+        seed_capability(&db, &coords, "coordinator", 0x10, 4, true, cutoff - 100);
+
+        let below = QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false);
+        assert_eq!(
+            below,
+            vec![(decode_node_id(&pays).unwrap(), 4)],
+            "below the gate only GhostPay earns the slot; coordinator verdicts pay nothing"
+        );
+
+        let at = QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .with_coordinator_shares(true)
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false);
+        assert_eq!(
+            at,
+            vec![(decode_node_id(&coords).unwrap(), 4)],
+            "at the gate the slot moves: the coordinator earns +4 and GhostPay earns nothing"
+        );
+    }
+
+    /// A coordinator verdict is still subject to the majority rule: failing verdicts from a
+    /// majority of distinct challengers earn nothing, even at the gate.
+    #[test]
+    fn a_coordinator_failing_its_challengers_earns_nothing() {
+        let target = hex_id(0xC3);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64;
+        let db = Arc::new(Database::in_memory().unwrap());
+        seed_capability(&db, &target, "coordinator", 0x10, 1, true, cutoff - 100);
+        seed_capability(&db, &target, "coordinator", 0x20, 3, false, cutoff - 100);
+
+        let at = QualifiedCapabilityProvider::new(db)
+            .with_coordinator_shares(true)
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false);
+        assert!(
+            at.is_empty(),
+            "1 pass of 4 distinct challengers is not a majority"
+        );
     }
 
     /// Two nodes with identical converged ledgers must produce byte-identical
