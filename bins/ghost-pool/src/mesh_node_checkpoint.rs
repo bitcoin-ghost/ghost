@@ -121,6 +121,9 @@ pub struct MeshNodeListCheckpointManager {
     pending: RwLock<HashMap<u64, Pending>>,
     last_sync_request: RwLock<u64>,
     sync_serves: RwLock<HashMap<NodeId, u64>>,
+    /// The `(height, cutoff_ts)` the propose path last reached a FINAL answer for: not the
+    /// proposer, node set unchanged, or proposed. See [`Self::maybe_propose`].
+    settled: RwLock<Option<(u64, i64)>>,
 }
 
 fn now_ms() -> u64 {
@@ -322,6 +325,7 @@ impl MeshNodeListCheckpointManager {
             pending: RwLock::new(HashMap::new()),
             last_sync_request: RwLock::new(0),
             sync_serves: RwLock::new(HashMap::new()),
+            settled: RwLock::new(None),
         }
     }
 
@@ -475,10 +479,25 @@ impl MeshNodeListCheckpointManager {
         if height < self.gate() {
             return; // dormant below the activation gate — behaviour-neutral
         }
+        // ⛔ Once per `(height, cutoff_ts)`, not once per tick (#1034). The cadence calls this
+        // every 30 s, but its height is `tip - 144` and moves once per block, and this
+        // checkpoint is only minted when the node set CHANGES — so nearly every call re-ran the
+        // full qualification derivation (twice on the proposer) to reach the answer it reached
+        // 30 s earlier. Only a FINAL answer is remembered; the abstain paths below ("adverts
+        // not available yet", "no ratified qualified set") stay retryable every tick, because
+        // what they wait for arrives over the network.
+        //
+        // ⚖ What this gives up: a late ledger row that changes the voter set or the qualified
+        // set at a cutoff already evaluated is picked up at the next block rather than the
+        // next tick. The cutoff is a day old, so such a row is rare, and the cost is minutes.
+        if *self.settled.read() == Some((height, cutoff_ts)) {
+            return;
+        }
         let me = self.identity.node_id();
         let voters = self.voter_set_for(height, cutoff_ts);
         let proposer = (!voters.is_empty()).then(|| voters[(height as usize) % voters.len()]);
         if proposer != Some(me) || self.already_finalized(height) {
+            self.settle(height, cutoff_ts);
             return;
         }
         let Some(qualified) = self.qualified_set_for(height, cutoff_ts) else {
@@ -539,6 +558,7 @@ impl MeshNodeListCheckpointManager {
                     height,
                     "mesh node checkpoint: node set unchanged — not re-proposing"
                 );
+                self.settle(height, cutoff_ts);
                 return;
             }
         }
@@ -577,6 +597,12 @@ impl MeshNodeListCheckpointManager {
         self.broadcast(MessageType::MeshNodeListCheckpoint, &msg);
         self.cast_vote(height, hash, true);
         self.maybe_finalize(height, hash);
+        self.settle(height, cutoff_ts);
+    }
+
+    /// Record that the propose path reached a final answer for `(height, cutoff_ts)`.
+    fn settle(&self, height: u64, cutoff_ts: i64) {
+        *self.settled.write() = Some((height, cutoff_ts));
     }
 
     async fn on_proposal(&self, env: &MessageEnvelope) -> GhostResult<()> {
@@ -1186,6 +1212,16 @@ mod tests {
     }
 
     fn build(n: usize, holds: &[Hold]) -> (Vec<Node>, Vec<NodeId>, Vec<MeshEndpointAdvert>) {
+        build_counting(n, holds, None)
+    }
+
+    /// [`build`], with every node's voter-set resolver bumping `calls` — how a test observes
+    /// whether the qualification derivation ran.
+    fn build_counting(
+        n: usize,
+        holds: &[Hold],
+        calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> (Vec<Node>, Vec<NodeId>, Vec<MeshEndpointAdvert>) {
         assert_eq!(n, holds.len());
         let ids: Vec<Arc<NodeIdentity>> =
             (0..n).map(|_| Arc::new(NodeIdentity::generate())).collect();
@@ -1216,6 +1252,7 @@ mod tests {
             };
             let compute: ComputeAdvertsFn = Arc::new(move |_qualified| mine.clone());
             let ratified = elders.clone();
+            let calls_c = calls.clone();
             let mgr = MeshNodeListCheckpointManager::new(
                 identity.clone(),
                 Arc::clone(&db),
@@ -1223,7 +1260,12 @@ mod tests {
                 compute,
             )
             // The ratified qualified set — identical on every node, which is the whole point.
-            .with_active_voter_set_fn(Arc::new(move |_ts, _h| ratified.clone()))
+            .with_active_voter_set_fn(Arc::new(move |_ts, _h| {
+                if let Some(c) = &calls_c {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                ratified.clone()
+            }))
             .with_gate_height(0); // armed for the cluster tests
             nodes.push(Node {
                 id: identity.node_id(),
@@ -1507,6 +1549,53 @@ mod tests {
                 "incomplete coverage must produce no checkpoint at all"
             );
         }
+    }
+
+    /// #1034: the 30 s cadence repeats one `(height, cutoff)` for a whole block. Once a node has
+    /// a final answer for it — here, "not the proposer" — the repeats must not re-run the
+    /// qualification derivation.
+    #[tokio::test]
+    async fn a_settled_height_is_not_re_derived_every_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (nodes, _, _) = build_counting(4, &[Hold::All; 4], Some(Arc::clone(&calls)));
+        // At/above the active-voter-set gate, or the resolver is never consulted. Nodes are in
+        // elder order, so the proposer is `nodes[h % 4]`; pick the node after it.
+        let h = crate::active_voter_set_height();
+        let voter = &nodes[(h as usize + 1) % 4];
+        for _ in 0..10 {
+            voter.mgr.maybe_propose(h, CUTOFF).await;
+        }
+        assert_eq!(
+            calls.load(SeqCst),
+            1,
+            "ten ticks at one height, one derivation"
+        );
+
+        // A new height is a new question.
+        voter.mgr.maybe_propose(h + 4, CUTOFF).await;
+        assert_eq!(calls.load(SeqCst), 2);
+    }
+
+    /// The other half: an ABSTAIN is not an answer. A proposer still waiting for adverts must
+    /// re-try on the next tick, or a checkpoint that needs one more advert would wait a block.
+    #[tokio::test]
+    async fn an_abstaining_proposer_retries_on_the_next_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = crate::active_voter_set_height();
+        let p = h as usize % 4;
+        let mut holds = [Hold::All; 4];
+        holds[p] = Hold::Nothing; // the proposer holds no adverts → "not available yet"
+        let (nodes, _, _) = build_counting(4, &holds, Some(Arc::clone(&calls)));
+        nodes[p].mgr.maybe_propose(h, CUTOFF).await;
+        let after_first = calls.load(SeqCst);
+        assert!(after_first > 0, "the resolver must be reached at all");
+        nodes[p].mgr.maybe_propose(h, CUTOFF).await;
+        assert!(
+            calls.load(SeqCst) > after_first,
+            "a proposer that abstained must derive again on the next tick"
+        );
     }
 
     #[tokio::test]

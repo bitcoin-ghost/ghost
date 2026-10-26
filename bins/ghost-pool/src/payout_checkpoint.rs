@@ -707,10 +707,20 @@ impl PayoutCheckpointManager {
     /// Called on a cadence from `main.rs` with the target lagging checkpoint
     /// height. No-op unless this node is the deterministic proposer for it.
     pub async fn maybe_propose(&self, height: u64, cutoff_ts: i64) {
+        // ⛔ Finalised FIRST, before the voter set. Resolving the voter set runs the whole
+        // qualification derivation (~1.5 s holding the DB connection on a 2-CPU node), and the
+        // cadence calls this every 30 s for `tip - LAG`, which only moves once per block — so
+        // almost every call is for a height that already finalised. Checking second made each
+        // of those calls pay for a proposer it then threw away: two derivations a minute on
+        // every node, the bulk of #1034's slow holds. Returning early here cannot change an
+        // outcome: a finalised height returned before as well, just after the work.
+        if self.already_finalized(height) {
+            return;
+        }
         let me = self.identity.node_id();
         let voters = self.voter_set_for(height, cutoff_ts);
         let proposer = (!voters.is_empty()).then(|| voters[(height as usize) % voters.len()]);
-        if proposer != Some(me) || self.already_finalized(height) {
+        if proposer != Some(me) {
             return;
         }
         let Some(canonical) = self.compute_root_off_runtime(cutoff_ts, height).await else {
@@ -1604,6 +1614,57 @@ mod tests {
 
         assert_ne!(a, b, "the cutoff is part of the key, not decoration");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// #1034: a height that already finalised must not resolve a voter set at all.
+    ///
+    /// The propose cadence calls `maybe_propose` every 30 s for a height that moves once per
+    /// block, so nearly every call lands on a finalised height. Resolving the voter set first
+    /// ran the full qualification derivation each time, only to return on the finalised check
+    /// that followed it.
+    #[tokio::test]
+    async fn a_finalised_height_does_not_resolve_the_voter_set() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        let elders: Vec<NodeId> = (1..=3u8).map(|n| [n; 32]).collect();
+        register_elders(&db, &elders);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let mgr = PayoutCheckpointManager::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::clone(&db),
+            Arc::new(|_, _| Ok(())),
+            Arc::new(|_c, _h| None),
+        )
+        .with_active_voter_set_fn(Arc::new(move |_cutoff, _height| {
+            calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![[1u8; 32], [2u8; 32], [3u8; 32]]
+        }));
+
+        let height = crate::active_voter_set_height();
+        let cutoff = 1_786_228_093;
+        db.upsert_payout_ledger_checkpoint(&PayoutLedgerCheckpointRecord {
+            height,
+            cutoff_ts: cutoff,
+            ledger_root: [7u8; 32],
+            proposer_id: hex::encode([1u8; 32]),
+            active_node_count: 3,
+            miner_payouts: vec![],
+            node_shares: vec![],
+        })
+        .expect("persist");
+
+        mgr.maybe_propose(height, cutoff).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a finalised height must return before the voter set is resolved"
+        );
+
+        // Control: the next, unfinalised height still resolves it.
+        mgr.maybe_propose(height + 1, cutoff).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
