@@ -153,7 +153,7 @@ jobs:
           # runtime), so this is safe.
           cargo build --release --target ${{ matrix.target }} \
             --features ghost-mining/zk-production \
-            -p ghost-mining -p ghost-cli \
+            -p ghost-mining -p ghost-cli -p ghost-miner-proxy \
             -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
 
       # Build ghostd (the C++ Bitcoin Core daemon) so the node binaries ship in
@@ -214,7 +214,7 @@ jobs:
           mkdir -p dist
 
           # Copy binaries (check actual names from target directory)
-          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
+          for bin in ghost-mining ghost-admin ghost-miner-proxy translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
             if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi
@@ -284,6 +284,15 @@ jobs:
             done
             cmp "$check/ghost-mining" "$check/ghost-pool" || { echo "::error::ghost-pool is not the same build as ghost-mining"; exit 1; }
             echo "archive extracts ghost-mining and ghost-pool, identical"
+            # #402: the miner-side discovery shim ships with every node release, asked by name.
+            [ -x "$check/ghost-miner-proxy" ] || { echo "::error::the archive does not carry ghost-miner-proxy"; exit 1; }
+            # Run only where the runner can execute the target: a cross-built macOS x86_64 binary
+            # on an arm64 runner is not this check's business.
+            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+              proxy_says="$("$check/ghost-miner-proxy" --help 2>&1 || true)"
+              case "$proxy_says" in *"Decentralised mining discovery"*) ;; *) echo "::error::ghost-miner-proxy in the archive is not the discovery shim: ${proxy_says%%$'\n'*}"; exit 1 ;; esac
+            fi
+            echo "archive carries the ghost-miner-proxy discovery shim"
             # Where ghostd ships, so does its RPC client — and under that name it must BE the
             # RPC client. Asked of the extracted binary, not inferred from how it was built.
             if [ -f "$check/ghostd" ]; then

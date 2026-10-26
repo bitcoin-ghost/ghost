@@ -10,25 +10,27 @@ Nothing in that path requires trusting DNS, this website, or the node that serve
 
 ---
 
-## Status: not yet live
+## Status: live, single operator
 
-**The node-list checkpoint is dormant.** `MESH_NODE_LIST_CHECKPOINT_HEIGHT` is `u64::MAX`, so no
-checkpoint is proposed and none is served. The shim has nothing to verify yet.
+**The node-list checkpoint is live.** `MESH_NODE_LIST_CHECKPOINT_HEIGHT` fired at 970,500 on
+2026-10-08 and the checkpoint finalised there, with all eight nodes deriving the same blob. A new
+checkpoint is minted only when the list changes; it has not changed since 970,501.
 
-The genesis signer set below is published now because it is **stable and independently
-verifiable today** — you can check it against any pool node yourself, and it is the same value
-that will anchor the chain when discovery is armed. Nothing else on this page is usable yet.
+Verified end to end on 2026-10-26: `ghost-miner-proxy`, given only the eight ids below and one seed,
+fetched the checkpoint, verified it offline (8 nodes, 8 coordinators, height 970,501) and proxied a
+`mining.subscribe` to a live pool node, which answered with work.
 
-Before it can be armed, three things must be true:
+Two limits remain, and neither is solved by code:
 
-1. The checkpoint must **converge** — every node must derive a byte-identical blob. It could not
-   until recently: the node set was built from each node's own view of who was reachable, so eight
-   nodes produced up to six different answers and nothing ever finalised. That is fixed, but the
-   fix has not been proven on the live fleet.
-2. The genesis signer set must be **published** — this page.
-3. At least three **independently operated seeds** must exist. Today every pool node is run by one
-   operator, so a shim seeded only with Ghost nodes is trusting one party for its first fetch. That
-   is a real limitation and it is not solved by code.
+1. **One operator.** Every pool node is run by the same operator, so a shim seeded only with Ghost
+   nodes is trusting one party for its first fetch. At least three independently operated seeds are
+   needed before that changes.
+2. **The root of trust is the fleet's own keys.** With the eight ids below, whoever controls six of
+   the eight fleet keys can sign a list that points miners anywhere. The repository also carries a
+   stronger set (`config/genesis-signers.txt`: the eight plus four offline-only keys, 9 of 12
+   required), but the live checkpoint carries fleet signatures only, so a shim started from that
+   set rejects it today (`insufficient quorum: 6/9`). Until the offline keys co-sign, the
+   eight-id set below is the one that works.
 
 ---
 
@@ -63,7 +65,7 @@ curl -sk https://<any-pool-node>:8443/api/v1/network/elder \
   | jq -r '.elders[].node_id' | sort
 ```
 
-Verified against all eight nodes on 2026-08-20: identical, 8 elders, same hash. If a node disagrees
+Verified against all eight nodes on 2026-08-20 and again on 2026-10-26 (the MPC elder set, read from two nodes, identical): 8 elders, same hash. If a node disagrees
 with this page, trust the nodes and tell us — a set this page gets wrong is a wrong root of trust,
 which is worse than no page at all.
 
