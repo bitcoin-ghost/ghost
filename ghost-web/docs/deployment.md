@@ -130,7 +130,7 @@ Run from a file like this, with **no** flags at all, on a terminal, the installe
 
 `--archive` overrides both and writes `hazemode=FullArchive` (and `archive_mode = true` in `pool.toml`).
 
-`--sync haze` stops and asks you to type `yes`. That prompt reads from standard input, which under `curl … | sudo bash` is the script itself, not your keyboard — so for a haze install, download the script and run the file as shown above.
+`--sync haze` stops and asks you to type `yes` at the terminal. With `--non-interactive` there is no prompt: passing it is taken as confirmation that you have read the warning above. Without a terminal and without `--non-interactive`, the installer refuses.
 
 ### Mining mode
 
@@ -301,7 +301,7 @@ The installer does not install the node dashboard. It writes `/etc/systemd/syste
 
 ### Re-running the installer
 
-Re-running is safe for the two things that can't be recreated: an existing `node.key` is kept, and `internal_api_secret` is read back from the existing `pool.toml` and reused. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password, `signing_key` and SV2 authority keypair. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
+Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
 
 ## Automatic updates
 
@@ -320,6 +320,8 @@ When it is on, `ghost-auto-update.timer` runs `/opt/ghost/bin/ghost-auto-update.
 3. backs up the current binaries next to themselves as `*.bak.<timestamp>`;
 4. stops `ghost-mining` and `ghostd`, swaps in the new `ghostd` and `ghost-mining` (and `ghost-cli` and `ghost-admin` where installed), and starts them again;
 5. checks that ghostd's RPC answers and that ghost-mining's `/health` reports more than zero peers, and rolls back to the backups if either fails.
+
+⚠ The updater does not yet swap `pool_sv2` or `translator_sv2`. A release that changes either of them leaves an auto-updated node running a new `ghost-mining` against the old SV2 binaries, so keep auto-update off and upgrade by re-running the installer with the same flags.
 
 The outcome of the last run is in `/var/lib/ghost/auto-update.status`. `sudo /opt/ghost/bin/ghost-auto-update.sh --dry-run` verifies the latest release and reports what it would swap, without swapping.
 
