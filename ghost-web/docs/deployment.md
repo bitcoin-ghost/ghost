@@ -1,36 +1,48 @@
 # Deployment
 
-*How to stand up a Ghost node from scratch on Linux. Covers the full stack: ghost-core (the validating node), ghost-mining (the mining-pool daemon), and optionally ghost-pay (the L2 payment network). Targets operators who want their node visibly participating in the mesh, not someone trying out the software in dev mode.*
+*How to stand up a Ghost node on Linux with the one-line installer. Covers what the installer asks for, what it puts where, how the node comes up, and where to look when it doesn't. Targets operators who want their node visibly participating in the mesh, not someone trying out the software in dev mode.*
 
 ## What you're deploying
 
-Three binaries that talk to each other:
+Four services on one machine, all installed by `scripts/install-node.sh`:
 
 ```
                    ┌─────────────────┐
-                   │   ghost-core    │   Bitcoin Core fork
-                   │   (port 8332)   │   validates the chain
+                   │     ghostd      │   Bitcoin Core fork
+                   │  (P2P 8333,     │   validates the chain
+                   │   RPC 8332)     │
                    └────────┬────────┘
-                            │ RPC + ZMQ
-              ┌─────────────┴─────────────┐
-              │                           │
-   ┌──────────▼──────────┐     ┌─────────▼─────────┐
-   │     ghost-mining      │     │     ghost-pay     │
-   │  decentralised pool │◄────┤    L2 daemon      │
-   │  Stratum + BFT mesh │     │   (optional)      │
-   │  (ports 3333/8080…) │     │   (port 8800)     │
-   └──────────┬──────────┘     └───────────────────┘
-              │ Stratum V1 (port 3333)
-              │ Stratum V2 (port 34255)
-              ▼
-        ┌──────────┐
-        │  miners  │
-        └──────────┘
+                            │ RPC + ZMQ (localhost)
+                   ┌────────▼────────┐
+                   │  ghost-mining   │   decentralised pool node
+                   │  mesh 8555-8563 │   BFT mesh, payouts, capability
+                   │  HTTP 8080      │   challenges, Template
+                   │  TDP 8442       │   Distribution (TDP)
+                   └────────┬────────┘
+                            │ TDP
+                   ┌────────▼────────┐
+                   │    sri-pool     │   pool_sv2 — Stratum V2
+                   │   (SV2 34255)   │
+                   └────────┬────────┘
+                            │ SV2 (localhost)
+                   ┌────────▼────────┐
+                   │ sri-translator  │   translator_sv2 — Stratum V1
+                   │ (SV1 3333,      │   in front of the SV2 pool
+                   │  farm tier 4444)│
+                   └────────┬────────┘
+                            ▼
+                      ┌──────────┐
+                      │  miners  │
+                      └──────────┘
 ```
 
-You always need ghost-core. You almost always want ghost-mining — it's what makes the node a mining-pool participant and earns capability shares. ghost-pay is optional: it adds the L2 payments network and qualifies the node for the +4 GhostPay capability share if you also pass the verification challenges.
+The systemd units are `ghostd`, `ghost-mining`, `sri-pool` and `sri-translator`, plus a fifth, `ghost-mining-gate`, which starts the last three once ghostd has synced (see *The boot gate*, below).
 
-## Hardware
+Every binary comes from the signed release tarball. For each release that tarball holds `ghostd`, `ghost-cli` (the ghostd RPC client, like `bitcoin-cli`), `ghost-mining`, `ghost-admin`, `pool_sv2`, `translator_sv2`, `jd_client_sv2`, and `ghost-pool` (a hard link to `ghost-mining`, kept so older installers still find it). The installer installs `ghostd`, `ghost-cli`, `ghost-mining`, `ghost-admin`, `pool_sv2` and `translator_sv2` into `/opt/ghost/bin`; it does not install `jd_client_sv2` or the `ghost-pool` link.
+
+## Before you start
+
+**Machine.** The installer refuses anything that isn't `x86_64`, and must run as root. It uses `apt-get` and `ufw`, and is written for Ubuntu. Release tarballs also exist for macOS (x86_64 and aarch64), but the installer only uses the Linux one.
 
 | Component | Minimum | Recommended |
 |---|---|---|
@@ -39,400 +51,313 @@ You always need ghost-core. You almost always want ghost-mining — it's what ma
 | Storage | 500 GB SSD | 1 TB NVMe |
 | Network | 100 Mbps symmetric | 1 Gbps |
 
-The disk requirement depends on archive mode. A hazed node sits around 195 GB; a full archive is ~720 GB and growing. Most VPS hosts that advertise 500 GB SSD work for hazed; for full archive plan on 1 TB.
+The installer does not check any of these — they are guidance, not gates. Disk depends on the sync mode you choose: the default (`ibd`) prunes old blocks, `haze` sits around 195 GB, and a full archive (`--archive`) is ~720 GB and growing.
 
-## Software
+**Two bech32 mainnet addresses** (`bc1…`) that you control:
 
-- **OS:** Ubuntu 22.04 LTS or Debian 12. Other distributions work but aren't tested first.
-- **Rust:** 1.75+ (only required if building from source).
-- **SQLite 3.35+** — bundled with ghost-mining, no separate install.
-- **SQLCipher** — required for ghost-pay if you run it. Available as `libsqlcipher-dev` on Debian-family.
+- a **payout address**, where this node's reward share is paid; and
+- a **treasury address**, where this node's pool fee accumulates. There is deliberately no default — the installer refuses to run without one.
 
-A minimal apt install:
+They can be the same address or different ones. A third, a fresh taproot address (`bc1p…`), is needed only if you run a Wraith coordinator (below).
 
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev libsqlcipher-dev
-```
+**An alert endpoint** (for example `https://ntfy.sh`). It is optional in the sense that the install completes without it, but then alerts are disabled and every detector — low disk, node offline, behind tip, restart loop — fires into nothing.
 
-If building from source, also install Rust:
+⚠ **SSH on a non-standard port.** The installer enables `ufw` with `--force` and only allows SSH on `22/tcp`. If your SSH daemon listens anywhere else, add that rule (`sudo ufw allow <port>/tcp`) *before* you run the installer, or you will lock yourself out.
+
+## Install
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
+curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \
+  --payout-address bc1q... \
+  --treasury-address bc1q... \
+  --alert-webhook https://ntfy.sh
 ```
 
-## Install ghost-core
+That gives you the defaults: full trustless sync with pruning, Public Pool mining, the mempool Reaper on, no archive, no Wraith coordinator, no Tor, no automatic updates.
 
-ghost-core is a fork of Bitcoin Core with the haze, Reaper, and Shroud features added. Build it first so it's ready to validate the chain while you set up ghost-mining.
+The installer always installs the latest published GitHub release. To pin one, set `GHOST_VERSION` — after `sudo`, so it survives into the root shell:
 
 ```bash
-git clone https://github.com/bitcoin-ghost/ghost-core.git
-cd ghost-core
-./autogen.sh
-./configure --with-gui=no
-make -j$(nproc)
-sudo make install
+curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=v1.11.46 bash -s -- --payout-address ...
 ```
 
-Configure it via `/etc/ghost/bitcoin.conf`:
+If the GitHub API can't be reached and no version is pinned, the installer stops rather than guessing.
 
-```ini
-# Connection
-rpcuser=ghostrpc
-rpcpassword=CHOOSE_A_LONG_RANDOM_PASSWORD
-rpcbind=127.0.0.1
-rpcallowip=127.0.0.1
-rpcport=8332
-
-# ZMQ — ghost-mining reads new-block notifications via these
-zmqpubhashblock=tcp://127.0.0.1:28332
-zmqpubhashtx=tcp://127.0.0.1:28333
-
-# Privacy features (defaults; set them explicitly so the choice is in the config)
-shroud=1
-ghostmode=0
-hazemode=Hazed   # or FullArchive if you want to serve raw block data
-```
-
-Create the service user and the data directory before starting anything. Both ghostd and
-ghost-mining run as this one user — that is what the reference fleet does, and what
-`install-node.sh` sets up:
+**Reading it first.** The installer is one self-contained shell script. To read it before it runs as root, download it and run the file:
 
 ```bash
-sudo useradd --system --create-home --home-dir /home/ghost --shell /usr/sbin/nologin ghost
-sudo mkdir -p /var/lib/bitcoin /etc/ghost
-sudo chown -R ghost:ghost /var/lib/bitcoin /home/ghost
-sudo chmod 750 /var/lib/bitcoin
+curl -sSLo install-node.sh https://get.bitcoinghost.org
+less install-node.sh
+sudo bash install-node.sh --payout-address bc1q... --treasury-address bc1q... --alert-webhook https://ntfy.sh
 ```
 
-`--create-home` matters: ghost-mining keeps its database and MPC parameters under
-`/home/ghost/.ghost`, which the unit below references.
+Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the same choices as the flags below (payout and treasury addresses, sync mode, mining mode, pool name, Reaper, archive, Wraith, Tor, auto-update, nickname), shows a summary and asks before it changes anything. The wizard does not ask for an alert endpoint, so a wizard install has alerts disabled until you add one. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
 
-Start it under systemd. A skeleton unit at `/etc/systemd/system/ghost-core.service`:
+### Flags
 
-```ini
-[Unit]
-Description=Ghost Core (Bitcoin)
-After=network.target
+| Flag | Default | What it does |
+|---|---|---|
+| `--payout-address <bech32>` | — (required) | Where this node's reward share is paid. |
+| `--treasury-address <bech32>` | — (required) | Where this node's pool fee accumulates. |
+| `--alert-webhook <url>` | none | Push endpoint for node alerts. Without it, `[alerts]` is written with `enabled = false`. |
+| `--alert-topic <name>` | `ghost-node` | Push topic. |
+| `--nickname <name>` | `ghost-node` | Display name in the mesh. |
+| `--pool-name <name>` | mode default | Custom coinbase tag, shown on explorers as `- G H O S T - <name>`. Printable ASCII, at most 30 characters. |
+| `--sync <ibd\|haze>` | `ibd` | How ghostd stores the chain. See *Sync mode*, below. |
+| `--mining-mode <public\|pool\|solo>` | `public` | Who can mine on this node. See *Mining mode*, below. |
+| `--no-public-mining` | | Older alias for `--mining-mode solo`. If both are given, the last one wins. |
+| `--no-reaper` | Reaper on | Don't run the mempool Reaper. |
+| `--archive` | off | Full archive node (~720 GB). |
+| `--wraith` | off | Run a Wraith mixing coordinator. Requires `--coordinator-fee-address`. |
+| `--coordinator-fee-address <bc1p…>` | — | Where the coordinator's per-round fee lands. Must be taproot and must not be the payout address. |
+| `--no-wraith` | | Never run a coordinator (the default). |
+| `--tor` | off | Hybrid Tor: ghostd peers via Tor and publishes an onion, still reachable on clearnet 8333. |
+| `--tor-only` | off | ghostd uses Tor only (`onlynet=onion`) and 8333 is closed. Implies `--tor`. |
+| `--no-tor` | | Never use Tor (the default). |
+| `--auto-update` | off | Apply newer signed releases automatically. See *Automatic updates*, below. |
+| `--no-auto-update` | | Never auto-update (the default). |
+| `--non-interactive` | | Never start the wizard. |
+| `-h`, `--help` | | Print the help. |
 
-[Service]
-Type=simple
-User=ghost
-Group=ghost
-ExecStart=/usr/local/bin/ghostd -conf=/etc/ghost/bitcoin.conf -datadir=/var/lib/bitcoin
-Restart=always
-RestartSec=5
+## Choices
 
-[Install]
-WantedBy=multi-user.target
-```
+### Sync mode
 
-⚠ This unit ran as `User=bitcoin` for a long time, which was wrong twice over: nothing in
-this guide creates that user, and the reference fleet runs ghostd as `ghost` — the same
-user as ghost-mining below. If you built a node from an older copy of this guide, check with
-`systemctl show ghostd -p User --value` rather than reading the unit file.
+| `--sync` | Writes to `bitcoin.conf` | Meaning |
+|---|---|---|
+| `ibd` (default) | `prune=550` | Full trustless sync — every block validated — then old block files pruned. Takes hours, up to about a day. |
+| `haze` | `hazemode=Hazed` | Strips block data, ~195 GB, faster. **Irreversible**: the node can never serve raw blocks or become an archive node without a full resync. See [Haze](#haze). |
 
-`sudo systemctl enable --now ghost-core` and let it sync. Initial Block Download takes ~3 minutes via snapshot sync (hazed mode) or several hours from genesis on a slow link.
+`--archive` overrides both and writes `hazemode=FullArchive` (and `archive_mode = true` in `pool.toml`).
 
-## Install ghost-mining
+`--sync haze` stops and asks you to type `yes`. That prompt reads from standard input, which under `curl … | sudo bash` is the script itself, not your keyboard — so for a haze install, download the script and run the file as shown above.
 
-Either build from source or download a release.
+### Mining mode
 
-### Build from source
+| `--mining-mode` | Written as | Who can mine | Rewards | Stratum ports |
+|---|---|---|---|---|
+| `public` (default) | `public_pool` | Anyone. The node is DNS-registered. | Pool-aggregated (shared). | 3333, 34255 and 4444 open |
+| `pool` | `private_pool` | Your miners plus invited external miners, with a password. Not in DNS. | Pool-aggregated (shared). | 3333 and 34255 open |
+| `solo` | `private_solo` | Only miners you run locally, with a password. Not in DNS. | 99% of the subsidy plus all fees to your payout address. | all closed |
 
-```bash
-git clone https://github.com/bitcoin-ghost/ghost.git
-cd ghost
-cargo build --release -p ghost-mining --features zk-production
-```
+For the two private modes the installer generates a miner password, writes it to `/etc/ghost/pool.toml` as `[network] private_mining_password`, and prints it at the end of the install. Anyone with it can mine on the node.
 
-The `--features zk-production` flag is **required for mainnet** — it bakes in the requirement that real MPC ceremony parameters be present at runtime. Without it, the binary will refuse to start on mainnet with: `MAINNET SECURITY: ZK consensus on mainnet requires trusted setup parameters`. There are no exceptions to this rule.
+Port 4444 is a second SV1 listener (the "farm tier") with a higher starting difficulty, for large and rented miners; 3333 is sized for hobby hardware such as a BitAxe. It exists only in Public Pool mode.
 
-Binary lands at `target/release/ghost-mining`. Move it into place:
+SV1 miners connect to `stratum+tcp://<your-ip>:3333` and may authorise as `<address>.<worker>` to attribute their own shares.
 
-```bash
-sudo mkdir -p /opt/ghost/bin
-sudo cp target/release/ghost-mining /opt/ghost/bin/ghost-mining
-sudo chown root:root /opt/ghost/bin/ghost-mining
-sudo chmod 755 /opt/ghost/bin/ghost-mining
-```
+### Capabilities and reward shares
 
-### Pre-built binaries
+Nodes split the network's node rewards by capability shares, 5-4-3-2-1:
 
-```bash
-wget https://github.com/bitcoin-ghost/ghost/releases/latest/download/ghost-pool-linux-amd64.tar.gz
-tar -xzf ghost-pool-linux-amd64.tar.gz
-sudo cp ghost-mining /opt/ghost/bin/ghost-mining
-```
+| Shares | Capability | How a node gets there |
+|---|---|---|
+| +5 | Archive | `--archive`, so the node holds the full chain. |
+| +4 | Wraith coordinator | Once activated, earned by running a Wraith coordinator that peers can reach: `--wraith --coordinator-fee-address bc1p…`. See [Wraith](#wraith). |
+| +3 | Public Mining | `--mining-mode public` (the default). The private modes do not earn it. |
+| +2 | Reaper | On by default; `--no-reaper` gives it up. See [Reaper](#reaper). |
+| +1 | Elder | The first 101 nodes. See [Elder system](#elder-system). |
 
-Verify the signature (see [Security](/security.html) for the disclosure flow's GPG fingerprint).
+A flag does not award a share. Shares are earned by passing challenges that peers send to the node; a flag only puts the node in a position to pass them. A public-mining node whose Stratum port peers can't reach, or a coordinator whose port 9100 they can't dial, doesn't qualify.
 
-## Configure ghost-mining
+A Wraith coordinator also needs its own fee address. The installer refuses `--wraith` without `--coordinator-fee-address`, refuses one that isn't taproot (`bc1p…`), and refuses the payout address: that address is public, so a round paying it would be identifiable and attributable to this node.
 
-The minimum config that runs on mainnet, at `/etc/ghost/pool.toml`:
+### Tor
 
-```toml
-[identity]
-key_path = "/etc/ghost/node.key"
-display_name = "MyGhostNode"
+`--tor` installs Tor, adds `ControlPort 9051` with cookie authentication to `/etc/tor/torrc`, adds the `ghost` user to `debian-tor`, and gives ghostd `listenonion=1`, `torcontrol=127.0.0.1:9051` and `proxy=127.0.0.1:9050`. `--tor-only` adds `onlynet=onion` and removes the `8333/tcp` firewall rule.
 
-[bitcoin]
-network        = "mainnet"
-rpc_host       = "127.0.0.1"
-rpc_port       = 8332
-rpc_user       = "ghostrpc"
-rpc_password   = "MUST_MATCH_BITCOIN_CONF"
-zmq_hashblock  = "tcp://127.0.0.1:28332"
-zmq_hashtx     = "tcp://127.0.0.1:28333"
+Tor applies to ghostd's Bitcoin P2P only. ghost-mining's mesh, its HTTP API and the Stratum ports stay on clearnet, and `pool.toml` still records the machine's public IP.
 
-[network]
-public_address    = "pool.example.com"
-sv1_port          = 3333
-sv2_port          = 34255
-http_port         = 8080
-public_mining     = true                # qualifies for the +3 PublicMining share
-mining_mode       = "PublicPool"        # PublicPool | PrivatePool | PrivateSolo
+## What the installer does
 
-# REQUIRED on mainnet:
-noise_enabled        = true
-internal_api_secret  = "$(openssl rand -hex 32)"
-seed_nodes           = ["tcp://83.136.251.162:8559", "tcp://85.9.198.212:8559"]
-shroud_enabled       = true
+In order:
 
-[network.p2p]
-share_propagation    = 8555
-block_announcement   = 8556
-consensus_voting     = 8557
-health_monitoring    = 8558
-discovery            = 8559
-elder_management     = 8560
-payout_proposal      = 8561
-payout_transaction   = 8562
+1. **Packages.** `apt-get install` of the libevent and ZeroMQ runtime libraries, `ufw`, `openssl`, `curl`, `gnupg`, `tar` (and `tor` with `--tor`).
+2. **User and directories.** Creates the system user `ghost` with home `/home/ghost`, and `/opt/ghost/bin`, `/etc/ghost`, `/etc/bitcoin`, `/var/lib/bitcoin`, `/var/lib/ghost`, `/home/ghost/.ghost/data`. If you ran it via `sudo`, your own user is added to `systemd-journal` so `journalctl` works without sudo after your next login.
+3. **Persistent journal.** Writes `/etc/systemd/journald.conf.d/10-ghost.conf`: `Storage=persistent`, 2 GB cap, 1 GB kept free, two weeks' retention. Without it the journal lives in RAM and a reboot erases the evidence you need.
+4. **Download and verify.** Fetches `bitcoin-ghost-<version>-x86_64-unknown-linux-gnu.tar.gz`, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc` from the GitHub release, imports the release key from `https://get.bitcoinghost.org/ghost-release-key.asc`, and requires a valid signature from exactly `777FE81F8CC077FD3D08055E852C2B3190F5B928` before checking the tarball's SHA256. Any failure stops the install before a binary is written.
+5. **Secrets.** Generates a fresh RPC password, `internal_api_secret`, `signing_key`, and — for private modes — the miner password, all on this machine. Nothing is shared with any other node.
+6. **Configs.** Writes `/etc/bitcoin/bitcoin.conf` and `/etc/ghost/pool.toml` (both `ghost`-owned, mode 600), `/etc/ghost/translator-config.toml` (644) and `/etc/ghost/pool-config.toml` (root-only 600; it holds the SV2 authority secret).
+7. **Node identity.** Generates `/home/ghost/.ghost/node.key` with `ghost-mining --generate-identity` — unless one already exists, in which case it is kept.
+8. **SV2 keys.** Generates a fresh SV2 pool authority keypair for this node, and derives ghost-mining's template-server key from `node.key` so pool_sv2 can pin it.
+9. **Units.** Installs the units below, the firewall, the restart-loop watchdog and the auto-updater.
+10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else.
 
-[policy]
-profile = "permissive"   # bitcoin_pure | permissive | full_open
+ghost-mining runs genesis-anchored to the MPC ceremony: the drop-in `/etc/systemd/system/ghost-mining.service.d/genesis-anchor.conf` sets `ZK_GENESIS_PARAMS_HASH`, the immutable hash of the ceremony's genesis parameters, and `ZK_PARAMS_PATH` is `/home/ghost/.ghost/mpc_params`. There is no per-release parameter hash for you to set.
 
-[storage]
-db_path     = "/var/lib/ghost/data"
-wal_mode    = true
-haze_mode   = "Standard"
+### Files
 
-[pool]
-treasury_address  = "bc1q..."        # YOUR treasury P2TR address
-min_payout_sats   = 10000
-```
-
-**Items you must change before the first start:**
-
-- `bitcoin.rpc_password` — match what's in `bitcoin.conf`.
-- `network.public_address` — your reachable hostname or IP. Leave blank only if not running public mining.
-- `network.internal_api_secret` — generate with `openssl rand -hex 32`. Required on mainnet; ghost-mining refuses to start without it.
-- `pool.treasury_address` — a P2TR (`bc1p…`) address you control. The pool fee accumulates here until the treasury threshold is reached.
-
-**Items the deploy fails on if missing:**
-
-The mainnet config validator will reject the start with a specific error if any of these are missing or wrong:
-
-| Missing | Error |
+| Path | What |
 |---|---|
-| `noise_enabled = true` | "MAINNET SECURITY: Noise Protocol encryption is REQUIRED for mainnet" |
-| `internal_api_secret` | "MAINNET SECURITY: Internal API authentication is REQUIRED for mainnet" |
-| `seed_nodes` empty | "MAINNET SECURITY: At least one seed node is REQUIRED for mainnet" |
-| `signing_key` missing when `public_mining = true` | "signing_key is REQUIRED when public_mining is enabled" |
+| `/opt/ghost/bin/` | All binaries and helper scripts |
+| `/etc/bitcoin/bitcoin.conf` | ghostd config |
+| `/var/lib/bitcoin` | ghostd data directory |
+| `/etc/ghost/pool.toml` | ghost-mining config |
+| `/home/ghost/.ghost/node.key` | Node identity |
+| `/home/ghost/.ghost/data` | ghost-mining database |
+| `/etc/ghost/pool-config.toml` | pool_sv2 (sri-pool) config |
+| `/etc/ghost/translator-config.toml` | translator_sv2 (sri-translator) config |
+| `/etc/ghost/auto-update.conf` | Auto-update opt-in |
+| `/etc/ghost/version` | Installed release version |
 
-These are deliberate hard fails. Don't try to work around them.
+### Units
 
-## Generate keys
+| Unit | Runs as | Enabled at boot | Started by |
+|---|---|---|---|
+| `ghostd` | `ghost` | yes | systemd |
+| `ghost-mining-gate` | root | yes | systemd |
+| `ghost-mining` | `ghost` | no | the gate |
+| `sri-pool` | root | no | the gate |
+| `sri-translator` | `ghost` | no | the gate |
+| `ghost-mining-firewall.path` | root | yes | systemd |
+| `ghost-restart-watch.timer` | root | yes | systemd |
+| `ghost-auto-update.timer` | root | only with `--auto-update` | systemd |
 
-Two keys per node, both managed by `ghost-mining` itself:
+### The boot gate
 
-```bash
-# Ed25519 node identity. Writes to <data_dir>/node.key (default
-# ~/.ghost/node.key for the running user). No --output flag — the path
-# is derived from --data-dir / config. The PoW step takes a few seconds.
-sudo -u ghost /opt/ghost/bin/ghost-mining --generate-identity
+`ghost-mining`, `sri-pool` and `sri-translator` are **disabled at boot on purpose**. `ghost-mining-gate` runs `/opt/ghost/bin/wait-for-ghostd-sync.sh`, which asks ghostd's RPC for `getblockchaininfo` every 30 seconds. Once `initialblockdownload` is `false` it starts `ghost-mining`, then `sri-pool`, then `sri-translator`. On a fresh install that is hours away; on a normal reboot ghostd is already synced and the gate returns almost at once.
 
-# Inspect the generated identity (Node ID, signer type)
-sudo -u ghost /opt/ghost/bin/ghost-mining --show-identity
+The gate is what keeps an unsynced node off the mesh. Don't `systemctl enable` the three gated units yourself.
 
-# Tighten permissions on the resulting key file
-sudo chmod 600 /home/ghost/.ghost/node.key
+### Firewall and ports
 
-# X25519 Noise keypair: auto-generated on first start at
-# <data_dir>/noise.key if it doesn't already exist. There is no separate
-# subcommand to generate it — just start the service once and the key
-# file appears alongside node.key.
+The installer enables `ufw` and allows:
+
+| Port | Service | Notes |
+|---|---|---|
+| 22/tcp | SSH | The only SSH rule — see the warning above |
+| 8333/tcp | ghostd P2P | Removed with `--tor-only` |
+| 8080/tcp | ghost-mining HTTP API | |
+| 8442/tcp | ghost-mining TDP | |
+| 8443/tcp | Verification HTTPS | Peers fetch MPC params and votes |
+| 8555–8562/tcp | Mesh consensus | Share propagation, blocks, voting, health, discovery, Elder management, payouts |
+| 8563/tcp | Noise mesh | Verifications and MPC exchange |
+
+Four more ports follow `pool.toml`. `ghost-mining-firewall.path` watches the file and re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever it changes, so changing the mining mode later updates the firewall without a manual `ufw` step:
+
+| Port | Open when |
+|---|---|
+| 3333/tcp (SV1), 34255/tcp (SV2) | `mining_mode` is `public_pool` or `private_pool` |
+| 4444/tcp (farm tier) | `mining_mode` is `public_pool` |
+| 9100/tcp (Wraith coordinator) | `[coordinator] coordinator_role_enabled = true` |
+
+RPC (8332), ZMQ (28332–28334) and pool_sv2's monitoring endpoint (9090) are bound to `127.0.0.1`.
+
+## After the install
+
+The installer ends by printing the Node ID and each service's state:
+
+```
+  ✅ Bitcoin Ghost node installed.
+     ghostd:          active
+     ghost-mining-gate: active  (waiting for sync, then auto-starts ghost-mining)
+     ghost-mining:    inactive  (started by the gate)
+     sri-pool:        inactive  ...
+     sri-translator:  inactive  ...
 ```
 
-The node identity is your peer ID forever. Lose it and you lose your peer slot, your verification history, and (if you're an Elder) your Elder position. Back it up.
+`inactive` is expected for the last three until ghostd finishes syncing. For the private modes it also prints the miner password.
 
-## Systemd unit for ghost-mining
-
-`/etc/systemd/system/ghost-mining.service`:
-
-```ini
-[Unit]
-Description=Ghost Pool
-After=network.target ghost-core.service
-Wants=ghost-core.service
-
-[Service]
-Type=simple
-User=ghost
-Group=ghost
-ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml
-Restart=always
-RestartSec=10
-LimitNOFILE=65536
-
-# Ensure ZK params are findable
-Environment=ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params
-Environment=ZK_PARAMS_HASH=<sha256-of-the-params-your-cluster-runs>
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Two environment variables matter on mainnet:
-
-- `ZK_PARAMS_PATH` — directory containing the current MPC ceremony params and verifying keys (`note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`). The ceremony is rolling, so these are the current chain head, not necessarily a final ossified set.
-- `ZK_PARAMS_HASH` — SHA256 of the params used to verify the binary loaded the right ones. The release notes for each version include the expected hash.
-
-If the params don't match the hash, ghost-mining refuses to start. This protects against a node accidentally running with stale or test params.
-
-## First-time mainnet checklist
-
-Before flipping the service on, walk this checklist. Every item must pass:
-
-**Build:**
-
-- [ ] Binary built with `--features zk-production` (the binary will hard-fail at startup if not).
-- [ ] Binary built with `--release` profile.
-- [ ] `cargo clippy` clean (project allow rules apply).
-- [ ] `cargo audit` clean (no known vulnerabilities).
-
-**Configuration:**
-
-- [ ] `pool.toml: bitcoin.network = "mainnet"`.
-- [ ] `pool.toml: bitcoin.rpc_port = 8332`.
-- [ ] `pool.toml: noise_enabled = true`.
-- [ ] `pool.toml: internal_api_secret` set.
-- [ ] `pool.toml: seed_nodes` contains at least one valid peer.
-- [ ] `pool.toml: pool.treasury_address` is a P2TR address you control.
-- [ ] If running ghost-pay: `GHOST_PAY_API_SECRET` and `GHOST_PAY_PASSWORD` set in the systemd unit, `--network mainnet` flag passed.
-
-**ZK pipeline:**
-
-- [ ] All three VK files present: `note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`.
-- [ ] MPC params match the cluster you're joining (the current rolling-ceremony chain head, not test params).
-- [ ] `ZK_PARAMS_HASH` env matches the published hash for your ghost-mining version.
-
-**Database:**
-
-- [ ] Schema at the version expected by your binary. Migrations run on first start; check the log.
-- [ ] If running ghost-pay: SQLCipher encryption enabled on `ghost-pay.db`.
-- [ ] Backup scripts installed (recommended: nightly cron of `/var/lib/ghost/data` + `~/.ghost/mpc_params`).
-
-**Operational:**
-
-- [ ] `health-check.sh` (or similar) running every 15 minutes.
-- [ ] Alerts wired to Slack / email / PagerDuty.
-- [ ] `/metrics` endpoint scraping in your monitoring stack (Prometheus format).
-
-**Network hardening (mainnet defaults):**
-
-- [ ] Address validation rejects non-mainnet addresses.
-- [ ] Subsidy mismatch is a hard error.
-- [ ] Settlement requires 6 confirmations (not 1).
-- [ ] TX-fee sanity limit active (>100 BTC rejected).
-
-These are all on by default in the `--features zk-production` build. The checklist exists because surprise behaviours have caused incidents in the past.
-
-## First start
+Follow the sync, then the gate:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now ghost-mining
+sudo journalctl -u ghostd -f
+sudo journalctl -u ghost-mining-gate -f
+```
+
+When the gate logs `ghostd synced — starting ghost-mining`, the node joins the mesh and registers as an Elder if slots remain. Then:
+
+```bash
 sudo journalctl -u ghost-mining -f
+sudo journalctl -u sri-pool -u sri-translator -f
+curl -s 'http://127.0.0.1:8080/health?unsigned=true'      # peer_count should be above 0
+sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo
 ```
 
-What healthy startup logs look like, in order:
+`ghost-cli` lives in `/opt/ghost/bin`, not on the default `PATH`, and needs `sudo -u ghost` because `bitcoin.conf` (which holds the RPC password) is readable only by `ghost`.
 
-```
-INFO  Ghost Pool starting...
-INFO  Loaded config from /etc/ghost/pool.toml
-INFO  Node identity:  <ed25519-public-key>
-INFO  Coinbase tag:   - G H O S T - PublicPool
-INFO  Loaded ZK params:  note_spend_vk (sha256: …)
-INFO  Loaded ZK params:  payout_vk (sha256: …)
-INFO  Loaded ZK params:  unshield_vk (sha256: …)
-INFO  Connected to ghostd  network=mainnet  block_height=946700
-INFO  Mesh listening on tcp://0.0.0.0:8563  (Noise)
-INFO  Stratum V1 listening on 0.0.0.0:3333
-INFO  Stratum V2 listening on 0.0.0.0:34255
-INFO  Verification HTTP API on 0.0.0.0:8080
-INFO  Connected to seed peer  83.136.251.162:8559
-INFO  Connected to seed peer  85.9.198.212:8559
-INFO  Ghost Pool is ready!
-```
+**Back up `node.key`.** `/home/ghost/.ghost/node.key` is the node's identity. The node ID derives from it and the Elder slot is bound to it. Lose it and you lose the peer slot, the verification history and any Elder position; nothing on the machine backs it up for you. See [Key management](#key-management).
 
-If you see the "Ghost Pool is ready!" line, the node is up and on the mesh.
+### pool.toml
 
-If the log stops at `MAINNET SECURITY: …` — fix the mainnet hard-fail and restart.
+The installer writes `/etc/ghost/pool.toml` in full. The flags land here:
 
-## Verifying the node is actually participating
+| Flag | Key |
+|---|---|
+| `--payout-address` | `[pool] node_payout_address` (and `[network] solo_payout_address` for `solo`) |
+| `--treasury-address` | `[pool] treasury_address` |
+| `--nickname` | `[identity] display_name` |
+| `--pool-name` | `[pool] pool_name` |
+| `--mining-mode` | `[network] mining_mode` |
+| `--archive` | `[storage] archive_mode` |
+| `--no-reaper` | `[reaper] enabled` |
+| `--wraith` | `[coordinator] coordinator_enabled`, `coordinator_role_enabled`, and `[ghost_pay] wraith_enabled` |
+| `--coordinator-fee-address` | `[coordinator] coordinator_fee_address` |
+| `--alert-webhook`, `--alert-topic` | `[alerts]`, `[alerts.channels.push] webhook_url`, `topic` |
 
-Within 1-2 minutes the node should:
+The `[ghost_pay]` section name is historical: Ghost Pay is retired and `enabled` is always `false`; the section survives only because `wraith_enabled` is still read from it. The `[coordinator]` block is written on every node, switched off unless you passed `--wraith`, so the option is visible.
 
-1. **Appear in `/api/v1/mesh/status`** on a peer node, with `last_seen` updating every 10 seconds.
-2. **Be receiving health pings** — `sudo journalctl -u ghost-mining | grep "Received HealthPing"` should show entries.
-3. **Have a registered Elder slot** if it's among the first 101 — visible via `/api/v1/mesh/elders`.
+The installer does not install the node dashboard. It writes `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf` so that a dashboard installed later signs its requests with the same `internal_api_secret`. See [Node dashboard](#node-dashboard).
 
-Run `curl -s http://localhost:8080/api/v1/mining/status | jq` to see the local view. Run the same against any peer's public IP to compare.
+### Re-running the installer
 
-## Optional: ghost-pay (L2)
+Re-running is safe for the two things that can't be recreated: an existing `node.key` is kept, and `internal_api_secret` is read back from the existing `pool.toml` and reused. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password, `signing_key` and SV2 authority keypair. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
 
-If you want the +4 GhostPay capability share, install ghost-pay alongside:
+## Automatic updates
+
+Off by default. A node never upgrades itself unless you opt in, with `--auto-update` at install time or later:
 
 ```bash
-cargo build --release -p ghost-pay --features mainnet
-sudo cp target/release/ghost-pay /opt/ghost/bin/ghost-pay
+sudo /opt/ghost/bin/ghost-autoupdate-toggle on     # or off
 ```
 
-Configure via env vars in the systemd unit:
+The toggle writes `AUTO_UPDATE=true|false` to `/etc/ghost/auto-update.conf` and enables or disables `ghost-auto-update.timer`. The updater is a no-op unless that file says exactly `AUTO_UPDATE=true`.
 
-```ini
-Environment=GHOST_PAY_API_SECRET=<openssl rand -hex 32>
-Environment=GHOST_PAY_PASSWORD=<another-secret>
-ExecStart=/opt/ghost/bin/ghost-pay --network mainnet --port 8800
-```
+When it is on, `ghost-auto-update.timer` runs `/opt/ghost/bin/ghost-auto-update.sh` 15 minutes after boot and then every 6 hours, with up to an hour of random delay. Each run:
 
-The capability is verified by random L2-block-lookup challenges from peers. Pass rate ≥ 90% over 30 days qualifies the node.
+1. compares the latest GitHub release with `/etc/ghost/version`, and stops if it is not newer;
+2. downloads the tarball, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc`, and verifies the signature against the same pinned key and the tarball's checksum — on any failure no binary is touched;
+3. backs up the current binaries next to themselves as `*.bak.<timestamp>`;
+4. stops `ghost-mining` and `ghostd`, swaps in the new `ghostd` and `ghost-mining` (and `ghost-cli` and `ghost-admin` where installed), and starts them again;
+5. checks that ghostd's RPC answers and that ghost-mining's `/health` reports more than zero peers, and rolls back to the backups if either fails.
+
+The outcome of the last run is in `/var/lib/ghost/auto-update.status`. `sudo /opt/ghost/bin/ghost-auto-update.sh --dry-run` verifies the latest release and reports what it would swap, without swapping.
+
+## Alerts and the restart watchdog
+
+With `--alert-webhook`, `pool.toml` gets an `[alerts]` block with a push channel. Without it the block is written with `enabled = false` and a comment saying so, and ghost-mining warns at every start. To add one later, set `[alerts] enabled = true` and fill in `[alerts.channels.push]`.
+
+systemd restarts a crashing service for ever and reports it `active` between crashes. `ghost-restart-watch.timer` runs `/opt/ghost/bin/ghost-restart-watch.sh` every 5 minutes against `ghost-mining`, `sri-pool`, `sri-translator` and `ghostd`. It alerts through the node's own `[alerts]` configuration on two conditions: a unit restarting 3 or more times between runs, and a unit that is `active` but not listening on its port (8442, 34255, 3333 and 8332 respectively) for 3 consecutive checks. Optional settings go in `/etc/ghost/restart-watch.conf`.
 
 ## Where to look when things break
 
 | Symptom | First check |
 |---|---|
-| ghost-mining exits at startup | `sudo journalctl -u ghost-mining -n 50` — most config errors are explicit |
-| Stuck at "Connecting to seed nodes" | Outbound 8559 not allowed by firewall, or seed nodes unreachable |
-| Mesh count = 0 | Inbound 8563 (Noise) or 8559 (discovery) blocked, or peer reachability problem |
-| Verification challenges all failing | HTTP API not reachable from peers, or `internal_api_secret` mismatch between this node and its peers |
-| ZK params hash mismatch | Wrong binary version vs deployed params; rebuild matching the cluster's params |
-| `MAINNET SECURITY` errors | A required mainnet field is missing — read the exact error, fix, restart |
+| Installer stops with `Release signature verification FAILED` or `Checksum verification FAILED` | The download did not match the signed release. Don't work around it; re-run, and if it persists report it. |
+| Installer stops with `could not determine the latest release` | The GitHub API was unreachable. Re-run, or pin `GHOST_VERSION`. |
+| Lost SSH after the install | `ufw` only allows 22/tcp. Use the provider's console and `ufw allow <port>/tcp`. |
+| ghost-mining, sri-pool, sri-translator all `inactive` | Expected until ghostd is synced. `sudo journalctl -u ghost-mining-gate -f` — it logs `waiting for ghostd to finish initial sync...` until then. |
+| ghostd not syncing | `sudo journalctl -u ghostd -n 100`; `sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo` |
+| ghost-mining exits at startup | `sudo journalctl -u ghost-mining -n 100` — most config errors are explicit |
+| `peer_count` stays at 0 | Inbound 8555–8563 or 8443 blocked upstream of `ufw` (a provider firewall or security group) |
+| Miners can't connect | `sudo journalctl -u sri-pool -u sri-translator -n 100`; `sudo ufw status` should show 3333 (and 34255) for the pool modes. In `solo` mode they are closed on purpose. |
+| A service keeps restarting, or is up but serving nothing | `sudo /opt/ghost/bin/ghost-restart-watch.sh --check` |
+| An automatic update rolled back | `cat /var/lib/ghost/auto-update.status`; `sudo journalctl -u ghost-auto-update -n 100` |
 
 The [Recovery runbook](#recovery) covers what to do when a running node breaks (DB corruption, mesh split, payout proposal divergence, etc).
 
 ## What this guide isn't
 
-- **It isn't a tuning guide.** Defaults are sane; performance tuning is a separate exercise. Ghost-pool has been running at our reference cluster on 8-core / 16 GB / NVMe for months without configuration past the basics.
-- **It isn't multi-node coordination.** A second node uses the same procedure on a different host; they discover each other through the seed-node list. There's no centralised registry or membership flow.
-- **It isn't an exhaustive config reference.** Many fields exist that aren't covered here. The internal `DEPLOYMENT_RUNBOOK.md` lists every field; this doc covers the ones an operator must touch.
-- **It isn't a security review.** [Security](/security.html) covers the disclosure flow. The deployment doc assumes operators know to keep their RPC credentials out of public repos and their `internal_api_secret` rotated.
+- **It isn't a tuning guide.** The installer's defaults are what the reference fleet runs.
+- **It isn't multi-node coordination.** A second node runs the same installer on a different host; it bootstraps from the seed Elders built into the installer and discovers the rest through gossip. There's no centralised registry or membership flow.
+- **It isn't a config reference.** It covers the keys the installer's flags set; other fields keep their defaults.
+- **It isn't a security review.** [Security](/security.html) covers the disclosure flow. Keep `pool.toml`, `bitcoin.conf`, `pool-config.toml` and `node.key` off public repos and backups you don't control.
 
 ## Source
 
 | File | Purpose |
 |---|---|
-| `bins/ghost-pool/src/main.rs` | Service entry point + config loading + mainnet validation |
-| `crates/ghost-common/src/config.rs` | NetworkConfig, P2PPortConfig structures |
+| `scripts/install-node.sh` | The installer, including the boot gate, firewall reconcile, restart watchdog and auto-updater it lays down |
+| `scripts/ghost-auto-update.sh` | Canonical copy of the auto-updater |
+| `crates/ghost-common/src/constants.rs` | Capability share weights, `MAX_ELDERS` |
+| `crates/ghost-common/src/config.rs` | `pool.toml` structures |
