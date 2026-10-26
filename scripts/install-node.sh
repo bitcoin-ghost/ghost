@@ -109,13 +109,15 @@ Bitcoin Ghost node installer
 
 Required:
   --payout-address <bech32>   Where this node's reward share is paid.
+  --treasury-address <bech32> Where THIS node's pool fee accumulates. There is deliberately
+                                no default: a default would silently pay a stranger's fee to
+                                whoever shipped the installer (#982).
+
+Strongly recommended:
   --alert-webhook <url>       Push endpoint for node alerts (e.g. https://ntfy.sh). Without
                                 this, alerts are DISABLED and all fourteen detectors — low disk,
                                 node offline, behind tip, restart loop … — fire into nothing.
   --alert-topic <name>        Push topic                        (default: ghost-node)
-  --treasury-address <bech32> Where THIS node's pool fee accumulates. There is deliberately
-                                no default: a default would silently pay a stranger's fee to
-                                whoever shipped the installer (#982).
 
 Options:
   --nickname <name>           Display name in the mesh        (default: ghost-node)
@@ -144,7 +146,12 @@ Options:
                                 one on the command line wins.
   --no-reaper                 Don't run the mempool reaper    (capability -2)
   --archive                   Full archive node (~720GB, capability +5)
-  --wraith                    Run a Wraith mixing coordinator
+  --wraith                    Run a Wraith mixing coordinator (needs
+                                --coordinator-fee-address)
+  --coordinator-fee-address <bc1p…>
+                              Where the coordinator's round fee is paid. Required
+                                with --wraith; a mainnet P2TR address that is NOT
+                                the payout address.
   --no-wraith                 Never run a Wraith mixing coordinator (default)
   --tor                       Route over Tor (hybrid): outbound peers via Tor +
                                 publish an onion, still reachable on clearnet 8333
@@ -152,8 +159,8 @@ Options:
                                 close 8333 (implies --tor)
   --no-tor                    Never use Tor                   (default)
   --auto-update               Automatically apply newer SIGNED releases (off by
-                                default). Verifies the GPG signature + ghostd
-                                checksum before swapping any binary; health-checks
+                                default). Verifies the GPG signature and the
+                                tarball checksum before swapping any binary; health-checks
                                 and rolls back on failure. Checked every 6h.
   --no-auto-update            Never auto-update                (default)
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
@@ -505,7 +512,17 @@ case "$SYNC_MODE" in ibd) ;;
   haze) if [[ "$WIZARD_RAN" != "true" ]]; then
           echo -e "\033[33mWARNING\033[0m: --sync haze strips block data IRREVERSIBLY. This node can never";
           echo "         serve raw blocks or become an archive node without a full resync.";
-          read -rp "         Type 'yes' to continue: " c; [[ "$c" == "yes" ]] || err "Aborted.";
+          # ⛔ Never `read` stdin here: under `curl … | sudo bash` stdin IS this script, so the
+          # prompt swallowed the next line of the installer as its answer. Ask the terminal; with
+          # no terminal, --non-interactive is the operator saying they have read this.
+          if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            echo "         --non-interactive given: continuing."
+          elif { true </dev/tty; } 2>/dev/null; then
+            read -rp "         Type 'yes' to continue: " c </dev/tty || c=""
+            [[ "$c" == "yes" ]] || err "Aborted."
+          else
+            err "--sync haze needs confirmation and there is no terminal to ask. Re-run with --non-interactive to confirm."
+          fi
         fi;;
   *) err "--sync must be ibd or haze.";;
 esac
@@ -614,7 +631,7 @@ tar -xzf "$POOL_TARBALL"
 # journal as `ghost-pool`, a unit this installer does not create, so the dashboard's restart and
 # log pages would fail on a node that otherwise looked healthy.
 NODE_BIN_SRC="$(find . -name ghost-mining -type f | head -1)"
-[ -n "$NODE_BIN_SRC" ] || err "Release ${VERSION:-} does not contain ghost-mining — it predates the rename from ghost-pool. This installer needs a newer release."
+[ -n "$NODE_BIN_SRC" ] || err "Release ${GHOST_VERSION:-} does not contain ghost-mining — it predates the rename from ghost-pool. This installer needs a newer release."
 install -m755 -o root -g root "$NODE_BIN_SRC" /opt/ghost/bin/ghost-mining
 # ghost-cli (the ghostd RPC client, like bitcoin-cli) ships in the same signed
 # tarball. Install it so operators can query their node's ghostd directly — it is
@@ -678,7 +695,12 @@ if [[ -f /etc/ghost/pool.toml ]] && grep -qE '^internal_api_secret[[:space:]]*='
   APISECRET="$(sed -nE 's/^internal_api_secret[[:space:]]*=[[:space:]]*"([0-9a-fA-F]{64})".*/\1/p' /etc/ghost/pool.toml | head -1)"
 fi
 [[ -n "${APISECRET:-}" ]] || APISECRET="$(openssl rand -hex 32)"
-SIGNKEY="$(openssl rand -hex 32)"
+# Kept across a re-run, like the secret above: a fresh one every run would quietly re-key a node
+# whose operator only meant to change a flag.
+if [[ -f /etc/ghost/pool.toml ]] && grep -qE '^signing_key[[:space:]]*=' /etc/ghost/pool.toml; then
+  SIGNKEY="$(sed -nE 's/^signing_key[[:space:]]*=[[:space:]]*"([0-9a-fA-F]{64})".*/\1/p' /etc/ghost/pool.toml | head -1)"
+fi
+[[ -n "${SIGNKEY:-}" ]] || SIGNKEY="$(openssl rand -hex 32)"
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 # Private-mining password. The private modes (private_pool, private_solo) require
 # a miner password — ghost-mining refuses to start without one — so we generate a
@@ -1027,10 +1049,18 @@ TDP_PUBKEY="$(/opt/ghost/bin/pool_sv2 --tdp-pubkey-from-keyfile "$NODE_KEY_FILE"
   || err "Failed to derive the TDP authority public key. The installed pool_sv2 lacks --tdp-pubkey-from-keyfile; use a release that bundles the SV2 keygen support."
 [[ -n "$TDP_PUBKEY" ]] || err "Derived TDP authority public key is empty."
 
-# Fresh per-node SV2 pool authority keypair (base58 secp256k1, the format
-# pool-config.toml expects). Printed as two TOML lines; we split out each half.
-SV2_KEYPAIR="$(/opt/ghost/bin/pool_sv2 --generate-key 2>/dev/null)" \
-  || err "Failed to generate the SV2 pool authority keypair. The installed pool_sv2 lacks --generate-key; use a release that bundles the SV2 keygen support."
+# Per-node SV2 pool authority keypair (base58 secp256k1, the format pool-config.toml expects).
+# Printed as two TOML lines; we split out each half. ⛔ Reused on a re-run: SV2 miners pin the
+# authority PUBLIC key, so a fresh pair every run would cut off every SV2 miner on this node.
+if [[ -f /etc/ghost/pool-config.toml ]] \
+   && grep -qE '^authority_public_key *= *"[^"]+"$' /etc/ghost/pool-config.toml \
+   && grep -qE '^authority_secret_key *= *"[^"]+"$' /etc/ghost/pool-config.toml; then
+  SV2_KEYPAIR="$(grep -E '^authority_(public|secret)_key *= *"' /etc/ghost/pool-config.toml)"
+  log "Keeping the existing SV2 pool authority keypair"
+else
+  SV2_KEYPAIR="$(/opt/ghost/bin/pool_sv2 --generate-key 2>/dev/null)" \
+    || err "Failed to generate the SV2 pool authority keypair. The installed pool_sv2 lacks --generate-key; use a release that bundles the SV2 keygen support."
+fi
 SV2_AUTH_PUB="$(sed -n 's/^authority_public_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEYPAIR")"
 SV2_AUTH_SEC="$(sed -n 's/^authority_secret_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEYPAIR")"
 [[ -n "$SV2_AUTH_PUB" && -n "$SV2_AUTH_SEC" ]] || err "Could not parse the generated SV2 authority keypair."
@@ -2585,6 +2615,12 @@ systemctl enable --now ghost-mining-gate >/dev/null 2>&1
 sleep 5
 
 NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
+# Solo mode closes Stratum to external miners, so "point a miner at <public IP>" would be wrong.
+if [[ "$MINING_MODE" == "private_solo" ]]; then
+  MINER_POINTER="Point a miner running on this host at:  stratum+tcp://127.0.0.1:3333"
+else
+  MINER_POINTER="Point a miner at:  stratum+tcp://${PUBIP}:3333"
+fi
 cat <<EOF
 
   ✅ Bitcoin Ghost node installed.
@@ -2599,7 +2635,7 @@ cat <<EOF
   then starts ghost-mining AUTOMATICALLY — your node joins the mesh and registers as
   an Elder if slots remain (first 101) — followed by the SV2 stratum stack
   (sri-pool + sri-translator), which serves miners on Stratum port 3333 (SV1) /
-  34255 (SV2). Point a miner at:  stratum+tcp://${PUBIP}:3333
+  34255 (SV2). ${MINER_POINTER}
   Watch the gate:    sudo journalctl -u ghost-mining-gate -f
   Watch the stratum: sudo journalctl -u sri-pool -u sri-translator -f
 EOF
