@@ -6387,6 +6387,20 @@ const ADDRESS_PROOF_FAILED_SQL: &str = "SELECT target_node_id
      HAVING 2 * COUNT(DISTINCT CASE WHEN passed = 0 THEN challenger_id END)
             > COUNT(DISTINCT challenger_id)";
 
+/// [`Database::ledger_voterset_challenger_rows`]. A constant so the plan test explains exactly
+/// this statement.
+///
+/// ⛔ `INDEXED BY` (#1034): left alone the planner drives from `nodes` into the PRIMARY KEY index
+/// and reads a proof-blob table page per verdict for `passed` and `round_height` — 18.9-21.6 s
+/// cold for one pass against 1.4 s through the covering index. See `migrate_v62`.
+const VOTERSET_CHALLENGER_ROWS_SQL: &str =
+    "SELECT vl.challenger_id, vl.round_height, n.public_address, vl.passed
+     FROM verification_ledger vl INDEXED BY idx_vled_target_cap_ts_cover
+     JOIN nodes n ON n.node_id = vl.challenger_id
+     WHERE vl.target_node_id = ?1 AND vl.capability = ?2
+       AND vl.timestamp >= ?3 AND vl.timestamp <= ?4
+       AND n.payout_address IS NOT NULL AND n.payout_address != ''";
+
 impl Database {
     /// Persist a signed verification result into the verification ledger (schema v42).
     ///
@@ -7226,14 +7240,7 @@ impl Database {
     ) -> GhostResult<Vec<LedgerVerdictRow>> {
         self.with_connection(|conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT vl.challenger_id, vl.round_height, n.public_address, vl.passed
-                     FROM verification_ledger vl
-                     JOIN nodes n ON n.node_id = vl.challenger_id
-                     WHERE vl.target_node_id = ?1 AND vl.capability = ?2
-                       AND vl.timestamp >= ?3 AND vl.timestamp <= ?4
-                       AND n.payout_address IS NOT NULL AND n.payout_address != ''",
-                )
+                .prepare(VOTERSET_CHALLENGER_ROWS_SQL)
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let rows = stmt
                 .query_map(params![target_hex, capability, since, until], |row| {
@@ -14978,55 +14985,87 @@ mod tests {
         );
     }
 
+    /// `EXPLAIN QUERY PLAN` for `sql` under production statistics for the ledger and `nodes`.
+    ///
+    /// On an empty, unanalyzed database the planner picks the covering indexes unprompted, so a
+    /// plan test there could not see an `INDEXED BY` pin go missing. With these it picks the
+    /// table-reading plans, exactly as production did. Ledger rows are vm5's (2026-10-27), `nodes`
+    /// is vm8's; the two covering indexes did not exist on vm5 when this was read.
+    fn ledger_query_plan(sql: &str, params: impl rusqlite::Params) -> Vec<String> {
+        let db = Database::in_memory().expect("create in-memory db");
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                // ANALYZE creates sqlite_stat1; `ANALYZE sqlite_schema` reloads it.
+                "ANALYZE;
+                 DELETE FROM sqlite_stat1 WHERE tbl IN ('verification_ledger', 'nodes');
+                 INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
+                   ('verification_ledger', 'idx_vled_ts', '843995 3'),
+                   ('verification_ledger', 'sqlite_autoindex_verification_ledger_1',
+                    '843995 105500 14807 3735 1'),
+                   -- vm5's idx_vled_target_cap_ts was '843995 93778 24824 1'; widening it
+                   -- appends a 1 per added column (vm8 after v62: '847331 94148 24922 1 1 1 1').
+                   ('verification_ledger', 'idx_vled_target_cap_ts_cover',
+                    '843995 93778 24824 1 1 1 1'),
+                   -- Four capabilities over 843,995 rows, and (capability, timestamp) all but
+                   -- unique given idx_vled_ts's 3 rows per timestamp across ALL capabilities.
+                   ('verification_ledger', 'idx_vled_cap_ts_cover', '843995 210999 1 1 1 1 1'),
+                   ('nodes', 'idx_nodes_payout', '8 1'),
+                   ('nodes', 'idx_nodes_last_seen', '8 2'),
+                   ('nodes', 'idx_nodes_elder', '8 8 1'),
+                   ('nodes', 'sqlite_autoindex_nodes_1', '8 1');
+                 ANALYZE sqlite_schema;",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params, |row| row.get::<_, String>(3))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("explain the ledger query")
+    }
+
+    /// The plan step that reads `verification_ledger`.
+    fn ledger_step(plan: &[String]) -> &str {
+        plan.iter()
+            .find(|line| line.contains("verification_ledger") || line.contains(" vl "))
+            .unwrap_or_else(|| panic!("no ledger step in the plan: {plan:?}"))
+    }
+
     /// #1034: the address-proof window scan must never touch the ledger TABLE.
     ///
     /// Its rows sit on pages full of proof blobs, and on a 3.9 GB node those pages are rarely
     /// cached: the skip-scan the planner prefers read one per row and held the connection 17-20 s
     /// after block arrivals on vm5, freezing every other database caller. "COVERING INDEX" is
     /// the property that matters — a plain `USING INDEX` here is that stall again.
-    ///
-    /// The planner runs on vm5's real statistics (2026-10-27). On an empty, unanalyzed database
-    /// it picks the covering index unprompted, so without them this test could not see the
-    /// `INDEXED BY` pin go missing; with them it picks the skip-scan, exactly as production did.
     #[test]
     fn address_proof_scan_reads_only_the_covering_index() {
-        let db = Database::in_memory().expect("create in-memory db");
-        let plan: Vec<String> = db
-            .with_connection(|conn| {
-                conn.execute_batch(
-                    // ANALYZE creates sqlite_stat1; `ANALYZE sqlite_schema` reloads it.
-                    "ANALYZE;
-                     DELETE FROM sqlite_stat1 WHERE tbl = 'verification_ledger';
-                     INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
-                       ('verification_ledger', 'idx_vled_ts', '843995 3'),
-                       ('verification_ledger', 'idx_vled_target_cap_ts', '843995 93778 24824 1'),
-                       ('verification_ledger', 'sqlite_autoindex_verification_ledger_1',
-                        '843995 105500 14807 3735 1'),
-                       -- Not read from vm5, where the index does not exist yet: four
-                       -- capabilities over 843,995 rows, and (capability, timestamp) all but
-                       -- unique given idx_vled_ts's 3 rows per timestamp across ALL capabilities.
-                       ('verification_ledger', 'idx_vled_cap_ts_cover',
-                        '843995 210999 1 1 1 1 1');
-                     ANALYZE sqlite_schema;",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-                let mut stmt = conn
-                    .prepare(&format!("EXPLAIN QUERY PLAN {ADDRESS_PROOF_FAILED_SQL}"))
-                    .map_err(|e| GhostError::Database(e.to_string()))?;
-                let rows = stmt
-                    .query_map(params![0i64, 1i64, 0i64], |row| row.get::<_, String>(3))
-                    .map_err(|e| GhostError::Database(e.to_string()))?;
-                rows.collect::<Result<_, _>>()
-                    .map_err(|e| GhostError::Database(e.to_string()))
-            })
-            .expect("explain the address-proof query");
-        let scan = plan
-            .iter()
-            .find(|line| line.contains("verification_ledger"))
-            .unwrap_or_else(|| panic!("no ledger step in the plan: {plan:?}"));
+        let plan = ledger_query_plan(ADDRESS_PROOF_FAILED_SQL, params![0i64, 1i64, 0i64]);
+        let scan = ledger_step(&plan);
         assert!(
             scan.contains("USING COVERING INDEX idx_vled_cap_ts_cover"),
             "the address-proof scan must read only idx_vled_cap_ts_cover, got: {scan}"
+        );
+    }
+
+    /// #1034: the per-target voter-set read must never touch the ledger TABLE either.
+    ///
+    /// Once the address-proof scan was fixed, this was the block-arrival stall: unpinned, the
+    /// planner starts from `nodes` and probes the PRIMARY KEY index, which lacks `passed` and
+    /// `round_height` — a table page per verdict, ~17 s across one qualification pass on vm5.
+    #[test]
+    fn voterset_rows_read_only_the_covering_index() {
+        let plan = ledger_query_plan(
+            VOTERSET_CHALLENGER_ROWS_SQL,
+            params!["t", "address", 0i64, 1i64],
+        );
+        let scan = ledger_step(&plan);
+        assert!(
+            scan.contains("USING COVERING INDEX idx_vled_target_cap_ts_cover"),
+            "the voter-set read must use only idx_vled_target_cap_ts_cover, got: {scan}"
         );
     }
 

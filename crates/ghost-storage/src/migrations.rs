@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 61;
+const SCHEMA_VERSION: u32 = 62;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -138,6 +138,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (59, migrate_v59),
         (60, migrate_v60),
         (61, migrate_v61),
+        (62, migrate_v62),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2704,34 +2705,53 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
-/// v60: one payout row per `(round_id, recipient_id, recipient_type)` (#995).
+/// v62 (#1034): make the per-target ledger index covering.
 ///
-/// `record_payout_entries` runs on **every arming**, and `insert_payout` was a plain `INSERT`.
-/// Arming happens per proposal, not per block, so a round armed twice accumulated a second full
-/// set of payout rows — with DIFFERENT amounts, because the later proposal saw more accumulated
-/// work. MEASURED on ghost-vm5, 2026-10-04: 35,571 rows over 2,417 rounds held **752** duplicate
-/// `(round, recipient, type)` groups, up to **3** rows deep, and in 455 of those groups the
-/// amounts differed. Only one proposal is ever live (`approved_payout` is overwritten), so every
-/// earlier set is superseded and nothing in the table said which was which.
+/// `ledger_voterset_challenger_rows` reads one target+capability over the seven-day window, once
+/// per (node, capability) in a qualification pass. The planner drove it from `nodes` into the
+/// PRIMARY KEY index, which has no `passed` or `round_height`, so every verdict cost a TABLE
+/// lookup on a proof-blob page. With `address_proof_failed_nodes` fixed by v61 this became the
+/// block-arrival stall: on vm5 after a 40-minute gap, 8 holds of 1.0-4.0 s, ~17 s in all
+/// (2026-10-27). MEASURED on a copy of vm8's database, the 32 queries of one pass: **18.9-21.6 s
+/// cold**, 0.84 s warm.
 ///
-/// ⛔ **`UNIQUE(round_id, recipient_id)` would be the WRONG constraint** and would have rejected
-/// 1,284 legitimate rows — the gap between 2,036 duplicate PAIRS and 752 duplicate TRIPLES. The
-/// tx-fees entry is written with `recipient_id = proposer`, and that same node is also a `node`
-/// recipient in the same round, so one node holds two rows per round under different
-/// `recipient_type`s by design.
+/// `idx_vled_target_cap_ts` already led with `(target_node_id, capability, timestamp)`; carrying
+/// `challenger_id`, `passed` and `round_height` as well answers the query from the index alone:
+/// **1.4 s cold**, 0.27 s warm, identical rows. The wider index replaces the old one — every
+/// lookup the old one served is a prefix of the new one — so the file grows ~56 MB, not ~132 MB.
+/// The query pins it with `INDEXED BY`: even with the index analyzed the planner kept the
+/// `nodes`-first plan.
 ///
-/// **Dedupe rule: keep the newest, never touch a settled row.** Greatest `created_at`, tie-broken
-/// on greatest `id`, which is the arming that was actually live. A row with a `txid` records money
-/// that moved and is preserved whatever its age — there are **zero** such rows on the fleet today,
-/// which is precisely why the rule is written now instead of when there are some.
-///
-/// The index then makes the upsert in `insert_payout` possible, so a re-arm REPLACES its own
-/// earlier set. Without the index the upsert has no conflict target; without the dedupe the index
-/// cannot be created at all — `CREATE UNIQUE INDEX` fails outright on the 752 groups, so the
-/// order here is load-bearing.
-///
-/// Cheap: `payouts` plus its indexes measured **6.6 MB**. This was once deferred as needing "a
-/// 2.7 GB table rebuild" — that figure belonged to `shares_archive`.
+/// An older binary opens the newer database fine: nothing before v62 names either index.
+fn migrate_v62(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v62: covering per-target index for verification_ledger");
+    // Migrations replay over partial schemas in tests; v60 guards the same way.
+    let has_ledger: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='verification_ledger'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_ledger {
+        debug!("v62: no `verification_ledger` table — nothing to index");
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_vled_target_cap_ts_cover
+             ON verification_ledger(target_node_id, capability, timestamp, challenger_id, passed,
+                                    round_height);
+         DROP INDEX IF EXISTS idx_vled_target_cap_ts;",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    // As v61: analyze the new index while it is cached, or the next `Database::optimize`
+    // re-analyzes the whole ledger cold. The dropped index's stat1 row goes with it.
+    conn.execute_batch("ANALYZE idx_vled_target_cap_ts_cover;")
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v62: replaced idx_vled_target_cap_ts with the covering idx_vled_target_cap_ts_cover");
+    Ok(())
+}
+
 /// v61 (#1034): a covering index for the ledger's capability-wide window scans.
 ///
 /// `address_proof_failed_nodes` reads every `address` verdict in a seven-day window across ALL
@@ -2777,6 +2797,34 @@ fn migrate_v61(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v60: one payout row per `(round_id, recipient_id, recipient_type)` (#995).
+///
+/// `record_payout_entries` runs on **every arming**, and `insert_payout` was a plain `INSERT`.
+/// Arming happens per proposal, not per block, so a round armed twice accumulated a second full
+/// set of payout rows — with DIFFERENT amounts, because the later proposal saw more accumulated
+/// work. MEASURED on ghost-vm5, 2026-10-04: 35,571 rows over 2,417 rounds held **752** duplicate
+/// `(round, recipient, type)` groups, up to **3** rows deep, and in 455 of those groups the
+/// amounts differed. Only one proposal is ever live (`approved_payout` is overwritten), so every
+/// earlier set is superseded and nothing in the table said which was which.
+///
+/// ⛔ **`UNIQUE(round_id, recipient_id)` would be the WRONG constraint** and would have rejected
+/// 1,284 legitimate rows — the gap between 2,036 duplicate PAIRS and 752 duplicate TRIPLES. The
+/// tx-fees entry is written with `recipient_id = proposer`, and that same node is also a `node`
+/// recipient in the same round, so one node holds two rows per round under different
+/// `recipient_type`s by design.
+///
+/// **Dedupe rule: keep the newest, never touch a settled row.** Greatest `created_at`, tie-broken
+/// on greatest `id`, which is the arming that was actually live. A row with a `txid` records money
+/// that moved and is preserved whatever its age — there are **zero** such rows on the fleet today,
+/// which is precisely why the rule is written now instead of when there are some.
+///
+/// The index then makes the upsert in `insert_payout` possible, so a re-arm REPLACES its own
+/// earlier set. Without the index the upsert has no conflict target; without the dedupe the index
+/// cannot be created at all — `CREATE UNIQUE INDEX` fails outright on the 752 groups, so the
+/// order here is load-bearing.
+///
+/// Cheap: `payouts` plus its indexes measured **6.6 MB**. This was once deferred as needing "a
+/// 2.7 GB table rebuild" — that figure belonged to `shares_archive`.
 fn migrate_v60(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v60: dedupe payouts and make the arming triple unique");
 

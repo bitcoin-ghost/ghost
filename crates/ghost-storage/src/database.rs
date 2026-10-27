@@ -2062,7 +2062,7 @@ mod tests {
             db.with_connection(|conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_vled_target_cap_ts'",
+                        "SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_vled_target_cap_ts_cover'",
                         [],
                         |row| row.get(0),
                     )
