@@ -6372,6 +6372,21 @@ pub struct VerificationProofInsert<'a> {
     pub round_height: Option<i64>,
 }
 
+/// [`Database::address_proof_failed_nodes`]. A constant so the plan test explains exactly this
+/// statement.
+///
+/// ⛔ `INDEXED BY` (#1034): the planner prefers a skip-scan of `idx_vled_target_cap_ts` that reads
+/// a proof-blob table page per row — 16.9 s cold against 0.13 s through the covering index. See
+/// `migrate_v61`.
+const ADDRESS_PROOF_FAILED_SQL: &str = "SELECT target_node_id
+     FROM verification_ledger INDEXED BY idx_vled_cap_ts_cover
+     WHERE capability = 'address'
+       AND timestamp >= ?1 AND timestamp <= ?2
+       AND round_height IS NOT NULL AND round_height >= ?3
+     GROUP BY target_node_id
+     HAVING 2 * COUNT(DISTINCT CASE WHEN passed = 0 THEN challenger_id END)
+            > COUNT(DISTINCT challenger_id)";
+
 impl Database {
     /// Persist a signed verification result into the verification ledger (schema v42).
     ///
@@ -7272,16 +7287,7 @@ impl Database {
         let floor = i64::try_from(min_round_height).unwrap_or(i64::MAX);
         self.with_connection(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT target_node_id
-                     FROM verification_ledger
-                     WHERE capability = 'address'
-                       AND timestamp >= ?1 AND timestamp <= ?2
-                       AND round_height IS NOT NULL AND round_height >= ?3
-                     GROUP BY target_node_id
-                     HAVING 2 * COUNT(DISTINCT CASE WHEN passed = 0 THEN challenger_id END)
-                            > COUNT(DISTINCT challenger_id)",
-                )
+                .prepare(ADDRESS_PROOF_FAILED_SQL)
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let rows = stmt
                 .query_map(params![since, until, floor], |row| {
@@ -14969,6 +14975,58 @@ mod tests {
                 .len(),
             2,
             "both distinct records, deduped to two"
+        );
+    }
+
+    /// #1034: the address-proof window scan must never touch the ledger TABLE.
+    ///
+    /// Its rows sit on pages full of proof blobs, and on a 3.9 GB node those pages are rarely
+    /// cached: the skip-scan the planner prefers read one per row and held the connection 17-20 s
+    /// after block arrivals on vm5, freezing every other database caller. "COVERING INDEX" is
+    /// the property that matters — a plain `USING INDEX` here is that stall again.
+    ///
+    /// The planner runs on vm5's real statistics (2026-10-27). On an empty, unanalyzed database
+    /// it picks the covering index unprompted, so without them this test could not see the
+    /// `INDEXED BY` pin go missing; with them it picks the skip-scan, exactly as production did.
+    #[test]
+    fn address_proof_scan_reads_only_the_covering_index() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let plan: Vec<String> = db
+            .with_connection(|conn| {
+                conn.execute_batch(
+                    // ANALYZE creates sqlite_stat1; `ANALYZE sqlite_schema` reloads it.
+                    "ANALYZE;
+                     DELETE FROM sqlite_stat1 WHERE tbl = 'verification_ledger';
+                     INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
+                       ('verification_ledger', 'idx_vled_ts', '843995 3'),
+                       ('verification_ledger', 'idx_vled_target_cap_ts', '843995 93778 24824 1'),
+                       ('verification_ledger', 'sqlite_autoindex_verification_ledger_1',
+                        '843995 105500 14807 3735 1'),
+                       -- Not read from vm5, where the index does not exist yet: four
+                       -- capabilities over 843,995 rows, and (capability, timestamp) all but
+                       -- unique given idx_vled_ts's 3 rows per timestamp across ALL capabilities.
+                       ('verification_ledger', 'idx_vled_cap_ts_cover',
+                        '843995 210999 1 1 1 1 1');
+                     ANALYZE sqlite_schema;",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+                let mut stmt = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {ADDRESS_PROOF_FAILED_SQL}"))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![0i64, 1i64, 0i64], |row| row.get::<_, String>(3))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("explain the address-proof query");
+        let scan = plan
+            .iter()
+            .find(|line| line.contains("verification_ledger"))
+            .unwrap_or_else(|| panic!("no ledger step in the plan: {plan:?}"));
+        assert!(
+            scan.contains("USING COVERING INDEX idx_vled_cap_ts_cover"),
+            "the address-proof scan must read only idx_vled_cap_ts_cover, got: {scan}"
         );
     }
 

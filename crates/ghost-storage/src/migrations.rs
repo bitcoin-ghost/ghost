@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 60;
+const SCHEMA_VERSION: u32 = 61;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -137,6 +137,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (58, migrate_v58),
         (59, migrate_v59),
         (60, migrate_v60),
+        (61, migrate_v61),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2731,6 +2732,46 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 ///
 /// Cheap: `payouts` plus its indexes measured **6.6 MB**. This was once deferred as needing "a
 /// 2.7 GB table rebuild" — that figure belonged to `shares_archive`.
+/// v61 (#1034): a covering index for the ledger's capability-wide window scans.
+///
+/// `address_proof_failed_nodes` reads every `address` verdict in a seven-day window across ALL
+/// targets. Through `idx_vled_target_cap_ts` that is a skip-scan per target followed by a TABLE
+/// lookup for `challenger_id`, `passed` and `round_height` on every row, and the table pages are
+/// full of proof blobs. On a 3.9 GB node holding a 2.8 GB database those pages are rarely cached,
+/// so each lookup is a random disk read. MEASURED on a copy of vm8's database: **16.9 s cold**,
+/// 0.23 s warm. Live on vm5 it held the connection 17.6 s and 20.1 s after block arrivals
+/// (2026-10-27, `wait_ms=0`), freezing every other database caller behind it.
+///
+/// Leading with `(capability, timestamp)` makes the window one contiguous range, and carrying the
+/// other four columns means the table is never touched: **0.13 s cold** on the same copy. It adds
+/// ~138 MB to a 2.45 GB file. The query pins it with `INDEXED BY` — with full statistics the
+/// planner still preferred the skip-scan.
+///
+/// Additive only: an older binary opens the newer database and ignores the index.
+fn migrate_v61(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v61: covering index for verification_ledger window scans");
+    // Migrations replay over partial schemas in tests; v60 guards the same way.
+    let has_ledger: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='verification_ledger'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_ledger {
+        debug!("v61: no `verification_ledger` table — nothing to index");
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_vled_cap_ts_cover
+             ON verification_ledger(capability, timestamp, target_node_id, challenger_id, passed,
+                                    round_height);",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v61: created idx_vled_cap_ts_cover");
+    Ok(())
+}
+
 fn migrate_v60(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v60: dedupe payouts and make the arming triple unique");
 
