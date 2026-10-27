@@ -1158,10 +1158,38 @@ impl Database {
     /// shrink.
     pub fn optimize(&self) -> GhostResult<()> {
         self.with_connection(|conn| {
+            let started = std::time::Instant::now();
             // Truncating checkpoint first: cheap, and bounds WAL growth. Without this the WAL
             // file never shrinks (`journal_size_limit` is -1 by default).
             if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
                 warn!("WAL checkpoint during maintenance failed: {e}");
+            }
+            let checkpoint_ms = started.elapsed().as_millis();
+
+            // ⛔ An EMPTY partial index gets no `sqlite_stat1` row from ANALYZE, and
+            // `PRAGMA optimize` reads a missing row as "never analyzed" — so it re-analyzed the
+            // whole table every pass. `shares_archive` (1.98M rows) and `shares` both carry a
+            // `WHERE paid_in_proposal_hash IS NOT NULL` index with no rows in it: MEASURED on vm5
+            // 2026-10-27 the pass still held the connection 4.8 s and 6.1 s after the switch to
+            // `optimize`. Record such an index as near-empty, which is what it is. Only on a
+            // table that HAS statistics: there the absence can only mean "empty at the last
+            // analysis", while a table never analyzed must stay visible to `optimize`.
+            // `ANALYZE sqlite_schema` reloads the statistics so this pass already sees the rows.
+            let placeholders = conn
+                .execute(
+                    "INSERT INTO sqlite_stat1 (tbl, idx, stat)
+                     SELECT m.tbl_name, m.name, '1 1'
+                     FROM sqlite_master m
+                     WHERE m.type = 'index' AND m.sql LIKE '%WHERE%'
+                       AND NOT EXISTS (SELECT 1 FROM sqlite_stat1 s WHERE s.idx = m.name)
+                       AND EXISTS (SELECT 1 FROM sqlite_stat1 s WHERE s.tbl = m.tbl_name)",
+                    [],
+                )
+                // No `sqlite_stat1` yet (nothing ever analyzed): nothing to mark.
+                .unwrap_or(0);
+            if placeholders > 0 {
+                conn.execute_batch("ANALYZE sqlite_schema;")
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
             }
 
             // `PRAGMA optimize`, not `ANALYZE` (#1034). A bare ANALYZE reads every index in
@@ -1177,6 +1205,13 @@ impl Database {
             // selective. Cheap statistics that are wrong cost more than the stall.
             conn.execute_batch("PRAGMA optimize;")
                 .map_err(|e| GhostError::Database(e.to_string()))?;
+            // Per step, so a slow pass names its own cause (#1034).
+            info!(
+                checkpoint_ms,
+                statistics_ms = started.elapsed().as_millis() - checkpoint_ms,
+                partial_index_placeholders = placeholders,
+                "Database optimize: checkpoint and statistics"
+            );
 
             let page_size: i64 = conn
                 .query_row("PRAGMA page_size", [], |row| row.get(0))
@@ -2051,6 +2086,78 @@ mod tests {
             Some(first.as_str()),
             "statistics were rewritten for a table that only doubled — optimize is re-reading \
              every index on every pass again, which is the hourly stall"
+        );
+    }
+
+    /// An EMPTY partial index must not make `optimize()` re-analyze its whole table (#1034).
+    ///
+    /// ANALYZE writes no `sqlite_stat1` row for a partial index with no entries, and
+    /// `PRAGMA optimize` treats the missing row as "never analyzed". That is `shares_archive`
+    /// (1.98M rows) and `shares` on vm5, each with an empty
+    /// `WHERE paid_in_proposal_hash IS NOT NULL` index: the hourly pass still held the
+    /// connection 4.8-6.1 s after the switch to `optimize`. Doubling the table stays inside the
+    /// 25x threshold, so the table's statistics must not be rewritten.
+    #[test]
+    fn optimize_does_not_reanalyze_a_table_for_an_empty_partial_index() {
+        let db = Database::in_memory().expect("create in-memory database");
+        let fill_and_query = |from: i64, to: i64| {
+            db.with_connection(|conn| {
+                for i in from..to {
+                    conn.execute(
+                        "INSERT INTO t1034 (a, paid) VALUES (?1, NULL)",
+                        rusqlite::params![i % 8],
+                    )
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                }
+                conn.query_row("SELECT COUNT(*) FROM t1034 WHERE a = 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("fill t1034")
+        };
+        let stat = || -> String {
+            db.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT stat FROM sqlite_stat1 WHERE idx = 't1034_a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("t1034_a statistics")
+        };
+
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE t1034 (a INTEGER, paid TEXT);
+                 CREATE INDEX t1034_a ON t1034(a);
+                 CREATE INDEX t1034_paid ON t1034(paid) WHERE paid IS NOT NULL;",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("create t1034");
+        fill_and_query(0, 200);
+        // A full ANALYZE, as every live node ran hourly until #1034: the table HAS statistics,
+        // and the empty partial index still has none.
+        db.with_connection(|conn| {
+            conn.execute_batch("ANALYZE;")
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("initial analyze");
+        let first = stat();
+        assert!(
+            first.starts_with("200 "),
+            "first analysis saw 200 rows, got {first:?}"
+        );
+
+        fill_and_query(200, 400);
+        db.optimize().expect("optimize");
+        assert_eq!(
+            stat(),
+            first,
+            "t1034 was re-analyzed because its empty partial index has no statistics row — \
+             the hourly full-table ANALYZE of shares_archive again"
         );
     }
 

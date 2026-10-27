@@ -2768,7 +2768,12 @@ fn migrate_v61(conn: &Connection) -> GhostResult<()> {
                                     round_height);",
     )
     .map_err(|e| GhostError::Migration(e.to_string()))?;
-    info!("v61: created idx_vled_cap_ts_cover");
+    // Statistics for the new index alone, while its pages are still cached from the build.
+    // Without them the next `Database::optimize` sees an unanalyzed index and re-analyzes the
+    // WHOLE ledger — cold, on the one connection — which is the stall this index removes.
+    conn.execute_batch("ANALYZE idx_vled_cap_ts_cover;")
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v61: created and analyzed idx_vled_cap_ts_cover");
     Ok(())
 }
 
