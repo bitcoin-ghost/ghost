@@ -730,6 +730,10 @@ impl Database {
         // system healthiest precisely when it is worst.
         let started = std::time::Instant::now();
         let conn = self.inner.write_conn.lock();
+        // ⛔ `held_ms` alone could not name a culprit (#1034): every caller queued behind a
+        // 25 s holder reported ~25 s too, so the most FREQUENT caller looked like the slowest.
+        // `wait_ms` is the queueing half; `held_ms - wait_ms` is what this call itself cost.
+        let waited = started.elapsed();
         let out = f(&conn);
         drop(conn);
         let elapsed = started.elapsed();
@@ -739,6 +743,7 @@ impl Database {
             DB_SLOW_CALLS.fetch_add(1, Relaxed);
             tracing::warn!(
                 held_ms = elapsed.as_millis(),
+                wait_ms = waited.as_millis(),
                 caller = %caller,
                 "database connection held past the slow threshold -- on a 2-CPU node this parks \
                  a tokio worker for the duration (#537)"
@@ -805,9 +810,12 @@ impl Database {
         // contention the wait is the larger half, and timing only the body reports the system
         // healthiest precisely when it is worst.
         let started = std::time::Instant::now();
+        let mut waited = std::time::Duration::ZERO;
 
         let result = (|| {
             let mut conn = self.inner.write_conn.lock();
+            // The queueing half, as in `with_connection` (#1034).
+            waited = started.elapsed();
             let tx = conn
                 .transaction()
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -827,6 +835,7 @@ impl Database {
             DB_SLOW_CALLS.fetch_add(1, Relaxed);
             tracing::warn!(
                 held_ms = elapsed.as_millis(),
+                wait_ms = waited.as_millis(),
                 caller = %caller,
                 kind = "transaction",
                 "database connection held past the slow threshold -- on a 2-CPU node this parks \
@@ -1128,9 +1137,9 @@ impl Database {
 
     /// Optimize the database.
     ///
-    /// Always runs `ANALYZE` (cheap, and it is what actually helps the query planner) and a
-    /// WAL checkpoint. Only runs `VACUUM` when there is enough reclaimable space to justify
-    /// it — see `VACUUM_MIN_RECLAIMABLE_BYTES`.
+    /// Always runs `PRAGMA optimize` (refreshes planner statistics only where they are
+    /// missing or stale) and a WAL checkpoint. Only runs `VACUUM` when there is enough
+    /// reclaimable space to justify it — see `VACUUM_MIN_RECLAIMABLE_BYTES`.
     ///
     /// This used to run `VACUUM; ANALYZE;` unconditionally, and `run_maintenance` calls it
     /// whenever a maintenance pass deletes more than 1000 rows — which pruning health pings,
@@ -1155,9 +1164,18 @@ impl Database {
                 warn!("WAL checkpoint during maintenance failed: {e}");
             }
 
-            // ANALYZE is the part that pays for itself — it refreshes planner statistics and
-            // costs orders of magnitude less than a rebuild.
-            conn.execute_batch("ANALYZE;")
+            // `PRAGMA optimize`, not `ANALYZE` (#1034). A bare ANALYZE reads every index in
+            // full: MEASURED 2026-10-27 it held the connection 23-30 s on vm5 and 7-10 s on
+            // vm1, every hour, freezing every other database caller and so the whole process.
+            // The statistics it rewrote did not change — retention keeps each table a rolling
+            // window of steady size. `optimize` (SQLite 3.39) re-analyzes only a table this
+            // connection has queried whose index lacks statistics or that has grown 25x since
+            // its last analysis, and when it does, at full precision.
+            //
+            // ⛔ Not `analysis_limit`: it made ANALYZE ~20x cheaper but recorded a 125,000
+            // rows-per-key column as 1,001, telling the planner a low-cardinality column is
+            // selective. Cheap statistics that are wrong cost more than the stall.
+            conn.execute_batch("PRAGMA optimize;")
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             let page_size: i64 = conn
@@ -1968,9 +1986,72 @@ mod tests {
 
         db.optimize().expect("optimize must succeed");
 
-        // Still usable, and ANALYZE ran without a rebuild.
+        // Still usable, and statistics were refreshed without a rebuild.
         let stats = db.stats().expect("stats after optimize");
         assert!(stats.page_count > 0);
+    }
+
+    /// `optimize()` must analyze a queried table that has no statistics, and must NOT re-read
+    /// one whose statistics are still current (#1034).
+    ///
+    /// The re-read is the stall: a full `ANALYZE` held the connection 23-30 s every hour on
+    /// vm5 to rewrite statistics for tables that had not changed shape. Doubling the table
+    /// stays well inside `PRAGMA optimize`'s 25x growth threshold, so the stored row count
+    /// must still be the first one. A full ANALYZE would rewrite it to the new count.
+    #[test]
+    fn optimize_refreshes_only_missing_or_stale_statistics() {
+        let db = Database::in_memory().expect("create in-memory database");
+        let insert = |from: i64, to: i64| {
+            db.with_connection(|conn| {
+                for i in from..to {
+                    conn.execute(
+                        "INSERT INTO verification_ledger
+                             (challenger_id, target_node_id, capability, passed, timestamp, proof)
+                         VALUES ('c', ?1, 'address', 1, ?2, x'00')",
+                        rusqlite::params![format!("t{}", i % 8), i],
+                    )
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                }
+                // An indexed lookup, so the planner consults this table's statistics and
+                // `PRAGMA optimize` considers it.
+                conn.query_row(
+                    "SELECT COUNT(*) FROM verification_ledger WHERE target_node_id = 't1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("insert ledger rows")
+        };
+        let stat = || -> Option<String> {
+            db.with_connection(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_vled_target_cap_ts'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok())
+            })
+            .expect("read sqlite_stat1")
+        };
+
+        insert(0, 200);
+        db.optimize().expect("first optimize");
+        let first = stat().expect("a queried table with no statistics must be analyzed");
+        assert!(
+            first.starts_with("200 "),
+            "first analysis saw 200 rows, got {first:?}"
+        );
+
+        insert(200, 400);
+        db.optimize().expect("second optimize");
+        assert_eq!(
+            stat().as_deref(),
+            Some(first.as_str()),
+            "statistics were rewritten for a table that only doubled — optimize is re-reading \
+             every index on every pass again, which is the hourly stall"
+        );
     }
 
     // Both sides ARE constants — that is the point. This guards the constant against being

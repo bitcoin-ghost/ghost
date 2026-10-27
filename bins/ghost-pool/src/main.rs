@@ -9688,8 +9688,12 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = interval.tick() => {
                     let config = ghost_storage::database::MaintenanceConfig::default();
-                    match db_for_maintenance.run_maintenance(config) {
-                        Ok(result) => {
+                    // Off the runtime (#1034): the pass is a chain of blocking database calls,
+                    // and run inline it parked one of a 2-CPU node's two tokio workers for its
+                    // whole length.
+                    let db = Arc::clone(&db_for_maintenance);
+                    match tokio::task::spawn_blocking(move || db.run_maintenance(config)).await {
+                        Ok(Ok(result)) => {
                             tracing::info!(
                                 rounds = result.rounds_deleted,
                                 pings = result.pings_deleted,
@@ -9714,8 +9718,11 @@ async fn main() -> Result<()> {
                                 "Database maintenance complete"
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "Database maintenance failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Database maintenance task did not complete");
                         }
                     }
                 }
