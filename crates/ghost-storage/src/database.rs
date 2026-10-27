@@ -1054,10 +1054,16 @@ impl Database {
 
     /// Pages returned to the filesystem per maintenance pass by `incremental_vacuum`.
     ///
-    /// 32,768 pages is 128 MiB at the 4 KiB page size this database uses. It is a bound on how
-    /// long the write connection is held, not a target: `PRAGMA incremental_vacuum(N)` stops as
-    /// soon as the free list is empty, so a node with nothing to reclaim pays nothing.
-    const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 32_768;
+    /// A bound on how long the write connection is held, not a target: `PRAGMA
+    /// incremental_vacuum(N)` stops as soon as the free list is empty, so a node with nothing to
+    /// reclaim pays nothing.
+    ///
+    /// ⛔ The bound is TIME, so size it from the measured rate (#1034). On vm5 a pass returning
+    /// 21,584 pages held the connection 14.9 s (~0.7 ms a page) — the free list left by v62
+    /// dropping an index. The old 32,768 allowed ~22 s. Steady-state passes on vm1 and vm5
+    /// return 650-2,700 pages an hour, so 4,096 (16 MiB, ~3 s at worst) still empties them
+    /// every pass, and a one-off backlog drains over a few hours instead of in one stall.
+    const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 4_096;
 
     /// Return freed pages to the filesystem without rebuilding the database.
     ///
@@ -2680,6 +2686,60 @@ mod tests {
             after, 0,
             "the whole free list fits inside INCREMENTAL_VACUUM_MAX_PAGES, so it should be empty"
         );
+    }
+
+    /// One pass must stop at `INCREMENTAL_VACUUM_MAX_PAGES`, and the next must carry on (#1034).
+    ///
+    /// The cap is what bounds the hold: uncapped, the 21,584-page free list v62 left on vm5 held
+    /// the connection 14.9 s in a single pass. Asserted on `freelist_count`, not the return value.
+    #[test]
+    fn incremental_vacuum_stops_at_the_cap_and_resumes_next_pass() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let cap = i64::from(Database::INCREMENTAL_VACUUM_MAX_PAGES);
+
+        db.with_connection(|conn| {
+            conn.execute_batch("CREATE TABLE bulk (id INTEGER PRIMARY KEY, blob BLOB);")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            // ~one 4 KiB page per row, and comfortably more rows than the cap.
+            let payload = vec![0xABu8; 3000];
+            let mut stmt = conn
+                .prepare("INSERT INTO bulk (blob) VALUES (?1)")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            for _ in 0..(cap + cap / 2) {
+                stmt.execute([&payload])
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+            }
+            conn.execute_batch("DELETE FROM bulk;")
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("populate and delete");
+
+        let freelist = || -> i64 {
+            db.with_connection(|conn| {
+                conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("read freelist_count")
+        };
+
+        let before = freelist();
+        assert!(
+            before > cap,
+            "the free list ({before}) must exceed the cap ({cap}) or this test proves nothing"
+        );
+
+        db.incremental_vacuum(Database::INCREMENTAL_VACUUM_MAX_PAGES)
+            .expect("first pass");
+        let middle = freelist();
+        assert_eq!(
+            before - middle,
+            cap,
+            "one pass must release exactly the cap ({before} -> {middle})"
+        );
+
+        db.incremental_vacuum(Database::INCREMENTAL_VACUUM_MAX_PAGES)
+            .expect("second pass");
+        assert_eq!(freelist(), 0, "the second pass must drain the remainder");
     }
 
     /// A fresh database must come up with INCREMENTAL auto_vacuum (#992).
