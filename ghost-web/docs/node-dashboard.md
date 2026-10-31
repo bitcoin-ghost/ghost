@@ -206,6 +206,55 @@ receive the `ghost-session` JWT cookie; subsequent requests include the cookie
 automatically. A request without one is redirected to `/login` (pages) or
 answered `401` (API) — there is no local exemption.
 
+### Operator-signed fleet control
+
+Two routes on the node backend act on the node itself, and both demand a command
+signed with the **operator's** Ed25519 key. The node holds only the public half,
+in `GHOST_OPERATOR_PUBKEY` (64 hex chars); without it both routes answer `501`.
+
+| Route | `action` | Effect |
+|---|---|---|
+| `POST /api/v1/swarm/nodes/:node_id/restart` | `restart` | restarts this node |
+| `PUT /api/v1/swarm/nodes/:node_id/config` | `configure` | writes ONE allowlisted key to this node's `pool.toml` — **does not restart** |
+
+The body is a signed command. The signature is over
+`ghost-fleet-v1\n<target_node_id>\n<action>\n<sha256-hex of params JSON>\n<nonce>\n<expires_at>`,
+so the target, the action and the parameters cannot be changed after signing.
+`expires_at` may be at most 120 s ahead, and each nonce is accepted once.
+
+```json
+{
+  "target_node_id": "<this node's id>",
+  "action": "configure",
+  "params": { "key": "network.max_miners", "value": 900 },
+  "nonce": "<random hex>",
+  "expires_at": 1793000000,
+  "signature": "<hex ed25519 signature>"
+}
+```
+
+`key` and `value` must be inside `params`. Put beside it, outside the signature,
+they are refused (`400 unsigned_fields`).
+
+**Settable keys** — nothing else: `alerts.enabled`, every
+`alerts.events.<event>` toggle (`node_offline`, `capability_drift`, `low_disk`,
+`restart_needed`, `peer_count_drop`, `block_found`, `reorg_detected`,
+`behind_tip`, `update_available`, `mempool_congestion`, `fee_spike`,
+`failed_login`, `service_restart_loop`), `network.max_miners` (1 to 4294967295)
+and `identity.display_name` (1-64 printable characters, no quotes).
+
+Anything else is `403 refused_by_design`, with a `category` saying why:
+`credential`, `money_destination`, `mining_mode`, `consensus_geometry`,
+`capability_claim` (a capability is earned by passing its verification
+challenges, not by setting a flag), `data_redirection`, or `not_on_allowlist`.
+
+A successful change answers `200` with `"applies_at": "next restart"` and
+`"restarted": false`. Nothing in `pool.toml` is re-read while the node runs, so
+the change rides the next restart — batch it with a binary roll rather than
+spending a restart on it. The edit keeps every comment and every other line,
+is checked against the node's real config loader before it is written, and
+replaces the file atomically with its original owner and mode.
+
 Full API documentation: [docs.ghostpool.io/api](https://docs.ghostpool.io/api)
 
 ## Security

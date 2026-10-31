@@ -11751,16 +11751,6 @@ async fn api_swarm_node_add_handler(
 /// Deliberately NOT wired to a real action in this change: one node restarting another is a
 /// security-sensitive capability that needs an auth design of its own, and inventing one under
 /// time pressure is how the rest of this file grew stubs.
-/// One allowlisted config change, carried by an operator-signed command.
-#[derive(serde::Deserialize)]
-struct SwarmConfigBody {
-    #[serde(flatten)]
-    cmd: crate::fleet_auth::SignedCommand,
-    /// Dotted key, e.g. `alerts.events.low_disk` or `pool.max_miners`.
-    key: String,
-    value: serde_json::Value,
-}
-
 fn swarm_not_implemented(node_id: &str, action: &str) -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -11839,49 +11829,103 @@ async fn api_swarm_node_refresh_handler(
     api_node_status_handler(State(state)).await.into_response()
 }
 
-/// API v1 Swarm: Configure a remote node
+/// One allowlisted config change, carried by an operator-signed command (#403).
+///
+/// The change itself — `{"key": "...", "value": ...}` — lives in the command's `params`, which the
+/// operator's signature covers (`params_hash` in
+/// [`crate::fleet_auth::SignedCommand::signing_payload`]).
+///
+/// ⛔ `key` and `value` are accepted at the top level ONLY to refuse them. The first version of this
+/// route read them from there, outside the signature: a command signed for one change could be
+/// re-paired, by anything that saw it in flight (a relaying node included), with any other
+/// allowlisted key and value, and it verified. Refusing the old shape loudly is better than ignoring
+/// it, because ignoring it would let an old client believe its unsigned fields were applied.
+#[derive(serde::Deserialize)]
+struct SwarmConfigBody {
+    #[serde(flatten)]
+    cmd: crate::fleet_auth::SignedCommand,
+    #[serde(default)]
+    key: Option<serde_json::Value>,
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+}
+
+/// The signed change: exactly `{"key": <string>, "value": <any>}` and nothing else, so no field can
+/// ride along under a signature without being applied.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwarmConfigParams {
+    key: String,
+    value: serde_json::Value,
+}
+
 /// API v1 Swarm: change one allowlisted key in THIS node's `pool.toml` (#403).
 ///
-/// Operator-signed, via the same `fleet_auth::SignedCommand` path `restart` uses — so a compromised
-/// peer cannot reconfigure anything, and a command for another node is refused with that node's id.
+/// `PUT /api/v1/swarm/nodes/:node_id/config`, body: a `fleet_auth::SignedCommand` with
+/// `action = "configure"` and `params = {"key": "<dotted.key>", "value": <json>}`.
+///
+/// Operator-signed, via the same `fleet_auth::SignedCommand` path `restart` uses — target bound to
+/// this node's id, single-use nonce, ≤120 s expiry — so a compromised peer cannot reconfigure
+/// anything, and the signed `params` mean a command for one key cannot be replayed as another.
 ///
 /// ⛔ Writes the file and does NOT restart. Nothing in `pool.toml` is re-read while the node runs,
 /// so the change takes effect at the next restart and rides the next binary roll. Every node is in
 /// the mining DNS, so a restart sheds that node's miners; CLAUDE.md's rule is one restart per node,
 /// carrying config and binary together.
 ///
-/// ⛔ Capability claims are not settable. See [`crate::node_config`]: a capability is earned by
-/// passing its verification challenges, not granted by setting a flag.
+/// ⛔ Only [`crate::node_config::SETTABLE`] keys are accepted. Anything else is a 403
+/// `refused_by_design` naming its category. Capability claims are among the refused: see
+/// [`crate::node_config`] — a capability is earned by passing its verification challenges.
 async fn api_swarm_node_config_handler(
     State(state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
     Json(body): Json<SwarmConfigBody>,
 ) -> impl IntoResponse {
-    if body.cmd.target_node_id != node_id {
-        return (
+    use crate::node_config::ConfigError;
+
+    let bad_request = |error: &str, message: String| {
+        (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "target_mismatch",
-                "message": "path node_id does not match the signed target_node_id",
-            })),
+            Json(serde_json::json!({ "error": error, "message": message })),
         )
-            .into_response();
+            .into_response()
+    };
+    let cmd = &body.cmd;
+    if cmd.target_node_id != node_id {
+        return bad_request(
+            "target_mismatch",
+            "path node_id does not match the signed target_node_id".into(),
+        );
     }
-    if body.cmd.action != "configure" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "action_mismatch",
-                "message": format!("this route performs 'configure', command says '{}'", body.cmd.action),
-            })),
-        )
-            .into_response();
+    if cmd.action != "configure" {
+        return bad_request(
+            "action_mismatch",
+            format!(
+                "this route performs 'configure', command says '{}'",
+                cmd.action
+            ),
+        );
     }
-    if let Err(e) = state
-        .fleet_auth
-        .verify(&body.cmd, crate::fleet_auth::now_secs())
-    {
-        warn!(node_id = %node_id, key = %body.key, error = %e, "fleet control: refused configure");
+    if body.key.is_some() || body.value.is_some() {
+        return bad_request(
+            "unsigned_fields",
+            "'key' and 'value' must be inside the signed 'params', not beside it: fields outside \
+             the signature could be swapped in flight"
+                .into(),
+        );
+    }
+    let change: SwarmConfigParams = match serde_json::from_value(cmd.params.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return bad_request(
+                "bad_params",
+                format!("params must be exactly {{\"key\": <string>, \"value\": <json>}}: {e}"),
+            )
+        }
+    };
+
+    if let Err(e) = state.fleet_auth.verify(cmd, crate::fleet_auth::now_secs()) {
+        warn!(node_id = %node_id, key = %change.key, error = %e, "fleet control: refused configure");
         let status = match e {
             crate::fleet_auth::FleetAuthError::NoOperatorKey => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::FORBIDDEN,
@@ -11907,16 +11951,25 @@ async fn api_swarm_node_config_handler(
 
     // ⛔ The value is NEVER logged. `display_name` is harmless, but this handler must not become the
     // reason a config value reaches a log line, because the next key added might not be.
-    match crate::node_config::write_change(&path, &body.key, &body.value) {
+    let SwarmConfigParams { key, value } = change;
+    let result = tokio::task::spawn_blocking({
+        let key = key.clone();
+        move || crate::node_config::write_change(&path, &key, &value)
+    })
+    .await
+    .unwrap_or_else(|e| Err(ConfigError::Io(format!("config writer panicked: {e}"))));
+
+    match result {
         Ok(()) => {
-            info!(node_id = %node_id, key = %body.key, "fleet control: operator-authorised config change");
+            info!(node_id = %node_id, key = %key, "fleet control: operator-authorised config change written");
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "written",
-                    "key": body.key,
+                    "key": key,
                     "node_id": node_id,
-                    "effective": "at this node's next restart",
+                    "applies_at": "next restart",
+                    "restarted": false,
                     "message": "pool.toml updated. Nothing is re-read while the node runs, so this \
                                 takes effect when the node next restarts — deliberately, so it can \
                                 ride a binary roll instead of spending a restart of its own.",
@@ -11925,21 +11978,31 @@ async fn api_swarm_node_config_handler(
                 .into_response()
         }
         Err(e) => {
-            let refused = matches!(e, crate::node_config::ConfigError::NotSettable(_));
-            warn!(node_id = %node_id, key = %body.key, "fleet control: config change rejected");
-            (
-                if refused {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                Json(serde_json::json!({
-                    "error": if refused { "refused_by_design" } else { "invalid_change" },
-                    "key": body.key,
-                    "message": e.to_string(),
-                })),
-            )
-                .into_response()
+            warn!(node_id = %node_id, key = %key, "fleet control: config change rejected");
+            let (status, error, category) = match &e {
+                ConfigError::NotSettable { category, .. } => (
+                    StatusCode::FORBIDDEN,
+                    "refused_by_design",
+                    Some(category.as_str()),
+                ),
+                ConfigError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "write_failed", None),
+                _ => (StatusCode::BAD_REQUEST, "invalid_change", None),
+            };
+            let mut body = serde_json::json!({
+                "error": error,
+                "action": "configure node",
+                "key": key,
+                "node_id": node_id,
+                "message": e.to_string(),
+            });
+            if let Some(c) = category {
+                body["category"] = serde_json::json!(c);
+                body["settable"] = serde_json::json!(crate::node_config::SETTABLE
+                    .iter()
+                    .map(|(s, k, _)| format!("{s}.{k}"))
+                    .collect::<Vec<_>>());
+            }
+            (status, Json(body)).into_response()
         }
     }
 }
@@ -13077,6 +13140,267 @@ mod tests {
             whole.contains("deploy-node.sh"),
             "the refusal must name the supported path, or an operator is left guessing: {whole}"
         );
+    }
+
+    /// Harness for the `config` route: a node with an operator key and a real `pool.toml` on disk.
+    mod swarm_config {
+        use super::super::*;
+        use axum::response::IntoResponse;
+        use ed25519_dalek::{Signer, SigningKey};
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use http_body_util::BodyExt;
+        use serde_json::json;
+
+        const NODE: &str = "test_node";
+
+        fn operator() -> SigningKey {
+            SigningKey::from_bytes(&[9u8; 32])
+        }
+
+        struct Node {
+            state: Arc<VerificationState>,
+            path: std::path::PathBuf,
+            _dir: tempfile::TempDir,
+        }
+
+        impl Node {
+            fn new(with_key: bool) -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("pool.toml");
+                std::fs::write(&path, include_str!("../../../config/mainnet.toml")).unwrap();
+                let mut state = crate::server::VerificationState::new(
+                    NODE.to_string(),
+                    "1.0.0".to_string(),
+                    PolicyProfile::default(),
+                    NodeCapabilities::default(),
+                )
+                .with_pool_config_path(path.clone());
+                state.fleet_auth = Arc::new(crate::fleet_auth::FleetAuth::new(
+                    NODE.to_string(),
+                    with_key.then(|| operator().verifying_key().to_bytes()),
+                ));
+                Self {
+                    state: Arc::new(state),
+                    path,
+                    _dir: dir,
+                }
+            }
+
+            fn file(&self) -> String {
+                std::fs::read_to_string(&self.path).unwrap()
+            }
+
+            async fn put(&self, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+                let body: SwarmConfigBody = serde_json::from_value(body).unwrap();
+                let resp = api_swarm_node_config_handler(
+                    axum::extract::State(self.state.clone()),
+                    axum::extract::Path(NODE.to_string()),
+                    axum::Json(body),
+                )
+                .await
+                .into_response();
+                let status = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                (status, serde_json::from_slice(&bytes).unwrap())
+            }
+        }
+
+        /// A command as the operator's tooling would produce it.
+        fn signed(action: &str, params: serde_json::Value, nonce: &str) -> serde_json::Value {
+            let mut cmd = crate::fleet_auth::SignedCommand {
+                target_node_id: NODE.into(),
+                action: action.into(),
+                params,
+                nonce: nonce.into(),
+                expires_at: crate::fleet_auth::now_secs() + 60,
+                signature: String::new(),
+            };
+            cmd.signature = hex::encode(operator().sign(&cmd.signing_payload()).to_bytes());
+            serde_json::to_value(cmd).unwrap()
+        }
+
+        fn change(key: &str, value: serde_json::Value) -> serde_json::Value {
+            json!({"key": key, "value": value})
+        }
+
+        #[tokio::test]
+        async fn a_signed_allowlisted_change_is_written_and_does_not_restart() {
+            let n = Node::new(true);
+            let (s, b) = n
+                .put(signed(
+                    "configure",
+                    change("network.max_miners", json!(900)),
+                    "n1",
+                ))
+                .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(b["status"], "written");
+            assert_eq!(b["applies_at"], "next restart");
+            assert_eq!(b["restarted"], false);
+            let cfg: ghost_common::config::NodeConfig = toml::from_str(&n.file()).unwrap();
+            assert_eq!(cfg.network.max_miners, 900);
+        }
+
+        #[tokio::test]
+        async fn an_unsigned_command_is_refused_and_writes_nothing() {
+            let n = Node::new(true);
+            let before = n.file();
+            let mut cmd = signed("configure", change("network.max_miners", json!(900)), "n1");
+            cmd["signature"] = json!("00".repeat(64));
+            let (s, b) = n.put(cmd).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+            assert_eq!(b["error"], "unauthorized");
+            assert_eq!(n.file(), before);
+        }
+
+        /// A signature for `restart` must not configure anything.
+        #[tokio::test]
+        async fn a_command_signed_for_another_action_is_refused() {
+            let n = Node::new(true);
+            let before = n.file();
+            let (s, b) = n
+                .put(signed(
+                    "restart",
+                    change("network.max_miners", json!(900)),
+                    "n1",
+                ))
+                .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["error"], "action_mismatch");
+            assert_eq!(n.file(), before);
+        }
+
+        #[tokio::test]
+        async fn a_replayed_command_is_refused() {
+            let n = Node::new(true);
+            let cmd = signed("configure", change("network.max_miners", json!(900)), "n1");
+            assert_eq!(n.put(cmd.clone()).await.0, StatusCode::OK);
+            // Put the file back, so a replay that got through would be visible as a re-write.
+            let restored = n.file().replace("max_miners = 900", "max_miners = 10000");
+            std::fs::write(&n.path, &restored).unwrap();
+            let (s, b) = n.put(cmd).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+            assert!(b["message"].as_str().unwrap().contains("nonce"), "{b}");
+            assert_eq!(n.file(), restored);
+        }
+
+        /// ⛔ The defect this route shipped with: key and value sat OUTSIDE the signature. A command
+        /// signed for one change must not carry a different one.
+        #[tokio::test]
+        async fn a_signed_change_cannot_be_swapped_for_another() {
+            let n = Node::new(true);
+            let before = n.file();
+            for (k, v) in [
+                ("alerts.events.low_disk", json!(true)),  // different value
+                ("identity.display_name", json!("evil")), // different key
+            ] {
+                let mut cmd = signed(
+                    "configure",
+                    change("alerts.events.low_disk", json!(false)),
+                    "n1",
+                );
+                cmd["params"] = change(k, v);
+                let (s, b) = n.put(cmd).await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{k}: {b}");
+                assert_eq!(b["error"], "unauthorized");
+            }
+            assert_eq!(n.file(), before);
+        }
+
+        /// The old wire shape put key/value beside the signature. It must be refused, not ignored.
+        #[tokio::test]
+        async fn key_and_value_outside_the_signature_are_refused() {
+            let n = Node::new(true);
+            let before = n.file();
+            let mut cmd = signed(
+                "configure",
+                change("alerts.events.low_disk", json!(false)),
+                "n1",
+            );
+            cmd["key"] = json!("identity.display_name");
+            cmd["value"] = json!("evil");
+            let (s, b) = n.put(cmd).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["error"], "unsigned_fields");
+            assert_eq!(n.file(), before);
+        }
+
+        /// Extra fields in the signed params are refused, so nothing rides along unapplied.
+        #[tokio::test]
+        async fn params_must_be_exactly_key_and_value() {
+            let n = Node::new(true);
+            for p in [
+                json!({"key": "network.max_miners", "value": 5, "restart": true}),
+                json!({"key": "network.max_miners"}),
+                json!(null),
+            ] {
+                let (s, b) = n.put(signed("configure", p.clone(), "n1")).await;
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{p}: {b}");
+                assert_eq!(b["error"], "bad_params");
+            }
+        }
+
+        /// A correctly signed command for a refused key gets #955's `refused_by_design` shape,
+        /// naming the category, and the file is untouched.
+        #[tokio::test]
+        async fn a_signed_refused_key_is_refused_by_design_with_its_category() {
+            let n = Node::new(true);
+            let before = n.file();
+            for (i, (k, cat)) in [
+                ("storage.archive_mode", "capability_claim"),
+                ("pool.treasury_address", "money_destination"),
+                ("network.internal_api_secret", "credential"),
+                ("alerts.events.not_a_key_yet", "not_on_allowlist"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (s, b) = n
+                    .put(signed(
+                        "configure",
+                        change(k, json!(true)),
+                        &format!("n{i}"),
+                    ))
+                    .await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{k}: {b}");
+                assert_eq!(b["error"], "refused_by_design");
+                assert_eq!(b["category"], cat, "{k}");
+                assert!(b["settable"].as_array().is_some_and(|a| !a.is_empty()));
+            }
+            assert_eq!(n.file(), before);
+        }
+
+        #[tokio::test]
+        async fn a_bad_value_is_invalid_change_and_writes_nothing() {
+            let n = Node::new(true);
+            let before = n.file();
+            let (s, b) = n
+                .put(signed(
+                    "configure",
+                    change("network.max_miners", json!(0)),
+                    "n1",
+                ))
+                .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["error"], "invalid_change");
+            assert_eq!(n.file(), before);
+        }
+
+        #[tokio::test]
+        async fn a_node_without_an_operator_key_cannot_be_configured() {
+            let n = Node::new(false);
+            let before = n.file();
+            let (s, _) = n
+                .put(signed(
+                    "configure",
+                    change("network.max_miners", json!(900)),
+                    "n1",
+                ))
+                .await;
+            assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(n.file(), before);
+        }
     }
 
     /// `refresh` is the one fleet-control action that is real (#403), so it gets the opposite
