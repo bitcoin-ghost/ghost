@@ -106,6 +106,26 @@ pub enum FleetAuthError {
     MalformedSignature,
 }
 
+impl FleetAuthError {
+    /// A fixed label for logs.
+    ///
+    /// ⛔ Refusals happen before the signature has proved anything, on a port open to the internet,
+    /// so nothing the caller sent may reach a log line. [`std::fmt::Display`] quotes the claimed
+    /// target, which is theirs to choose (any length, newlines included), so it is for the reply
+    /// to the caller only.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NoOperatorKey => "no_operator_key",
+            Self::WrongTarget { .. } => "wrong_target",
+            Self::Expired { .. } => "expired",
+            Self::TtlTooLong { .. } => "ttl_too_long",
+            Self::ReplayedNonce => "replayed_nonce",
+            Self::BadSignature => "bad_signature",
+            Self::MalformedSignature => "malformed_signature",
+        }
+    }
+}
+
 impl std::fmt::Display for FleetAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
