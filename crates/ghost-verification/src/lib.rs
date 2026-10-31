@@ -52,9 +52,6 @@ pub mod fleet_auth;
 pub mod handlers;
 pub mod journal;
 pub mod log_buffer;
-/// H-7: prove a node controls the address it CLAIMS, by requiring a reply signed
-/// under its own node id over a nonce the prober chose.
-/// Operator-signed changes to this node's own `pool.toml` (#403).
 pub mod node_config;
 
 pub mod maxconnections;

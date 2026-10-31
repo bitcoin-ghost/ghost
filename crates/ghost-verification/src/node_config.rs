@@ -458,6 +458,63 @@ pub fn apply(
     Ok(text)
 }
 
+/// Make the same change to the node's in-memory config that [`apply`] made to the file.
+///
+/// Each key is named here rather than round-tripped through serde, so a field the serialiser skips
+/// cannot be lost from the live config. `apply_live_matches_the_file_for_every_settable_key` proves
+/// this match and [`SETTABLE`] agree.
+pub fn apply_live(
+    cfg: &mut NodeConfig,
+    dotted: &str,
+    value: &serde_json::Value,
+) -> Result<(), ConfigError> {
+    let Some((section, key, kind)) = lookup(dotted) else {
+        return Err(ConfigError::NotSettable {
+            key: dotted.to_string(),
+            category: refusal_category(dotted),
+        });
+    };
+    let rendered = render(dotted, kind, value)?;
+    let wrong = || ConfigError::WrongType {
+        key: dotted.into(),
+        want: kind,
+    };
+    match (section, key) {
+        ("network", "max_miners") => {
+            cfg.network.max_miners = rendered
+                .as_integer()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(wrong)?;
+        }
+        ("identity", "display_name") => {
+            cfg.identity.display_name = Some(rendered.as_str().ok_or_else(wrong)?.to_string());
+        }
+        _ => {
+            let on = rendered.as_bool().ok_or_else(wrong)?;
+            let events = &mut cfg.alerts.events;
+            let slot = match (section, key) {
+                ("alerts", "enabled") => &mut cfg.alerts.enabled,
+                (_, "low_disk") => &mut events.low_disk,
+                (_, "node_offline") => &mut events.node_offline,
+                (_, "service_restart_loop") => &mut events.service_restart_loop,
+                (_, "behind_tip") => &mut events.behind_tip,
+                (_, "restart_needed") => &mut events.restart_needed,
+                (_, "peer_count_drop") => &mut events.peer_count_drop,
+                (_, "capability_drift") => &mut events.capability_drift,
+                (_, "block_found") => &mut events.block_found,
+                (_, "update_available") => &mut events.update_available,
+                (_, "mempool_congestion") => &mut events.mempool_congestion,
+                (_, "fee_spike") => &mut events.fee_spike,
+                (_, "failed_login") => &mut events.failed_login,
+                (_, "reorg_detected") => &mut events.reorg_detected,
+                _ => return Err(wrong()),
+            };
+            *slot = on;
+        }
+    }
+    Ok(())
+}
+
 /// Serialises read-modify-write. Two concurrent changes would otherwise each read the same original
 /// and the second rename would silently discard the first.
 static WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -1054,6 +1111,32 @@ mod disk_tests {
         let ev = toml::Value::try_from(&cfg.alerts.events).unwrap();
         for k in &keys {
             assert_eq!(ev[*k].as_bool(), Some(false), "{k} was lost");
+        }
+    }
+
+    /// Both directions for every bool: whichever one differs from the file's value proves the key
+    /// really moved, so a match arm pointing at the wrong field cannot pass.
+    #[test]
+    fn apply_live_matches_the_file_for_every_settable_key() {
+        let original = include_str!("../../../config/mainnet.toml");
+        for (section, key, kind) in SETTABLE {
+            let dotted = format!("{section}.{key}");
+            let values = match kind {
+                ValueKind::Bool => vec![json!(true), json!(false)],
+                ValueKind::PositiveU32 => vec![json!(7)],
+                ValueKind::ShortText => vec![json!("  a name  ")],
+            };
+            for v in values {
+                let edited = apply(original, &dotted, &v).unwrap();
+                let on_disk: NodeConfig = toml::from_str(&edited).unwrap();
+                let mut live: NodeConfig = toml::from_str(original).unwrap();
+                apply_live(&mut live, &dotted, &v).unwrap();
+                assert_eq!(
+                    toml::Value::try_from(&live).unwrap(),
+                    toml::Value::try_from(&on_disk).unwrap(),
+                    "{dotted} = {v}"
+                );
+            }
         }
     }
 }

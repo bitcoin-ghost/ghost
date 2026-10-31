@@ -11873,6 +11873,9 @@ struct SwarmConfigParams {
 /// the mining DNS, so a restart sheds that node's miners; CLAUDE.md's rule is one restart per node,
 /// carrying config and binary together.
 ///
+/// The in-memory config changes with the file, so the dashboard shows the new value at once and its
+/// next save keeps it. What the running node acts on is still only read at startup.
+///
 /// ⛔ Only [`crate::node_config::SETTABLE`] keys are accepted. Anything else is a 403
 /// `refused_by_design` naming its category. Capability claims are among the refused: see
 /// [`crate::node_config`] — a capability is earned by passing its verification challenges.
@@ -11914,18 +11917,11 @@ async fn api_swarm_node_config_handler(
                 .into(),
         );
     }
-    let change: SwarmConfigParams = match serde_json::from_value(cmd.params.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            return bad_request(
-                "bad_params",
-                format!("params must be exactly {{\"key\": <string>, \"value\": <json>}}: {e}"),
-            )
-        }
-    };
 
+    // ⛔ The signature comes before anything reads `params`. Port 8080 is open to the internet, so
+    // until this passes the body is a stranger's, and none of it may reach a log line.
     if let Err(e) = state.fleet_auth.verify(cmd, crate::fleet_auth::now_secs()) {
-        warn!(node_id = %node_id, key = %change.key, error = %e, "fleet control: refused configure");
+        warn!(reason = e.reason(), "fleet control: refused configure");
         let status = match e {
             crate::fleet_auth::FleetAuthError::NoOperatorKey => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::FORBIDDEN,
@@ -11936,6 +11932,16 @@ async fn api_swarm_node_config_handler(
         )
             .into_response();
     }
+
+    let change: SwarmConfigParams = match serde_json::from_value(cmd.params.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return bad_request(
+                "bad_params",
+                format!("params must be exactly {{\"key\": <string>, \"value\": <json>}}: {e}"),
+            )
+        }
+    };
 
     let path = match state.pool_config_path.as_ref() {
         Some(p) => p.clone(),
@@ -11954,7 +11960,18 @@ async fn api_swarm_node_config_handler(
     let SwarmConfigParams { key, value } = change;
     let result = tokio::task::spawn_blocking({
         let key = key.clone();
-        move || crate::node_config::write_change(&path, &key, &value)
+        let state = state.clone();
+        move || {
+            // ⛔ The dashboard's saves write this same file from the in-memory config, whole. Hold
+            // their lock across the write and update the memory too, or the next dashboard save
+            // would put the old value back after this reply said "written".
+            let mut live = state.full_node_config.as_ref().map(|c| c.write());
+            crate::node_config::write_change(&path, &key, &value)?;
+            match live.as_deref_mut() {
+                Some(cfg) => crate::node_config::apply_live(cfg, &key, &value),
+                None => Ok(()),
+            }
+        }
     })
     .await
     .unwrap_or_else(|e| Err(ConfigError::Io(format!("config writer panicked: {e}"))));
@@ -12042,7 +12059,7 @@ async fn api_swarm_node_restart_handler(
     }
 
     if let Err(e) = state.fleet_auth.verify(&cmd, crate::fleet_auth::now_secs()) {
-        warn!(node_id = %node_id, error = %e, "fleet control: refused restart");
+        warn!(reason = e.reason(), "fleet control: refused restart");
         // 403 for an authorisation failure; 501 when the node has no operator key at all,
         // because that is a missing capability rather than a rejected caller.
         let status = match e {
@@ -13175,7 +13192,11 @@ mod tests {
                     PolicyProfile::default(),
                     NodeCapabilities::default(),
                 )
-                .with_pool_config_path(path.clone());
+                .with_pool_config_path(path.clone())
+                .with_full_node_config(
+                    toml::from_str(include_str!("../../../config/mainnet.toml")).unwrap(),
+                    path.clone(),
+                );
                 state.fleet_auth = Arc::new(crate::fleet_auth::FleetAuth::new(
                     NODE.to_string(),
                     with_key.then(|| operator().verifying_key().to_bytes()),
@@ -13222,6 +13243,42 @@ mod tests {
 
         fn change(key: &str, value: serde_json::Value) -> serde_json::Value {
             json!({"key": key, "value": value})
+        }
+
+        /// The dashboard saves the in-memory config over this same file, so a change that reached
+        /// only the file would be undone by the next save, after the operator was told "written".
+        #[tokio::test]
+        async fn a_later_dashboard_save_keeps_a_signed_change() {
+            let n = Node::new(true);
+            let (s, b) = n
+                .put(signed(
+                    "configure",
+                    change("network.max_miners", json!(900)),
+                    "a",
+                ))
+                .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+
+            persist_full_config(&n.state, |_| {}).unwrap();
+
+            let cfg: ghost_common::config::NodeConfig = toml::from_str(&n.file()).unwrap();
+            assert_eq!(cfg.network.max_miners, 900);
+        }
+
+        /// Until the signature passes, the body is a stranger's: nothing in `params` may be read,
+        /// so a malformed one is refused as unsigned, not parsed and answered.
+        #[tokio::test]
+        async fn unsigned_params_are_refused_before_anything_reads_them() {
+            let n = Node::new(true);
+            let before = n.file();
+            let mut body = signed("configure", json!({"junk": "x\ny"}), "a");
+            body["signature"] = json!("00".repeat(64));
+
+            let (s, b) = n.put(body).await;
+
+            assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+            assert_eq!(b["error"], "unauthorized");
+            assert_eq!(n.file(), before);
         }
 
         #[tokio::test]
@@ -13330,12 +13387,16 @@ mod tests {
         #[tokio::test]
         async fn params_must_be_exactly_key_and_value() {
             let n = Node::new(true);
-            for p in [
-                json!({"key": "network.max_miners", "value": 5, "restart": true}),
-                json!({"key": "network.max_miners"}),
-                json!(null),
+            // A signed command spends its nonce before its params are read, so each needs its own.
+            for (nonce, p) in [
+                (
+                    "n1",
+                    json!({"key": "network.max_miners", "value": 5, "restart": true}),
+                ),
+                ("n2", json!({"key": "network.max_miners"})),
+                ("n3", json!(null)),
             ] {
-                let (s, b) = n.put(signed("configure", p.clone(), "n1")).await;
+                let (s, b) = n.put(signed("configure", p.clone(), nonce)).await;
                 assert_eq!(s, StatusCode::BAD_REQUEST, "{p}: {b}");
                 assert_eq!(b["error"], "bad_params");
             }
