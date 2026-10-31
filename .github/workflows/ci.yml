@@ -219,6 +219,10 @@ jobs:
       # key is pinned; and injected target strings are rejected. Temp dirs, fake sftp, no node.
       - name: Off-node backup self-test
         run: ./scripts/test-backup-offsite.sh
+      # A fresh install used to get no nightly backups at all (#1016). The installer now installs
+      # the job on every node and enables it unless --no-backups.
+      - name: Installer nightly-backup option self-test
+        run: ./scripts/test-installer-backups.sh
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.

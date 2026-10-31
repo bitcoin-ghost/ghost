@@ -102,6 +102,7 @@ TOR_MODE="hybrid"
 # operator explicitly opts in (here, or later via the dashboard toggle). The
 # updater verifies the GPG release signature before applying anything.
 AUTO_UPDATE="false"
+BACKUPS="true"
 
 usage() {
   cat <<EOF
@@ -163,6 +164,10 @@ Options:
                                 tarball checksum before swapping any binary; health-checks
                                 and rolls back on failure. Checked every 6h.
   --no-auto-update            Never auto-update                (default)
+  --backups                   Nightly local database backups at 03:00 UTC,
+                                kept 7 days in /var/backups/ghost/db   (default)
+  --no-backups                No nightly backups. They can be switched on later:
+                                sudo systemctl enable --now ghost-backup.timer
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
@@ -208,6 +213,8 @@ while [[ $# -gt 0 ]]; do
     --no-tor)         TOR="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --auto-update)    AUTO_UPDATE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-auto-update) AUTO_UPDATE="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --backups)        BACKUPS="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --no-backups)     BACKUPS="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -411,6 +418,7 @@ run_wizard() {
   echo
   echo "Maintenance:"
   AUTO_UPDATE="$(prompt_yes_no "  Enable automatic updates? (verifies GPG signature before applying)" N)"
+  BACKUPS="$(prompt_yes_no "  Back up the node database every night? (local copies, kept 7 days)" Y)"
 
   # Nickname.
   echo
@@ -432,6 +440,7 @@ run_wizard() {
   echo "  Wraith mixing  : $WRAITH"
   echo "  Tor            : $([[ "$TOR" == "true" ]] && echo "$TOR_MODE" || echo "off")"
   echo "  Auto-update    : $AUTO_UPDATE"
+  echo "  Backups        : $BACKUPS"
   echo "  Nickname       : $NICKNAME"
   echo
   local proceed
@@ -3270,6 +3279,440 @@ if [[ "$AUTO_UPDATE" == "true" ]]; then
 else
   systemctl disable --now ghost-auto-update.timer >/dev/null 2>&1 || true
   log "auto-update disabled (default) — node will not self-upgrade"
+fi
+
+# ───────────────────── nightly database backups (#1016) ──────────────────────
+# The same nightly job the fleet runs: a gzipped `VACUUM INTO` copy of the node database at
+# 03:00 UTC, kept 7 days, refusing rather than filling the disk. Installed on every node so it can
+# be switched on later; ENABLED only with BACKUPS=true (the default; --no-backups turns it off).
+# Off-node copies stay a separate, optional setting (ghost-backup-offsite, the node dashboard).
+install -d -m 0755 -o root -g root /opt/ghost/scripts /opt/ghost/scripts/lib
+# Canonical source: scripts/backup-databases.sh.
+cat > /opt/ghost/scripts/backup-databases.sh <<'BACKUP_DATABASES_SH_EOF'
+#!/usr/bin/env bash
+# backup-databases.sh — Automated backup for ghost.db and ghost-pay.db
+#
+# Gzipped `VACUUM INTO` copies into /var/backups/ghost/db, pruned by BOTH age and count.
+# Logs to syslog. Usage: backup-databases.sh [--ghost-dir /home/ghost/.ghost]
+#
+# ⛔ Run as the database's OWNER, not as root. The databases are WAL mode with `ghost:ghost` 0600
+# sidecars, and sqlite3 opens the source read-write. Under the systemd unit this is fine
+# because it sets `User=ghost`; a hand-run under sudo that has to recreate `-wal` or `-shm` leaves
+# them ROOT-owned, after which the `ghost` user cannot open its own database for writing. The pool
+# wedges and it reads as corruption. The guard below refuses rather than relying on anyone
+# remembering that.
+#
+# ⛔ It refuses when there is no room, instead of writing until the filesystem says no. The old
+# version did the latter, which on a node near full produced a failed backup AND a full root
+# filesystem — the second of which takes the node down and has nothing to do with backups.
+#
+# ## The sizing this is built around
+#
+# MEASURED on the fleet 2026-10-04/05: ghost.db is 2.4–2.7 GB, and free space is
+#
+#     vm1 24,665M   vm2 26,639M   vm3 26,683M   vm4 26,495M
+#     vm5 24,172M   vm6 24,004M   vm7 24,313M   vm8 12,217M
+#
+# Seven daily UNCOMPRESSED copies is 18.2 GB. That fills vm8 in about four days and leaves vm1–vm7
+# with 6–9 GB, on nodes whose database grows and whose `optimize` path can still want twice the
+# database free. This is why the file is gzipped: the two ceremony snapshots already on every node
+# compress 2.6 GB to 788 MB and 901 MB, about 3x, so seven of them is ~6 GB and fits everywhere.
+
+set -euo pipefail
+
+GHOST_DIR="${1:-/home/ghost/.ghost}"
+BACKUP_DIR="/var/backups/ghost/db"
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
+KEEP_COUNT="${BACKUP_KEEP_COUNT:-7}"
+# OPTIONAL off-node copy (#1016). Absent file = off, and the run is exactly what it was before.
+OFFSITE_CONF="${BACKUP_OFFSITE_CONF:-/etc/ghost/backup.conf}"
+# The off-node copy must finish inside the unit's TimeoutStartSec=1800, or systemd stops the whole
+# run and reports a local backup that succeeded as failed. Seconds since this script started.
+OFFSITE_DEADLINE="${BACKUP_OFFSITE_DEADLINE:-1620}"
+TIMESTAMP="$(date +%Y%m%d%H%M)"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/backup-retention.sh
+. "$SCRIPT_DIR/lib/backup-retention.sh"
+
+log() {
+    logger -t ghost-backup "$1"
+    echo "[$(date -Iseconds)] $1"
+}
+
+die() {
+    log "ERROR: $1"
+    exit 1
+}
+
+# ⛔ An ERR trap, because `set -e` aborts without a word: a failure in a command substitution or a
+# pipeline leaves the unit "failed" with the last log line being whatever succeeded before it, which
+# reads as a backup that worked and then stopped for no reason.
+trap 'rc=$?; [ "$rc" -ne 0 ] && log "ERROR: aborted at line $LINENO with status $rc"; exit $rc' ERR
+
+if [ "$(id -u)" -eq 0 ]; then
+    die "refusing to run as root. The databases are WAL mode with ghost-owned 0600 sidecars, and a
+root-run sqlite3 that recreates -wal or -shm leaves them root-owned, after which the ghost user
+cannot write its own database. Run as the owning user (the systemd unit sets User=ghost)."
+fi
+
+# The live database is 0600. Its copies should not be readable by anyone who could not read it.
+umask 077
+
+mkdir -p "$BACKUP_DIR"
+
+# The uncompressed copy in flight, if any. Removed on EVERY exit path — `die`, the ERR trap, and a
+# `systemctl stop` or start timeout, which arrive as SIGTERM.
+PARTIAL=""
+discard_copy() {
+    rm -f -- "$1" "$1-wal" "$1-shm" "$1-journal"
+}
+cleanup_partial() {
+    [ -n "$PARTIAL" ] || return 0
+    discard_copy "$PARTIAL"
+    log "removed the incomplete copy at $PARTIAL"
+    PARTIAL=""
+}
+trap cleanup_partial EXIT
+trap 'cleanup_partial; exit 143' TERM INT
+
+# Back up one database: check there is room, copy, compress, verify the copy opens.
+backup_one() {
+    local label="$1" src="$2" prefix="$3"
+    if [ ! -f "$src" ]; then
+        log "WARN: $label not found at $src, skipping"
+        return 0
+    fi
+
+    local db_kb avail_kb verdict
+    db_kb="$(du -k "$src" | cut -f1)"
+    # ⛔ `df -Pk` prints a header, so the available column is taken with NR==2. Guessing a field
+    # offset off the whole output picks the header's "Capacity" string.
+    avail_kb="$(df -Pk "$BACKUP_DIR" | awk 'NR==2{print $4}')"
+
+    if ! verdict="$(backup_space_verdict "$db_kb" "$avail_kb")"; then
+        die "$label: $verdict — need $(echo "$verdict" | awk '{print $2}')KB free under $BACKUP_DIR,
+have $(echo "$verdict" | awk '{print $3}')KB. Refusing: filling the root filesystem to take a
+backup takes the node down for a reason unrelated to backups."
+    fi
+    log "$label: ${db_kb}KB database, $(echo "$verdict" | awk '{print $3}')KB free — proceeding"
+
+    local dest="$BACKUP_DIR/${prefix}-${TIMESTAMP}.db"
+    log "$label: backing up to ${dest}.gz"
+    # From here until the gzip lands, a failure must not leave the uncompressed copy behind: it is
+    # the full size of the database, on a filesystem this script was written to stop filling.
+    PARTIAL="$dest"
+    # `VACUUM INTO` refuses an existing destination, and a stale one can only be debris.
+    discard_copy "$dest"
+
+    # ⛔ `VACUUM INTO`, not `.backup`. The online backup API RESTARTS whenever another connection
+    # commits to the source, and the pool commits about 45 times a minute. Whether a pass over
+    # 2.4 GB fits between two commits depends on the node: vm5-vm7 got through in under four
+    # minutes, and on vm8 the same command sat at 84% of a CPU for 23 minutes with the destination
+    # fixed at 2,247,475,200 bytes until it was stopped by hand (#1009). `VACUUM INTO` reads inside
+    # ONE transaction, so a writer cannot restart it — on vm8 it finished in 11 seconds.
+    sqlite3 "$src" "VACUUM INTO '$dest'" || die "$label: sqlite3 VACUUM INTO failed"
+
+    # Verify BEFORE compressing, while it is still a database. A truncated file is still a file, and
+    # a gzip of one is still a valid gzip — the kind of backup whose problem surfaces at restore.
+    local ver
+    ver="$(sqlite3 "file:$dest?mode=ro" 'PRAGMA user_version;' 2>/dev/null)" \
+        || die "$label: the copy at $dest does not open as a database"
+    case "$ver" in
+        ''|*[!0-9]*) die "$label: the copy at $dest reports user_version='$ver'" ;;
+    esac
+    local integ
+    integ="$(sqlite3 "file:$dest?mode=ro" 'PRAGMA quick_check;' 2>/dev/null)"
+    [ "$integ" = "ok" ] || die "$label: quick_check on $dest said '$integ'"
+
+    gzip -f "$dest" || die "$label: gzip failed"
+    PARTIAL=""
+    # Verifying a copy can leave `-wal`/`-shm` beside it. Nothing prunes those — retention matches
+    # `*.db.gz` only — so one pair per night would stay for ever.
+    rm -f -- "$dest-wal" "$dest-shm" "$dest-journal"
+    log "$label: complete — $(du -h "${dest}.gz" | cut -f1) compressed from ${db_kb}KB, user_version=$ver, quick_check=ok"
+}
+
+# Each database on its own, so one that cannot be copied does not take the others — or the prune
+# below — down with it. vm1-vm4 carry a `ghost-pay.db` that plain sqlite3 cannot open at all
+# ("file is not a database": it is encrypted, and its service is retired). When that aborted the
+# whole run, `ghost.db` had been copied but nothing was ever pruned, on every night, for ever.
+#
+# The run still FAILS if any database was not backed up, and says which. Carrying on is not the
+# same as calling it a success.
+#
+# ⛔ The subshell is deliberately not written `( ... ) || rc=$?` or `if ! ( ... )`. Either puts it
+# in a condition context, where bash ignores `set -e` for everything inside, and `backup_one`
+# relies on it. So the ERR trap is lifted, errexit is suspended out here, and re-armed in there.
+FAILED=""
+backup_isolated() {
+    local rc
+    trap - ERR
+    set +e
+    (
+        set -e
+        trap cleanup_partial EXIT
+        trap 'cleanup_partial; exit 143' TERM INT
+        backup_one "$@"
+    )
+    rc=$?
+    set -e
+    trap 'rc=$?; [ "$rc" -ne 0 ] && log "ERROR: aborted at line $LINENO with status $rc"; exit $rc' ERR
+    # Stopped, not failed: do not carry on to the next database after a SIGTERM.
+    [ "$rc" -ne 143 ] || exit 143
+    [ "$rc" -eq 0 ] || FAILED="$FAILED $1"
+}
+
+backup_isolated "ghost.db"     "$GHOST_DIR/ghost.db"                  "ghost"
+backup_isolated "ghost-pay.db" "$GHOST_DIR/ghost-pay/ghost-pay.db"    "ghost-pay"
+
+# Prune. Per prefix, so a missing ghost-pay.db cannot let ghost.db copies count towards its quota.
+#
+# ⛔ Both rules must condemn a file: older than RETENTION_DAYS *and* not among the newest
+# KEEP_COUNT. Age alone was the whole policy and age alone has no bound on COUNT — a node that was
+# off and caught up through `Persistent=true` holds any number of same-day copies, none old enough
+# to prune, and the disk fills. The count rule alone would delete a copy that is the only recent one
+# as soon as an eighth appears the same day. See scripts/test-backup-retention.sh.
+for prefix in ghost ghost-pay; do
+    listing=""
+    for f in "$BACKUP_DIR/${prefix}-"*.db.gz; do
+        [ -e "$f" ] || continue
+        listing="${listing}$(stat -c '%Y' "$f") $f
+"
+    done
+    [ -n "$listing" ] || continue
+
+    pruned=0
+    while IFS= read -r victim; do
+        [ -n "$victim" ] || continue
+        rm -f -- "$victim" && pruned=$((pruned + 1))
+    done < <(backup_prune_list "$KEEP_COUNT" "$RETENTION_DAYS" "$(date +%s)" "$listing")
+    [ "$pruned" -gt 0 ] && log "$prefix: pruned $pruned backup(s) (older than ${RETENTION_DAYS}d and beyond the newest ${KEEP_COUNT})"
+done
+
+log "Backup complete. Current backups:"
+# ⛔ Report a COUNT, positively. `ls | while read` printed nothing when there were no backups, which
+# is the same output as a successful run whose files had all just been pruned.
+found=0
+for f in "$BACKUP_DIR"/ghost*.db.gz; do
+    [ -e "$f" ] || continue
+    found=$((found + 1))
+    log "  $(ls -lh "$f" | awk '{print $5, $9}')"
+done
+log "  $found backup file(s) in $BACKUP_DIR, $(df -Pk "$BACKUP_DIR" | awk 'NR==2{print $4}')KB free"
+[ "$found" -gt 0 ] || die "no backup files present after a run that reported success"
+
+# ---------------------------------------------------------------- optional off-node copy (#1016)
+#
+# Only when /etc/ghost/backup.conf exists. Nothing in this block can fail or undo the local backup
+# above: the helper runs with errexit and the ERR trap lifted, its exit status is LOGGED and never
+# returned, and it records its own outcome where the dashboard reads it (`last_offsite_result`). The
+# run's exit status below is decided by the local backup alone.
+offsite_copy() {
+    local helper="${BACKUP_OFFSITE_HELPER:-$SCRIPT_DIR/ghost-backup-offsite.sh}"
+    local files=() prefix f budget out rc
+    # This run's copies only. An older file was already sent, or failed and will be superseded.
+    for prefix in ghost ghost-pay; do
+        f="$BACKUP_DIR/${prefix}-${TIMESTAMP}.db.gz"
+        if [ -f "$f" ]; then files+=("$f"); fi
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+        log "off-node: configured, but this run produced no backup to copy"
+        return 0
+    fi
+    if [ ! -x "$helper" ]; then
+        log "WARN: off-node: $OFFSITE_CONF is present but the helper $helper is not — nothing copied"
+        return 0
+    fi
+    budget=$((OFFSITE_DEADLINE - SECONDS))
+    if [ "$budget" -lt 60 ]; then
+        log "WARN: off-node: only ${budget}s left before the unit's timeout — not starting a copy"
+        return 0
+    fi
+    log "off-node: copying ${#files[@]} file(s), ${budget}s allowed"
+    out="$(GHOST_BACKUP_CONF="$OFFSITE_CONF" GHOST_BACKUP_DIR="$BACKUP_DIR" \
+           GHOST_BACKUP_GHOST_DIR="$GHOST_DIR" \
+           timeout --kill-after=10 $((budget + 30)) "$helper" push --deadline "$budget" "${files[@]}" 2>&1)"
+    rc=$?
+    log "off-node: $out"
+    if [ "$rc" -eq 0 ]; then
+        log "off-node: copy complete"
+    else
+        log "WARN: off-node copy FAILED (exit $rc) — the local backup above is complete and unaffected"
+    fi
+    return 0
+}
+
+if [ -e "$OFFSITE_CONF" ]; then
+    trap - ERR
+    set +e
+    offsite_copy
+    set -e
+    trap 'rc=$?; [ "$rc" -ne 0 ] && log "ERROR: aborted at line $LINENO with status $rc"; exit $rc' ERR
+fi
+
+# The verdict, last, so it is the final line anyone reads in the journal.
+[ -z "$FAILED" ] || die "NOT backed up:$FAILED — every other database above was copied and pruned normally"
+
+exit 0
+BACKUP_DATABASES_SH_EOF
+# Canonical source: scripts/lib/backup-retention.sh.
+cat > /opt/ghost/scripts/lib/backup-retention.sh <<'BACKUP_RETENTION_SH_EOF'
+#!/usr/bin/env bash
+#
+# The sizing and retention decisions for scripts/backup-databases.sh (#996).
+#
+# ## Why this is a separate file
+#
+# Both decisions are arithmetic over a handful of numbers, and both are the kind of arithmetic that
+# is wrong in a way nothing notices until a disk is full. They are driven directly by
+# scripts/test-backup-retention.sh rather than by running a backup, which would need a 2.6 GB
+# database to be interesting.
+#
+# ## The numbers these exist to respect
+#
+# MEASURED on the fleet 2026-10-04/05. Database 2.4–2.7 GB; free space:
+#
+#     vm1 24,665M   vm2 26,639M   vm3 26,683M   vm4 26,495M
+#     vm5 24,172M   vm6 24,004M   vm7 24,313M   vm8 12,217M
+#
+# Seven daily UNCOMPRESSED copies is 18.2 GB, which fills vm8 in about four days and leaves vm1–vm7
+# with 6–9 GB on a node whose `optimize` path can still want twice the database free. Gzip is the
+# established shape here — the two ceremony snapshots on every node are already gzipped, at 788 MB
+# and 901 MB against 2.6 GB raw, so about 3x. Seven of those is ~6 GB and fits everywhere.
+
+# Decide whether there is room to take a backup.
+#
+# Usage: backup_space_verdict <db_kb> <avail_kb>
+#
+# A backup needs the FULL uncompressed size transiently — `.backup` writes a plain copy and gzip
+# then reads it — plus headroom, so this asks for the database size plus a margin rather than the
+# compressed size it will settle at. Prints one verdict and returns 0 to proceed, 1 to refuse:
+#
+#   OK <need_kb> <avail_kb>
+#   REFUSE_SPACE <need_kb> <avail_kb>
+#   REFUSE_PARSE <field> <value>
+#
+# ⛔ Refusing is the behaviour that was missing. `sqlite3 .backup` writes until it cannot and then
+# fails, so on a node near full the old script produced a failed backup AND a full root filesystem —
+# the second of which takes the node down and has nothing to do with backups.
+BACKUP_HEADROOM_KB=${BACKUP_HEADROOM_KB:-1048576}   # 1 GiB
+
+backup_space_verdict() {
+    local db_kb="${1:-}" avail_kb="${2:-}"
+    local field
+    # Each field separately. Concatenating them and testing `*[!0-9]*` makes an EMPTY field
+    # invisible whenever the others are numeric, which is how a probe that answered nothing reads
+    # as a probe that answered fine.
+    for field in "db_kb:${db_kb}" "avail_kb:${avail_kb}"; do
+        case "${field#*:}" in
+            ''|*[!0-9]*) echo "REFUSE_PARSE ${field%%:*} ${field#*:}"; return 1 ;;
+        esac
+    done
+
+    local need_kb=$((db_kb + BACKUP_HEADROOM_KB))
+    if [ "$avail_kb" -lt "$need_kb" ]; then
+        echo "REFUSE_SPACE $need_kb $avail_kb"
+        return 1
+    fi
+    echo "OK $need_kb $avail_kb"
+    return 0
+}
+
+# Choose which backups to delete.
+#
+# Usage: backup_prune_list <keep_count> <retention_days> <now_epoch> <listing>
+#
+# `listing` is one `<epoch> <path>` line per existing backup, any order. Prints the paths to delete,
+# newest-surviving-first order not guaranteed. Returns 0 always: "nothing to prune" is an answer.
+#
+# Two rules, and a file is deleted only when BOTH agree it may go:
+#
+#   * older than `retention_days`, AND
+#   * not among the newest `keep_count`.
+#
+# ⛔ The age rule alone was the whole policy, and age alone has no bound on COUNT. A node that was
+# off and caught up through `Persistent=true` can hold an unlimited number of same-day copies, none
+# of which is old enough to prune. The count rule alone is not enough either: it would delete a
+# backup that is the only one there is as soon as an eighth appears on the same day.
+#
+# ⛔ And the newest is never deleted, whatever the numbers say. A prune that can remove every copy
+# is not a retention policy — see the `CONTROL: offset 1` case in test-deploy-gate.sh for the same
+# mistake made with binaries.
+backup_prune_list() {
+    local keep="${1:-}" days="${2:-}" now="${3:-}" listing="${4:-}"
+    case "${keep}${days}${now}" in
+        ''|*[!0-9]*) echo "REFUSE_PARSE args ${keep}/${days}/${now}" >&2; return 1 ;;
+    esac
+    [ "$keep" -ge 1 ] || { echo "REFUSE_PARSE keep_count $keep" >&2; return 1; }
+
+    local cutoff=$((now - days * 86400))
+    # Newest first, so the line number IS the rank.
+    printf '%s\n' "$listing" \
+        | /usr/bin/grep -E '^[0-9]+ ' \
+        | sort -k1,1nr \
+        | awk -v cutoff="$cutoff" -v keep="$keep" '
+            NR > keep && $1 < cutoff { $1 = ""; sub(/^ /, ""); print }
+          '
+}
+BACKUP_RETENTION_SH_EOF
+chmod 755 /opt/ghost/scripts/backup-databases.sh
+chmod 644 /opt/ghost/scripts/lib/backup-retention.sh
+# The nightly job looks for the off-node helper next to itself.
+install -m 0755 -o root -g root /opt/ghost/bin/ghost-backup-offsite /opt/ghost/scripts/ghost-backup-offsite.sh
+# Canonical source: scripts/systemd/ghost-backup.service (read from the fleet, byte for byte).
+cat > /etc/systemd/system/ghost-backup.service <<'GHOST_BACKUP_SERVICE_EOF'
+[Unit]
+Description=Ghost Pool Database Backup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ghost/scripts/backup-databases.sh /home/ghost/.ghost
+User=ghost
+Group=ghost
+
+# ⛔ User=ghost is load-bearing, not tidiness. The databases are WAL mode with ghost-owned 0600
+# sidecars and sqlite3 opens the source read-write; a root-run that has to recreate
+# -wal or -shm leaves them root-owned, after which the ghost user cannot write its own database.
+# backup-databases.sh also refuses to run as root, so these two agree.
+
+# A 2.6 GB read plus gzip competes with the pool for the same disk. Deprioritised so a backup can
+# never be the reason a share took too long to credit.
+# A healthy run is under four minutes. Type=oneshot has NO start timeout by default, so a copy
+# that cannot finish holds a CPU until someone notices — 23 minutes on vm8 before it was stopped
+# by hand (#1009). The script removes its partial copy when this fires.
+TimeoutStartSec=1800
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target
+GHOST_BACKUP_SERVICE_EOF
+# Canonical source: scripts/systemd/ghost-backup.timer.
+cat > /etc/systemd/system/ghost-backup.timer <<'GHOST_BACKUP_TIMER_EOF'
+[Unit]
+Description=Daily Ghost Pool Database Backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+GHOST_BACKUP_TIMER_EOF
+mkdir -p /var/backups/ghost/db
+chown ghost:ghost /var/backups/ghost/db
+systemctl daemon-reload >/dev/null 2>&1 || true
+if [[ "$BACKUPS" == "true" ]]; then
+  systemctl enable --now ghost-backup.timer >/dev/null 2>&1 || true
+  log "nightly backups ENABLED — 03:00 UTC, kept 7 days in /var/backups/ghost/db"
+else
+  systemctl disable --now ghost-backup.timer >/dev/null 2>&1 || true
+  log "nightly backups disabled (--no-backups) — enable later: systemctl enable --now ghost-backup.timer"
 fi
 
 # ─────────────────────────────── 11. start ───────────────────────────────────
