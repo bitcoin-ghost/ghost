@@ -51,6 +51,10 @@ PAIRS = {
     "GHOST_AUTOUPDATE_SH_EOF":        "scripts/ghost-auto-update.sh",
     "GHOST_AUTOUPDATE_SERVICE_EOF":   "scripts/systemd/ghost-auto-update.service",
     "GHOST_AUTOUPDATE_TIMER_EOF":     "scripts/systemd/ghost-auto-update.timer",
+    # The optional off-node backup helper (#1016) runs as root from the dashboard. Its input
+    # validation IS its security boundary, so a fresh node must not get a looser copy of it.
+    "GHOST_BACKUP_OFFSITE_SH_EOF":      "scripts/ghost-backup-offsite.sh",
+    "GHOST_BACKUP_OFFSITE_SUDOERS_EOF": "scripts/ghost-backup-offsite.sudoers",
 }
 
 src = open(INSTALLER).read()

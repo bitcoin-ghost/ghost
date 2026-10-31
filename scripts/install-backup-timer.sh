@@ -77,6 +77,26 @@ EOF
 mkdir -p /var/backups/ghost/db
 chown ghost:ghost /var/backups/ghost/db
 
+# The OPTIONAL off-node copy (#1016). Installing the helper turns nothing on: it copies only once
+# /etc/ghost/backup.conf exists, which only the operator creates (from the dashboard, or by running
+# the helper's `set`). The nightly job runs the copy beside it in $SCRIPT_DIR; the dashboard runs the
+# root-owned copy below through a sudoers rule pinned to five exact argvs.
+if [ -f "$SCRIPT_DIR/ghost-backup-offsite.sh" ]; then
+    chmod +x "$SCRIPT_DIR/ghost-backup-offsite.sh"
+    install -d -m 0755 /opt/ghost/bin
+    install -m 0755 -o root -g root "$SCRIPT_DIR/ghost-backup-offsite.sh" /opt/ghost/bin/ghost-backup-offsite
+    if [ -f "$SCRIPT_DIR/ghost-backup-offsite.sudoers" ]; then
+        install -m 0440 -o root -g root "$SCRIPT_DIR/ghost-backup-offsite.sudoers" /etc/sudoers.d/ghost-backup-offsite
+        # A malformed sudoers file breaks ALL sudo; refuse to leave one behind.
+        if ! visudo -cf /etc/sudoers.d/ghost-backup-offsite >/dev/null 2>&1; then
+            rm -f /etc/sudoers.d/ghost-backup-offsite
+            echo "WARNING: ghost-backup-offsite sudoers failed validation — removed (dashboard setting unavailable)"
+        fi
+    fi
+else
+    echo "NOTE: $SCRIPT_DIR/ghost-backup-offsite.sh not found — off-node copies unavailable (local backups unaffected)"
+fi
+
 # Enable and start timer
 systemctl daemon-reload
 systemctl enable ghost-backup.timer
@@ -88,6 +108,7 @@ echo "  Backup dir: /var/backups/ghost/db"
 echo "  Retention: older than 7 days AND beyond the newest 7 (both must agree)"
 echo "  Format: gzipped — ~850MB per copy against a 2.6GB database, so ~6GB for seven"
 echo "  Refuses rather than filling the disk if free space is under the database size + 1GiB"
+echo "  Off-node copy: OFF unless configured (dashboard, or: sudo /opt/ghost/bin/ghost-backup-offsite show)"
 echo ""
 echo "Verify with: systemctl list-timers ghost-backup.timer"
 echo "Test now with: systemctl start ghost-backup.service"
