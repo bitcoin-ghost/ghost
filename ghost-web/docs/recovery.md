@@ -297,7 +297,7 @@ sqlite3 /home/ghost/.ghost/ghost-pay/ghost-pay.db \
 
 | What | Script | Schedule | Retention |
 |---|---|---|---|
-| `ghost.db` + `ghost-pay.db` | `backup-databases.sh` | Daily 03:00 UTC | 7 days local + offsite |
+| `ghost.db` + `ghost-pay.db` | `backup-databases.sh` | Daily 03:00 UTC | 7 days local; an off-node copy only if you configure one (see the deployment guide, *Database backups*) |
 | MPC params + VK files | `backup-mpc-params.sh` | After ceremony, on demand | 3 copies, geographically separated |
 | Node identity (`node.key`) | manual | Once at creation | Multiple secure locations |
 | Noise keypair (`noise.key`) | manual | Once at creation | Same as node.key |

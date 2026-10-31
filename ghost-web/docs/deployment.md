@@ -198,6 +198,7 @@ ghost-mining runs genesis-anchored to the MPC ceremony: the drop-in `/etc/system
 | `/etc/ghost/pool-config.toml` | pool_sv2 (sri-pool) config |
 | `/etc/ghost/translator-config.toml` | translator_sv2 (sri-translator) config |
 | `/etc/ghost/auto-update.conf` | Auto-update opt-in |
+| `/etc/ghost/backup.conf` | Optional off-node backup destination. Not present unless you configure one |
 | `/etc/ghost/version` | Installed release version |
 
 ### Units
@@ -325,6 +326,35 @@ The SV2 binaries always move with `ghost-mining`: a release that does not carry 
 
 The outcome of the last run is in `/var/lib/ghost/auto-update.status`. `sudo /opt/ghost/bin/ghost-auto-update.sh --dry-run` verifies the latest release and reports what it would swap, without swapping.
 
+## Database backups
+
+`ghost-backup.timer` runs `backup-databases.sh` as `ghost` every night at 03:00 UTC. It takes a `VACUUM INTO` copy of `ghost.db` (and `ghost-pay.db` where present), checks that the copy opens and passes `quick_check`, gzips it into `/var/backups/ghost/db`, and keeps copies that are newer than 7 days or among the newest 7. It refuses to run if free space is below the database size plus 1 GiB. The installer does not set the timer up; run `sudo scripts/install-backup-timer.sh` from a checkout to install it.
+
+Those copies sit on the same disk as the database. They protect you from a bad migration or a corrupted file, but not from losing the disk or the VM.
+
+### Off-node copy (optional)
+
+Off by default, and never required. The network does not provide or pay for the storage. If you want a second copy somewhere you control, set it on the dashboard under **Settings › System › Nightly Database Backups**, or with the helper:
+
+```bash
+sudo /opt/ghost/bin/ghost-backup-offsite show
+printf 'kind=local\ntarget=/mnt/backup-drive/ghost\nkeep=7\n' | sudo /opt/ghost/bin/ghost-backup-offsite set
+printf 'kind=ssh\ntarget=backup@nas.example.org:/srv/ghost\nport=22\nkeep=7\n' | sudo /opt/ghost/bin/ghost-backup-offsite set
+sudo /opt/ghost/bin/ghost-backup-offsite test
+sudo /opt/ghost/bin/ghost-backup-offsite disable
+```
+
+The setting is stored in `/etc/ghost/backup.conf`. If that file doesn't exist, the nightly job does exactly what it did before. There are two kinds of destination:
+
+- **A local directory**, such as a mounted USB drive or an NFS share. It must exist, `ghost` must be able to write to it, and it must be on a different filesystem from both `/var/backups/ghost/db` and the database. A directory on the same disk is refused because it isn't off-disk. This also covers a drive that has come unmounted: its empty mountpoint is on the root filesystem, so nothing is written there.
+- **A server over SSH**, given as `user@host:/path` with an optional port. Copies go over SFTP, so a restricted SFTP-only account works. The node generates its own ed25519 key pair in `/var/lib/ghost-backup`, owned by `ghost`. The dashboard and `show` give you the **public** key, which you add to `~/.ssh/authorized_keys` for that account on the server. The private key is never shown. **Test** writes and removes a probe file and pins the server's host key the first time it succeeds. After that, the nightly copy accepts only that host key, and until it has been pinned, the nightly copy refuses to connect.
+
+User names, host names and paths may contain only letters, digits and `. _ - /`. Anything else is rejected, including spaces, `..`, and characters a shell would interpret. IPv6 literals aren't supported; use a host name.
+
+After the local backup succeeds, the nightly job copies that night's files to the destination, then deletes older copies there until only the newest `keep` (default 7) are left. It only ever deletes files whose names the job itself writes (`ghost-YYYYmmddHHMM.db.gz`, `ghost-pay-YYYYmmddHHMM.db.gz`). A local destination also has to have room for the copies plus 256 MiB, or the copy is refused.
+
+**A failed off-node copy never fails or undoes the local backup.** The unit's exit status depends only on the local backup. The off-node outcome is written to `/var/lib/ghost-backup/offsite.status` (`last_offsite_result`, `last_offsite_time`, `last_offsite_error`), and the dashboard shows it. Copies are not encrypted before they leave the node, so store them somewhere only you can read.
+
 ## Alerts and the restart watchdog
 
 With `--alert-webhook`, `pool.toml` gets an `[alerts]` block with a push channel. Without it the block is written with `enabled = false` and a comment saying so, and ghost-mining warns at every start. To add one later, set `[alerts] enabled = true` and fill in `[alerts.channels.push]`.
@@ -345,6 +375,7 @@ systemd restarts a crashing service for ever and reports it `active` between cra
 | Miners can't connect | `sudo journalctl -u sri-pool -u sri-translator -n 100`; `sudo ufw status` should show 3333 (and 34255) for the pool modes. In `solo` mode they are closed on purpose. |
 | A service keeps restarting, or is up but serving nothing | `sudo /opt/ghost/bin/ghost-restart-watch.sh --check` |
 | An automatic update rolled back | `cat /var/lib/ghost/auto-update.status`; `sudo journalctl -u ghost-auto-update -n 100` |
+| The off-node backup copy failed | `sudo /opt/ghost/bin/ghost-backup-offsite show` (see `last_result`); `sudo /opt/ghost/bin/ghost-backup-offsite test`; `sudo journalctl -u ghost-backup -n 100` |
 
 The [Recovery runbook](#recovery) covers what to do when a running node breaks (DB corruption, mesh split, payout proposal divergence, etc).
 
@@ -361,5 +392,7 @@ The [Recovery runbook](#recovery) covers what to do when a running node breaks (
 |---|---|
 | `scripts/install-node.sh` | The installer, including the boot gate, firewall reconcile, restart watchdog and auto-updater it lays down |
 | `scripts/ghost-auto-update.sh` | Canonical copy of the auto-updater |
+| `scripts/backup-databases.sh` | The nightly database backup |
+| `scripts/ghost-backup-offsite.sh` | Canonical copy of the optional off-node backup helper |
 | `crates/ghost-common/src/constants.rs` | Capability share weights, `MAX_ELDERS` |
 | `crates/ghost-common/src/config.rs` | `pool.toml` structures |
