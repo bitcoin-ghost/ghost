@@ -55,6 +55,12 @@ PAIRS = {
     # validation IS its security boundary, so a fresh node must not get a looser copy of it.
     "GHOST_BACKUP_OFFSITE_SH_EOF":      "scripts/ghost-backup-offsite.sh",
     "GHOST_BACKUP_OFFSITE_SUDOERS_EOF": "scripts/ghost-backup-offsite.sudoers",
+    # Nightly backups (#1016). A fresh install used to get none: the timer was only ever installed
+    # by hand with scripts/install-backup-timer.sh. The units are the fleet's, read back from vm1.
+    "BACKUP_DATABASES_SH_EOF":          "scripts/backup-databases.sh",
+    "BACKUP_RETENTION_SH_EOF":          "scripts/lib/backup-retention.sh",
+    "GHOST_BACKUP_SERVICE_EOF":         "scripts/systemd/ghost-backup.service",
+    "GHOST_BACKUP_TIMER_EOF":           "scripts/systemd/ghost-backup.timer",
 }
 
 src = open(INSTALLER).read()

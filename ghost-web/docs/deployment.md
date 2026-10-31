@@ -91,7 +91,7 @@ less install-node.sh
 sudo bash install-node.sh --payout-address bc1q... --treasury-address bc1q... --alert-webhook https://ntfy.sh
 ```
 
-Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the same choices as the flags below (payout and treasury addresses, sync mode, mining mode, pool name, Reaper, archive, Wraith, Tor, auto-update, nickname), shows a summary and asks before it changes anything. The wizard does not ask for an alert endpoint, so a wizard install has alerts disabled until you add one. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
+Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the same choices as the flags below (payout and treasury addresses, sync mode, mining mode, pool name, Reaper, archive, Wraith, Tor, auto-update, nightly backups, nickname), shows a summary and asks before it changes anything. The wizard does not ask for an alert endpoint, so a wizard install has alerts disabled until you add one. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
 
 ### Flags
 
@@ -116,6 +116,8 @@ Run from a file like this, with **no** flags at all, on a terminal, the installe
 | `--no-tor` | | Never use Tor (the default). |
 | `--auto-update` | off | Apply newer signed releases automatically. See *Automatic updates*, below. |
 | `--no-auto-update` | | Never auto-update (the default). |
+| `--backups` | on | Back up the node database every night at 03:00 UTC, kept 7 days. See *Database backups*, below. |
+| `--no-backups` | | No nightly backups. The job is still installed; switch it on later with `sudo systemctl enable --now ghost-backup.timer`. |
 | `--non-interactive` | | Never start the wizard. |
 | `-h`, `--help` | | Print the help. |
 
@@ -213,6 +215,7 @@ ghost-mining runs genesis-anchored to the MPC ceremony: the drop-in `/etc/system
 | `ghost-mining-firewall.path` | root | yes | systemd |
 | `ghost-restart-watch.timer` | root | yes | systemd |
 | `ghost-auto-update.timer` | root | only with `--auto-update` | systemd |
+| `ghost-backup.timer` | ghost | unless `--no-backups` | systemd |
 
 ### The boot gate
 
@@ -328,7 +331,7 @@ The outcome of the last run is in `/var/lib/ghost/auto-update.status`. `sudo /op
 
 ## Database backups
 
-`ghost-backup.timer` runs `backup-databases.sh` as `ghost` every night at 03:00 UTC. It takes a `VACUUM INTO` copy of `ghost.db` (and `ghost-pay.db` where present), checks that the copy opens and passes `quick_check`, gzips it into `/var/backups/ghost/db`, and keeps copies that are newer than 7 days or among the newest 7. It refuses to run if free space is below the database size plus 1 GiB. The installer does not set the timer up; run `sudo scripts/install-backup-timer.sh` from a checkout to install it.
+`ghost-backup.timer` runs `backup-databases.sh` as `ghost` every night at 03:00 UTC. It takes a `VACUUM INTO` copy of `ghost.db` (and `ghost-pay.db` where present), checks that the copy opens and passes `quick_check`, gzips it into `/var/backups/ghost/db`, and keeps copies that are newer than 7 days or among the newest 7. It refuses to run if free space is below the database size plus 1 GiB. The installer sets it up and enables it unless you pass `--no-backups` (or answer no in the wizard).
 
 Those copies sit on the same disk as the database. They protect you from a bad migration or a corrupted file, but not from losing the disk or the VM.
 
