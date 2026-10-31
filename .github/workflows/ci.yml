@@ -105,6 +105,12 @@ jobs:
       # takes `ghost-cli` from ghost-core and `ghost-admin` from cargo.
       - name: ghost-cli identity self-test
         run: ./scripts/test-cli-identity.sh
+      # The auto-updater swapped ghostd and ghost-mining but never pool_sv2 or translator_sv2,
+      # splitting the stack on any node that opted in (#1044); and on a node with ghost-pay
+      # masked it rolled back every update. Runs the real updater against a signed throwaway
+      # release, stub binaries and a recording systemctl.
+      - name: auto-update swap self-test
+        run: ./scripts/test-auto-update-swap.sh
       # release.sh orchestrates the roll, and two of its steps failed silently in v1.11.38: it
       # reported a release "published" that was still a draft (#857), and it rolled genesis FIRST
       # against its own stated rule (#856). Both are the shape a self-test catches and a reader

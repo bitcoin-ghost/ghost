@@ -12,6 +12,13 @@
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
 # failure.
 #
+# ⛔ The SV2 stratum stack (`pool_sv2` under sri-pool, `translator_sv2` under
+# sri-translator) is swapped in the SAME set as ghost-mining (#1044). Share-batch
+# signing lives in the pool_sv2 binary (#742), so a new ghost-mining against an old
+# pool_sv2 is the split the fleet's roll order exists to prevent. All of it moves,
+# or none of it does: a release that is missing an installed SV2 binary is refused,
+# and a rollback restores the whole set.
+#
 # SUPPLY-CHAIN-CRITICAL: a binary is NEVER written unless the GPG signature over
 # the tarball verifies. ghostd rides that SAME signature (it lives inside the
 # tarball now), so there is no longer a separate ghostd checksum side-channel.
@@ -159,6 +166,13 @@ unit_present() {
   $SYSTEMCTL list-unit-files "$unit" >/dev/null 2>&1
 }
 
+# unit_in_use — present and not masked. ghost-pay is masked on nodes that keep its unit file;
+# starting or health-checking it there fails by design and would roll back every update.
+unit_in_use() {
+  unit_present "$1" || return 1
+  [[ "$($SYSTEMCTL is-enabled "$1" 2>/dev/null || true)" != masked ]]
+}
+
 # ─────────────────────────── health checks ───────────────────────────────────
 
 health_ghostd() {
@@ -197,11 +211,30 @@ health_ghost_pool() {
   return 1
 }
 
+# health_stratum — the SV2 stack is listening: sri-pool on :34255 (SV2) and
+# sri-translator on :3333 (SV1, what miners connect to). Only units the node has.
+# A listening socket is what the miners need; neither binary has a cheaper probe.
+health_stratum() {
+  local unit port ok
+  for unit in sri-pool sri-translator; do
+    unit_in_use "$unit.service" || { log "health: $unit not installed — skipped"; continue; }
+    case "$unit" in sri-pool) port=34255 ;; sri-translator) port=3333 ;; esac
+    ok=""
+    for _ in $(seq 1 30); do
+      if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then ok=1; break; fi
+      sleep 2
+    done
+    [[ -n "$ok" ]] || { err "health: $unit is not listening on :$port"; return 1; }
+    log "health: $unit listening on :$port"
+  done
+  return 0
+}
+
 health_ghost_pay() {
   # Only meaningful when ghost-pay is installed. It serves TLS with an
   # identity-derived cert, so -k (we are localhost, integrity is the binary swap
   # we just verified, not the transport).
-  unit_present ghost-pay.service || { log "health: ghost-pay not installed — skipped"; return 0; }
+  unit_in_use ghost-pay.service || { log "health: ghost-pay not installed or masked — skipped"; return 0; }
   local code
   for _ in $(seq 1 30); do
     code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 "https://127.0.0.1:8800/health" 2>/dev/null || true)"
@@ -224,7 +257,39 @@ run_health_checks() {
     bash -c "$GHOST_HEALTHCHECK_OVERRIDE"
     return $?
   fi
-  health_ghostd && health_ghost_pool && health_ghost_pay
+  health_ghostd && health_ghost_pool && health_ghost_pay && health_stratum
+}
+
+# The node's units, in START order. Stops run this list backwards. Same order as the boot
+# gate (wait-for-ghostd-sync.sh): the stratum stack has nothing to serve until the node is up.
+START_ORDER=(ghostd.service ghost-mining.service ghost-pay.service sri-pool.service sri-translator.service)
+
+# stop_all — reverse start order, each verified inactive. Returns non-zero naming the first
+# unit that would not stop; units the node does not have are skipped by stop_and_wait.
+stop_all() {
+  local i
+  for (( i=${#START_ORDER[@]}-1; i>=0; i-- )); do
+    stop_and_wait "${START_ORDER[$i]}" || { STOP_FAILED="${START_ORDER[$i]}"; return 1; }
+  done
+}
+
+# start_all — start order. ghostd and ghost-mining always exist; the rest only where present.
+# Returns non-zero naming the first unit that failed to start.
+start_all() {
+  local u
+  for u in "${START_ORDER[@]}"; do
+    case "$u" in
+      ghostd.service|ghost-mining.service) ;;
+      *) unit_in_use "$u" || continue ;;
+    esac
+    if ! $SYSTEMCTL start "$u"; then
+      # As in the boot gate: ghost-pay's failure is not the node's.
+      [[ "$u" == ghost-pay.service ]] && { warn "ghost-pay did not start — continuing"; continue; }
+      START_FAILED="$u"; return 1
+    fi
+    [[ "$u" == ghostd.service ]] && sleep 3
+  done
+  return 0
 }
 
 # ──────────────────────────────── main ───────────────────────────────────────
@@ -322,12 +387,14 @@ main() {
   # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli new_admin new_ghostd
+  local new_pool new_pay new_cli new_admin new_ghostd new_pool_sv2 new_translator
   new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
   new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
   new_admin="$(find "$tmp" -name ghost-admin -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
+  new_pool_sv2="$(find "$tmp" -name pool_sv2 -type f | head -1 || true)"
+  new_translator="$(find "$tmp" -name translator_sv2 -type f | head -1 || true)"
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
@@ -354,6 +421,20 @@ main() {
   if [[ -x "$BIN_DIR/ghost-admin" && -n "$new_admin" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-admin"); SWAP_SRC+=("$new_admin")
   fi
+  # The SV2 stack moves with ghost-mining or the update does not happen (#1044). An installed
+  # binary the release does not carry would be left at the old version under a new ghost-mining
+  # — refuse before anything is touched rather than split the stack.
+  local sv2 sv2_src
+  for sv2 in pool_sv2 translator_sv2; do
+    [[ -x "$BIN_DIR/$sv2" ]] || continue
+    if [[ "$sv2" == pool_sv2 ]]; then sv2_src="$new_pool_sv2"; else sv2_src="$new_translator"; fi
+    if [[ -z "$sv2_src" ]]; then
+      err "verified tarball does not contain $sv2, which this node runs — refusing to split the stack, no binary touched"
+      write_status "error" "tarball missing $sv2" "$latest"
+      exit 1
+    fi
+    SWAP_DEST+=("$BIN_DIR/$sv2"); SWAP_SRC+=("$sv2_src")
+  done
 
   if [[ "$DRY_RUN" == "true" ]]; then
     log "DRY-RUN: verification PASSED for $latest. Would back up + swap:"
@@ -380,24 +461,19 @@ main() {
   # rollback: restore every backup taken this run, restart, log.
   rollback() {
     err "rolling back to pre-update binaries"
-    stop_and_wait ghost-pay.service || true
-    stop_and_wait ghost-mining.service || true
-    stop_and_wait ghostd.service || true
+    stop_all || true
     local j
     for j in "${!BACKUP_DEST[@]}"; do
       cp -p "${BACKUP_DEST[$j]}" "${BACKUP_OF[$j]}" && log "restored ${BACKUP_OF[$j]}"
     done
-    $SYSTEMCTL start ghostd.service || true
-    sleep 3
-    $SYSTEMCTL start ghost-mining.service || true
-    unit_present ghost-pay.service && { $SYSTEMCTL start ghost-pay.service || true; }
+    start_all || err "rollback: ${START_FAILED:-a unit} did not start"
     return 0  # never let the rollback's last status trip `set -e` in the caller
   }
 
-  # 7. Stop services (reverse dependency order), verify inactive.
-  stop_and_wait ghost-pay.service || true
-  stop_and_wait ghost-mining.service || { err "ghost-mining would not stop — rolling back"; rollback; write_status "rolled-back" "ghost-mining failed to stop" "$latest"; exit 1; }
-  stop_and_wait ghostd.service    || { err "ghostd would not stop — rolling back"; rollback; write_status "rolled-back" "ghostd failed to stop" "$latest"; exit 1; }
+  # 7. Stop services (reverse start order: translator, pool, pay, ghost-mining, ghostd), each
+  #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
+  local STOP_FAILED="" START_FAILED=""
+  stop_all || { err "$STOP_FAILED would not stop — rolling back"; rollback; write_status "rolled-back" "$STOP_FAILED failed to stop" "$latest"; exit 1; }
 
   # 8. Swap the verified binaries into place atomically (install = temp+rename).
   # Owned root:root in production (the unit runs as root); a non-root manual run
@@ -415,13 +491,8 @@ main() {
     fi
   done
 
-  # 9. Start services (dependency order).
-  $SYSTEMCTL start ghostd.service || { err "ghostd failed to start — rolling back"; rollback; write_status "rolled-back" "ghostd failed to start" "$latest"; exit 1; }
-  sleep 3
-  $SYSTEMCTL start ghost-mining.service || { err "ghost-mining failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-mining failed to start" "$latest"; exit 1; }
-  if unit_present ghost-pay.service; then
-    $SYSTEMCTL start ghost-pay.service || { err "ghost-pay failed to start — rolling back"; rollback; write_status "rolled-back" "ghost-pay failed to start" "$latest"; exit 1; }
-  fi
+  # 9. Start services (start order: ghostd, ghost-mining, pay, pool, translator).
+  start_all || { err "$START_FAILED failed to start — rolling back"; rollback; write_status "rolled-back" "$START_FAILED failed to start" "$latest"; exit 1; }
 
   # 10. Health-check; roll back on any failure.
   if run_health_checks; then
