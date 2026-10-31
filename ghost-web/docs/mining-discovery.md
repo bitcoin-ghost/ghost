@@ -25,12 +25,12 @@ Two limits remain, and neither is solved by code:
 1. **One operator.** Every pool node is run by the same operator, so a shim seeded only with Ghost
    nodes is trusting one party for its first fetch. At least three independently operated seeds are
    needed before that changes.
-2. **The root of trust is the fleet's own keys.** With the eight ids below, whoever controls six of
-   the eight fleet keys can sign a list that points miners anywhere. The repository also carries a
-   stronger set (`config/genesis-signers.txt`: the eight plus four offline-only keys, 9 of 12
-   required), but the live checkpoint carries fleet signatures only, so a shim started from that
-   set rejects it today (`insufficient quorum: 6/9`). Until the offline keys co-sign, the
-   eight-id set below is the one that works.
+2. **The root of trust is the fleet's own keys.** Whoever controls six of the eight fleet keys can
+   sign a list that points miners anywhere. That is the chosen launch position: the set in
+   `config/genesis-signers.txt` is exactly the eight ids below. A stronger set that added four
+   offline-only keys was considered and set aside, because the live checkpoint carries fleet
+   signatures only and nothing yet collects offline co-signatures. The fleet's share of the set
+   falls below the threshold as independent operators are added to it.
 
 ---
 
