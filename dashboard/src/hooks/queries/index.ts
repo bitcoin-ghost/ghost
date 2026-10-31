@@ -31,6 +31,9 @@ export * from './useBackupQueries';
 // Scheduled-backup config queries
 export * from './useBackupScheduleQueries';
 
+// Nightly database backups + optional off-node destination
+export * from './useBackupOffsiteQueries';
+
 // Watchdog queries
 export * from './useWatchdogQueries';
 
