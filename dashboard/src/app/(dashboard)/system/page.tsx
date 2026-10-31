@@ -30,6 +30,7 @@ import { getBackupDownloadUrl } from "@/lib/api/backup";
 import { useToast } from "@/components/ui/Toast";
 import { AutoUpdateSection } from "@/components/settings/AutoUpdateSection";
 import { ScheduledBackupsCard } from "@/components/settings/ScheduledBackupsCard";
+import { NightlyBackupsCard } from "@/components/settings/NightlyBackupsCard";
 import { StoragePruningCard } from "@/components/settings/StoragePruningCard";
 import type { UpdateStatus } from "@/lib/api/system";
 import type { VerifyBackupResponse } from "@/types/api";
@@ -733,6 +734,13 @@ export default function SystemPage() {
       {/* ----------------------------------------------------------------- */}
       <SectionErrorBoundary section="Scheduled Backups">
         <ScheduledBackupsCard />
+      </SectionErrorBoundary>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Nightly Database Backups + optional off-node copy (#1016)          */}
+      {/* ----------------------------------------------------------------- */}
+      <SectionErrorBoundary section="Nightly Database Backups">
+        <NightlyBackupsCard />
       </SectionErrorBoundary>
 
       {/* ================================================================= */}

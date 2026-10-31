@@ -5,10 +5,12 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { AutoUpdateSection } from "@/components/settings/AutoUpdateSection";
 import { ScheduledBackupsCard } from "@/components/settings/ScheduledBackupsCard";
+import { NightlyBackupsCard } from "@/components/settings/NightlyBackupsCard";
 
 /**
  * Settings › System — central home for the operator-adjustable, persisted system
- * settings: the automatic-updates opt-in and the scheduled-backups schedule.
+ * settings: the automatic-updates opt-in, the scheduled-backups schedule, and the
+ * optional off-node destination for the nightly database backups (#1016).
  * Reuses the same AutoUpdateSection (`useSetAutoUpdate`) and ScheduledBackupsCard
  * (`useSetBackupSchedule`) components that /system renders, so the persisted
  * settings have a Settings home consistent with the mirror pattern. Manual
@@ -32,6 +34,10 @@ export default function SystemSettingsPage() {
 
       <SectionErrorBoundary section="Scheduled backups">
         <ScheduledBackupsCard />
+      </SectionErrorBoundary>
+
+      <SectionErrorBoundary section="Nightly database backups">
+        <NightlyBackupsCard />
       </SectionErrorBoundary>
 
       <Card>
