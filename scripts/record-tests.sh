@@ -77,6 +77,8 @@ echo "==> backup retention + script self-tests"
     || { echo "FAILED: backup script self-test" >&2; exit 1; }
 ./scripts/test-backup-health.sh \
     || { echo "FAILED: backup health self-test" >&2; exit 1; }
+./scripts/test-backup-offsite.sh \
+    || { echo "FAILED: off-node backup self-test" >&2; exit 1; }
 
 echo "==> restart-watch self-test"
 ./scripts/test-restart-watch.sh \

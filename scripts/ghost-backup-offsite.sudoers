@@ -1,0 +1,16 @@
+# Bitcoin Ghost — node-dashboard off-node backup setting (#1016).
+#
+# Grants the dashboard service user (ghost) the five subcommands of the off-node backup helper,
+# each pinned to its EXACT argv, and nothing else:
+#     sudo /opt/ghost/bin/ghost-backup-offsite show
+#     sudo /opt/ghost/bin/ghost-backup-offsite set        (settings arrive on stdin, as data)
+#     sudo /opt/ghost/bin/ghost-backup-offsite disable
+#     sudo /opt/ghost/bin/ghost-backup-offsite keygen
+#     sudo /opt/ghost/bin/ghost-backup-offsite test
+# No wildcard: any extra argument is rejected by sudo. `push` is deliberately absent; the nightly
+# job runs it as ghost, without sudo. The helper is root-owned 0755, so the dashboard user cannot
+# rewrite what runs as root.
+#
+# Installed 0440 at /etc/sudoers.d/ghost-backup-offsite; validated with `visudo -cf`.
+Defaults!/opt/ghost/bin/ghost-backup-offsite !requiretty
+ghost ALL=(root) NOPASSWD: /opt/ghost/bin/ghost-backup-offsite show, /opt/ghost/bin/ghost-backup-offsite set, /opt/ghost/bin/ghost-backup-offsite disable, /opt/ghost/bin/ghost-backup-offsite keygen, /opt/ghost/bin/ghost-backup-offsite test

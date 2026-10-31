@@ -33,6 +33,11 @@ GHOST_DIR="${1:-/home/ghost/.ghost}"
 BACKUP_DIR="/var/backups/ghost/db"
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 KEEP_COUNT="${BACKUP_KEEP_COUNT:-7}"
+# OPTIONAL off-node copy (#1016). Absent file = off, and the run is exactly what it was before.
+OFFSITE_CONF="${BACKUP_OFFSITE_CONF:-/etc/ghost/backup.conf}"
+# The off-node copy must finish inside the unit's TimeoutStartSec=1800, or systemd stops the whole
+# run and reports a local backup that succeeded as failed. Seconds since this script started.
+OFFSITE_DEADLINE="${BACKUP_OFFSITE_DEADLINE:-1620}"
 TIMESTAMP="$(date +%Y%m%d%H%M)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -205,6 +210,55 @@ for f in "$BACKUP_DIR"/ghost*.db.gz; do
 done
 log "  $found backup file(s) in $BACKUP_DIR, $(df -Pk "$BACKUP_DIR" | awk 'NR==2{print $4}')KB free"
 [ "$found" -gt 0 ] || die "no backup files present after a run that reported success"
+
+# ---------------------------------------------------------------- optional off-node copy (#1016)
+#
+# Only when /etc/ghost/backup.conf exists. Nothing in this block can fail or undo the local backup
+# above: the helper runs with errexit and the ERR trap lifted, its exit status is LOGGED and never
+# returned, and it records its own outcome where the dashboard reads it (`last_offsite_result`). The
+# run's exit status below is decided by the local backup alone.
+offsite_copy() {
+    local helper="${BACKUP_OFFSITE_HELPER:-$SCRIPT_DIR/ghost-backup-offsite.sh}"
+    local files=() prefix f budget out rc
+    # This run's copies only. An older file was already sent, or failed and will be superseded.
+    for prefix in ghost ghost-pay; do
+        f="$BACKUP_DIR/${prefix}-${TIMESTAMP}.db.gz"
+        if [ -f "$f" ]; then files+=("$f"); fi
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+        log "off-node: configured, but this run produced no backup to copy"
+        return 0
+    fi
+    if [ ! -x "$helper" ]; then
+        log "WARN: off-node: $OFFSITE_CONF is present but the helper $helper is not — nothing copied"
+        return 0
+    fi
+    budget=$((OFFSITE_DEADLINE - SECONDS))
+    if [ "$budget" -lt 60 ]; then
+        log "WARN: off-node: only ${budget}s left before the unit's timeout — not starting a copy"
+        return 0
+    fi
+    log "off-node: copying ${#files[@]} file(s), ${budget}s allowed"
+    out="$(GHOST_BACKUP_CONF="$OFFSITE_CONF" GHOST_BACKUP_DIR="$BACKUP_DIR" \
+           GHOST_BACKUP_GHOST_DIR="$GHOST_DIR" \
+           timeout --kill-after=10 $((budget + 30)) "$helper" push --deadline "$budget" "${files[@]}" 2>&1)"
+    rc=$?
+    log "off-node: $out"
+    if [ "$rc" -eq 0 ]; then
+        log "off-node: copy complete"
+    else
+        log "WARN: off-node copy FAILED (exit $rc) — the local backup above is complete and unaffected"
+    fi
+    return 0
+}
+
+if [ -e "$OFFSITE_CONF" ]; then
+    trap - ERR
+    set +e
+    offsite_copy
+    set -e
+    trap 'rc=$?; [ "$rc" -ne 0 ] && log "ERROR: aborted at line $LINENO with status $rc"; exit $rc' ERR
+fi
 
 # The verdict, last, so it is the final line anyone reads in the journal.
 [ -z "$FAILED" ] || die "NOT backed up:$FAILED — every other database above was copied and pruned normally"
