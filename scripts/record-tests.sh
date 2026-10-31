@@ -58,6 +58,10 @@ echo "==> ghost-cli identity self-test"
 ./scripts/test-cli-identity.sh \
     || { echo "FAILED: ghost-cli identity self-test" >&2; exit 1; }
 
+echo "==> auto-update swap self-test"
+./scripts/test-auto-update-swap.sh \
+    || { echo "FAILED: auto-update swap self-test" >&2; exit 1; }
+
 echo "==> boot gate self-test"
 ./scripts/test-boot-gate.sh \
     || { echo "FAILED: boot gate self-test" >&2; exit 1; }
