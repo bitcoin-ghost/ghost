@@ -118,6 +118,15 @@ const MAX_BLOCK_READ_ATTEMPTS: u32 = 3;
 /// `shard_settled_blocks`, so a lost or rewound cursor re-reads blocks and changes nothing.
 const SETTLE_CURSOR_KEY: &str = "shard.settle_height";
 
+/// How long past maturity a block stays on the retry list, about two weeks. It has to end: a sibling
+/// deployment's block carries the same tag and will never resolve, so an unbounded list would grow
+/// with every block they mine.
+const DEFERRED_SETTLE_WINDOW_BLOCKS: u64 = 2_016;
+
+/// Proposals asked for per new tip. Each request costs a broadcast from every peer holding it, and
+/// the relay channel holds 16, so a push and a retry can share it.
+const MAX_PROPOSAL_REQUESTS_PER_TIP: usize = 8;
+
 /// What one epoch's fold did, for logs and for the caller's soak checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldReport {
@@ -277,9 +286,10 @@ enum SettleBlockOutcome {
     /// discharges for that block: departed miners keep drawing a share of every later block and
     /// active miners are diluted, unbounded and undetected.
     ///
-    /// ⚠ The cursor still advances past it. A foreign coinbase can coincidentally carry bytes that
-    /// parse as a tag, and refusing to advance would stall settlement permanently on someone
-    /// else's block — a worse failure. So this is recorded and reported loudly instead of retried.
+    /// The cursor still advances past it: a foreign coinbase can carry bytes that parse as a tag,
+    /// and refusing to advance would stall settlement permanently on someone else's block. So the
+    /// block goes on the `deferred_settlements` list instead, and
+    /// [`ShardRuntime::retry_deferred`] returns to it once a peer supplies the proposal.
     OursButUnresolvable,
     /// Not yet [`COINBASE_MATURITY`] deep. Refused, never recorded: an immature block's payment
     /// can still be undone by a reorg, and the shard carries no undo.
@@ -301,8 +311,8 @@ pub struct SettleReport {
     /// Blocks whose coinbase carried a payout tag that resolved to no proposal we hold.
     ///
     /// ⛔ **Never benign.** Either a foreign coinbase coincidentally parsed, or a block we won
-    /// cannot be settled and its balances will never discharge. Reported so the second case is
-    /// visible; see `SettleBlockOutcome::OursButUnresolvable` (private to this module).
+    /// cannot be settled yet. Each is on the retry list; see
+    /// `SettleBlockOutcome::OursButUnresolvable` (private to this module).
     pub ours_but_unresolvable: usize,
     /// The height the walk could not read, if it stopped early. **A stall must be visible**: a
     /// settlement that has silently stopped looks exactly like one with nothing to do, and the
@@ -317,6 +327,26 @@ pub struct SettleReport {
     /// Blocks handed to this call but left for the next one by the per-call bound. Non-zero
     /// means the next call continues the catch-up.
     pub deferred: usize,
+}
+
+/// What one [`ShardRuntime::retry_deferred`] call did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeferredReport {
+    /// Blocks settled off the retry list this call.
+    pub settled: Vec<BlockSettlement>,
+    /// Payout ids to ask the mesh for now.
+    pub requests: Vec<[u8; 16]>,
+    /// Heights given up on, past [`DEFERRED_SETTLE_WINDOW_BLOCKS`]. Their work stays owed.
+    pub expired: Vec<u64>,
+}
+
+/// The retry list, split by what can be done about each row.
+struct DeferredSweep {
+    /// `(block_hash, height)` whose proposal has arrived.
+    ready: Vec<(String, u64)>,
+    /// Payout ids still missing.
+    waiting: Vec<[u8; 16]>,
+    expired: Vec<u64>,
 }
 
 /// The shard's view on this node: the merged table, plus the fold watermark.
@@ -363,6 +393,9 @@ pub struct ShardRuntime {
     /// In memory only: a restart is itself a reason to retry, and persisting a give-up decision
     /// would outlive the condition that caused it.
     read_failures: Mutex<Option<(u64, u32)>>,
+    /// The tip the retry list last asked the mesh at. Settlement ticks every 30s and a block takes
+    /// ten minutes, so without this one stuck block is a broadcast every 30s from every holder.
+    last_request_tip: Mutex<u64>,
     /// The last epoch [`ShardRuntime::note_height`] saw, stored as `epoch + 1` so zero can mean
     /// "never" (an epoch is `height / EPOCH_BLOCKS`, so `+ 1` cannot wrap). Atomic because it is
     /// read on the template-refresh path, which must never wait on a fold in progress.
@@ -503,6 +536,7 @@ impl ShardRuntime {
             solo,
             owns_evidence,
             read_failures: Mutex::new(None),
+            last_request_tip: Mutex::new(0),
             table: Mutex::new(table),
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
@@ -1919,6 +1953,136 @@ impl ShardRuntime {
         Ok(report)
     }
 
+    /// Revisit blocks the walk could not resolve, and name the proposals to ask the mesh for.
+    ///
+    /// Separate from [`Self::settle_matured`] because that returns early whenever the cursor is
+    /// level with maturity, which is nearly every tick. The cursor stays where the walk left it:
+    /// this list is what remembers the block, and a late settlement discharges at the current rate
+    /// for the same reason any settlement does — `owed` is signed and the next block corrects it.
+    pub async fn retry_deferred(
+        &self,
+        rpc: &BitcoinRpc,
+        tip_height: u64,
+    ) -> GhostResult<DeferredReport> {
+        if self.solo {
+            return Ok(DeferredReport::default());
+        }
+        let sweep = self.sweep_deferred(tip_height)?;
+        let mut report = DeferredReport {
+            requests: self.requests_for_tip(tip_height, &sweep.waiting),
+            expired: sweep.expired,
+            ..DeferredReport::default()
+        };
+        for (block_hash, height) in sweep.ready.into_iter().take(MAX_SETTLES_PER_CALL) {
+            let read = match rpc.get_block_hash(height).await {
+                Ok(hash) => crate::coinbase_verifier::fetch_coinbase_parts(rpc, &hash)
+                    .await
+                    .map(|(scriptsig, outputs)| FetchedCoinbase {
+                        block_hash: hash,
+                        height,
+                        scriptsig,
+                        outputs,
+                    }),
+                Err(e) => Err(e),
+            };
+            match read {
+                Ok(fetched) => {
+                    if let Some(settled) =
+                        self.settle_deferred(tip_height, &block_hash, &fetched)?
+                    {
+                        report.settled.push(settled);
+                    }
+                }
+                Err(e) => warn!(height, error = %e, "shard: retry could not read a deferred block"),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Sort the retry list by whether each block's proposal has arrived, dropping any past its
+    /// window.
+    fn sweep_deferred(&self, tip_height: u64) -> GhostResult<DeferredSweep> {
+        let mut sweep = DeferredSweep {
+            ready: Vec::new(),
+            waiting: Vec::new(),
+            expired: Vec::new(),
+        };
+        for (block_hash, height, payout_id) in self.db.list_deferred_settlements()? {
+            if self.db.get_proposal_by_hash_prefix(&payout_id)?.is_some() {
+                sweep.ready.push((block_hash, height));
+            } else if height.saturating_add(COINBASE_MATURITY + DEFERRED_SETTLE_WINDOW_BLOCKS)
+                < tip_height
+            {
+                error!(
+                    payout_id = %hex::encode(payout_id),
+                    height,
+                    "shard: giving up on a block no peer could supply the proposal for — if it was \
+                     ours, its payments discharge nothing and that work stays owed"
+                );
+                self.db.clear_deferred_settlement(&block_hash)?;
+                sweep.expired.push(height);
+            } else {
+                sweep.waiting.push(payout_id);
+            }
+        }
+        Ok(sweep)
+    }
+
+    /// The ids to ask for at this tip: nothing if we already asked at it, and otherwise a bounded
+    /// slice that rotates, so old rows that will never resolve cannot starve a new one.
+    fn requests_for_tip(&self, tip_height: u64, waiting: &[[u8; 16]]) -> Vec<[u8; 16]> {
+        let mut last = self.last_request_tip.lock();
+        if waiting.is_empty() || *last == tip_height {
+            return Vec::new();
+        }
+        *last = tip_height;
+        waiting
+            .iter()
+            .cycle()
+            .skip(tip_height as usize % waiting.len())
+            .take(MAX_PROPOSAL_REQUESTS_PER_TIP.min(waiting.len()))
+            .copied()
+            .collect()
+    }
+
+    /// Settle one block off the retry list, clearing its row unless it has to be tried again.
+    fn settle_deferred(
+        &self,
+        tip_height: u64,
+        deferred_hash: &str,
+        block: &FetchedCoinbase,
+    ) -> GhostResult<Option<BlockSettlement>> {
+        // The list remembers a hash and the chain answers by height. If they differ the block we
+        // deferred is no longer the one at that height, and it paid nobody.
+        if block_hash_to_display_order(&block.block_hash) != deferred_hash {
+            warn!(
+                height = block.height,
+                deferred = %deferred_hash,
+                "shard: a deferred block is no longer on the chain — dropping it"
+            );
+            self.db.clear_deferred_settlement(deferred_hash)?;
+            return Ok(None);
+        }
+        let outcome = self.settle_block_from_coinbase(
+            tip_height,
+            &block.block_hash,
+            block.height,
+            &block.scriptsig,
+            &block.outputs,
+        )?;
+        match outcome {
+            SettleBlockOutcome::Immature | SettleBlockOutcome::OursButUnresolvable => Ok(None),
+            SettleBlockOutcome::NotOurs | SettleBlockOutcome::AlreadySettled => {
+                self.db.clear_deferred_settlement(deferred_hash)?;
+                Ok(None)
+            }
+            SettleBlockOutcome::Settled(settlement) => {
+                self.db.clear_deferred_settlement(deferred_hash)?;
+                Ok(Some(settlement))
+            }
+        }
+    }
+
     /// The height range the next settlement call should examine, or `None` if there is nothing
     /// to do. Initialises the cursor on the first call ever: history that matured before the
     /// shard ran belongs to the legacy ledger — the shard accrued nothing for it, so its
@@ -2057,25 +2221,40 @@ impl ShardRuntime {
             return Ok(SettleBlockOutcome::NotOurs);
         };
         match self.db.get_proposal_by_hash_prefix(&payout_id) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // A block on the chain names it, so a late peer may yet need it from us. Keeping it
+                // is not worth failing a settlement over.
+                if let Err(e) = self.db.mark_proposal_won(&payout_id) {
+                    warn!(error = %e, height, "shard: could not mark a won proposal");
+                }
+            }
             Ok(None) => {
                 // A tag we cannot resolve. Possibly a foreign coinbase whose bytes happen to
-                // parse, possibly a block of OURS whose proposal was pruned — and the second
-                // means the ledger never discharges for it. Say so; do not file it as a
-                // stranger's block.
+                // parse, possibly a block of OURS whose proposal never arrived. Say so, and
+                // remember it: the `?` keeps the cursor from passing a block nothing recorded.
                 warn!(
                     payout_id = %hex::encode(payout_id),
                     height,
-                    "shard: coinbase carries a payout tag that matches NO proposal we hold — if \
-                     this block was ours its balances will never discharge (proposal retention is \
-                     24h against ~16.7h maturity, so a won block's proposal can be pruned first)"
+                    "shard: coinbase carries a payout tag that matches NO proposal we hold — \
+                     deferring it and asking peers; if this block was ours it settles when the \
+                     proposal arrives"
                 );
+                self.db.defer_settlement(
+                    &block_hash_to_display_order(block_hash),
+                    height,
+                    &payout_id,
+                )?;
                 return Ok(SettleBlockOutcome::OursButUnresolvable);
             }
             Err(e) => {
                 // Cannot prove ownership => do not settle. Failing closed here costs a deferral;
                 // failing open would discharge real balances on an unproven block.
                 warn!(error = %e, height, "shard: payout id lookup failed — deferring, not settling");
+                self.db.defer_settlement(
+                    &block_hash_to_display_order(block_hash),
+                    height,
+                    &payout_id,
+                )?;
                 return Ok(SettleBlockOutcome::OursButUnresolvable);
             }
         }
@@ -3793,8 +3972,8 @@ mod tests {
     /// quietly stopped decaying: departed miners keep drawing a share of every later block while
     /// active miners are diluted.
     ///
-    /// Reachable with nobody misbehaving: `PROPOSAL_RETENTION_SECS` is 24h against a ~16.7h
-    /// coinbase maturity, so a won block's proposal can be pruned before settlement reaches it.
+    /// Reachable with nobody misbehaving: only the node that built a proposal holds it until a peer
+    /// supplies it, so every node but the winner reaches this for every won block.
     #[test]
     fn an_unresolvable_payout_tag_is_distinguished_from_a_foreign_block() {
         let (identity, db, rt) = runtime();
@@ -3827,6 +4006,240 @@ mod tests {
         // Fail-closed is preserved: neither discharges anything, neither is recorded as settled.
         assert_eq!(rt.owed().get(ADDR_A), Some(&micro_work(5.0)));
         assert_eq!(settled_block_count(&db), 0);
+    }
+
+    /// A block whose coinbase names `proposal`, paying ADDR_A.
+    fn block_naming(
+        proposal: &ghost_common::types::PayoutProposal,
+        height: u64,
+    ) -> FetchedCoinbase {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&proposal.proposal_hash[..16]);
+        let mut scriptsig = vec![0x03, 0x40, 0x1f, 0x0e];
+        scriptsig.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&id));
+        scriptsig.extend_from_slice(b"GHOST PublicPool");
+        FetchedCoinbase {
+            block_hash: "00".repeat(32),
+            height,
+            scriptsig,
+            outputs: coinbase(&[(ADDR_A, 250_000_000)]),
+        }
+    }
+
+    type Sent = parking_lot::Mutex<Vec<Vec<u8>>>;
+    type PeerNode = (
+        Arc<Database>,
+        ShardRuntime,
+        crate::proposal_sync::ProposalSyncHandler,
+        Arc<Sent>,
+    );
+
+    /// One node of two: a runtime that owes ADDR_A, and the sync handler it would use.
+    fn peer_node() -> PeerNode {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+        crate::proposal_sync::tests::ratify(
+            &db,
+            &[
+                crate::proposal_sync::tests::a_proposal().proposer,
+                identity.node_id(),
+            ],
+        );
+        let sent: Arc<Sent> = Arc::default();
+        let tx = Arc::clone(&sent);
+        let sync = crate::proposal_sync::ProposalSyncHandler::new(Arc::clone(&db)).with_send(
+            Arc::new(move |bytes| {
+                tx.lock().push(bytes);
+                Ok(())
+            }),
+        );
+        (db, rt, sync, sent)
+    }
+
+    fn drain(sent: &Sent) -> crate::proposal_sync::ProposalSyncPayload {
+        let bytes = sent.lock().pop().expect("something must have been sent");
+        serde_json::from_slice(&bytes).expect("a sync payload")
+    }
+
+    fn cursor(db: &Database) -> Option<String> {
+        db.kv_get(SETTLE_CURSOR_KEY).expect("cursor")
+    }
+
+    fn store(db: &Database, proposal: &ghost_common::types::PayoutProposal) {
+        db.store_payout_proposal(
+            &proposal.proposal_hash,
+            proposal.round_id,
+            proposal.block_height,
+            &serde_json::to_string(proposal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The defect, in the order it happens. A peer that never received the winner's proposal walks
+    /// past the block. Nothing else ever looks at that height again, so without the retry list the
+    /// proposal arriving later changes nothing and the work stays owed for ever. Here the list asks,
+    /// the winner answers, and the block discharges.
+    #[test]
+    fn a_block_the_walk_could_not_resolve_settles_when_a_peer_supplies_the_proposal() {
+        let (winner_db, _, winner_sync, winner_sent) = peer_node();
+        let (db, rt, sync, sent) = peer_node();
+        let proposal = crate::proposal_sync::tests::a_proposal();
+        store(&winner_db, &proposal);
+        let block = block_naming(&proposal, 602);
+        let tip = 800;
+
+        let walked = rt
+            .settle_fetched(tip, std::slice::from_ref(&block))
+            .expect("walk");
+        assert_eq!(walked.ours_but_unresolvable, 1);
+        assert_eq!(
+            cursor(&db).as_deref(),
+            Some("602"),
+            "the walk must not stall"
+        );
+        let owed_before = *rt.owed().get(ADDR_A).expect("owed");
+        assert_eq!(owed_before, micro_work(5.0), "nothing discharged yet");
+
+        // The list names the block, and it is asked for once at this tip.
+        let sweep = rt.sweep_deferred(tip).expect("sweep");
+        let requests = rt.requests_for_tip(tip, &sweep.waiting);
+        assert_eq!(requests.len(), 1);
+        assert!(rt.requests_for_tip(tip, &sweep.waiting).is_empty());
+        sync.request(requests[0]).expect("request");
+
+        // Over the wire to the winner and back.
+        let identity = proposal.proposer;
+        winner_sync
+            .on_payload(&identity, drain(&sent))
+            .expect("serve");
+        sync.on_payload(&identity, drain(&winner_sent))
+            .expect("accept");
+
+        let sweep = rt.sweep_deferred(tip).expect("sweep");
+        assert_eq!(sweep.ready.len(), 1, "the proposal has arrived");
+        let (hash, _) = &sweep.ready[0];
+        let settled = rt
+            .settle_deferred(tip, hash, &block)
+            .expect("settle")
+            .expect("the block must settle now");
+        assert!(settled.discharged_micro > 0);
+        assert!(*rt.owed().get(ADDR_A).expect("owed") < owed_before);
+        assert_eq!(settled_block_count(&db), 1);
+        assert!(db.list_deferred_settlements().unwrap().is_empty());
+
+        // A rerun moves nothing.
+        let owed_after = *rt.owed().get(ADDR_A).expect("owed");
+        assert_eq!(rt.settle_deferred(tip, hash, &block).expect("rerun"), None);
+        assert_eq!(*rt.owed().get(ADDR_A).expect("owed"), owed_after);
+        assert_eq!(settled_block_count(&db), 1);
+    }
+
+    /// The happy path: the push lands before maturity, so the walk settles the block outright and
+    /// nothing ever has to ask.
+    #[test]
+    fn a_pushed_proposal_settles_on_the_first_walk() {
+        let (winner_db, _, winner_sync, winner_sent) = peer_node();
+        let (db, rt, sync, _) = peer_node();
+        let proposal = crate::proposal_sync::tests::a_proposal();
+        store(&winner_db, &proposal);
+
+        winner_sync
+            .announce_win(proposal.proposal_hash)
+            .expect("announce");
+        sync.on_payload(&proposal.proposer, drain(&winner_sent))
+            .expect("push");
+
+        let walked = rt
+            .settle_fetched(800, &[block_naming(&proposal, 602)])
+            .expect("walk");
+
+        assert_eq!(walked.settled.len(), 1);
+        assert_eq!(walked.ours_but_unresolvable, 0);
+        assert!(db.list_deferred_settlements().unwrap().is_empty());
+    }
+
+    /// A peer that settled is a place a later node can fetch from, so settling has to keep the copy
+    /// even though only the winner marked it at the time of the win.
+    #[test]
+    fn a_proposal_settled_on_a_peer_outlives_the_prune() {
+        let (db, rt, _, _) = peer_node();
+        let proposal = crate::proposal_sync::tests::a_proposal();
+        store(&db, &proposal);
+
+        rt.settle_fetched(800, &[block_naming(&proposal, 602)])
+            .expect("walk");
+
+        let past_any_window = chrono::Utc::now().timestamp() + 3600;
+        db.prune_payout_proposals(past_any_window).expect("prune");
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&proposal.proposal_hash[..16]);
+        assert!(db.get_proposal_by_hash_prefix(&id).unwrap().is_some());
+    }
+
+    /// The list must end. A sibling deployment's blocks carry the tag and never resolve, so a row
+    /// has to go eventually — and it must not go early, because the fleet may just be down.
+    #[test]
+    fn an_unresolved_block_expires_only_after_its_window() {
+        let (db, rt, _, _) = peer_node();
+        let proposal = crate::proposal_sync::tests::a_proposal();
+        let block = block_naming(&proposal, 602);
+        rt.settle_fetched(800, std::slice::from_ref(&block))
+            .expect("walk");
+
+        let last_try = 602 + COINBASE_MATURITY + DEFERRED_SETTLE_WINDOW_BLOCKS;
+        let sweep = rt.sweep_deferred(last_try).expect("sweep");
+        assert_eq!(
+            sweep.waiting.len(),
+            1,
+            "inside the window it is still asked for"
+        );
+
+        let sweep = rt.sweep_deferred(last_try + 1).expect("sweep");
+        assert_eq!(sweep.expired, vec![602]);
+        assert!(sweep.waiting.is_empty());
+        assert!(db.list_deferred_settlements().unwrap().is_empty());
+    }
+
+    /// A block deferred and then reorged out paid nobody, so whatever now sits at that height must
+    /// not be settled in its name.
+    #[test]
+    fn a_deferred_block_no_longer_on_the_chain_is_dropped_unsettled() {
+        let (db, rt, _, _) = peer_node();
+        let proposal = crate::proposal_sync::tests::a_proposal();
+        let block = block_naming(&proposal, 602);
+        rt.settle_fetched(800, std::slice::from_ref(&block))
+            .expect("walk");
+        store(&db, &proposal);
+        let (deferred, _) = rt.sweep_deferred(800).expect("sweep").ready.remove(0);
+
+        let mut replaced = block;
+        replaced.block_hash = "11".repeat(32);
+
+        assert_eq!(
+            rt.settle_deferred(800, &deferred, &replaced)
+                .expect("retry"),
+            None
+        );
+        assert_eq!(settled_block_count(&db), 0);
+        assert!(db.list_deferred_settlements().unwrap().is_empty());
+    }
+
+    /// Requests are bounded per tip, and the bound rotates, or eight rows that will never resolve
+    /// would keep a real block off the wire until they expired.
+    #[test]
+    fn deferred_requests_are_bounded_and_rotate() {
+        let (_, rt, _, _) = peer_node();
+        let waiting: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+
+        let mut seen = std::collections::BTreeSet::new();
+        for tip in 1..=12u64 {
+            let asked = rt.requests_for_tip(tip, &waiting);
+            assert_eq!(asked.len(), MAX_PROPOSAL_REQUESTS_PER_TIP);
+            seen.extend(asked);
+        }
+
+        assert_eq!(seen.len(), waiting.len(), "every row gets its turn");
     }
 
     /// The per-call bound: one call settles at most MAX_SETTLES_PER_CALL blocks and defers the
