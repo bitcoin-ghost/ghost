@@ -336,7 +336,7 @@ pub struct DeferredReport {
     pub settled: Vec<BlockSettlement>,
     /// Payout ids to ask the mesh for now.
     pub requests: Vec<[u8; 16]>,
-    /// Heights given up on, past [`DEFERRED_SETTLE_WINDOW_BLOCKS`]. Their work stays owed.
+    /// Heights given up on, past `DEFERRED_SETTLE_WINDOW_BLOCKS`. Their work stays owed.
     pub expired: Vec<u64>,
 }
 
