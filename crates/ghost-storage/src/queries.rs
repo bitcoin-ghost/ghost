@@ -309,6 +309,9 @@ pub const MAX_ROTATION_PROOF_SIZE: usize = 10 * 1024;
 /// Prevents storage exhaustion attacks through the key-value store API.
 pub const MAX_KV_VALUE_SIZE: usize = 1024 * 1024;
 
+/// `kv_store` key prefix for [`Database::mark_proposal_won`]; the hex payout id follows.
+const WON_PROPOSAL_KEY_PREFIX: &str = "payout.won_proposal.";
+
 /// L-1: Maximum length for node display_name field (128 chars)
 pub const MAX_DISPLAY_NAME_LEN: usize = 128;
 
@@ -2362,6 +2365,10 @@ impl Database {
     /// v56: the "still referenced" check reads `shares_all`. Archived rows carry
     /// `paid_in_proposal_hash` too, and pruning a proposal they point at would leave
     /// `reverse_settlement` unable to name what it was undoing.
+    ///
+    /// A proposal marked by [`Self::mark_proposal_won`] is kept at any age: the retention window is
+    /// 24h and a coinbase takes ~16.7h to mature, and a node that comes back later still has to
+    /// fetch the proposal from whoever kept it.
     pub fn prune_payout_proposals(&self, cutoff_ts: i64) -> GhostResult<usize> {
         self.with_connection(|conn| {
             let removed = conn
@@ -2373,12 +2380,26 @@ impl Database {
                         AND proposal_hash NOT IN (
                             SELECT DISTINCT paid_in_proposal_hash FROM shares_all
                              WHERE paid_in_proposal_hash IS NOT NULL
-                        )",
-                    params![cutoff_ts],
+                        )
+                        AND (?2 || lower(hex(substr(proposal_hash, 1, 16))))
+                            NOT IN (SELECT key FROM kv_store)",
+                    params![cutoff_ts, WON_PROPOSAL_KEY_PREFIX],
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(removed)
         })
+    }
+
+    /// Record that a block on the chain names this payout, so its proposal outlives the prune.
+    ///
+    /// Keyed on the 16-byte id because that is what a coinbase carries. A row in `kv_store` rather
+    /// than a column, because the fact has to outlive settlement: a proposal is what ownership is
+    /// proven from, so every copy dropped is one a late node can no longer fetch.
+    pub fn mark_proposal_won(&self, payout_id: &[u8; 16]) -> GhostResult<()> {
+        self.kv_set(
+            &format!("{WON_PROPOSAL_KEY_PREFIX}{}", hex::encode(payout_id)),
+            "1",
+        )
     }
 
     /// Blocks this node believes it has settled and not reversed.
@@ -2660,8 +2681,8 @@ impl Database {
         })
     }
 
-    /// Remember a block that is ours but cannot be settled yet, because the proposal its coinbase
-    /// names never reached this node.
+    /// Remember a block that may be ours but cannot be settled yet, because the proposal its
+    /// coinbase names never reached this node.
     ///
     /// Recording it is what makes the recovery finish. The forward scan is cursor-driven, so once
     /// the cursor passes this height the block is never examined again — and the proposal fetched
@@ -13411,6 +13432,36 @@ mod tests {
 
         let removed = db.prune_payout_proposals(now - 24 * 3600).unwrap();
         assert_eq!(removed, 0, "a proposal inside the window must survive");
+    }
+
+    /// The one thing the 24h window must not take: the proposal a mined block names. Age it past
+    /// the window, as a block that took its full ~16.7h to mature plus any time the node was away
+    /// would, and check an unmarked neighbour still goes so the exemption is not a blanket one.
+    #[test]
+    fn pruning_proposals_keeps_a_won_proposal_at_any_age() {
+        let db = Database::in_memory().unwrap();
+        let now = ledger_now_s();
+        let won = [0x51u8; 32];
+        let not_won = [0x52u8; 32];
+        for hash in [won, not_won] {
+            db.store_payout_proposal(&hash, 1, 900_000, "{}").unwrap();
+        }
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE payout_proposals SET created_at = ?1",
+                params![now - 30 * 24 * 3600],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .unwrap();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&won[..16]);
+        db.mark_proposal_won(&id).unwrap();
+
+        let removed = db.prune_payout_proposals(now - 24 * 3600).unwrap();
+
+        assert_eq!(removed, 1, "only the proposal nothing names may go");
+        assert!(db.get_proposal_by_hash_prefix(&id).unwrap().is_some());
     }
 
     /// The retrospective era-boundary derivation (#650): rounds are persisted with their block
