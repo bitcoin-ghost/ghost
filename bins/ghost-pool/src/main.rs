@@ -4408,11 +4408,48 @@ async fn main() -> Result<()> {
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
+    // Gets a won block's proposal to the nodes that did not build it. Without it they cannot settle
+    // the block and go on owing work the pool has paid. Built here because the win path below and
+    // the settlement tick both need it.
+    let proposal_sync = {
+        let (psync_tx, mut psync_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let mesh_for_psync = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            while let Some(bytes) = psync_rx.recv().await {
+                match mesh_for_psync
+                    .create_envelope_raw(ghost_consensus::MessageType::PayoutProposalSync, bytes)
+                {
+                    Ok(envelope) => {
+                        if let Err(e) = mesh_for_psync.broadcast(envelope).await {
+                            debug!(error = %e, "payout-proposal sync broadcast failed");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "payout-proposal sync envelope failed")
+                    }
+                }
+            }
+        });
+        let psync_send: ghost_pool::proposal_sync::ProposalSyncSendFn = Arc::new(move |bytes| {
+            psync_tx.try_send(bytes).map_err(|e| {
+                ghost_common::error::GhostError::P2PMessage(format!("proposal-sync channel: {e}"))
+            })
+        });
+        let proposal_sync = Arc::new(
+            ghost_pool::proposal_sync::ProposalSyncHandler::new(Arc::clone(&db))
+                .with_send(psync_send),
+        );
+        mesh.register_handler(Arc::clone(&proposal_sync)
+            as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+        proposal_sync
+    };
+
     if let Some(ref rt) = shard {
         // Two handles: one for the relay task, one for the tick task that owns the fold.
         let rt_publish = Arc::clone(rt);
         let rt = Arc::clone(rt);
         let rpc_c = Arc::clone(&rpc);
+        let proposal_sync_for_retry = Arc::clone(&proposal_sync);
         // Broadcast relay for this node's own summaries. Channel-plus-relay, the same shape the
         // checkpoint path uses: the fold holds the storage lock and must never await a
         // network send while holding it.
@@ -4550,16 +4587,16 @@ async fn main() -> Result<()> {
                         "shard: settlement did NOT complete its window"
                     ),
                     // ⛔ An unresolvable payout tag outranks "we settled something", because it
-                    // means a block we may have WON cannot be settled and its balances will never
-                    // discharge. It was previously counted into the report and never logged at
-                    // all, so the one symptom was a weight ledger that quietly stopped decaying.
+                    // means a block we may have WON cannot be settled yet. It was previously
+                    // counted into the report and never logged at all, so the one symptom was a
+                    // weight ledger that quietly stopped decaying.
                     Ok(r) if r.ours_but_unresolvable > 0 => warn!(
                         tip,
                         unresolvable = r.ours_but_unresolvable,
                         settled = r.settled.len(),
                         deferred = r.deferred,
-                        "shard: coinbase payout tag(s) matched NO proposal we hold — if any of \
-                         those blocks were ours, their balances will never discharge"
+                        "shard: coinbase payout tag(s) matched NO proposal we hold — asking peers, \
+                         and those blocks settle when the proposal arrives"
                     ),
                     Ok(r) if !r.settled.is_empty() => info!(
                         tip,
@@ -4570,6 +4607,27 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(e) => {
                         warn!(error = %e, tip, "shard: maturity settlement failed — retrying next tick")
+                    }
+                }
+
+                // After the walk, so a block it just deferred is asked for on this same tick.
+                match rt.retry_deferred(&rpc_c, tip).await {
+                    Ok(r) => {
+                        for payout_id in r.requests {
+                            if let Err(e) = proposal_sync_for_retry.request(payout_id) {
+                                debug!(error = %e, "shard: proposal request not sent");
+                            }
+                        }
+                        if !r.settled.is_empty() {
+                            info!(
+                                tip,
+                                blocks = r.settled.len(),
+                                "shard: settled deferred pool blocks"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, tip, "shard: deferred settlement failed — retrying next tick")
                     }
                 }
             }
@@ -8818,6 +8876,7 @@ async fn main() -> Result<()> {
     {
         let rm_for_block = Arc::clone(&round_manager);
         let tp_for_block = Arc::clone(&template_processor);
+        let proposal_sync_for_block = Arc::clone(&proposal_sync);
         let payout_for_block = Arc::clone(&payout_handler);
         let identity_for_block = Arc::clone(&identity);
         let db_for_block = Arc::clone(&db);
@@ -8838,6 +8897,21 @@ async fn main() -> Result<()> {
                     solo_mode = is_solo_mode,
                     "Block submitted to Ghost Core, creating payout proposal..."
                 );
+
+                // This is the win. `handle_block_found` is not: it runs on every proposer turn and
+                // builds the proposal for the NEXT block, while the one this block pays is the
+                // snapshot its template was built against. Solo work never enters the shared
+                // ledger, so a solo win is nothing peers should settle.
+                if let (false, Some(proposal_hash)) = (is_solo_mode, info.payout_snapshot) {
+                    if let Err(e) = proposal_sync_for_block.announce_win(proposal_hash) {
+                        warn!(
+                            error = %e,
+                            height = info.height,
+                            "Could not push the won block's payout proposal — peers will ask for \
+                             it at maturity"
+                        );
+                    }
+                }
 
                 // Settlement is the SHARD's, and it happens at COINBASE_MATURITY — not here, and
                 // not at tip. Stage 6 removed the tip-time settler entirely.
@@ -9650,8 +9724,9 @@ async fn main() -> Result<()> {
                     // recent window so settlement can match a block won on a slightly stale
                     // template. Everything older that no payout references is a proposal which
                     // armed a coinbase that never won — 1,234 such rows had accumulated on vm1 with
-                    // not one referenced by anything. The prune keeps the approved row and any
-                    // provenance a settled block or paid share depends on, at any age.
+                    // not one referenced by anything. The prune keeps the approved row, any
+                    // proposal a block has named, and any provenance a settled block or paid share
+                    // depends on, at any age.
                     let proposal_cutoff =
                         chrono::Utc::now().timestamp() - PROPOSAL_RETENTION_SECS;
                     match db_for_pruning.prune_payout_proposals(proposal_cutoff) {
@@ -10585,46 +10660,7 @@ async fn main() -> Result<()> {
         // not a gap: `owed` is signed and never clamped, so a second payment inside the window
         // leaves a residual the next block corrects (SHARE_SHARD.md §4.4, §4.6).
         //
-        // The proposal-sync handler below OUTLIVES it on purpose. It answers peers as well as
-        // asking, and a node still on a pre-Stage-6 binary needs those answers to settle at all.
-        // Retire it once no fleet binary can ask.
-        {
-            let (psync_tx, mut psync_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-            {
-                let mesh_for_psync = Arc::clone(&mesh);
-                tokio::spawn(async move {
-                    while let Some(bytes) = psync_rx.recv().await {
-                        match mesh_for_psync.create_envelope_raw(
-                            ghost_consensus::MessageType::PayoutProposalSync,
-                            bytes,
-                        ) {
-                            Ok(envelope) => {
-                                if let Err(e) = mesh_for_psync.broadcast(envelope).await {
-                                    debug!(error = %e, "payout-proposal sync broadcast failed");
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "payout-proposal sync envelope failed")
-                            }
-                        }
-                    }
-                });
-            }
-            let psync_send: ghost_pool::proposal_sync::ProposalSyncSendFn =
-                Arc::new(move |bytes| {
-                    psync_tx.try_send(bytes).map_err(|e| {
-                        ghost_common::error::GhostError::P2PMessage(format!(
-                            "proposal-sync channel: {e}"
-                        ))
-                    })
-                });
-            let proposal_sync = Arc::new(
-                ghost_pool::proposal_sync::ProposalSyncHandler::new(Arc::clone(&db))
-                    .with_send(psync_send),
-            );
-            mesh.register_handler(Arc::clone(&proposal_sync)
-                as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-        }
+        // A won block's proposal reaches the other nodes through `proposal_sync`, built earlier.
 
         info!("ZMQ block watcher connected to {}", zmq_endpoint);
         if let Some(seq_ep) = sequence_endpoint {
