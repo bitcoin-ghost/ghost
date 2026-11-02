@@ -115,7 +115,7 @@ export default function OnboardingPage() {
               }
             />
             <StatItem label="Block height" value={status?.block_height?.toLocaleString() ?? status?.sync_height?.toLocaleString() ?? "—"} />
-            <StatItem label="Peers" value={status?.peer_count ?? "—"} />
+            <StatItem label="Relay peers" value={status?.peer_count ?? "—"} />
             <StatItem
               label="Health"
               value={

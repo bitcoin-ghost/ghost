@@ -32,13 +32,6 @@ function formatUptime(percent: number): string {
   return `${percent.toFixed(1)}%`;
 }
 
-function formatHashrate(th: number): string {
-  if (th >= 1000) {
-    return `${(th / 1000).toFixed(1)} PH/s`;
-  }
-  return `${th.toFixed(0)} TH/s`;
-}
-
 // Small inline help affordance placed next to a label; the surrounding element
 // is wrapped in a <Tooltip> that carries the explanatory copy.
 function InfoIcon() {
@@ -57,12 +50,15 @@ const TOOLTIPS = {
   nodes: "Total nodes tracked in this swarm.",
   online: "Nodes currently reporting healthy.",
   combinedHashrate: "Combined hashrate summed across the mesh.",
+  // The old mesh fed the aggregate tiles and the auto-discovered peers; it was removed.
+  meshGone:
+    "Unavailable: this was summed across the old mesh, which was removed. The page now lists this node only.",
   // This Node card
   nodeId: "This node's mesh identity — paste it into another node to add this one.",
   connectionAddress: "The endpoint other nodes add to reach this node.",
   // Per-node fields
   uptime: "Trailing-7-day uptime %. — means this peer did not gossip it.",
-  peers: "Mesh peers this node is connected to. — means not gossiped.",
+  peers: "Share-chain relay peers this node is connected to. — means not reported.",
   l1Height: "Bitcoin (L1) chain height. — means not gossiped.",
   // Status badges
   statusOnline: "Whether this node is reachable and reporting healthy.",
@@ -133,7 +129,6 @@ export default function SwarmPage() {
   const [isUpdating, setIsUpdating] = useState(false);
 
   const nodes = swarmData?.nodes ?? [];
-  const stats = swarmData?.stats ?? null;
   const alerts = swarmData?.alerts ?? [];
 
   const handleAddNode = async () => {
@@ -428,20 +423,20 @@ export default function SwarmPage() {
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <StatCard
             label="Nodes"
-            value={stats?.total_nodes ?? 0}
-            tooltip={TOOLTIPS.nodes}
+            value="unavailable"
+            tooltip={TOOLTIPS.meshGone}
             loading={swarmLoading}
           />
           <StatCard
             label="Online"
-            value={stats?.online_nodes ?? 0}
-            tooltip={TOOLTIPS.online}
+            value="unavailable"
+            tooltip={TOOLTIPS.meshGone}
             loading={swarmLoading}
           />
           <StatCard
             label="Combined Hashrate"
-            value={formatHashrate(stats?.combined_hashrate_th ?? 0)}
-            tooltip={TOOLTIPS.combinedHashrate}
+            value="unavailable"
+            tooltip={TOOLTIPS.meshGone}
             loading={swarmLoading}
           />
         </div>
