@@ -34,8 +34,6 @@ members = [
     "crates/ghost-accounting",
     "crates/ghost-verification",
     "crates/ghost-np-relay",
-    # Ghost Pay L2
-    "crates/ghost-reconciliation",
     # GSP
     # Node Binaries
     "bins/ghost-pool",
@@ -81,8 +79,6 @@ ghost-accounting = { path = "crates/ghost-accounting" }
 ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 ghost-np-relay = { path = "crates/ghost-np-relay" }
-# Ghost Pay L2 crates
-ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # GSP crates
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
@@ -197,7 +193,6 @@ ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-consensus = { workspace = true, features = ["test-utils"] }
 ghost-mining = { workspace = true }
-ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }
 
 # Test dependencies

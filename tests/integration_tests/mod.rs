@@ -27,7 +27,6 @@ pub mod cryptography;
 pub mod discovery_security;
 pub mod e2e;
 pub mod edge_cases;
-pub mod fund_safety;
 pub mod helpers;
 pub mod historical_bugs;
 pub mod hypothetical_bugs;

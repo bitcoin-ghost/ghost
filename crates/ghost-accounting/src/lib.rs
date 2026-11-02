@@ -20,19 +20,13 @@
 //| FILE: lib.rs                                                                                                         |
 //|======================================================================================================================|
 
-//! Ghost Accounting - Economics and Share Tracking
+//! Ghost Accounting - share difficulty
 //!
-//! This crate handles economic calculations for Bitcoin Ghost:
-//!
-//! - **Share Accounting**: Track miner shares per round
-//! - **Coinbase Construction**: Build payout transactions
+//! The canonical share difficulty and proof-of-work checks ([`DifficultyCalculator`]) the node's
+//! share ingest uses. Payouts are the node pool's (`ghost_common::canonical_payout`).
 
 #![deny(unreachable_pub)]
 
-pub mod coinbase;
-pub mod genesis_balances;
-pub mod shard_genesis;
 pub mod shares;
 
-pub use coinbase::*;
 pub use shares::*;

@@ -34,7 +34,6 @@
 /// Node pool anchor chain: fork choice, ancestry and retarget, in memory.
 pub mod anchor_chain;
 pub mod atomic_file;
-pub mod batch_two_phase;
 
 /// Node pool: the canonical payout rule, a port of `docs/node-pool-reference/refimpl_v3.py`.
 pub mod canonical_payout;
@@ -48,7 +47,6 @@ pub mod error;
 pub mod identity;
 pub mod identity_rotation;
 pub mod internal_auth;
-pub mod key_rotation;
 pub mod metrics;
 
 /// Node pool protocol constants (new names only; nothing live reads them).
@@ -68,17 +66,10 @@ pub mod share_commit;
 /// Node pool slot-class sensing: the firmware ceiling table and the per-miner stepping loop.
 pub mod slot_class_sensing;
 
-/// Proving a share was mined to the node that claims it.
-pub mod share_binding;
-
-/// Share shard: the network shard's deterministic core (two grow-only quantities, max-merge,
-/// signed epoch summaries, table root).
-pub mod share_shard;
 pub mod signer;
 pub mod template_verifier;
 pub mod tls;
 pub mod types;
-pub mod work_fold;
 /// Bitcoin Core ZMQ subscriber. Gated behind the default `zmq` feature: it
 /// depends on the UNIX-only `tmq` crate, so wallet builds targeting Windows
 /// disable it via `default-features = false`.
@@ -90,7 +81,6 @@ pub use constants::*;
 pub use error::*;
 pub use identity::*;
 pub use identity_rotation::*;
-pub use key_rotation::*;
 pub use sanitize::{sanitize_for_log, sanitize_for_log_with_len};
 pub use signer::*;
 pub use types::*;

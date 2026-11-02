@@ -43,7 +43,6 @@ pub mod migrations;
 pub mod models;
 pub mod node_pool_store;
 pub mod queries;
-pub mod shard_store;
 pub mod snapshot;
 
 pub use audit_log::*;

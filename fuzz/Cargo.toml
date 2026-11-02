@@ -29,42 +29,18 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
-# `ghost-mining` is the package in bins/ghost-pool, whose LIBRARY is still `ghost_pool` (#1018).
-# cargo-machete matches a dependency to imports by the package name, so it sees no
-# `ghost_mining::` anywhere and reports this one unused. It is used, as `ghost_pool::`.
-[package.metadata.cargo-machete]
-ignored = ["ghost-mining"]
-
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
 # Local crates to fuzz
-ghost-mining = { path = "../bins/ghost-pool" }
 ghost-consensus = { path = "../crates/ghost-consensus" }
-ghost-common = { path = "../crates/ghost-common" }
-ghost-reconciliation = { path = "../crates/ghost-reconciliation" }
 serde_json = "1"
-chrono = "0.4"
 
 [workspace]
 members = ["."]
 
 # Fuzz targets - each is a separate binary
-[[bin]]
-name = "fuzz_stratum_username"
-path = "fuzz_targets/fuzz_stratum_username.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_stratum_rpc"
-path = "fuzz_targets/fuzz_stratum_rpc.rs"
-test = false
-doc = false
-bench = false
-
 [[bin]]
 name = "fuzz_message_envelope"
 path = "fuzz_targets/fuzz_message_envelope.rs"
@@ -73,29 +49,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_validation"
-path = "fuzz_targets/fuzz_validation.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_checkpoint_voting"
-path = "fuzz_targets/fuzz_checkpoint_voting.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fuzz_p2p_payloads"
 path = "fuzz_targets/fuzz_p2p_payloads.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_fee_distribution"
-path = "fuzz_targets/fuzz_fee_distribution.rs"
 test = false
 doc = false
 bench = false

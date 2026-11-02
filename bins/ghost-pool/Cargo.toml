@@ -52,7 +52,6 @@ ghost-policy = { workspace = true }
 ghost-storage = { workspace = true }
 ghost-consensus = { workspace = true }
 ghost-accounting = { workspace = true }
-ghost-reconciliation = { workspace = true }
 ghost-verification = { workspace = true }
 
 # Async runtime
@@ -117,4 +116,4 @@ optional = true
 [dev-dependencies]
 tempfile = "3.10"
 # The arming tests must use the SAME adopted bytes the genesis pin was taken over, not a copy.
-ghost-accounting = { workspace = true, features = ["test-fixtures"] }
+

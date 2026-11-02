@@ -20,11 +20,11 @@
 //| FILE: fuzz_p2p_payloads.rs                                                                                           |
 //|======================================================================================================================|
 
-//! Fuzz target for all P2P message payload types
+//! Fuzz target for the P2P message payload types
 //!
 //! The message envelope fuzzer tests envelope parsing, but the inner payloads
 //! are deserialized separately from the payload bytes. This target exercises
-//! all 30+ payload types that arrive over the untrusted P2P network.
+//! the payload types that arrive over the untrusted P2P network.
 
 #![no_main]
 
@@ -33,24 +33,7 @@ use ghost_consensus::message::*;
 
 fuzz_target!(|data: &[u8]| {
     // Try deserializing as every P2P payload type — none should panic
-
-    // Core consensus
-    let _ = serde_json::from_slice::<PayoutProposalMessage>(data);
-    let _ = serde_json::from_slice::<VoteMessage>(data);
-    let _ = serde_json::from_slice::<ShareProofMessage>(data);
-
-    // Health & discovery
     let _ = serde_json::from_slice::<HealthPingMessage>(data);
     let _ = serde_json::from_slice::<DiscoveryMessage>(data);
     let _ = serde_json::from_slice::<PeerInfo>(data);
-
-    // Share convergence
-    let _ = serde_json::from_slice::<ShareConvergenceMessage>(data);
-    let _ = serde_json::from_slice::<ShareConvergenceResponse>(data);
-
-    // Verification
-    let _ = serde_json::from_slice::<VerificationResultMessage>(data);
-
-    // Byzantine evidence
-    let _ = serde_json::from_slice::<EquivocationProofMessage>(data);
 });

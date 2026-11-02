@@ -628,7 +628,6 @@ dependencies = [
  "ghost-consensus",
  "ghost-mining",
  "ghost-policy",
- "ghost-reconciliation",
  "ghost-storage",
  "hex",
  "parking_lot",
@@ -2105,7 +2104,6 @@ dependencies = [
  "ed25519-dalek",
  "ghost-common",
  "hex",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tracing",
@@ -2150,7 +2148,6 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
- "ghost-reconciliation",
  "hex",
  "hmac",
  "once_cell",
@@ -2223,7 +2220,6 @@ dependencies = [
  "ghost-consensus",
  "ghost-policy",
  "ghost-reaper",
- "ghost-reconciliation",
  "ghost-storage",
  "ghost-verification",
  "hex",
@@ -2283,16 +2279,6 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "ghost-reconciliation"
-version = "1.11.46"
-dependencies = [
- "chrono",
- "serde",
- "sha2 0.10.9",
  "tracing",
 ]
 
