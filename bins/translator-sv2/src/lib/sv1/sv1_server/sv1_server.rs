@@ -1929,6 +1929,18 @@ impl Sv1Server {
         // The 32-byte bound is ours (`MAX_USER_IDENTITY_BYTES`), not a spec limit; the SV2 wire
         // type is `Str0255`.
 
+        // The miner's agent rides along for the node pool's sensing loop. The channel manager
+        // forwards it only to an upstream that negotiated the Ghost agent extension, and never
+        // for an aggregated channel, which is not one miner.
+        let agent_tlv = if crate::is_aggregated() {
+            None
+        } else {
+            downstream
+                .downstream_data
+                .super_safe_lock(|d| d.user_agent.clone())
+                .map(|agent| vec![super::ghost_agent_tlv(&agent)])
+        };
+
         if let Ok(open_channel_msg) = build_sv2_open_extended_mining_channel(
             request_id,
             user_identity.clone(),
@@ -1938,7 +1950,10 @@ impl Sv1Server {
         ) {
             self.sv1_server_channel_state
                 .channel_manager_sender
-                .send((Mining::OpenExtendedMiningChannel(open_channel_msg), None))
+                .send((
+                    Mining::OpenExtendedMiningChannel(open_channel_msg),
+                    agent_tlv,
+                ))
                 .await
                 .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
         } else {

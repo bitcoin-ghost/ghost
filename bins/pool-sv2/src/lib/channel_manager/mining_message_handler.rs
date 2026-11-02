@@ -223,6 +223,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!("Received Close Channel: {msg}");
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+        if let Some(np) = &self.node_pool {
+            np.on_channel_closed((downstream_id, msg.channel_id));
+        }
         self.channel_manager_data
             .super_safe_lock(|channel_manager_data| {
                 let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id)
@@ -299,6 +302,21 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 }
             };
 
+            // NODE_POOL (at/above its activation height only): standard channels are allowed and
+            // always carry the full class; the miner only hashes a header. The channel must
+            // still credit a payee the ledger accepts, checked before anything is allocated.
+            let tiering = self.per_channel_mode(Some(&last_future_template));
+            if matches!(tiering, Some(crate::node_pool::PerChannelMode::NodePool(_))) {
+                if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
+                    error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
+                    let open_standard_mining_channel_error = OpenMiningChannelError {
+                        request_id,
+                        error_code: code.to_string().try_into().expect("error code must be valid string"),
+                    };
+                    return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_standard_mining_channel_error)).into()]);
+                }
+            }
+
             let coinbase_outputs = payout_mode.coinbase_outputs(
                 last_future_template.coinbase_tx_value_remaining,
                 &self.coinbase_reward_script,
@@ -351,14 +369,18 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 // tiered — target quantised to its tier's exact target, tier commitment armed
                 // for its first job build. Done BEFORE the success message so the target the
                 // miner is told is the tier target it will be credited at.
-                let tiering = self.tier_binding.clone().filter(|tb| tb.template_is_tiered(&last_future_template));
                 if let Some(ref tb) = tiering {
                     let q = tb.quantise_target(
                         standard_channel.get_target(),
                         standard_channel.get_requested_max_target(),
                     );
                     standard_channel.set_target(q);
-                    standard_channel.set_tier_commitment(Some(tb.stamp_for_target(&q)));
+                    standard_channel.set_tier_commitment(Some(tb.stamp(
+                        (downstream_id, channel_id),
+                        crate::node_pool::ChannelKind::Standard,
+                        &user_identity,
+                        &q,
+                    )));
                 }
 
                 let group_channel_id = downstream_data.group_channel.get_group_channel_id();
@@ -382,13 +404,16 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 // form (plain node tag stripped; the tier tag rides as the factory extra push)
                 // when tiering is active, the template verbatim otherwise
                 let channel_template = match tiering {
-                    Some(_) => crate::tier_binding::strip_plain_node_tag(&last_future_template),
+                    Some(ref mode) => mode.prepare_template(&last_future_template),
                     None => last_future_template,
                 };
                 standard_channel.on_new_template(channel_template, coinbase_outputs.clone()).map_err(|e| PoolError::disconnect(e, downstream_id))?;
                 let future_standard_job_id = standard_channel
                     .get_future_job_id_from_template_id(template_id)
                     .expect("future job id must exist");
+                if let Some(ref mode) = tiering {
+                    mode.bind_job((downstream_id, channel_id), future_standard_job_id);
+                }
                 let future_standard_job = standard_channel
                     .get_future_job(future_standard_job_id)
                     .expect("future job must exist");
@@ -457,7 +482,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: OpenExtendedMiningChannel<'_>,
-        _tlv_fields: Option<&[Tlv]>,
+        tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let request_id = msg.get_request_id_as_u32();
         let user_identity = msg.user_identity.as_utf8_or_hex();
@@ -481,6 +506,30 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     .downstream_data
                     .super_safe_lock(|downstream_data| {
                         let mut messages: Vec<RouteMessageTo> = Vec::new();
+
+                        // SHARE_TIER_BIND / NODE_POOL: how this channel's jobs are stamped, if
+                        // per channel. Custom-work connections are excluded: their coinbases
+                        // come from the declaring client and cannot carry this pool's
+                        // commitment (an arming-scope limitation, logged where custom work is
+                        // negotiated).
+                        let tiering = if downstream.requires_custom_work.load(Ordering::SeqCst) {
+                            None
+                        } else {
+                            self.per_channel_mode(channel_manager_data.last_future_template.as_ref())
+                        };
+
+                        // NODE_POOL: the channel must credit a payee the ledger accepts. Checked
+                        // before the prefix is minted, for the reason given just below.
+                        if matches!(tiering, Some(crate::node_pool::PerChannelMode::NodePool(_))) {
+                            if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
+                                error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
+                                let open_extended_mining_channel_error = OpenMiningChannelError {
+                                    request_id,
+                                    error_code: code.to_string().try_into().expect("error code must be valid string"),
+                                };
+                                return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_extended_mining_channel_error)).into()]);
+                            }
+                        }
 
                         // Validate the request in full BEFORE any extranonce prefix is minted.
                         // See `validate_and_allocate_extended`: the extended allocator's
@@ -605,26 +654,25 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         // SHARE_TIER_BIND: as for standard channels — quantise the target to
                         // its tier and arm the commitment BEFORE the success message, so the
                         // target the client is told is the tier target it will be credited at.
-                        // Custom-work connections are excluded: their coinbases come from the
-                        // declaring client and cannot carry this pool's tier commitment (an
-                        // arming-scope limitation, logged where custom work is negotiated).
-                        let tiering = if downstream.requires_custom_work.load(Ordering::SeqCst) {
-                            None
-                        } else {
-                            self.tier_binding.clone().filter(|tb| {
-                                channel_manager_data
-                                    .last_future_template
-                                    .as_ref()
-                                    .is_some_and(|t| tb.template_is_tiered(t))
-                            })
-                        };
+                        // NODE_POOL: the translator's agent TLV seeds the sensing loop; the
+                        // stamp registers the channel at the smallest class its model allows.
                         if let Some(ref tb) = tiering {
+                            if let (crate::node_pool::PerChannelMode::NodePool(np), Some(agent)) =
+                                (tb, crate::node_pool::agent_from_tlvs(tlv_fields))
+                            {
+                                np.note_agent((downstream_id, channel_id), Some(agent));
+                            }
                             let q = tb.quantise_target(
                                 extended_channel.get_target(),
                                 extended_channel.get_requested_max_target(),
                             );
                             extended_channel.set_target(q);
-                            extended_channel.set_tier_commitment(Some(tb.stamp_for_target(&q)));
+                            extended_channel.set_tier_commitment(Some(tb.stamp(
+                                (downstream_id, channel_id),
+                                crate::node_pool::ChannelKind::Extended,
+                                &user_identity,
+                                &q,
+                            )));
                         }
 
                         let group_channel_id = downstream_data.group_channel.get_group_channel_id();
@@ -683,7 +731,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             // the tiered form (plain node tag stripped; the tier tag rides as
                             // the factory extra push) when tiering is active
                             let channel_template = match tiering {
-                                Some(_) => crate::tier_binding::strip_plain_node_tag(&last_future_template),
+                                Some(ref mode) => mode.prepare_template(&last_future_template),
                                 None => last_future_template.clone(),
                             };
                             extended_channel.on_new_template(
@@ -694,6 +742,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             let future_extended_job_id = extended_channel
                                 .get_future_job_id_from_template_id(last_future_template.template_id)
                                 .expect("future job id must exist");
+                            if let Some(ref mode) = tiering {
+                                mode.bind_job((downstream_id, channel_id), future_extended_job_id);
+                            }
                             let future_extended_job = extended_channel
                                 .get_future_job(future_extended_job_id)
                                 .expect("future job must exist");
@@ -1076,6 +1127,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             None
         };
 
+        let mut class_changed = None;
         let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
             let channel_id = msg.channel_id;
             let Some(downstream) = channel_manager_data.downstream.get(&downstream_id) else {
@@ -1109,6 +1161,22 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 let res = extended_channel.validate_share(msg.clone());
                 vardiff.increment_shares_since_last_update();
+
+                // NODE_POOL: every judged share feeds the miner's sensing loop. Inert unless the
+                // channel was registered by an active node pool stamp.
+                if let Some(np) = &self.node_pool {
+                    use ghost_common::slot_class_sensing::ShareVerdict;
+                    let verdict = match &res {
+                        Ok(_) => ShareVerdict::Valid,
+                        Err(ShareValidationError::DoesNotMeetTarget) => ShareVerdict::Corrupt,
+                        Err(_) => ShareVerdict::Other,
+                    };
+                    if let Some(change) = np.on_share((downstream_id, channel_id), msg.job_id, verdict) {
+                        if change.from != change.to {
+                            class_changed = Some((downstream_id, channel_id));
+                        }
+                    }
+                }
 
                 // Worker-Specific Hashrate Tracking TLV: when present, splice the per-miner
                 // worker name onto the channel address for the share_webhook payload so
@@ -1423,6 +1491,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             }
         }
 
+        // NODE_POOL: the miner's class changed; give it a job at the new class now.
+        if let Some(key) = class_changed {
+            self.node_pool_rebuild(Some(&std::collections::HashSet::from([key])))
+                .await;
+        }
+
         Ok(())
     }
 
@@ -1448,13 +1522,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let new_nominal_hash_rate = msg.nominal_hash_rate;
                 let requested_maximum_target = Target::from_le_bytes(msg.maximum_target.inner_as_ref().try_into().unwrap());
 
-                // SHARE_TIER_BIND: is tiering active for the template era we are in?
-                let tiering = self.tier_binding.clone().filter(|tb| {
-                    channel_manager_data
-                        .last_future_template
-                        .as_ref()
-                        .is_some_and(|t| tb.template_is_tiered(t))
-                });
+                // SHARE_TIER_BIND / NODE_POOL: is per-channel tiering active for the template era
+                // we are in?
+                let tiering =
+                    self.per_channel_mode(channel_manager_data.last_future_template.as_ref());
 
                 // Make a half-armed deployment LOUD. The two halves of the gate live in two
                 // separately-deployed binaries and nothing else would notice a desync:
@@ -1478,7 +1549,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                          running without quantise_to_tiers = true and its miners are being \
                          credited below the difficulty they mine at"
                     );
-                } else if self.tier_binding.is_none() && max_is_tier_shaped {
+                } else if self.tier_binding.is_none() && self.node_pool.is_none() && max_is_tier_shaped {
                     error!(
                         channel_id,
                         "SHARE_TIER_BIND DESYNC? this client sends tier-shaped difficulties \

@@ -67,6 +67,9 @@ pub mod setup;
 /// Node pool share tag and the pure share checks.
 pub mod share_commit;
 
+/// Node pool slot-class sensing: the firmware ceiling table and the per-miner stepping loop.
+pub mod slot_class_sensing;
+
 /// Proving a share was mined to the node that claims it.
 pub mod share_binding;
 

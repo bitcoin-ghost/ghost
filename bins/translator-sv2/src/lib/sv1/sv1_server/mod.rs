@@ -252,6 +252,44 @@ pub(super) fn check_username_attributable(name: &str) -> Result<(), UsernameReje
 /// Returning `None` makes the caller omit the identity, which the pool treats as
 /// unattributable and refuses to credit. That is loud and costs one share; guessing is
 /// silent and costs someone their earnings.
+/// SV2 extension type of the Ghost user-agent TLV.
+///
+/// ⚠ AUTHORITY: `ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE`, read by `pool_sv2`.
+/// Duplicated as a literal because this crate is an SRI fork that deliberately does not link the
+/// ghost workspace crates (see `difficulty_manager::MIN_DIFFICULTY_TIER_LOG2`). The pin test below
+/// and the pool's own test hold the two copies to the same value.
+pub(crate) const GHOST_AGENT_EXTENSION_TYPE: u16 = 0x4748;
+
+/// Field type of the agent inside [`GHOST_AGENT_EXTENSION_TYPE`]. Authority as above
+/// (`AGENT_TLV_FIELD_TYPE`).
+pub(crate) const GHOST_AGENT_FIELD_TYPE: u8 = 0x01;
+
+/// Longest agent forwarded, in bytes. Authority as above (`MAX_AGENT_LEN`).
+const MAX_AGENT_LEN: usize = 255;
+
+/// Cut an SV1 agent to [`MAX_AGENT_LEN`] bytes at a character boundary.
+fn clamp_agent(agent: &str) -> &str {
+    if agent.len() <= MAX_AGENT_LEN {
+        return agent;
+    }
+    let mut end = MAX_AGENT_LEN;
+    while !agent.is_char_boundary(end) {
+        end -= 1;
+    }
+    &agent[..end]
+}
+
+/// The Ghost agent TLV for an SV1 miner's `mining.subscribe` agent. The pool's node pool layer
+/// looks the agent up in its firmware ceiling table to choose the miner's slot class; the pool
+/// builds the coinbase, so the sensing loop lives there and this is the one fact it cannot see.
+fn ghost_agent_tlv(agent: &str) -> stratum_apps::stratum_core::parsers_sv2::Tlv {
+    stratum_apps::stratum_core::parsers_sv2::Tlv::new(
+        GHOST_AGENT_EXTENSION_TYPE,
+        GHOST_AGENT_FIELD_TYPE,
+        clamp_agent(agent).as_bytes().to_vec(),
+    )
+}
+
 fn tlv_compatible_username(s: &str) -> Option<&str> {
     if s.len() <= MAX_USER_IDENTITY_LENGTH {
         return Some(s);
@@ -579,6 +617,68 @@ mod worker_tlv_length_tests {
                 .unwrap_or_else(|e| panic!("encode rejected {identity:?}: {e:?}"));
             let decoded = UserIdentity::from_tlv(&tlv).expect("decode");
             assert_eq!(decoded.as_str().unwrap(), identity);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ghost_agent_tlv_tests {
+    use super::*;
+    use stratum_apps::stratum_core::{
+        codec_sv2::StandardSv2Frame,
+        mining_sv2::OpenExtendedMiningChannel,
+        parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, TlvList},
+    };
+
+    /// The literals must match the pool's authority, `ghost_common::slot_class_sensing`.
+    #[test]
+    fn the_constants_match_the_pools() {
+        assert_eq!(GHOST_AGENT_EXTENSION_TYPE, 0x4748);
+        assert_eq!(GHOST_AGENT_FIELD_TYPE, 0x01);
+        assert_eq!(MAX_AGENT_LEN, 255);
+    }
+
+    #[test]
+    fn long_agents_are_cut_at_a_character_boundary() {
+        let tlv = ghost_agent_tlv(&"é".repeat(200));
+        assert!(tlv.value.len() <= MAX_AGENT_LEN);
+        assert!(std::str::from_utf8(&tlv.value).is_ok());
+    }
+
+    /// The agent survives the frame the channel manager sends, and a pool that negotiated the
+    /// extension reads it back; one that did not never sees it.
+    #[test]
+    fn the_agent_rides_the_channel_open_frame() {
+        let open = OpenExtendedMiningChannel {
+            request_id: 1,
+            user_identity: "bc1qexample.rig1".as_bytes().to_vec().try_into().unwrap(),
+            nominal_hash_rate: 1.0e12,
+            max_target: vec![0xFFu8; 32].try_into().unwrap(),
+            min_extranonce_size: 4,
+        };
+        let tlv = ghost_agent_tlv("Antminer S19j Pro/1.0");
+        let bytes = TlvList::from_slice(&[tlv])
+            .unwrap()
+            .build_frame_bytes_with_tlvs(Mining::OpenExtendedMiningChannel(open))
+            .unwrap();
+        for (negotiated, expect) in [(vec![GHOST_AGENT_EXTENSION_TYPE], true), (vec![], false)] {
+            let mut frame =
+                StandardSv2Frame::<AnyMessage<'static>>::from_bytes(bytes.clone().into()).unwrap();
+            let header = frame.get_header().unwrap();
+            let (message, tlvs) =
+                parse_message_frame_with_tlvs(header, frame.payload(), &negotiated).unwrap();
+            assert!(matches!(
+                message,
+                AnyMessage::Mining(Mining::OpenExtendedMiningChannel(_))
+            ));
+            let agent = tlvs.unwrap_or_default().into_iter().find(|t| {
+                t.r#type.extension_type == GHOST_AGENT_EXTENSION_TYPE
+                    && t.r#type.field_type == GHOST_AGENT_FIELD_TYPE
+            });
+            assert_eq!(
+                agent.map(|t| t.value),
+                expect.then(|| b"Antminer S19j Pro/1.0".to_vec())
+            );
         }
     }
 }

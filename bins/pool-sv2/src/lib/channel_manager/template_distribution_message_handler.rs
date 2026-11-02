@@ -39,15 +39,20 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         // binary flips at the same block as ghost-mining's height gate rather than at a restart.
         // `None` (unconfigured — the only shipped state) keeps the group-broadcast path below,
         // byte-identical to today.
-        let tiering = self
-            .tier_binding
-            .clone()
-            .filter(|tb| tb.template_is_tiered(&msg));
-        // The tiered template: the plain node tag stripped out of the prefix, making room (the
-        // exact same 25 bytes) for the per-tier tag each channel's factory stamps back in.
+        //
+        // NODE_POOL: when `[node_pool]` is configured and this template is at/above its
+        // activation height, the same per-channel path runs with the node pool's stamp instead
+        // (`per_channel_mode`). Absent, `per_channel_mode` is exactly the tier-binding filter.
+        if let Some(np) = &self.node_pool {
+            np.on_new_template(&msg);
+        }
+        let tiering = self.per_channel_mode(Some(&msg));
+        // The tiered template: the bytes the per-channel stamp replaces taken out of the prefix
+        // (the plain node tag for SHARE_TIER_BIND, both Ghost tags for the node pool), making
+        // room, byte for byte, for what each channel's factory stamps back in.
         let tiered_template = tiering
             .as_ref()
-            .map(|_| crate::tier_binding::strip_plain_node_tag(&msg.clone().into_static()));
+            .map(|mode| mode.prepare_template(&msg.clone().into_static()));
 
         let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
             if msg.future_template {
@@ -138,9 +143,13 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     maximum_target: q.to_le_bytes().into(),
                                 })).into());
                             }
-                            standard_channel.set_tier_commitment(Some(
-                                tb.stamp_for_target(standard_channel.get_target()),
-                            ));
+                            let key = (*downstream_id, *channel_id);
+                            standard_channel.set_tier_commitment(Some(tb.stamp(
+                                key,
+                                crate::node_pool::ChannelKind::Standard,
+                                standard_channel.get_user_identity(),
+                                standard_channel.get_target(),
+                            )));
                             standard_channel.on_new_template(tiered_template.clone(), downstream_coinbase_outputs.clone()).map_err(|e| {
                                 tracing::error!("Error while adding tiered template to standard channel with id: {channel_id:?}");
                                 PoolError::shutdown(e)
@@ -162,6 +171,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     .get_job_message()
                                     .clone(),
                             };
+                            tb.bind_job(key, job_message.job_id);
                             messages.push((*downstream_id, Mining::NewMiningJob(job_message.into_static())).into());
                         }
 
@@ -177,9 +187,13 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     maximum_target: q.to_le_bytes().into(),
                                 })).into());
                             }
-                            extended_channel.set_tier_commitment(Some(
-                                tb.stamp_for_target(extended_channel.get_target()),
-                            ));
+                            let key = (*downstream_id, *channel_id);
+                            extended_channel.set_tier_commitment(Some(tb.stamp(
+                                key,
+                                crate::node_pool::ChannelKind::Extended,
+                                extended_channel.get_user_identity(),
+                                extended_channel.get_target(),
+                            )));
                             extended_channel.on_new_template(tiered_template.clone(), downstream_coinbase_outputs.clone()).map_err(|e| {
                                 tracing::error!("Error while adding tiered template to extended channel with id: {channel_id:?}");
                                 PoolError::shutdown(e)
@@ -201,6 +215,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     .get_job_message()
                                     .clone(),
                             };
+                            tb.bind_job(key, job_message.job_id);
                             messages.push((*downstream_id, Mining::NewExtendedMiningJob(job_message.into_static())).into());
                         }
 
@@ -317,6 +332,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
+
+        if let Some(np) = &self.node_pool {
+            np.on_set_new_prev_hash(msg.template_id);
+        }
 
         let messages = self.channel_manager_data.super_safe_lock(|data| {
             data.last_new_prev_hash = Some(msg.clone().into_static());

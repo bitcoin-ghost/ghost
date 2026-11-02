@@ -7,11 +7,32 @@ use stratum_apps::monitoring::client::{
     ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientsMonitoring,
 };
 
-use crate::{channel_manager::ChannelManager, downstream::Downstream};
+use std::collections::HashMap;
+
+use crate::{
+    channel_manager::ChannelManager,
+    downstream::Downstream,
+    node_pool::{ChannelStatus, NodePool},
+};
 
 /// Helper to convert a Downstream to Sv2ClientInfo.
 /// Returns None if the lock cannot be acquired (graceful degradation for monitoring).
-fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
+///
+/// With the node pool layer configured, extended channels also report their slot class and the
+/// low-limit firmware warning, if any.
+fn downstream_to_sv2_client_info(
+    client: &Downstream,
+    node_pool: Option<&NodePool>,
+) -> Option<Sv2ClientInfo> {
+    let node_pool_status: HashMap<u32, ChannelStatus> = node_pool
+        .map(|np| {
+            np.channel_status()
+                .into_iter()
+                .filter(|s| s.key.0 == client.downstream_id)
+                .map(|s| (s.key.1, s))
+                .collect()
+        })
+        .unwrap_or_default();
     client
         .downstream_data
         .safe_lock(|dd| {
@@ -24,6 +45,7 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let requested_max_target = extended_channel.get_requested_max_target();
                 let user_identity = extended_channel.get_user_identity();
                 let share_accounting = extended_channel.get_share_accounting();
+                let node_pool = node_pool_status.get(&channel_id);
 
                 extended_channels.push(ExtendedChannelInfo {
                     channel_id,
@@ -43,6 +65,10 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     last_batch_work_sum: share_accounting.get_last_batch_work_sum(),
                     share_batch_size: share_accounting.get_share_batch_size(),
                     blocks_found: share_accounting.get_blocks_found(),
+                    slot_class: node_pool.map(|s| s.slot_class),
+                    slot_class_warning: node_pool
+                        .and_then(|s| s.sensing.as_ref()?.warning.as_ref())
+                        .map(ToString::to_string),
                 });
             }
 
@@ -92,7 +118,7 @@ impl Sv2ClientsMonitoring for ChannelManager {
 
         downstream_refs
             .iter()
-            .filter_map(downstream_to_sv2_client_info)
+            .filter_map(|d| downstream_to_sv2_client_info(d, self.node_pool.as_deref()))
             .collect()
     }
 
@@ -101,7 +127,7 @@ impl Sv2ClientsMonitoring for ChannelManager {
             .safe_lock(|d| {
                 d.downstream
                     .get(&client_id)
-                    .and_then(downstream_to_sv2_client_info)
+                    .and_then(|c| downstream_to_sv2_client_info(c, self.node_pool.as_deref()))
             })
             .unwrap_or(None)
     }
