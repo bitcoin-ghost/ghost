@@ -3508,22 +3508,16 @@ impl TemplateProcessor {
             }
         }
 
-        // 5. Validate block weight (max 4M weight units per BIP141)
-        // Coinbase weight: non-witness bytes * 4 + witness bytes * 1
-        let coinbase_non_witness_len = coinbase_non_witness.len();
-        // SEC-BLOCK-2: Prevent integer underflow in weight calculation
-        let coinbase_witness_extra = coinbase_witness.len().checked_sub(coinbase_non_witness_len)
-            .ok_or_else(|| anyhow::anyhow!(
-                "Invalid coinbase: witness serialization ({} bytes) shorter than non-witness ({} bytes)",
-                coinbase_witness.len(),
-                coinbase_non_witness_len
-            ))?;
-        let coinbase_weight = (coinbase_non_witness_len * 4 + coinbase_witness_extra) as u64;
+        // 5. Validate block weight (max 4M weight units per BIP141): header, tx count,
+        // coinbase and transactions. SEC-BLOCK-2 underflow check inside.
+        let total_weight = crate::block_limits::block_weight(
+            tx_count,
+            coinbase_non_witness.len(),
+            coinbase_witness.len(),
+            work.total_weight,
+        )?;
 
-        // Total weight = coinbase weight + transaction weights from template
-        let total_weight = coinbase_weight + work.total_weight;
-
-        const MAX_BLOCK_WEIGHT: u64 = 4_000_000; // 4M weight units (BIP141)
+        const MAX_BLOCK_WEIGHT: u64 = crate::block_limits::MAX_BLOCK_WEIGHT;
         const MIN_BLOCK_SIZE: usize = 81; // 80 byte header + 1 byte tx count minimum
 
         if block_data.len() < MIN_BLOCK_SIZE {
@@ -3702,19 +3696,16 @@ impl TemplateProcessor {
             }
         }
 
-        // 5. Validate block weight
-        let coinbase_non_witness_len = coinbase_non_witness.len();
-        // SEC-BLOCK-2: Prevent integer underflow in weight calculation
-        let coinbase_witness_extra = coinbase_witness.len().checked_sub(coinbase_non_witness_len)
-            .ok_or_else(|| anyhow::anyhow!(
-                "Invalid coinbase: witness serialization ({} bytes) shorter than non-witness ({} bytes)",
-                coinbase_witness.len(),
-                coinbase_non_witness_len
-            ))?;
-        let coinbase_weight = (coinbase_non_witness_len * 4 + coinbase_witness_extra) as u64;
-        let total_weight = coinbase_weight + work.total_weight;
+        // 5. Validate block weight: header, tx count, coinbase and transactions.
+        // SEC-BLOCK-2 underflow check inside.
+        let total_weight = crate::block_limits::block_weight(
+            tx_count,
+            coinbase_non_witness.len(),
+            coinbase_witness.len(),
+            work.total_weight,
+        )?;
 
-        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+        const MAX_BLOCK_WEIGHT: u64 = crate::block_limits::MAX_BLOCK_WEIGHT;
         const MIN_BLOCK_SIZE: usize = 81;
 
         if block_data.len() < MIN_BLOCK_SIZE {
