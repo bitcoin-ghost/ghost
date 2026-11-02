@@ -20,10 +20,12 @@
 //| FILE: client.rs                                                                                                      |
 //|======================================================================================================================|
 
-//! A one-shot relay client: shake hands with one node and ask it one thing (W2.9).
+//! A one-shot relay client: shake hands with one node and ask it one thing (W2.9, W2.10).
 //!
 //! `ghost-audit` and the public prober use it to read a node's advert (its `Hello`: protocol
-//! version, genesis, tip, user agent) and its job stamps ([`crate::wire::JobStamps`]). It is not
+//! version, genesis, tip, user agent), its job stamps ([`crate::wire::JobStamps`]), the stratum
+//! ports it serves miners on ([`crate::wire::NodeAdvert`]), and the peer addresses it gossips
+//! (`GetAddr`), which is how open listing discovers nodes. It is not
 //! a peer: it relays nothing, claims the genesis as its tip so it is never asked for anything,
 //! and closes as soon as it has its answer.
 
@@ -37,7 +39,8 @@ use ghost_common::anchor_chain::AnchorHash;
 use ghost_common::node_pool_u256::U256;
 
 use crate::wire::{
-    Hello, JobStamps, Message, NotFoundKind, WireError, FRAME_HEADER_LEN, PROTOCOL_VERSION,
+    Hello, JobStamps, Message, NodeAdvert, NotFoundKind, WireError, FRAME_HEADER_LEN,
+    PROTOCOL_VERSION,
 };
 
 /// Frames read past the handshake while waiting for an answer, before giving up.
@@ -75,6 +78,9 @@ pub enum ClientError {
     /// The node does not answer `GetStamps`: it does not stamp jobs, or is too old to.
     #[error("the node does not serve job stamps")]
     NoStamps,
+    /// The node does not answer `GetAdvert`: it serves no miners, or is too old to say.
+    #[error("the node does not advertise stratum ports")]
+    NoAdvert,
 }
 
 /// An open, handshaken connection.
@@ -174,6 +180,53 @@ impl Session {
             }
         }
         Err(ClientError::NoStamps)
+    }
+}
+
+impl Session {
+    /// Ask for the node's mining advert: the stratum ports it serves miners on.
+    pub async fn advert(&mut self, timeout: Duration) -> Result<NodeAdvert, ClientError> {
+        tokio::time::timeout(timeout, self.advert_inner())
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+
+    async fn advert_inner(&mut self) -> Result<NodeAdvert, ClientError> {
+        self.send(&Message::GetAdvert).await?;
+        for _ in 0..MAX_FRAMES {
+            match read_frame(&mut self.stream).await? {
+                Message::Advert(a) => return Ok(a),
+                Message::NotFound(NotFoundKind::Advert, _) => return Err(ClientError::NoAdvert),
+                _ => {}
+            }
+        }
+        Err(ClientError::NoAdvert)
+    }
+
+    /// Ask for the peer addresses the node gossips (at most [`crate::wire::MAX_ADDRS`], as the
+    /// wire caps them), as sent: unparsed and unchecked. An empty list if it sends none in time.
+    pub async fn addrs(&mut self, timeout: Duration) -> Result<Vec<String>, ClientError> {
+        match tokio::time::timeout(timeout, self.addrs_inner()).await {
+            Ok(r) => r,
+            Err(_) => Err(ClientError::Timeout),
+        }
+    }
+
+    async fn addrs_inner(&mut self) -> Result<Vec<String>, ClientError> {
+        self.send(&Message::GetAddr).await?;
+        for _ in 0..MAX_FRAMES {
+            if let Message::Addr(v) = read_frame(&mut self.stream).await? {
+                return Ok(v);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    async fn send(&mut self, m: &Message) -> Result<(), ClientError> {
+        self.stream
+            .write_all(&m.encode())
+            .await
+            .map_err(|e| ClientError::Io(e.to_string()))
     }
 }
 
