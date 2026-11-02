@@ -33,7 +33,7 @@ use ghost_common::share_commit::batch_root;
 use ghost_storage::Database;
 
 use crate::peers::penalty;
-use crate::relay::{JobAnchor, NoRetirements, Relay};
+use crate::relay::{JobAnchor, Relay};
 use crate::testkit::*;
 use crate::wire::{AnchorMsg, Message, MsgType};
 
@@ -336,7 +336,7 @@ fn a_restarted_node_reloads_its_chain_and_ledger() {
     s.nodes[1].relay = Relay::open(
         params(),
         Arc::new(Database::open(&path).unwrap()),
-        Box::new(NoRetirements),
+        fed_archive(START_TIP),
     )
     .unwrap();
     s.nodes[1].relay.set_btc_tip(START_TIP);
@@ -355,7 +355,7 @@ fn a_restarted_node_reloads_its_chain_and_ledger() {
     let r = Relay::open(
         params(),
         Arc::new(Database::open(&path).unwrap()),
-        Box::new(NoRetirements),
+        fed_archive(START_TIP),
     )
     .unwrap();
     assert_eq!(r.best(), best);

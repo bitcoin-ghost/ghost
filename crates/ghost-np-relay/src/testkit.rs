@@ -20,12 +20,13 @@
 //| FILE: testkit.rs                                                                                                     |
 //|======================================================================================================================|
 
-//! Test support: a fake Bitcoin header chain, simulated miners that build canonical coinbases on a
-//! node's published job, and a deterministic in-process network of relay cores.
+//! Test support: a fake Bitcoin chain of real headers (mainnet bits without the work), simulated
+//! miners that build canonical coinbases on a node's published job, and a deterministic in-process
+//! network of relay cores, each with its own Bitcoin node and archive.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
@@ -46,10 +47,10 @@ use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::{hash_meets_tier, ShareTagPreimage};
 use ghost_storage::Database;
 
+use crate::archive::{ArchivedBlock, BtcArchive, MTP_SPAN};
 use crate::headers::{HeaderFacts, MemHeaders};
-use crate::relay::{
-    Genesis, JobAnchor, LocalOutcome, NoRetirements, Out, PeerId, Relay, RelayParams,
-};
+use crate::relay::{Genesis, JobAnchor, LocalOutcome, Out, PeerId, Relay, RelayParams};
+use crate::settlement::MemBlocks;
 use crate::wire::{Message, NetShare};
 
 /// Header bits of every fake block.
@@ -108,22 +109,153 @@ pub fn params() -> RelayParams {
     )
 }
 
+/// The first fake Bitcoin block.
+pub const BTC_FLOOR: u32 = GENESIS_BTC - 40;
+
+/// The header time of fake block `h`: ten minutes apart, well below every share's time.
+pub fn btc_time(h: u32) -> u32 {
+    1_000_000_000 + 600 * h
+}
+
+/// A coinbase at height `h` with no node pool layout, varied by `tag`.
+pub fn plain_coinbase(h: u32, tag: u8) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: bitcoin::script::Builder::new()
+                .push_int(h as i64)
+                .push_slice([tag; 4])
+                .into_script(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(312_500_000),
+            script_pubkey: ScriptBuf::from_bytes(p2tr("solo")),
+        }],
+    }
+}
+
+/// A one-transaction block at `h` on `prev` with coinbase `cb`.
+pub fn make_block(prev: [u8; 32], h: u32, cb: Transaction) -> ArchivedBlock {
+    ArchivedBlock {
+        header: Header {
+            version: Version::from_consensus(0x2000_0000),
+            prev_blockhash: BlockHash::from_byte_array(prev),
+            merkle_root: TxMerkleNode::from_byte_array(cb.compute_txid().to_byte_array()),
+            time: btc_time(h),
+            bits: CompactTarget::from_consensus(BITS),
+            nonce: 0,
+        },
+        height: h,
+        coinbase: Some((cb, vec![])),
+    }
+}
+
+/// Fake main-chain block `h`, from [`BTC_FLOOR`] up. The same in every test.
+pub fn main_block(h: u32) -> ArchivedBlock {
+    static CHAIN: OnceLock<Mutex<BTreeMap<u32, ArchivedBlock>>> = OnceLock::new();
+    let mut c = CHAIN
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    assert!(h >= BTC_FLOOR);
+    let mut next = c.keys().next_back().map_or(BTC_FLOOR, |k| k + 1);
+    while next <= h {
+        let prev = if next == BTC_FLOOR {
+            [0; 32]
+        } else {
+            c[&(next - 1)].hash()
+        };
+        c.insert(next, make_block(prev, next, plain_coinbase(next, 0)));
+        next += 1;
+    }
+    c[&h].clone()
+}
+
+/// The hash of fake main-chain block `h`.
+pub fn btc_hash(h: u32) -> [u8; 32] {
+    main_block(h).hash()
+}
+
+/// The facts a node derives for block `b` from its chain `at` (median of the last 11 times).
+pub fn facts_of(b: &ArchivedBlock, time_at: impl Fn(u32) -> u32) -> HeaderFacts {
+    let lo = b.height.saturating_sub(MTP_SPAN - 1).max(BTC_FLOOR);
+    let mut t: Vec<u32> = (lo..b.height).map(time_at).collect();
+    t.push(b.header.time);
+    t.sort_unstable();
+    HeaderFacts {
+        height: b.height,
+        next_bits: CompactTarget::from_consensus(BITS),
+        median_time_past: t[t.len() / 2],
+    }
+}
+
+/// An archive holding the fake main chain from [`BTC_FLOOR`] to `tip`, as this node's best.
+pub fn fed_archive(tip: u32) -> Arc<BtcArchive> {
+    let a = BtcArchive::in_memory();
+    a.trust_work_for_tests();
+    feed(&a, &main_node(tip));
+    a
+}
+
+/// A Bitcoin node holding the fake main chain up to `tip`.
+pub fn main_node(tip: u32) -> MemBlocks {
+    let n = MemBlocks::default();
+    for h in BTC_FLOOR..=tip {
+        n.set(main_block(h));
+    }
+    n
+}
+
+/// What settlement does for an archive: archive the node's best chain and record it as best.
+pub fn feed(a: &BtcArchive, node: &MemBlocks) {
+    let tip = node.best_height().unwrap_or(BTC_FLOOR);
+    for h in BTC_FLOOR..=tip {
+        let Some(b) = node.at(h) else { break };
+        let hash = b.hash();
+        if a.main_at(h) == Some(hash) {
+            continue;
+        }
+        a.insert_local(b, 0).expect("local block");
+        a.set_main(h, hash);
+    }
+    a.truncate_main(tip);
+}
+
+/// What the network layer does with the blocks a relay wanted: read them back from the node's
+/// own Bitcoin node to an archived ancestor, and ask peers for the rest.
+pub fn fetch_wanted(r: &mut Relay, node: &MemBlocks) {
+    let mut missing = Vec::new();
+    for h in r.take_needed_headers() {
+        let mut cur = h;
+        loop {
+            if r.archive().has_full(&cur) {
+                break;
+            }
+            let Some(b) = node.get(&cur) else {
+                missing.push(cur);
+                break;
+            };
+            cur = b.prev();
+            r.archive().insert_local(b, 0).expect("local block");
+        }
+    }
+    if !missing.is_empty() {
+        r.request_btc_blocks(&missing);
+    }
+}
+
 /// A relay over a fresh in-memory store.
 pub fn relay() -> Relay {
     Relay::open(
         params(),
         Arc::new(Database::in_memory().expect("db")),
-        Box::new(NoRetirements),
+        fed_archive(START_TIP),
     )
     .expect("open")
-}
-
-/// The hash of fake Bitcoin block `h`.
-pub fn btc_hash(h: u32) -> [u8; 32] {
-    let mut s = Sha256::new();
-    s.update(b"fake bitcoin block");
-    s.update(h.to_le_bytes());
-    s.finalize().into()
 }
 
 /// A fake Bitcoin header chain.
@@ -132,38 +264,35 @@ pub struct Btc {
     pub headers: MemHeaders,
     /// Current tip height.
     pub tip: u32,
-    /// Median time past of block `h` is `t0 - 100_000 + h`.
-    pub t0: u64,
+    /// The shared Bitcoin node every simulated node reads unless given its own.
+    pub node: MemBlocks,
 }
 
 impl Btc {
     /// Headers from below genesis up to `tip`.
     pub fn new(tip: u32) -> Btc {
-        Btc::with_time(tip, T0)
-    }
-
-    /// Headers whose times sit just below `t0`.
-    pub fn with_time(tip: u32, t0: u64) -> Btc {
         let mut b = Btc {
             headers: MemHeaders::default(),
             tip: 0,
-            t0,
+            node: MemBlocks::default(),
         };
         b.extend_to(tip);
         b
     }
 
+    /// The same chain; header times are fixed, so `t0` no longer matters.
+    pub fn with_time(tip: u32, _t0: u64) -> Btc {
+        Btc::new(tip)
+    }
+
     /// Mine fake blocks up to `tip`.
     pub fn extend_to(&mut self, tip: u32) {
-        for h in GENESIS_BTC - 40..=tip {
-            self.headers.insert(
-                btc_hash(h),
-                HeaderFacts {
-                    height: h,
-                    next_bits: CompactTarget::from_consensus(BITS),
-                    median_time_past: (self.t0 - 100_000) as u32 + h,
-                },
-            );
+        for h in BTC_FLOOR..=tip {
+            let b = main_block(h);
+            self.headers.insert(b.hash(), facts_of(&b, btc_time));
+            if self.node.at(h).is_none() {
+                self.node.set(b);
+            }
         }
         self.tip = tip;
         self.headers.set_tip(tip);
@@ -192,9 +321,21 @@ impl Miner {
         }
     }
 
-    /// Build a share on `job` on top of Bitcoin block `prev_height`, paying the canonical outputs
-    /// of the table `table`, and grind it to `tier`.
+    /// Build a share on `job` on top of main-chain Bitcoin block `prev_height`, paying the
+    /// canonical outputs of the table `table`, and grind it to `tier`.
     pub fn build(&mut self, job: JobAnchor, table: &Table, prev_height: u32, tier: u8) -> NetShare {
+        self.build_on(job, table, btc_hash(prev_height), prev_height, tier)
+    }
+
+    /// [`Miner::build`] on Bitcoin block `prev` at `prev_height`, on any branch.
+    pub fn build_on(
+        &mut self,
+        job: JobAnchor,
+        table: &Table,
+        prev: [u8; 32],
+        prev_height: u32,
+        tier: u8,
+    ) -> NetShare {
         self.extranonce += 1;
         let h = prev_height + 1;
         let tag = ShareTagPreimage {
@@ -234,7 +375,7 @@ impl Miner {
         };
         let header = Header {
             version: Version::from_consensus(0x2000_0000),
-            prev_blockhash: BlockHash::from_byte_array(btc_hash(prev_height)),
+            prev_blockhash: BlockHash::from_byte_array(prev),
             merkle_root: TxMerkleNode::from_byte_array(tx.compute_txid().to_byte_array()),
             time: self.time,
             bits: CompactTarget::from_consensus(BITS),
@@ -300,6 +441,8 @@ pub fn grind(header: Header, tier: u8) -> Header {
 pub struct SimNode {
     /// Its relay core.
     pub relay: Relay,
+    /// Its own Bitcoin node (shared with the others unless a test gives it its own).
+    pub node: MemBlocks,
     /// Its miner.
     pub miner: Miner,
     /// Penalties it handed out: `(peer, score, reason)`.
@@ -348,7 +491,10 @@ impl Sim {
         for i in 0..n {
             let mut r = make(i);
             r.set_btc_tip(START_TIP);
+            r.archive().trust_work_for_tests();
+            feed(r.archive(), &s.btc.node);
             s.nodes.push(SimNode {
+                node: s.btc.node.clone(),
                 relay: r,
                 miner: Miner::new(&format!("miner-{i}"), i as u8 + 1),
                 penalties: Vec::new(),
@@ -431,16 +577,57 @@ impl Sim {
         }
     }
 
-    /// Advance the clock by `dt` seconds and run every node's timers.
+    /// Advance the clock by `dt` seconds and run every node's timers: archive its Bitcoin
+    /// node's best chain, fetch the blocks its checks wanted, then its relay timers.
     pub fn tick(&mut self, dt: u64) {
         self.now += dt;
         for i in 0..self.nodes.len() {
             let tip = self.btc.tip;
-            self.nodes[i].relay.set_btc_tip(tip);
+            let n = &mut self.nodes[i];
+            feed(n.relay.archive(), &n.node);
+            n.relay.set_btc_tip(tip);
+            fetch_wanted(&mut n.relay, &n.node);
+            let outs = n.relay.take_out();
+            self.route(i, outs);
             let outs = self.nodes[i].relay.tick(&self.btc.headers, self.now);
             self.route(i, outs);
         }
         self.run();
+    }
+
+    /// Replace node `i`'s relay (a restart or a fresh node), linked to nobody.
+    pub fn replace(&mut self, i: usize, mut r: Relay) {
+        for j in 0..self.nodes.len() {
+            if j != i {
+                self.unlink(i, j);
+            }
+        }
+        r.set_btc_tip(self.btc.tip);
+        r.archive().trust_work_for_tests();
+        feed(r.archive(), &self.nodes[i].node);
+        self.nodes[i].relay = r;
+        self.nodes[i].penalties.clear();
+        let outs = self.nodes[i].relay.take_out();
+        self.route(i, outs);
+    }
+
+    /// Add a node on relay `r`, linked to nobody. Returns its index.
+    pub fn add(&mut self, r: Relay) -> usize {
+        let i = self.nodes.len();
+        self.nodes.push(SimNode {
+            node: self.btc.node.clone(),
+            relay: r,
+            miner: Miner::new(&format!("miner-{i}"), i as u8 + 1),
+            penalties: Vec::new(),
+            published: Vec::new(),
+        });
+        let n = &mut self.nodes[i];
+        n.relay.set_btc_tip(self.btc.tip);
+        n.relay.archive().trust_work_for_tests();
+        feed(n.relay.archive(), &n.node);
+        let outs = n.relay.take_out();
+        self.route(i, outs);
+        i
     }
 
     /// Node `i`'s miner finds a share (`anchor`: an anchor) and node `i` takes it.

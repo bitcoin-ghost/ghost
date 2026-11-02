@@ -31,16 +31,16 @@
 //! - [`peers`]: rate limits, ban scores, the address book.
 //! - [`headers`]: the Bitcoin header facts share checks need.
 //! - [`net`]: the TCP transport that drives the core.
-//! - [`settlement`]: retiring what pool blocks paid, and the snapshot hook that subtracts it.
-//!
-//! Left for W2.13 (share-chain sync): initial sync of a fresh node from genesis (here a node
-//! fetches missing ancestors one by one through a bounded orphan pool), batch retention and
-//! pruning policy, and the archive of stale Bitcoin headers and coinbases. Their hooks:
-//! [`relay::Relay::behind_peers`], [`headers::HeaderOracle`], the store's
-//! `np_prune_batches_below`, and the `GetAnchor` / `GetBatch` / `GetShares` serving paths.
+//! - [`settlement`]: retiring what pool blocks paid into the stored ledger.
+//! - [`archive`]: the Bitcoin block archive, stale branches included, that share checks and
+//!   settlement read (W2.13).
+//! - [`checkpoint`]: folded ledger state at a deep anchor (W2.13).
+//! - [`relay::sync`]: initial sync, checkpoints, retention and pruning (W2.13).
 
 #![warn(missing_docs)]
 
+pub mod archive;
+pub mod checkpoint;
 pub mod headers;
 pub mod net;
 pub mod peers;
@@ -56,3 +56,6 @@ mod multi_node;
 
 #[cfg(test)]
 mod net_tests;
+
+#[cfg(test)]
+mod sync_tests;
