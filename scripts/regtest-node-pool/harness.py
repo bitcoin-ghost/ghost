@@ -503,8 +503,17 @@ authority_pubkey = "{POOL_PUB}"
                 "SELECT hex(block_hash), position, height, hex(script), hex(amount) FROM np_retirements"))
             blocks = sorted(c.execute(
                 "SELECT height, hex(event_key) FROM np_ledger_events WHERE kind = 1"))
-            anchors = c.execute("SELECT count(*) FROM np_anchors").fetchone()[0]
-            batches = sorted(c.execute("SELECT hex(anchor_hash), share_count FROM np_batches"))
+            # The best share chain only: a node that synced later never fetched dead-fork
+            # anchors it did not need, and that is not a disagreement.
+            parent = dict(c.execute("SELECT hex(hash), hex(parent) FROM np_anchors"))
+            tip = self.status()["share_chain"]["tip"].upper()
+            best = []
+            while tip in parent:
+                best.append(tip)
+                tip = parent[tip]
+            counts = dict(c.execute("SELECT hex(anchor_hash), share_count FROM np_batches"))
+            anchors = len(best)
+            batches = [(a, counts.get(a)) for a in best]
         finally:
             c.close()
 
