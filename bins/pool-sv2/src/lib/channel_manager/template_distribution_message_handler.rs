@@ -1,4 +1,3 @@
-
 use stratum_apps::stratum_core::{
     bitcoin::{Amount, TxOut},
     handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,

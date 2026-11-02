@@ -21,7 +21,6 @@ use stratum_apps::{
     utils::types::{SharesBatchSize, SharesPerMinute},
 };
 
-
 fn default_share_webhook_batch_size() -> usize {
     100
 }

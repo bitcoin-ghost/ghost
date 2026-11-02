@@ -26,7 +26,6 @@ use stratum_apps::stratum_core::{
 use stratum_apps::utils::types::SharesPerMinute;
 use tracing::{debug, error, info, warn};
 
-
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo, CLIENT_SEARCH_SPACE_BYTES},
     error::{self, PoolError, PoolErrorKind},
@@ -269,165 +268,264 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         }
         let np = self.node_pool.clone();
 
-        let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
-            let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id) else {
-                return Err(PoolError::disconnect(PoolErrorKind::DownstreamIdNotFound, downstream_id));
-            };
-
-            let Some(last_future_template) = channel_manager_data.last_future_template.clone() else {
-                return Err(PoolError::disconnect(PoolErrorKind::FutureTemplateNotPresent, downstream_id));
-            };
-
-            let Some(last_set_new_prev_hash_tdp) = channel_manager_data.last_new_prev_hash.clone() else {
-                return Err(PoolError::disconnect(PoolErrorKind::LastNewPrevhashNotFound, downstream_id));
-            };
-
-            // NODE_POOL: standard channels are allowed and always carry the full class; the miner
-            // only hashes a header. The channel must credit a payee the ledger accepts (its
-            // username is its payout address), checked before anything is allocated.
-            if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
-                error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
-                let open_standard_mining_channel_error = OpenMiningChannelError {
-                    request_id,
-                    error_code: code.to_string().try_into().expect("error code must be valid string"),
-                };
-                return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_standard_mining_channel_error)).into()]);
-            }
-
-            downstream.downstream_data.super_safe_lock(|downstream_data| {
-                let nominal_hash_rate = msg.nominal_hash_rate;
-                let requested_max_target = Target::from_le_bytes(msg.max_target.inner_as_ref().try_into().unwrap());
-                let extranonce_prefix = channel_manager_data.extranonce_prefix_factory_standard.next_prefix_standard().map_err(PoolError::shutdown)?;
-
-                let channel_id = downstream_data.channel_id_factory.fetch_add(1, Ordering::SeqCst);
-                let job_store = DefaultJobStore::new();
-
-                let mut standard_channel = match StandardChannel::new_for_pool(channel_id, user_identity.to_string(), extranonce_prefix.to_vec(), requested_max_target, nominal_hash_rate, self.share_batch_size, self.shares_per_minute, job_store, self.pool_tag_string.clone()) {
-                    Ok(channel) => channel,
-                    Err(e) => match e {
-                        StandardChannelError::InvalidNominalHashrate => {
-                            error!("OpenMiningChannelError: invalid-nominal-hashrate");
-                            let open_standard_mining_channel_error = OpenMiningChannelError {
-                                request_id,
-                                error_code: "invalid-nominal-hashrate"
-                                    .to_string()
-                                    .try_into()
-                                    .expect("error code must be valid string"),
-                            };
-                            return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_standard_mining_channel_error)).into()]);
-                        }
-                        StandardChannelError::RequestedMaxTargetOutOfRange => {
-                            error!("OpenMiningChannelError: max-target-out-of-range");
-                            let open_standard_mining_channel_error = OpenMiningChannelError {
-                                request_id,
-                                error_code: "max-target-out-of-range"
-                                    .to_string()
-                                    .try_into()
-                                    .expect("error code must be valid string"),
-                            };
-                            return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_standard_mining_channel_error)).into()]);
-                        }
-                        _ => {
-                            error!("error in handle_open_standard_mining_channel: {:?}", e);
-                            return Err(PoolError::disconnect(PoolErrorKind::ChannelErrorSender, downstream_id) );
-                        }
-                    },
+        let messages = self
+            .channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id)
+                else {
+                    return Err(PoolError::disconnect(
+                        PoolErrorKind::DownstreamIdNotFound,
+                        downstream_id,
+                    ));
                 };
 
-                // The channel starts life at its tier: target quantised, share tag armed for its
-                // first job. Done BEFORE the success message so the target the miner is told is
-                // the tier target it will be credited at.
-                let q = np.quantise_target(
-                    standard_channel.get_target(),
-                    standard_channel.get_requested_max_target(),
-                );
-                standard_channel.set_target(q);
-                standard_channel.set_tier_commitment(Some(np.stamp(
-                    (downstream_id, channel_id),
-                    crate::node_pool::ChannelKind::Standard,
-                    &user_identity,
-                    &q,
-                )));
+                let Some(last_future_template) = channel_manager_data.last_future_template.clone()
+                else {
+                    return Err(PoolError::disconnect(
+                        PoolErrorKind::FutureTemplateNotPresent,
+                        downstream_id,
+                    ));
+                };
 
-                let group_channel_id = downstream_data.group_channel.get_group_channel_id();
-                let extranonce_prefix_size = standard_channel.get_extranonce_prefix().len();
+                let Some(last_set_new_prev_hash_tdp) =
+                    channel_manager_data.last_new_prev_hash.clone()
+                else {
+                    return Err(PoolError::disconnect(
+                        PoolErrorKind::LastNewPrevhashNotFound,
+                        downstream_id,
+                    ));
+                };
 
-                let open_standard_mining_channel_success = OpenStandardMiningChannelSuccess {
-                    request_id: msg.request_id,
-                    channel_id,
-                    target: standard_channel.get_target().to_le_bytes().into(),
-                    extranonce_prefix: standard_channel.get_extranonce_prefix().clone().try_into().expect("Extranonce_prefix must be valid"),
-                    group_channel_id
-                }.into_static();
-
-                let mut  messages: Vec<RouteMessageTo> = Vec::new();
-
-                messages.push((downstream_id, Mining::OpenStandardMiningChannelSuccess(open_standard_mining_channel_success)).into());
-
-                let template_id = last_future_template.template_id;
-
-                // The first job, on the last future template: its Ghost tags out of the prefix,
-                // the share tag back in as the factory's extra push, the canonical outputs.
-                let coinbase_outputs = np
-                    .job_outputs((downstream_id, channel_id), &last_future_template)
-                    .map_err(|e| PoolError::disconnect(PoolErrorKind::Custom(e), downstream_id))?;
-                let channel_template = np.prepare_template(&last_future_template);
-                standard_channel.on_new_template(channel_template, coinbase_outputs).map_err(|e| PoolError::disconnect(e, downstream_id))?;
-                let future_standard_job_id = standard_channel
-                    .get_future_job_id_from_template_id(template_id)
-                    .expect("future job id must exist");
-                np.bind_job((downstream_id, channel_id), future_standard_job_id);
-                let future_standard_job = standard_channel
-                    .get_future_job(future_standard_job_id)
-                    .expect("future job must exist");
-                let future_standard_job_message =
-                    future_standard_job.get_job_message().clone().into_static();
-
-                messages.push((downstream_id, Mining::NewMiningJob(future_standard_job_message)).into());
-
-                // Same guard as the extended path — see #898. Only activate when the cached
-                // `last_new_prev_hash` refers to the same template we just seeded; a channel
-                // opening between a `NewTemplate(N)` and its `SetNewPrevHash(N)` would otherwise
-                // try to activate N-1 and take the whole process down.
-                if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, template_id) {
-                    let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
-                    let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
-                    let n_bits = last_set_new_prev_hash_tdp.n_bits;
-                    let set_new_prev_hash_mining = SetNewPrevHash {
-                        channel_id,
-                        job_id: future_standard_job_id,
-                        prev_hash,
-                        min_ntime: header_timestamp,
-                        nbits: n_bits,
+                // NODE_POOL: standard channels are allowed and always carry the full class; the miner
+                // only hashes a header. The channel must credit a payee the ledger accepts (its
+                // username is its payout address), checked before anything is allocated.
+                if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
+                    error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
+                    let open_standard_mining_channel_error = OpenMiningChannelError {
+                        request_id,
+                        error_code: code
+                            .to_string()
+                            .try_into()
+                            .expect("error code must be valid string"),
                     };
+                    return Ok(vec![(
+                        downstream_id,
+                        Mining::OpenMiningChannelError(open_standard_mining_channel_error),
+                    )
+                        .into()]);
+                }
 
-                    standard_channel
-                    .on_set_new_prev_hash(last_set_new_prev_hash_tdp.clone()).map_err(|e| PoolError::disconnect(e, downstream_id))?;
+                downstream
+                    .downstream_data
+                    .super_safe_lock(|downstream_data| {
+                        let nominal_hash_rate = msg.nominal_hash_rate;
+                        let requested_max_target = Target::from_le_bytes(
+                            msg.max_target.inner_as_ref().try_into().unwrap(),
+                        );
+                        let extranonce_prefix = channel_manager_data
+                            .extranonce_prefix_factory_standard
+                            .next_prefix_standard()
+                            .map_err(PoolError::shutdown)?;
 
-                    messages.push((downstream_id, Mining::SetNewPrevHash(set_new_prev_hash_mining)).into());
-                } else {
-                    debug!(
-                        channel_id,
-                        template_id,
-                        prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
-                        "Opened channel between NewTemplate and its SetNewPrevHash — \
+                        let channel_id = downstream_data
+                            .channel_id_factory
+                            .fetch_add(1, Ordering::SeqCst);
+                        let job_store = DefaultJobStore::new();
+
+                        let mut standard_channel = match StandardChannel::new_for_pool(
+                            channel_id,
+                            user_identity.to_string(),
+                            extranonce_prefix.to_vec(),
+                            requested_max_target,
+                            nominal_hash_rate,
+                            self.share_batch_size,
+                            self.shares_per_minute,
+                            job_store,
+                            self.pool_tag_string.clone(),
+                        ) {
+                            Ok(channel) => channel,
+                            Err(e) => match e {
+                                StandardChannelError::InvalidNominalHashrate => {
+                                    error!("OpenMiningChannelError: invalid-nominal-hashrate");
+                                    let open_standard_mining_channel_error =
+                                        OpenMiningChannelError {
+                                            request_id,
+                                            error_code: "invalid-nominal-hashrate"
+                                                .to_string()
+                                                .try_into()
+                                                .expect("error code must be valid string"),
+                                        };
+                                    return Ok(vec![(
+                                        downstream_id,
+                                        Mining::OpenMiningChannelError(
+                                            open_standard_mining_channel_error,
+                                        ),
+                                    )
+                                        .into()]);
+                                }
+                                StandardChannelError::RequestedMaxTargetOutOfRange => {
+                                    error!("OpenMiningChannelError: max-target-out-of-range");
+                                    let open_standard_mining_channel_error =
+                                        OpenMiningChannelError {
+                                            request_id,
+                                            error_code: "max-target-out-of-range"
+                                                .to_string()
+                                                .try_into()
+                                                .expect("error code must be valid string"),
+                                        };
+                                    return Ok(vec![(
+                                        downstream_id,
+                                        Mining::OpenMiningChannelError(
+                                            open_standard_mining_channel_error,
+                                        ),
+                                    )
+                                        .into()]);
+                                }
+                                _ => {
+                                    error!("error in handle_open_standard_mining_channel: {:?}", e);
+                                    return Err(PoolError::disconnect(
+                                        PoolErrorKind::ChannelErrorSender,
+                                        downstream_id,
+                                    ));
+                                }
+                            },
+                        };
+
+                        // The channel starts life at its tier: target quantised, share tag armed for its
+                        // first job. Done BEFORE the success message so the target the miner is told is
+                        // the tier target it will be credited at.
+                        let q = np.quantise_target(
+                            standard_channel.get_target(),
+                            standard_channel.get_requested_max_target(),
+                        );
+                        standard_channel.set_target(q);
+                        standard_channel.set_tier_commitment(Some(np.stamp(
+                            (downstream_id, channel_id),
+                            crate::node_pool::ChannelKind::Standard,
+                            &user_identity,
+                            &q,
+                        )));
+
+                        let group_channel_id = downstream_data.group_channel.get_group_channel_id();
+                        let extranonce_prefix_size = standard_channel.get_extranonce_prefix().len();
+
+                        let open_standard_mining_channel_success =
+                            OpenStandardMiningChannelSuccess {
+                                request_id: msg.request_id,
+                                channel_id,
+                                target: standard_channel.get_target().to_le_bytes().into(),
+                                extranonce_prefix: standard_channel
+                                    .get_extranonce_prefix()
+                                    .clone()
+                                    .try_into()
+                                    .expect("Extranonce_prefix must be valid"),
+                                group_channel_id,
+                            }
+                            .into_static();
+
+                        let mut messages: Vec<RouteMessageTo> = Vec::new();
+
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::OpenStandardMiningChannelSuccess(
+                                    open_standard_mining_channel_success,
+                                ),
+                            )
+                                .into(),
+                        );
+
+                        let template_id = last_future_template.template_id;
+
+                        // The first job, on the last future template: its Ghost tags out of the prefix,
+                        // the share tag back in as the factory's extra push, the canonical outputs.
+                        let coinbase_outputs = np
+                            .job_outputs((downstream_id, channel_id), &last_future_template)
+                            .map_err(|e| {
+                                PoolError::disconnect(PoolErrorKind::Custom(e), downstream_id)
+                            })?;
+                        let channel_template = np.prepare_template(&last_future_template);
+                        standard_channel
+                            .on_new_template(channel_template, coinbase_outputs)
+                            .map_err(|e| PoolError::disconnect(e, downstream_id))?;
+                        let future_standard_job_id = standard_channel
+                            .get_future_job_id_from_template_id(template_id)
+                            .expect("future job id must exist");
+                        np.bind_job((downstream_id, channel_id), future_standard_job_id);
+                        let future_standard_job = standard_channel
+                            .get_future_job(future_standard_job_id)
+                            .expect("future job must exist");
+                        let future_standard_job_message =
+                            future_standard_job.get_job_message().clone().into_static();
+
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::NewMiningJob(future_standard_job_message),
+                            )
+                                .into(),
+                        );
+
+                        // Same guard as the extended path — see #898. Only activate when the cached
+                        // `last_new_prev_hash` refers to the same template we just seeded; a channel
+                        // opening between a `NewTemplate(N)` and its `SetNewPrevHash(N)` would otherwise
+                        // try to activate N-1 and take the whole process down.
+                        if may_activate_seeded_job(
+                            last_set_new_prev_hash_tdp.template_id,
+                            template_id,
+                        ) {
+                            let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
+                            let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
+                            let n_bits = last_set_new_prev_hash_tdp.n_bits;
+                            let set_new_prev_hash_mining = SetNewPrevHash {
+                                channel_id,
+                                job_id: future_standard_job_id,
+                                prev_hash,
+                                min_ntime: header_timestamp,
+                                nbits: n_bits,
+                            };
+
+                            standard_channel
+                                .on_set_new_prev_hash(last_set_new_prev_hash_tdp.clone())
+                                .map_err(|e| PoolError::disconnect(e, downstream_id))?;
+
+                            messages.push(
+                                (
+                                    downstream_id,
+                                    Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                                )
+                                    .into(),
+                            );
+                        } else {
+                            debug!(
+                                channel_id,
+                                template_id,
+                                prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
+                                "Opened channel between NewTemplate and its SetNewPrevHash — \
                          leaving the future job unactivated for the next broadcast"
-                    );
-                }
+                            );
+                        }
 
-                downstream_data.standard_channels.insert(channel_id, standard_channel);
-                if !downstream.requires_standard_jobs.load(Ordering::SeqCst) {
-                    downstream_data.group_channel.add_channel_id(channel_id, extranonce_prefix_size).map_err(|e| {
-                        error!("Failed to add channel id to group channel: {:?}", e);
-                        PoolError::shutdown(e)
-                    })?;
-                }
-                let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
-                channel_manager_data.vardiff.insert((downstream_id, channel_id).into(), vardiff);
+                        downstream_data
+                            .standard_channels
+                            .insert(channel_id, standard_channel);
+                        if !downstream.requires_standard_jobs.load(Ordering::SeqCst) {
+                            downstream_data
+                                .group_channel
+                                .add_channel_id(channel_id, extranonce_prefix_size)
+                                .map_err(|e| {
+                                    error!("Failed to add channel id to group channel: {:?}", e);
+                                    PoolError::shutdown(e)
+                                })?;
+                        }
+                        let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
+                        channel_manager_data
+                            .vardiff
+                            .insert((downstream_id, channel_id).into(), vardiff);
 
-                Ok(messages)
-            })
-        })?;
+                        Ok(messages)
+                    })
+            })?;
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -1664,7 +1762,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
-        warn!(downstream_id, "SetCustomMiningJob refused: custom jobs are not supported");
+        warn!(
+            downstream_id,
+            "SetCustomMiningJob refused: custom jobs are not supported"
+        );
         let error = SetCustomMiningJobError {
             request_id: msg.request_id,
             channel_id: msg.channel_id,

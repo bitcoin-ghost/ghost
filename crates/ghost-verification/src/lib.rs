@@ -20,56 +20,40 @@
 //| FILE: lib.rs                                                                                                         |
 //|======================================================================================================================|
 
-//! Ghost Verification - HTTP Capability Verification
+//! Ghost Verification - the node's HTTP API
 //!
-//! This crate provides HTTP endpoints for verifying node capabilities:
+//! The operator and public API of a ghost-mining node: health, mining and miner statistics,
+//! configuration, alerts, backups, logs, the share ingest from the co-located pool_sv2, and the
+//! WebSocket feed. The capability challenges this crate was named for are gone.
 //!
-//! - **Archive Mode**: Verify historical block/transaction access
-//! - **Ghost Pay**: Verify L2 functionality
-//! - **Public Mining**: Verify Stratum endpoint accessibility
-//! - **Bitcoin Pure**: Verify policy enforcement
-//!
-//! Endpoints:
-//! - `GET /verify/archive?block={hash}` - Archive verification
-//! - `GET /verify/policy?tx={hex}` - Policy verification
-//! - `GET /verify/stratum` - Stratum accessibility check
-//! - `GET /verify/ghostpay` - Ghost Pay verification
+//! Endpoints include:
 //! - `GET /health` - Node health status
+//! - `POST /api/internal/shares` - Share ingest from pool_sv2
 //! - `GET /ws` - WebSocket for real-time updates
 
 #![deny(unreachable_pub)]
 
-pub mod address_proof;
 pub mod alerts;
 pub mod auth;
 pub mod chain_health;
 pub mod challenge;
-pub mod challenger_assignment;
-pub mod client;
 pub mod config;
 /// Operator-signed fleet control (#403).
 pub mod fleet_auth;
-pub mod handlers;
 pub mod journal;
 pub mod log_buffer;
 pub mod node_config;
 
 pub mod maxconnections;
 pub mod pool_series;
-pub mod qualification;
 pub mod routes;
 pub mod server;
 pub mod single_flight;
-pub mod task;
 pub mod websocket;
 
 pub use auth::*;
 pub use challenge::*;
-pub use client::*;
 pub use config::*;
-pub use handlers::*;
-pub use qualification::*;
 pub use routes::*;
 pub use server::*;
-pub use task::*;
 pub use websocket::*;

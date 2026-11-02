@@ -57,7 +57,7 @@ use ghost_consensus::mesh::{MeshConfig, MeshNetwork};
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
 use ghost_storage::Database;
-use ghost_verification::{start_server, GspHandler, RpcArchiveHandler, VerificationState};
+use ghost_verification::{start_server, GspHandler, VerificationState};
 
 use ghost_pool::capacity;
 use ghost_pool::reorg::{ReorgConfig, ReorgHandler};
@@ -1223,7 +1223,6 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // Start verification HTTP server
-    let rpc_for_verification = Arc::clone(&rpc);
     let rm_for_height = Arc::clone(&round_manager);
     let rm_for_round = Arc::clone(&round_manager);
     let rm_for_miners = Arc::clone(&round_manager);
@@ -1233,7 +1232,6 @@ async fn main() -> Result<()> {
     let mut verification_state = VerificationState::new(
         identity.node_id_hex(),
         env!("CARGO_PKG_VERSION").to_string(),
-        policy.clone(),
         capabilities,
     );
 
@@ -1253,17 +1251,10 @@ async fn main() -> Result<()> {
     verification_state = verification_state
         .with_share_tier_bind_height(0)
         .with_share_pow_verify_height(0);
-    // VER-6: When a peer challenges this node's stratum capability, our
-    // handler probes the stratum endpoint to confirm reachability. Without
-    // this, the handler falls back to 127.0.0.1, which only proves loopback
-    // listening (not external reachability) AND spams pool_sv2 with bogus
-    // Noise NK handshakes that get logged as ERROR. Wiring the configured
-    // public_address restores VER-6's intent.
+    // The stratum host the API reports to miners.
     if let Some(public_address) = config.network.public_address.clone() {
         verification_state = verification_state.with_stratum_host(public_address);
     }
-    verification_state =
-        verification_state.with_stratum_ports(config.network.sv2_port, config.network.sv1_port);
 
     // Configure callbacks for health/status endpoints
     // Miner count now comes from share notifications via SRI forwarder
@@ -1445,16 +1436,6 @@ async fn main() -> Result<()> {
     verification_state = verification_state.with_reaper_stats(move || {
         serde_json::to_value(reaper_stats_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
     });
-
-    // Configure archive handler if archive mode enabled
-    if capabilities.archive_mode {
-        let archive_handler = RpcArchiveHandler::new(Arc::clone(&rpc_for_verification));
-        verification_state = verification_state.with_archive_handler(archive_handler);
-    }
-
-    // Note: GhostPay verification is now handled directly by ghost-pay on port 8800.
-    // The verification client routes GhostPay challenges to ghost-pay instead of ghost-mining,
-    // so no stub handler is needed here. Ghost-pay queries its own L2 database for real state.
 
     // Wire GSP handler if GSP service URL is configured or default (port 8900)
     let gsp_handler = CachedGspHandler::new("https://127.0.0.1:8900".to_string());

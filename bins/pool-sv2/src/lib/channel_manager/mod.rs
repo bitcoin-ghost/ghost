@@ -40,7 +40,6 @@ use stratum_apps::{
 use tokio::{net::TcpListener, select};
 use tracing::{debug, error, info, warn};
 
-
 use crate::connection_limit::{ConnectionLimiter, RefusedBecause};
 use crate::{
     config::PoolConfig,

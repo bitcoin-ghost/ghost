@@ -26,13 +26,11 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
-use ghost_common::constants::{SV1_STRATUM_PORT, SV2_STRATUM_PORT};
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::types::{NodeCapabilities, WindowBestRecord};
-use ghost_policy::{PolicyEngine, PolicyProfile};
 use ghost_storage::Database;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -845,9 +843,6 @@ async fn security_headers_middleware(request: axum::extract::Request, next: Next
     response
 }
 
-/// Callback for triggering test consensus proposal
-pub type TestProposalFn = Arc<dyn Fn() -> GhostResult<[u8; 32]> + Send + Sync>;
-
 /// Share notification data from SRI Pool
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShareNotification {
@@ -856,7 +851,7 @@ pub struct ShareNotification {
     pub share_hash: String,
     pub job_id: u32,
     pub timestamp: u64,
-    /// Whether this share found a block (triggers payout proposal)
+    /// Whether this share found a block
     pub is_block: bool,
     /// Payout address extracted from user_identity (format: `<address>.<worker>`)
     pub payout_address: Option<String>,
@@ -865,12 +860,6 @@ pub struct ShareNotification {
     /// proof-of-work independently. Optional for backward compatibility.
     #[serde(default)]
     pub header: Option<String>,
-    /// Full extranonce this share was mined with, hex.
-    #[serde(default)]
-    pub extranonce: Option<String>,
-    /// Content address of the coinbase skeleton this share was mined against, hex.
-    #[serde(default)]
-    pub skeleton_id: Option<String>,
     /// The power-of-two difficulty tier (`log2`) this share's job COMMITTED to in its coinbase
     /// (SHARE_TIER_BIND). `None` from any emitter predating the tier era — which today is every
     /// emitter, so the field is absent on the wire while the gate is dormant.
@@ -905,41 +894,12 @@ pub struct ShareData {
     /// (`sha256d(header) == share_hash`). Optional for backward compatibility.
     #[serde(default)]
     pub header: Option<String>,
-    /// The full extranonce this share was mined with, hex.
-    ///
-    /// The one part of the coinbase that cannot be inferred from the job, and therefore the one
-    /// part needed to rebuild it.
-    #[serde(default)]
-    pub extranonce: Option<String>,
-    /// Content address of the coinbase skeleton this share was mined against, hex.
-    ///
-    /// Names the coinbase rather than carrying it. The skeleton itself arrives once per job in
-    /// [`ShareBatch::skeletons`].
-    #[serde(default)]
-    pub skeleton_id: Option<String>,
     /// The power-of-two difficulty tier (`log2`) this share's job COMMITTED to in its coinbase
     /// (SHARE_TIER_BIND). Absent from any `pool_sv2` predating the tier era — which today is
     /// every `pool_sv2`: the emitting side (per-tier jobs in the SRI layer) is not built yet,
     /// so this deserialises as `None` on every live batch while the gate is dormant.
     #[serde(default)]
     pub tier_log2: Option<u32>,
-}
-
-/// A coinbase skeleton, carried once per job rather than once per share.
-///
-/// `coinbase_prefix ‖ extranonce ‖ coinbase_suffix` is the serialized coinbase; folding its txid
-/// up `merkle_path` must reproduce the merkle root inside the share's header. Nothing here is
-/// trusted — a wrong skeleton simply fails to reproduce the root.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SkeletonData {
-    /// Content address, matching `skeleton_id` on the shares referencing it.
-    pub skeleton_id: String,
-    /// Serialized coinbase up to where the extranonce begins, hex.
-    pub coinbase_prefix: String,
-    /// Serialized coinbase from where the extranonce ends, hex.
-    pub coinbase_suffix: String,
-    /// Sibling hashes folding the coinbase txid to the header merkle root, hex.
-    pub merkle_path: Vec<String>,
 }
 
 /// Batch of shares from SRI Pool native webhook
@@ -951,19 +911,10 @@ pub struct ShareBatch {
     pub batch_seq: u64,
     /// Array of shares in this batch
     pub shares: Vec<ShareData>,
-    /// Skeletons first referenced by this batch.
-    ///
-    /// Usually empty — a job lasts ~30 s against ~2 s batches. Absent on an older `pool_sv2`,
-    /// which is why it defaults rather than being required.
-    #[serde(default)]
-    pub skeletons: Vec<SkeletonData>,
 }
 
 /// Callback for recording shares (from SRI Pool notifications)
 pub type RecordShareFn = Arc<dyn Fn(ShareNotification) -> GhostResult<()> + Send + Sync>;
-
-/// Callback for storing a coinbase skeleton announced alongside a share batch.
-pub type RecordSkeletonFn = Arc<dyn Fn(SkeletonData) -> GhostResult<()> + Send + Sync>;
 
 /// Data passed to the block_found callback when a block-difficulty share arrives
 #[derive(Debug, Clone)]
@@ -1273,47 +1224,6 @@ pub type RecordsCache = Arc<
     >,
 >;
 
-/// Everything a node would commit in a mesh node-list checkpoint, for comparison across the fleet.
-///
-/// ⛔ **Every root the vote path can reject on must be here.** Named fields rather than a tuple
-/// because this is the instrument that decides whether a consensus gate gets armed, and a
-/// positional `|(_, _, _, r, _)|` in the handler is the kind of thing that reads fine and is
-/// wrong.
-///
-/// The three derived from LOCAL state are the ones that can diverge between honest nodes:
-///
-/// * `list_root` and `coordinator_roster_root` — re-derived from the proposal's adverts and this
-///   node's ratified qualified set. Exact-set agreement, so one differing member is a reject.
-/// * `signer_set_root` — compared against this node's own voter set, so two nodes that disagree
-///   on the voter set disagree here and one of them rejects.
-///
-/// `advert_root` is a pure function of the adverts in the message, but a *proposer's* advert set
-/// is local (`store.covering`), so it is reported too.
-///
-/// #943 added `coordinator_roster_root` to the checkpoint and this endpoint did not learn about
-/// it, which would have let the pre-arming check report "converged" without ever comparing a root
-/// that every vote checks. A fleet agreeing on three of four finalises nothing, silently.
-#[derive(Debug, Clone)]
-pub struct MeshNodeListConvergence {
-    /// How many nodes are on the derived list.
-    pub listed: usize,
-    /// Root of the derived node list.
-    pub list_root: String,
-    /// Root of the advert set this node would adopt.
-    pub advert_root: String,
-    /// Root of the derived coordinator roster.
-    pub coordinator_roster_root: String,
-    /// Root of the voter set this node would commit as the signer set.
-    pub signer_set_root: String,
-    /// Qualified nodes whose signed endpoint this node has not seen. Empty = full coverage.
-    pub missing_adverts: Vec<String>,
-}
-
-/// What [`VerificationState::mesh_node_list_fn`] holds: given `(cutoff_ts, height)`, the checkpoint
-/// this node would commit, or `None` when it cannot derive one.
-pub type MeshNodeListConvergenceFn =
-    Arc<dyn Fn(i64, u64) -> Option<MeshNodeListConvergence> + Send + Sync>;
-
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -1325,8 +1235,6 @@ pub struct VerificationState {
     pub network: ghost_common::config::BitcoinNetwork,
     /// Node identity for signing responses
     identity: Option<Arc<NodeIdentity>>,
-    /// Policy engine
-    policy_engine: parking_lot::Mutex<PolicyEngine>,
     /// Capabilities
     pub capabilities: NodeCapabilities,
     /// Operator-signed fleet control (#403). Disabled unless an operator public key is
@@ -1394,20 +1302,8 @@ pub struct VerificationState {
     /// rather than a confident row of zeros that looks like a clean mesh.
     get_mesh_validation:
         Option<Box<dyn Fn() -> crate::challenge::MeshValidationStats + Send + Sync>>,
-    /// #647: outbound convergence-queue counters. Optional for the same reason as above — an
-    /// unwired caller reports `null`, not a row of zeros that reads like a queue shedding nothing.
-    get_convergence_channels:
-        Option<Box<dyn Fn() -> crate::challenge::ConvergenceChannelStats + Send + Sync>>,
-    /// Archive mode handler
-    archive_handler: Option<Box<dyn ArchiveHandler + Send + Sync>>,
-    /// GhostPay handler
-    ghostpay_handler: Option<Box<dyn GhostPayHandler + Send + Sync>>,
     /// GSP (Ghost Service Protocol) handler for light wallets
     gsp_handler: Option<Box<dyn GspHandler + Send + Sync>>,
-    /// Stratum port (SV2)
-    stratum_sv2_port: u16,
-    /// Stratum port (SV1)
-    stratum_sv1_port: u16,
     /// Database for queries (optional)
     pub database: Option<Database>,
     /// Memo for `GET /api/v1/pool/records`, keyed by window name.
@@ -1435,48 +1331,6 @@ pub struct VerificationState {
     pub scoped_set_flight: crate::single_flight::SingleFlight<serde_json::Value>,
     /// Ghost Core RPC client (optional)
     pub rpc: Option<Arc<BitcoinRpc>>,
-    /// A-2b block-hash oracle for the consensus challenger draw. Injected from
-    /// ghost-mining's warm `CachedBlockHashOracle` so the scoped-set endpoint can
-    /// compute the assignment-scoped qualified set (to prove its convergence
-    /// before arming `CHALLENGER_ASSIGNMENT`).
-    pub block_hash_oracle: Option<Arc<dyn crate::challenger_assignment::BlockHashProvider>>,
-    /// FEE convergence proof: given a height, returns a hash of the FEE-armed node-reward
-    /// split (adopted `node_shares` distributed over a normalised pool) so the scoped-set
-    /// endpoint can prove the coinbase node-split converges fleet-wide BEFORE arming
-    /// `COINBASE_FEE_SPLIT`. Injected from ghost-mining (owns the `PayoutHandler` split math).
-    #[allow(clippy::type_complexity)]
-    pub fee_node_split_fn: Option<Arc<dyn Fn(u64) -> Option<String> + Send + Sync>>,
-    /// ACTIVE_VOTER_SET convergence proof: given `(cutoff_ts, height)`, returns the
-    /// checkpoint-path voter set consensus WOULD use once the gate is armed —
-    /// `(count, hash-of-sorted-node-ids, floored)` where `floored` = the superset floor
-    /// engaged (active set not a superset of elders → fell back to the elder set). Ignores
-    /// the gate height itself so the value that goes live can be proven identical fleet-wide
-    /// BEFORE arming. Injected from ghost-mining (owns `widen_voter_set`).
-    #[allow(clippy::type_complexity)]
-    pub checkpoint_voter_set_fn:
-        Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>>,
-    /// MESH_NODE_LIST convergence proof: given `(cutoff_ts, height)`, the node-list checkpoint
-    /// this node WOULD propose — `(listed, list_root, advert_root, missing_adverts)` — computed
-    /// with the activation gate IGNORED.
-    ///
-    /// ⚠ Ignoring the gate is the entire point. #625: nothing is proposed below
-    /// `MESH_NODE_LIST_CHECKPOINT_HEIGHT`, so "prove the blob is byte-identical fleet-wide,
-    /// then arm" is circular — convergence only becomes observable once it is already live,
-    /// which is how a gate ships that fires on schedule and then quietly never produces
-    /// anything. This makes #402's acceptance criterion measurable BEFORE arming.
-    ///
-    /// `missing_adverts` names the qualified nodes whose signed endpoint this node has not
-    /// seen. A stalled checkpoint should say who is holding it up, not just fail.
-    pub mesh_node_list_fn: Option<MeshNodeListConvergenceFn>,
-    /// FEE coinbase reward-split convergence proof: given `(cutoff_ts, height)`, returns a hash of
-    /// the GO-LIVE reward split (`miner_pool`, `treasury_amount`, `node_reward_pool`) — the
-    /// `COINBASE_FEE_SPLIT` regime forced ON — computed from THIS node's `treasury_state` at the
-    /// CONVERGED checkpoint cutoff. Identical across all nodes = the coinbase reward split (miners
-    /// 99% of subsidy+fees; treasury/node the decaying 1%) converges before the gate is armed;
-    /// the adopted lists (checkpoint) and node distribution (`fee_node_split`) are already proven.
-    /// Injected from ghost-mining.
-    #[allow(clippy::type_complexity)]
-    pub fee_split_fn: Option<Arc<dyn Fn(i64, u64) -> Option<String> + Send + Sync>>,
     /// Dashboard config (mutable settings)
     pub dashboard_config: parking_lot::RwLock<DashboardConfig>,
     /// Node config with disk persistence (ghost_mode, etc.) - minimal JSON config
@@ -1490,11 +1344,8 @@ pub struct VerificationState {
     pub full_node_config_path: Option<PathBuf>,
     /// WebSocket state for real-time updates
     pub ws_state: Arc<WsState>,
-    /// Test proposal callback (for admin testing)
-    test_proposal_fn: Option<TestProposalFn>,
     /// Share recording callback (from SRI Pool notifications)
     record_share_fn: Option<RecordShareFn>,
-    record_skeleton_fn: Option<RecordSkeletonFn>,
     /// Block found callback (triggers payout proposal before block submission)
     block_found_fn: Option<BlockFoundFn>,
     /// Internal API authentication (H10/H11 security fix)
@@ -1511,18 +1362,6 @@ pub struct VerificationState {
     /// concrete `ReaperStats` type lives in `bins/ghost-pool` and we don't
     /// want a reverse dep from ghost-verification.
     get_reaper_stats: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
-    /// Capability self-check snapshot callback. Returns a JSON-serializable
-    /// snapshot of the current `SelfCheckState` (per-capability
-    /// claimed/passed/reason) so the dashboard can surface drift between a
-    /// claimed capability and its missing prerequisite. Pre-serialized to JSON
-    /// because the concrete `SelfCheckState` type lives in `bins/ghost-pool`
-    /// and we don't want a reverse dep from ghost-verification.
-    get_self_check: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
-    /// Coordinator-election snapshot callback (pre-serialized JSON to avoid a
-    /// reverse-dependency on the `wraith-protocol`/`ghost-mining` election types).
-    /// Returns `{enabled, epoch, tiers, coordinators, my_tiers, my_endpoint, …}` when the feature is
-    /// on, or `{enabled:false}` when off / not wired. Read-only.
-    get_coordinator_status: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Mesh-wide deduplicated active miner count callback. Returns the size
     /// of the union of locally-active miner_id hashes and every connected
     /// peer's most-recent reported set, giving an exact pool-wide active
@@ -1586,11 +1425,6 @@ pub struct VerificationState {
     /// prepends this node (self) from local state. None on deploys without the
     /// provider wired — the endpoint then returns just self.
     get_mesh_nodes: Option<Box<dyn Fn() -> Vec<MeshNodeInfo> + Send + Sync>>,
-    /// Returns the latest finalised mesh node-list checkpoint as a pre-built, verifiable JSON
-    /// blob (proposal fields + proposer signature + ≥67% approver signatures), or None if none
-    /// is finalised / the provider isn't wired. Serves the signed
-    /// `/api/v1/pool/mesh-node-list-checkpoint` endpoint a miner-side shim verifies offline.
-    get_mesh_node_list_checkpoint: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
@@ -1626,15 +1460,6 @@ pub struct VerificationState {
     max_capacity: AtomicU32,
     /// Prometheus metrics (optional - only present when running as ghost-mining)
     pub metrics: Option<Arc<Metrics>>,
-    /// Cached stratum self-verification results. The verification handler
-    /// uses bogus Noise-NK bytes / mining.subscribe to confirm the local
-    /// stratum endpoint is up; pool_sv2 logs the rejection as ERROR. Caching
-    /// the result for STRATUM_VERIFY_CACHE_TTL keeps incoming peer challenges
-    /// from re-probing on every cycle and slamming pool_sv2's log.
-    /// Key: (protocol, port). Value: (probe_time, response).
-    stratum_verify_cache: parking_lot::Mutex<
-        std::collections::HashMap<(StratumProtocol, u16), (Instant, StratumResponse)>,
-    >,
     /// Rolling in-memory time-series of pool-wide hashrate + connected miners,
     /// fed by a periodic sampler task in `bins/ghost-pool` and exposed via
     /// `GET /api/v1/pool/series`. Bounded ring; empty until the first sample
@@ -1653,51 +1478,6 @@ pub struct VerificationState {
     /// dispatcher every other trigger site uses. Empty on servers that never
     /// wire it (e.g. minimal/test servers) — the endpoint then no-ops.
     pub alert_dispatcher: std::sync::OnceLock<Arc<crate::alerts::AlertDispatcher>>,
-}
-
-/// TTL for cached stratum self-verification results. Verification cycles run
-/// every 5 minutes mesh-wide and the 3+ peer challenges within a cycle arrive
-/// spread out (often 1–2 min apart), not as a tight burst. A 240s TTL covers
-/// the full intra-cycle spread while still refreshing once per cycle so a
-/// real stratum outage is detected within ~4–5 minutes.
-const STRATUM_VERIFY_CACHE_TTL: Duration = Duration::from_secs(240);
-
-/// Archive handler trait
-pub trait ArchiveHandler {
-    fn get_block(&self, hash: &str) -> GhostResult<Option<BlockData>>;
-    fn get_transaction(&self, txid: &str) -> GhostResult<Option<TxData>>;
-    fn has_block_at_height(&self, height: u64) -> bool;
-}
-
-/// H-5: Epoch proof for cryptographic GhostPay verification
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EpochProof {
-    /// Epoch number this proof is for
-    pub epoch: u64,
-    /// Hash of L2 state at this epoch (SHA256 of serialized state)
-    pub state_hash: String,
-    /// Number of transactions in this epoch
-    pub tx_count: u64,
-}
-
-/// GhostPay handler trait
-pub trait GhostPayHandler {
-    fn is_enabled(&self) -> bool;
-    fn get_virtual_block(&self) -> u64;
-    fn get_epoch(&self) -> u64;
-    fn get_balance(&self, address: &str) -> GhostResult<u64>;
-    fn is_wraith_enabled(&self) -> bool;
-
-    /// H-5: Get proof of L2 state at a specific epoch
-    ///
-    /// This method is used for cryptographic verification that a node
-    /// actually has L2 state data, not just self-reporting capability.
-    /// Returns None if the node doesn't have state for the requested epoch.
-    fn get_epoch_proof(&self, epoch: u64) -> Option<EpochProof> {
-        // Default implementation returns None (node doesn't support proofs)
-        let _ = epoch;
-        None
-    }
 }
 
 /// GSP (Ghost Service Protocol) handler trait for light wallet support
@@ -1726,13 +1506,6 @@ pub struct GspInfo {
     pub connections: u32,
     pub sync_status: String,
     pub registered_wallets: u32,
-}
-
-/// Ghost Pay L2 status summary (for dashboard)
-pub struct GhostPayInfo {
-    pub epoch: u64,
-    pub virtual_block: u64,
-    pub wraith_enabled: bool,
 }
 
 /// How many recently-admitted share hashes ingest remembers, for replay rejection (H-13).
@@ -1813,12 +1586,7 @@ pub(crate) fn share_pow_is_acceptable(
 
 impl VerificationState {
     /// Create new verification state
-    pub fn new(
-        node_id: String,
-        version: String,
-        policy_profile: PolicyProfile,
-        capabilities: NodeCapabilities,
-    ) -> Self {
+    pub fn new(node_id: String, version: String, capabilities: NodeCapabilities) -> Self {
         // Initialize dashboard config with defaults (all features enabled)
         let dashboard_config = DashboardConfig::default();
         // L-28: Capture debug endpoint setting at startup - immutable thereafter
@@ -1835,7 +1603,6 @@ impl VerificationState {
             // ghost-mining overrides this via `with_network` from pool.toml.
             network: ghost_common::config::BitcoinNetwork::Signet,
             identity: None,
-            policy_engine: parking_lot::Mutex::new(PolicyEngine::new(policy_profile)),
             capabilities,
             start_time: Instant::now(),
             records_cache: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -1852,34 +1619,20 @@ impl VerificationState {
             get_peer_count: Box::new(|| 0),
             get_core_health: None,
             get_mesh_validation: None,
-            get_convergence_channels: None,
-            archive_handler: None,
-            ghostpay_handler: None,
             gsp_handler: None,
-            stratum_sv2_port: SV2_STRATUM_PORT,
-            stratum_sv1_port: SV1_STRATUM_PORT,
             database: None,
             rpc: None,
-            block_hash_oracle: None,
-            fee_node_split_fn: None,
-            checkpoint_voter_set_fn: None,
-            mesh_node_list_fn: None,
-            fee_split_fn: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
             node_config: parking_lot::RwLock::new(NodeConfig::default()),
             node_config_path: None,
             full_node_config: None,
             full_node_config_path: None,
             ws_state: Arc::new(WsState::new()),
-            test_proposal_fn: None,
             record_share_fn: None,
-            record_skeleton_fn: None,
             block_found_fn: None,
             internal_auth: None,
             get_pool_peers: None,
             get_reaper_stats: None,
-            get_self_check: None,
-            get_coordinator_status: None,
             get_mesh_active_miners: None,
             get_self_deduped_miners: None,
             get_mesh_total_hashrate: None,
@@ -1891,7 +1644,6 @@ impl VerificationState {
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
-            get_mesh_node_list_checkpoint: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
@@ -1903,7 +1655,6 @@ impl VerificationState {
             debug_endpoints_frozen: AtomicBool::new(debug_enabled),
             max_capacity: AtomicU32::new(0),
             metrics: None,
-            stratum_verify_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             // 24h of history at the sampler's 30s cadence (2880 samples).
             pool_series: crate::pool_series::PoolSeries::new(2880),
             chain_health: Arc::new(crate::chain_health::ChainHealth::default()),
@@ -2020,18 +1771,6 @@ impl VerificationState {
         F: Fn(ShareNotification) -> GhostResult<()> + Send + Sync + 'static,
     {
         self.record_share_fn = Some(Arc::new(recorder));
-        self
-    }
-
-    /// Set the coinbase-skeleton recorder.
-    ///
-    /// Skeletons arrive alongside the shares that reference them and are stored **first** — see
-    /// `record_share_batch`. A share whose skeleton is in the same batch must find it.
-    pub fn with_skeleton_recorder<F>(mut self, recorder: F) -> Self
-    where
-        F: Fn(SkeletonData) -> GhostResult<()> + Send + Sync + 'static,
-    {
-        self.record_skeleton_fn = Some(Arc::new(recorder));
         self
     }
 
@@ -2192,17 +1931,6 @@ impl VerificationState {
             ));
         }
 
-        // Skeletons first, and deliberately so: a share naming a skeleton carried in the *same*
-        // batch must be able to find it. Recording the shares first would defer every one of them
-        // for no reason, and the deferral would only be cleared on a later tick.
-        if let Some(ref recorder) = self.record_skeleton_fn {
-            for skeleton in batch.skeletons {
-                if let Err(e) = recorder(skeleton) {
-                    tracing::warn!(error = %e, "Failed to record coinbase skeleton from batch");
-                }
-            }
-        }
-
         let mut recorded = 0;
         let mut blocks_found = 0;
 
@@ -2237,8 +1965,6 @@ impl VerificationState {
                     None
                 },
                 header: share.header.clone(),
-                extranonce: share.extranonce.clone(),
-                skeleton_id: share.skeleton_id.clone(),
                 tier_log2: share.tier_log2,
             };
 
@@ -2439,20 +2165,6 @@ impl VerificationState {
         self.identity.is_some()
     }
 
-    /// Set test proposal callback (for admin testing of BFT consensus)
-    pub fn with_test_proposal_fn(mut self, f: TestProposalFn) -> Self {
-        self.test_proposal_fn = Some(f);
-        self
-    }
-
-    /// Trigger test proposal if callback is set
-    pub fn trigger_test_proposal(&self) -> GhostResult<Option<[u8; 32]>> {
-        match &self.test_proposal_fn {
-            Some(f) => Ok(Some(f()?)),
-            None => Ok(None),
-        }
-    }
-
     /// Set database for queries
     pub fn with_database(mut self, db: Database) -> Self {
         self.database = Some(db);
@@ -2465,54 +2177,9 @@ impl VerificationState {
         self
     }
 
-    /// Set the A-2b block-hash oracle (enables the assignment-scoped convergence proof).
-    pub fn with_block_hash_oracle(
-        mut self,
-        oracle: Arc<dyn crate::challenger_assignment::BlockHashProvider>,
-    ) -> Self {
-        self.block_hash_oracle = Some(oracle);
-        self
-    }
-
-    /// Set the FEE node-split hash closure (enables the COINBASE_FEE_SPLIT convergence proof).
-    #[allow(clippy::type_complexity)]
-    pub fn with_fee_node_split_fn(
-        mut self,
-        f: Arc<dyn Fn(u64) -> Option<String> + Send + Sync>,
-    ) -> Self {
-        self.fee_node_split_fn = Some(f);
-        self
-    }
-
-    /// Set the checkpoint-path voter-set closure (enables the ACTIVE_VOTER_SET proof).
-    #[allow(clippy::type_complexity)]
-    pub fn with_checkpoint_voter_set_fn(
-        mut self,
-        f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>,
-    ) -> Self {
-        self.checkpoint_voter_set_fn = Some(f);
-        self
-    }
-
     /// Tell this node where its `pool.toml` is, enabling the operator-signed config endpoint (#403).
     pub fn with_pool_config_path(mut self, p: std::path::PathBuf) -> Self {
         self.pool_config_path = Some(p);
-        self
-    }
-
-    /// See [`VerificationState::mesh_node_list_fn`].
-    pub fn with_mesh_node_list_fn(mut self, f: MeshNodeListConvergenceFn) -> Self {
-        self.mesh_node_list_fn = Some(f);
-        self
-    }
-
-    /// Set the FEE treasury-decay split closure (enables the COINBASE_FEE_SPLIT treasury proof).
-    #[allow(clippy::type_complexity)]
-    pub fn with_fee_split_fn(
-        mut self,
-        f: Arc<dyn Fn(i64, u64) -> Option<String> + Send + Sync>,
-    ) -> Self {
-        self.fee_split_fn = Some(f);
         self
     }
 
@@ -2634,17 +2301,6 @@ impl VerificationState {
         self
     }
 
-    /// Wire the outbound convergence-queue counters into `/health` (#647). Without this, a queue
-    /// shedding frames is observable only by grepping journald on every node — which is how #647
-    /// went unnoticed until an unrelated soak tripped over it.
-    pub fn with_convergence_channels(
-        mut self,
-        probe: impl Fn() -> crate::challenge::ConvergenceChannelStats + Send + Sync + 'static,
-    ) -> Self {
-        self.get_convergence_channels = Some(Box::new(probe));
-        self
-    }
-
     pub fn with_core_health(
         mut self,
         probe: impl Fn() -> (bool, u64) + Send + Sync + 'static,
@@ -2703,46 +2359,6 @@ impl VerificationState {
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
     ) -> Self {
         self.get_reaper_stats = Some(Box::new(f));
-        self
-    }
-
-    /// Capability self-check snapshot for `/api/v1/system/self-check`, or
-    /// `null` when not wired (older deploy). Reports, for each capability the
-    /// node CLAIMS, whether its prerequisite probe currently passes and a
-    /// human-readable reason when it does not. Read-only: reads the snapshot
-    /// the background loop already computed — no probing in the request path.
-    pub fn self_check(&self) -> serde_json::Value {
-        self.get_self_check
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or(serde_json::Value::Null)
-    }
-
-    /// Set the self-check callback (pre-serialized JSON to avoid a
-    /// reverse-dependency on ghost-mining's `SelfCheckState`).
-    pub fn with_self_check(
-        mut self,
-        f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
-    ) -> Self {
-        self.get_self_check = Some(Box::new(f));
-        self
-    }
-
-    /// Coordinator status attested by `/verify/coordinator`. Nothing sets it since the
-    /// Wraith election was removed, so it reads `{enabled:false}` unless a test wires one.
-    pub fn coordinator_status(&self) -> serde_json::Value {
-        self.get_coordinator_status
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_else(|| serde_json::json!({ "enabled": false }))
-    }
-
-    /// Set the coordinator status callback (pre-serialized JSON).
-    pub fn with_coordinator_status(
-        mut self,
-        f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
-    ) -> Self {
-        self.get_coordinator_status = Some(Box::new(f));
         self
     }
 
@@ -2914,32 +2530,6 @@ impl VerificationState {
             .unwrap_or_default()
     }
 
-    /// Wire the signed mesh node-list checkpoint provider (see the field).
-    pub fn with_mesh_node_list_checkpoint(
-        mut self,
-        f: impl Fn() -> Option<serde_json::Value> + Send + Sync + 'static,
-    ) -> Self {
-        self.get_mesh_node_list_checkpoint = Some(Box::new(f));
-        self
-    }
-
-    /// The latest finalised signed mesh node-list checkpoint blob, or None if none is
-    /// finalised or no provider is wired.
-    pub fn mesh_node_list_checkpoint(&self) -> Option<serde_json::Value> {
-        self.get_mesh_node_list_checkpoint
-            .as_ref()
-            .and_then(|f| f())
-    }
-
-    /// Set archive handler
-    pub fn with_archive_handler(
-        mut self,
-        handler: impl ArchiveHandler + Send + Sync + 'static,
-    ) -> Self {
-        self.archive_handler = Some(Box::new(handler));
-        self
-    }
-
     /// Set GSP handler for light wallet support
     pub fn with_gsp_handler(mut self, handler: impl GspHandler + 'static) -> Self {
         self.gsp_handler = Some(Box::new(handler));
@@ -2966,31 +2556,7 @@ impl VerificationState {
         })
     }
 
-    /// Get Ghost Pay L2 status (sync, for dashboard)
-    pub fn get_ghostpay_status(&self) -> Option<GhostPayInfo> {
-        let handler = self.ghostpay_handler.as_ref()?;
-        if !handler.is_enabled() {
-            return None;
-        }
-        Some(GhostPayInfo {
-            epoch: handler.get_epoch(),
-            virtual_block: handler.get_virtual_block(),
-            wraith_enabled: handler.is_wraith_enabled(),
-        })
-    }
-
-    /// Set stratum ports
-    pub fn with_stratum_ports(mut self, sv2_port: u16, sv1_port: u16) -> Self {
-        self.stratum_sv2_port = sv2_port;
-        self.stratum_sv1_port = sv1_port;
-        self
-    }
-
-    /// Set the publicly-advertised stratum host (IP or DNS name) used when
-    /// answering an incoming stratum challenge. The challenge handler probes
-    /// this address via `verify_sv1` / `verify_sv2`. Setting it to the node's
-    /// real public address (per VER-6) makes the self-verification check
-    /// external reachability, not just a loopback listener.
+    /// Set the publicly-advertised stratum host (IP or DNS name) the API reports to miners.
     pub fn with_stratum_host(self, host: String) -> Self {
         self.dashboard_config.write().stratum_host = Some(host);
         self
@@ -3032,7 +2598,6 @@ impl VerificationState {
         HealthResponse {
             db_connection,
             mesh_validation: self.get_mesh_validation.as_ref().map(|p| p()),
-            convergence_channels: self.get_convergence_channels.as_ref().map(|p| p()),
             // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it
             // can reach Ghost Core, and saying "healthy" on that basis is what hid vm7's outage.
             healthy: core.map(|(reachable, _)| reachable).unwrap_or(false),
@@ -3047,358 +2612,6 @@ impl VerificationState {
             capabilities: self.capabilities.into(),
             uptime_secs: self.start_time.elapsed().as_secs(),
         }
-    }
-
-    /// Verify archive challenge
-    pub async fn verify_archive(
-        &self,
-        challenge: ArchiveChallenge,
-    ) -> GhostResult<ArchiveResponse> {
-        if !self.capabilities.archive_mode {
-            return Ok(ArchiveResponse {
-                success: false,
-                block_data: None,
-                tx_data: None,
-                error: Some("Archive mode not enabled".to_string()),
-            });
-        }
-
-        let handler =
-            self.archive_handler
-                .as_ref()
-                .ok_or_else(|| GhostError::VerificationFailed {
-                    capability: "archive".to_string(),
-                    reason: "Archive handler not configured".to_string(),
-                })?;
-
-        match challenge.challenge_type {
-            ChallengeType::ArchiveBlock => {
-                let hash = challenge
-                    .block_hash
-                    .ok_or_else(|| GhostError::VerificationFailed {
-                        capability: "archive".to_string(),
-                        reason: "Block hash required".to_string(),
-                    })?;
-
-                let block_data = handler.get_block(&hash)?;
-
-                Ok(ArchiveResponse {
-                    success: block_data.is_some(),
-                    block_data,
-                    tx_data: None,
-                    error: None,
-                })
-            }
-            ChallengeType::ArchiveTx => {
-                let txid = challenge
-                    .txid
-                    .ok_or_else(|| GhostError::VerificationFailed {
-                        capability: "archive".to_string(),
-                        reason: "Transaction ID required".to_string(),
-                    })?;
-
-                let tx_data = handler.get_transaction(&txid)?;
-
-                Ok(ArchiveResponse {
-                    success: tx_data.is_some(),
-                    block_data: None,
-                    tx_data,
-                    error: None,
-                })
-            }
-            _ => Ok(ArchiveResponse {
-                success: false,
-                block_data: None,
-                tx_data: None,
-                error: Some("Invalid challenge type for archive".to_string()),
-            }),
-        }
-    }
-
-    /// Verify policy challenge
-    pub async fn verify_policy(&self, challenge: PolicyChallenge) -> GhostResult<PolicyResponse> {
-        // Decode transaction hex
-        let tx_bytes =
-            hex::decode(&challenge.tx_hex).map_err(|e| GhostError::VerificationFailed {
-                capability: "policy".to_string(),
-                reason: format!("Invalid transaction hex: {}", e),
-            })?;
-
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
-            GhostError::VerificationFailed {
-                capability: "policy".to_string(),
-                reason: format!("Invalid transaction: {}", e),
-            }
-        })?;
-
-        // Evaluate against policy
-        let mut engine = self.policy_engine.lock();
-        let decision = engine.evaluate(&tx);
-
-        let classification = match &decision {
-            ghost_policy::PolicyDecision::Accept { classification, .. }
-            | ghost_policy::PolicyDecision::Reject { classification, .. } => {
-                Some(PolicyClassification {
-                    tier: classification.tier.to_string(),
-                    reason: classification.reason.to_string(),
-                    features: classification
-                        .features
-                        .iter()
-                        .map(|f| f.to_string())
-                        .collect(),
-                })
-            }
-        };
-
-        let (accepted, rejection_reason) = match &decision {
-            ghost_policy::PolicyDecision::Accept { .. } => (true, None),
-            ghost_policy::PolicyDecision::Reject { reason, .. } => {
-                (false, Some(reason.to_string()))
-            }
-        };
-
-        Ok(PolicyResponse {
-            success: true,
-            profile: engine.profile().name.clone(),
-            classification,
-            accepted,
-            rejection_reason,
-            // CONSENSUS SECURITY: bind this classification to the exact tx we
-            // evaluated. This goes inside the SIGNED payload, so a recipient can
-            // verify the challenger paired our signature with the correct tx_hex
-            // (txid recompute must match) before trusting the verdict.
-            tx_txid: Some(tx.compute_txid().to_string()),
-            error: None,
-        })
-    }
-
-    /// Verify stratum challenge.
-    ///
-    /// Confirms the local stratum endpoint is bound on the configured port by
-    /// scanning `/proc/net/tcp{,6}` for a LISTEN socket. We deliberately do
-    /// NOT open a TCP connection: the previous implementation wrote bogus
-    /// Noise NK bytes to pool_sv2 to "test" it, which pool_sv2 (correctly)
-    /// rejected and logged as ERROR — every peer challenge created spurious
-    /// log spam.
-    ///
-    /// Loss vs. a real protocol handshake is small. Pool_sv2 is constantly
-    /// handling translator + miner SV2 traffic; a broken endpoint surfaces
-    /// in mining metrics within seconds — well before the 5-min verification
-    /// cycle would catch it. The listener check tells us the daemon is up
-    /// and bound; the daemon's behaviour is validated by real load.
-    pub async fn verify_stratum(
-        &self,
-        challenge: StratumChallenge,
-    ) -> GhostResult<StratumResponse> {
-        if !self.capabilities.public_mining {
-            return Ok(StratumResponse {
-                success: false,
-                port: challenge.port.unwrap_or(self.stratum_sv2_port),
-                protocol: challenge.protocol,
-                connected: false,
-                latency_ms: None,
-                error: Some("Public mining not enabled".to_string()),
-            });
-        }
-
-        let port = match challenge.protocol {
-            StratumProtocol::Sv2 => challenge.port.unwrap_or(self.stratum_sv2_port),
-            StratumProtocol::Sv1 => challenge.port.unwrap_or(self.stratum_sv1_port),
-        };
-
-        // Cache hit: peer challenges arrive several times per verification
-        // cycle. /proc/net/tcp scans are cheap (~µs) but caching keeps the
-        // hot path even quieter and matches how the rest of self-verification
-        // is rate-limited.
-        let cache_key = (challenge.protocol, port);
-        if let Some((stored_at, cached)) = self.stratum_verify_cache.lock().get(&cache_key) {
-            if stored_at.elapsed() < STRATUM_VERIFY_CACHE_TTL {
-                return Ok(cached.clone());
-            }
-        }
-
-        let start = Instant::now();
-        let listening = port_listening(port);
-        let latency_ms = Some(start.elapsed().as_millis() as u32);
-
-        let response = StratumResponse {
-            success: listening,
-            port,
-            protocol: challenge.protocol,
-            connected: listening,
-            latency_ms,
-            error: if listening {
-                None
-            } else {
-                Some(format!("No listener bound on port {port}"))
-            },
-        };
-        self.stratum_verify_cache
-            .lock()
-            .insert(cache_key, (Instant::now(), response.clone()));
-        Ok(response)
-    }
-
-    /// Test-only: install a Ghost Pay handler.
-    ///
-    /// Deliberately `#[cfg(test)]`. Production has no way to set this field — that is the observation
-    /// #616 turns on — and adding a public setter would quietly change what a node can claim. Whether
-    /// production should be able to wire a handler is a decision to take on that issue, not a side
-    /// effect of making a path testable.
-    #[cfg(test)]
-    fn with_ghostpay_handler(mut self, handler: Box<dyn GhostPayHandler + Send + Sync>) -> Self {
-        self.ghostpay_handler = Some(handler);
-        self
-    }
-
-    /// Verify GhostPay challenge
-    ///
-    /// H-5: When a challenge_epoch is provided, the node must prove it has
-    /// L2 state data for that epoch. This prevents nodes from claiming
-    /// GhostPay capability without actually maintaining L2 state.
-    ///
-    /// VER-2/VER-3: When a challenge_nonce is provided, the response must include
-    /// nonce_bound_proof = SHA256(epoch_state_hash || challenge_nonce). This prevents
-    /// precomputation attacks where an attacker pre-builds a lookup table of
-    /// epoch_state_hash values for all possible epochs.
-    pub async fn verify_ghostpay(
-        &self,
-        challenge: GhostPayChallenge,
-    ) -> GhostResult<GhostPayResponse> {
-        // #616 DIAGNOSTIC. Every node answers this endpoint "Ghost Pay handler not configured" or
-        // "not enabled" when asked directly on 8080 and 8443, yet the verification ledger records
-        // ghostpay passing 7300/62 in 24h with live per-nonce proofs — and `epoch_proof_fn` has no
-        // setter since 573fa59ec, which is already in the deployed commit. Two readings with opposite
-        // consequences, and six hours of tracing did not separate them.
-        //
-        // So state the three facts that do, on every request, at INFO so no log-level change is needed
-        // to see them. Whichever way it falls, this line says it outright:
-        //   claims_ghost_pay=false          -> the node does not claim the capability at all
-        //   handler_configured=false        -> it claims it with nothing behind it, and passes cannot
-        //                                      come from here
-        //   epoch_proof=Some(..)            -> the "unreachable" path is reachable and the code reading
-        //                                      was wrong
-        tracing::info!(
-            claims_ghost_pay = self.capabilities.ghost_pay,
-            handler_configured = self.ghostpay_handler.is_some(),
-            challenge_epoch = ?challenge.challenge_epoch,
-            has_nonce = challenge.challenge_nonce.is_some(),
-            "#616 ghostpay request"
-        );
-
-        if !self.capabilities.ghost_pay {
-            return Ok(GhostPayResponse {
-                success: false,
-                l2_enabled: false,
-                virtual_block: None,
-                epoch: None,
-                balance_sats: None,
-                wraith_enabled: false,
-                epoch_state_hash: None,
-                epoch_tx_count: None,
-                nonce_bound_proof: None,
-                epoch_proof: None,
-                error: Some("Ghost Pay not enabled".to_string()),
-            });
-        }
-
-        let handler = match &self.ghostpay_handler {
-            Some(h) => h,
-            None => {
-                return Ok(GhostPayResponse {
-                    success: false,
-                    l2_enabled: true,
-                    virtual_block: None,
-                    epoch: None,
-                    balance_sats: None,
-                    wraith_enabled: false,
-                    epoch_state_hash: None,
-                    epoch_tx_count: None,
-                    nonce_bound_proof: None,
-                    epoch_proof: None,
-                    error: Some("Ghost Pay handler not configured".to_string()),
-                });
-            }
-        };
-
-        let balance = if let Some(address) = &challenge.address {
-            Some(handler.get_balance(address)?)
-        } else {
-            None
-        };
-
-        // H-5: If a challenge epoch is specified, require epoch proof
-        let (epoch_state_hash, epoch_tx_count, epoch_proof_success) =
-            if let Some(challenge_epoch) = challenge.challenge_epoch {
-                match handler.get_epoch_proof(challenge_epoch) {
-                    Some(proof) => {
-                        // #616: if this ever logs, `get_epoch_proof` is returning a proof despite
-                        // `epoch_proof_fn` having no setter — which is the whole question.
-                        tracing::info!(
-                            epoch = challenge_epoch,
-                            state_hash = %proof.state_hash,
-                            tx_count = proof.tx_count,
-                            "#616 ghostpay epoch proof PRODUCED"
-                        );
-                        (Some(proof.state_hash), Some(proof.tx_count), true)
-                    }
-                    None => {
-                        // Node claims GhostPay but can't prove epoch state
-                        tracing::info!(
-                            epoch = challenge_epoch,
-                            "#616 ghostpay epoch proof ABSENT — answering success=false"
-                        );
-                        return Ok(GhostPayResponse {
-                            success: false,
-                            l2_enabled: handler.is_enabled(),
-                            virtual_block: Some(handler.get_virtual_block()),
-                            epoch: Some(handler.get_epoch()),
-                            balance_sats: balance,
-                            wraith_enabled: handler.is_wraith_enabled(),
-                            epoch_state_hash: None,
-                            epoch_tx_count: None,
-                            nonce_bound_proof: None,
-                            epoch_proof: None,
-                            error: Some(format!(
-                                "Cannot prove L2 state for epoch {}",
-                                challenge_epoch
-                            )),
-                        });
-                    }
-                }
-            } else {
-                // No challenge epoch - basic verification only
-                (None, None, true)
-            };
-
-        // VER-2/VER-3 FIX: Compute nonce_bound_proof if challenge_nonce was provided
-        // nonce_bound_proof = SHA256(epoch_state_hash || challenge_nonce)
-        // This prevents precomputation attacks by binding the response to the specific challenge.
-        let nonce_bound_proof = if let (Some(ref state_hash), Some(ref nonce)) =
-            (&epoch_state_hash, &challenge.challenge_nonce)
-        {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(state_hash.as_bytes());
-            hasher.update(nonce.as_bytes());
-            Some(hex::encode(hasher.finalize()))
-        } else {
-            None
-        };
-
-        Ok(GhostPayResponse {
-            success: epoch_proof_success,
-            l2_enabled: handler.is_enabled(),
-            virtual_block: Some(handler.get_virtual_block()),
-            epoch: Some(handler.get_epoch()),
-            balance_sats: balance,
-            wraith_enabled: handler.is_wraith_enabled(),
-            epoch_state_hash,
-            epoch_tx_count,
-            nonce_bound_proof,
-            epoch_proof: None, // VER-3: Future enhancement - add merkle proof from GhostPay consensus
-            error: None,
-        })
     }
 }
 
@@ -3712,37 +2925,6 @@ async fn serve_tls(
     }
 }
 
-/// Return true iff a TCP listener is bound to `port` on any local interface.
-/// Reads `/proc/net/tcp{,6}` directly so the check is invisible to the
-/// listening daemon (no spurious connections, no log noise).
-#[cfg(target_os = "linux")]
-fn port_listening(port: u16) -> bool {
-    fn scan(path: &str, port: u16) -> bool {
-        // /proc/net/tcp format (whitespace-separated):
-        //   sl  local_address  rem_address  st  ...
-        // local_address is "ADDR:PORT" in big-endian hex; state 0A = LISTEN.
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let port_hex = format!("{:04X}", port);
-        for line in content.lines().skip(1) {
-            let mut fields = line.split_whitespace();
-            let _sl = fields.next();
-            let Some(local) = fields.next() else { continue };
-            let _rem = fields.next();
-            let Some(state) = fields.next() else { continue };
-            if state != "0A" {
-                continue;
-            }
-            if local.rsplit_once(':').map(|(_, p)| p) == Some(port_hex.as_str()) {
-                return true;
-            }
-        }
-        false
-    }
-    scan("/proc/net/tcp", port) || scan("/proc/net/tcp6", port)
-}
-
 #[cfg(not(target_os = "linux"))]
 fn port_listening(port: u16) -> bool {
     use std::net::TcpStream;
@@ -3894,7 +3076,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_share_recorder(move |_| {
@@ -3924,8 +3105,6 @@ mod tests {
             is_block: false,
             payout_address: Some("bc1qtest".to_string()),
             header: Some(hex::encode(&genesis_header)),
-            extranonce: None,
-            skeleton_id: None,
             tier_log2: None,
         };
 
@@ -3969,7 +3148,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_share_recorder(move |_| {
@@ -4003,8 +3181,6 @@ mod tests {
             is_block: false,
             payout_address: Some("bc1qtest".to_string()),
             header,
-            extranonce: None,
-            skeleton_id: None,
             tier_log2: None,
         };
 
@@ -4103,7 +3279,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_share_recorder(move |_| {
@@ -4129,8 +3304,6 @@ mod tests {
             is_block: false,
             payout_address: Some("bc1qtest".to_string()),
             header: Some(hdr.to_string()),
-            extranonce: None,
-            skeleton_id: None,
             tier_log2: None,
         };
 
@@ -4216,7 +3389,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_share_recorder(move |_| {
@@ -4243,11 +3415,8 @@ mod tests {
                 is_block: true,
                 user_identity: "bc1qtest.worker".to_string(),
                 header: None,
-                extranonce: None,
-                skeleton_id: None,
                 tier_log2: None,
             }],
-            skeletons: vec![],
         };
 
         // Positive control: the first delivery must work end to end.
@@ -4284,7 +3453,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_share_recorder(move |_| {
@@ -4303,8 +3471,6 @@ mod tests {
             is_block: false,
             payout_address: None,
             header: None,
-            extranonce: None,
-            skeleton_id: None,
             tier_log2: None,
         };
 
@@ -4330,7 +3496,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_share_recorder(move |_| {
@@ -4354,8 +3519,6 @@ mod tests {
             is_block: true,
             user_identity: "bc1qattacker.worker".to_string(),
             header: None,
-            extranonce: None,
-            skeleton_id: None,
             tier_log2: None,
         };
 
@@ -4364,7 +3527,6 @@ mod tests {
                 pool_id: 1,
                 batch_seq: 1,
                 shares: vec![forged],
-                skeletons: vec![],
             })
             .expect("batch handling itself must not error");
 
@@ -4389,7 +3551,6 @@ mod tests {
             VerificationState::new(
                 "test_node".to_string(),
                 "1.0.0".to_string(),
-                PolicyProfile::default(),
                 NodeCapabilities::default(),
             )
         }
@@ -4416,72 +3577,8 @@ mod tests {
         assert_eq!(stats.too_large, 60, "the drop count must be readable");
     }
 
-    /// #647. The outbound convergence queues shed frames when full, and the only trace was one
-    /// ERROR line per shed frame — 3,770 a day on ghost-vm4, found by accident during an
-    /// unrelated soak. A number nobody can read without an SSH session is not instrumentation.
-    #[tokio::test]
-    async fn health_surfaces_convergence_channels_when_wired_and_omits_them_when_not() {
-        use crate::challenge::{ConvergenceChannelStats, ConvergenceLaneStats};
-
-        fn state() -> VerificationState {
-            VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-        }
-
-        // Unwired: absent, NOT a row of zeros that reads like a queue shedding nothing.
-        assert!(
-            state().get_health().await.convergence_channels.is_none(),
-            "an unwired probe must report unknown, not a clean-looking zero"
-        );
-
-        let wired = state().with_convergence_channels(|| ConvergenceChannelStats {
-            share: ConvergenceLaneStats {
-                capacity: 64,
-                queued: 3,
-                enqueued: 9_000,
-                shed: 3_770,
-                unicast: 8_800,
-                fanout: 200,
-                unaddressable: 0,
-                send_failed: 12,
-                expired: 47,
-            },
-            challenge: ConvergenceLaneStats::default(),
-        });
-        let stats = wired
-            .get_health()
-            .await
-            .convergence_channels
-            .expect("wired probe must report");
-        assert_eq!(
-            stats.share.shed, 3_770,
-            "the shed count is the whole point — it must reach the response"
-        );
-        assert_eq!(stats.share.capacity, 64, "headroom needs the bound too");
-        assert_eq!(
-            stats.share.unicast, 8_800,
-            "whether replies are addressed must be readable, or a silently unaddressed fleet \
-             looks identical to a fixed one"
-        );
-        // The three ways a frame fails to reach the wire must be separable, or an operator cannot
-        // tell a broken link from an overloaded producer from a drain that fell behind.
-        assert_eq!(
-            stats.share.send_failed, 12,
-            "a frame the transport could not send is lost as completely as a shed one"
-        );
-        assert_eq!(
-            stats.share.expired, 47,
-            "frames discarded for staleness must be distinguishable from frames shed on enqueue"
-        );
-    }
-
     use super::*;
     use ghost_common::types::NodeCapabilities;
-    use ghost_policy::PolicyProfile;
 
     /// The payout address is everything before the FIRST dot.
     ///
@@ -4544,7 +3641,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_full_node_config(node_config, std::path::PathBuf::from("/tmp/pool.toml"));
@@ -4561,7 +3657,6 @@ mod tests {
         let state_on = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_full_node_config(node_config_on, std::path::PathBuf::from("/tmp/pool.toml"));
@@ -4576,7 +3671,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         );
 
@@ -4593,7 +3687,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_internal_auth(auth);
@@ -4606,7 +3699,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .allow_insecure_internal_api(true);
@@ -4621,7 +3713,6 @@ mod tests {
         let state = Arc::new(VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         ));
 
@@ -4641,7 +3732,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .allow_insecure_internal_api(true);
@@ -4661,7 +3751,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_internal_auth(auth);
@@ -4678,7 +3767,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         );
 
@@ -4736,7 +3824,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         );
 
@@ -4749,7 +3836,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_debug_endpoints(true);
@@ -4763,7 +3849,6 @@ mod tests {
         let state = VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_debug_endpoints(true);
@@ -5245,116 +4330,6 @@ mod tests {
         assert_eq!(k1, PeerIpKey("ip:1.2.3.4".to_string()));
     }
 
-    // ---- #616: what `verify_ghostpay` actually does on the shipped code ----
-    //
-    // Nothing exercised this path before. That is part of why #616 took six hours: the +4 capability's
-    // server side had no test pinning what it returns, so the only way to find out was to ask a live
-    // node, and the answer contradicted the ledger.
-    //
-    // These pin the three outcomes reachable with the code as shipped. If any of them starts failing,
-    // something changed about whether a node can prove L2 state — which is exactly the thing that
-    // should not change silently.
-
-    fn ghostpay_state(claims: bool) -> VerificationState {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-        let caps = NodeCapabilities {
-            ghost_pay: claims,
-            ..NodeCapabilities::default()
-        };
-        VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            caps,
-        )
-    }
-
-    fn epoch_challenge() -> crate::challenge::GhostPayChallenge {
-        crate::challenge::GhostPayChallenge {
-            challenge_type: crate::challenge::ChallengeType::GhostPayBalance,
-            address: None,
-            challenge_epoch: Some(7),
-            challenge_nonce: Some("a".repeat(64)),
-        }
-    }
-
-    /// A node that does not claim Ghost Pay says so, and says `l2_enabled: false`.
-    #[tokio::test]
-    async fn ghostpay_unclaimed_reports_not_enabled() {
-        let resp = ghostpay_state(false)
-            .verify_ghostpay(epoch_challenge())
-            .await
-            .expect("verify_ghostpay must not error");
-        assert!(!resp.success);
-        assert!(
-            !resp.l2_enabled,
-            "an unclaimed node must not report l2_enabled"
-        );
-        assert_eq!(resp.error.as_deref(), Some("Ghost Pay not enabled"));
-        assert!(resp.epoch_state_hash.is_none());
-    }
-
-    /// A node that CLAIMS Ghost Pay with no handler wired reports `l2_enabled: true` and
-    /// `success: false`. This is what all eight fleet nodes do today, on both the plain and TLS ports.
-    ///
-    /// Note the shape: `l2_enabled` is true while `success` is false. A verdict that graded on
-    /// `l2_enabled` alone would read this as a pass.
-    #[tokio::test]
-    async fn ghostpay_claimed_without_a_handler_fails_but_still_reports_l2_enabled() {
-        let resp = ghostpay_state(true)
-            .verify_ghostpay(epoch_challenge())
-            .await
-            .expect("verify_ghostpay must not error");
-        assert!(!resp.success, "no handler means no proof, so not a success");
-        assert!(
-            resp.l2_enabled,
-            "l2_enabled reflects the CLAIM, not the capability — the gap #605 is about"
-        );
-        assert_eq!(
-            resp.error.as_deref(),
-            Some("Ghost Pay handler not configured")
-        );
-        assert!(resp.epoch_state_hash.is_none());
-        assert!(resp.nonce_bound_proof.is_none());
-    }
-
-    /// With the shipped `GhostPayL2Handler`, an epoch challenge CANNOT be answered.
-    ///
-    /// `epoch_proof_fn` is set to `None` at construction and has had no setter since `573fa59ec`
-    /// removed `with_epoch_proof`, so `get_epoch_proof` falls through to the trait default and returns
-    /// `None`. The node therefore answers `success: false` — meaning the +4 is not obtainable through
-    /// this path on this code.
-    ///
-    /// That is asserted here rather than described anywhere, because the live verification ledger
-    /// disagrees (#616) and the disagreement needs a fixed reference point. If someone wires an epoch
-    /// proof source, this test fails and they must decide deliberately what the new behaviour is.
-    #[tokio::test]
-    async fn ghostpay_with_the_shipped_handler_cannot_prove_an_epoch() {
-        let handler =
-            crate::handlers::GhostPayL2Handler::new(true, || 100, || 44, |_| Ok(0), false);
-        let state = ghostpay_state(true).with_ghostpay_handler(Box::new(handler));
-
-        let resp = state
-            .verify_ghostpay(epoch_challenge())
-            .await
-            .expect("verify_ghostpay must not error");
-
-        assert!(
-            !resp.success,
-            "the shipped handler has no epoch proof source, so an epoch challenge cannot pass"
-        );
-        assert_eq!(
-            resp.error.as_deref(),
-            Some("Cannot prove L2 state for epoch 7")
-        );
-        assert!(resp.epoch_state_hash.is_none());
-        // The getters that DO work still answer, which is why a response can look populated while
-        // carrying no proof at all.
-        assert_eq!(resp.epoch, Some(44));
-        assert_eq!(resp.virtual_block, Some(100));
-    }
-
     /// H-7 prerequisite: a node must be able to SIGN an HTTP response, or an
     /// identity-bound reachability probe is impossible — the whole point is that
     /// whoever answers at a claimed address proves it holds that node's key.
@@ -5369,7 +4344,7 @@ mod tests {
     fn a_state_given_an_identity_signs_a_nonce_bound_response_under_its_own_node_id() {
         use ghost_common::identity::NodeIdentity;
         use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+
         use std::sync::Arc;
 
         let identity = Arc::new(NodeIdentity::generate());
@@ -5378,7 +4353,6 @@ mod tests {
         let unwired = VerificationState::new(
             node_id_hex.clone(),
             "test".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         );
         assert!(
@@ -5395,7 +4369,6 @@ mod tests {
         let wired = VerificationState::new(
             node_id_hex.clone(),
             "test".to_string(),
-            PolicyProfile::default(),
             NodeCapabilities::default(),
         )
         .with_node_identity(Arc::clone(&identity));
