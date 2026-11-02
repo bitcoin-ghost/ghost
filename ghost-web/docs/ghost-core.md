@@ -105,7 +105,7 @@ Mempool profiles control which transactions your node accepts and relays. Profil
 | ghost | Local only, no relay | Private mempool (Ghost Mode) |
 
 :::info Terminology
-**`bitcoin_pure`** here is a `PolicyProfile` (defined in `crates/ghost-policy/src/profile.rs`) — it controls which transactions your node will *relay*. This is distinct from the **Reaper +2 capability share**, which is the node-reward bonus earned by *verified* enforcement of dead-code policy (see [Elder System](elder-system.md)).
+**`bitcoin_pure`** here is a `PolicyProfile` (defined in `crates/ghost-policy/src/profile.rs`) — it controls which transactions your node will *relay*.
 :::
 
 ## Template Profiles

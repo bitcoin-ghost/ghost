@@ -43,59 +43,9 @@ pub const MAX_JSON_DEPTH: usize = 16;
 
 /// Maximum payload sizes by message type
 pub const MAX_SHARE_PROOF_SIZE: usize = 10_000;
-pub const MAX_BLOCK_FOUND_SIZE: usize = 100_000;
-pub const MAX_VOTE_SIZE: usize = 1_000;
-/// Payout-ledger checkpoint vote. Sized for a voter REPORTING its own recomputed per-address work
-/// (#606), not for a bare hash + signature.
-///
-/// A voter used to send `approve: bool` and throw its own numbers away, which is what let a proposer
-/// skew every address within tolerance and still be ratified. Reporting the numbers is what makes a
-/// per-address median possible — and it means the vote now carries up to `LEDGER_CAP` (1000) entries.
-///
-/// At `LEDGER_CAP = 1000` (defined in ghost-mining, which this crate cannot link to), an entry is a ~42-byte address plus a 16-byte micro-work integer plus
-/// JSON overhead: on the order of 70 KB. Against the previous `MAX_VOTE_SIZE` of 1 KB that is a 70x
-/// overrun, and the trap is that it would have looked fine — live canonical payouts currently carry
-/// 4-6 addresses (~500 bytes), so the old limit passes today and would start silently dropping every
-/// vote once the pool grows past roughly a dozen paid addresses. Votes dropped fleet-wide means no
-/// checkpoint finalises, which means payouts stop.
-///
-/// 128 KB leaves headroom above the 70 KB worst case without approaching the envelope cap.
-///
-/// This constant must be DEPLOYED FLEET-WIDE BEFORE the gate that makes any node emit an enlarged
-/// vote. A node on an older build validates against 1 KB and drops the message, so a partial roll
-/// would cost quorum. That ordering is the reason #606 is gated on height at all.
-pub const MAX_PAYOUT_LEDGER_VOTE_SIZE: usize = 128_000;
 pub const MAX_HEALTH_PING_SIZE: usize = 2_000;
 pub const MAX_DISCOVERY_SIZE: usize = 50_000;
-pub const MAX_PAYOUT_PROPOSAL_SIZE: usize = 500_000;
-/// Payout-checkpoint sync response: a small page of checkpoints (`MAX_SYNC_CHECKPOINTS`),
-/// bounded by the hard envelope cap so a peer can't ship an oversized batch.
-pub const MAX_PAYOUT_SYNC_SIZE: usize = MAX_ENVELOPE_SIZE;
-pub const MAX_ELDER_UPDATE_SIZE: usize = 10_000;
-/// ZK block proposal can include transactions + proof (up to 2MB)
-pub const MAX_ZK_PROPOSAL_SIZE: usize = 2_000_000;
-/// ZK vote is small (just signature + metadata)
-pub const MAX_ZK_VOTE_SIZE: usize = 1_000;
-/// Verification result is small (node IDs + capability + result + signature)
-pub const MAX_VERIFICATION_SIZE: usize = 5_000;
-/// Challenge-convergence exchange: a request advertises ledger keys for a window,
-/// a response carries a batch of signed verification-result blobs. Bounded to the
-/// 1MB envelope tier; the per-response proof count (`MAX_CONVERGENCE_PROOFS`) is
-/// sized so a full batch of worst-case proofs stays under this.
-pub const MAX_CHALLENGE_CONVERGENCE_SIZE: usize = 1_000_000;
 
-/// GHOST-03 share/ledger convergence carries a BATCH of share proofs, not one proof, so it
-/// cannot share `MAX_SHARE_PROOF_SIZE` — which bounds a SINGLE proof at 10 KB.
-///
-/// It did, and that is what #558 was. A real share proof averages ~1169 bytes, and the payload
-/// expands ~3.1x as JSON (`proofs: Vec<Vec<u8>>` encodes each byte as a decimal integer), so a
-/// 10 KB ceiling could not carry even **one** proof. Every window-convergence response was
-/// rejected as oversized, historical divergence was never repaired, and the canaries sat 52-62k
-/// shares short for nine days with payouts stalled behind them.
-///
-/// Mirrors `MAX_CHALLENGE_CONVERGENCE_SIZE` — the other batch-carrying convergence type, which
-/// was correctly given its own limit.
-pub const MAX_SHARE_CONVERGENCE_SIZE: usize = 1_000_000;
 /// Share-batch chain: the largest proposed batch that may cross the wire.
 ///
 /// **This number is the authority, and the packer derives its budget from it** — see
@@ -104,27 +54,7 @@ pub const MAX_SHARE_CONVERGENCE_SIZE: usize = 1_000_000;
 /// all a sender bounding by the wrong thing and a receiver rejecting the result. A batch too large
 /// to send is worse than a small one, because the chain cannot skip the sequence.
 pub const MAX_SHARE_BATCH_SIZE: usize = MAX_ENVELOPE_SIZE;
-/// Share-batch chain: a vote is a sequence, a hash and a signature.
-pub const MAX_SHARE_BATCH_VOTE_SIZE: usize = MAX_VOTE_SIZE;
-/// Share-batch chain: a sync response carries one batch, so it is bounded like one.
-pub const MAX_SHARE_BATCH_SYNC_SIZE: usize = MAX_SHARE_BATCH_SIZE;
 
-/// Bytes a proposer may fill with shares, after the batch's own fields and the JSON expansion.
-///
-/// Derived from [`MAX_SHARE_BATCH_SIZE`] rather than chosen. Two reservations:
-///
-/// * **JSON expansion.** The wire encoding is JSON and a `Vec<u8>` becomes a list of decimal
-///   integers, so payload bytes are roughly 3.1x the underlying data — the ratio measured on real
-///   share proofs when #558 was diagnosed. Ignoring it is how a 10 KB ceiling ended up unable to
-///   carry one 1,169-byte proof.
-/// * **Envelope and batch overhead.** Signature, roots, node shares and settled blocks all ride in
-///   the same message.
-///
-/// Deliberately conservative: under-filling a batch costs one extra batch, while over-filling it
-/// produces a message every peer rejects, at a sequence the chain cannot skip past.
-/// One signed endpoint advert. Generous against a long hostname while still far below any
-/// bound that would let a peer spend our bandwidth: 2 KiB.
-pub const MAX_MESH_ENDPOINT_ADVERT_SIZE: usize = 2 * 1024;
 
 pub const fn share_batch_pack_budget() -> usize {
     const JSON_EXPANSION_NUMERATOR: usize = 10;
@@ -136,14 +66,6 @@ pub const fn share_batch_pack_budget() -> usize {
         .saturating_mul(JSON_EXPANSION_NUMERATOR)
         / JSON_EXPANSION_DENOMINATOR
 }
-/// P2P-H3: Equivocation proof (two votes + metadata)
-pub const MAX_EQUIVOCATION_PROOF_SIZE: usize = 10_000;
-/// P2P-C1: Elder registration proposal (candidate + PoW + signatures)
-pub const MAX_ELDER_REGISTRATION_PROPOSAL_SIZE: usize = 1_000;
-/// P2P-C2: Elder list proposal (full list of up to 101 elders + metadata)
-pub const MAX_ELDER_LIST_PROPOSAL_SIZE: usize = 100_000;
-/// P2P-C3: Elder list approval (signature + epoch + merkle root)
-pub const MAX_ELDER_LIST_APPROVAL_SIZE: usize = 500;
 
 // ─── Share-shard caps (docs/SHARE_SHARD.md) ──────────────────────────────────
 //

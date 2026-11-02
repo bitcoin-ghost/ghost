@@ -154,7 +154,7 @@ Nodes split the network's node rewards by capability shares, 5-4-3-2-1:
 | +5 | Archive | `--archive`, so the node holds the full chain. |
 | +3 | Public Mining | `--mining-mode public` (the default). The private modes do not earn it. |
 | +2 | Reaper | On by default; `--no-reaper` gives it up. See [Reaper](#reaper). |
-| +1 | Elder | The first 101 nodes. See [Elder system](#elder-system). |
+| +1 | Elder | The first 101 nodes. |
 
 A flag does not award a share. Shares are earned by passing challenges that peers send to the node; a flag only puts the node in a position to pass them. A public-mining node whose Stratum port peers can't reach doesn't qualify.
 
