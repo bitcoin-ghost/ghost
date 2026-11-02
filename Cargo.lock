@@ -2308,16 +2308,9 @@ dependencies = [
 name = "ghost-reconciliation"
 version = "1.11.46"
 dependencies = [
- "bitcoin",
  "chrono",
- "getrandom 0.2.17",
- "ghost-common",
- "hex",
- "parking_lot",
- "secp256k1 0.29.1",
  "serde",
  "sha2 0.10.9",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -4447,7 +4440,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
  "bitcoin_hashes 0.14.1",
- "rand 0.8.6",
  "secp256k1-sys 0.10.1",
  "serde",
 ]

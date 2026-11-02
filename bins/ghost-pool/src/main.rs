@@ -118,54 +118,6 @@ fn should_claim_archive(config_archive_mode: bool, hazed: bool, pruned: bool) ->
     config_archive_mode && !hazed && !pruned
 }
 
-/// Local ghost-pay L2 status endpoint (unsigned, loopback IPC). Same service as
-/// `GHOST_PAY_FINALIZE_URL`; returns this node's L2 virtual-block height.
-const GHOST_PAY_STATUS_URL: &str = "https://127.0.0.1:8800/verify/ghostpay?unsigned=true";
-
-/// Lightweight cache of the local ghost-pay L2 virtual-block height, refreshed
-/// by a background poller and read (a cheap atomic load) on the health-ping hot
-/// path so gossiping this node's L2 tip never blocks on a cross-process call.
-/// `known` stays false until the first successful poll; once set it retains the
-/// last good value across a failed poll, so peers see "—" only while we
-/// genuinely have no L2 height to report.
-#[derive(Default)]
-struct L2HeightCache {
-    height: std::sync::atomic::AtomicU64,
-    known: std::sync::atomic::AtomicBool,
-}
-
-impl L2HeightCache {
-    fn set(&self, height: u64) {
-        self.height
-            .store(height, std::sync::atomic::Ordering::Relaxed);
-        self.known.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn get(&self) -> Option<u64> {
-        self.known
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| self.height.load(std::sync::atomic::Ordering::Relaxed))
-    }
-}
-
-/// Query the local ghost-pay service for its current L2 virtual-block height.
-/// ghost-pay serves identity-derived TLS on :8800, so this loopback IPC skips
-/// cert-chain validation (loopback IPC).
-/// Returns `None` when ghost-pay is unreachable or reports failure.
-async fn fetch_ghostpay_virtual_block(client: &reqwest::Client) -> Option<u64> {
-    let resp = client.get(GHOST_PAY_STATUS_URL).send().await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let inner = json.get("response")?;
-    if !inner
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    inner.get("virtual_block").and_then(|v| v.as_u64())
-}
-
 /// Build this node's best (rarest) valid share per records window from the
 /// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
 /// miner_id, achieved difficulty from the hash). Gossiped in health pings so
@@ -1193,14 +1145,10 @@ async fn main() -> Result<()> {
     // We'll update after registering with the database
     let mut capabilities = NodeCapabilities {
         archive_mode: config.storage.archive_mode,
-        // Advertise GhostPay only when it is actually enabled — NOT on mere
-        // presence of a `[ghost_pay]` block. Pool-only nodes carry a default
-        // (disabled) block; advertising `is_some()` made them claim GhostPay,
-        // so every peer port-probed their (absent) ghost-pay API and logged a
-        // `GhostPay verification failed: Verification timeout` warning. Gating on
-        // `ghost_pay_enabled()` stops the false claim (verification still
-        // correctly denied them the +4 share, but silently now).
-        ghost_pay: config.ghost_pay_enabled(),
+        // Ghost Pay is removed, so this node never claims it. The capability bit stays in
+        // the wire type until the capability ladder goes at the cutover; a node without a
+        // ghost-pay daemon always failed the challenge, so no award changes.
+        ghost_pay: false,
         public_mining: is_public_mining, // Derived from mining_mode
         reaper: config.reaper.enabled,
         elder_status: false,
@@ -1688,13 +1636,6 @@ async fn main() -> Result<()> {
             .map(|ratio| ratio * 100.0)
     }));
 
-    // Ghost Pay L2 virtual-block height, read from a lightweight cache refreshed
-    // by a background poller (below). Reading a cached atomic keeps the health-
-    // ping hot path free of the cross-process ghost-pay call.
-    let l2_height_cache = Arc::new(L2HeightCache::default());
-    let l2_cache_for_ping = Arc::clone(&l2_height_cache);
-    mesh_inner.set_l2_height_provider(Arc::new(move || l2_cache_for_ping.get()));
-
     // Gossip whether our own Ghost Core is reachable, so peers can route around us when it is
     // not (#778). Same probe and same staleness bound the `/health` endpoint uses — two missed
     // template refreshes, floored at 120s — so the two can never disagree about this node.
@@ -1709,32 +1650,6 @@ async fn main() -> Result<()> {
             .max(120);
         mesh_inner
             .set_core_healthy_provider(Arc::new(move || rpc_for_ping.core_liveness(stale_after).0));
-    }
-
-    // Poll the local ghost-pay service (:8800) for the L2 tip and cache it, so
-    // both this node's gossiped L2 height and the cache stay warm. Only runs
-    // when ghost-pay is enabled; on failure the last good value is retained.
-    if config.ghost_pay_enabled() {
-        let l2_cache_for_poll = Arc::clone(&l2_height_cache);
-        tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .danger_accept_invalid_certs(true)
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "L2 height poller: failed to build client");
-                    return;
-                }
-            };
-            loop {
-                if let Some(height) = fetch_ghostpay_virtual_block(&client).await {
-                    l2_cache_for_poll.set(height);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            }
-        });
     }
 
     let mesh = Arc::new(mesh_inner);
@@ -3846,7 +3761,6 @@ async fn main() -> Result<()> {
                 l1_height: (p.block_height != 0).then_some(p.block_height),
                 uptime_percent: p.uptime_percent,
                 peer_count: p.peer_count,
-                l2_height: p.l2_height,
             })
             .collect()
     });

@@ -443,48 +443,6 @@ fn test_131_wal_mode_defaults_enabled() {
 }
 
 // =============================================================================
-// GHOST PAY CONFIG TESTS (Tests 132-135)
-// =============================================================================
-
-#[test]
-fn test_132_zero_virtual_block_secs_rejected() {
-    let config = NodeConfig {
-        ghost_pay: Some(GhostPayConfig {
-            enabled: true,
-            virtual_block_secs: 0,
-            ..GhostPayConfig::default()
-        }),
-        ..NodeConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "ghost_pay.virtual_block_secs"));
-}
-
-#[test]
-fn test_133_zero_epoch_blocks_rejected() {
-    let config = NodeConfig {
-        ghost_pay: Some(GhostPayConfig {
-            enabled: true,
-            epoch_blocks: 0,
-            ..GhostPayConfig::default()
-        }),
-        ..NodeConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "ghost_pay.epoch_blocks"));
-}
-
-// =============================================================================
 // POOL CONFIG VALIDATE METHOD TESTS
 // =============================================================================
 

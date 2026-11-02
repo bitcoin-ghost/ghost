@@ -369,41 +369,14 @@ fn check_archive(config: &NodeConfig) -> CapabilityCheck {
     }
 }
 
-async fn check_ghost_pay(config: &NodeConfig) -> CapabilityCheck {
-    // Match the capability advertisement: claim GhostPay only when enabled, not
-    // on mere presence of a (possibly disabled) `[ghost_pay]` block.
-    let claimed = config.ghost_pay_enabled();
-    let last_checked_unix = now_unix();
-    if !claimed {
-        return CapabilityCheck {
-            claimed: false,
-            passed: false,
-            reason: None,
-            last_checked_unix,
-        };
-    }
-
-    // Default Ghost Pay API port is 8800 (per CLAUDE.md). The actual port
-    // can be overridden in the ghost-pay binary's args; the self-check uses
-    // the conventional default since pool.toml doesn't store it directly.
-    const GHOST_PAY_PORT: u16 = 8800;
-    if port_listening(GHOST_PAY_PORT) {
-        CapabilityCheck {
-            claimed: true,
-            passed: true,
-            reason: None,
-            last_checked_unix,
-        }
-    } else {
-        CapabilityCheck {
-            claimed: true,
-            passed: false,
-            reason: Some(format!(
-                "ghost-pay daemon not listening on 127.0.0.1:{} — check `systemctl status ghost-pay`",
-                GHOST_PAY_PORT
-            )),
-            last_checked_unix,
-        }
+/// Ghost Pay is removed, so the capability is never claimed. The row stays in the snapshot
+/// until the capability ladder goes at the cutover.
+async fn check_ghost_pay(_config: &NodeConfig) -> CapabilityCheck {
+    CapabilityCheck {
+        claimed: false,
+        passed: false,
+        reason: None,
+        last_checked_unix: now_unix(),
     }
 }
 
@@ -527,7 +500,7 @@ fn free_bytes(_path: &std::path::Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_common::config::{GhostPayConfig, MiningMode};
+    use ghost_common::config::MiningMode;
 
     #[test]
     fn reaper_check_mirrors_config() {
@@ -635,30 +608,9 @@ mod tests {
 
     #[tokio::test]
     async fn ghost_pay_check_unclaimed_short_circuits() {
-        let cfg = NodeConfig {
-            ghost_pay: None,
-            ..Default::default()
-        };
+        let cfg = NodeConfig::default();
         let r = check_ghost_pay(&cfg).await;
         assert!(!r.claimed && !r.passed && r.reason.is_none());
-    }
-
-    #[tokio::test]
-    async fn ghost_pay_check_failure_carries_remediation_hint() {
-        // ghost-pay ENABLED (claimed) but not running — the remediation scenario.
-        let cfg = NodeConfig {
-            ghost_pay: Some(GhostPayConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        // 127.0.0.1:8800 almost certainly not bound in test env
-        let r = check_ghost_pay(&cfg).await;
-        assert!(r.claimed);
-        if !r.passed {
-            assert!(r.reason.as_ref().unwrap().contains("ghost-pay"));
-        }
     }
 
     #[tokio::test]
@@ -699,19 +651,5 @@ mod tests {
         // State was written (last_checked_unix set on at least one probe).
         let snap = sc.snapshot();
         assert!(snap.reaper.last_checked_unix > 0);
-    }
-
-    #[tokio::test]
-    async fn ghost_pay_check_disabled_block_is_unclaimed() {
-        // v1.10.20: a present-but-disabled `[ghost_pay]` block must NOT claim the
-        // capability (gate on `enabled`, not mere block presence) — otherwise
-        // pool-only nodes advertise GhostPay and peers waste probes on port 8800.
-        // default enabled = false, which is the point of this case
-        let cfg = NodeConfig {
-            ghost_pay: Some(GhostPayConfig::default()),
-            ..Default::default()
-        };
-        let r = check_ghost_pay(&cfg).await;
-        assert!(!r.claimed && !r.passed && r.reason.is_none());
     }
 }

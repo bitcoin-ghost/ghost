@@ -902,8 +902,8 @@ mod tests {
     /// `coordinator.coordinator_enabled`, the two paths that actually drive a claim.
     pub(super) const CAPABILITY_CONFIG_PATHS: &[(&str, Option<&str>)] = &[
         ("archive_mode", Some("storage.archive_mode")),
-        // Claimed via `config.ghost_pay_enabled()`, which reads `[ghost_pay] enabled`.
-        ("ghost_pay", Some("ghost_pay.enabled")),
+        // Ghost Pay is removed and never claimed. No config path sets it.
+        ("ghost_pay", None),
         // ⚠ NOT `pool.public_mining`. The claim is `matches!(mining_mode, MiningMode::PublicPool)`.
         ("public_mining", Some("network.mining_mode")),
         ("reaper", Some("reaper.enabled")),

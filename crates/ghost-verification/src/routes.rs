@@ -292,7 +292,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/mesh/status", get(consensus_state_handler))
         .route("/api/v1/config", get(api_config_handler))
         .route("/api/v1/resources/status", get(api_resources_handler))
-        .route("/api/v1/ghostpay/status", get(api_ghostpay_status_handler))
         .route(
             "/api/v1/buds/capabilities",
             get(api_buds_capabilities_handler),
@@ -303,14 +302,9 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/rewards/current", get(api_rewards_current_handler))
         .route("/api/v1/rewards/history", get(api_rewards_history_handler))
         // HIGH-4: /api/v1/logs endpoint REMOVED - exposed journalctl output (security risk)
-        .route("/api/v1/locks", get(api_locks_handler))
         .route("/api/v1/node/nickname", get(api_nickname_handler))
         // Additional endpoints for dashboard compatibility
         .route("/api/v1/rewards/full", get(api_rewards_full_handler))
-        .route(
-            "/api/v1/settlement/status",
-            get(api_settlement_status_handler),
-        )
         .route("/api/v1/swarm/nodes", get(api_swarm_nodes_handler))
         .route("/api/v1/watchdog/status", get(api_watchdog_status_handler))
         .route("/api/v1/system/version", get(api_system_version_handler))
@@ -337,8 +331,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/mining/best-hash",
             get(api_mining_best_hash_handler),
         )
-        // `/api/v1/network/payout-history` and `/api/v1/ghostpay/payout-history` moved to
-        // `internal_router` — they emit recipient addresses, destinations and L1 txids.
+        // `/api/v1/network/payout-history` moved to `internal_router` — it emits recipient
+        // addresses and L1 txids.
         .route(
             "/api/v1/rewards/node-history",
             get(api_rewards_node_history_handler),
@@ -357,8 +351,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         // Config endpoints (GET only - reading is public, POST requires auth via internal router)
         // CRIT-6: POST handlers moved to internal_router to require authentication
-        // `/api/v1/config/full` moved to `internal_router` — it carries `payout.address` and
-        // `payout.ghostpay_address`.
+        // `/api/v1/config/full` moved to `internal_router` — it carries `payout.address`.
         .route(
             "/api/v1/config/archive_mode",
             get(api_config_archive_mode_handler),
@@ -379,10 +372,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/config/backup_schedule",
             get(api_config_backup_schedule_handler),
         )
-        .route(
-            "/api/v1/config/ghost_pay",
-            get(api_config_ghost_pay_handler),
-        )
         .route("/api/v1/config/elder", get(api_config_elder_handler))
         .route(
             "/api/v1/config/operator_window",
@@ -395,16 +384,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         .route("/api/v1/mining/private", get(api_mining_private_handler))
         .route("/api/v1/mining/public", get(api_mining_public_handler))
-        // Ghost Pay endpoints
-        .route(
-            "/api/v1/ghost-pay/pruning",
-            get(api_ghostpay_pruning_handler),
-        )
-        // Settings endpoints
-        .route(
-            "/api/v1/settings/ghostpay_payout_address",
-            get(api_settings_ghostpay_payout_address_handler),
-        )
         // Ghost Haze & Shroud endpoints
         .route("/api/v1/haze/status", get(api_haze_status_handler))
         .route("/api/v1/haze/legal-pack", get(api_haze_legal_pack_handler))
@@ -488,10 +467,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/network/payout-history",
             get(api_payout_history_handler),
         )
-        .route(
-            "/api/v1/ghostpay/payout-history",
-            get(api_ghostpay_payout_history_handler),
-        )
         .route("/api/v1/config/full", get(api_config_full_handler))
         // maxconnections (#499). Both verbs are on the internal tier: the POST mutates node
         // config, and the GET exposes the node's peer-slot headroom — useful to an operator,
@@ -567,10 +542,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/alerts/internal/service-restart",
             post(api_alerts_service_restart_post_handler),
-        )
-        .route(
-            "/api/v1/config/ghost_pay",
-            post(api_config_ghost_pay_post_handler),
         )
         .route("/api/v1/config/elder", post(api_config_elder_post_handler))
         // M-14: Miner stats endpoint moved here to require HMAC authentication
@@ -657,11 +628,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/watchdog/clear-cache",
             get(api_watchdog_clear_cache_handler).post(api_watchdog_clear_cache_handler),
-        )
-        // Dashboard: GhostPay payout address POST
-        .route(
-            "/api/v1/settings/ghostpay_payout_address",
-            post(api_settings_ghostpay_payout_address_post_handler),
         )
         // Dashboard: Mining POST handlers
         .route(
@@ -2796,13 +2762,9 @@ async fn api_pool_treasury_state_handler(
         (balance_sats as f64 / TREASURY_THRESHOLD_SATS as f64 * 100.0).min(100.0)
     };
 
-    // Cumulative totals paid into the node reward pool.
-    //   * Coinbase: authoritative sum across every approved PayoutProposal
-    //   * L2:       running kv_store accumulator bumped at Ghost Pay
-    //               broadcast-success time in bins/ghost-pay/src/main.rs
+    // Cumulative total paid into the node reward pool: the authoritative sum across every
+    // approved PayoutProposal. Ghost Pay's L2 share is gone with Ghost Pay.
     let node_rewards_coinbase = db.get_total_node_rewards_paid().unwrap_or(0);
-    let node_rewards_l2 = db.get_l2_node_rewards_paid().unwrap_or(0);
-    let node_rewards_total = node_rewards_coinbase.saturating_add(node_rewards_l2);
 
     Json(serde_json::json!({
         "phase": phase,
@@ -2817,8 +2779,7 @@ async fn api_pool_treasury_state_handler(
         "node_rate_bps": node_bps,
         "pool_fee_bps": 100u32,
         "node_rewards_paid_coinbase_sats": node_rewards_coinbase,
-        "node_rewards_paid_l2_sats": node_rewards_l2,
-        "node_rewards_paid_total_sats": node_rewards_total,
+        "node_rewards_paid_total_sats": node_rewards_coinbase,
     }))
 }
 
@@ -2934,7 +2895,6 @@ fn mesh_node_to_json(node: &MeshNodeInfo, is_registry_elder: bool) -> serde_json
         "l1_height": node.l1_height,
         "uptime_percent": node.uptime_percent,
         "peer_count": node.peer_count,
-        "l2_height": node.l2_height,
         "healthy": node.healthy,
         "is_self": false,
     })
@@ -4124,126 +4084,6 @@ async fn api_resources_handler(State(state): State<Arc<VerificationState>>) -> i
     }))
 }
 
-/// Ghost Pay L2 status result
-struct GhostPayLiveStatus {
-    epoch: u64,
-    virtual_block: u64,
-    wraith_enabled: bool,
-    sync_state: &'static str,
-}
-
-/// Query ghost-pay L2 status — tries in-process handler first, then HTTPS to localhost:8800.
-/// Returns a self-contained future (no borrows) so axum handlers stay Send.
-///
-/// ghost-pay serves identity-derived TLS on 8800 (cert pubkey == node_id).
-/// Loopback IPC under the same identity, so we skip cert-chain validation.
-async fn fetch_ghostpay_from_service() -> Option<GhostPayLiveStatus> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .ok()?;
-
-    let resp = client
-        .get("https://127.0.0.1:8800/verify/ghostpay?unsigned=true")
-        .send()
-        .await
-        .ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let inner = json.get("response")?;
-
-    let success = inner
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !success {
-        return None;
-    }
-
-    Some(GhostPayLiveStatus {
-        epoch: inner.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0),
-        virtual_block: inner
-            .get("virtual_block")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        wraith_enabled: inner
-            .get("wraith_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        sync_state: "synced",
-    })
-}
-
-/// Check ghost-pay status from in-process handler (sync). Returns None if handler unavailable.
-fn check_ghostpay_local(state: &VerificationState) -> Option<GhostPayLiveStatus> {
-    let config = state.dashboard_config.read();
-    if !config.ghost_pay {
-        return Some(GhostPayLiveStatus {
-            epoch: 0,
-            virtual_block: 0,
-            wraith_enabled: false,
-            sync_state: "disabled",
-        });
-    }
-    drop(config);
-
-    state.get_ghostpay_status().map(|info| GhostPayLiveStatus {
-        epoch: info.epoch,
-        virtual_block: info.virtual_block,
-        wraith_enabled: info.wraith_enabled,
-        sync_state: "synced",
-    })
-}
-
-/// API v1 GhostPay status handler
-async fn api_ghostpay_status_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-
-    // Try in-process handler first (sync, no borrow issues)
-    let gp = match check_ghostpay_local(&state) {
-        Some(status) => status,
-        None => {
-            // Ghost-pay runs as separate service on port 8800 — query via spawned task
-            // 5s timeout prevents hanging when ghost-pay is unresponsive
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::spawn(fetch_ghostpay_from_service()),
-            )
-            .await
-            {
-                Ok(Ok(Some(status))) => status,
-                _ => GhostPayLiveStatus {
-                    epoch: 0,
-                    virtual_block: 0,
-                    wraith_enabled: false,
-                    sync_state: "unavailable",
-                },
-            }
-        }
-    };
-
-    Json(serde_json::json!({
-        "enabled": gp.sync_state != "disabled",
-        "node_id": health.node_id,
-        "protocol_version": 1,
-        "network": state.network.as_str(),
-        "l2_era": gp.epoch,
-        "virtual_block": gp.virtual_block,
-        "l2_height": gp.virtual_block,
-        "block_height": health.block_height,
-        "epoch": gp.epoch,
-        "peer_count": health.peer_count,
-        "uptime_secs": health.uptime_secs,
-        "sync_state": gp.sync_state,
-        // Retained internal signal: whether the ghost-pay process itself hosts
-        // CoinJoin sessions (always false post-wraith-coordinator split).
-        "ghostpay_hosts_mixing": gp.wraith_enabled,
-        "total_balances": 0
-    }))
-}
-
 /// API v1 BUDS capabilities handler
 async fn api_buds_capabilities_handler(
     State(state): State<Arc<VerificationState>>,
@@ -4336,26 +4176,6 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         self_caps.elder_status,
     );
 
-    // THIS node's own L2 (Ghost Pay) virtual-block height. `check_ghostpay_local`
-    // reads the in-process handler, which production ghost-mining does NOT wire —
-    // ghost-pay runs as a separate service on :8800 — so it returns `None` and
-    // the self row's L2 showed "—". Mirror the ghostpay status endpoint: on that
-    // `None`, fall back to querying the local :8800 service. `Some(disabled)`
-    // (ghost-pay off) still resolves to `None` → "—", never a fabricated value.
-    let self_l2_height = match check_ghostpay_local(&state) {
-        Some(gp) if gp.sync_state == "disabled" => None,
-        Some(gp) => Some(gp.virtual_block),
-        None => match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::spawn(fetch_ghostpay_from_service()),
-        )
-        .await
-        {
-            Ok(Ok(Some(status))) => Some(status.virtual_block),
-            _ => None,
-        },
-    };
-
     // This node's own trailing-7-day uptime %, the qualification gatekeeper
     // metric (>=95% before capabilities count). It's the exact figure the
     // qualification layer reads (`get_uptime_percent`, GHOST-10 time-based
@@ -4393,7 +4213,6 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         // Locally-known stats the mesh doesn't gossip (fixes the self row's "—").
         "peer_count": health.peer_count,
         "l1_height": health.block_height,
-        "l2_height": self_l2_height,
         "uptime_percent": self_uptime_percent,
     });
 
@@ -4445,7 +4264,6 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "uptime_percent": peer.uptime_percent,
             "peer_count": peer.peer_count,
             "l1_height": peer.l1_height,
-            "l2_height": peer.l2_height,
         }));
     }
 
@@ -4655,58 +4473,6 @@ async fn api_rewards_history_handler(
 // The endpoint has been completely removed rather than adding authentication
 // because even authenticated access to logs is a security concern.
 
-/// API v1 Locks handler (Ghost Lock state channels)
-async fn api_locks_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let config = state.dashboard_config.read();
-
-    // Query Ghost Locks for this node from database
-    let (locks, active_count, total_locked) = if let Some(ref db) = state.database {
-        // Get all locks owned by this node's ghost ID
-        let ghost_id = format!("ghost{}", &health.node_id[..8.min(health.node_id.len())]);
-        match db.get_ghost_locks_by_owner(&ghost_id) {
-            Ok(lock_records) => {
-                let active: Vec<_> = lock_records
-                    .iter()
-                    .filter(|l| l.state == ghost_storage::models::GhostLockState::Active)
-                    .collect();
-                let total: u64 = active.iter().map(|l| l.amount_sats).sum();
-                let locks_json: Vec<_> = lock_records
-                    .iter()
-                    .map(|l| {
-                        serde_json::json!({
-                            "lock_id": l.lock_id,
-                            "denomination": l.denomination,
-                            "amount_sats": l.amount_sats,
-                            "state": format!("{:?}", l.state),
-                            "timelock_tier": l.timelock_tier,
-                            "creation_height": l.creation_height,
-                            "recovery_height": l.recovery_height,
-                            "funding_txid": l.funding_txid,
-                            "next_jump_height": l.next_jump_height,
-                            "created_at": l.created_at
-                        })
-                    })
-                    .collect();
-                (locks_json, active.len(), total)
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to query ghost locks");
-                (vec![], 0, 0)
-            }
-        }
-    } else {
-        (vec![], 0, 0)
-    };
-
-    Json(serde_json::json!({
-        "enabled": config.ghost_pay,
-        "active_locks": active_count,
-        "total_locked_sats": total_locked,
-        "locks": locks
-    }))
-}
-
 /// API v1 Nickname handler
 async fn api_nickname_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
@@ -4809,56 +4575,6 @@ async fn api_rewards_full_handler(
         "last_credited_round": last_round,
         "last_payout": last_payout,
         "rewards_history": rewards_history
-    }))
-}
-
-/// API v1 Settlement status handler
-async fn api_settlement_status_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Query pending reconciliation batches
-    let (pending_count, last_settlement, total_settled) = if let Some(ref db) = state.database {
-        let pending = db.get_pending_reconciliation_batches().unwrap_or_default();
-        let pending_count = pending.len();
-
-        // Get the most recent finalized batch
-        let all_pending = db.get_pending_reconciliation_batches().unwrap_or_default();
-        let last = all_pending
-            .iter()
-            .find(|b| b.finalized_at.is_some())
-            .map(|b| {
-                serde_json::json!({
-                    "batch_id": b.batch_id,
-                    "total_amount_sats": b.total_amount_sats,
-                    "l1_txid": b.l1_txid,
-                    "finalized_at": b.finalized_at
-                })
-            });
-
-        let total: u64 = all_pending
-            .iter()
-            .filter(|b| b.finalized_at.is_some())
-            .map(|b| b.total_amount_sats)
-            .sum();
-
-        (pending_count, last, total)
-    } else {
-        (0, None, 0)
-    };
-
-    let status = if pending_count > 0 {
-        "processing"
-    } else {
-        "idle"
-    };
-
-    Json(serde_json::json!({
-        "status": status,
-        "pending_settlements": pending_count,
-        "pending_count": pending_count,
-        "batches_24h": 0,
-        "last_settlement": last_settlement,
-        "total_settled_sats": total_settled
     }))
 }
 
@@ -5017,40 +4733,6 @@ async fn api_watchdog_status_handler(
         })
     };
 
-    // Check ghost-pay L2 service status
-    let gp = match check_ghostpay_local(&state) {
-        Some(status) => status,
-        None => match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::spawn(fetch_ghostpay_from_service()),
-        )
-        .await
-        {
-            Ok(Ok(Some(status))) => status,
-            _ => GhostPayLiveStatus {
-                epoch: 0,
-                virtual_block: 0,
-                wraith_enabled: false,
-                sync_state: "unavailable",
-            },
-        },
-    };
-    let ghost_pay_status = match gp.sync_state {
-        "synced" => serde_json::json!({
-            "status": "running",
-            "epoch": gp.epoch,
-            "virtual_block": gp.virtual_block
-        }),
-        "disabled" => serde_json::json!({
-            "status": "not_enabled",
-            "message": "Ghost Pay not configured"
-        }),
-        _ => serde_json::json!({
-            "status": "error",
-            "message": "Ghost Pay not responding"
-        }),
-    };
-
     // Check GSP (Ghost Service Protocol) status for light wallet support
     let gsp_status = if let Some(gsp_info) = state.get_gsp_info() {
         serde_json::json!({
@@ -5081,11 +4763,6 @@ async fn api_watchdog_status_handler(
             "details": ghost_core_status
         }),
         serde_json::json!({
-            "name": "ghost-pay",
-            "status": ghost_pay_status.get("status").and_then(|s| s.as_str()).unwrap_or("not_enabled"),
-            "details": ghost_pay_status
-        }),
-        serde_json::json!({
             "name": "gsp",
             "status": gsp_status.get("status").and_then(|s| s.as_str()).unwrap_or("not_enabled"),
             "details": gsp_status
@@ -5108,15 +4785,6 @@ async fn api_watchdog_status_handler(
             "name": "ghost-core",
             "port": 8332,
             "status": if ghost_core_status.get("status").and_then(|s| s.as_str()) == Some("running") { "ok" } else { "error" },
-            "last_check": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        }),
-        serde_json::json!({
-            "name": "ghost-pay",
-            "port": 8800,
-            "status": if ghost_pay_status.get("status").and_then(|s| s.as_str()) == Some("running") { "ok" } else { "down" },
             "last_check": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -5967,44 +5635,6 @@ async fn api_payout_history_handler(
     }))
 }
 
-/// API v1 Ghost Pay payout history handler
-async fn api_ghostpay_payout_history_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let ghost_id = format!("ghost{}", &health.node_id[..8.min(health.node_id.len())]);
-
-    // Query withdrawals as GhostPay payouts
-    let (payouts, total) = if let Some(ref db) = state.database {
-        let withdrawals = db.get_pending_withdrawals(&ghost_id).unwrap_or_default();
-        let payouts_json: Vec<_> = withdrawals
-            .iter()
-            .map(|w| {
-                serde_json::json!({
-                    "id": w.id,
-                    "lock_id": w.lock_id,
-                    "destination": w.destination_address,
-                    "amount_sats": w.amount_sats,
-                    "fee_sats": w.fee_sats,
-                    "status": format!("{:?}", w.status),
-                    "batch_id": w.batch_id,
-                    "l1_txid": w.l1_txid,
-                    "created_at": w.created_at
-                })
-            })
-            .collect();
-        let total = payouts_json.len();
-        (payouts_json, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "payouts": payouts,
-        "total": total
-    }))
-}
-
 /// API v1 Rewards node history handler
 /// Optional `?time_filter=7d|30d|all` window for history endpoints.
 #[derive(Debug, Deserialize)]
@@ -6314,7 +5944,6 @@ fn qualification_scoped_set_report(state: &VerificationState) -> serde_json::Val
 /// (pool.toml) — NOT the ephemeral `dashboard_config` mirror — so a
 /// POST→`save_atomic`→GET round-trips the value from disk:
 ///   * `payout.address`           ← `pool.node_payout_address`
-///   * `payout.ghostpay_address`   ← `ghost_pay.payout_address`
 ///   * `public_mining`            ← `network.mining_mode == PublicPool`
 ///   * `pool_name`                ← `pool.pool_name`
 ///   * `archive_mode`             ← `storage.archive_mode`
@@ -6337,10 +5966,6 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
             (
                 serde_json::json!({
                     "address": cfg.pool.node_payout_address,
-                    "ghostpay_address": cfg
-                        .ghost_pay
-                        .as_ref()
-                        .and_then(|gp| gp.payout_address.clone()),
                 }),
                 matches!(
                     cfg.network.mining_mode,
@@ -6366,7 +5991,6 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
             (
                 serde_json::json!({
                     "address": serde_json::Value::Null,
-                    "ghostpay_address": serde_json::Value::Null,
                 }),
                 config.public_mining,
                 config.pool_name.clone(),
@@ -6548,17 +6172,6 @@ async fn api_config_daemon_handler(
         // Terminal result of the last automatic ghostd apply.
         "ghostd_apply": apply,
         "message": "ghostd daemon launch settings (restart-required)",
-    }))
-}
-
-/// API v1 Config ghost pay handler
-async fn api_config_ghost_pay_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(serde_json::json!({
-        "enabled": config.ghost_pay,
-        "message": "Ghost Pay configuration"
     }))
 }
 
@@ -8661,20 +8274,6 @@ async fn api_alerts_service_restart_post_handler(
     Json(serde_json::json!({ "success": true, "dispatched": dispatched })).into_response()
 }
 
-/// API v1 Config ghost_pay POST handler
-async fn api_config_ghost_pay_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ToggleRequest>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.ghost_pay = payload.enabled;
-    Json(serde_json::json!({
-        "success": true,
-        "enabled": payload.enabled,
-        "message": "Ghost Pay updated"
-    }))
-}
-
 /// API v1 Config elder handler (READ-ONLY status).
 ///
 /// Elder status is NOT operator-set: the Elder capability (+1 share) is earned
@@ -8799,59 +8398,6 @@ async fn api_mining_public_handler(
         "enabled": health.capabilities.public_mining,
         "miners": miners,
         "total": total
-    }))
-}
-
-// ============================================================================
-// Ghost Pay Endpoints
-// ============================================================================
-
-/// API v1 Ghost Pay pruning handler
-///
-/// Reports the L2 (ghost-pay) lock-pruning status. L2 lock pruning is not an
-/// operator-configurable setting: there is no persisted config field for it, so
-/// this returns a stable "disabled" default (no locks pruned by threshold). This
-/// is deliberately decoupled from L1 block pruning (`storage.prune_height`) —
-/// block-storage pruning and L2 lock retention are unrelated concerns.
-async fn api_ghostpay_pruning_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "enabled": false,
-        "threshold_sats": 0,
-        "last_prune": null
-    }))
-}
-
-// ============================================================================
-// Settings Endpoints
-// ============================================================================
-
-/// API v1 Settings ghostpay payout address handler
-///
-/// Reports the GhostPay L2 payout address from the REAL persisted config
-/// (`[ghost_pay] payout_address` in pool.toml), NOT the ephemeral dashboard
-/// mirror. This is the address GhostPay L2 transaction-fee distributions settle
-/// to.
-async fn api_settings_ghostpay_payout_address_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let address = state.full_node_config.as_ref().and_then(|c| {
-        c.read()
-            .ghost_pay
-            .as_ref()
-            .and_then(|gp| gp.payout_address.clone())
-    });
-
-    let message = if address.is_some() {
-        "Ghost Pay payout address"
-    } else {
-        "No Ghost Pay payout address configured"
-    };
-
-    Json(serde_json::json!({
-        "address": address,
-        "message": message
     }))
 }
 
@@ -9502,8 +9048,6 @@ pub struct ConfigUpdateRequest {
     pub solo_payout_address: Option<String>,
     /// Policy profile: "bitcoin_pure", "permissive", "full_open", or "custom"
     pub policy_profile: Option<String>,
-    /// Enable/disable Ghost Pay L2
-    pub ghost_pay_enabled: Option<bool>,
 }
 
 /// Response from config update API
@@ -9742,7 +9286,6 @@ fn validate_address_prefix(address: &str, network: ghost_common::config::Bitcoin
 /// - private_mining_password: required for private modes
 /// - solo_payout_address: required for PrivateSolo
 /// - policy_profile: bitcoin_pure/permissive/full_open/custom
-/// - ghost_pay_enabled: toggle L2 on/off
 async fn api_config_update_handler(
     State(state): State<Arc<VerificationState>>,
     Json(request): Json<ConfigUpdateRequest>,
@@ -9905,26 +9448,6 @@ async fn api_config_update_handler(
                 )
                     .into_response();
             }
-        }
-    }
-
-    // Apply ghost_pay_enabled
-    if let Some(enabled) = request.ghost_pay_enabled {
-        if let Some(ref mut gp) = config.ghost_pay {
-            gp.enabled = enabled;
-            updated_fields.push("ghost_pay_enabled".to_string());
-        } else if enabled {
-            // Can't enable ghost_pay if not configured at all
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: "Cannot enable ghost_pay: [ghost_pay] section not configured in config"
-                        .to_string(),
-                    code: "GHOST_PAY_NOT_CONFIGURED".to_string(),
-                }),
-            )
-                .into_response();
         }
     }
 
@@ -11389,74 +10912,6 @@ async fn watchdog_service_control(service: &str, action: &str) -> axum::response
         )
             .into_response(),
     }
-}
-
-/// GhostPay payout address body
-#[derive(Debug, Deserialize)]
-struct GhostPayAddressBody {
-    address: Option<String>,
-}
-
-/// API v1 Settings: Set GhostPay payout address (POST)
-///
-/// Persists the operator's GhostPay L2 payout address to the REAL config
-/// (`[ghost_pay] payout_address` in pool.toml) via `save_atomic`, so it survives
-/// a restart and is read by the L2 settlement path. A null/empty address clears
-/// the setting. Non-empty addresses are validated against the node's network
-/// prefix so a typo can't silently redirect L2 fee distributions.
-async fn api_settings_ghostpay_payout_address_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<GhostPayAddressBody>,
-) -> impl IntoResponse {
-    // Normalise: trim and treat empty as "clear" (None).
-    let new_address: Option<String> = match body.address {
-        Some(ref a) if !a.trim().is_empty() => Some(a.trim().to_string()),
-        _ => None,
-    };
-
-    // Validate non-empty addresses against the node's network prefix.
-    if let Some(ref addr) = new_address {
-        if !validate_address_prefix(addr, state.network) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!(
-                        "Invalid address prefix for {} network",
-                        state.network.as_str()
-                    ),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    // Persist to pool.toml. GhostPayConfig is optional; create a default when the
-    // operator sets an address before ghost-pay is otherwise configured.
-    let persist = persist_full_config(&state, |cfg| match cfg.ghost_pay {
-        Some(ref mut gp) => gp.payout_address = new_address.clone(),
-        None => {
-            cfg.ghost_pay = Some(ghost_common::config::GhostPayConfig {
-                payout_address: new_address.clone(),
-                ..Default::default()
-            });
-        }
-    });
-    if let Err((code, msg)) = persist {
-        error!(error = %msg, "Failed to persist GhostPay payout address");
-        return (
-            code,
-            Json(serde_json::json!({"success": false, "error": msg})),
-        )
-            .into_response();
-    }
-
-    Json(serde_json::json!({
-        "success": true,
-        "address": new_address,
-        "message": "GhostPay payout address saved."
-    }))
-    .into_response()
 }
 
 /// Mining toggle body
@@ -12992,59 +12447,6 @@ mod tests {
         Arc::new(state)
     }
 
-    /// #1014: a node with GhostPay disabled in its config reported `ghost_pay: true` and counted
-    /// the +4, so the fleet's dashboards said 10 shares on nodes ratified at 6.
-    #[tokio::test]
-    async fn node_shares_counts_ghostpay_only_when_the_node_config_enables_it() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        async fn shares(cfg: FullNodeConfig) -> serde_json::Value {
-            let state = Arc::new(
-                crate::server::VerificationState::new(
-                    "test_node".to_string(),
-                    "1.0.0".to_string(),
-                    PolicyProfile::default(),
-                    NodeCapabilities::default(),
-                )
-                .with_full_node_config(cfg, std::path::PathBuf::from("/nonexistent/pool.toml")),
-            );
-            let resp = api_node_shares_handler(axum::extract::State(state))
-                .await
-                .into_response();
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .expect("body");
-            serde_json::from_slice(&body).expect("json")
-        }
-
-        // What every fleet node carries: a `[ghost_pay]` block that is present and disabled.
-        let disabled = FullNodeConfig {
-            ghost_pay: Some(ghost_common::config::GhostPayConfig {
-                enabled: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let off = shares(disabled).await;
-        assert_eq!(off["ghost_pay"], false);
-
-        let enabled = FullNodeConfig {
-            ghost_pay: Some(ghost_common::config::GhostPayConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let on = shares(enabled).await;
-        assert_eq!(on["ghost_pay"], true);
-
-        // The +4 is the whole difference between the two, so it is counted exactly when claimed.
-        let total = |v: &serde_json::Value| v["total"].as_i64().expect("total");
-        assert_eq!(total(&on) - total(&off), 4, "off={off} on={on}");
-    }
-
     /// #1002: the scoped-set derivation is seconds of synchronous database work, so it must not
     /// run on the thread that is serving requests. On a current-thread runtime that thread is
     /// this test's, which makes "ran somewhere else" directly observable.
@@ -13979,10 +13381,6 @@ mod tests {
         cfg.storage.archive_mode = true;
         cfg.storage.prune_height = 5000;
         cfg.network.mining_mode = MiningMode::PublicPool;
-        cfg.ghost_pay = Some(ghost_common::config::GhostPayConfig {
-            payout_address: Some("tb1qghostpayaddr".to_string()),
-            ..Default::default()
-        });
 
         let state = Arc::new(
             crate::server::VerificationState::new(
@@ -14021,10 +13419,6 @@ mod tests {
             Some("tb1qexamplepayoutaddr")
         );
         // GhostPay payout address now surfaces from the real config (Group C).
-        assert_eq!(
-            json["payout"]["ghostpay_address"].as_str(),
-            Some("tb1qghostpayaddr")
-        );
         assert_eq!(json["pool_name"].as_str(), Some("SatoshiPool"));
         assert_eq!(json["archive_mode"].as_bool(), Some(true));
         assert_eq!(json["public_mining"].as_bool(), Some(true));
@@ -14156,107 +13550,6 @@ mod tests {
             reloaded.pool.node_payout_address.as_deref(),
             Some("tb1qsignetpayoutaddress")
         );
-    }
-
-    /// Group C: GhostPay payout POST persists `[ghost_pay] payout_address`,
-    /// rejects a wrong-network prefix, and the dedicated GET reads it back.
-    #[tokio::test]
-    async fn test_ghostpay_payout_address_post_persists_and_reads_back() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
-        );
-
-        let post = |body: &'static str| {
-            let state = Arc::clone(&state);
-            let auth = auth.clone();
-            async move {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let signature = auth.sign(timestamp, body.as_bytes());
-                super::create_router(state)
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/api/v1/settings/ghostpay_payout_address")
-                            .header("Content-Type", "application/json")
-                            .header("X-Ghost-Signature", signature)
-                            .header("X-Ghost-Timestamp", timestamp.to_string())
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap()
-            }
-        };
-
-        // Wrong-network (mainnet) prefix on a Signet node → 400, nothing persisted
-        // (the config is unchanged; no file is written on the rejected path).
-        let bad = post(r#"{"address": "bc1qmainnetaddress"}"#).await;
-        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-        assert!(state
-            .full_node_config
-            .as_ref()
-            .unwrap()
-            .read()
-            .ghost_pay
-            .as_ref()
-            .and_then(|gp| gp.payout_address.as_ref())
-            .is_none());
-
-        // Correct signet prefix → 200 and persisted to disk (ghost_pay created).
-        let good = post(r#"{"address": "tb1qsignetghostpayaddr"}"#).await;
-        assert_eq!(good.status(), StatusCode::OK);
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert_eq!(
-            reloaded
-                .ghost_pay
-                .as_ref()
-                .and_then(|gp| gp.payout_address.as_deref()),
-            Some("tb1qsignetghostpayaddr")
-        );
-
-        // The dedicated GET reads the persisted value back (not a hardcoded null).
-        let get_resp = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/settings/ghostpay_payout_address")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(get_resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(get_resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["address"].as_str(), Some("tb1qsignetghostpayaddr"));
-
-        // Clearing with an empty address resets the field to None.
-        let cleared = post(r#"{"address": ""}"#).await;
-        assert_eq!(cleared.status(), StatusCode::OK);
-        assert!(FullNodeConfig::load(&path)
-            .unwrap()
-            .ghost_pay
-            .and_then(|gp| gp.payout_address)
-            .is_none());
     }
 
     /// Group C: Operator Window POST persists `storage.prune_height` and clamps a
@@ -14536,7 +13829,6 @@ mod tests {
             "/api/v1/config/policy_custom",
             "/api/v1/config/public_mining",
             "/api/v1/config/reaper",
-            "/api/v1/config/ghost_pay",
             "/api/v1/config/elder",
             "/api/v1/config/operator_window",
         ];
@@ -14958,7 +14250,6 @@ mod tests {
             "/payouts",
             "/api/v1/payments",
             "/api/v1/network/payout-history",
-            "/api/v1/ghostpay/payout-history",
             "/api/v1/config/full",
             "/api/v1/config/alerts",
         ];
@@ -15139,7 +14430,6 @@ mod tests {
             l1_height: Some(912_345),
             uptime_percent: Some(99.7),
             peer_count: Some(3),
-            l2_height: Some(4_567),
         };
 
         let v = mesh_node_to_json(&node, false);
@@ -15155,7 +14445,6 @@ mod tests {
         assert_eq!(v["l1_height"], 912_345);
         assert_eq!(v["uptime_percent"], 99.7);
         assert_eq!(v["peer_count"], 3);
-        assert_eq!(v["l2_height"], 4_567);
         // Peers are never self.
         assert_eq!(v["is_self"], false);
         // Capabilities are nested exactly as the website expects.
@@ -15188,7 +14477,6 @@ mod tests {
             l1_height: None,
             uptime_percent: None,
             peer_count: None,
-            l2_height: None,
         };
 
         let v = mesh_node_to_json(&node, false);
@@ -15203,7 +14491,6 @@ mod tests {
         assert!(v["l1_height"].is_null());
         assert!(v["uptime_percent"].is_null());
         assert!(v["peer_count"].is_null());
-        assert!(v["l2_height"].is_null());
         assert!(v["capabilities"].is_object());
     }
 
@@ -15230,7 +14517,6 @@ mod tests {
             l1_height: Some(1),
             uptime_percent: Some(99.0),
             peer_count: Some(2),
-            l2_height: None,
         };
 
         // Registry says this node_id is an elder → elder=true everywhere.

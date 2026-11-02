@@ -12,8 +12,7 @@ use chrono::{DateTime, Utc};
 
 // Re-export shared types from ghost-reconciliation
 pub use ghost_reconciliation::fee_distribution::{
-    distribute_to_nodes, L2FeeDistribution, TreasuryState, DECAY_SCHEDULE_BPS,
-    TREASURY_THRESHOLD_SATS,
+    TreasuryState, DECAY_SCHEDULE_BPS, TREASURY_THRESHOLD_SATS,
 };
 
 /// Total pool fee in basis points (100 bps = 1% of subsidy)
@@ -626,74 +625,4 @@ mod tests {
     }
 
     // L2 Fee Distribution Tests
-
-    #[test]
-    fn test_l2_fee_distribution_pre_threshold() {
-        let state = TreasuryState::new();
-        let now = Utc::now();
-        let nodes = vec![
-            ("node1".to_string(), "addr1".to_string(), 4),
-            ("node2".to_string(), "addr2".to_string(), 4),
-        ];
-
-        let dist = L2FeeDistribution::calculate(1000, &state, now, &nodes);
-
-        assert_eq!(dist.treasury_amount, 500);
-        assert_eq!(dist.node_pool, 500);
-        assert_eq!(dist.treasury_amount + dist.node_pool, dist.total_fee_pool);
-    }
-
-    #[test]
-    fn test_l2_fee_distribution_year5() {
-        let now = Utc::now();
-        let threshold_time = now - chrono::Duration::days(365 * 6);
-        let state = TreasuryState::from_stored(TREASURY_THRESHOLD_SATS, Some(threshold_time));
-        let nodes = vec![("node1".to_string(), "addr1".to_string(), 4)];
-
-        let dist = L2FeeDistribution::calculate(1000, &state, now, &nodes);
-
-        assert_eq!(dist.treasury_amount, 0);
-        assert_eq!(dist.node_pool, 1000);
-    }
-
-    #[test]
-    fn test_l2_fee_distribution_no_nodes() {
-        let state = TreasuryState::new();
-        let now = Utc::now();
-
-        let dist = L2FeeDistribution::calculate(1000, &state, now, &[]);
-
-        assert_eq!(dist.treasury_amount, 500);
-        assert_eq!(dist.node_pool, 500);
-        assert!(dist.node_payouts.is_empty());
-    }
-
-    #[test]
-    fn test_l2_fee_distribution_dust_redirect() {
-        let state = TreasuryState::new();
-        let now = Utc::now();
-        let nodes = vec![
-            ("node1".to_string(), "addr1".to_string(), 100),
-            ("node2".to_string(), "addr2".to_string(), 1),
-        ];
-
-        let dist = L2FeeDistribution::calculate(1000, &state, now, &nodes);
-
-        assert_eq!(dist.node_payouts.len(), 1);
-        assert_eq!(dist.node_payouts[0].0, "node1");
-        assert_eq!(dist.node_payouts[0].2, 500);
-    }
-
-    #[test]
-    fn test_l2_fee_distribution_zero_pool() {
-        let state = TreasuryState::new();
-        let now = Utc::now();
-        let nodes = vec![("node1".to_string(), "addr1".to_string(), 4)];
-
-        let dist = L2FeeDistribution::calculate(0, &state, now, &nodes);
-
-        assert_eq!(dist.treasury_amount, 0);
-        assert_eq!(dist.node_pool, 0);
-        assert!(dist.node_payouts.is_empty());
-    }
 }

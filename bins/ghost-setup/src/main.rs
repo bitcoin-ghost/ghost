@@ -43,9 +43,6 @@ struct Args {
     /// Enable archive mode
     #[arg(long, default_value = "true")]
     archive: bool,
-    /// Enable Ghost Pay
-    #[arg(long, default_value = "true")]
-    ghost_pay: bool,
     /// Enable Reaper
     #[arg(long, default_value = "true")]
     reaper: bool,
@@ -101,7 +98,6 @@ fn main() {
         fields.insert("payout_address".to_string(), FieldValue::Text(addr.clone()));
     }
     fields.insert("archive_mode".to_string(), FieldValue::Bool(args.archive));
-    fields.insert("ghost_pay".to_string(), FieldValue::Bool(args.ghost_pay));
     fields.insert("reaper".to_string(), FieldValue::Bool(args.reaper));
 
     let profile_idx = match args.mempool_profile.as_str() {

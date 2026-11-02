@@ -1498,7 +1498,7 @@ TREASURY_EOF
 }
 
 # ══════════════════════════════════════════════════════════════════════
-# Phase 6: Capability Verification (4 tests)
+# Phase 6: Capability Verification (3 tests)
 # ══════════════════════════════════════════════════════════════════════
 
 phase_6() {
@@ -1600,27 +1600,6 @@ print(r.get('capabilities', {}).get('reaper', False))
         fi
     done
     if $bp_ok; then pass; else fail "${VM_NAMES[$i]} reaper=$bp unexpected"; fi
-
-    # 6.4 Ghost Pay verified on all
-    run_test "6.4" "Ghost Pay: all 4 nodes report ghost_pay=true"
-    local gp_ok=true
-    for i in "${!ALL_IPS[@]}"; do
-        local ip="${ALL_IPS[$i]}"
-        local health
-        health=$(api_get "$ip" "/health?unsigned=true")
-        local gp
-        gp=$(echo "$health" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-r = d.get('response', d)
-print(r.get('capabilities', {}).get('ghost_pay', False))
-" 2>/dev/null)
-        if [[ "$gp" != "True" && "$gp" != "true" ]]; then
-            gp_ok=false
-            break
-        fi
-    done
-    if $gp_ok; then pass; else fail "${VM_NAMES[$i]} ghost_pay=$gp"; fi
 }
 
 # ══════════════════════════════════════════════════════════════════════

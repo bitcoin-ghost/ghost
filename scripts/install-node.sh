@@ -842,22 +842,11 @@ shard_coinbase = true
 
 ${ALERTS_BLOCK}
 
-# Ghost Pay is retired and \`enabled\` is hard-false. The section stays because
-# NodeConfig still reads it.
-[ghost_pay]
-enabled = false
-virtual_block_secs = 10
-epoch_blocks = 100
-
 # NOTE (#760): the keys removed from the blocks above and below were read by NOTHING. There is no
 # \`#[serde(deny_unknown_fields)]\` on NodeConfig, so they parsed, were discarded, and produced no
 # warning — while reading, to anyone opening the file, exactly like settings that were in force:
 #
 #   pool.treasury_fee_percent      no such field on PoolConfig; the split is a constant
-#   ghost_pay.transfer_fee_bps     no such field on GhostPayConfig
-#   ghost_pay.min_transfer_fee_sats  ditto
-#   ghost_pay.wraith_fee_percent   ditto
-#   ghost_pay.http_port            ditto (network.http_port is real; this one was not)
 #   reaper.mode                    no such field on ReaperSettings; the controls are reject_*
 #
 # The whole [tdp] section went with them. TDP is configured on the COMMAND LINE, not in this file:
@@ -1444,10 +1433,8 @@ ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
-ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications + MPC contribution/vote exchange)
-ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS (peers fetch MPC params + votes)
-# Ghost Pay L2 (peers issue Ghost Pay verification challenges here) — only
-# when enabled.
+ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications)
+ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.

@@ -358,10 +358,6 @@ pub struct MeshNetwork {
     /// uptime as a percentage (0-100), gossiped in health pings. Returns `None`
     /// when there are no samples yet; absent provider → `None` in the ping.
     uptime_percent_fn: Option<Arc<dyn Fn() -> Option<f64> + Send + Sync>>,
-    /// Application-provided callback returning this node's Ghost Pay L2
-    /// virtual-block height, gossiped in health pings. `None` when ghost-pay
-    /// isn't running / the tip is unknown; absent provider → `None` in the ping.
-    l2_height_fn: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     /// Application-provided callback reporting whether this node's own Ghost Core is reachable,
     /// gossiped in health pings so peers can route around a node whose `ghostd` is down (#778).
     ///
@@ -1535,7 +1531,6 @@ impl MeshNetwork {
             best_records_fn: None,
             l1_height_fn: None,
             uptime_percent_fn: None,
-            l2_height_fn: None,
             core_healthy_fn: None,
             max_capacity: AtomicU32::new(0),
             coordinator_sessions: AtomicU32::new(0),
@@ -1654,13 +1649,6 @@ impl MeshNetwork {
     /// Returns `None` when there are no samples yet.
     pub fn set_uptime_percent_provider(&mut self, f: Arc<dyn Fn() -> Option<f64> + Send + Sync>) {
         self.uptime_percent_fn = Some(f);
-    }
-
-    /// Set a callback providing this node's Ghost Pay L2 virtual-block height,
-    /// gossiped in health pings. Returns `None` when ghost-pay isn't running or
-    /// the L2 tip isn't known yet.
-    pub fn set_l2_height_provider(&mut self, f: Arc<dyn Fn() -> Option<u64> + Send + Sync>) {
-        self.l2_height_fn = Some(f);
     }
 
     /// Set the provider reporting whether this node's own Ghost Core is reachable (#778).
@@ -3596,12 +3584,11 @@ impl MeshNetwork {
                 .map(|f| f())
                 .unwrap_or_default();
             // Swarm-page telemetry gossiped for peers to render. L1 height comes
-            // from a provider (fallback 0 = "unknown"); uptime % and L2 height
-            // are Option (None when unavailable); peer_count is this node's own
+            // from a provider (fallback 0 = "unknown"); uptime % is
+            // Option (None when unavailable); peer_count is this node's own
             // deduplicated view, matching the self figure the swarm endpoint uses.
             let block_height = self.l1_height_fn.as_ref().map(|f| f()).unwrap_or(0);
             let uptime_percent = self.uptime_percent_fn.as_ref().and_then(|f| f());
-            let l2_height = self.l2_height_fn.as_ref().and_then(|f| f());
             let peer_count = Some(self.peers.unique_peer_count() as u32);
             let ping = ghost_common::types::HealthPing {
                 node_id: self.identity.node_id(),
@@ -3630,7 +3617,6 @@ impl MeshNetwork {
                 coordinator_sessions: self.coordinator_sessions.load(Ordering::Relaxed),
                 uptime_percent,
                 peer_count,
-                l2_height,
                 // Operator-chosen, read from config — advertise our payout address so
                 // every peer's node registry converges (see HealthPing::payout_address).
                 payout_address: self.config.advertised_payout_address.clone(),

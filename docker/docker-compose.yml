@@ -8,7 +8,6 @@
 #   - bitcoind: Bitcoin Core (ghost-core fork)
 #   - ghost-pool: Mining pool node
 #   - translator: SV1 to SV2 protocol translator
-#   - ghost-pay: L2 instant payments (optional)
 #   - prometheus: Metrics collection
 #   - grafana: Metrics visualization
 
@@ -120,36 +119,6 @@ services:
       - sv1
 
   # ============================================================================
-  # Ghost Pay - L2 Instant Payments (Optional)
-  # ============================================================================
-  ghost-pay:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      target: ghost-pay
-    image: bitcoin-ghost/ghost-pay:${VERSION:-latest}
-    container_name: ghost-pay
-    restart: unless-stopped
-    depends_on:
-      ghost-pool:
-        condition: service_healthy
-    volumes:
-      - ghostpay-data:/var/lib/ghost
-      - ./config/ghost-pay.toml:/etc/ghost/config.toml:ro
-    ports:
-      - "8081:8081"      # L2 API
-    networks:
-      - ghost-network
-    environment:
-      - POOL_HOST=ghost-pool
-      - POOL_PORT=8080
-      - VIRTUAL_BLOCK_SECS=${VIRTUAL_BLOCK_SECS:-10}
-      - EPOCH_BLOCKS=${EPOCH_BLOCKS:-100}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-    profiles:
-      - l2
-
-  # ============================================================================
   # Prometheus - Metrics Collection
   # ============================================================================
   prometheus:
@@ -217,8 +186,6 @@ volumes:
   ghost-data:
     driver: local
   ghost-config:
-    driver: local
-  ghostpay-data:
     driver: local
   prometheus-data:
     driver: local

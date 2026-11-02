@@ -1203,9 +1203,6 @@ pub struct MeshNodeInfo {
     /// The number of mesh peers this node itself reported seeing. `None` when
     /// not reported (older peer) → "—".
     pub peer_count: Option<u32>,
-    /// This node's Ghost Pay L2 virtual-block height. `None` when the node
-    /// doesn't run ghost-pay (or is an older peer) → "—".
-    pub l2_height: Option<u64>,
 }
 
 /// Outcome of the most recent automatic `ghost-setup apply-reaper` run.
@@ -2360,7 +2357,7 @@ impl VerificationState {
     /// Set the full node configuration (pool.toml) for config update API
     ///
     /// This allows the config update API to modify settings like mining_mode,
-    /// policy_profile, ghost_pay_enabled, etc. and persist them to disk.
+    /// policy_profile, etc. and persist them to disk.
     ///
     /// # Arguments
     /// * `config` - The full NodeConfig loaded from pool.toml
@@ -2375,11 +2372,9 @@ impl VerificationState {
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.archive_mode = config.storage.archive_mode;
-            // Same rule for GhostPay (#1014). The default is `true`, and with nothing
-            // overwriting it every node reported the +4 as claimed and `/api/v1/node/shares`
-            // answered 10 on a fleet ratified at 6. `ghost_pay_enabled()` is what the
-            // advertised capability is built from, so the display now matches the claim.
-            dashboard.ghost_pay = config.ghost_pay_enabled();
+            // Same rule for GhostPay (#1014): the display matches the claim, and Ghost Pay is
+            // removed, so the node never claims it.
+            dashboard.ghost_pay = false;
         }
         self.full_node_config = Some(parking_lot::RwLock::new(config));
         self.full_node_config_path = Some(path);
