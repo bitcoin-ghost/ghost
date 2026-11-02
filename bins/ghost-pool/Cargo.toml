@@ -50,7 +50,6 @@ ghost-buds = { workspace = true }
 ghost-reaper = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-storage = { workspace = true }
-ghost-consensus = { workspace = true }
 ghost-verification = { workspace = true }
 
 # Async runtime

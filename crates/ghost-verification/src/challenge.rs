@@ -70,7 +70,8 @@ pub struct HealthResponse {
     pub round_id: u64,
     /// Connected miners
     pub miner_count: u32,
-    /// Connected peers
+    /// Always 0: the old mesh was removed. Kept so existing readers of `/health` still parse;
+    /// share-chain relay peers are on `/api/v1/node-pool/status`.
     pub peer_count: u32,
     /// Uptime (seconds)
     pub uptime_secs: u64,
@@ -87,28 +88,6 @@ pub struct HealthResponse {
     /// behind another caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_connection: Option<DbConnectionStats>,
-    /// Mesh message-validation counters, or `null` if not wired.
-    ///
-    /// #591: these were incremented on every rejected message and read by nobody, so an oversized
-    /// or malformed-message storm was invisible — the same blindness that let #558 and #583 run
-    /// for weeks. A counter with no reader is not instrumentation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mesh_validation: Option<MeshValidationStats>,
-}
-
-/// Mesh message-validation counters surfaced on `/health`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-pub struct MeshValidationStats {
-    pub total: u64,
-    pub valid: u64,
-    pub too_small: u64,
-    pub too_large: u64,
-    pub bad_version: u64,
-    pub bad_type: u64,
-    pub bad_signature: u64,
-    pub bad_timestamp: u64,
-    pub other_errors: u64,
-    pub memory_limit_exceeded: u64,
 }
 
 /// Maximum age of a signed response before it's considered stale (5 minutes)
@@ -285,7 +264,6 @@ mod tests {
     fn test_signed_response_creation() {
         let health = HealthResponse {
             db_connection: None,
-            mesh_validation: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),
@@ -319,7 +297,6 @@ mod tests {
     fn test_signed_response_timestamp_validation() {
         let health = HealthResponse {
             db_connection: None,
-            mesh_validation: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),

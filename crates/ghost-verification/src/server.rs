@@ -30,7 +30,6 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::types::WindowBestRecord;
 use ghost_storage::Database;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -1035,99 +1034,6 @@ impl Default for DashboardConfig {
 }
 
 /// Verification server state
-/// Peer info for the load-balancer endpoint (`/api/internal/pool-nodes`).
-///
-/// `max_capacity` is the peer's hardware-derived ceiling. The translator's
-/// load balancer divides `miner_count` by `max_capacity` to compute
-/// utilisation and route new connections to the under-utilised peer; an
-/// operator with bigger hardware naturally absorbs more.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PoolPeerInfo {
-    pub public_address: String,
-    pub miner_count: u32,
-    pub last_seen: u64,
-    /// Peer's effective max miners (derived from CPU/RAM/FD, capped by
-    /// operator's `network.max_miners` if set). 0 means the peer hasn't
-    /// reported it yet (treated as "unknown" / excluded from routing).
-    #[serde(default)]
-    pub max_capacity: u32,
-    /// Deduplicated share of the mesh-wide active-miner total attributed to
-    /// this peer: each unique miner-id hash is owned by exactly one node
-    /// (freshest gossip wins, ties by node id), so summing this across all
-    /// nodes (self + peers) equals the deduped `mesh_active_miners` grand total.
-    /// The raw `miner_count` above is kept unchanged for the translator load
-    /// balancer (utilisation = miner_count / max_capacity); this field is for
-    /// the Capacity page's per-node breakdown, which must not double-count a
-    /// miner that fails over between nodes.
-    #[serde(default)]
-    pub deduped_miner_count: u32,
-    /// Whether this peer's own Ghost Core was reachable at its last health ping (#778).
-    ///
-    /// `None` = the peer has never reported it (older build, or not yet pinged). The translator
-    /// must treat that as "keep routing here", NOT as unhealthy: assuming the worst on absence
-    /// would divert every miner away from every peer the moment a rolling deploy put one node
-    /// ahead of the rest.
-    #[serde(default)]
-    pub core_healthy: Option<bool>,
-    /// The peer's SV1 hobby listener, or `None` if it does not advertise one. The translator
-    /// treats absence as "serves the default 3333", which is what every node did before the farm
-    /// tier existed (#495).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hobby_port: Option<u16>,
-    /// The peer's SV1 farm listener. `None` means "no farm tier" OR "too old to say", and both
-    /// disqualify it as a farm routing target — assuming a port is how a farm miner ends up on a
-    /// hobby floor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub farm_port: Option<u16>,
-}
-
-/// One mesh node as surfaced by the public `/api/v1/pool/mesh-nodes`
-/// endpoint. Carries only the gossiped, already-public fields a peer
-/// advertises in its health pings, so the website can render the live
-/// node list (self + every connected peer) without hard-coding the
-/// original VM set. Filled by a callback in `bins/ghost-pool` from each
-/// `Peer` returned by `PeerManager::get_connected_peers`, keeping the
-/// `ghost-consensus` peer type out of this crate's public surface.
-///
-#[derive(Debug, Clone)]
-pub struct MeshNodeInfo {
-    /// Node ID (hex).
-    pub node_id: String,
-    /// Public address (`host:port`) the peer advertises. May be empty if
-    /// the peer has not published one yet.
-    pub address: String,
-    /// The node's own realized hashrate (TH/s) over its trailing window.
-    pub hashrate_th: f64,
-    /// Miners currently connected to this node.
-    pub miner_count: u32,
-    /// Peer's hardware-derived miner capacity ceiling (derived from
-    /// CPU/RAM/FD, capped by the operator's `network.max_miners` if set).
-    /// `0` means the peer has not gossiped it yet (rendered as "unknown" on
-    /// the Capacity page rather than a real ceiling). Surfaced here so the
-    /// Capacity table can show every mesh node — including community nodes
-    /// that don't advertise the `public_mining` capability the load-balancer
-    /// `pool-nodes` path filters on — against its utilisation ceiling.
-    pub max_capacity: u32,
-    /// Deduplicated share of the mesh-wide active-miner total attributed to
-    /// this node: each unique miner-id hash is owned by exactly one node, so
-    /// summing this across the mesh-nodes list (self + peers) equals the
-    /// deduped grand total. The raw `miner_count` is retained for display; this
-    /// is the sum-consistent figure that avoids double-counting fail-over.
-    pub deduped_miner_count: u32,
-    /// Whether the node is considered healthy/reachable on the mesh.
-    pub healthy: bool,
-    /// This node's L1 (Bitcoin) block height, from its most recent health ping.
-    /// `None` when the peer hasn't reported it (older build) so the Swarm page
-    /// renders "—" instead of a misleading 0.
-    pub l1_height: Option<u64>,
-    /// This node's trailing-7-day uptime percentage (0-100), from its health
-    /// ping. `None` when not reported (older peer / no samples) → "—".
-    pub uptime_percent: Option<f64>,
-    /// The number of mesh peers this node itself reported seeing. `None` when
-    /// not reported (older peer) → "—".
-    pub peer_count: Option<u32>,
-}
-
 /// Outcome of the most recent automatic `ghost-setup apply-reaper` run.
 ///
 /// The reaper config POST persists `[reaper]` to `pool.toml` and then, in the
@@ -1264,18 +1170,12 @@ pub struct VerificationState {
     get_round_id: Box<dyn Fn() -> u64 + Send + Sync>,
     /// Miner count getter (callback)
     get_miner_count: Box<dyn Fn() -> u32 + Send + Sync>,
-    /// Peer count getter (callback)
-    get_peer_count: Box<dyn Fn() -> u32 + Send + Sync>,
     /// Liveness of Ghost Core: `(reachable, seconds since it last answered)`.
     ///
     /// Optional so an unwired caller reports `core_reachable: null` — "unknown" — rather than
     /// silently claiming health. Defaulting an unwired probe to `true` is precisely the bug this
     /// replaces.
     get_core_health: Option<Box<dyn Fn() -> (bool, u64) + Send + Sync>>,
-    /// #591: mesh validation counters. Optional so an unwired caller reports `null` — "unknown" —
-    /// rather than a confident row of zeros that looks like a clean mesh.
-    get_mesh_validation:
-        Option<Box<dyn Fn() -> crate::challenge::MeshValidationStats + Send + Sync>>,
     /// GSP (Ghost Service Protocol) handler for light wallets
     gsp_handler: Option<Box<dyn GspHandler + Send + Sync>>,
     /// Database for queries (optional)
@@ -1329,39 +1229,17 @@ pub struct VerificationState {
     /// When true (default), server will fail to start if internal_auth is not configured
     /// When false, allows insecure mode for development/testing ONLY
     pub require_internal_auth: bool,
-    /// Pool peers callback: returns peers with public_mining + miner counts for load balancing.
-    get_pool_peers: Option<Box<dyn Fn() -> Vec<PoolPeerInfo> + Send + Sync>>,
     /// Reaper stats callback: returns a JSON-serializable snapshot of the
     /// cumulative ReaperStats counters. Pre-serialized to JSON because the
     /// concrete `ReaperStats` type lives in `bins/ghost-pool` and we don't
     /// want a reverse dep from ghost-verification.
     get_reaper_stats: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
-    /// Mesh-wide deduplicated active miner count callback. Returns the size
-    /// of the union of locally-active miner_id hashes and every connected
-    /// peer's most-recent reported set, giving an exact pool-wide active
-    /// count that's stable across the round rotations and load-balancer
-    /// hopping that make per-VM counts misleading when summed.
-    get_mesh_active_miners: Option<Box<dyn Fn() -> u32 + Send + Sync>>,
-    /// This node's (self) deduplicated share of the mesh-wide active-miner
-    /// total — the count attributed to our own node id by the same
-    /// per-node attribution that fills each peer's `deduped_miner_count`.
-    /// Surfaced on the `this_node`/self entries of the pool-nodes and
-    /// mesh-nodes responses so `self + peers` sum to `get_mesh_active_miners`.
-    /// None on older deploys without the provider wired.
-    get_self_deduped_miners: Option<Box<dyn Fn() -> u32 + Send + Sync>>,
-    /// Mesh-wide pool hashrate (TH/s): sum of every node's own realized
-    /// hashrate (one term per node, scoped by `received_by` at source so it
-    /// can't double-count), so load-balancer migrations don't crater or inflate
-    /// the figure. None on older deploys without the mesh provider wired up —
-    /// callers fall back to the node-local value.
-    get_mesh_total_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
-    /// This node's own realized hashrate (TH/s) over the trailing window — the
-    /// exact term it contributes to `get_mesh_total_hashrate`. Surfaced as
-    /// `local_hashrate_th` so the per-node and mesh figures reconcile.
+    /// This node's own realized hashrate (TH/s) over the trailing window,
+    /// surfaced as `local_hashrate_th`.
     get_local_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
     /// This node's own `received_by` key — `hex(node_id[..8])`, the same key
     /// local shares are stored under. Scopes the detailed miner list to
-    /// locally-connected miners (vs mesh-gossiped ones).
+    /// locally-connected miners.
     local_received_by: Option<String>,
     /// Live handle to the template processor's refresh cadence (ms), so the
     /// dashboard can retune it (10–60s) without restarting the pool.
@@ -1389,20 +1267,6 @@ pub struct VerificationState {
     /// the dashboard's round-progress readout can show how long the pool has
     /// been on the current template. None on deploys without the provider wired.
     get_round_elapsed_secs: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
-    /// Mesh-wide best (rarest) records per window: the connected peers'
-    /// gossiped `best_records`, already reduced to one winner per window.
-    /// The records endpoint merges this with the local DB best so it returns
-    /// the pool-wide rarest record even when the record-holding node is
-    /// momentarily unreachable. None on older deploys without the provider —
-    /// callers fall back to the node-local DB record only.
-    get_mesh_best_records: Option<Box<dyn Fn() -> Vec<WindowBestRecord> + Send + Sync>>,
-    /// Live mesh node list: every connected peer (NOT self) from
-    /// `PeerManager::get_connected_peers`, mapped to `MeshNodeInfo`. Backs the
-    /// public `/api/v1/pool/mesh-nodes` endpoint so the website renders the
-    /// whole mesh from one node instead of a hard-coded VM list. The handler
-    /// prepends this node (self) from local state. None on deploys without the
-    /// provider wired — the endpoint then returns just self.
-    get_mesh_nodes: Option<Box<dyn Fn() -> Vec<MeshNodeInfo> + Send + Sync>>,
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
@@ -1593,9 +1457,7 @@ impl VerificationState {
             )),
             get_round_id: Box::new(|| 0),
             get_miner_count: Box::new(|| 0),
-            get_peer_count: Box::new(|| 0),
             get_core_health: None,
-            get_mesh_validation: None,
             gsp_handler: None,
             database: None,
             rpc: None,
@@ -1608,11 +1470,7 @@ impl VerificationState {
             record_share_fn: None,
             block_found_fn: None,
             internal_auth: None,
-            get_pool_peers: None,
             get_reaper_stats: None,
-            get_mesh_active_miners: None,
-            get_self_deduped_miners: None,
-            get_mesh_total_hashrate: None,
             get_local_hashrate: None,
             local_received_by: None,
             template_refresh_ms: None,
@@ -1620,8 +1478,6 @@ impl VerificationState {
             coinbase_snapshot: None,
             node_pool_api: DEFAULT_NODE_POOL_API.to_string(),
             get_round_elapsed_secs: None,
-            get_mesh_best_records: None,
-            get_mesh_nodes: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
@@ -2258,12 +2114,10 @@ impl VerificationState {
         block_height: impl Fn() -> u64 + Send + Sync + 'static,
         round_id: impl Fn() -> u64 + Send + Sync + 'static,
         miner_count: impl Fn() -> u32 + Send + Sync + 'static,
-        peer_count: impl Fn() -> u32 + Send + Sync + 'static,
     ) -> Self {
         self.get_block_height = Box::new(block_height);
         self.get_round_id = Box::new(round_id);
         self.get_miner_count = Box::new(miner_count);
-        self.get_peer_count = Box::new(peer_count);
         self
     }
 
@@ -2272,16 +2126,6 @@ impl VerificationState {
     /// The callback returns `(reachable, seconds_since_last_success)`. Without it `/health` cannot
     /// claim the node is healthy — it reports `core_reachable: null` and leaves `healthy` false,
     /// because an unmeasured dependency is not a working one.
-    /// Wire the mesh validation counters into `/health` (#591). Without this they are incremented
-    /// and read by nobody, so a malformed-message storm is invisible.
-    pub fn with_mesh_validation(
-        mut self,
-        probe: impl Fn() -> crate::challenge::MeshValidationStats + Send + Sync + 'static,
-    ) -> Self {
-        self.get_mesh_validation = Some(Box::new(probe));
-        self
-    }
-
     pub fn with_core_health(
         mut self,
         probe: impl Fn() -> (bool, u64) + Send + Sync + 'static,
@@ -2308,23 +2152,6 @@ impl VerificationState {
         self.max_capacity.store(value, Ordering::Relaxed);
     }
 
-    /// Returns pool peers with public_mining enabled (for load balancer).
-    pub fn pool_peers(&self) -> Vec<PoolPeerInfo> {
-        self.get_pool_peers
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_default()
-    }
-
-    /// Set pool-peers callback for the load-balancer endpoint.
-    pub fn with_pool_peers(
-        mut self,
-        f: impl Fn() -> Vec<PoolPeerInfo> + Send + Sync + 'static,
-    ) -> Self {
-        self.get_pool_peers = Some(Box::new(f));
-        self
-    }
-
     /// Reaper observability snapshot, or `null` when not wired.
     pub fn reaper_stats(&self) -> serde_json::Value {
         self.get_reaper_stats
@@ -2343,47 +2170,16 @@ impl VerificationState {
         self
     }
 
-    /// Set the mesh-wide active-miner count callback.
-    pub fn with_mesh_active_miners(mut self, f: impl Fn() -> u32 + Send + Sync + 'static) -> Self {
-        self.get_mesh_active_miners = Some(Box::new(f));
-        self
-    }
-
-    /// Returns the mesh-wide deduplicated active miner count, or None if no
-    /// callback has been wired up (older deploys without the mesh provider).
-    pub fn mesh_active_miners(&self) -> Option<u32> {
-        self.get_mesh_active_miners.as_ref().map(|f| f())
-    }
-
-    /// Set the self (this-node) deduplicated active-miner-count callback.
-    pub fn with_self_deduped_miner_count(
-        mut self,
-        f: impl Fn() -> u32 + Send + Sync + 'static,
-    ) -> Self {
-        self.get_self_deduped_miners = Some(Box::new(f));
-        self
-    }
-
-    /// This node's deduplicated share of the mesh-wide active-miner total, or 0
-    /// when the provider isn't wired (older deploys) — in which case the
-    /// per-node breakdown simply omits self's deduped figure.
-    pub fn self_deduped_miner_count(&self) -> u32 {
-        self.get_self_deduped_miners
+    /// Miners active on this node in the shared active-miner window
+    /// (`ACTIVE_MINER_WINDOW_SECS`), from the database; 0 without one.
+    pub fn local_active_miners(&self) -> u32 {
+        self.database
             .as_ref()
-            .map(|f| f())
+            .and_then(|db| {
+                db.count_active_miners(ghost_common::constants::ACTIVE_MINER_WINDOW_SECS)
+                    .ok()
+            })
             .unwrap_or(0)
-    }
-
-    /// Set the mesh-wide pool hashrate (TH/s) callback.
-    pub fn with_mesh_total_hashrate(mut self, f: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
-        self.get_mesh_total_hashrate = Some(Box::new(f));
-        self
-    }
-
-    /// Returns the mesh-wide pool hashrate (TH/s), or None if no callback has
-    /// been wired up (older deploys without the mesh provider).
-    pub fn mesh_total_hashrate(&self) -> Option<f64> {
-        self.get_mesh_total_hashrate.as_ref().map(|f| f())
     }
 
     /// Set this node's own realized-hashrate (TH/s) callback.
@@ -2392,8 +2188,8 @@ impl VerificationState {
         self
     }
 
-    /// Returns this node's own realized hashrate (TH/s) — its contribution to
-    /// the mesh total — or None if no callback has been wired up.
+    /// Returns this node's own realized hashrate (TH/s), or None if no callback
+    /// has been wired up.
     pub fn local_hashrate(&self) -> Option<f64> {
         self.get_local_hashrate.as_ref().map(|f| f())
     }
@@ -2476,41 +2272,6 @@ impl VerificationState {
         self.get_round_elapsed_secs.as_ref().map(|f| f())
     }
 
-    /// Set the mesh-wide best-records-per-window callback.
-    pub fn with_mesh_best_records(
-        mut self,
-        f: impl Fn() -> Vec<WindowBestRecord> + Send + Sync + 'static,
-    ) -> Self {
-        self.get_mesh_best_records = Some(Box::new(f));
-        self
-    }
-
-    /// Returns the connected peers' best records per window (already reduced to
-    /// one winner per window), or None if no callback has been wired up.
-    pub fn mesh_best_records(&self) -> Option<Vec<WindowBestRecord>> {
-        self.get_mesh_best_records.as_ref().map(|f| f())
-    }
-
-    /// Set the live mesh-node-list callback (connected peers, not self).
-    pub fn with_mesh_nodes(
-        mut self,
-        f: impl Fn() -> Vec<MeshNodeInfo> + Send + Sync + 'static,
-    ) -> Self {
-        self.get_mesh_nodes = Some(Box::new(f));
-        self
-    }
-
-    /// Returns the connected peers as `MeshNodeInfo` (self excluded), or an
-    /// empty vec if no callback has been wired up. The `mesh-nodes` handler
-    /// prepends this node from local state, so an empty result still yields a
-    /// one-element (self-only) response rather than a failure.
-    pub fn mesh_nodes(&self) -> Vec<MeshNodeInfo> {
-        self.get_mesh_nodes
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_default()
-    }
-
     /// Set GSP handler for light wallet support
     pub fn with_gsp_handler(mut self, handler: impl GspHandler + 'static) -> Self {
         self.gsp_handler = Some(Box::new(handler));
@@ -2578,7 +2339,6 @@ impl VerificationState {
         });
         HealthResponse {
             db_connection,
-            mesh_validation: self.get_mesh_validation.as_ref().map(|p| p()),
             // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it
             // can reach Ghost Core, and saying "healthy" on that basis is what hid vm7's outage.
             healthy: core.map(|(reachable, _)| reachable).unwrap_or(false),
@@ -2589,7 +2349,8 @@ impl VerificationState {
             block_height: (self.get_block_height)(),
             round_id: (self.get_round_id)(),
             miner_count: (self.get_miner_count)(),
-            peer_count: (self.get_peer_count)(),
+            // The old mesh is gone; share-chain relay peers are on `/api/v1/node-pool/status`.
+            peer_count: 0,
             uptime_secs: self.start_time.elapsed().as_secs(),
         }
     }
@@ -3062,7 +2823,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_callbacks(|| 960_000, || 1, || 1)
             .with_share_pow_verify_height(959_030);
 
         // A genuine share: the genesis header justifies its claimed work.
@@ -3126,7 +2887,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
-            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_callbacks(|| 960_000, || 1, || 1)
             .with_share_pow_verify_height(959_030);
 
         let header = [0u8; 80];
@@ -3253,7 +3014,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
-            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_callbacks(|| 960_000, || 1, || 1)
             .with_share_pow_verify_height(959_030);
 
         let header = [0u8; 80];
@@ -3362,7 +3123,7 @@ mod tests {
             .with_block_found_callback(move |_| {
                 block_counter.fetch_add(1, Ordering::SeqCst);
             })
-            .with_callbacks(|| 100, || 1, || 1, || 1);
+            .with_callbacks(|| 100, || 1, || 1);
         // Below every gate, so the PoW check is not what decides this test.
 
         let batch = || ShareBatch {
@@ -3419,7 +3180,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
-            .with_callbacks(|| 100, || 1, || 1, || 1);
+            .with_callbacks(|| 100, || 1, || 1);
         // Height left unwired: the dormant u64::MAX default.
 
         let share = ShareNotification {
@@ -3461,7 +3222,7 @@ mod tests {
             .with_block_found_callback(move |_| {
                 block_counter.fetch_add(1, Ordering::SeqCst);
             })
-            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_callbacks(|| 960_000, || 1, || 1)
             .with_share_pow_verify_height(959_030);
 
         let forged = ShareData {
@@ -3493,40 +3254,6 @@ mod tests {
             0,
             "a rejected share must not start a payout proposal"
         );
-    }
-
-    /// #591. `ValidationStats` was incremented on every rejected mesh message and read by nobody —
-    /// no HTTP surface, no metric, no log. An oversized- or malformed-message storm was therefore
-    /// indistinguishable from a clean mesh, which is the blindness that let #558 and #583 run for
-    /// weeks. A counter with no reader is not instrumentation.
-    #[tokio::test]
-    async fn health_surfaces_mesh_validation_when_wired_and_omits_it_when_not() {
-        use crate::challenge::MeshValidationStats;
-
-        fn state() -> VerificationState {
-            VerificationState::new("test_node".to_string(), "1.0.0".to_string())
-        }
-
-        // Unwired: absent, NOT a confident row of zeros.
-        assert!(
-            state().get_health().await.mesh_validation.is_none(),
-            "an unwired probe must report unknown, not a clean-looking zero"
-        );
-
-        // Wired: the numbers reach the response.
-        let wired = state().with_mesh_validation(|| MeshValidationStats {
-            total: 1_000,
-            valid: 940,
-            too_large: 60,
-            ..Default::default()
-        });
-        let stats = wired
-            .get_health()
-            .await
-            .mesh_validation
-            .expect("wired probe must report");
-        assert_eq!(stats.total, 1_000);
-        assert_eq!(stats.too_large, 60, "the drop count must be readable");
     }
 
     use super::*;
