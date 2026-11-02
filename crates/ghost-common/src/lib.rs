@@ -47,6 +47,12 @@ pub mod internal_auth;
 pub mod key_rotation;
 pub mod metrics;
 pub mod mpc;
+
+/// Node pool protocol constants (new names only; nothing live reads them).
+pub mod node_pool_constants;
+
+/// Node pool 256-bit arithmetic.
+pub mod node_pool_u256;
 pub mod rpc;
 
 pub mod sanitize;
