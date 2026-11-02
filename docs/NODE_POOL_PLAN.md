@@ -21,8 +21,8 @@ Sizes assume one engineer. Workers run in isolated worktrees. Every merge, roll 
 Parallel streams, after W2.1 merges:
 - **W2.1 Pure core** (about 1,300 lines): `share_commit.rs`, `anchor_chain.rs`, `canonical_payout.rs`, Rust port of the payout rule, vectors. No I/O.
 - **W2.2 Limits** (about 200 lines, new constants only; `MAX_MINER_OUTPUTS` feeds live selection at `payout.rs:385` and `:2690`, so it changes only at H): `blockreservedweight=90000` in `bitcoin.conf`, read `target_weight` and the template constraints, script-class limits, and a 22 KB coinbase ceiling.
-- **W2.3 SV2 layer** (350): tag stamping, re-stamp on anchor, refuse standard channels.
-- **W2.4 Storage** (350): additive tables only, including units in sats.
+- **W2.3 SV2 layer** DONE 11-02 (merged `0bc997816`): tag stamping, re-stamp on anchor via `AnchorDriver`, standard channels at the full class, the sensing loop in pool_sv2, the translator user-agent extension 0x4748, low-limit warnings in monitoring.
+- **W2.4 Storage** DONE 11-02 (`573ef32ae`): migration v63, `np_*` tables, typed API with exact reorg undo.
 - **W2.5 Relay** (1,100): NS and anchor messages, tip tracking, batching, job push.
 - **W2.6 Coinbase** (300): canonical build, submit-time check, finder output excluded from discharge. Remove the zero-value 31-byte output pool_sv2 adds to each channel's first job (`mining_message_handler.rs:302`, `:678`), which would fail the canonical check. The checkpoint dependency at `main.rs:8740` and the elder proposer at `:10814` stay live below H and only stop being used at H.
 - **W2.7 Settlement** (250): ancestry fold at tip.
