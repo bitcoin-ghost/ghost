@@ -224,20 +224,6 @@ phase0_preflight() {
         fi
     done
 
-    # VK files
-    log "Checking VK files..."
-    local vk_files=("note_spend_vk.bin" "payout_vk.bin" "unshield_vk.bin")
-    for i in $(seq 0 $((VM_COUNT - 1))); do
-        for vk in "${vk_files[@]}"; do
-            if ssh_cmd "$i" "test -f /home/ghost/.ghost/mpc_params/$vk && echo ok" | grep -q "ok"; then
-                check_ok "VK $vk on $(vm_label $i)" "ok"
-            else
-                check_ok "VK $vk on $(vm_label $i)" "missing"
-                ((failures++))
-            fi
-        done
-    done
-
     # Schema version consistency
     log "Checking schema versions..."
     local schemas=()

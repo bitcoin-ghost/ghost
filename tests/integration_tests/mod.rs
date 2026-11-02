@@ -18,7 +18,6 @@
 //! cargo test --test integration round_management
 //! cargo test --test integration edge_cases
 //! cargo test --test integration settlement_reconciliation
-//! cargo test --test integration l2_nullifier_route
 //! ```
 
 pub mod adversarial;
@@ -34,7 +33,6 @@ pub mod fund_safety;
 pub mod helpers;
 pub mod historical_bugs;
 pub mod hypothetical_bugs;
-pub mod l2_nullifier_route;
 pub mod mesh_cluster;
 pub mod policy_enforcement;
 pub mod pool_cycle;

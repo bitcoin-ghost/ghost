@@ -41,8 +41,6 @@ pub mod ban_manager;
 pub mod broadcast;
 pub mod discovery_handler;
 pub mod epoch;
-#[cfg(feature = "zk-consensus")]
-pub mod epoch_manager;
 pub mod health_handler;
 pub mod mesh;
 pub mod message;
@@ -50,8 +48,6 @@ pub mod message_validator;
 pub mod noise;
 pub mod noise_fragment;
 pub mod noise_pool;
-#[cfg(feature = "zk-consensus")]
-pub mod nullifier_route_handler;
 pub mod peer;
 pub mod reorg;
 pub mod shard_handler;
@@ -62,16 +58,12 @@ pub mod voting;
 pub use ban_manager::*;
 pub use discovery_handler::*;
 pub use epoch::*;
-#[cfg(feature = "zk-consensus")]
-pub use epoch_manager::*;
 pub use health_handler::*;
 pub use mesh::*;
 pub use message::*;
 pub use message_validator::*;
 pub use noise::*;
 pub use noise_pool::*;
-#[cfg(feature = "zk-consensus")]
-pub use nullifier_route_handler::*;
 pub use peer::*;
 pub use reorg::*;
 pub use shard_handler::*;

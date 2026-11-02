@@ -36,8 +36,6 @@ members = [
     "crates/ghost-np-relay",
     # Ghost Pay L2
     "crates/ghost-reconciliation",
-    # ZK-BFT Infrastructure
-    "crates/ghost-zkp",
     # GSP
     # Node Binaries
     "bins/ghost-pool",
@@ -89,8 +87,6 @@ ghost-verification = { path = "crates/ghost-verification" }
 ghost-np-relay = { path = "crates/ghost-np-relay" }
 # Ghost Pay L2 crates
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
-# ZK-BFT Infrastructure
-ghost-zkp = { path = "crates/ghost-zkp" }
 # GSP crates
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
@@ -203,11 +199,10 @@ ignored = ["ghost-mining"]
 ghost-common = { workspace = true }
 ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
-ghost-consensus = { workspace = true, features = ["test-utils", "zk-consensus"] }
+ghost-consensus = { workspace = true, features = ["test-utils"] }
 ghost-mining = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }
-ghost-zkp = { workspace = true }
 
 # Test dependencies
 tokio = { workspace = true }

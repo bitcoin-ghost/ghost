@@ -7544,35 +7544,6 @@ impl Database {
 // MPC CEREMONY QUERIES
 // =============================================================================
 
-/// MPC ceremony state record (singleton, id=1).
-///
-/// This row is the authoritative source of truth for ceremony progression
-/// (`contribution_count`, `current_params_hash`, `is_ossified`) and for the
-/// stable `ceremony_id` that Schnorr proofs bind to.
-#[derive(Debug, Clone)]
-pub struct MpcCeremonyState {
-    pub contribution_count: u32,
-    pub current_params_hash: [u8; 32],
-    pub is_ossified: bool,
-    pub ossified_at: Option<u64>,
-    pub block_vk_hash: Option<[u8; 32]>,
-    pub payout_vk_hash: Option<[u8; 32]>,
-    pub updated_at: u64,
-    /// Stable, genesis-derived ceremony identifier (= position-1
-    /// `prev_params_hash`, the genesis lineage hash). Identical fleet-wide for
-    /// the life of the ceremony. `[0u8; 32]` if not yet established (pre-genesis
-    /// or a legacy row written before this column existed).
-    pub ceremony_id: [u8; 32],
-    /// Autonomous-ossification latch: the raw-file SHA-256 of the FINAL
-    /// `note_spend_params_current.bin`, recorded the moment the ceremony reached
-    /// `MAX_CEREMONY_CONTRIBUTORS`. This is the SAME digest a `ZK_PARAMS_HASH`
-    /// static pin holds — NOT the structured lineage hash. `None` until the
-    /// ceremony ossifies. Once set it is PERMANENT: `save_mpc_ceremony_state`
-    /// refuses to null it (a one-way latch at the storage layer), and it drives
-    /// the self-activating `OssifiedPinned` startup mode with no operator action.
-    pub ossified_file_hash: Option<[u8; 32]>,
-}
-
 /// One unpaid share, with its miner's payout address in PLAINTEXT, for one-time ledger
 /// reconciliation across the operator's own nodes.
 ///
@@ -7604,130 +7575,6 @@ pub struct MpcContributionRecord {
 }
 
 impl Database {
-    /// Get the MPC ceremony state
-    ///
-    /// Returns None if the ceremony hasn't been initialized yet.
-    #[allow(clippy::type_complexity)]
-    pub fn get_mpc_ceremony_state(&self) -> GhostResult<Option<MpcCeremonyState>> {
-        self.with_connection(|conn| {
-            #[allow(clippy::type_complexity)]
-            let result: Option<(
-                i64,
-                Vec<u8>,
-                i64,
-                Option<i64>,
-                Option<Vec<u8>>,
-                Option<Vec<u8>>,
-                i64,
-                Option<Vec<u8>>,
-                Option<Vec<u8>>,
-            )> = conn
-                .query_row(
-                    "SELECT contribution_count, current_params_hash, is_ossified, ossified_at,
-                            block_vk_hash, payout_vk_hash, updated_at, ceremony_id,
-                            ossified_file_hash
-                     FROM mpc_ceremony WHERE id = 1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                            row.get(8)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match result {
-                Some((
-                    count,
-                    hash_bytes,
-                    ossified,
-                    ossified_at,
-                    block_vk,
-                    payout_vk,
-                    updated,
-                    ceremony_id_bytes,
-                    ossified_file_hash_bytes,
-                )) => {
-                    let mut params_hash = [0u8; 32];
-                    if hash_bytes.len() == 32 {
-                        params_hash.copy_from_slice(&hash_bytes);
-                    }
-
-                    // ceremony_id is nullable for legacy rows written before the
-                    // column existed; a NULL or wrong-length value reads as zero.
-                    let mut ceremony_id = [0u8; 32];
-                    if let Some(ref cid) = ceremony_id_bytes {
-                        if cid.len() == 32 {
-                            ceremony_id.copy_from_slice(cid);
-                        }
-                    }
-
-                    let block_vk_hash = block_vk.and_then(|v| {
-                        if v.len() == 32 {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&v);
-                            Some(arr)
-                        } else {
-                            None
-                        }
-                    });
-
-                    let payout_vk_hash = payout_vk.and_then(|v| {
-                        if v.len() == 32 {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&v);
-                            Some(arr)
-                        } else {
-                            None
-                        }
-                    });
-
-                    // Ossification latch: nullable for pre-ossified / legacy rows.
-                    let ossified_file_hash = ossified_file_hash_bytes.and_then(|v| {
-                        if v.len() == 32 {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&v);
-                            Some(arr)
-                        } else {
-                            None
-                        }
-                    });
-
-                    // M-10 FIX: Use safe conversions
-                    Ok(Some(MpcCeremonyState {
-                        contribution_count: i64_to_u32_count(count, "contribution_count")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        current_params_hash: params_hash,
-                        is_ossified: ossified != 0,
-                        ossified_at: match ossified_at {
-                            Some(v) => Some(
-                                i64_to_u64(v, "ossified_at")
-                                    .map_err(|e| GhostError::Database(e.to_string()))?,
-                            ),
-                            None => None,
-                        },
-                        block_vk_hash,
-                        payout_vk_hash,
-                        updated_at: i64_to_u64(updated, "updated_at")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        ceremony_id,
-                        ossified_file_hash,
-                    }))
-                }
-                None => Ok(None),
-            }
-        })
-    }
-
     /// Save an MPC contribution.
     ///
     /// Stage C: this is a SAFE proof-fill upsert. A first INSERT records the row.
@@ -7764,62 +7611,6 @@ impl Database {
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
-        })
-    }
-
-    /// Get an MPC contribution by position
-    #[allow(clippy::type_complexity)]
-    pub fn get_mpc_contribution(
-        &self,
-        position: u32,
-    ) -> GhostResult<Option<MpcContributionRecord>> {
-        self.with_connection(|conn| {
-            let result: Option<(String, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64)> = conn
-                .query_row(
-                    "SELECT contributor_node_id, prev_params_hash, new_params_hash,
-                            contribution_proof, epoch, created_at
-                     FROM mpc_contributions WHERE elder_position = ?1",
-                    params![position as i64],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match result {
-                Some((node_id, prev_hash, new_hash, proof, epoch, created_at)) => {
-                    let mut prev_params_hash = [0u8; 32];
-                    let mut new_params_hash = [0u8; 32];
-                    if prev_hash.len() == 32 {
-                        prev_params_hash.copy_from_slice(&prev_hash);
-                    }
-                    if new_hash.len() == 32 {
-                        new_params_hash.copy_from_slice(&new_hash);
-                    }
-
-                    // M-10 FIX: Use safe conversions
-                    Ok(Some(MpcContributionRecord {
-                        elder_position: position,
-                        contributor_node_id: node_id,
-                        prev_params_hash,
-                        new_params_hash,
-                        contribution_proof: proof,
-                        epoch: i64_to_u64(epoch, "mpc_epoch")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        created_at: i64_to_u64(created_at, "mpc_created_at")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                    }))
-                }
-                None => Ok(None),
-            }
         })
     }
 
@@ -7914,17 +7705,6 @@ impl Database {
             i64_to_u32_count(count, "mpc_elder_count")
                 .map_err(|e| GhostError::Database(e.to_string()))
         })
-    }
-
-    /// Stable, genesis-derived ceremony identifier.
-    ///
-    /// Defined as position-1's `prev_params_hash` (the genesis lineage hash),
-    /// which never changes for the life of the ceremony and is identical on
-    /// every node. Returns `None` before the genesis contribution exists.
-    /// This is the canonical source; the persisted `mpc_ceremony.ceremony_id`
-    /// column is a cache of the same value.
-    pub fn mpc_genesis_ceremony_id(&self) -> GhostResult<Option<[u8; 32]>> {
-        Ok(self.get_mpc_contribution(1)?.map(|c| c.prev_params_hash))
     }
 
     /// Get all MPC elder node IDs as parsed 32-byte arrays

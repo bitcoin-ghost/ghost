@@ -238,16 +238,6 @@ preflight() {
             continue
         fi
 
-        # VK files
-        local vk_ok=true
-        for vk in note_spend_vk.bin payout_vk.bin unshield_vk.bin; do
-            if ! ssh_cmd "$i" "test -f /home/ghost/.ghost/mpc_params/$vk" 2>/dev/null; then
-                log "  ${RED}FAIL: Missing $vk on $label${RESET}"
-                vk_ok=false
-                failed=true
-            fi
-        done
-
         # DB integrity
         local integrity
         integrity=$(ssh_cmd "$i" "sqlite3 /home/ghost/.ghost/ghost.db 'PRAGMA integrity_check;'" 2>/dev/null)
@@ -260,7 +250,7 @@ preflight() {
         local schema
         schema=$(ssh_cmd "$i" "sqlite3 /home/ghost/.ghost/ghost.db 'PRAGMA user_version;'" 2>/dev/null)
 
-        log "  $label: ${GREEN}OK${RESET} (schema=$schema, vk=$( $vk_ok && echo ok || echo missing))"
+        log "  $label: ${GREEN}OK${RESET} (schema=$schema)"
     done
 
     # Block height baseline

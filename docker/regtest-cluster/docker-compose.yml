@@ -4,9 +4,8 @@
 #
 #   cd docker/regtest-cluster && docker compose up -d
 #
-# Build the ghost-pool image WITHOUT --features zk-production (regtest needs no
-# MPC params). The image must contain bash + gettext (envsubst) for the
-# entrypoint — see README §Build.
+# Build the ghost-pool image first. The image must contain bash + gettext
+# (envsubst) for the entrypoint — see README §Build.
 
 x-pool-common: &pool-common
   image: bitcoin-ghost/ghost-pool:regtest
