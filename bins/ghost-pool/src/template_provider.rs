@@ -661,6 +661,10 @@ async fn handle_template_distribution_message(
                 "Received CoinbaseOutputConstraints from client {}",
                 client_id
             );
+            template_processor.note_coinbase_output_constraints(
+                constraints.coinbase_output_max_additional_size,
+                constraints.coinbase_output_max_additional_sigops,
+            );
             // Store constraints for this client
             if let Some(client) = clients.write().get_mut(&client_id) {
                 client.coinbase_constraints = Some(constraints);

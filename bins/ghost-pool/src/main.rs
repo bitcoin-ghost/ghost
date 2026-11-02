@@ -8265,6 +8265,7 @@ async fn main() -> Result<()> {
     let rm_for_shares = Arc::clone(&round_manager);
     let identity_for_shares = Arc::clone(&identity);
     let db_for_shares = Arc::clone(&db);
+    let network_for_shares = config.bitcoin.network;
     verification_state = verification_state.with_share_recorder(move |share| {
         // Get current round ID for database record
         let round_id = rm_for_shares.current_round_id();
@@ -8506,7 +8507,26 @@ async fn main() -> Result<()> {
         // Update miner's payout address in database if provided
         // The payout_address is extracted from user_identity (format: <address>.<worker>)
         if let Some(ref payout_address) = share.payout_address {
-            if !payout_address.is_empty() {
+            // Node pool (dark until activation): only P2SH, P2WPKH, P2WSH and P2TR are recorded.
+            let payee_refused = if payout_address.is_empty() {
+                None
+            } else {
+                ghost_pool::payee_class::accept_payout_address(
+                    rm_for_shares.current_height(),
+                    ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
+                    payout_address,
+                    network_for_shares.to_bitcoin_network(),
+                )
+                .err()
+            };
+            if let Some(refusal) = payee_refused {
+                tracing::warn!(
+                    miner_id = %share.miner_id,
+                    payout_address = %payout_address,
+                    %refusal,
+                    "payout address refused for the node pool; not recorded"
+                );
+            } else if !payout_address.is_empty() {
                 if let Err(e) = db_for_shares.update_miner_address(&share.miner_id, payout_address)
                 {
                     tracing::warn!(

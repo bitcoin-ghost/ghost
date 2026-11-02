@@ -229,6 +229,10 @@ jobs:
       # the job on every node and enables it unless --no-backups.
       - name: Installer nightly-backup option self-test
         run: ./scripts/test-installer-backups.sh
+      # The node pool's coinbase runs to 22 KB and ghostd's default 8,000 WU block reserve lost a
+      # block at 2.25 KB. --node-pool writes blockreservedweight=90000; off unless asked.
+      - name: Installer node pool reserve self-test
+        run: ./scripts/test-installer-node-pool-reserve.sh
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.

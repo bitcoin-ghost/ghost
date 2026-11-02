@@ -128,3 +128,20 @@ pub const RETARGET_MAX_COUNT_PER_BLOCK: u32 = 1 << 20;
 /// Re-inclusion depth from the spec's constants table. Recorded here, NOT used by any rule yet:
 /// see `docs/node-pool-reference/PORTING_NOTES.md`.
 pub const REINCLUSION_DEPTH_K: u32 = 120;
+
+/// Hard ceiling on a node pool coinbase, non-witness bytes, extranonce and any outputs the SV2
+/// pool adds included. The largest slot class (500 P2TR miner outputs) builds about 21.9 KB.
+/// Measured on regtest (W0.2): a 22,034 B coinbase mined on a full template under a 90,000 WU
+/// reserve, and the SV2 wire carried up to 65,436 B before `SubmitSolution` overflowed, so this
+/// leaves the wire a wide margin. A job above it is refused, never sent.
+pub const MAX_COINBASE_BYTES: usize = 22_000;
+
+/// `blockreservedweight` a node pool node gives ghostd: the weight `getblocktemplate` leaves
+/// free for the block header, the transaction count and the coinbase. ghostd's default, 8,000
+/// WU, lost a block at a 2.25 KB coinbase on a full template (W0.2).
+pub const NODE_POOL_BLOCK_RESERVED_WEIGHT: u64 = 90_000;
+
+// The reserve must hold the largest coinbase the ceiling allows, plus the 80-byte header, a
+// 5-byte transaction count and the 36 witness bytes of a segwit coinbase.
+const _: () =
+    assert!((MAX_COINBASE_BYTES as u64) * 4 + 36 + (80 + 5) * 4 <= NODE_POOL_BLOCK_RESERVED_WEIGHT);
