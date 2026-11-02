@@ -100,10 +100,9 @@ pub fn bip34_height_push(height: u64) -> Vec<u8> {
 }
 
 /// Read the BIP34 height push at the start of a coinbase scriptSig (or a template's
-/// `coinbase_prefix`): `(height, bytes the push takes)`. Only the encoding
-/// [`bip34_height_push`](crate::coinbase_tags::bip34_height_push) writes is accepted, so a
-/// non-minimal or negative push, or one that runs past the end, reads as `None` rather than a
-/// height Bitcoin would not agree with.
+/// `coinbase_prefix`): `(height, bytes the push takes)`. Only the encoding [`bip34_height_push`]
+/// writes is accepted, so a non-minimal or negative push, or one that runs past the end, reads as
+/// `None` rather than a height Bitcoin would not agree with.
 pub fn bip34_height_from(script_sig: &[u8]) -> Option<(u64, usize)> {
     let first = *script_sig.first()?;
     let height = match first {
