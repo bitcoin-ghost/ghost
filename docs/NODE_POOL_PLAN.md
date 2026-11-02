@@ -53,6 +53,8 @@ Parallel streams, after W2.1 merges:
 - **W2.15 Docs overhaul** (user, 11-02): rewrite operator and miner docs from `NODE_POOL_SPEC.md`: what the pool is, running a node, pointing a miner, the payout rule in plain words, firmware compatibility and the sensing loop, auditing your node with `ghost-audit`, the honest-reading section. Delete docs for removed features.
 - **W2.16 Website overhaul** (user, 11-02): rewrite the website for the node pool: one clear explainer, live pool stats, the miner page (`/api/v1/ledger/{address}`), node list, firmware compatibility table, and the required launch wording from Phase 6. Remove pages for removed features.
 
+- **W2.17 Miner stats pages** (user, 11-02): most pools do this badly, so make it a strength. Node runners have the dashboard (W2.14); miners get proper public pages built on `/api/v1/ledger/{address}` and the status endpoint. Per miner: hashrate over time (per worker too), accepted/rejected/stale shares, balance history, queue position and an honest expected wait, every payout with its block, sensed slot class and any firmware warning, and which node they are on. W2.11's `miner.html` rewrite is the starting point, not the end. Launch blocker.
+
 Removal status (replaces R1-R11): waves 1-3 merged 11-02 (about 330k lines removed in all). Still to go: migration v65 (v64 is W2.13's sync tables); the leftover Noise mesh listener, which no longer sends anything; the `capability_drift` alert field; ghostd to stock Bitcoin Core (wave 4).
 
 ### Phase 3: prove it (about 4 weeks)
@@ -87,7 +89,7 @@ Order of publication: spec, export digest and table, notice of the freeze height
 ### Phase 6: public launch
 Website and docs rewrite, remove the "NOT READY" banner only after Phases 3 and 4 pass. Required wording: no block has ever been found, no payout ever made, your balance may stay unpaid for a long time, an unaudited node can cheat you, use an established pool if you need steady income.
 
-Launch blockers: W2.1-W2.9, W2.11-W2.16, migration v65, Phases 3 and 4, ninth node.
+Launch blockers: W2.1-W2.9, W2.11-W2.17, migration v65, Phases 3 and 4, ninth node.
 
 ## 4. Total size
 About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to end for one engineer. Soak, signet and hardware are elapsed-time bound whoever does the work.
