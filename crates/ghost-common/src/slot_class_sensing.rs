@@ -36,7 +36,7 @@
 //! so this crate takes no new dependency; the tests pin each row.
 //!
 //! Pure: no I/O and no clock. Times are milliseconds on any monotonic clock the caller chooses.
-//! Nothing here persists; [`SensingStore`] is the interface storage (W2.4) will implement.
+//! Nothing here persists; [`SensingStore`](crate::slot_class_sensing::SensingStore) is the interface storage (W2.4) will implement.
 
 use std::collections::VecDeque;
 use std::fmt;

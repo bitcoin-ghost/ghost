@@ -30,8 +30,8 @@
 //! ```
 //!
 //! and its coinbase pays exactly the canonical outputs of the ledger snapshot it was built on.
-//! [`verify_share`] checks rules 1 to 5 from the share alone plus the chain-dependent facts the
-//! caller resolves first and passes in as [`ShareContext`]: the network tier, the including
+//! [`verify_share`](crate::share_commit::verify_share) checks rules 1 to 5 from the share alone plus the chain-dependent facts the
+//! caller resolves first and passes in as [`ShareContext`](crate::share_commit::ShareContext): the network tier, the including
 //! anchor's `btc_height`, the height of the header's `prev_hash`, the expected bits, the time
 //! bounds and the snapshot table. Rule 6 (ancestry) lives in `anchor_chain`.
 //!

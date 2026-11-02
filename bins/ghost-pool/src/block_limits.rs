@@ -5,9 +5,9 @@
 //! and the coinbase, so a coinbase larger than about 1.9 KB on a full template makes a block
 //! ghostd rejects as `bad-blk-weight` (measured, W0.2). The checks here count every byte:
 //!
-//! - [`block_weight`]: the weight of an assembled block, header and transaction count included.
+//! - [`block_weight`](crate::block_limits::block_weight): the weight of an assembled block, header and transaction count included.
 //!   Used by the submit paths. LIVE: it can only refuse a block ghostd would reject anyway.
-//! - [`assess`] / [`trim_to_fit`] / [`check_built_coinbase`]: the template-time checks, against
+//! - [`assess`](crate::block_limits::assess) / [`trim_to_fit`](crate::block_limits::trim_to_fit) / [`check_built_coinbase`](crate::block_limits::check_built_coinbase): the template-time checks, against
 //!   the template's own limits, the operator's `target_weight` and what the SV2 pool said it adds
 //!   to the coinbase (`CoinbaseOutputConstraints`). Below `NODE_POOL_ACTIVATION_HEIGHT` they only
 //!   warn; at and above it a template is trimmed to leave room for the largest coinbase, and a
