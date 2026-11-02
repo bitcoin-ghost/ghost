@@ -44,12 +44,18 @@ use tokio::net::TcpListener;
 use ghost_audit::check::{FailReason, JobReport, Verdict};
 use ghost_audit::job::to_sv1_prev_hash;
 use ghost_audit::probe::{probe, ProbeConfig, ProbeVerdict};
-use ghost_audit::source::RelayChain;
+use ghost_audit::source::{
+    start_share_chain_on, ChainConfig, ExportSource, GenesisSource, RelayChain,
+};
 use ghost_audit::sv1::Sv1Config;
 use ghost_audit::{audit_jobs, AuditTarget, RelayStamps};
-use ghost_common::canonical_payout::{coinbase_outputs, Balance, CoinbaseOutput, Table};
+use ghost_common::canonical_payout::{
+    coinbase_outputs, table_root, Balance, CoinbaseOutput, Table,
+};
 use ghost_common::coinbase_tags::{encode_node_tag, encode_payout_tag};
 use ghost_common::node_pool_constants::FACE_PER_SAT;
+use ghost_common::node_pool_genesis_export::{sample_export, EXPORT_BIN, EXPORT_JSON};
+use ghost_common::node_pool_network::NodePoolNetwork;
 use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::ShareTagPreimage;
 use ghost_np_relay::archive::{ArchivedBlock, BtcArchive};
@@ -73,16 +79,103 @@ fn p2tr(tag: &str) -> Vec<u8> {
     s
 }
 
-fn genesis_table() -> Table {
-    (0..30u32)
+/// The cutover export's height in these tests.
+const EXPORT_H: u64 = 900;
+
+/// The rows of the network's published ledger export: 30 balances carried over at the cutover.
+fn export_rows(extra: u128) -> Vec<(Vec<u8>, u128)> {
+    let mut r: Vec<(Vec<u8>, u128)> = (0..30u32)
         .map(|i| {
-            let b = Balance {
-                owed: (2_000 + 100 * i as i128) * FACE_PER_SAT,
-                queue_since: Some(900 + i),
-            };
-            (p2tr(&format!("m{i}")), b)
+            let face = (2_000 + 100 * i as u128) * FACE_PER_SAT as u128;
+            (
+                p2tr(&format!("m{i}")),
+                face + if i == 0 { extra } else { 0 },
+            )
         })
-        .collect()
+        .collect();
+    r.sort();
+    r
+}
+
+/// The network's genesis table: the export's, as every node imports it.
+fn genesis_table() -> Table {
+    ghost_common::node_pool_genesis_export::genesis_table(&export_rows(0), EXPORT_H as u32).unwrap()
+}
+
+/// The digest the network pins: the genesis table's `table_root`.
+fn pinned() -> [u8; 32] {
+    table_root(&genesis_table())
+}
+
+/// An export directory as the network publishes it, removed on drop.
+struct ExportDir(std::path::PathBuf);
+
+impl Drop for ExportDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn export_dir(tag: &str, extra: u128) -> (ExportDir, ExportSource) {
+    let p = std::env::temp_dir().join(format!(
+        "ghost-audit-e2e-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&p).unwrap();
+    let rows = export_rows(extra);
+    let (bin, json, digest) = sample_export("regtest", EXPORT_H, &rows, &rows);
+    std::fs::write(p.join(EXPORT_BIN), bin).unwrap();
+    std::fs::write(p.join(EXPORT_JSON), json).unwrap();
+    let src = ExportSource {
+        dir: p.clone(),
+        digest,
+    };
+    (ExportDir(p), src)
+}
+
+/// The auditor's own relay node, started as `ghost-audit` starts it: its genesis table loaded
+/// from `export` and held to `pin` before anything is judged.
+async fn auditor_chain(
+    blocks: &MemBlocks,
+    export: Option<ExportSource>,
+    pin: Option<[u8; 32]>,
+) -> Result<RelayChain, String> {
+    let cfg = ChainConfig {
+        data_dir: std::env::temp_dir(),
+        genesis_table: GenesisSource {
+            network: NodePoolNetwork::Regtest,
+            export,
+            pinned: pin,
+        },
+        genesis_anchor: GENESIS,
+        genesis_height: G,
+        genesis_tier: 10,
+        tier_base: U256::from_be_bytes([0xFF; 32]),
+        relay_peers: vec![],
+        rpc_host: String::new(),
+        rpc_port: 0,
+        rpc_user: String::new(),
+        rpc_password: String::new(),
+    };
+    let headers = MemHeaders::default();
+    headers.set_tip(TIP);
+    start_share_chain_on(
+        &cfg,
+        Arc::new(Database::in_memory().unwrap()),
+        BtcArchive::in_memory(),
+        Arc::new(headers),
+        Arc::new(blocks.clone()),
+        NetConfig {
+            tick_ms: 100,
+            dial_secs: 1,
+            ..NetConfig::default()
+        },
+    )
+    .await
 }
 
 /// A plain Bitcoin chain from `G - 10` to `TIP`.
@@ -320,6 +413,7 @@ struct World {
     chain: RelayChain,
     stamp: JobAnchor,
     prev: [u8; 32],
+    _export: ExportDir,
 }
 
 async fn world() -> World {
@@ -327,8 +421,10 @@ async fn world() -> World {
     let prev = blocks.at(TIP).unwrap().hash();
     let stamp = Arc::new(Mutex::new(None));
     let node = relay(&blocks, true, Some(NODE_ID), stamp.clone()).await;
-    let mine = relay(&blocks, false, None, Arc::new(Mutex::new(None))).await;
-    let chain = RelayChain::from_handle(mine, Arc::new(blocks));
+    let (export, src) = export_dir("world", 0);
+    let chain = auditor_chain(&blocks, Some(src), Some(pinned()))
+        .await
+        .expect("the auditor starts on the network's genesis table");
     for _ in 0..100 {
         if stamp.lock().unwrap().is_some() {
             break;
@@ -345,6 +441,7 @@ async fn world() -> World {
         chain,
         stamp,
         prev,
+        _export: export,
     }
 }
 
@@ -409,6 +506,49 @@ async fn honest_jobs_pass_and_each_hostile_job_gets_its_named_fail() {
     }
     assert_eq!(reports[0].slot_class, Some(9));
     assert_eq!(reports[0].parent_anchor, Some(hex::encode(GENESIS)));
+}
+
+/// The genesis table is not empty here (30 balances carried over at the cutover): the honest
+/// jobs above pass because the auditor started from the network's own table. An auditor on any
+/// other table refuses to start, so nothing is audited, probed or listed on it; and one that did
+/// run on another table (no pin, regtest) would condemn the honest node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_auditor_on_another_genesis_table_refuses_to_start() {
+    assert_eq!(genesis_table().len(), 30);
+    let blocks = bitcoin_chain();
+
+    let (_a, other) = export_dir("other", 1);
+    let e = auditor_chain(&blocks, Some(other.clone()), Some(pinned()))
+        .await
+        .err()
+        .expect("refused");
+    assert!(e.contains("refusing to audit"), "{e}");
+    let e = auditor_chain(&blocks, None, Some(pinned()))
+        .await
+        .err()
+        .expect("an empty table is refused too");
+    assert!(
+        e.contains("refusing to audit") && e.contains("(0 rows)"),
+        "{e}"
+    );
+
+    // Why: unpinned, the auditor runs on the other table and fails honest jobs.
+    let prev = blocks.at(TIP).unwrap().hash();
+    let stamp = Arc::new(Mutex::new(None));
+    let node = relay(&blocks, true, Some(NODE_ID), stamp.clone()).await;
+    let stamp = stamp_of(&stamp).await;
+    let wrong = auditor_chain(&blocks, Some(other), None).await.unwrap();
+    let me = p2tr("the miner");
+    let addr = stratum(vec![notify(1, prev, stamp, &me, Hostile::Honest)]).await;
+    let stamps = RelayStamps {
+        addr: node.listen_addr.unwrap(),
+        genesis: GENESIS,
+        timeout: Duration::from_secs(5),
+    };
+    let r = audit_jobs(&target(addr, &me, 1), &stamps, &wrong, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(r[0].verdict, Verdict::Fail, "{}", r[0].detail);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -616,8 +756,10 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
         "the honest node reached its peers"
     );
 
-    let mine = relay(&blocks, false, None, Arc::new(Mutex::new(None))).await;
-    let chain = RelayChain::from_handle(mine, Arc::new(blocks));
+    let (_export, src) = export_dir("list", 0);
+    let chain = auditor_chain(&blocks, Some(src), Some(pinned()))
+        .await
+        .unwrap();
     let prober = Arc::new(LiveProber {
         genesis: GENESIS,
         address: "bcrt1p-the-lister".into(),

@@ -52,6 +52,9 @@ pub mod metrics;
 /// Node pool protocol constants (new names only; nothing live reads them).
 pub mod node_pool_constants;
 
+/// The cutover's ledger export, read and checked as a share-chain genesis table (Phase 4).
+pub mod node_pool_genesis_export;
+
 /// Where each network's node pool share chain starts (W2.8).
 pub mod node_pool_network;
 

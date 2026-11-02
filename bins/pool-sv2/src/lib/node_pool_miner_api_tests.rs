@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::{
     miner_stats::{MinerStats, Outcome, RejectReason},
-    node_pool_api::tests::{addr, payee, world, ONE},
+    node_pool_api::tests::{addr, genesis, payee, world, world_on, EXPORT_H, ONE},
 };
 
 use super::*;
@@ -376,7 +376,7 @@ fn the_balance_history_starts_from_the_last_event_before_the_window() {
         ev(450, 3, NpLedgerEventKind::Block, 2_500, 3_000),
     ];
     let starts = [100, 200, 300, 400];
-    let h = balance_history(&events, &starts, 100, 500 * ONE);
+    let h = balance_history(&events, None, &starts, 100, 500 * ONE);
     assert_eq!(h.start_sats, 2_000);
     assert_eq!(h.end_sats, vec![3_000, 3_000, 3_000, 500]);
     assert_eq!(h.credited_sats, vec![1_000, 0, 0, 0]);
@@ -385,9 +385,78 @@ fn the_balance_history_starts_from_the_last_event_before_the_window() {
     assert_eq!(h.payouts[0].height, 903);
 
     // No events: flat at the balance now.
-    let h = balance_history(&[], &starts, 100, 777 * ONE);
+    let h = balance_history(&[], None, &starts, 100, 777 * ONE);
     assert_eq!(h.start_sats, 777);
     assert_eq!(h.end_sats, vec![777; 4]);
+}
+
+#[test]
+fn the_history_opens_with_the_carried_over_balance() {
+    let ev = |time, seq, kind, amount: i128, prior: i128| BalanceEvent {
+        time,
+        seq,
+        kind,
+        amount: amount * ONE,
+        prior_owed: prior * ONE,
+        height: 900 + seq as u32,
+        block_hash: (kind == NpLedgerEventKind::Block).then_some([seq as u8; 32]),
+    };
+    let open = Opening {
+        time: 150,
+        height: 850,
+        owed: 3_000 * ONE,
+    };
+    // Carried over inside the window, then credited at the same second and paid later.
+    let events = vec![
+        ev(150, 1, NpLedgerEventKind::Credit, 500, 3_000),
+        ev(350, 2, NpLedgerEventKind::Block, 2_000, 3_500),
+    ];
+    let starts = [100, 200, 300, 400];
+    let h = balance_history(&events, Some(&open), &starts, 100, 1_500 * ONE);
+    assert_eq!(h.start_sats, 0, "nothing before the cutover");
+    assert_eq!(h.end_sats, vec![3_500, 3_500, 1_500, 1_500]);
+    assert_eq!(
+        h.credited_sats,
+        vec![500, 0, 0, 0],
+        "the carried balance is not a credit"
+    );
+    assert_eq!(h.paid_sats, vec![0, 0, 2_000, 0]);
+    let c = h.carried_over.unwrap();
+    assert_eq!((c.time, c.height, c.sats), (150, 850, 3_000));
+
+    // Carried over before the window, no event since: flat at it.
+    let h = balance_history(&[], Some(&open), &[200, 300], 100, 3_000 * ONE);
+    assert_eq!(h.start_sats, 3_000);
+    assert_eq!(h.end_sats, vec![3_000, 3_000]);
+}
+
+#[tokio::test]
+async fn the_miner_pages_read_the_carried_over_balance() {
+    let api = world_on(Some(genesis()))
+        .api
+        .with_miner_stats(Arc::new(MinerStats::in_memory(NOW)))
+        .with_clock(now);
+    // Payee 4 holds only its carried-over balance: the history shows it from the import on.
+    let h = api.miner_history(&addr(&payee(4)), "24h").await.unwrap();
+    let c = h.balance.carried_over.clone().unwrap();
+    assert_eq!((c.height, c.sats), (EXPORT_H, 3_000));
+    assert_eq!(
+        c.time, 1_900,
+        "no archived header at the export height: its import time"
+    );
+    assert_eq!(h.balance.start_sats, 3_000);
+    assert!(h.balance.end_sats.iter().all(|s| *s == 3_000));
+    assert!(h.balance.credited_sats.iter().all(|s| *s == 0));
+
+    // Payee 1: carried 500 sats, then credited and paid; the history ends at its balance.
+    let h = api.miner_history(&addr(&payee(1)), "24h").await.unwrap();
+    let end = *h.balance.end_sats.last().unwrap();
+    let want = api.ledger(&addr(&payee(1))).await.unwrap().balance.sats;
+    assert_eq!(end, want);
+    assert_eq!(
+        h.balance.start_sats, 500,
+        "the window opens after the cutover"
+    );
 }
 
 #[cfg(feature = "monitoring")]

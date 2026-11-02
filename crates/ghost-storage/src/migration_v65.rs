@@ -11,10 +11,14 @@
 //!
 //! In order, each step refusing with no change made:
 //!
-//! 1. **Halt on money.** Any row in `withdrawal_requests`, `ghost_locks`, any `l2_*` or any
-//!    `wraith_*` table refuses the migration, naming every table and its row count. Those rows
-//!    are value someone may still be owed or have locked; they are resolved by hand, never
-//!    dropped by a binary.
+//! 1. **Halt on money.** Any row in a table that can hold user funds or an unspent claim refuses
+//!    the migration, naming every table and its row count: `withdrawal_requests`, `ghost_locks`,
+//!    every `l2_*` and `wraith_*` table, Ghost Pay's notes, nullifiers, transfers, shields and
+//!    instant payments ([`HALT_TABLES`]), the confirmed pool's staged transactions and pending
+//!    reconciliation entries, and a `node_rewards` row with a balance ([`HALT_WHERE`]). Those
+//!    rows are value someone may still be owed, have locked or be able to spend; they are
+//!    resolved by hand, never dropped by a binary. The old payout ledger is not on the list: the
+//!    cutover's ledger export carries it into `np_genesis`.
 //! 2. **Backup gate.** If any table to be dropped holds a row, a verified copy of the database
 //!    must exist first: `<database>.pre-v65`, written with `VACUUM INTO` (the pattern of
 //!    `deploy-node.sh`'s pre-migration gate, #996) after checking that the filesystem has twice
@@ -57,11 +61,35 @@ use ghost_common::error::{GhostError, GhostResult};
 /// The version this migration writes.
 pub(crate) const V65: u32 = 65;
 
-/// Tables whose rows are money: any row refuses the migration. Prefixes end in `_`.
-pub(crate) const HALT_TABLES: &[&str] = &["withdrawal_requests", "ghost_locks"];
+/// Tables whose rows are money (funds someone holds, has locked or may still claim): any row
+/// refuses the migration.
+pub(crate) const HALT_TABLES: &[&str] = &[
+    "withdrawal_requests",
+    "ghost_locks",
+    // Ghost Pay: notes are funds, nullifiers decide which of them are spent (dropping them alone
+    // would make a spent note spendable again in any copy that kept the notes), transfers and
+    // shields are notes in flight, and instant payments are amounts accepted or reserved against
+    // a lock.
+    "confidential_notes",
+    "nullifiers",
+    "pending_nullifiers",
+    "confidential_transfers",
+    "pending_l2_shields",
+    "accepted_instant_payments",
+    "instant_payment_reservations",
+    // Verified transactions waiting for a checkpoint: dropping them freezes the sender's funds.
+    "confirmed_pool_staging",
+    // L2 reconciliation: amounts owed in or out of a batch.
+    "reconciliation_entries",
+];
 
 /// Table-name prefixes whose rows are money: any row in any matching table refuses.
 pub(crate) const HALT_PREFIXES: &[&str] = &["l2_", "wraith_"];
+
+/// Tables where only some rows are money, with the condition that makes a row one. A
+/// `node_rewards` row is created at zero by every health report and is money only once it holds
+/// a balance.
+pub(crate) const HALT_WHERE: &[(&str, &str)] = &[("node_rewards", "balance_sats != 0")];
 
 /// Every table v65 drops. Nothing on this branch reads any of them (checked by grep over every
 /// crate and binary when v65 was written; the maintenance prunes of the challenge, vote,
@@ -220,14 +248,17 @@ fn row_count(conn: &Connection, table: &str) -> GhostResult<i64> {
     )
 }
 
-/// Money-bearing tables present, with their row counts, whether or not they hold rows.
+/// Money-bearing tables present, with their counts of money rows (every row, or for a
+/// [`HALT_WHERE`] table the rows its condition selects), whether or not they hold any.
 pub(crate) fn money_tables(conn: &Connection) -> GhostResult<Vec<(String, i64)>> {
     let mut out = Vec::new();
     for t in tables(conn)? {
-        let money =
-            HALT_TABLES.contains(&t.as_str()) || HALT_PREFIXES.iter().any(|p| t.starts_with(p));
-        if money {
+        if HALT_TABLES.contains(&t.as_str()) || HALT_PREFIXES.iter().any(|p| t.starts_with(p)) {
             let n = row_count(conn, &t)?;
+            out.push((t, n));
+        } else if let Some((_, cond)) = HALT_WHERE.iter().find(|(w, _)| *w == t) {
+            // Both the name and the condition are the constants above, never input.
+            let n = count_i64(conn, &format!("SELECT COUNT(*) FROM \"{t}\" WHERE {cond}"))?;
             out.push((t, n));
         }
     }
@@ -797,12 +828,26 @@ mod tests {
             "l2_notes",
             "wraith_rounds",
             "wraith_participants",
+            "confidential_notes",
+            "nullifiers",
+            "pending_nullifiers",
+            "accepted_instant_payments",
+            "instant_payment_reservations",
+            "confidential_transfers",
+            "pending_l2_shields",
+            "confirmed_pool_staging",
+            "reconciliation_entries",
+            "node_rewards",
         ] {
             assert!(names.iter().any(|n| n == want), "{want} not covered");
         }
-        assert!(names.len() >= 12, "{names:?}");
+        assert!(names.len() >= 22, "{names:?}");
         for t in &names {
             let c = v64_in_memory();
+            if t == "node_rewards" {
+                // Covered with its condition below.
+                continue;
+            }
             if t.starts_with("l2_") && t != "l2_epochs" {
                 // The l2 tables' epoch triggers need the epoch to exist.
                 insert_any(&c, "l2_epochs");
@@ -817,6 +862,64 @@ mod tests {
             assert_eq!(count(&c, &format!("SELECT COUNT(*) FROM \"{t}\"")), 1);
             assert_eq!(count(&c, "SELECT COUNT(*) FROM votes"), 3);
         }
+    }
+
+    /// Every money table is one v65 drops: the halt list guards exactly what would be lost.
+    #[test]
+    fn every_halt_table_is_a_dropped_one() {
+        for t in HALT_TABLES.iter().chain(HALT_WHERE.iter().map(|(t, _)| t)) {
+            assert!(
+                DROPPED_TABLES.contains(t),
+                "{t} is halted on but not dropped"
+            );
+        }
+    }
+
+    /// A `node_rewards` row at zero (what every health report creates) does not halt; one with
+    /// a balance does, and nothing changes.
+    #[test]
+    fn node_rewards_halts_only_on_a_balance() {
+        let c = v64_in_memory();
+        c.execute(
+            "INSERT INTO node_rewards (node_id, balance_sats, created_at, updated_at) \
+             VALUES ('zero', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            money_tables(&c)
+                .unwrap()
+                .iter()
+                .find(|(t, _)| t == "node_rewards")
+                .unwrap()
+                .1,
+            0
+        );
+        refuse_money_rows(&c).unwrap();
+
+        c.execute(
+            "INSERT INTO node_rewards (node_id, balance_sats, created_at, updated_at) \
+             VALUES ('owed', 2500, 1, 1)",
+            [],
+        )
+        .unwrap();
+        insert_votes(&c, 3);
+        let before = user_tables(&c);
+        let e = run_migrations(&c).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSED") && e.contains("node_rewards (1 rows)"),
+            "{e}"
+        );
+        assert_eq!(raw_version(&c), 64);
+        assert_eq!(user_tables(&c), before);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM node_rewards"), 2);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM votes"), 3);
+
+        // Paid back to zero, it migrates.
+        c.execute("UPDATE node_rewards SET balance_sats = 0", [])
+            .unwrap();
+        run_migrations(&c).unwrap();
+        assert_eq!(raw_version(&c), -65);
     }
 
     /// Old rows on disk: the copy is taken and verified first, the tables go, the free list is

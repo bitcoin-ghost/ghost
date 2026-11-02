@@ -65,12 +65,17 @@ ghost-audit audit \
   --relay-peer other-node.example.org:8566 \
   --address bc1p... \
   --rpc-user you --rpc-password ... \
+  --genesis-export ./ledger-export \
+  --export-digest <published sha256 of ledger-export.bin> \
+  --genesis-table-digest <published table_root> \
   --user-agent "bmminer/2.0.0" \
   --jobs 5
 ```
 
 - `--user-agent`: the node chooses how many outputs your jobs carry from your miner's user agent. Pass the one your hardware sends to audit the jobs your hardware actually gets.
 - `--genesis-anchor` and `--genesis-height`: the share chain's start. Regtest has a fixed one; none is published for mainnet or signet yet.
+- `--genesis-export` and `--export-digest`: the published ledger export (`ledger-export.bin` and `ledger-export.json`), which holds the balances carried over at the cutover. Every payout table starts from them, so the auditor must start from the same ones the network does. It checks the export exactly as a node's import does and keeps the table in its data directory, so later runs need not pass it again.
+- `--genesis-table-digest`: the network's pinned digest of that table (the `table_root` every node pins). `ghost-audit` refuses to audit, probe or list unless its table hashes to it, since a table that is not the network's would make every verdict wrong. Required except on regtest.
 - `--json` prints one JSON object per job.
 
 The first run syncs the share chain from your relay peers, which takes a while; jobs are `UNCHECKED` until it has.

@@ -311,8 +311,36 @@ pub struct BalanceHistory {
     pub paid_sats: Vec<i64>,
     /// Payouts in the window.
     pub payouts: Vec<PayoutPoint>,
+    /// The balance carried over from the old pool at the cutover (the imported genesis table),
+    /// when the window reaches back to it: the opening balance, in place from its time on.
+    /// Not counted in `credited_sats`.
+    pub carried_over: Option<CarriedOverPoint>,
     /// How events are placed in time.
     pub time_basis: &'static str,
+}
+
+/// The opening balance carried over at the cutover, placed in time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CarriedOverPoint {
+    /// Unix seconds (see `time_basis`): the export height's block time, else when it was
+    /// imported.
+    pub time: i64,
+    /// The export's height (the freeze height).
+    pub height: u64,
+    /// Sats carried over.
+    pub sats: i64,
+}
+
+/// A payee's genesis row as the history opens with it: its balance from `time` on, before any
+/// share-chain event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opening {
+    /// Unix seconds.
+    pub time: i64,
+    /// The export's height.
+    pub height: u64,
+    /// Face units carried over.
+    pub owed: i128,
 }
 
 /// `GET /api/v1/node-pool/miner/{address}/history`.
@@ -747,19 +775,52 @@ pub struct BalanceEvent {
     pub block_hash: Option<[u8; 32]>,
 }
 
-/// The balance over `starts` (each `width` long), from `events` and the balance now.
+/// One step of a balance's history: the opening balance, or a ledger event.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Open(&'a Opening),
+    Event(&'a BalanceEvent),
+}
+
+impl Step<'_> {
+    fn key(&self) -> (i64, i64) {
+        match self {
+            // Before any event at the same second: the share chain starts on it.
+            Step::Open(o) => (o.time, i64::MIN),
+            Step::Event(e) => (e.time, e.seq),
+        }
+    }
+
+    fn before(&self) -> i128 {
+        match self {
+            Step::Open(_) => 0,
+            Step::Event(e) => e.prior_owed,
+        }
+    }
+
+    fn after(&self) -> i128 {
+        match self {
+            Step::Open(o) => o.owed,
+            Step::Event(e) => match e.kind {
+                NpLedgerEventKind::Credit => e.prior_owed + e.amount,
+                NpLedgerEventKind::Block => e.prior_owed - e.amount,
+            },
+        }
+    }
+}
+
+/// The balance over `starts` (each `width` long), from `events`, the genesis `opening` when the
+/// events reach back to it (every event after it is in `events`), and the balance now.
 pub fn balance_history(
     events: &[BalanceEvent],
+    opening: Option<&Opening>,
     starts: &[u64],
     width: u64,
     balance_now: i128,
 ) -> BalanceHistory {
-    let mut ev: Vec<&BalanceEvent> = events.iter().collect();
-    ev.sort_by_key(|e| (e.time, e.seq));
-    let after = |e: &BalanceEvent| match e.kind {
-        NpLedgerEventKind::Credit => e.prior_owed + e.amount,
-        NpLedgerEventKind::Block => e.prior_owed - e.amount,
-    };
+    let mut ev: Vec<Step> = events.iter().map(Step::Event).collect();
+    ev.extend(opening.map(Step::Open));
+    ev.sort_by_key(Step::key);
     let Some(&first) = starts.first() else {
         return BalanceHistory {
             time_basis: TIME_BASIS,
@@ -767,38 +828,45 @@ pub fn balance_history(
         };
     };
     let first = first as i64;
-    // The balance at the window's start: after the last event before it, else before the
-    // first event in it, else (no events at all) the balance now.
+    // The balance at the window's start: after the last step before it, else before the first
+    // step in it, else (no steps at all) the balance now.
     let start = ev
         .iter()
         .rev()
-        .find(|e| e.time < first)
-        .map(|e| after(e))
-        .or_else(|| ev.iter().find(|e| e.time >= first).map(|e| e.prior_owed))
+        .find(|e| e.key().0 < first)
+        .map(Step::after)
+        .or_else(|| ev.iter().find(|e| e.key().0 >= first).map(Step::before))
         .unwrap_or(balance_now);
     let mut h = BalanceHistory {
         start_sats: sats(start),
         time_basis: TIME_BASIS,
+        carried_over: opening.map(|o| CarriedOverPoint {
+            time: o.time,
+            height: o.height,
+            sats: sats(o.owed),
+        }),
         ..Default::default()
     };
     let mut bal = start;
-    let mut idx = ev.partition_point(|e| e.time < first);
+    let mut idx = ev.partition_point(|e| e.key().0 < first);
     for &t in starts {
         let end = (t + width) as i64;
         let (mut credited, mut paid) = (0i128, 0i128);
-        while idx < ev.len() && ev[idx].time < end {
-            let e = ev[idx];
-            bal = after(e);
-            match e.kind {
-                NpLedgerEventKind::Credit => credited += e.amount,
-                NpLedgerEventKind::Block => {
-                    paid += e.amount;
-                    h.payouts.push(PayoutPoint {
-                        time: e.time,
-                        height: e.height,
-                        sats: sats(e.amount),
-                        block_hash: e.block_hash.as_ref().map(display_hash).unwrap_or_default(),
-                    });
+        while idx < ev.len() && ev[idx].key().0 < end {
+            let step = ev[idx];
+            bal = step.after();
+            if let Step::Event(e) = step {
+                match e.kind {
+                    NpLedgerEventKind::Credit => credited += e.amount,
+                    NpLedgerEventKind::Block => {
+                        paid += e.amount;
+                        h.payouts.push(PayoutPoint {
+                            time: e.time,
+                            height: e.height,
+                            sats: sats(e.amount),
+                            block_hash: e.block_hash.as_ref().map(display_hash).unwrap_or_default(),
+                        });
+                    }
                 }
             }
             idx += 1;
@@ -815,8 +883,14 @@ impl NodePoolApi {
         self.live.node_id().map(hex::encode)
     }
 
-    /// The ledger events of `script` reaching back at least `span` seconds, placed in time.
-    fn balance_events(&self, script: &[u8], span: u64) -> Result<Vec<BalanceEvent>, ApiError> {
+    /// The ledger events of `script` reaching back at least `span` seconds, placed in time, and
+    /// its genesis row as the opening balance when they reach back to the export height (and
+    /// none was cut by the event limit).
+    fn balance_events(
+        &self,
+        script: &[u8],
+        span: u64,
+    ) -> Result<(Vec<BalanceEvent>, Option<Opening>), ApiError> {
         // Heights are chain time, so a syncing node's late application cannot hide events: read
         // from 1.5x the window's blocks below the tip (and the snapshot lag), then place each
         // event in time and let the caller cut the window.
@@ -831,7 +905,21 @@ impl NodePoolApi {
             .db
             .np_payee_ledger_events(script, min_height, MAX_LEDGER_EVENTS)
             .map_err(internal)?;
-        Ok(all
+        let opening = if all.len() < MAX_LEDGER_EVENTS {
+            self.parts
+                .db
+                .np_genesis_balance(script)
+                .map_err(internal)?
+                .filter(|g| g.export_height >= u64::from(min_height))
+                .map(|g| Opening {
+                    time: event_time(g.imported_at, g.chain_time),
+                    height: g.export_height,
+                    owed: g.balance.owed,
+                })
+        } else {
+            None
+        };
+        let events = all
             .into_iter()
             .map(|e| BalanceEvent {
                 time: event_time(e.applied_at, e.chain_time),
@@ -842,7 +930,8 @@ impl NodePoolApi {
                 height: e.height,
                 block_hash: e.block_hash,
             })
-            .collect())
+            .collect();
+        Ok((events, opening))
     }
 
     fn credited_24h(events: &[BalanceEvent], now: u64) -> i64 {
@@ -926,10 +1015,10 @@ impl NodePoolApi {
         let balance = self
             .parts
             .db
-            .np_balance(&script)
+            .np_payee_balance(&script)
             .map_err(internal)?
             .map_or(0, |b| b.owed);
-        let events = self.balance_events(&script, 86_400)?;
+        let (events, _) = self.balance_events(&script, 86_400)?;
         let credited = Self::credited_24h(&events, now);
         let expected_wait = self
             .wait_for(&script, sats(balance), Some(credited), now)
@@ -1007,11 +1096,11 @@ impl NodePoolApi {
         let balance_now = self
             .parts
             .db
-            .np_balance(&script)
+            .np_payee_balance(&script)
             .map_err(internal)?
             .map_or(0, |b| b.owed);
-        let events = self.balance_events(&script, w.span)?;
-        let balance = balance_history(&events, &starts, w.res.width, balance_now);
+        let (events, opening) = self.balance_events(&script, w.span)?;
+        let balance = balance_history(&events, opening.as_ref(), &starts, w.res.width, balance_now);
 
         Ok(HistoryResponse {
             address: address.trim().to_string(),

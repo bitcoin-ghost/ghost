@@ -154,6 +154,15 @@ test('a known wait shows the estimate with its assumptions', () => {
   assert(out.queue.includes('about 3.0 days') && out.queue.includes('2 pool blocks') && out.queue.includes('recent rate'));
 });
 
+test('a balance carried over at the cutover is named, and absent when there is none', () => {
+  const st = goodState();
+  assert(!MP.renderAll(st, 640).queue.includes('carried over'), 'no genesis row, no sentence');
+  st.ledger.body = Object.assign(ledger(), { genesis: { owed: { units: '1', sats: 3000 }, export_height: 974500, queue_since: 974500 } });
+  const out = MP.renderAll(st, 640);
+  assert(out.queue.includes('3,000 sats carried over from the old pool at height 974500'), out.queue);
+  assert(!/NaN|undefined/.test(out.queue));
+});
+
 test('a selected worker gets its own chart and row highlight', () => {
   const st = goodState(MP.parseQuery('?id=' + ADDR + '.rig2'));
   const out = MP.renderAll(st, 640);

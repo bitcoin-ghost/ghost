@@ -193,6 +193,7 @@ test("miner detail: ledger, queue by class, workers, payouts and shares", () => 
   const t = text(m);
   assert.match(t, /Balance owed 6,501 sats/);
   assert.match(t, /Queued since height 901/);
+  assert.match(t, /Carried over at the cutover 500 sats/);
   assert.match(t, /Oldest-queue rank #1/);
   assert.match(t, /Next block height 1,000/);
   assert.equal(count(m, "worker-row"), 1);
@@ -216,6 +217,7 @@ test("miner detail: a failed API shows unavailable for both halves", () => {
   );
   assert.match(t, /Miner statistics unavailable/);
   assert.match(t, /Ledger unavailable/);
+  assert.doesNotMatch(t, /Carried over/);
   assert.match(t, /Payouts unavailable/);
   assert.doesNotMatch(t, /Balance owed/);
   assertNothingHealthy(t);

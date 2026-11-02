@@ -45,6 +45,13 @@ function LedgerCard({ ledger, ledgerError }: { ledger?: NodePoolLedger; ledgerEr
       <Grid>
         <Kv label="Balance owed" value={fmtSats(ledger.balance.sats)} hint={`${ledger.balance.units} units of 2^-32 sat`} />
         <Kv label="Queued since height" value={ledger.queue_since != null ? fmtInt(ledger.queue_since) : "not queued (below the floor)"} />
+        {ledger.genesis ? (
+          <Kv
+            label="Carried over at the cutover"
+            value={fmtSats(ledger.genesis.owed.sats)}
+            hint={`at height ${fmtInt(ledger.genesis.export_height)}; included in the balance owed`}
+          />
+        ) : null}
         <Kv label="Minimum payout" value={fmtSats(ledger.min_payout_sats)} />
         <Kv label="Next block height" value={fmtInt(q?.next_block_height)} />
         <Kv label="Owed on the next block's table" value={q ? fmtSats(q.owed.sats) : UNKNOWN} />

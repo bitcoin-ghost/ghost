@@ -182,6 +182,12 @@ export interface NodePoolLedger {
   known: boolean;
   message: string | null;
   balance: NpAmount;
+  /** The balance carried over at the cutover (the imported genesis table); already in `balance`. */
+  genesis?: {
+    owed: NpAmount;
+    export_height: number;
+    queue_since: number | null;
+  } | null;
   queue_since: number | null;
   min_payout_sats: number;
   units_per_sat: number;

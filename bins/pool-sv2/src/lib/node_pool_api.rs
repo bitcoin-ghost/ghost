@@ -12,9 +12,12 @@
 //!   units), where it stands in the payout queues of the table the next block pays (ranked by
 //!   [`canonical_payout::queue_position`], paid per slot class by
 //!   [`canonical_payout::paid_to`]: the rule is never re-implemented here), recent credited
-//!   shares, and recent payouts with their heights, settled or provisional. An address with no
-//!   row, share or payout is a 200 with `known: false`; an address that is not one of this
-//!   network's, or not a payee class, is a 400.
+//!   shares, and recent payouts with their heights, settled or provisional. The balance includes
+//!   what the address was carried over with at the cutover (the imported genesis table, shown
+//!   on its own as `genesis`): the share chain's ledger holds only what changed since, and is
+//!   folded onto it ([`ghost_storage::Database::np_payee_balance`]). An address with no row,
+//!   share or payout is a 200 with `known: false`; an address that is not one of this network's,
+//!   or not a payee class, is a 400.
 //! - `GET /api/v1/node-pool/status`: share-chain tip and anchor height, peers, settlement
 //!   caught up or not, recent pool blocks with their payouts and the treasury change, and the
 //!   connected miners with their slot class and any firmware warning. For the operator dashboard
@@ -248,6 +251,18 @@ pub struct SettlementBrief {
     pub provisional_blocks: usize,
 }
 
+/// The balance an address was carried over with at the cutover: its row in the imported
+/// genesis table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GenesisView {
+    /// Owed when it was carried over. Already part of the ledger's `balance`.
+    pub owed: Amount,
+    /// The export's height (the freeze height) it was carried over at.
+    pub export_height: u64,
+    /// The `queue_since` it was given: the export height at or above the floor, else none.
+    pub queue_since: Option<u32>,
+}
+
 /// `GET /api/v1/node-pool/ledger/{address}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LedgerResponse {
@@ -261,8 +276,11 @@ pub struct LedgerResponse {
     pub known: bool,
     /// Plain words when `known` is false.
     pub message: Option<String>,
-    /// Owed now: every credit through the tip, minus every payout.
+    /// Owed now: the balance carried over at the cutover, plus every credit through the tip,
+    /// minus every payout.
     pub balance: Amount,
+    /// The balance carried over at the cutover, if the address had one.
+    pub genesis: Option<GenesisView>,
     /// The height its balance last crossed 1,000 sats; it orders the oldest queue.
     pub queue_since: Option<u32>,
     /// Balances below this are not paid.
@@ -484,7 +502,8 @@ pub struct StatusResponse {
     pub settlement: SettlementView,
     /// The finder output: every fee of a block this node's miners find.
     pub fee_address: String,
-    /// Rows in the balance table.
+    /// Payees with a balance row: carried over at the cutover, credited on the share chain, or
+    /// both.
     pub ledger_rows: u64,
     /// Recent pool blocks, highest first.
     pub recent_blocks: Vec<BlockView>,
@@ -592,7 +611,8 @@ impl NodePoolApi {
     pub async fn ledger(&self, address: &str) -> Result<LedgerResponse, ApiError> {
         let script = self.payee_script(address)?;
         let db = &self.parts.db;
-        let row = db.np_balance(&script).map_err(internal)?;
+        let row = db.np_payee_balance(&script).map_err(internal)?;
+        let genesis = db.np_genesis_balance(&script).map_err(internal)?;
 
         let mut recent_shares = Vec::new();
         for s in db
@@ -675,6 +695,11 @@ impl NodePoolApi {
                     .to_string()
             }),
             balance: Amount::of(balance),
+            genesis: genesis.map(|g| GenesisView {
+                owed: Amount::of(g.balance.owed),
+                export_height: g.export_height,
+                queue_since: g.balance.queue_since,
+            }),
             queue_since: row.and_then(|b| b.queue_since),
             min_payout_sats: MIN_PAYOUT_SATS,
             units_per_sat: FACE_PER_SAT as u64,

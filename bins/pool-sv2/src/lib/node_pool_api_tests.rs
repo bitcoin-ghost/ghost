@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use ghost_common::{
-    canonical_payout::{build_outputs, select, split_slots},
+    canonical_payout::{build_outputs, select, split_slots, Balance},
     node_pool_network::{NetworkStart, StartSource},
     node_pool_u256::U256,
     share_commit::ShareTagPreimage,
@@ -114,7 +114,47 @@ pub(crate) struct World {
 pub(crate) const P1_CREDIT: i128 = 9_000 * ONE + 123_456_789;
 
 pub(crate) fn world() -> World {
+    world_on(None)
+}
+
+/// The cutover's export height in the genesis worlds.
+pub(crate) const EXPORT_H: u64 = 850;
+
+/// A genesis table as the import writes it: payee 1 carried over below the floor, payee 4 above
+/// it (and never seen on the share chain since), payee 5 just under it.
+pub(crate) fn genesis() -> Table {
+    let mut t = Table::new();
+    for (who, sats) in [(1u8, 500i128), (4, 3_000), (5, 900)] {
+        t.insert(
+            payee(who),
+            Balance {
+                owed: sats * ONE,
+                queue_since: (sats >= MIN_PAYOUT_SATS as i128).then_some(EXPORT_H as u32),
+            },
+        );
+    }
+    t
+}
+
+/// [`world`], on a store whose genesis table is `genesis` (imported before the relay ran, as
+/// `--np-import-genesis` does); the next block's table is folded onto it.
+pub(crate) fn world_on(genesis: Option<Table>) -> World {
     let db = Arc::new(Database::in_memory().unwrap());
+    if let Some(g) = &genesis {
+        db.np_import_genesis(
+            g,
+            &ghost_storage::node_pool_genesis::NpGenesisMeta {
+                export_digest: [0x0E; 32],
+                network: "regtest".into(),
+                export_height: EXPORT_H,
+                queue_since: EXPORT_H as u32,
+                row_count: g.len() as u64,
+                table_root: ghost_common::canonical_payout::table_root(g),
+                imported_at: 1_900,
+            },
+        )
+        .unwrap();
+    }
     anchor(&db, 1, 900);
     anchor(&db, 2, 901);
     db.np_insert_batch(
@@ -139,8 +179,22 @@ pub(crate) fn world() -> World {
     db.np_apply_block(&[0xB2; 32], 960, &[(payee(1), 1_000 * ONE)], 2_300)
         .unwrap();
 
-    // The table the next block pays: the store's own fold at NEXT.
-    let table = Arc::new(db.np_table_for_block(NEXT).unwrap());
+    // The table the next block pays: the store's own fold at NEXT, or with a genesis table the
+    // same events folded onto it, as the relay's `block_table` does.
+    let table = Arc::new(match genesis {
+        None => db.np_table_for_block(NEXT).unwrap(),
+        Some(g) => ghost_common::canonical_payout::table_for_from(
+            g,
+            NEXT,
+            &[(901, credits)].into(),
+            &[
+                (950, vec![(payee(1), 1_500 * ONE)]),
+                (960, vec![(payee(1), 1_000 * ONE)]),
+            ]
+            .into(),
+        )
+        .unwrap(),
+    });
     let status = RelayStatus {
         best: [0xAB; 32],
         height: 7,
@@ -514,4 +568,57 @@ async fn the_routes_answer_over_http() {
         .as_str()
         .unwrap()
         .contains("not a Bitcoin address"));
+}
+
+/// A carried-over balance shows: alone, added to share-chain credits and payouts, and in the
+/// queue the next block's table gives. Payee 5 crosses the floor only with its genesis amount,
+/// so its `queue_since` is the fold's, not the share chain's own row's.
+#[tokio::test]
+async fn balances_include_the_genesis_table() {
+    let w = world_on(Some(genesis()));
+    let db = w.api.parts.db.clone();
+    let mut late = BTreeMap::new();
+    late.insert(payee(5), 200 * ONE);
+    db.np_apply_credits(&credit_event_key(&[3; 32], 905), 905, &late, 2_400)
+        .unwrap();
+
+    // Only carried over: known, its whole balance, queued since the export height.
+    let r = w.api.ledger(&addr(&payee(4))).await.unwrap();
+    assert!(r.known && r.message.is_none());
+    assert_eq!(r.balance.sats, 3_000);
+    assert_eq!(r.queue_since, Some(EXPORT_H as u32));
+    let g = r.genesis.unwrap();
+    assert_eq!((g.owed.sats, g.export_height), (3_000, EXPORT_H));
+    assert_eq!(g.queue_since, Some(EXPORT_H as u32));
+    assert!(r.recent_shares.is_empty() && r.payouts.is_empty());
+    let q = r.queue.unwrap();
+    let p = queue_position(&w.table, &payee(4)).unwrap().unwrap();
+    assert!(q.eligible && p.eligible);
+    assert_eq!(q.owed.sats, 3_000);
+    assert_eq!((q.age_rank, q.size_rank), (p.age_rank, p.size_rank));
+
+    // Carried over, then credited and paid on the share chain.
+    let r = w.api.ledger(&addr(&payee(1))).await.unwrap();
+    let owed = 500 * ONE + P1_CREDIT - 2_500 * ONE;
+    assert_eq!(r.balance.units, owed.to_string());
+    assert_eq!(
+        r.genesis.unwrap().queue_since,
+        None,
+        "below the floor when carried"
+    );
+    assert_eq!(r.queue_since, Some(901));
+    assert_eq!(r.payouts.len(), 2);
+
+    // Over the floor only with its carried-over 900 sats.
+    let r = w.api.ledger(&addr(&payee(5))).await.unwrap();
+    assert_eq!(r.balance.sats, 1_100);
+    assert_eq!(r.queue_since, Some(905));
+    assert_eq!(db.np_balance(&payee(5)).unwrap().unwrap().queue_since, None);
+
+    // Payees 1, 2, 3 credited, 4 and 5 carried over (1 and 5 both).
+    assert_eq!(w.api.status().await.unwrap().ledger_rows, 5);
+
+    // Without a genesis table nothing is carried.
+    let r = world().api.ledger(&addr(&payee(4))).await.unwrap();
+    assert!(!r.known && r.genesis.is_none());
 }

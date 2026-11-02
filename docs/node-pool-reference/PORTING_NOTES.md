@@ -212,6 +212,16 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   queue_position`, which shares `select`'s orderings; what each slot class would pay is
   `paid_to`, i.e. `build_outputs`. The balance shown is the materialised ledger (credits to the
   tip), which is ahead of that table by up to 20 blocks of credits.
+- **Genesis balances.** `np_ledger` holds only what the share chain changed and starts empty;
+  settlement folds it onto the imported genesis table. So every balance the API shows (ledger,
+  miner page, wait estimate, balance history) is the payee's `np_genesis` row with its applied
+  credits and retirements folded on in applied order by `apply_credits`/`apply_block`
+  (`Database::np_payee_balance`); `queue_since` needs that fold, since a carried-over balance
+  can cross the floor with a credit the share chain's own row never would. Journalled
+  `prior_owed` values get the genesis amount added (owed is additive). The ledger answer carries
+  the carried-over row as `genesis`, the history opens with it at the export height
+  (`carried_over`, not a credit) when the window reaches back to it, and `ledger_rows` counts
+  payees in either table once.
 - **Credited shares** are batch memberships whose credit event `(anchor, job height)` is applied,
   so a share in a losing anchor's batch is not listed.
 - **Settled or provisional** is settlement's in-memory pending set; a restart re-derives it.
@@ -232,6 +242,13 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   `prev_hash`: `TableRequest` gained `prev` (pool_sv2 passes `None`, unchanged); with `prev`, the
   answer is `None` unless `prev` is archived at `H - 1`. The audited node is never asked for a
   table. A Bitcoin node is required: a fresh archive has no base without one (see Open).
+- **Genesis table**: the auditor's relay starts from the network's, read from the published
+  export (`--genesis-export DIR --export-digest HEX`) by `ghost_common::node_pool_genesis_export`,
+  the checks pool_sv2's import runs (moved there from pool_sv2 so the two cannot differ), and
+  imported into the auditor's store on first use (later runs read the store). Its `table_root`
+  must equal `--genesis-table-digest` (or mainnet's compiled pin), or `audit`, `probe` and `list`
+  refuse to start; only regtest may run unpinned. A store that already holds another export's
+  table, or has run on another table, is refused rather than mixed.
 - **Height** is `height(prev_hash) + 1` from the miner's Bitcoin node, and the scriptSig must
   start with its BIP34 push.
 - **Tier check**: a committed tier above `floor(log2(difficulty))` (with 1e-9 slack for a float
@@ -300,8 +317,14 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   store) and creates `np_genesis` and `np_genesis_meta`. Kept, because code still reads them:
   `miners`, `shares`, `shares_archive` (and the `shares_all` view), `rounds`, `nodes`, `peers`,
   `uptime_samples`, `won_blocks`, and every `np_*` table.
-- **It refuses, changing nothing,** on any row in `withdrawal_requests`, `ghost_locks`, `l2_*` or
-  `wraith_*`, and when a table it drops holds rows but no verified copy exists: it takes one
+- **It refuses, changing nothing,** on any row in a table that can hold user funds or an unspent
+  claim: `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`, Ghost Pay's
+  `confidential_notes`, `nullifiers`, `pending_nullifiers`, `confidential_transfers`,
+  `pending_l2_shields`, `accepted_instant_payments` and `instant_payment_reservations`,
+  `confirmed_pool_staging` and `reconciliation_entries`, and on a `node_rewards` row whose
+  `balance_sats` is not 0 (every health report creates one at 0). The old payout ledger is not
+  halted on: the ledger export carries it. It also refuses when a table it drops holds rows but
+  no verified copy exists: it takes one
   itself (`<db>.pre-v65`, `VACUUM INTO`, twice the database free required), reuses a verifying
   one, and never overwrites one that does not verify.
 - **Space**: with `auto_vacuum = INCREMENTAL` the free list is drained step by step after the
