@@ -270,6 +270,11 @@ impl ChannelManager {
                     "NODE_POOL: the node pool job layer is CONFIGURED. Templates at/above the \
                      activation height get per-channel GhostShare/v2 tags and slot-class sensing"
                 );
+                if let Some(relay) = &cfg.relay {
+                    crate::node_pool_relay::start(relay, &np)
+                        .await
+                        .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+                }
                 Some(Arc::new(np))
             }
         };

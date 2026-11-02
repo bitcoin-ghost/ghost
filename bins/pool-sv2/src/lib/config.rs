@@ -137,6 +137,9 @@ pub struct NodePoolConfig {
     /// Valid shares a class needs before a miner is stepped up. Defaults to 20.
     #[serde(default)]
     pub sensing_min_shares: Option<u32>,
+    /// `[node_pool.relay]`: run the share-chain relay. Absent: no relay.
+    #[serde(default)]
+    pub relay: Option<crate::node_pool_relay::NodePoolRelayConfig>,
 }
 
 /// Configuration for the Pool, including connection, authority, and coinbase settings.

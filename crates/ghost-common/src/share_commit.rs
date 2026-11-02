@@ -161,6 +161,124 @@ pub fn fold_coinbase_branch(txid: [u8; 32], branch: &[[u8; 32]]) -> [u8; 32] {
     })
 }
 
+/// Domain separator of a batch root.
+pub const BATCH_ROOT_DOMAIN: &[u8] = b"GhostBatch/v1";
+
+fn batch_leaf(id: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([0x00]);
+    h.update(id);
+    h.finalize().into()
+}
+
+fn batch_node(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([0x01]);
+    h.update(l);
+    h.update(r);
+    h.finalize().into()
+}
+
+/// Largest power of two strictly below `n` (`n >= 2`).
+fn split_point(n: usize) -> usize {
+    1 << (usize::BITS - 1 - (n - 1).leading_zeros())
+}
+
+/// RFC 6962 merkle tree hash over share ids, in order: `leaf = sha256(0x00 || id)`,
+/// `node = sha256(0x01 || left || right)`, split at the largest power of two below `n`, so an odd
+/// node is carried up, never duplicated. Empty: 32 zero bytes.
+fn batch_merkle(ids: &[[u8; 32]]) -> [u8; 32] {
+    match ids.len() {
+        0 => [0; 32],
+        1 => batch_leaf(&ids[0]),
+        n => {
+            let k = split_point(n);
+            batch_node(&batch_merkle(&ids[..k]), &batch_merkle(&ids[k..]))
+        }
+    }
+}
+
+/// The `batch_root` a job commits: `sha256("GhostBatch/v1" || n as u32 LE || merkle(ids))`, with
+/// `merkle` the RFC 6962 tree over the share ids (each share's header hash, internal byte order)
+/// in batch order. The count is committed so no two lists share a root, and the tree gives a
+/// share's owner a log-size proof that an anchor included it ([`batch_proof`]).
+pub fn batch_root(ids: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(BATCH_ROOT_DOMAIN);
+    h.update((ids.len() as u32).to_le_bytes());
+    h.update(batch_merkle(ids));
+    h.finalize().into()
+}
+
+/// Audit path for `ids[index]`, leaf to root (RFC 6962). `None` if out of range.
+pub fn batch_proof(ids: &[[u8; 32]], index: usize) -> Option<Vec<[u8; 32]>> {
+    if index >= ids.len() {
+        return None;
+    }
+    let mut path = Vec::new();
+    let (mut lo, mut hi, mut i) = (0, ids.len(), index);
+    let mut frames = Vec::new();
+    while hi - lo > 1 {
+        let k = split_point(hi - lo);
+        if i < k {
+            frames.push(batch_merkle(&ids[lo + k..hi]));
+            hi = lo + k;
+        } else {
+            frames.push(batch_merkle(&ids[lo..lo + k]));
+            lo += k;
+            i -= k;
+        }
+    }
+    while let Some(f) = frames.pop() {
+        path.push(f);
+    }
+    Some(path)
+}
+
+/// Check that `id` sits at `index` of an `n`-share batch with root `root`, by its audit path.
+pub fn verify_batch_proof(
+    root: &[u8; 32],
+    id: &[u8; 32],
+    index: usize,
+    n: usize,
+    path: &[[u8; 32]],
+) -> bool {
+    if index >= n {
+        return false;
+    }
+    // Walk down to record which side each level takes, then fold up.
+    let (mut lo, mut hi, mut i) = (0usize, n, index);
+    let mut left_side = Vec::new();
+    while hi - lo > 1 {
+        let k = split_point(hi - lo);
+        if i < k {
+            left_side.push(true);
+            hi = lo + k;
+        } else {
+            left_side.push(false);
+            lo += k;
+            i -= k;
+        }
+    }
+    if left_side.len() != path.len() {
+        return false;
+    }
+    let mut acc = batch_leaf(id);
+    for (is_left, sib) in left_side.iter().rev().zip(path) {
+        acc = if *is_left {
+            batch_node(&acc, sib)
+        } else {
+            batch_node(sib, &acc)
+        };
+    }
+    let mut h = Sha256::new();
+    h.update(BATCH_ROOT_DOMAIN);
+    h.update((n as u32).to_le_bytes());
+    h.update(acc);
+    let want: [u8; 32] = h.finalize().into();
+    &want == root
+}
+
 /// The share as received.
 #[derive(Debug, Clone, Copy)]
 pub struct ShareSubmission<'a> {
@@ -588,6 +706,41 @@ mod tests {
         let mut other = t.clone();
         other.tier = 13;
         assert_ne!(other.tag(), t.tag());
+    }
+
+    #[test]
+    fn batch_root_vectors_and_proofs() {
+        let ids: Vec<[u8; 32]> = (0..7u8).map(|i| [i; 32]).collect();
+        // Independently computed in Python (hashlib, RFC 6962 split).
+        assert_eq!(
+            hex::encode(batch_root(&[])),
+            "fb467fde239aa2ba036944e6dd1787401b8d021fbeb3e203f53f04d18242bfb5"
+        );
+        assert_eq!(
+            hex::encode(batch_root(&ids[..3])),
+            "44b2da39f74705013e5f276f3e5c12a60f54a247d072e77f910c7fa555b7b734"
+        );
+        assert_eq!(
+            hex::encode(batch_root(&ids)),
+            "2afb3fb79e90289de1b2731929f37487a47f8b0117e77ec86ebdbb2ec7cda47c"
+        );
+        assert_ne!(batch_root(&ids[..2]), batch_root(&[ids[1], ids[0]]));
+        assert_ne!(
+            batch_root(&ids[..3]),
+            batch_root(&[ids[0], ids[1], ids[2], ids[2]])
+        );
+        for n in 1..=ids.len() {
+            let root = batch_root(&ids[..n]);
+            for i in 0..n {
+                let p = batch_proof(&ids[..n], i).unwrap();
+                assert!(verify_batch_proof(&root, &ids[i], i, n, &p), "n {n} i {i}");
+                assert!(!verify_batch_proof(&root, &[9; 32], i, n, &p));
+                if n > 1 {
+                    assert!(!verify_batch_proof(&root, &ids[i], (i + 1) % n, n, &p));
+                }
+            }
+            assert!(batch_proof(&ids[..n], n).is_none());
+        }
     }
 
     #[test]

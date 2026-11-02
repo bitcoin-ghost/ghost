@@ -342,6 +342,17 @@ pub fn table_for(
     credits: &BTreeMap<u32, BTreeMap<Script, i128>>,
     blocks: &BTreeMap<u32, Vec<(Script, i128)>>,
 ) -> Result<Table, PayoutError> {
+    table_for_from(Table::new(), h, credits, blocks)
+}
+
+/// [`table_for`] folded onto a starting table `base` instead of an empty one: the genesis table a
+/// node pool starts from (plan, Phase 4), or a checkpointed table below every height folded here.
+pub fn table_for_from(
+    base: Table,
+    h: u32,
+    credits: &BTreeMap<u32, BTreeMap<Script, i128>>,
+    blocks: &BTreeMap<u32, Vec<(Script, i128)>>,
+) -> Result<Table, PayoutError> {
     let mut keys: Vec<u64> = credits
         .keys()
         .map(|c| *c as u64 + SNAPSHOT_CUT_LAG as u64)
@@ -350,7 +361,7 @@ pub fn table_for(
         .collect();
     keys.sort_unstable();
     keys.dedup();
-    let mut t = Table::new();
+    let mut t = base;
     for p in keys {
         if let Some(c) = p.checked_sub(SNAPSHOT_CUT_LAG as u64) {
             if let Some(d) = credits.get(&(c as u32)) {

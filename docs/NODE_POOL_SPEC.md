@@ -104,6 +104,13 @@ Mandatory corrections from simulation:
 6. **An anchor counts as unseen until its batch is held.** Simulated: honest void 0%, against 1.96-5.8% without it.
 7. **Share-chain sync is part of the protocol.** New nodes need headers, batches, retention and pruning rules, and an archive of the stale Bitcoin headers and coinbases that shares refer to, because Bitcoin peers will not serve them.
 
+**Batches and relay (W2.5, `crates/ghost-np-relay`).**
+- `batch_root = sha256("GhostBatch/v1" || n as u32 LE || M)`, where `M` is the RFC 6962 merkle tree over the batch's share ids in batch order (`leaf = sha256(0x00 || id)`, `node = sha256(0x01 || left || right)`, split at the largest power of two below `n`, odd nodes carried up, empty tree 32 zero bytes). A share id is its header hash. The count is committed, and the tree gives a miner a log-size proof that an anchor included its share.
+- A job's batch is the set of loose network shares its node held when it last re-batched: on every new best anchor, and every 30 s. A share mined since then waits for the next batch.
+- Messages, all length-prefixed and capped per type: `Hello` (protocol version, genesis anchor, tip), `Share` (header, coinbase, merkle branch, tag preimage), `Anchor` (`btc_height` and the anchor's own share), `Batch` (anchor and share ids), `GetBatch`, `GetShares`, `Shares`, `GetAnchor`, `NotFound`, `Tip`, `GetAddr`, `Addr`. A node relays an anchor and its batch only after checking them, so it never passes on an anchor it cannot serve.
+- An anchor's own share is checked as included by the anchor itself; if it fails, the anchor is invalid. It earns credit only when a later anchor includes it, like any network share.
+- Peers are any nodes on the same genesis. Invalid data scores toward a 24-hour ban; late, stale or fork data never does.
+
 Bandwidth estimate at 10 EH/s: about 3.7 KB/s per link, 320 MB/day. An SV1 notify with 500 outputs is about 44 KB, so 1,000 miners on 30 s jobs is about 1.5 MB/s of egress. Anchor pushes raise this; measure it.
 
 ### 2.3 Ledger and payout

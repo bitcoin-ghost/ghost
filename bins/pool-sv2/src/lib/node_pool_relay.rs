@@ -1,0 +1,199 @@
+//! `[node_pool.relay]`: run the share-chain relay (W2.5) inside pool_sv2.
+//!
+//! pool_sv2 owns both ends the relay needs: the shares miners submit, and the
+//! [`AnchorDriver`](crate::node_pool::AnchorDriver) that re-stamps every channel's jobs. So the
+//! relay runs here, with its own store file. Every accepted share whose hash meets the lowest
+//! network tier is offered to it ([`crate::node_pool::NodePool::offer_share`]); the relay keeps
+//! those at `T_net` and turns one at `T_net + 8` on a published job into an anchor. Every new best
+//! tip, and the 30 s re-batch, is published back to the driver at once.
+//!
+//! Absent, nothing starts. Present, it runs whatever the activation height: below it pool_sv2
+//! builds no node pool jobs, so the relay sees no local shares and only follows its peers.
+
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
+use ghost_common::{node_pool_u256::U256, rpc::BitcoinRpc, share_commit::diff1_target};
+use ghost_np_relay::{
+    headers::{HeaderOracle, RpcHeaderOracle},
+    net::{spawn, NetConfig, RelayHandle},
+    relay::{Genesis, NoRetirements, Relay, RelayParams},
+};
+use ghost_storage::Database;
+use tracing::warn;
+
+use crate::node_pool::{AnchorUpdate, NodePool};
+
+/// The relay's settings.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePoolRelayConfig {
+    /// Where to accept peers, e.g. `0.0.0.0:8566`. Absent: outbound only.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// The port peers should dial, when it differs from `listen`'s.
+    #[serde(default)]
+    pub advertise_port: Option<u16>,
+    /// Peers to dial, `host:port`. More are learned from them.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// The relay's own store (anchors, batches, shares, ledger).
+    pub db_path: PathBuf,
+    /// The genesis anchor, 64 hex characters, internal byte order.
+    pub genesis_anchor: String,
+    /// The genesis anchor's `btc_height`.
+    pub genesis_btc_height: u32,
+    /// `T_net` at genesis. Defaults to the floor.
+    #[serde(default)]
+    pub genesis_tier: Option<u8>,
+    /// Tier 0 target, 64 hex characters, big-endian. Defaults to the difficulty-1 target; regtest
+    /// needs an easier one.
+    #[serde(default)]
+    pub tier_base: Option<String>,
+    /// The local Bitcoin node's RPC, for share headers.
+    pub rpc_host: String,
+    /// RPC port.
+    pub rpc_port: u16,
+    /// RPC user.
+    pub rpc_user: String,
+    /// RPC password.
+    pub rpc_password: String,
+}
+
+fn hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
+    let v = hex::decode(s.trim()).map_err(|e| format!("{what}: {e}"))?;
+    v.try_into().map_err(|_| format!("{what}: not 32 bytes"))
+}
+
+/// Open the store and start the relay, publishing to `np`'s anchor driver and taking its
+/// offered shares.
+pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHandle, String> {
+    let tier_base = match &cfg.tier_base {
+        Some(h) => U256::from_be_bytes(hex32(h, "tier_base")?),
+        None => diff1_target(),
+    };
+    let genesis = Genesis {
+        hash: hex32(&cfg.genesis_anchor, "genesis_anchor")?,
+        btc_height: cfg.genesis_btc_height,
+        tier: cfg
+            .genesis_tier
+            .unwrap_or(ghost_common::node_pool_constants::T_NET_FLOOR),
+        // The imported genesis table is the cutover's (plan, Phase 4); until then, empty.
+        table: Default::default(),
+    };
+    let db = Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?;
+    let relay = Relay::open(
+        RelayParams::new(genesis, tier_base),
+        Arc::new(db),
+        Box::new(NoRetirements),
+    )
+    .map_err(|e| format!("relay: {e}"))?;
+    let rpc = BitcoinRpc::new(
+        &cfg.rpc_host,
+        cfg.rpc_port,
+        &cfg.rpc_user,
+        &cfg.rpc_password,
+    )
+    .map_err(|e| format!("relay rpc: {e}"))?;
+    let oracle: Arc<dyn HeaderOracle> = Arc::new(RpcHeaderOracle::new(rpc));
+    let mut peers = Vec::new();
+    for p in &cfg.peers {
+        match tokio::net::lookup_host(p.as_str()).await {
+            Ok(mut addrs) => peers.extend(addrs.next()),
+            Err(e) => warn!("NODE_POOL_RELAY: peer {p} does not resolve: {e}"),
+        }
+    }
+    let net = NetConfig {
+        listen: cfg.listen,
+        advertise_port: cfg.advertise_port,
+        peers,
+        ..NetConfig::default()
+    };
+    let driver = np.anchor_driver();
+    let handle = spawn(
+        relay,
+        net,
+        oracle,
+        Arc::new(move |j| {
+            driver.publish(AnchorUpdate {
+                parent_anchor: j.parent_anchor,
+                batch_root: j.batch_root,
+            })
+        }),
+    )
+    .await
+    .map_err(|e| format!("relay listen: {e}"))?;
+    np.set_relay_sink(handle.local.clone(), tier_base);
+    warn!(
+        listen = ?handle.listen_addr,
+        "NODE_POOL_RELAY: the share-chain relay is RUNNING"
+    );
+    Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NodePoolConfig;
+
+    const GENESIS: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    fn parse(toml: &str) -> Result<NodePoolConfig, ext_config::ConfigError> {
+        ext_config::Config::builder()
+            .add_source(ext_config::File::from_str(
+                toml,
+                ext_config::FileFormat::Toml,
+            ))
+            .build()?
+            .try_deserialize()
+    }
+
+    fn relay_toml(db: &std::path::Path, extra: &str) -> String {
+        format!(
+            "[relay]\nlisten = \"127.0.0.1:0\"\npeers = [\"127.0.0.1:1\"]\ndb_path = {:?}\n\
+             genesis_anchor = \"{GENESIS}\"\ngenesis_btc_height = 974400\nrpc_host = \
+             \"127.0.0.1\"\nrpc_port = 1\nrpc_user = \"u\"\nrpc_password = \"p\"\n{extra}",
+            db.display().to_string()
+        )
+    }
+
+    #[test]
+    fn the_relay_section_parses_and_refuses_unknown_keys() {
+        let db = std::path::Path::new("/tmp/np.db");
+        let c = parse(&relay_toml(db, "")).unwrap();
+        let r = c.relay.expect("relay section");
+        assert_eq!(r.genesis_btc_height, 974_400);
+        assert_eq!(r.peers, vec!["127.0.0.1:1".to_string()]);
+        assert!(r.tier_base.is_none() && r.genesis_tier.is_none());
+        assert!(parse(&relay_toml(db, "nonsense = 1\n")).is_err());
+        assert!(parse("").unwrap().relay.is_none(), "absent by default");
+    }
+
+    #[tokio::test]
+    async fn a_started_relay_publishes_its_tip_to_the_anchor_driver() {
+        let dir = std::env::temp_dir().join(format!("np-relay-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = parse(&relay_toml(&dir.join("relay.db"), ""))
+            .unwrap()
+            .relay
+            .unwrap();
+        let np = NodePool::from_parts([0x7A; 32], u64::MAX, 60.0, 20);
+        let mut bad = cfg.clone();
+        bad.genesis_anchor = "zz".into();
+        assert!(start(&bad, &np).await.is_err());
+        let h = start(&cfg, &np).await.unwrap();
+        let mut rx = np.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx.wait_for(|u| u.is_some()),
+        )
+        .await
+        .expect("published")
+        .unwrap();
+        let u = np.anchor_driver().current().unwrap();
+        assert_eq!(u.parent_anchor, hex32(GENESIS, "g").unwrap());
+        assert_eq!(u.batch_root, ghost_common::share_commit::batch_root(&[]));
+        h.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
