@@ -3,7 +3,6 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use core::sync::atomic::Ordering;
 use stratum_apps::stratum_core::parsers_sv2::Mining;
 use tracing::error;
 
@@ -51,9 +50,6 @@ impl ChannelManager {
         let messages: Vec<RouteMessageTo> = self.channel_manager_data.super_safe_lock(|cm| {
             let mut messages = vec![];
             for (downstream_id, downstream) in cm.downstream.iter_mut() {
-                if downstream.requires_custom_work.load(Ordering::SeqCst) {
-                    continue;
-                }
                 downstream.downstream_data.super_safe_lock(|data| {
                     for (channel_id, channel) in data.extended_channels.iter_mut() {
                         let key = (*downstream_id, *channel_id);

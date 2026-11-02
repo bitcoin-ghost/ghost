@@ -24,9 +24,8 @@ use stratum_apps::stratum_core::{
     template_distribution_sv2::SubmitSolution,
 };
 use stratum_apps::utils::types::SharesPerMinute;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo, CLIENT_SEARCH_SPACE_BYTES},
@@ -275,18 +274,6 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 return Err(PoolError::disconnect(PoolErrorKind::DownstreamIdNotFound, downstream_id));
             };
 
-            if downstream.requires_custom_work.load(Ordering::SeqCst) {
-                error!("OpenStandardMiningChannel: Standard Channels are not supported for this connection");
-                let open_standard_mining_channel_error = OpenMiningChannelError {
-                    request_id,
-                    error_code: "standard-channels-not-supported-for-custom-work"
-                        .to_string()
-                        .try_into()
-                        .expect("error code must be valid string"),
-                };
-                return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_standard_mining_channel_error)).into()]);
-            }
-
             let Some(last_future_template) = channel_manager_data.last_future_template.clone() else {
                 return Err(PoolError::disconnect(PoolErrorKind::FutureTemplateNotPresent, downstream_id));
             };
@@ -492,22 +479,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     .super_safe_lock(|downstream_data| {
                         let mut messages: Vec<RouteMessageTo> = Vec::new();
 
-                        // NODE_POOL: how this channel's jobs are stamped. Custom-work connections
-                        // are excluded: their coinbases come from the declaring client and
-                        // cannot carry this pool's commitment.
-                        let stamped = !downstream.requires_custom_work.load(Ordering::SeqCst);
-
                         // NODE_POOL: the channel must credit a payee the ledger accepts. Checked
                         // before the prefix is minted, for the reason given just below.
-                        if stamped {
-                            if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
-                                error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
-                                let open_extended_mining_channel_error = OpenMiningChannelError {
-                                    request_id,
-                                    error_code: code.to_string().try_into().expect("error code must be valid string"),
-                                };
-                                return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_extended_mining_channel_error)).into()]);
-                            }
+                        if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
+                            error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
+                            let open_extended_mining_channel_error = OpenMiningChannelError {
+                                request_id,
+                                error_code: code.to_string().try_into().expect("error code must be valid string"),
+                            };
+                            return Ok(vec![(downstream_id, Mining::OpenMiningChannelError(open_extended_mining_channel_error)).into()]);
                         }
 
                         // Validate the request in full BEFORE any extranonce prefix is minted.
@@ -634,26 +614,24 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         // else a native SV2 miner's SetupConnection fields, seed the sensing
                         // loop; the stamp registers the channel at the smallest class its model
                         // allows.
-                        if stamped {
-                            np.note_identity(
-                                (downstream_id, channel_id),
-                                crate::node_pool::NodePool::identity_for_open(
-                                    tlv_fields,
-                                    downstream_data.setup_device.as_ref(),
-                                ),
-                            );
-                            let q = np.quantise_target(
-                                extended_channel.get_target(),
-                                extended_channel.get_requested_max_target(),
-                            );
-                            extended_channel.set_target(q);
-                            extended_channel.set_tier_commitment(Some(np.stamp(
-                                (downstream_id, channel_id),
-                                crate::node_pool::ChannelKind::Extended,
-                                &user_identity,
-                                &q,
-                            )));
-                        }
+                        np.note_identity(
+                            (downstream_id, channel_id),
+                            crate::node_pool::NodePool::identity_for_open(
+                                tlv_fields,
+                                downstream_data.setup_device.as_ref(),
+                            ),
+                        );
+                        let q = np.quantise_target(
+                            extended_channel.get_target(),
+                            extended_channel.get_requested_max_target(),
+                        );
+                        extended_channel.set_target(q);
+                        extended_channel.set_tier_commitment(Some(np.stamp(
+                            (downstream_id, channel_id),
+                            crate::node_pool::ChannelKind::Extended,
+                            &user_identity,
+                            &q,
+                        )));
 
                         let group_channel_id = downstream_data.group_channel.get_group_channel_id();
 
@@ -694,100 +672,90 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             return Err(PoolError::disconnect(PoolErrorKind::FutureTemplateNotPresent,downstream_id));
                         };
 
-                        // if the client requires custom work, we don't need to send any extended
-                        // jobs so we just process the SetNewPrevHash
+                        // The first job: Ghost tags out of the prefix, the share tag back in as
+                        // the factory's extra push, the canonical outputs.
+                        let coinbase_outputs = np
+                            .job_outputs((downstream_id, channel_id), &last_future_template)
+                            .map_err(|e| PoolError::disconnect(PoolErrorKind::Custom(e), downstream_id))?;
+                        let channel_template = np.prepare_template(&last_future_template);
+                        extended_channel.on_new_template(
+                            channel_template,
+                            coinbase_outputs,
+                        ).map_err(|e| PoolError::disconnect(e, downstream_id))?;
+
+                        let future_extended_job_id = extended_channel
+                            .get_future_job_id_from_template_id(last_future_template.template_id)
+                            .expect("future job id must exist");
+                        np.bind_job((downstream_id, channel_id), future_extended_job_id);
+                        let future_extended_job = extended_channel
+                            .get_future_job(future_extended_job_id)
+                            .expect("future job must exist");
+
+                        let future_extended_job_message =
+                            future_extended_job.get_job_message().clone().into_static();
+
+                        // send this future job as new job message
+                        // to be immediately activated with the subsequent SetNewPrevHash
                         // message
-                        if downstream.requires_custom_work.load(Ordering::SeqCst) {
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::NewExtendedMiningJob(future_extended_job_message),
+                            )
+                                .into(),
+                        );
+
+                        // Activate the future job we just seeded — but ONLY when the two
+                        // cached Template Distribution fields actually agree.
+                        //
+                        // `last_future_template` and `last_new_prev_hash` are written by two
+                        // different TP handlers, each taking this lock separately. Between a
+                        // `NewTemplate(N)` and its `SetNewPrevHash(N)` the pair is legitimately
+                        // mismatched: the template is already N while the prev hash still
+                        // refers to N-1. A channel opening in that window would seed job N and
+                        // then ask to activate N-1, which `on_set_new_prev_hash` reports as
+                        // `TemplateIdNotFound` (#898).
+                        //
+                        // Skipping is safe and loses nothing: the channel keeps its future job,
+                        // and the next `SetNewPrevHash` broadcast activates it for every
+                        // downstream. Sending the client a `SetNewPrevHash` built from the
+                        // stale prev hash would be actively wrong, so that is skipped with it.
+                        if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, last_future_template.template_id) {
+                            let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
+                            let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
+                            let n_bits = last_set_new_prev_hash_tdp.n_bits;
+                            let set_new_prev_hash_mining = SetNewPrevHash {
+                                channel_id,
+                                job_id: future_extended_job_id,
+                                prev_hash,
+                                min_ntime: header_timestamp,
+                                nbits: n_bits,
+                            };
+
                             extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(|e| PoolError::disconnect(e, downstream_id))?;
-                            // if the client does not require custom work, we need to send the
-                            // future extended job
-                            // and the SetNewPrevHash message
-                        } else {
-                            // The first job: Ghost tags out of the prefix, the share tag back in as
-                            // the factory's extra push, the canonical outputs.
-                            let coinbase_outputs = np
-                                .job_outputs((downstream_id, channel_id), &last_future_template)
-                                .map_err(|e| PoolError::disconnect(PoolErrorKind::Custom(e), downstream_id))?;
-                            let channel_template = np.prepare_template(&last_future_template);
-                            extended_channel.on_new_template(
-                                channel_template,
-                                coinbase_outputs,
-                            ).map_err(|e| PoolError::disconnect(e, downstream_id))?;
 
-                            let future_extended_job_id = extended_channel
-                                .get_future_job_id_from_template_id(last_future_template.template_id)
-                                .expect("future job id must exist");
-                            np.bind_job((downstream_id, channel_id), future_extended_job_id);
-                            let future_extended_job = extended_channel
-                                .get_future_job(future_extended_job_id)
-                                .expect("future job must exist");
-
-                            let future_extended_job_message =
-                                future_extended_job.get_job_message().clone().into_static();
-
-                            // send this future job as new job message
-                            // to be immediately activated with the subsequent SetNewPrevHash
-                            // message
                             messages.push(
                                 (
                                     downstream_id,
-                                    Mining::NewExtendedMiningJob(future_extended_job_message),
+                                    Mining::SetNewPrevHash(set_new_prev_hash_mining),
                                 )
                                     .into(),
                             );
-
-                            // Activate the future job we just seeded — but ONLY when the two
-                            // cached Template Distribution fields actually agree.
-                            //
-                            // `last_future_template` and `last_new_prev_hash` are written by two
-                            // different TP handlers, each taking this lock separately. Between a
-                            // `NewTemplate(N)` and its `SetNewPrevHash(N)` the pair is legitimately
-                            // mismatched: the template is already N while the prev hash still
-                            // refers to N-1. A channel opening in that window would seed job N and
-                            // then ask to activate N-1, which `on_set_new_prev_hash` reports as
-                            // `TemplateIdNotFound` (#898).
-                            //
-                            // Skipping is safe and loses nothing: the channel keeps its future job,
-                            // and the next `SetNewPrevHash` broadcast activates it for every
-                            // downstream. Sending the client a `SetNewPrevHash` built from the
-                            // stale prev hash would be actively wrong, so that is skipped with it.
-                            if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, last_future_template.template_id) {
-                                let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
-                                let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
-                                let n_bits = last_set_new_prev_hash_tdp.n_bits;
-                                let set_new_prev_hash_mining = SetNewPrevHash {
-                                    channel_id,
-                                    job_id: future_extended_job_id,
-                                    prev_hash,
-                                    min_ntime: header_timestamp,
-                                    nbits: n_bits,
-                                };
-
-                                extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(|e| PoolError::disconnect(e, downstream_id))?;
-
-                                messages.push(
-                                    (
-                                        downstream_id,
-                                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                                    )
-                                        .into(),
-                                );
-                            } else {
-                                debug!(
-                                    channel_id,
-                                    template_id = last_future_template.template_id,
-                                    prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
-                                    "Opened channel between NewTemplate and its SetNewPrevHash — \
-                                     leaving the future job unactivated for the next broadcast"
-                                );
-                            }
-
-                            let full_extranonce_size = extended_channel.get_full_extranonce_size();
-                            downstream_data.group_channel.add_channel_id(channel_id, full_extranonce_size).map_err(|e| {
-                                error!("Failed to add channel id to group channel: {:?}", e);
-                                PoolError::shutdown(e)
-                            })?;
+                        } else {
+                            debug!(
+                                channel_id,
+                                template_id = last_future_template.template_id,
+                                prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
+                                "Opened channel between NewTemplate and its SetNewPrevHash — \
+                                 leaving the future job unactivated for the next broadcast"
+                            );
                         }
+
+                        let full_extranonce_size = extended_channel.get_full_extranonce_size();
+                        downstream_data.group_channel.add_channel_id(channel_id, full_extranonce_size).map_err(|e| {
+                            error!("Failed to add channel id to group channel: {:?}", e);
+                            PoolError::shutdown(e)
+                        })?;
 
                         downstream_data
                             .extended_channels
@@ -1685,106 +1653,32 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         Ok(())
     }
 
+    /// Custom jobs are refused. A declared job's coinbase comes from the declaring client, so it
+    /// cannot pay the node pool's canonical outputs; every job this pool runs is built from a
+    /// template it holds.
     async fn handle_set_custom_mining_job(
         &mut self,
         client_id: Option<usize>,
         msg: SetCustomMiningJob<'_>,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", msg);
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
-
-        let Some(ref mut job_declarator) = self.job_declarator else {
-            let error = SetCustomMiningJobError {
-                request_id: msg.request_id,
-                channel_id: msg.channel_id,
-                error_code: "jd-not-supported"
-                    .to_string()
-                    .try_into()
-                    .expect("error code must be valid string"),
-            };
-            let message: RouteMessageTo =
-                (downstream_id, Mining::SetCustomMiningJobError(error)).into();
-            message
-                .forward(&self.channel_manager_channel)
-                .await
-                .map_err(|e| PoolError::disconnect(e, downstream_id))?;
-            return Ok(());
+        warn!(downstream_id, "SetCustomMiningJob refused: custom jobs are not supported");
+        let error = SetCustomMiningJobError {
+            request_id: msg.request_id,
+            channel_id: msg.channel_id,
+            error_code: "custom-jobs-not-supported"
+                .to_string()
+                .try_into()
+                .expect("error code must be valid string"),
         };
-
-        let msg_static = msg.clone().into_static();
-
-        // Step 1: Validate the custom job via JDS (token + job validation).
-        let jds_response = job_declarator
-            .handle_set_custom_mining_job(msg_static.clone(), _tlv_fields)
-            .await
-            .map_err(|e| PoolError::shutdown(PoolErrorKind::Jds(e.into())))?;
-
-        if let SetCustomMiningJobResponse::Error(jds_err) = jds_response {
-            let message: RouteMessageTo = (
-                downstream_id,
-                Mining::SetCustomMiningJobError(jds_err.into_static()),
-            )
-                .into();
-            message
-                .forward(&self.channel_manager_channel)
-                .await
-                .map_err(|e| PoolError::disconnect(e, downstream_id))?;
-            return Ok(());
-        }
-
-        // Step 2: JDS validated successfully — commit the job to the extended channel.
         let message: RouteMessageTo =
-            self.channel_manager_data
-                .super_safe_lock(|channel_manager_data| {
-                    let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id)
-                    else {
-                        return Err(PoolError::disconnect(
-                            PoolErrorKind::DownstreamNotFound(downstream_id),
-                            downstream_id,
-                        ));
-                    };
-
-                    downstream
-                        .downstream_data
-                        .super_safe_lock(|downstream_data| {
-                            let Some(extended_channel) = downstream_data
-                                .extended_channels
-                                .get_mut(&msg_static.channel_id)
-                            else {
-                                error!("SetCustomMiningJobError: invalid-channel-id");
-                                let error = SetCustomMiningJobError {
-                                    request_id: msg_static.request_id,
-                                    channel_id: msg_static.channel_id,
-                                    error_code: "invalid-channel-id"
-                                        .to_string()
-                                        .try_into()
-                                        .expect("error code must be valid string"),
-                                };
-                                return Ok(
-                                    (downstream_id, Mining::SetCustomMiningJobError(error)).into()
-                                );
-                            };
-
-                            let job_id = extended_channel
-                                .on_set_custom_mining_job(msg_static.clone())
-                                .map_err(|error| PoolError::disconnect(error, downstream_id))?;
-
-                            let success = SetCustomMiningJobSuccess {
-                                channel_id: msg_static.channel_id,
-                                request_id: msg_static.request_id,
-                                job_id,
-                            };
-                            Ok((downstream_id, Mining::SetCustomMiningJobSuccess(success)).into())
-                        })
-                })?;
-
+            (downstream_id, Mining::SetCustomMiningJobError(error)).into();
         message
             .forward(&self.channel_manager_channel)
             .await
             .map_err(|e| PoolError::disconnect(e, downstream_id))?;
-
         Ok(())
     }
 }

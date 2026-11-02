@@ -4,7 +4,6 @@ use crate::{
     sv1_minerd::MinerdProcess, template_provider::*,
 };
 use interceptor::InterceptAction;
-use jd_client_sv2::{config::ConfigJDCMode, JobDeclaratorClient};
 use once_cell::sync::OnceCell;
 use pool_sv2::PoolSv2;
 use std::{
@@ -50,11 +49,10 @@ const SHARES_PER_MINUTE: f32 = 120.0;
 
 pub const POOL_COINBASE_REWARD_ADDRESS: &str = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8";
 const POOL_COINBASE_REWARD_DESCRIPTOR: &str = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)";
-const JDC_COINBASE_REWARD_DESCRIPTOR: &str = "addr(tb1qpusf5256yxv50qt0pm0tue8k952fsu5lzsphft)";
 
 static LOGGER: OnceCell<()> = OnceCell::new();
 
-/// Helper to create Sv2Tp config for Pool/JDC with default public key.
+/// Helper to create Sv2Tp config for the Pool with default public key.
 pub fn sv2_tp_config(address: SocketAddr) -> TemplateProviderType {
     TemplateProviderType::Sv2Tp {
         address: address.to_string(),
@@ -163,7 +161,6 @@ pub async fn start_pool(
         required_extensions,
         monitoring_address,
         monitoring_cache_refresh_secs,
-        None, // no JDS
     );
     // `get_available_address` keeps the port BOUND so nothing can steal it between choice and
     // use (#408, #612). `PoolSv2` binds the address itself, so that reservation has to be handed
@@ -199,165 +196,6 @@ pub fn start_bitcoin_core(difficulty_level: DifficultyLevel) -> BitcoinCore {
     let bitcoin_core = BitcoinCore::start(address.port(), difficulty_level);
     bitcoin_core.generate_blocks(1);
     bitcoin_core
-}
-
-pub fn start_jdc(
-    pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
-    template_provider_config: TemplateProviderType,
-    supported_extensions: Vec<u16>,
-    required_extensions: Vec<u16>,
-    enable_monitoring: bool,
-    jdc_mode: Option<ConfigJDCMode>,
-) -> (JobDeclaratorClient, SocketAddr, Option<SocketAddr>) {
-    use jd_client_sv2::config::{JobDeclaratorClientConfig, PoolConfig, ProtocolConfig, Upstream};
-    let jdc_address = get_available_address();
-    let max_supported_version = 2;
-    let min_supported_version = 2;
-    let authority_public_key = Secp256k1PublicKey::try_from(
-        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
-    )
-    .unwrap();
-    let authority_secret_key = Secp256k1SecretKey::try_from(
-        "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n".to_string(),
-    )
-    .unwrap();
-    let coinbase_reward_script =
-        CoinbaseRewardScript::from_descriptor(JDC_COINBASE_REWARD_DESCRIPTOR).unwrap();
-    let authority_pubkey = Secp256k1PublicKey::try_from(
-        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
-    )
-    .unwrap();
-    let upstreams = pool
-        .iter()
-        .map(|(pool_addr, jds_addr)| {
-            Upstream::new(
-                authority_pubkey,
-                pool_addr.ip().to_string(),
-                pool_addr.port(),
-                jds_addr.ip().to_string(),
-                jds_addr.port(),
-            )
-        })
-        .collect();
-    let pool_config = PoolConfig::new(authority_public_key, authority_secret_key);
-    let protocol_config = ProtocolConfig::new(
-        max_supported_version,
-        min_supported_version,
-        coinbase_reward_script,
-    );
-    let shares_per_minute = 10.0;
-    let shares_batch_size = 1;
-    let user_identity = "IT-test".to_string();
-    let jdc_signature = "JDC".to_string();
-    let monitoring_address = if enable_monitoring {
-        Some(get_available_address())
-    } else {
-        None
-    };
-    let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let jd_client_proxy = JobDeclaratorClientConfig::new(
-        jdc_address,
-        protocol_config,
-        user_identity,
-        shares_per_minute,
-        shares_batch_size,
-        pool_config,
-        3600,
-        template_provider_config,
-        upstreams,
-        jdc_signature,
-        jdc_mode,
-        supported_extensions,
-        required_extensions,
-        monitoring_address,
-        monitoring_cache_refresh_secs,
-    );
-    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
-    // component binds the address itself, so the reservation must be handed back first or its
-    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
-    // it for. That was the root cause behind 14 of the 18 targets (#617).
-    release_reservation(jdc_address);
-    if let Some(addr) = monitoring_address {
-        release_reservation(addr);
-    }
-
-    let ret = jd_client_sv2::JobDeclaratorClient::new(jd_client_proxy);
-    let ret_clone = ret.clone();
-    tokio::spawn(async move { ret_clone.start().await });
-    (ret, jdc_address, monitoring_address)
-}
-
-pub async fn start_pool_with_jds(
-    bitcoin_core: &BitcoinCore,
-    supported_extensions: Vec<u16>,
-    required_extensions: Vec<u16>,
-    enable_monitoring: bool,
-) -> (PoolSv2, SocketAddr, SocketAddr, Option<SocketAddr>) {
-    use pool_sv2::config::{AuthorityConfig, ConnectionConfig, JDSPartialConfig, PoolConfig};
-
-    let pool_address = get_available_address();
-    let jds_address = get_available_address();
-
-    let authority_public_key = Secp256k1PublicKey::try_from(
-        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
-    )
-    .expect("failed");
-    let authority_secret_key = Secp256k1SecretKey::try_from(
-        "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n".to_string(),
-    )
-    .expect("failed");
-    let cert_validity_sec = 3600;
-    let coinbase_reward_script =
-        CoinbaseRewardScript::from_descriptor(POOL_COINBASE_REWARD_DESCRIPTOR).unwrap();
-
-    let template_provider_config = ipc_config(
-        bitcoin_core.data_dir().clone(),
-        bitcoin_core.is_signet(),
-        None,
-    );
-
-    let pool_signature = "Stratum V2 SRI Pool".to_string();
-    let connection_config = ConnectionConfig::new(pool_address, cert_validity_sec, pool_signature);
-    let authority_config = AuthorityConfig::new(authority_public_key, authority_secret_key);
-    let share_batch_size = 1;
-    let monitoring_address = if enable_monitoring {
-        Some(get_available_address())
-    } else {
-        None
-    };
-    let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let config = PoolConfig::new(
-        connection_config,
-        template_provider_config,
-        authority_config,
-        coinbase_reward_script.clone(),
-        SHARES_PER_MINUTE,
-        share_batch_size,
-        1,
-        supported_extensions.clone(),
-        required_extensions.clone(),
-        monitoring_address,
-        monitoring_cache_refresh_secs,
-        Some(JDSPartialConfig::new(jds_address)),
-    );
-
-    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
-    // component binds the address itself, so the reservation must be handed back first or its
-    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
-    // it for. That was the root cause behind 14 of the 18 targets (#617).
-    release_reservation(pool_address);
-    release_reservation(jds_address);
-    if let Some(addr) = monitoring_address {
-        release_reservation(addr);
-    }
-
-    let pool = PoolSv2::new(config);
-    let pool_clone = pool.clone();
-    tokio::spawn(async move {
-        _ = pool_clone.start().await;
-    });
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    (pool, pool_address, jds_address, monitoring_address)
 }
 
 pub async fn start_sv2_translator(

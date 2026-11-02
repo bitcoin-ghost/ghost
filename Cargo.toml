@@ -48,8 +48,6 @@ members = [
     # SV2 apps (amalgamated from the former sv2-apps submodule)
     "bins/translator-sv2",
     "bins/pool-sv2",
-    "bins/jd-client-sv2",
-    "bins/jd-server-sv2",
     "crates/stratum-apps",
     "crates/bitcoin-core-sv2",
     "tests/integration-sv2",

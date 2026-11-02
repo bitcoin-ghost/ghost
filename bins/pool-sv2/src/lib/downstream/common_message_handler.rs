@@ -77,27 +77,40 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
         self.downstream_data
             .super_safe_lock(|data| data.setup_device = setup_device);
 
-        self.requires_custom_work
-            .store(has_work_selection(msg.flags), Ordering::SeqCst);
+        // Work selection (job declaration) is refused: a declared job's coinbase comes from the
+        // client and cannot pay the node pool's canonical outputs.
+        if has_work_selection(msg.flags) {
+            info!("Rejecting connection from {downstream_id}: work selection is not supported.");
+            let response = SetupConnectionError {
+                // REQUIRES_WORK_SELECTION, the flag this server does not support.
+                flags: 0b10,
+                error_code: "unsupported-feature-flags"
+                    .to_string()
+                    .try_into()
+                    .expect("error code must be valid string"),
+            };
+            let frame: Sv2Frame = AnyMessage::Common(response.into_static().into())
+                .try_into()
+                .map_err(PoolError::shutdown)?;
+            self.downstream_channel
+                .downstream_sender
+                .send(frame)
+                .await
+                .map_err(|_| {
+                    PoolError::disconnect(PoolErrorKind::ChannelErrorSender, downstream_id)
+                })?;
+            return Err(PoolError::disconnect(
+                PoolErrorKind::UnsupportedProtocol,
+                downstream_id,
+            ));
+        }
         self.requires_standard_jobs
             .store(has_requires_std_job(msg.flags), Ordering::SeqCst);
 
-        // SetupConnection.Success.flags for Mining Protocol (server -> client):
-        // Bit 0: REQUIRES_FIXED_VERSION (upstream won't accept version changes)
-        // Bit 1: REQUIRES_EXTENDED_CHANNELS (upstream won't accept standard channels)
-        //
-        // When the downstream requests work selection, the pool requires extended channels,
-        // since custom work (job declaration) uses extended channels.
-        //
-        // TODO: replace magic numbers with named constants once
-        // https://github.com/stratum-mining/stratum/issues/2075 is resolved.
-        let mut response_flags: u32 = 0;
-        if has_work_selection(msg.flags) {
-            response_flags |= 0x02; // REQUIRES_EXTENDED_CHANNELS
-        }
+        // SetupConnection.Success.flags for Mining Protocol (server -> client): none are set.
         let response = SetupConnectionSuccess {
             used_version: 2,
-            flags: response_flags,
+            flags: 0,
         };
         let frame: Sv2Frame = AnyMessage::Common(response.into_static().into())
             .try_into()

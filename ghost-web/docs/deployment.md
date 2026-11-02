@@ -38,7 +38,7 @@ Four services on one machine, all installed by `scripts/install-node.sh`:
 
 The systemd units are `ghostd`, `ghost-mining`, `sri-pool` and `sri-translator`, plus a fifth, `ghost-mining-gate`, which starts the last three once ghostd has synced (see *The boot gate*, below).
 
-Every binary comes from the signed release tarball. For each release that tarball holds `ghostd`, `ghost-cli` (the ghostd RPC client, like `bitcoin-cli`), `ghost-mining`, `ghost-admin`, `pool_sv2`, `translator_sv2`, `jd_client_sv2`, and `ghost-pool` (a hard link to `ghost-mining`, kept so older installers still find it). The installer installs `ghostd`, `ghost-cli`, `ghost-mining`, `ghost-admin`, `pool_sv2` and `translator_sv2` into `/opt/ghost/bin`; it does not install `jd_client_sv2` or the `ghost-pool` link.
+Every binary comes from the signed release tarball. For each release that tarball holds `ghostd`, `ghost-cli` (the ghostd RPC client, like `bitcoin-cli`), `ghost-mining`, `ghost-admin`, `pool_sv2`, `translator_sv2` and `ghost-pool` (a hard link to `ghost-mining`, kept so older installers still find it). The installer installs `ghostd`, `ghost-cli`, `ghost-mining`, `ghost-admin`, `pool_sv2` and `translator_sv2` into `/opt/ghost/bin`; it does not install the `ghost-pool` link.
 
 ## Before you start
 

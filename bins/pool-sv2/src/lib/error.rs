@@ -193,8 +193,6 @@ pub enum PoolErrorKind {
     InvalidKey,
     ///Error when parsing the PayoutMode for Solo Mining Mode
     PayoutModeError(String),
-    /// JDS error (from embedded Job Declaration Server)
-    Jds(jd_server_sv2::error::JDSErrorKind),
     /// `[share_webhook]` is present but unusable — today, a `secret` that is not a valid
     /// internal-API secret (H-13).
     ///
@@ -294,7 +292,6 @@ impl std::fmt::Display for PoolErrorKind {
             JobNotFound => write!(f, "Job not found"),
             InvalidKey => write!(f, "Invalid key used during noise handshake"),
             PayoutModeError(e) => write!(f, "Unable to parse the PayoutMode: {e}"),
-            Jds(e) => write!(f, "JDS error: {e:?}"),
         }
     }
 }
@@ -409,12 +406,6 @@ impl From<ParserError> for PoolErrorKind {
 impl From<ShareValidationError> for PoolErrorKind {
     fn from(value: ShareValidationError) -> Self {
         PoolErrorKind::ChannelSv2(ChannelSv2Error::ShareValidationError(value))
-    }
-}
-
-impl From<jd_server_sv2::error::JDSErrorKind> for PoolErrorKind {
-    fn from(value: jd_server_sv2::error::JDSErrorKind) -> Self {
-        PoolErrorKind::Jds(value)
     }
 }
 

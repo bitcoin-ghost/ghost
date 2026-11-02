@@ -40,7 +40,6 @@ use stratum_apps::{
 use tokio::{net::TcpListener, select};
 use tracing::{debug, error, info, warn};
 
-use jd_server_sv2::job_declarator::JobDeclarator;
 
 use crate::connection_limit::{ConnectionLimiter, RefusedBecause};
 use crate::{
@@ -163,8 +162,6 @@ pub struct ChannelManager {
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).
     required_extensions: Vec<u16>,
-    /// Embedded Job Declaration engine (present when `[jds]` config is set).
-    job_declarator: Option<JobDeclarator>,
     /// Optional ghost share webhook sender. When Some, every validated share is posted.
     pub(crate) share_webhook_sender: Option<crate::share_webhook::ShareWebhookSender>,
     /// The node pool: share tags, slot classes and the canonical coinbase of every job. The only
@@ -181,7 +178,6 @@ impl ChannelManager {
         tp_sender: Sender<TemplateDistribution<'static>>,
         tp_receiver: Receiver<TemplateDistribution<'static>>,
         downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
-        job_declarator: Option<JobDeclarator>,
         share_webhook_sender: Option<crate::share_webhook::ShareWebhookSender>,
     ) -> PoolResult<Self, error::ChannelManager> {
         let range_0 = 0..0;
@@ -269,7 +265,6 @@ impl ChannelManager {
             coinbase_reward_script: config.coinbase_reward_script().clone(),
             supported_extensions,
             required_extensions: config.required_extensions().to_vec(),
-            job_declarator,
             share_webhook_sender,
             node_pool,
         };

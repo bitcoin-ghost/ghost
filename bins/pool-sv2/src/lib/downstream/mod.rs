@@ -85,7 +85,6 @@ pub struct Downstream {
     downstream_channel: DownstreamChannel,
     pub downstream_id: usize,
     pub requires_standard_jobs: Arc<AtomicBool>,
-    pub requires_custom_work: Arc<AtomicBool>,
     /// Extensions that the pool supports
     pub supported_extensions: Vec<u16>,
     /// Extensions that the pool requires
@@ -158,7 +157,6 @@ impl Downstream {
             downstream_data,
             downstream_id,
             requires_standard_jobs: Arc::new(AtomicBool::new(false)),
-            requires_custom_work: Arc::new(AtomicBool::new(false)),
             supported_extensions,
             required_extensions,
             downstream_connection_token,

@@ -37,9 +37,8 @@ cd "$REPO_ROOT"
 
 # Existing instances are baselined in scripts/select-cancellation-baseline.txt, keyed by
 # "path handler_name" so the list survives edits above it. This is a RATCHET: anything NOT in the
-# baseline fails, so the debt cannot grow while it is being paid down. 21 instances across
-# jd-client-sv2, jd-server-sv2 and pool-sv2 were present when this was written (#926) — pool-sv2
-# runs on the production fleet.
+# baseline fails, so the debt cannot grow while it is being paid down. 21 instances across the SV2
+# apps were present when this was written (#926); all were fixed.
 BASELINE="$REPO_ROOT/scripts/select-cancellation-baseline.txt"
 [ -r "$BASELINE" ] || { echo "check-select-cancellation-safety: baseline missing at $BASELINE"; exit 2; }
 

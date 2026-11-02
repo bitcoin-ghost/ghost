@@ -2942,7 +2942,6 @@ dependencies = [
  "criterion",
  "half",
  "hex",
- "jd_client_sv2",
  "num-format",
  "num_cpus",
  "once_cell",
@@ -3017,37 +3016,6 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
-
-[[package]]
-name = "jd_client_sv2"
-version = "1.11.46"
-dependencies = [
- "async-channel 1.9.0",
- "bitcoin_core_sv2",
- "clap",
- "config",
- "hex",
- "hotpath",
- "serde",
- "stratum-apps",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "jd_server_sv2"
-version = "1.11.46"
-dependencies = [
- "async-channel 1.9.0",
- "async-trait",
- "bitcoin_core_sv2",
- "dashmap 6.2.1",
- "hotpath",
- "serde",
- "stratum-apps",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "job_declaration_sv2"
@@ -3784,7 +3752,6 @@ dependencies = [
  "ghost-storage",
  "hex",
  "hotpath",
- "jd_server_sv2",
  "reqwest",
  "serde",
  "serde_json",

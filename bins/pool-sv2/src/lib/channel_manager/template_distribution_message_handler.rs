@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 
 use stratum_apps::stratum_core::{
     bitcoin::{Amount, TxOut},
@@ -71,12 +70,6 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             }];
 
             for (downstream_id, downstream) in channel_manager_data.downstream.iter_mut() {
-                // If REQUIRES_CUSTOM_WORK is set, skip template handling entirely (see https://github.com/stratum-mining/sv2-apps/issues/55)
-                let requires_custom_work = downstream.requires_custom_work.load(Ordering::SeqCst);
-                if requires_custom_work {
-                    continue;
-                }
-
                 let messages_: Vec<RouteMessageTo<'_>> = downstream.downstream_data.super_safe_lock(|data| {
                     data.group_channel.on_new_template(msg.clone().into_static(), group_outputs.clone()).map_err(|e| {
                         tracing::error!("Error while adding template to group channel");
@@ -238,12 +231,6 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             let mut messages: Vec<RouteMessageTo> = vec![];
 
             for (downstream_id, downstream) in data.downstream.iter_mut() {
-                // If downstream requires custom work, skip template handling entirely (see https://github.com/stratum-mining/sv2-apps/issues/55)
-                let requires_custom_work = downstream.requires_custom_work.load(Ordering::SeqCst);
-                if requires_custom_work {
-                    continue;
-                }
-
                 let downstream_messages = downstream.downstream_data.super_safe_lock(|data| {
                     let mut messages: Vec<RouteMessageTo> = vec![];
 

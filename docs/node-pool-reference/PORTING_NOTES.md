@@ -128,9 +128,9 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
   recorded; a mismatch is logged and nothing else. A valid Bitcoin block is worth more than any
   payout mismatch, and settlement on every other node, which retires nothing for a block that does
   not match, is the enforcement.
-- **Standard channels and custom work**: standard channels carry the full class. Custom-work
-  (JDS) connections are not stamped and their coinbases are the declaring client's; they are
-  outside this check (next wave).
+- **Standard channels and custom work**: standard channels carry the full class. Custom work is
+  refused: a SetupConnection asking for work selection gets `unsupported-feature-flags` and
+  `SetCustomMiningJob` gets `custom-jobs-not-supported`, so every job pays the canonical outputs.
 
 ## Settlement (W2.7, `ghost-np-relay/src/settlement.rs`)
 - **Where**: in the relay task, over the relay's store; it is the relay's `Retirements` hook
