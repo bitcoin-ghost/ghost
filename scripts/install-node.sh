@@ -2,31 +2,24 @@
 #
 # Bitcoin Ghost — one-command node installer.
 #
-#   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
+#   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --fee-address bc1q...
 #
-# Stands up a full Ghost node (ghostd + ghost-mining) on Ubuntu as a public node
-# pool node and joins the mesh. Mirrors the proven production setup; every
+# Stands up a full Ghost node (ghostd + ghost-mining + the SV2 stratum stack) on Ubuntu as a node
+# pool node and joins the mesh. The node pool is the only mode: there are no mining modes,
+# treasury prompts or capability flags. Mirrors the proven production setup; every
 # per-node secret is generated fresh on this machine and never leaves it.
 #
 # Derived from the verified provisioning of mainnet-5.
 set -euo pipefail
 
 # ─────────────────────────── network constants ───────────────────────────────
-# GHOST_VERSION auto-tracks the latest signed GitHub release, so cutting a new
-# release needs no installer edit (releases follow a version bump automatically).
-# Override with the GHOST_VERSION env var; falls back to a known-good pin when the
-# GitHub API is unreachable. The release tarball is GPG-verified below regardless
-# of how the version resolves, so auto-tracking never lowers the security bar.
-GHOST_VERSION="${GHOST_VERSION:-$(curl -fsSL --max-time 10 https://api.github.com/repos/bitcoin-ghost/ghost/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)}"
-# ⛔ No stale fallback. This used to pin v1.10.16 — roughly 27 releases behind current — so a
-# momentary GitHub API failure silently installed an ancient binary, GPG-verified and wrong.
-# "I could not determine the latest release" must stop, not guess: an operator can re-run, or pin
-# GHOST_VERSION deliberately.
-if [[ -z "${GHOST_VERSION}" ]]; then
-  echo "ERROR: could not determine the latest release from the GitHub API." >&2
-  echo "       Re-run when reachable, or pin one explicitly: GHOST_VERSION=v1.11.43 $0 ..." >&2
-  exit 1
-fi
+# ⛔ GHOST_VERSION must be PINNED. This installer used to track the latest GitHub release, but
+# every release published so far is the old network's (`main`), which keeps running beside the node
+# pool: tracking `latest` would install old-network binaries, without the node pool, onto a node
+# pool node. There is no node pool release channel yet, so the operator names the release and the
+# installer refuses without one (checked after the preflight, so --help and --preflight-only work).
+# The tarball is GPG-verified below regardless.
+GHOST_VERSION="${GHOST_VERSION:-}"
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
@@ -39,13 +32,27 @@ POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
-# Bootstrap peers. The node discovers the rest via gossip.
-SEED_NODES='"83.136.251.162:8555", "85.9.198.212:8555", "213.163.207.46:8555", "95.111.221.169:8555"'
+# ⛔ No mesh seed nodes. The old network's eight nodes keep running `main` beside node pool nodes,
+# and the two must never talk: this list used to name the old fleet, so every install dialled its
+# mesh. A node pool node agrees on its ledger over the share-chain relay (`[node_pool.relay]`,
+# `--relay-peer`), so it writes `seed_nodes = []` and keeps the old mesh ports closed (below).
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
 ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
 # ─────────────────────────────── defaults ────────────────────────────────────
-PAYOUT_ADDRESS=""
+# Where every transaction fee of a block this node's miners find is paid (`[node_pool]
+# fee_address`). Required. Miners themselves are paid from the subsidy by the share-chain ledger.
+FEE_ADDRESS=""
+NETWORK="mainnet"          # mainnet | signet | regtest
+# The share-chain relay (`[node_pool.relay]`): the port peers dial, peers to dial first, and the
+# share chain's genesis. Empty genesis = the network's published one (np_network_defaults), which
+# for mainnet and signet is not published yet: the node is then written with an UNSET placeholder
+# and pool_sv2 refuses to start until it is set.
+RELAY_PORT="8566"
+RELAY_PEERS=""
+GENESIS_ANCHOR=""
+GENESIS_HEIGHT=""
+PREFLIGHT_ONLY="false"
 ALERT_WEBHOOK=""
 ALERT_TOPIC="ghost-node"
 NICKNAME="ghost-node"
@@ -70,20 +77,30 @@ TOR_MODE="hybrid"
 # updater verifies the GPG release signature before applying anything.
 AUTO_UPDATE="false"
 BACKUPS="true"
-# Node pool block reserve. OFF by default: nothing changes for a node that does not ask.
-# --node-pool writes blockreservedweight=90000 into bitcoin.conf, so getblocktemplate leaves room
-# for the node pool's coinbase (up to 22 KB). ghostd's default 8,000 WU lost a block at a 2.25 KB
-# coinbase on a full template. Until the node pool activates it only costs block space (about 2%).
-NODE_POOL="false"
+# The node pool block reserve is always written: blockreservedweight=90000 in bitcoin.conf, so
+# getblocktemplate leaves room for the node pool's coinbase (up to 22 KB). ghostd's default
+# 8,000 WU lost a block at a 2.25 KB coinbase on a full template. `--node-pool` used to switch it
+# on; the node pool is now the only mode, so the flag is accepted and does nothing.
 
 usage() {
   cat <<EOF
 Bitcoin Ghost node installer
 
 Required:
-  --payout-address <bech32>   Payout address used by this node's SV2 pool
-                                (coinbase_reward_script) and translator
-                                (default miner user_identity).
+  --fee-address <address>     Where every transaction fee of a block this node's miners
+                                find is paid. P2SH, P2WPKH, P2WSH or P2TR, of --network.
+                                Miners are paid from the subsidy by the pool ledger, not here.
+
+Node pool:
+  --network <name>            mainnet | signet | regtest           (default: mainnet)
+  --relay-port <port>         Share-chain relay port peers dial     (default: 8566)
+  --relay-peer <host:port>    A relay peer to dial; repeat for more. More are learned.
+  --genesis-anchor <hex>      Share-chain genesis anchor (64 hex) and its Bitcoin height.
+  --genesis-height <n>          Default: the network's published genesis. None is published
+                                for mainnet or signet yet: without these the node is
+                                installed with an UNSET placeholder and pool_sv2 refuses to
+                                start until it is set.
+  --preflight-only            Run the preflight checks and exit; change nothing.
 
 Strongly recommended:
   --alert-webhook <url>       Push endpoint for node alerts (e.g. https://ntfy.sh). Without
@@ -118,14 +135,14 @@ Options:
                                 kept 7 days in /var/backups/ghost/db   (default)
   --no-backups                No nightly backups. They can be switched on later:
                                 sudo systemctl enable --now ghost-backup.timer
-  --node-pool                 Reserve room in every block template for the node pool's
-                                large coinbase (blockreservedweight=90000 in
-                                bitcoin.conf). Off by default; costs about 2% of
-                                block space until the node pool activates.
+  --payout-address <address>  Old name of --fee-address, still accepted.
+  --node-pool                 Accepted and ignored: the node pool is the only mode.
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
 With no config flags on an interactive terminal, a guided setup wizard runs.
+Every install runs a preflight first (fee address, RAM, disk, ports, Bitcoin node,
+relay); a failed check stops it before anything is changed.
 EOF
 }
 
@@ -138,7 +155,17 @@ CONFIG_FLAGS=0
 NON_INTERACTIVE="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --payout-address) PAYOUT_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --fee-address)    FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    # The old name. It set the SV2 coinbase_reward_script and the translator's default identity;
+    # the address an operator gave there is the one they mean to be paid at.
+    --payout-address) FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1))
+                      echo "NOTE: --payout-address is now --fee-address." >&2;;
+    --network)        NETWORK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --relay-port)     RELAY_PORT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --relay-peer)     RELAY_PEERS="${RELAY_PEERS:+$RELAY_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --genesis-anchor) GENESIS_ANCHOR="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --genesis-height) GENESIS_HEIGHT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --preflight-only) PREFLIGHT_ONLY="true"; shift;;
     --alert-webhook)  ALERT_WEBHOOK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --alert-topic)    ALERT_TOPIC="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -153,7 +180,7 @@ while [[ $# -gt 0 ]]; do
     --no-auto-update) AUTO_UPDATE="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --backups)        BACKUPS="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-backups)     BACKUPS="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --node-pool)      NODE_POOL="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --node-pool)      shift;;   # the only mode now; kept so old command lines still run
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -162,6 +189,390 @@ done
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo -e "\033[36m==>\033[0m $*"; }
+
+# >>> NODE_POOL_FUNCTIONS
+# The node pool pieces of this installer: fee address validation, per-network defaults, the
+# pool_sv2 config and the preflight. Kept between these two markers and free of side effects
+# (they only print), because two tests run them straight out of this file:
+#   scripts/test-installer-node-pool.sh       the shell-level checks, preflight lines included
+#   bins/pool-sv2/tests/installer_config.rs   pool_sv2 parses the rendered config, accepts it
+#                                             (NodePool::resolve, relay start), and agrees with
+#                                             np_fee_address_check on every address class
+# Edit them here; both tests read this file, not a copy.
+
+# Network → bech32 human-readable part. Signet and regtest share testnet's P2SH version byte.
+np_hrp() {
+  case "$1" in
+    mainnet) echo bc;; signet) echo tb;; regtest) echo bcrt;;
+    *) return 1;;
+  esac
+}
+np_p2sh_version() { case "$1" in mainnet) echo 5;; signet|regtest) echo 196;; *) return 1;; esac; }
+
+NP_B32_CHARSET="qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+NP_B58_ALPHABET="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+# BIP 173 checksum over a list of 5-bit values.
+np_bech32_polymod() {
+  local chk=1 v b i
+  local -a g=(0x3b6a57b2 0x26508e6d 0x1ea119fa 0x3d4233dd 0x2a1462b3)
+  for v in "$@"; do
+    b=$((chk >> 25))
+    chk=$(( ((chk & 0x1ffffff) << 5) ^ v ))
+    for i in 0 1 2 3 4; do
+      if (( (b >> i) & 1 )); then chk=$((chk ^ g[i])); fi
+    done
+  done
+  echo "$chk"
+}
+
+# Double SHA-256 of a hex string, as hex.
+np_sha256d_hex() {
+  local h
+  h="$(printf '%b' "$(sed 's/../\\x&/g' <<<"$1")" | sha256sum | cut -c1-64)"
+  printf '%b' "$(sed 's/../\\x&/g' <<<"$h")" | sha256sum | cut -c1-64
+}
+
+# np_fee_address_check ADDRESS NETWORK
+# Succeeds, printing the class (p2sh, p2wpkh, p2wsh, p2tr), when ADDRESS is a valid address of
+# NETWORK in one of the four payee classes pool_sv2 accepts for `[node_pool] fee_address`
+# (NodePool::fee_script). Otherwise fails, printing why. Checksums are verified: a typo in a fee
+# address sends every fee this node earns to a script nobody holds.
+np_fee_address_check() {
+  local a="$1" net="$2" hrp
+  hrp="$(np_hrp "$net")" || { echo "unknown network '$net'"; return 1; }
+  [[ -n "$a" ]] || { echo "no address given"; return 1; }
+  local lower="${a,,}"
+  if [[ "$lower" =~ ^([a-z]+)1([qpzry9x8gf2tvdw0s3jn54khce6mua7l]+)$ ]]; then
+    [[ "$a" == "$lower" || "$a" == "${a^^}" ]] || { echo "mixed-case bech32 is invalid"; return 1; }
+    (( ${#a} <= 90 )) || { echo "too long for a bech32 address"; return 1; }
+    local got="${BASH_REMATCH[1]}" data="${BASH_REMATCH[2]}"
+    if [[ "$got" != "$hrp" ]]; then
+      echo "is a '${got}1…' address; a ${net} node needs '${hrp}1…'"
+      return 1
+    fi
+    (( ${#data} >= 8 )) || { echo "too short for a segwit address"; return 1; }
+    local -a vals=() exp=()
+    local i c pre
+    for (( i = 0; i < ${#data}; i++ )); do
+      c="${data:i:1}"; pre="${NP_B32_CHARSET%%"$c"*}"; vals+=("${#pre}")
+    done
+    for (( i = 0; i < ${#hrp}; i++ )); do exp+=("$(( $(printf '%d' "'${hrp:i:1}") >> 5 ))"); done
+    exp+=(0)
+    for (( i = 0; i < ${#hrp}; i++ )); do exp+=("$(( $(printf '%d' "'${hrp:i:1}") & 31 ))"); done
+    local chk ver="${vals[0]}"
+    chk="$(np_bech32_polymod "${exp[@]}" "${vals[@]}")"
+    if (( ver == 0 )); then
+      (( chk == 1 )) || { echo "bad checksum"; return 1; }
+    else
+      (( chk == 0x2bc830a3 )) || { echo "bad checksum"; return 1; }
+    fi
+    # Witness program: 5-bit groups to bytes, no padding allowed beyond 4 zero bits.
+    local acc=0 bits=0 n=0 j
+    for (( j = 1; j < ${#vals[@]} - 6; j++ )); do
+      acc=$(( ((acc << 5) | vals[j]) & 0xfff ))
+      bits=$((bits + 5))
+      if (( bits >= 8 )); then bits=$((bits - 8)); n=$((n + 1)); fi
+    done
+    if (( bits >= 5 || (acc & (2 ** bits - 1)) != 0 )); then echo "bad padding"; return 1; fi
+    case "$ver:$n" in
+      0:20) echo p2wpkh;;
+      0:32) echo p2wsh;;
+      1:32) echo p2tr;;
+      *) echo "witness v${ver} with a ${n}-byte program is not P2WPKH, P2WSH or P2TR"; return 1;;
+    esac
+    return 0
+  fi
+  if [[ "$a" =~ ^[1-9A-HJ-NP-Za-km-z]{25,35}$ ]]; then
+    local -a bytes=()
+    local k carry pre2 z=0
+    for (( i = 0; i < ${#a}; i++ )); do
+      c="${a:i:1}"; pre2="${NP_B58_ALPHABET%%"$c"*}"; carry="${#pre2}"
+      for (( k = ${#bytes[@]} - 1; k >= 0; k-- )); do
+        carry=$(( carry + bytes[k] * 58 )); bytes[k]=$(( carry & 255 )); carry=$(( carry >> 8 ))
+      done
+      while (( carry > 0 )); do bytes=("$(( carry & 255 ))" "${bytes[@]}"); carry=$(( carry >> 8 )); done
+    done
+    while [[ "${a:z:1}" == 1 ]]; do bytes=(0 "${bytes[@]}"); z=$((z + 1)); done
+    (( ${#bytes[@]} == 25 )) || { echo "not a valid address"; return 1; }
+    local hex="" sum
+    for (( i = 0; i < 21; i++ )); do hex+="$(printf '%02x' "${bytes[i]}")"; done
+    sum="$(np_sha256d_hex "$hex")"
+    [[ "${sum:0:8}" == "$(printf '%02x%02x%02x%02x' "${bytes[@]:21:4}")" ]] \
+      || { echo "bad checksum"; return 1; }
+    case "${bytes[0]}" in
+      0|111) echo "P2PKH is not accepted (only P2SH, P2WPKH, P2WSH and P2TR)"; return 1;;
+    esac
+    if (( bytes[0] != $(np_p2sh_version "$net") )); then
+      if (( bytes[0] == 5 || bytes[0] == 196 )); then
+        echo "is a P2SH address of another network than ${net}"
+      else
+        echo "not a valid address"
+      fi
+      return 1
+    fi
+    echo p2sh
+    return 0
+  fi
+  echo "not a valid address"
+  return 1
+}
+
+# Per-network defaults. Sets:
+#   NP_P2P_PORT              ghostd's P2P port (the network's own default)
+#   NP_TIER_BASE             [node_pool.relay] tier_base, empty for the difficulty-1 default
+#   NP_GENESIS_ANCHOR        the network's published share-chain genesis, or UNSET
+#   NP_GENESIS_HEIGHT        its btc_height (0 when UNSET)
+#   NP_MIN_RAM_MB / NP_WARN_RAM_MB, NP_MIN_DISK_GB   the preflight's floors
+#
+# ⛔ No share-chain genesis is published for mainnet or signet yet. They get UNSET, which
+# pool_sv2 refuses at startup by name (`NodePoolRelayConfig::genesis_hash`). Guessing one would
+# start a private share chain that no other node joins. Regtest is a local test chain, so it gets
+# a fixed genesis every regtest node shares: sha256("GhostNodePool/genesis/regtest"), height 0, and
+# regtest's own proof-of-work limit as tier 0 so CPU-mined shares reach T_net.
+np_network_defaults() {
+  local net="$1" sync="${2:-ibd}" archive="${3:-false}"
+  NP_TIER_BASE=""
+  NP_GENESIS_ANCHOR="UNSET"
+  NP_GENESIS_HEIGHT=0
+  case "$net" in
+    mainnet)
+      NP_P2P_PORT=8333; NP_MIN_RAM_MB=7000; NP_WARN_RAM_MB=15000
+      if [[ "$archive" == "true" ]]; then NP_MIN_DISK_GB=800
+      elif [[ "$sync" == "haze" ]]; then NP_MIN_DISK_GB=250
+      else NP_MIN_DISK_GB=60; fi;;
+    signet)
+      NP_P2P_PORT=38333; NP_MIN_RAM_MB=3500; NP_WARN_RAM_MB=7000; NP_MIN_DISK_GB=30;;
+    regtest)
+      NP_P2P_PORT=18444; NP_MIN_RAM_MB=1500; NP_WARN_RAM_MB=3500; NP_MIN_DISK_GB=5
+      NP_TIER_BASE="7fffff0000000000000000000000000000000000000000000000000000000000"
+      NP_GENESIS_ANCHOR="8d8cd561340ff83e99410e115619d64ad94516264d3e5cd6a991109c69f1229c"
+      NP_GENESIS_HEIGHT=0;;
+    *) return 1;;
+  esac
+}
+
+# np_render_pool_config: the whole pool_sv2 config, on stdout. Reads
+#   SV2_AUTH_PUB SV2_AUTH_SEC TDP_PUBKEY APISECRET FEE_ADDRESS NETWORK RPC_USER RPCPW
+#   RELAY_PORT RELAY_PEERS (space-separated host:port) GENESIS_ANCHOR GENESIS_HEIGHT
+#   NP_TIER_BASE
+np_render_pool_config() {
+  local peers="" p tier_line genesis_note=""
+  for p in $RELAY_PEERS; do peers+="${peers:+, }\"${p}\""; done
+  tier_line="# tier_base: the difficulty-1 target (mainnet and signet)."
+  [[ -n "$NP_TIER_BASE" ]] && tier_line="tier_base = \"${NP_TIER_BASE}\""
+  if [[ "$GENESIS_ANCHOR" == "UNSET" ]]; then
+    genesis_note="# ⛔ PLACEHOLDER. No share-chain genesis is published for ${NETWORK} yet, so pool_sv2
+# REFUSES TO START until genesis_anchor and genesis_btc_height are set to the published values.
+# Set them here, or re-run the installer with --genesis-anchor <hex> --genesis-height <n>."
+  fi
+  cat <<EOF
+# Bitcoin Ghost — SRI Pool (SV2). Generated by install-node.sh.
+#
+# ghost-mining (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333) -> BitAxe
+
+# Per-node SV2 authority keypair (Ed25519/secp256k1, generated fresh at install).
+authority_public_key = "${SV2_AUTH_PUB}"
+authority_secret_key = "${SV2_AUTH_SEC}"
+cert_validity_sec = 3600
+
+# Listen for SV2 miners/translators.
+listen_address = "0.0.0.0:34255"
+
+# Required by the SV2 config, but not what blocks pay: every job carries the node pool's canonical
+# coinbase ([node_pool] below). Set to the fee address.
+coinbase_reward_script = "addr(${FEE_ADDRESS})"
+
+# Pool identification. pool_signature is kept in step with ghost-mining's coinbase
+# tag by update-pool-signature.sh (sri-pool ExecStartPre); this is the fallback
+# until ghost-mining has written its coinbase_tag file.
+server_id = 1
+pool_signature = "- G H O S T -"
+
+# Difficulty settings
+shares_per_minute = 6.0
+share_batch_size = 1
+
+# Protocol extensions — support the Ghost per-miner TLV extension (0x0002). pool_sv2 adds the
+# agent extension (0x4748) the slot-class sensing loop reads by itself.
+supported_extensions = [0x0002]
+required_extensions = []
+
+# Monitoring endpoint (localhost; the translator readiness gate polls it).
+monitoring_address = "127.0.0.1:9090"
+
+# Native share accounting into ghost-mining.
+#
+# \`secret\` is mandatory (H-13) and must match ghost-mining's [network] internal_api_secret —
+# the same value written into pool.toml. ghost-mining requires an HMAC on every share batch:
+# loopback alone authorised any process on the box to write to it.
+[share_webhook]
+url = "http://127.0.0.1:8080/api/internal/shares"
+secret = "${APISECRET}"
+batch_size = 1
+batch_timeout_ms = 2000
+max_retries = 3
+
+# Bounds on concurrent downstream connections (#994).
+#
+# ⛔ Commented out = the built-in defaults apply, NOT unlimited. Uncomment only to override.
+#   max_downstream_connections   default 512
+#   max_connections_per_ip       default 64
+# A value of 0 is clamped to 1 rather than honoured.
+# max_downstream_connections = 512
+# max_connections_per_ip = 64
+
+# The node pool: the only mode. pool_sv2 refuses to start without this section and its relay.
+# node_id is deliberately not set: pool_sv2 reads it from the co-located ghost-mining's /health.
+[node_pool]
+# Every transaction fee of a block this node's miners find is paid here (P2SH, P2WPKH, P2WSH or
+# P2TR). Miners are paid from the subsidy, by the share-chain ledger, never through this address.
+fee_address = "${FEE_ADDRESS}"
+
+# The share-chain relay and settlement (${NETWORK}). Peers dial the listen port, so it is opened
+# on the firewall. More peers are learned from the ones listed.
+[node_pool.relay]
+listen = "0.0.0.0:${RELAY_PORT}"
+peers = [${peers}]
+db_path = "/var/lib/ghost/node-pool.db"
+${genesis_note}
+genesis_anchor = "${GENESIS_ANCHOR}"
+genesis_btc_height = ${GENESIS_HEIGHT}
+${tier_line}
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_user = "${RPC_USER}"
+rpc_password = "${RPCPW}"
+
+# Template provider — this node's own ghost-mining TDP server. public_key is the
+# TDP authority key derived from node.key.
+[template_provider_type.Sv2Tp]
+address = "127.0.0.1:8442"
+public_key = "${TDP_PUBKEY}"
+EOF
+}
+
+# ── preflight ───────────────────────────────────────────────────────────────────
+# One line per check: PASS, WARN (installs anyway) or FAIL (stops before anything is changed).
+# The probes are functions so a test can stand in for the machine.
+PF_FAILS=0
+pf_line() {
+  local status="$1"; shift
+  printf '  [%s] %s\n' "$status" "$*"
+  [[ "$status" == FAIL ]] && PF_FAILS=$((PF_FAILS + 1))
+  return 0
+}
+pf_mem_mb() { awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || true; }
+# Free space, in GB, on the filesystem that will hold the chain.
+pf_disk_free_gb() {
+  local d=/var/lib
+  df -Pk "$d" 2>/dev/null | awk 'NR == 2 {print int($4 / 1048576)}' || true
+}
+# The process listening on a TCP port, or nothing when the port is free.
+pf_port_owner() {
+  ss -Hltnp "sport = :$1" 2>/dev/null | head -1 | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p;t;s/.+/unknown/p' || true
+}
+# getblockchaininfo's chain, or nothing when no node answers.
+pf_bitcoin_chain() {
+  local conf=/etc/bitcoin/bitcoin.conf user pw
+  [[ -r "$conf" ]] || return 0
+  user="$(grep -m1 '^rpcuser=' "$conf" | cut -d= -f2-)"
+  pw="$(grep -m1 '^rpcpassword=' "$conf" | cut -d= -f2-)"
+  curl -s --max-time 8 --user "${user}:${pw}" \
+    --data '{"jsonrpc":"1.0","id":"preflight","method":"getblockchaininfo","params":[]}' \
+    http://127.0.0.1:8332/ 2>/dev/null | grep -oE '"chain":[[:space:]]*"[a-z0-9]+"' | grep -oE '"[a-z0-9]+"$' | tr -d '"' || true
+}
+pf_resolves() { getent hosts "$1" >/dev/null 2>&1; }
+# The chain name bitcoind reports for a network.
+np_core_chain() { case "$1" in mainnet) echo main;; signet) echo signet;; regtest) echo regtest;; esac; }
+
+# np_preflight: every check, then a verdict. Reads NETWORK SYNC_MODE ARCHIVE FEE_ADDRESS RELAY_PORT
+# RELAY_PEERS GENESIS_ANCHOR ALERT_WEBHOOK. Returns non-zero when any check FAILed.
+np_preflight() {
+  PF_FAILS=0
+  np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE" || { pf_line FAIL "network '$NETWORK' is not mainnet, signet or regtest"; return 1; }
+  local why kind mem disk p owner chain
+  echo "Preflight (${NETWORK}):"
+
+  if kind="$(np_fee_address_check "$FEE_ADDRESS" "$NETWORK")"; then
+    pf_line PASS "fee address is a valid ${NETWORK} ${kind^^} address"
+  else
+    why="$kind"; pf_line FAIL "fee address '${FEE_ADDRESS}': ${why}"
+  fi
+
+  mem="$(pf_mem_mb)"
+  if [[ -z "$mem" ]]; then pf_line WARN "RAM: could not be read"
+  elif (( mem < NP_MIN_RAM_MB )); then pf_line FAIL "RAM: ${mem} MB, a ${NETWORK} node needs at least ${NP_MIN_RAM_MB} MB"
+  elif (( mem < NP_WARN_RAM_MB )); then pf_line WARN "RAM: ${mem} MB, ${NP_WARN_RAM_MB} MB or more recommended"
+  else pf_line PASS "RAM: ${mem} MB"; fi
+
+  disk="$(pf_disk_free_gb)"
+  if [[ -z "$disk" ]]; then pf_line WARN "disk: free space on /var/lib could not be read"
+  elif (( disk < NP_MIN_DISK_GB )); then pf_line FAIL "disk: ${disk} GB free on /var/lib, this node (${NETWORK}, sync ${SYNC_MODE}$([[ "$ARCHIVE" == true ]] && echo ", archive")) needs ${NP_MIN_DISK_GB} GB"
+  else pf_line PASS "disk: ${disk} GB free on /var/lib (needs ${NP_MIN_DISK_GB} GB)"; fi
+
+  # Ports this node listens on. Held by one of the node's own processes is a re-run, not a clash.
+  for p in "$NP_P2P_PORT" 8332 8080 8442 3333 4444 34255 9090 "$RELAY_PORT"; do
+    owner="$(pf_port_owner "$p")"
+    case "$owner" in
+      "") pf_line PASS "port ${p} is free";;
+      ghostd|ghost-mining|ghost-pool|pool_sv2|translator_sv2) pf_line PASS "port ${p} is held by this node's ${owner} (re-run)";;
+      *) pf_line FAIL "port ${p} is in use by ${owner}; this node needs it";;
+    esac
+  done
+
+  # The Bitcoin node. A re-run talks to the one already installed; a fresh install has none yet.
+  chain="$(pf_bitcoin_chain)"
+  if [[ -n "$chain" ]]; then
+    if [[ "$chain" == "$(np_core_chain "$NETWORK")" ]]; then
+      pf_line PASS "Bitcoin node answers on 127.0.0.1:8332 (chain ${chain})"
+    else
+      pf_line FAIL "Bitcoin node on 127.0.0.1:8332 runs chain '${chain}', not ${NETWORK}"
+    fi
+  elif [[ -r /etc/bitcoin/bitcoin.conf ]] && [[ -n "$(pf_port_owner 8332)" ]]; then
+    pf_line FAIL "Bitcoin RPC port 8332 is listening but does not answer with /etc/bitcoin/bitcoin.conf's credentials"
+  else
+    pf_line PASS "no Bitcoin node yet: ghostd is installed and checked again once started"
+  fi
+
+  # The relay. The port is opened on this firewall by the installer; reachability from outside
+  # cannot be tested before anything listens on it, and nothing probes it from outside yet.
+  pf_line PASS "relay port ${RELAY_PORT}/tcp will be opened on ufw (open it on any firewall in front of this machine too)"
+  if [[ -z "$RELAY_PEERS" ]]; then
+    pf_line WARN "no relay peers given (--relay-peer): the node waits for peers to dial it"
+  else
+    for p in $RELAY_PEERS; do
+      if [[ "$p" =~ ^(.+):([0-9]{1,5})$ ]] && (( BASH_REMATCH[2] > 0 && BASH_REMATCH[2] < 65536 )); then
+        if pf_resolves "${BASH_REMATCH[1]}"; then pf_line PASS "relay peer ${p} resolves"
+        else pf_line WARN "relay peer ${p} does not resolve now"; fi
+      else
+        pf_line FAIL "relay peer '${p}' is not host:port"
+      fi
+    done
+  fi
+  if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
+    pf_line WARN "no share-chain genesis is published for ${NETWORK}: pool_sv2 will refuse to start until one is set (--genesis-anchor/--genesis-height)"
+  elif [[ "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$ ]]; then
+    pf_line PASS "share-chain genesis ${GENESIS_ANCHOR:0:16}… at height ${GENESIS_HEIGHT}"
+  else
+    pf_line FAIL "genesis anchor '${GENESIS_ANCHOR}' is not 64 hex characters"
+  fi
+
+  if [[ -z "$ALERT_WEBHOOK" ]]; then
+    pf_line WARN "no alert webhook (--alert-webhook): alerts are written disabled"
+  elif [[ "$ALERT_WEBHOOK" =~ ^https?://[^[:space:]\"]+$ ]]; then
+    pf_line PASS "alert webhook ${ALERT_WEBHOOK}"
+  else
+    pf_line FAIL "alert webhook '${ALERT_WEBHOOK}' is not an http(s) URL"
+  fi
+
+  if (( PF_FAILS > 0 )); then
+    echo "Preflight: ${PF_FAILS} check(s) FAILED. Nothing has been changed."
+    return 1
+  fi
+  echo "Preflight: passed."
+}
+# <<< NODE_POOL_FUNCTIONS
 
 # is_core_rpc_client PATH — true only if PATH is the Ghost Core RPC client (#1028).
 # Two programs have been called `ghost-cli`: the Core RPC client, which is what the name means
@@ -211,24 +622,61 @@ prompt_yes_no() {
 }
 
 # Interactive first-run wizard. Collects the SAME variables the flag interface
-# sets (PAYOUT_ADDRESS, SYNC_MODE, POOL_NAME, REAPER, ARCHIVE,
-# NICKNAME); the rest of the installer is unchanged. Only ever runs with no
+# sets (FEE_ADDRESS, NETWORK, RELAY_PEERS, ALERT_WEBHOOK, SYNC_MODE, POOL_NAME, REAPER,
+# ARCHIVE, NICKNAME); the rest of the installer is unchanged. Only ever runs with no
 # config flags, on a TTY, without --non-interactive.
 run_wizard() {
   echo
   log "Bitcoin Ghost — guided node setup"
-  echo "This installs a full Ghost node (ghostd + ghost-mining) as a public node pool"
-  echo "node and joins the mesh. Press Enter to accept each [default]."
+  echo "This installs a full Ghost node (ghostd + ghost-mining + the SV2 stratum stack) as a"
+  echo "node pool node and joins the mesh. Press Enter to accept each [default]."
   echo
 
-  # Payout address — REQUIRED, no default, re-prompt until valid.
-  local addr
+  # Network.
+  local nw
+  read -rp "Network: mainnet, signet or regtest [mainnet]: " nw || true
+  nw="$(_trim "${nw:-mainnet}")"
+  case "$nw" in mainnet|signet|regtest) NETWORK="$nw";; *) echo "  Unrecognised — using mainnet."; NETWORK="mainnet";; esac
+
+  # Fee address — REQUIRED, no default, re-prompt until valid for the network.
+  local addr why
+  echo
+  echo "Fee address: every transaction fee of a block this node's miners find is paid here."
+  echo "Miners are paid from the subsidy by the pool ledger, not through this address."
   while :; do
-    read -rp "Payout address (mainnet bech32 — used by this node's SV2 pool and translator): " addr || true
-    if [[ "$addr" =~ ^bc1[a-z0-9]{20,}$ ]]; then
-      PAYOUT_ADDRESS="$addr"; break
+    read -rp "Fee address (${NETWORK}; P2SH, P2WPKH, P2WSH or P2TR): " addr || err "Input ended before a fee address was given."
+    addr="$(_trim "$addr")"
+    if why="$(np_fee_address_check "$addr" "$NETWORK")"; then
+      FEE_ADDRESS="$addr"; break
     fi
-    echo "  ✗ That doesn't look like a mainnet bech32 address (must start 'bc1…'). Try again."
+    echo "  ✗ ${why}. Try again."
+  done
+
+  # Relay peers (optional).
+  echo
+  echo "Share-chain relay peers to dial first, host:port separated by spaces (optional; more"
+  echo "are learned from them, and peers can dial this node on port ${RELAY_PORT})."
+  local rp
+  read -rp "Relay peers [none]: " rp || true
+  RELAY_PEERS="$(_trim "$rp")"
+
+  # Alert webhook (optional, but without it every detector fires into nothing).
+  echo
+  echo "Alert webhook (optional): an ntfy-style push endpoint, e.g. https://ntfy.sh. Without one,"
+  echo "alerts are written disabled and low disk, node offline, restart loops … reach nobody."
+  local wh
+  while :; do
+    read -rp "Alert webhook URL [none]: " wh || wh=""
+    wh="$(_trim "$wh")"
+    if [[ -z "$wh" ]]; then ALERT_WEBHOOK=""; break; fi
+    if [[ "$wh" =~ ^https?://[^[:space:]\"]+$ ]]; then
+      ALERT_WEBHOOK="$wh"
+      local tp
+      read -rp "Alert topic [${ALERT_TOPIC}]: " tp || true
+      tp="$(_trim "$tp")"; [[ -n "$tp" ]] && ALERT_TOPIC="$tp"
+      break
+    fi
+    echo "  ✗ Must be an http:// or https:// URL. Try again (or leave blank)."
   done
 
   # Sync mode.
@@ -305,7 +753,10 @@ run_wizard() {
   # Summary + final confirmation before anything destructive happens.
   echo
   log "Summary of your choices"
-  echo "  Payout address : $PAYOUT_ADDRESS"
+  echo "  Network        : $NETWORK"
+  echo "  Fee address    : $FEE_ADDRESS"
+  echo "  Relay peers    : ${RELAY_PEERS:-none}"
+  echo "  Alert webhook  : ${ALERT_WEBHOOK:-none (alerts disabled)}"
   echo "  Sync mode      : $SYNC_MODE"
   [[ -n "$POOL_NAME" ]] && echo "  Pool name      : $POOL_NAME  (coinbase: - G H O S T - $POOL_NAME)"
   echo "  Reaper         : $REAPER"
@@ -331,8 +782,58 @@ if [[ "$CONFIG_FLAGS" -eq 0 && "$NON_INTERACTIVE" != "true" && -t 0 ]]; then
   run_wizard
 fi
 
-[[ -n "$PAYOUT_ADDRESS" ]] || { usage; err "--payout-address is required."; }
-[[ "$PAYOUT_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Payout address doesn't look like a mainnet bech32 address."
+np_hrp "$NETWORK" >/dev/null || err "--network must be mainnet, signet or regtest."
+# A re-run keeps what the last install wrote when a flag does not say otherwise: the fee address,
+# the relay peers and the share-chain genesis live only in pool_sv2's config.
+OLD_POOL_CONFIG=/etc/ghost/pool-config.toml
+old_key() { [[ -r "$OLD_POOL_CONFIG" ]] && sed -nE "s/^${1}[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$OLD_POOL_CONFIG" | head -1 || true; }
+if [[ -z "$FEE_ADDRESS" ]]; then
+  FEE_ADDRESS="$(old_key fee_address | tr -d '"')"
+  [[ -n "$FEE_ADDRESS" ]] && log "Keeping the fee address from ${OLD_POOL_CONFIG}: ${FEE_ADDRESS}"
+fi
+if [[ -z "$FEE_ADDRESS" ]]; then
+  # An install from before the node pool has no fee_address; its payout address was written as
+  # the SV2 coinbase_reward_script. Use it rather than refuse an upgrade, and say so.
+  FEE_ADDRESS="$(old_key coinbase_reward_script | sed -nE 's/^"addr\(([^)]+)\)".*/\1/p')"
+  [[ -n "$FEE_ADDRESS" ]] && log "Using the old payout address from ${OLD_POOL_CONFIG} as the fee address: ${FEE_ADDRESS}"
+fi
+[[ -n "$FEE_ADDRESS" ]] || { usage; err "--fee-address is required."; }
+FEE_ADDRESS="$(_trim "$FEE_ADDRESS")"
+if [[ -z "$RELAY_PEERS" ]]; then
+  RELAY_PEERS="$(old_key peers | tr -d '[]",')"
+  RELAY_PEERS="$(_trim "$RELAY_PEERS")"
+fi
+np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE"
+if [[ -n "$GENESIS_ANCHOR" && -z "$GENESIS_HEIGHT" ]]; then
+  err "--genesis-anchor needs --genesis-height: the anchor's Bitcoin height is part of the genesis."
+fi
+if [[ -z "$GENESIS_ANCHOR" ]]; then
+  old_genesis="$(old_key genesis_anchor | tr -d '"')"
+  if [[ "$old_genesis" =~ ^[0-9a-fA-F]{64}$ && "$NP_GENESIS_ANCHOR" == UNSET ]]; then
+    GENESIS_ANCHOR="$old_genesis"
+    GENESIS_HEIGHT="${GENESIS_HEIGHT:-$(old_key genesis_btc_height)}"
+    log "Keeping the share-chain genesis from ${OLD_POOL_CONFIG}"
+  else
+    GENESIS_ANCHOR="$NP_GENESIS_ANCHOR"
+  fi
+fi
+[[ -n "$GENESIS_HEIGHT" ]] || GENESIS_HEIGHT="$NP_GENESIS_HEIGHT"
+[[ "$GENESIS_HEIGHT" =~ ^[0-9]{1,10}$ ]] || err "--genesis-height must be a block height."
+if ! [[ "$RELAY_PORT" =~ ^[0-9]{1,5}$ ]] || (( RELAY_PORT == 0 || RELAY_PORT > 65535 )); then
+  err "--relay-port must be a TCP port."
+fi
+
+# ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
+np_preflight || err "Preflight failed — fix the FAIL lines above and re-run."
+[[ "$PREFLIGHT_ONLY" == "true" ]] && exit 0
+[[ -n "$GHOST_VERSION" ]] || err "Pin the node pool release to install: GHOST_VERSION=<tag> $0 ... The latest GitHub release is the old network's and is not installed by default."
+# Automatic updates track the latest GitHub release too, which is the old network's: on a node
+# pool node they would replace its binaries with ones that have no node pool. Off until a node
+# pool release channel exists.
+if [[ "$AUTO_UPDATE" == "true" ]]; then
+  log "WARNING: --auto-update is not available for node pool nodes yet (it tracks the old network's releases) — leaving it off."
+  AUTO_UPDATE="false"
+fi
 
 # The [alerts] block. ⛔ Written with `enabled` reflecting whether a channel was actually given:
 # a section that says `enabled = true` with nowhere to deliver is worse than an honest false,
@@ -556,20 +1057,29 @@ fi
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 
 # ───────────────────────── 5. ghostd config (sync) ───────────────────────────
-log "Writing /etc/bitcoin/bitcoin.conf (sync mode: ${SYNC_MODE})"
+log "Writing /etc/bitcoin/bitcoin.conf (${NETWORK}, sync mode: ${SYNC_MODE})"
+# Mainnet is written at the top level, as it always was. Signet and regtest select their chain and
+# put every setting in that chain's section, where Core applies the network-specific ones (ports,
+# rpcbind); RPC stays on 8332 on every network so nothing downstream changes.
+RPC_USER="ghostrpc_mainnet"
+[[ "$NETWORK" == mainnet ]] || RPC_USER="ghostrpc_${NETWORK}"
 {
+  if [[ "$NETWORK" != mainnet ]]; then
+    echo "chain=${NETWORK}"
+    echo "[${NETWORK}]"
+  fi
   echo "server=1"
   echo "listen=1"
   if [[ "$ARCHIVE" == "true" ]]; then echo "hazemode=FullArchive"
   elif [[ "$SYNC_MODE" == "haze" ]]; then echo "hazemode=Hazed"
   else echo "prune=550"; fi
   cat <<EOF
-rpcuser=ghostrpc_mainnet
+rpcuser=${RPC_USER}
 rpcpassword=${RPCPW}
 rpcallowip=127.0.0.1
 rpcbind=127.0.0.1
 rpcport=8332
-port=8333
+port=${NP_P2P_PORT}
 zmqpubhashblock=tcp://127.0.0.1:28332
 zmqpubhashtx=tcp://127.0.0.1:28333
 zmqpubsequence=tcp://127.0.0.1:28334
@@ -587,16 +1097,13 @@ dbcache=1024
 # set on the smaller nodes (#417/#418), and connections are not free.
 maxconnections=125
 fallbackfee=0.00001
-assumevalid=${ASSUMEVALID}
 EOF
+  # The assumevalid block is a mainnet block.
+  [[ "$NETWORK" == mainnet ]] && echo "assumevalid=${ASSUMEVALID}"
+  # Node pool block reserve: room for the node pool's coinbase (up to 22 KB) in every template.
+  # Must match NODE_POOL_BLOCK_RESERVED_WEIGHT in crates/ghost-common/src/node_pool_constants.rs.
+  echo "blockreservedweight=90000"
 } > /etc/bitcoin/bitcoin.conf
-
-# Node pool block reserve (--node-pool). Must match NODE_POOL_BLOCK_RESERVED_WEIGHT in
-# crates/ghost-common/src/node_pool_constants.rs. Appended after the truncating write above, so a
-# re-run never duplicates it.
-if [[ "$NODE_POOL" == "true" ]]; then
-  echo "blockreservedweight=90000" >> /etc/bitcoin/bitcoin.conf
-fi
 
 # Tor wiring. `listen=1` is already written above; here we add the onion service
 # (listenonion), the control-port endpoint ghostd uses to create/rotate it
@@ -638,6 +1145,7 @@ fi
 
 # ─────────────────────────── 6. pool config ──────────────────────────────────
 log "Writing /etc/ghost/pool.toml"
+
 # Every node is a public node pool node, so there is no mining_mode to write. Configs from older
 # installs that still carry [network] mining_mode / private_mining_password / solo_payout_address,
 # [pool] treasury_address / min_payout_sats / payout_interval_blocks / node_payout_address /
@@ -671,9 +1179,9 @@ display_name = "${NICKNAME}"
 [bitcoin]
 rpc_host = "127.0.0.1"
 rpc_port = 8332
-rpc_user = "ghostrpc_mainnet"
+rpc_user = "${RPC_USER}"
 rpc_password = "${RPCPW}"
-network = "mainnet"
+network = "${NETWORK}"
 zmq_hashblock = "tcp://127.0.0.1:28332"
 zmq_hashtx = "tcp://127.0.0.1:28333"
 
@@ -687,7 +1195,9 @@ sv1_port = 3333
 http_port = 8080
 max_miners = 1000
 farm_port = 4444
-seed_nodes = [${SEED_NODES}]
+# No mesh seeds, on purpose: see the note at the top of install-node.sh. Share-chain peers are in
+# /etc/ghost/pool-config.toml, [node_pool.relay] peers.
+seed_nodes = []
 
 [network.p2p]
 share_propagation = 8555
@@ -859,9 +1369,9 @@ min_supported_version = 2
 # fan-out connections and reject a pool that advertises less. Braiins requires 7.
 downstream_extranonce2_size = 8
 
-# Default miner-username prefix (this node's payout address). Miners may override
-# per connection by authorising as <address>.<worker>.
-user_identity = "${PAYOUT_ADDRESS}"
+# Default miner-username prefix (this node's fee address). A node pool miner authorises as
+# <its own address>.<worker>: the username is its payout address.
+user_identity = "${FEE_ADDRESS}"
 
 # Each miner gets its own upstream channel (per-miner share attribution).
 aggregate_channels = false
@@ -969,81 +1479,15 @@ ghost_pool_url = "127.0.0.1:8080"
 poll_interval_secs = 30
 EOF
 
-# pool_sv2 — SV2 pool bridging miners/translators to ghost-mining's TDP. Holds the
-# secret half of the authority keypair, so this file is 0600 root-only.
-cat > /etc/ghost/pool-config.toml <<EOF
-# Bitcoin Ghost — SRI Pool (SV2). Generated by install-node.sh.
-#
-# ghost-mining (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333) -> BitAxe
-
-# Per-node SV2 authority keypair (Ed25519/secp256k1, generated fresh at install).
-authority_public_key = "${SV2_AUTH_PUB}"
-authority_secret_key = "${SV2_AUTH_SEC}"
-cert_validity_sec = 3600
-
-# Listen for SV2 miners/translators.
-listen_address = "0.0.0.0:34255"
-
-# Coinbase reward destination. ghost-mining assembles the real coinbase via TDP
-# (it controls every output), so this mirrors the node payout address.
-coinbase_reward_script = "addr(${PAYOUT_ADDRESS})"
-
-# Pool identification. pool_signature is kept in step with ghost-mining's coinbase
-# tag by update-pool-signature.sh (sri-pool ExecStartPre); this is the fallback
-# until ghost-mining has written its coinbase_tag file.
-server_id = 1
-pool_signature = "- G H O S T -"
-
-# Difficulty settings
-shares_per_minute = 6.0
-share_batch_size = 1
-
-# Protocol extensions — support the Ghost per-miner TLV extension (0x0002).
-supported_extensions = [0x0002]
-required_extensions = []
-
-# Monitoring endpoint (localhost; the translator readiness gate polls it).
-monitoring_address = "127.0.0.1:9090"
-
-# Native share accounting into ghost-mining.
-#
-# \`secret\` is mandatory (H-13) and must match ghost-mining's [network] internal_api_secret —
-# the same ${APISECRET} written into pool.toml above. ghost-mining now requires an HMAC on every
-# share batch: loopback alone authorised any process on the box to write the payout ledger, and
-# would authorise the internet if :8080 were ever put behind a reverse proxy.
-[share_webhook]
-url = "http://127.0.0.1:8080/api/internal/shares"
-secret = "${APISECRET}"
-batch_size = 1
-batch_timeout_ms = 2000
-max_retries = 3
-
-# Bounds on concurrent downstream connections (#994).
-#
-# ⛔ Commented out = the built-in defaults apply, NOT unlimited. The SV2 port is world-open and had
-# no cap of any kind: a peer could complete the TCP handshake, send nothing, and hold a task, a
-# socket and a descriptor until the pool shut down. Uncomment only to override.
-#
-#   max_downstream_connections   default 512
-#       pool_sv2 normally holds ONE connection from the co-located translator plus any direct SV2
-#       miners. The node advertises capacity for ~1,000 miners and nearly all of them arrive through
-#       the translator's single upstream connection, so 512 is far above any legitimate shape.
-#
-#   max_connections_per_ip       default 64
-#       A farm behind one NAT address can legitimately open several. 64 is generous for that and
-#       still means one source cannot occupy the whole table.
-#
-# A value of 0 is clamped to 1 rather than honoured — a limiter set to zero would refuse the
-# co-located translator and the node would mine nothing while every service reported healthy.
-# max_downstream_connections = 512
-# max_connections_per_ip = 64
-
-# Template provider — this node's own ghost-mining TDP server. public_key is the
-# TDP authority key derived from node.key above.
-[template_provider_type.Sv2Tp]
-address = "127.0.0.1:8442"
-public_key = "${TDP_PUBKEY}"
-EOF
+# pool_sv2 — SV2 pool bridging miners/translators to ghost-mining's TDP, and the node pool: the
+# canonical coinbase, the fee address and the share-chain relay. Holds the secret half of the
+# authority keypair, so this file is 0600 root-only. Rendered by np_render_pool_config (above),
+# which bins/pool-sv2/tests/installer_config.rs feeds to pool_sv2's own config loader.
+np_render_pool_config > /etc/ghost/pool-config.toml
+if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
+  log "WARNING: no share-chain genesis is published for ${NETWORK}. /etc/ghost/pool-config.toml carries"
+  log "         genesis_anchor = \"UNSET\", and pool_sv2 refuses to start until it is set."
+fi
 
 # update-pool-signature.sh keeps pool_signature in sync with ghost-mining's coinbase
 # tag (written by ghost-mining at startup to ~/.ghost/coinbase_tag). Runs as the
@@ -1173,7 +1617,7 @@ GHOSTD_AFTER=""
 [[ "$TOR" == "true" ]] && GHOSTD_AFTER=" tor.service"
 cat > /etc/systemd/system/ghostd.service <<EOF
 [Unit]
-Description=Ghost Bitcoin Core (mainnet)
+Description=Ghost Bitcoin Core (${NETWORK})
 After=network-online.target${GHOSTD_AFTER}
 Wants=network-online.target
 [Service]
@@ -1293,17 +1737,21 @@ EOF
 # ─────────────────────────────── 9. firewall ─────────────────────────────────
 log "Configuring firewall"
 ufw allow 22/tcp        >/dev/null 2>&1   # ssh FIRST so we don't lock out
-ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
+ufw allow "${NP_P2P_PORT}/tcp" >/dev/null 2>&1   # bitcoin P2P
+ufw allow "${RELAY_PORT}/tcp" >/dev/null 2>&1   # node pool share-chain relay
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
-ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
-ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications)
-ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS
+# The old mesh (8555-8562 ZMQ, 8563 Noise) and verification HTTPS (8443) stay CLOSED. ghost-mining
+# still listens on them, but a node pool node has no mesh seeds and must not be reachable by the
+# old fleet's mesh, which keeps running `main`. A rule left by an older install is removed.
+ufw delete allow 8555:8562/tcp >/dev/null 2>&1 || true
+ufw delete allow 8563/tcp      >/dev/null 2>&1 || true
+ufw delete allow 8443/tcp      >/dev/null 2>&1 || true
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
 if [[ "$TOR" == "true" && "$TOR_MODE" == "tor-only" ]]; then
-  ufw delete allow 8333/tcp >/dev/null 2>&1 || true   # tor-only: no clearnet P2P
+  ufw delete allow "${NP_P2P_PORT}/tcp" >/dev/null 2>&1 || true   # tor-only: no clearnet P2P
 fi
 ufw --force enable      >/dev/null 2>&1
 
@@ -3476,12 +3924,35 @@ systemctl enable --now ghostd >/dev/null 2>&1
 systemctl enable --now ghost-mining-gate >/dev/null 2>&1
 sleep 5
 
+# The Bitcoin node, checked again now that it runs: the preflight could only see one a re-run had
+# left behind. ghostd takes a few seconds to open RPC, so this waits up to a minute.
+post_chain=""
+for _ in $(seq 1 12); do
+  post_chain="$(pf_bitcoin_chain)"
+  [[ -n "$post_chain" ]] && break
+  sleep 5
+done
+if [[ "$post_chain" == "$(np_core_chain "$NETWORK")" ]]; then
+  BITCOIN_CHECK="[PASS] Bitcoin node answers on 127.0.0.1:8332 (chain ${post_chain})"
+elif [[ -n "$post_chain" ]]; then
+  BITCOIN_CHECK="[FAIL] Bitcoin node on 127.0.0.1:8332 runs chain '${post_chain}', not ${NETWORK}"
+else
+  BITCOIN_CHECK="[FAIL] Bitcoin node does not answer on 127.0.0.1:8332 yet: sudo journalctl -u ghostd -n 50"
+fi
+GENESIS_STATUS="${GENESIS_ANCHOR:0:16}… at height ${GENESIS_HEIGHT}"
+[[ "$GENESIS_ANCHOR" == UNSET ]] && GENESIS_STATUS="UNSET — pool_sv2 will refuse to start until it is set in /etc/ghost/pool-config.toml"
+
 NODE_ID="$(sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
 MINER_POINTER="Point a miner at:  stratum+tcp://${PUBIP}:3333"
 cat <<EOF
 
-  ✅ Bitcoin Ghost node installed.
+  ✅ Bitcoin Ghost node installed (${NETWORK}).
      ${NODE_ID}
+     ${BITCOIN_CHECK}
+     Fee address:     ${FEE_ADDRESS}
+     Relay:           port ${RELAY_PORT}, peers: ${RELAY_PEERS:-none yet}
+     Genesis:         ${GENESIS_STATUS}
+     Alerts:          ${ALERT_WEBHOOK:-DISABLED (no --alert-webhook)}
      ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
      ghost-mining-gate: $(systemctl is-active ghost-mining-gate)  (waiting for sync, then auto-starts ghost-mining)
      ghost-mining:    $(systemctl is-active ghost-mining)  (started by the gate)

@@ -439,15 +439,15 @@ impl NodeConfig {
             }
         }
 
-        // MAINNET REQUIREMENT 3: Seed nodes must be configured
-        // M-15: Without seed nodes, a mainnet node cannot discover peers and will be isolated,
-        // making it unable to participate in the P2P mesh or consensus.
+        // Seed nodes are the old mesh's (M-15). The node pool agrees on its ledger through the
+        // share-chain relay (`[node_pool.relay]` in pool_sv2), not this mesh, so a node pool node
+        // runs with none: an empty list keeps it off the old fleet's mesh, which must never hear
+        // from it. Said, not refused.
         if self.network.seed_nodes.is_empty() {
-            result.add_error(
+            result.add_warning(
                 "network.seed_nodes",
-                "MAINNET SECURITY: At least one seed node is REQUIRED for mainnet. \
-                 Configure seed_nodes in [network] section with valid peer addresses. \
-                 Without seed nodes, this node cannot discover the P2P network and will be isolated.",
+                "no mesh seed nodes: this node dials no mesh peers. The node pool's share chain \
+                 runs over [node_pool.relay] in pool_sv2, not this mesh.",
             );
         }
 
@@ -659,13 +659,16 @@ impl NodeConfig {
             }
         }
 
-        // M1: Mainnet requires at least 3 seed nodes for network redundancy
-        if self.bitcoin.network == BitcoinNetwork::Mainnet && self.network.seed_nodes.len() < 3 {
-            result.add_error(
+        // M1: fewer than 3 seeds is a single point of failure for mesh discovery. A warning since
+        // the node pool (see validate_mainnet_security): none at all is the node pool default.
+        if self.bitcoin.network == BitcoinNetwork::Mainnet
+            && (1..3).contains(&self.network.seed_nodes.len())
+        {
+            result.add_warning(
                 "network.seed_nodes",
                 &format!(
-                    "MAINNET SECURITY: At least 3 seed nodes are required for mainnet (got {}). \
-                     A single seed node is a single point of failure for peer discovery.",
+                    "only {} mesh seed node(s): a single seed is a single point of failure for \
+                     mesh discovery",
                     self.network.seed_nodes.len()
                 ),
             );
@@ -2781,8 +2784,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mainnet_requires_seed_nodes() {
-        // M-15: Mainnet nodes must have seed_nodes configured to discover peers
+    fn test_mainnet_allows_empty_seed_nodes_with_a_warning() {
+        // A node pool node runs with no mesh seeds, so it never dials the old fleet's mesh.
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
         config.network.noise_enabled = true;
@@ -2791,10 +2794,25 @@ mod tests {
         config.network.seed_nodes = vec![]; // Empty seed nodes
 
         let result = config.validate();
-        assert!(result
+        assert!(!result
             .errors
             .iter()
-            .any(|e| e.field == "network.seed_nodes" && e.message.contains("MAINNET SECURITY")));
+            .any(|e| e.field == "network.seed_nodes"));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.field == "network.seed_nodes" && w.message.contains("no mesh seed")));
+
+        config.network.seed_nodes = vec!["a.example:8559".to_string()];
+        let result = config.validate();
+        assert!(!result
+            .errors
+            .iter()
+            .any(|e| e.field == "network.seed_nodes"));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.field == "network.seed_nodes" && w.message.contains("only 1")));
     }
 
     #[test]

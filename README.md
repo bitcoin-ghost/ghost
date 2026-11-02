@@ -62,26 +62,29 @@ mempool policy.
 | 3333 | Stratum V1 — hobby tier, ~2,328 starting difficulty |
 | 4444 | Stratum V1 — farm/rental tier, ~232,827 starting difficulty |
 | 34255 | Stratum V2 — via SRI pool |
+| 8566 | Node pool share-chain relay |
 | 8080 | REST API |
-| 8555–8562 | P2P mesh (health pings, discovery) |
+| 8555–8562 | P2P mesh of the old network (closed on node pool nodes) |
 | 8900 | GSP WebSocket (light-wallet backend) |
 
 ## Running a node
 
-The install script provisions `ghostd` and `ghost-mining`, writes a config, and
-sets up the systemd services. Supply the Bitcoin address your node rewards
-should be paid to:
+The install script provisions `ghostd`, `ghost-mining` and the SV2 stratum stack
+as a node pool node, writes the configs, and sets up the systemd services. It
+runs a preflight first and changes nothing if a check fails. Supply the address
+that takes the transaction fees of blocks your node's miners find (P2SH, P2WPKH,
+P2WSH or P2TR):
 
 ```sh
-curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
+curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --fee-address bc1q... --alert-webhook https://ntfy.sh
 ```
 
-Run `sudo bash -s -- --help` to see options such as `--archive`,
-`--mining-mode`, and `--sync`. Full setup guidance is at
-<https://bitcoinghost.org/docs/>.
+Run `sudo bash -s -- --help` to see options such as `--network`, `--relay-peer`,
+`--archive` and `--sync`. Full setup guidance is in
+[`ghost-web/docs/deployment.md`](ghost-web/docs/deployment.md).
 
 Point a miner at your node with `stratum+tcp://<your-ip>:3333` and a worker name
-of `<btc_address>.worker1`.
+of `<your payout address>.worker1`; the address must be P2SH, P2WPKH, P2WSH or P2TR.
 
 ### Verifying releases
 

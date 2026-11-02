@@ -237,6 +237,11 @@ impl ChannelManager {
                     .into(),
             ))
         })?;
+        // A placeholder genesis (the installer's `UNSET`, for a network whose share chain has
+        // not been published) refuses here, by name, before anything is opened or fetched.
+        relay
+            .genesis_hash()
+            .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
         let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
             .await
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;

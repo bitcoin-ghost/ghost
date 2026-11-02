@@ -62,6 +62,35 @@ pub struct NodePoolRelayConfig {
     pub rpc_password: String,
 }
 
+/// The `genesis_anchor` an installer writes for a network whose share-chain genesis has not been
+/// published yet. A node refuses to start on it rather than guess a genesis: a guessed one is a
+/// share chain of its own, which no other node would ever join.
+pub const GENESIS_UNSET: &str = "UNSET";
+
+impl NodePoolRelayConfig {
+    /// The genesis anchor, refused when it is the [`GENESIS_UNSET`] placeholder, all zeros, or
+    /// not 32 bytes of hex. Checked at startup before anything else, so the refusal names the fix.
+    pub fn genesis_hash(&self) -> Result<[u8; 32], String> {
+        let g = self.genesis_anchor.trim();
+        if g.is_empty() || g.eq_ignore_ascii_case(GENESIS_UNSET) {
+            return Err(format!(
+                "node_pool.relay.genesis_anchor is {GENESIS_UNSET}: the share-chain genesis for \
+                 this network has not been published, and this node will not guess one. Set \
+                 genesis_anchor (64 hex characters) and genesis_btc_height in [node_pool.relay] \
+                 of the pool_sv2 config to the published values, or re-run the installer with \
+                 --genesis-anchor and --genesis-height"
+            ));
+        }
+        let h = hex32(g, "node_pool.relay.genesis_anchor")?;
+        if h == [0u8; 32] {
+            return Err(
+                "node_pool.relay.genesis_anchor is all zeros, which is not a genesis".to_string(),
+            );
+        }
+        Ok(h)
+    }
+}
+
 fn hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
     let v = hex::decode(s.trim()).map_err(|e| format!("{what}: {e}"))?;
     v.try_into().map_err(|_| format!("{what}: not 32 bytes"))
@@ -75,7 +104,7 @@ pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHand
         None => diff1_target(),
     };
     let genesis = Genesis {
-        hash: hex32(&cfg.genesis_anchor, "genesis_anchor")?,
+        hash: cfg.genesis_hash()?,
         btc_height: cfg.genesis_btc_height,
         tier: cfg
             .genesis_tier
@@ -208,5 +237,21 @@ mod tests {
         assert_eq!(u.batch_root, ghost_common::share_commit::batch_root(&[]));
         h.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unset_genesis_is_refused_by_name() {
+        let db = std::path::Path::new("/tmp/np.db");
+        let mut r = parse(&relay_toml(db, "")).unwrap().relay.unwrap();
+        assert_eq!(r.genesis_hash().unwrap(), [0xee; 32]);
+        for bad in [GENESIS_UNSET, "unset", " ", ""] {
+            r.genesis_anchor = bad.into();
+            let e = r.genesis_hash().unwrap_err();
+            assert!(e.contains("has not been published"), "{bad:?}: {e}");
+        }
+        r.genesis_anchor = "00".repeat(32);
+        assert!(r.genesis_hash().unwrap_err().contains("all zeros"));
+        r.genesis_anchor = "ab".repeat(31);
+        assert!(r.genesis_hash().unwrap_err().contains("not 32 bytes"));
     }
 }
