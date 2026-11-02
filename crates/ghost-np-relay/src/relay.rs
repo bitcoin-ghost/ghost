@@ -58,11 +58,12 @@
 //! ## Retirements (deterministic settlement, W2.13)
 //!
 //! A snapshot table subtracts the retirements of the node pool blocks on the Bitcoin ancestry of
-//! the share's own `prev_hash`, read from the [`BtcArchive`](crate::archive::BtcArchive), never this node's best chain. A pool
-//! block retires what it paid unless an anchor with its `GHPP` prefix sits on the includer's
-//! ancestry and none of them matches it (`block_table` root and canonical outputs), in which case
-//! it retires nothing. Every input is committed by the share, its includer, or an archived block,
-//! so two nodes with the same archive reach the same table whatever their Bitcoin tips.
+//! the share's own `prev_hash`, read from the [`crate::archive::BtcArchive`], never this node's
+//! best chain. A pool block retires what it paid unless an anchor with its `GHPP` prefix sits on
+//! the includer's ancestry and none of them matches it (`block_table` root and canonical outputs),
+//! in which case it retires nothing. Every input is committed by the share, its includer, or an
+//! archived block, so two nodes with the same archive reach the same table whatever their Bitcoin
+//! tips.
 //!
 //! ## Sync, checkpoints and pruning (W2.13)
 //!

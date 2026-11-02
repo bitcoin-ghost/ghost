@@ -33,9 +33,9 @@
 //! block that does not match retires nothing. On a Bitcoin reorg the disconnected blocks are
 //! undone.
 //!
-//! Settlement also feeds the [`BtcArchive`](crate::archive::BtcArchive): every best-chain block
-//! it reads (and the 11 at genesis, for median time past) is archived with its coinbase and
-//! recorded as this node's best chain. Blocks it leaves on a reorg stay archived.
+//! Settlement also feeds the [`crate::archive::BtcArchive`]: every best-chain block it reads (and
+//! the 11 at genesis, for median time past) is archived with its coinbase and recorded as this
+//! node's best chain. Blocks it leaves on a reorg stay archived.
 //!
 //! What it retires here is this node's stored ledger (`np_ledger`), which follows this node's
 //! Bitcoin best chain and the anchors it holds. Share checks and snapshot tables do not read it:
@@ -386,7 +386,7 @@ fn now_secs() -> i64 {
 }
 
 impl Settlement {
-    /// Settlement over the relay's store, publishing to `view` (the relay's [`Retirements`]).
+    /// Settlement over the relay's store, recording what it applied in `view`.
     pub fn new(db: Arc<Database>, view: SettledView, genesis_btc_height: u32) -> Settlement {
         Settlement {
             db,

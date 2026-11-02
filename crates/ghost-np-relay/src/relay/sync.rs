@@ -24,17 +24,17 @@
 //!
 //! ## Initial sync
 //!
-//! A node that hears of a heavier tip than its own asks that peer for anchor headers with a
-//! locator of its own chain (`GetHeaders`). The peer answers with up to
-//! [`MAX_HEADERS_PER_MESSAGE`](crate::wire::MAX_HEADERS_PER_MESSAGE) anchors of its best chain after the first locator hash it holds
-//! on that chain, parents first (`Headers`). Each is checked as any anchor is (its own share's
-//! self-checks, its work against `T_net + 8` on its parent) and held unseen. A full reply asks
-//! for more after its last anchor. The batches of held-but-unseen anchors are then requested,
-//! oldest first and at most [`RelayParams::sync_inflight`](crate::relay::RelayParams::sync_inflight) at a time, and checked against the
-//! including anchor's ancestry exactly as relayed ones are, from the genesis table up. A peer
-//! that does not answer, answers `NotFound`, or sends data that does not check is passed over
-//! for the next peer (`retry_request`). Nothing is trusted from a peer: a node that syncs reaches
-//! the same chain, credits and tables as one that relayed every anchor live.
+//! A node that hears of a heavier tip than its own asks that peer for anchor headers with a locator
+//! of its own chain (`GetHeaders`). The peer answers with up to
+//! [`crate::wire::MAX_HEADERS_PER_MESSAGE`] anchors of its best chain after the first locator hash
+//! it holds on that chain, parents first (`Headers`). Each is checked as any anchor is (its own
+//! share's self-checks, its work against `T_net + 8` on its parent) and held unseen. A full reply
+//! asks for more after its last anchor. The batches of held-but-unseen anchors are then requested,
+//! oldest first and at most [`crate::relay::RelayParams::sync_inflight`] at a time, and checked
+//! against the including anchor's ancestry exactly as relayed ones are, from the genesis table up.
+//! A peer that does not answer, answers `NotFound`, or sends data that does not check is passed
+//! over for the next peer (`retry_request`). Nothing is trusted from a peer: a node that syncs
+//! reaches the same chain, credits and tables as one that relayed every anchor live.
 //!
 //! Sync is resumable: anchors are stored only once their batch checks, so after a restart the
 //! locator starts from the stored best tip.
@@ -44,28 +44,27 @@
 //!
 //! ## Checkpoints
 //!
-//! Every [`RelayParams::checkpoint_interval`](crate::relay::RelayParams::checkpoint_interval) Bitcoin
-//! blocks the relay folds a [`Checkpoint`](crate::checkpoint::Checkpoint) at the last best-chain anchor [`RelayParams::checkpoint_depth`](crate::relay::RelayParams::checkpoint_depth) blocks below its
-//! tip, stores it with its digest, and drops from memory the batches and credits it folded. The
-//! two newest are kept. On start the relay replays from the older one that verifies (digest,
-//! genesis, and an anchor stored with the same height, `btc_height` and work), recomputes the
-//! newer one from the stored batches between them and compares: a corrupt or mismatching
-//! checkpoint is logged and rewritten. With neither, it replays from genesis; batches missing from
-//! the store are fetched from peers.
+//! Every [`crate::relay::RelayParams::checkpoint_interval`] Bitcoin blocks the relay folds a
+//! [`crate::checkpoint::Checkpoint`] at the last best-chain anchor
+//! [`crate::relay::RelayParams::checkpoint_depth`] blocks below its tip, stores it with its digest,
+//! and drops from memory the batches and credits it folded. The two newest are kept. On start the
+//! relay replays from the older one that verifies (digest, genesis, and an anchor stored with the
+//! same height, `btc_height` and work), recomputes the newer one from the stored batches between
+//! them and compares: a corrupt or mismatching checkpoint is logged and rewritten. With neither, it
+//! replays from genesis; batches missing from the store are fetched from peers.
 //!
 //! A checkpoint at depth `D` assumes no share-chain reorg forks below it (an anchor forking below
-//! the checkpoint is held but never judged) and no Bitcoin reorg deeper than about `D - 32`
-//! blocks.
+//! the checkpoint is held but never judged) and no Bitcoin reorg deeper than about `D - 32` blocks.
 //!
 //! ## Retention and pruning
 //!
 //! Kept forever: every anchor header and its own share, the Bitcoin archive, the ledger and its
-//! journals, and the two newest checkpoints. With [`RelayParams::prune`](crate::relay::RelayParams::prune) on, batches (membership
-//! and share bodies) of anchors below the older kept checkpoint are deleted. Such a node still
-//! serves every batch above that checkpoint, so it can feed any peer within its window and every
-//! reorg it can follow; a peer that needs older batches gets `NotFound` and asks another peer. A
-//! fresh node needs at least one archive peer (`prune` off) for batches older than its peers'
-//! windows.
+//! journals, and the two newest checkpoints. With [`crate::relay::RelayParams::prune`] on, batches
+//! (membership and share bodies) of anchors below the older kept checkpoint are deleted. Such a
+//! node still serves every batch above that checkpoint, so it can feed any peer within its window
+//! and every reorg it can follow; a peer that needs older batches gets `NotFound` and asks another
+//! peer. A fresh node needs at least one archive peer (`prune` off) for batches older than its
+//! peers' windows.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;

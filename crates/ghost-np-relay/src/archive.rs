@@ -29,25 +29,22 @@
 //!
 //! The archive serves three things:
 //!
-//! - **Header facts** ([`HeaderLookup`](crate::headers::HeaderLookup)) for any archived header: its height, the bits a child
-//!   must carry, and its median time past, computed from the archived headers alone.
+//! - **Header facts** ([`crate::headers::HeaderLookup`]) for any archived header: its height, the
+//!   bits a child must carry, and its median time past, computed from the archived headers alone.
 //! - **Settlement's input**: the node pool blocks on a share's Bitcoin ancestry
-//!   ([`BtcArchive::pool_blocks_on`](crate::archive::BtcArchive::pool_blocks_on)). The retirement rule is in [`crate::relay`]; it reads the
-//!   ancestry of the share's own `prev_hash`, never this node's best chain, so every viewer with
-//!   the same archive reaches the same table.
-//! - **Sync**: peers ask for blocks by hash (`GetBtcBlocks`); a block from a peer is checked
-//!   before it is kept
-//!   ([`BtcArchive::insert_from_peer`](crate::archive::BtcArchive::insert_from_peer)): it extends an archived parent at the
-//!   next height, its hash meets its own bits, its bits are its parent's (a retarget boundary
-//!   off this node's best chain cannot be checked and is refused without penalty), and its
+//!   ([`crate::archive::BtcArchive::pool_blocks_on`]). The retirement rule is in [`crate::relay`];
+//!   it reads the ancestry of the share's own `prev_hash`, never this node's best chain, so every
+//!   viewer with the same archive reaches the same table.
+//! - **Sync**: peers ask for blocks by hash (`GetBtcBlocks`); a block from a peer is checked before
+//!   it is kept ([`crate::archive::BtcArchive::insert_from_peer`]): it extends an archived parent
+//!   at the next height, its hash meets its own bits, its bits are its parent's (a retarget
+//!   boundary off this node's best chain cannot be checked and is refused without penalty), and its
 //!   coinbase folds to its merkle root and carries its BIP34 height. A block whose parent is
 //!   missing waits in a bounded pool while the parent is fetched.
 //!
-//! Blocks from the local Bitcoin node
-//! ([`BtcArchive::insert_local`](crate::archive::BtcArchive::insert_local)) are trusted for work,
-//! and define this node's best chain
-//! ([`BtcArchive::set_main`](crate::archive::BtcArchive::set_main)), which only jobs and settlement's
-//! materialised ledger read.
+//! Blocks from the local Bitcoin node ([`crate::archive::BtcArchive::insert_local`]) are trusted
+//! for work, and define this node's best chain ([`crate::archive::BtcArchive::set_main`]), which
+//! only jobs and settlement's materialised ledger read.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
