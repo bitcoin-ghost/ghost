@@ -125,6 +125,10 @@ jobs:
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # release.sh --node-pool: np- tag, pre-release, make_latest=false, `releases/latest` read back
+      # unchanged, and no phase that rolls the old fleet. Stubbed `gh`, throwaway repos.
+      - name: Node pool release-orchestrator self-test
+        run: ./scripts/test-release-node-pool.sh
       # E-1 forbids key material from a generator other than the OS CSPRNG. `thread_rng()` has
       # been substituted for `OsRng` three times here — once in the wallet seed, once minting the
       # SV2 AUTHORITY keypair while the doc comment claimed OsRng (#705). E-5 rules out catching

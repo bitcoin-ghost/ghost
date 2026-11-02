@@ -26,6 +26,7 @@
 #
 # Usage:
 #   scripts/release.sh <version> [--from <phase>] [--dry-run]
+#   scripts/release.sh --node-pool <version> [--from <phase>] [--dry-run]
 #   scripts/release.sh --status
 #
 #   <version>   e.g. 1.11.38 (no leading v)
@@ -35,6 +36,15 @@
 #   --dry-run   print what each phase would do; touch nothing
 #
 # Phases are idempotent and each verifies its OUTCOME rather than its exit code.
+#
+# --node-pool cuts a release on the NODE POOL channel instead: tag `np-v<version>`, built and
+# signed by .github/workflows/release-node-pool.yml, published as a PRE-release with
+# make_latest=false so GitHub's `releases/latest` (what every old-network node updates from) never
+# moves to it. It ships the node pool artefact set (pool_sv2, ghost-mining, translator_sv2,
+# ghost-admin, ghost-audit, and ghostd with ghost-cli in the archive), is cut from the node pool
+# branch (GHOST_NP_BRANCH, default feat/node-pool), and NEVER rolls the old fleet: its phases are
+#               check|gates|build|tag
+# The node pool runs on its own servers, which update themselves from the np- channel.
 
 set -uo pipefail
 
@@ -59,9 +69,18 @@ cd "$REPO_ROOT" || exit 1
 FLEET_BINARIES="pool_sv2 ghost-mining translator_sv2"
 PRODUCTION_ONLY=""
 
+# The node pool channel's artefact set, as built and asserted by `phase_build --node-pool`. ghostd
+# and its RPC client ghost-cli are built by CMake in release-node-pool.yml (as in release.yml) and
+# asserted there, in the archive.
+NP_BINARIES="pool_sv2 ghost-mining translator_sv2 ghost-admin ghost-audit"
+NP_BRANCH="${GHOST_NP_BRANCH:-feat/node-pool}"
+
 # cargo package name, where it differs from the binary name.
 pkg_for() {
-    echo "$1"
+    case "$1" in
+        ghost-admin) echo ghost-cli ;;
+        *) echo "$1" ;;
+    esac
 }
 
 # Addressed explicitly because the publish path uses `gh api`, which — unlike `gh release` — does
@@ -107,7 +126,8 @@ mkdir -p "$STATE_DIR"
 
 DRY_RUN=false
 VERSION=""
-FROM="bump"
+FROM=""
+CHANNEL="old-network"
 
 die()  { echo "REFUSED: $*" >&2; exit 1; }
 # Never let a phase run with an empty SHA: `cat` of a missing file yields "" and every
@@ -131,6 +151,7 @@ while [ $# -gt 0 ]; do
         --status)  shift; MODE=status ;;
         --from)    FROM="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --node-pool) CHANNEL="node-pool"; shift ;;
         -*)        die "unknown flag: $1" ;;
         *)         VERSION="$1"; shift ;;
     esac
@@ -141,6 +162,7 @@ if [ "$MODE" = "status" ]; then
     echo "workspace version: $(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
     echo "main:              $(git rev-parse --short origin/main 2>/dev/null)"
     echo "newest tag:        $(git tag -l 'v*' --sort=-v:refname | head -1)"
+    echo "newest np- tag:    $(git tag -l 'np-v*' --sort=-v:refname | head -1)"
     echo "newest release:    $(gh release list --limit 1 2>/dev/null | awk '{print $1}')"
     echo "state:             $STATE_DIR"
     ls -1 "$STATE_DIR" 2>/dev/null | sed 's/^/  /'
@@ -149,9 +171,19 @@ fi
 
 [ -n "$VERSION" ] || die "usage: $0 <version> [--from <phase>] [--dry-run]"
 echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || die "version must look like 1.11.38, got '$VERSION'"
-TAG="v$VERSION"
+if [ "$CHANNEL" = node-pool ]; then
+    TAG="np-v$VERSION"
+    RELEASE_REF="origin/$NP_BRANCH"
+    PHASES="check gates build tag"
+    WORKTREE="${GHOST_RELEASE_WORKTREE:-/tmp/ghost-release-np-$VERSION}"
+else
+    TAG="v$VERSION"
+    RELEASE_REF="origin/main"
+    PHASES="bump pr gates build canary soak production node tag"
+    WORKTREE="${GHOST_RELEASE_WORKTREE:-/tmp/ghost-release-$VERSION}"
+fi
+FROM="${FROM:-${PHASES%% *}}"
 SHA_FILE="$STATE_DIR/$TAG.sha"
-WORKTREE="${GHOST_RELEASE_WORKTREE:-/tmp/ghost-release-$VERSION}"
 
 # ---------------------------------------------------------------- shared guards
 #
@@ -161,6 +193,14 @@ WORKTREE="${GHOST_RELEASE_WORKTREE:-/tmp/ghost-release-$VERSION}"
 assert_sha_still_current() {
     local sha="$1" bad=""
     git fetch -q origin || die "cannot reach origin"
+    if [ "$CHANNEL" = node-pool ]; then
+        # Everything that goes into the archive, ghostd included.
+        git diff --quiet "$sha" "$RELEASE_REF" -- bins crates ghost-core Cargo.toml Cargo.lock 2>/dev/null \
+            || die "$sha no longer matches $RELEASE_REF for bins/, crates/ or ghost-core/. Something
+       merged into the node pool branch after the release SHA was recorded. Re-run from 'check'."
+        info "release SHA still matches $RELEASE_REF for everything shipped"
+        return 0
+    fi
     for b in $FLEET_BINARIES $PRODUCTION_ONLY; do
         local dir="bins/${b//_/-}"
         [ -d "$dir" ] || dir="bins/$b"
@@ -194,6 +234,26 @@ $bin's cargo package is '$(pkg_for "$bin")')"
 }
 
 # ---------------------------------------------------------------- phases
+# The node pool channel's first phase: no bump and no PR, the version is whatever the node pool
+# branch carries, and the tag must say the same (release-node-pool.yml refuses it otherwise).
+phase_check() {
+    step "node pool release $TAG from $NP_BRANCH"
+    git fetch -q origin || die "cannot reach origin"
+    git rev-parse --verify -q "$RELEASE_REF" >/dev/null || die "no $RELEASE_REF"
+    local cur sha
+    cur="$(git show "$RELEASE_REF:Cargo.toml" | grep -m1 '^version' | cut -d'"' -f2)"
+    [ "$cur" = "$VERSION" ] || die "$NP_BRANCH is at version $cur, not $VERSION. Every binary reports
+       the workspace version, so the tag must match it: bump it on $NP_BRANCH first (Cargo.toml,
+       Cargo.lock, fuzz/Cargo.lock), or release np-v$cur."
+    sha="$(git rev-parse "$RELEASE_REF")"
+    if [ -s "$SHA_FILE" ] && [ "$(cat "$SHA_FILE")" != "$sha" ]; then
+        info "replacing recorded SHA $(cut -c1-9 < "$SHA_FILE") with $RELEASE_REF"
+    fi
+    $DRY_RUN && { info "[dry-run] would record ${sha:0:9} as the release SHA for $TAG"; return 0; }
+    echo "$sha" > "$SHA_FILE"
+    info "release SHA ${sha:0:9} ($RELEASE_REF, version $cur)"
+}
+
 phase_bump() {
     step "bump to $VERSION"
     git rev-parse --abbrev-ref HEAD | grep -qx main || die "not on main"
@@ -287,6 +347,16 @@ phase_gates() {
 
 phase_build() {
     step "build every shipped binary at $VERSION"
+    if [ "$CHANNEL" = node-pool ]; then
+        $DRY_RUN && { info "[dry-run] would build: $NP_BINARIES"; return 0; }
+        [ -d "$WORKTREE" ] || die "no worktree at $WORKTREE — run the 'gates' phase first"
+        (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
+            -p ghost-mining -p pool_sv2 -p translator_sv2 -p ghost-cli -p ghost-audit) \
+            || die "node pool build failed"
+        local b
+        for b in $NP_BINARIES; do assert_binary "$WORKTREE" "$b" "$VERSION"; done
+        return 0
+    fi
     $DRY_RUN && { info "[dry-run] would build: $FLEET_BINARIES $PRODUCTION_ONLY"; return 0; }
     (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
         -p ghost-mining -p pool_sv2 -p translator_sv2) \
@@ -295,7 +365,14 @@ phase_build() {
     for b in $FLEET_BINARIES $PRODUCTION_ONLY; do assert_binary "$WORKTREE" "$b" "$VERSION"; done
 }
 
+# The node pool channel never touches the old fleet. Its phase list has no roll phase; this is
+# the backstop should one ever be called anyway.
+refuse_roll_on_node_pool() {
+    [ "$CHANNEL" != node-pool ] || die "the node pool channel never rolls the old fleet ($1)"
+}
+
 roll_node() {
+    refuse_roll_on_node_pool "$1"
     local node="$1" canary="$2" bins="$3" b rc
     echo "  ---- $node ----"
     for b in $bins; do
@@ -450,6 +527,7 @@ CMake was not reconfigured, so it read the old workspace version"
 #     "Job for ghostd.service canceled." and the deploy aborted with the backup taken and the
 #     binary unswapped. `restart` is one transaction and cannot be cancelled by a competing job.
 roll_ghostd() {
+    refuse_roll_on_node_pool "$1"
     local node="$1" bin="$2" want got
     want="$(sha256sum "$bin" | cut -d" " -f1)"
     echo "  ---- $node ----"
@@ -581,7 +659,12 @@ phase_tag() {
         # Left as a DRAFT on purpose: this path cannot produce assets, and a human should
         # decide whether an assetless release is what they want.
         info "no release.yml run for $TAG after ${waited}s — creating a DRAFT release"
-        gh release create "$TAG" --title "$TAG" --generate-notes --draft >/dev/null \
+        # A node pool draft is a pre-release from birth, so publishing it by hand cannot make it
+        # the old network's latest.
+        local np_flags=""
+        [ "$CHANNEL" = node-pool ] && np_flags="--prerelease"
+        # shellcheck disable=SC2086  # empty or one flag, never quoted into an empty argument
+        gh release create "$TAG" --title "$TAG" --generate-notes --draft $np_flags >/dev/null \
             || die "gh release create failed"
         rel_id=$(gh api "repos/$GH_REPO/releases?per_page=30" \
                     --jq ".[]|select(.tag_name==\"$TAG\")|.id" 2>/dev/null | head -1)
@@ -605,6 +688,11 @@ phase_tag() {
         || die "$TAG carries no SHA256SUMS.txt.asc — refusing to publish an UNSIGNED release.
        Assets present: $asset_names"
     info "artefacts present: $n_assets assets including SHA256SUMS.txt.asc"
+
+    if [ "$CHANNEL" = node-pool ]; then
+        publish_node_pool "$rel_id"
+        return $?
+    fi
 
     if [ "$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)" = "true" ]; then
         # NOT `gh release edit --draft=false`: that is a no-op in the installed gh — it prints
@@ -633,8 +721,50 @@ phase_tag() {
     info "published $TAG (verified: draft=false, tag=$tagged, assets=$final_assets)"
 }
 
+# The node pool channel's publish. Same rules as the old channel's (assets were checked by the
+# caller; the outcome is read back, never trusted from the call), and two more:
+#   * the release is a PRE-release with make_latest=false. GitHub never makes a pre-release the
+#     repository's latest, so `releases/latest`, which every old-network node updates from, stays
+#     on the old channel. release-node-pool.yml creates it that way; this sets it again, so a
+#     release edited by hand on the way is put back.
+#   * `releases/latest` is read before and after, and must be the same old-network release.
+publish_node_pool() {
+    local rel_id="$1" latest_before latest_after draft pre tagged final_assets
+    latest_before=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null)
+    case "$latest_before" in np-*) die "releases/latest is already a node pool release ($latest_before).
+       Every old-network node is about to update to it. Make it a pre-release, mark the newest
+       v-release latest, then re-run this phase." ;; esac
+
+    if [ "$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)" = "true" ] \
+       || [ "$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .prerelease 2>/dev/null)" != "true" ]; then
+        # tag_name sent for the reason the old channel sends it (a PATCH without it detaches the
+        # release). make_latest is the API's STRING "false", hence -f.
+        gh api -X PATCH "repos/$GH_REPO/releases/$rel_id" \
+            -f tag_name="$TAG" -f name="Node pool $TAG" -F draft=false -F prerelease=true \
+            -f make_latest=false >/dev/null \
+            || die "publish PATCH failed for $TAG"
+    fi
+
+    draft=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .draft 2>/dev/null)
+    pre=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .prerelease 2>/dev/null)
+    tagged=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq .tag_name 2>/dev/null)
+    final_assets=$(gh api "repos/$GH_REPO/releases/$rel_id" --jq '.assets|length' 2>/dev/null)
+    latest_after=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null)
+    [ "$draft" = "false" ] || die "$TAG is STILL a draft after publishing — see #857"
+    [ "$tagged" = "$TAG" ] || die "$TAG detached from its tag (now '$tagged') — re-PATCH with tag_name"
+    [ "$pre" = "true" ] || die "$TAG is published but NOT a pre-release, so GitHub may make it latest
+       and every old-network node would update to it. Mark it a pre-release NOW."
+    [ "${final_assets:-0}" -ge "$RELEASE_MIN_ASSETS" ] \
+        || die "$TAG published with only ${final_assets:-0} assets — see #909"
+    case "$latest_after" in np-*) die "releases/latest became $latest_after — every old-network node
+       will update to a node pool build. Mark the newest v-release latest NOW." ;; esac
+    [ "$latest_after" = "$latest_before" ] \
+        || die "releases/latest moved from '$latest_before' to '$latest_after' while publishing $TAG"
+    info "published $TAG (verified: draft=false, prerelease=true, tag=$tagged, assets=$final_assets, \
+releases/latest still ${latest_after:-<none>})"
+}
+
 # ---------------------------------------------------------------- driver
-PHASES="bump pr gates build canary soak production node tag"
 echo "$PHASES" | tr ' ' '\n' | grep -qx "$FROM" || die "unknown phase '$FROM' (want one of: $PHASES)"
 
 started=false
