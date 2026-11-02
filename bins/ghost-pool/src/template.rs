@@ -672,7 +672,9 @@ pub struct TemplateConfig {
     pub refresh_interval_ms: u64,
     /// Minimum fee rate to include (sat/vB)
     pub min_fee_rate: f64,
-    /// Target block weight
+    /// Most weight a whole block built here may have, header and coinbase included. Clamped to
+    /// the template's `weightlimit` and to consensus (`block_limits::BlockLimits`). Read at
+    /// template time only: a block already found is never refused for exceeding it.
     pub target_weight: u64,
     /// Coinbase extra data (pool signature)
     pub coinbase_extra: String,
@@ -732,7 +734,7 @@ impl Default for TemplateConfig {
         Self {
             refresh_interval_ms: 30_000,
             min_fee_rate: 1.0,
-            target_weight: 3_992_000, // ~99% of 4MW limit
+            target_weight: crate::block_limits::MAX_BLOCK_WEIGHT,
             coinbase_extra: "GHOST".to_string(),
             node_id: None,
             treasury_address: TreasuryAddress::default(), // Must be configured
@@ -946,6 +948,8 @@ pub struct TemplateProcessor {
     /// proposal carried no fees at all. This remembers the last real fee observation across the
     /// tip change so the proposal can carry an estimate instead of a structural zero.
     last_filled_fees: std::sync::atomic::AtomicU64,
+    /// What the SV2 pool said it adds to each coinbase (`CoinbaseOutputConstraints`).
+    coinbase_output_reserve: crate::block_limits::CoinbaseOutputReserve,
     /// Work states by template_id (for SubmitSolution lookup)
     work_states: RwLock<HashMap<u64, WorkState>>,
     /// Job counter
@@ -999,6 +1003,7 @@ impl TemplateProcessor {
             reaper_stats: crate::reaper_stats::ReaperStats::new(),
             current_work: RwLock::new(None),
             last_filled_fees: std::sync::atomic::AtomicU64::new(0),
+            coinbase_output_reserve: Default::default(),
             work_states: RwLock::new(HashMap::new()),
             job_counter: RwLock::new(0),
             event_tx,
@@ -2190,6 +2195,17 @@ impl TemplateProcessor {
             }
         }
 
+        // Node pool (dark until activation): leave room for the largest coinbase.
+        let mut filtered_txs = filtered_txs;
+        crate::block_limits::make_room_for_coinbase(
+            template.height,
+            ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
+            &template,
+            self.config.target_weight,
+            &self.coinbase_output_reserve,
+            &mut filtered_txs,
+        );
+
         // Calculate total fees and weight
         let total_fees: u64 = filtered_txs.iter().map(|tx| tx.fee).sum();
         let total_weight: u64 = filtered_txs.iter().map(|tx| tx.weight).sum();
@@ -2258,6 +2274,19 @@ impl TemplateProcessor {
                 error!(error = %e, "CRIT-10: Invalid address in payout - refusing to create block template");
                 anyhow::anyhow!("Address validation failed: {}", e)
             })?;
+
+        // Block limits: warns below node pool activation, refuses the job at and above it.
+        crate::block_limits::check_built_coinbase(
+            template.height,
+            ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
+            &template,
+            self.config.target_weight,
+            &self.coinbase_output_reserve,
+            &coinbase1,
+            &coinbase2,
+            &coinbase_outputs_serialized,
+            &filtered_txs,
+        )?;
 
         // Create work state
         // Note: template.coinbasevalue from Bitcoin Core = subsidy + all tx fees
@@ -3231,6 +3260,13 @@ impl TemplateProcessor {
         witness.extend_from_slice(&witness_data.nonce);
 
         Ok(witness)
+    }
+
+    /// Record a TDP client's `CoinbaseOutputConstraints`, so templates leave room for the
+    /// outputs and sigops it adds.
+    pub fn note_coinbase_output_constraints(&self, max_additional_size: u32, max_sigops: u16) {
+        self.coinbase_output_reserve
+            .note(max_additional_size, max_sigops);
     }
 
     /// Get current work state
