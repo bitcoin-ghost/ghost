@@ -4,7 +4,6 @@ export * from './node';
 export * from './config';
 export * from './mining';
 export * from './network';
-export * from './ghostpay';
 export * from './rewards';
 export * from './swarm';
 export * from './backup';

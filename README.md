@@ -83,7 +83,6 @@ selects its own transactions according to its configured mempool policy.
 | 34255 | Stratum V2 — via SRI pool |
 | 8080 | REST API |
 | 8555–8562 | P2P consensus mesh (shares, blocks, voting, health, discovery, elders, payouts) |
-| 8800 | Ghost Pay L2 API |
 | 8900 | GSP WebSocket (light-wallet backend) |
 
 ## Running a node
@@ -146,15 +145,9 @@ cargo fmt --all                               # format
 cargo audit                                   # dependency advisory check
 ```
 
-`ghost-mpc`'s lifecycle test needs its small-cap harness feature and is run on its own:
-
-```sh
-cargo test -p ghost-mpc --test mpc_lifecycle --features mpc-test-cap
-```
-
 Before opening a PR, `scripts/record-tests.sh` runs the full gate exactly as CI does
 — formatting, clippy with CI's own argument list, docs under `-D warnings`, the fuzz
-targets, and the feature-gated suites — and is the quickest way to find out whether
+targets — and is the quickest way to find out whether
 CI will be happy.
 
 ## Privacy features
@@ -165,7 +158,6 @@ own:
 | Feature | What it does |
 |---------|--------------|
 | Ghost Keys (BIP-352) | Silent Payments — a fresh on-chain address per payment from one static identifier. |
-| Ghost Pay L2 | Off-chain transfers proven with zero-knowledge proofs. |
 | Ghost Mode | Incognito node mode — the node stops accepting and advertising transactions to peers, so its mempool is never exposed to surveillance. Pairs with Tor. |
 | Ghost Shroud | Randomised relay delay on transactions to resist timing analysis. |
 | Ghost Haze | Strips witness padding, scriptSig stuffing, and OP_RETURN payloads from blocks before they are written to disk, retaining the full economic graph. |
@@ -174,7 +166,7 @@ own:
 
 Protocol and operator documentation is published at
 <https://bitcoinghost.org/docs/>, covering the consensus protocol, the
-node-capability system, economics, Ghost Keys, Ghost Pay,
+node-capability system, economics, Ghost Keys,
 Ghost Haze, the Reaper, and deployment.
 
 ## Contributing

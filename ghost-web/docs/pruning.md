@@ -84,7 +84,6 @@ There's no scheduled `VACUUM` cadence in the code. SQLite's standard incremental
 |---|---|---|
 | Block-level data | `blk*.dat` / `gsb*.dat`, full archive vs hazed | [Haze](#haze), [Exorcism](#exorcism) |
 | **Operational logs** | **Shares, verification challenges, L2 snapshots/reservations** | **this doc** |
-| L2 settlement | Ghost Pay batch settlement to L1 | [Reconciliation](#reconciliation) |
 | Mesh peer state | Recent peer messages, vote history | Held in RAM, expired on a much shorter window |
 
 Block data and operational data are pruned by different rules because they have different value: blocks are network duty, operational logs are local accounting. Confusing the two leads either to losing data the operator needs or hoarding data nobody benefits from.

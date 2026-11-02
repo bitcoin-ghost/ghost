@@ -83,32 +83,6 @@ async fn baseline_03_peer_count_consistent() {
     }
 }
 
-#[tokio::test]
-#[ignore]
-async fn baseline_04_mpc_status_consistent() {
-    let client = setup();
-    let mut counts = Vec::new();
-
-    for ip in client.config.all_ips() {
-        match client.get_mpc_contribution_count(ip).await {
-            Ok(c) => {
-                println!("  {} MPC contributions: {}", ip, c);
-                counts.push(c);
-            }
-            Err(e) => panic!("{} failed to get MPC status: {}", ip, e),
-        }
-    }
-
-    let first = counts[0];
-    for (i, c) in counts.iter().enumerate() {
-        assert_eq!(
-            *c, first,
-            "Node {} has {} MPC contributions, expected {} (same as node 0)",
-            i, c, first
-        );
-    }
-    println!("MPC contributions consistent: {} across all nodes", first);
-}
 
 #[tokio::test]
 #[ignore]

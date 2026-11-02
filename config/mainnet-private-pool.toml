@@ -104,11 +104,3 @@ prune_height = 10000
 treasury_address = "${TREASURY_ADDRESS}"
 min_payout_sats = 50000
 payout_interval_blocks = 100
-
-[ghost_pay]
-enabled = false
-# Required even when `enabled = false`. GhostPayConfig has no serde default for these two, so a
-# [ghost_pay] section missing either fails to parse and the node will NOT START. They are
-# inert while disabled and mirror config/mainnet.toml.
-virtual_block_secs = 10
-epoch_blocks = 2160

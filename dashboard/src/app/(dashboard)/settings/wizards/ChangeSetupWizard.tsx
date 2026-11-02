@@ -17,7 +17,6 @@ import {
   useSetGhostMode,
   useSetArchiveMode,
   useSetReaper,
-  useSetGhostPay,
   useSetPolicyProfile,
 } from '@/hooks/queries';
 import { toPolicyProfile } from '@/lib/api/config';
@@ -29,7 +28,6 @@ interface ChangeSetupData {
   ghost_mode: boolean;
   archive_mode: boolean;
   reaper: boolean;
-  ghost_pay: boolean;
   mempool_profile: string;
 }
 
@@ -68,7 +66,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
   const setGhostMode = useSetGhostMode();
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
-  const setGhostPay = useSetGhostPay();
   // The mempool step drives the REAL tier-policy lever (`/config/policy_profile`),
   // which persists to pool.toml and applies on the next graceful restart.
   const setPolicyProfile = useSetPolicyProfile();
@@ -87,7 +84,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
         ghost_mode: false,
         archive_mode: false,
         reaper: false,
-        ghost_pay: false,
         mempool_profile: 'standard',
       };
     }
@@ -98,7 +94,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
       ghost_mode: fullConfig.ghost_mode ?? fullConfig.node?.ghost_mode ?? false,
       archive_mode: fullConfig.archive_mode ?? fullConfig.node?.archive_mode ?? false,
       reaper: fullConfig.reaper ?? false,
-      ghost_pay: fullConfig.ghost_pay ?? false,
       // Derive the coarse wizard choice from the REAL tier policy (only "strict"
       // has a distinct wizard option; everything else shows as "standard").
       mempool_profile: fullConfig.policy?.profile === 'strict' ? 'strict' : 'standard',
@@ -190,10 +185,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           await setReaper.mutateAsync(data.reaper);
           changeCount++;
         }
-        if (data.ghost_pay !== original.ghost_pay) {
-          await setGhostPay.mutateAsync(data.ghost_pay);
-          changeCount++;
-        }
         if (data.mempool_profile !== original.mempool_profile) {
           await setPolicyProfile.mutateAsync(toPolicyProfile(data.mempool_profile));
           changeCount++;
@@ -212,7 +203,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
     },
   ], [
     configLoading, setNickname, setPublicMiningConfig, setPayoutAddress,
-    setGhostMode, setArchiveMode, setReaper, setGhostPay,
+    setGhostMode, setArchiveMode, setReaper,
     setPolicyProfile, toast, onClose,
   ]);
 
@@ -261,12 +252,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
       label: 'Reaper',
       shares: '+2 shares',
       description: 'Strict transaction policy filtering. Only accept standard Bitcoin transactions.',
-    },
-    {
-      key: 'ghost_pay' as const,
-      label: 'Ghost Pay',
-      shares: '+4 shares',
-      description: 'Participate in the Ghost Pay L2 instant payment network.',
     },
   ];
 
@@ -499,9 +484,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                 }
                 if (hasChanged('reaper')) {
                   changes.push({ label: 'Reaper', from: original?.reaper ? 'Enabled' : 'Disabled', to: data.reaper ? 'Enabled' : 'Disabled' });
-                }
-                if (hasChanged('ghost_pay')) {
-                  changes.push({ label: 'Ghost Pay', from: original?.ghost_pay ? 'Enabled' : 'Disabled', to: data.ghost_pay ? 'Enabled' : 'Disabled' });
                 }
                 if (hasChanged('mempool_profile')) {
                   changes.push({ label: 'Mempool Profile', from: original?.mempool_profile || '--', to: data.mempool_profile });

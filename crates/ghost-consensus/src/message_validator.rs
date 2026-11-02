@@ -144,30 +144,6 @@ pub const MAX_ELDER_REGISTRATION_PROPOSAL_SIZE: usize = 1_000;
 pub const MAX_ELDER_LIST_PROPOSAL_SIZE: usize = 100_000;
 /// P2P-C3: Elder list approval (signature + epoch + merkle root)
 pub const MAX_ELDER_LIST_APPROVAL_SIZE: usize = 500;
-/// MPC-C1: MPC contribution (proof + params hash + signature)
-pub const MAX_MPC_CONTRIBUTION_SIZE: usize = 50_000;
-/// MPC-C2: MPC verification vote (signature + approval)
-pub const MAX_MPC_VERIFICATION_VOTE_SIZE: usize = 500;
-/// MPC-C3: MPC parameters request (hash + chunk indices)
-pub const MAX_MPC_PARAMS_REQUEST_SIZE: usize = 5_000;
-/// MPC-C4: MPC parameters response (chunked data ~1MB)
-pub const MAX_MPC_PARAMS_RESPONSE_SIZE: usize = 1_100_000;
-/// L2 confidential transfer (~490 bytes per tx + envelope overhead)
-pub const MAX_L2_TRANSFER_SIZE: usize = 2_000;
-/// L2 transfer confirmation (receipt ~200 bytes)
-pub const MAX_L2_CONFIRMATION_SIZE: usize = 1_000;
-/// L2 transfer broadcast (~600 bytes)
-pub const MAX_L2_BROADCAST_SIZE: usize = 2_000;
-/// L2 checkpoint block (1000 txs * ~490 bytes + header)
-pub const MAX_L2_CHECKPOINT_SIZE: usize = 1_000_000;
-/// L2 checkpoint vote (~200 bytes)
-pub const MAX_L2_VOTE_SIZE: usize = 1_000;
-/// L2 tree sync (up to 10000 notes for reconstruction)
-pub const MAX_L2_TREE_SYNC_SIZE: usize = 1_000_000;
-/// GhostGlyph claim (256 pixels + 32 bitmap_hash + 32 commitment + ghost_id + overhead)
-pub const MAX_GLYPH_CLAIM_SIZE: usize = 2_000;
-/// GhostGlyph registration (bitmap_hash + ghost_id + txid + timestamp)
-pub const MAX_GLYPH_REGISTERED_SIZE: usize = 1_000;
 
 // ─── Share-shard caps (docs/SHARE_SHARD.md) ──────────────────────────────────
 //
@@ -531,15 +507,6 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::VerificationResult => MAX_VERIFICATION_SIZE,
         MessageType::ChallengeConvergence => MAX_CHALLENGE_CONVERGENCE_SIZE,
         MessageType::EquivocationProof => MAX_EQUIVOCATION_PROOF_SIZE,
-        MessageType::MpcContribution => MAX_MPC_CONTRIBUTION_SIZE,
-        MessageType::MpcVerificationVote => MAX_MPC_VERIFICATION_VOTE_SIZE,
-        MessageType::MpcParametersRequest => MAX_MPC_PARAMS_REQUEST_SIZE,
-        MessageType::MpcParametersResponse => MAX_MPC_PARAMS_RESPONSE_SIZE,
-        MessageType::L2ConfidentialTransfer => MAX_L2_TRANSFER_SIZE,
-        MessageType::L2TransferConfirmation => MAX_L2_CONFIRMATION_SIZE,
-        MessageType::L2TransferBroadcast => MAX_L2_BROADCAST_SIZE,
-        MessageType::L2CheckpointBlock => MAX_L2_CHECKPOINT_SIZE,
-        MessageType::L2CheckpointVote => MAX_L2_VOTE_SIZE,
         // The checkpoint carries the CANONICAL payout (top-N miner addresses + top-N node
         // shares) so the fleet can adopt it on finalise (option c); bounded but not tiny.
         // The vote is just a hash + signature.
@@ -570,10 +537,7 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::ShardEvidence => MAX_SHARD_EVIDENCE_SIZE,
         MessageType::ShardSampleRequest => MAX_SHARD_SAMPLE_REQUEST_SIZE,
         MessageType::ShardSampleResponse => MAX_SHARD_SAMPLE_RESPONSE_SIZE,
-        MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
-        MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height
-        MessageType::GhostGlyphClaim => MAX_GLYPH_CLAIM_SIZE,
-        MessageType::GhostGlyphRegistered => MAX_GLYPH_REGISTERED_SIZE,
+        // ShieldCommitment: 32-byte commitment + u64 index + u64 height
     }
 }
 

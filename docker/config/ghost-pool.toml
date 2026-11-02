@@ -52,8 +52,3 @@ prune_height = 0
 [pool]
 treasury_address = ""
 min_payout_sats = 10000
-
-[ghost_pay]
-enabled = true
-virtual_block_secs = 10
-epoch_blocks = 100

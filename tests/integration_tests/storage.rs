@@ -1373,7 +1373,6 @@ fn test_595_run_maintenance() {
         keep_uptime_sample_days: 7,
         keep_challenge_days: 30,
         keep_verification_days: 30,
-        keep_checkpoint_days: 90,
         force_optimize: false,
     };
 

@@ -78,10 +78,6 @@ docker run -d --name rc-translator --network container:rc-pool1 -v …/translato
 docker run -d --name rc-miner      --network container:rc-pool1 -v …/sv1_miner.py:/miner.py:ro python:3.11-slim python3 /miner.py 127.0.0.1 3333 "<bcrt1addr>.w1"
 ```
 
-⚠ Use a ghost-pool built **without** `--features zk-production`. The production binary
-refuses to start on regtest: `Trusted-setup verification is unconfigured: neither
-ZK_PARAMS_HASH nor ZK_GENESIS_PARAMS_HASH is set`.
-
 Confirmed working: TDP handshake, templates flowing, `💰 Block Found`, the share webhook
 firing with the correct payout address, and the payout proposal being built and stored.
 

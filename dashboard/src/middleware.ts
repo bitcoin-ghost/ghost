@@ -12,7 +12,7 @@ import { resolveJwtSecret, verifySession } from "@/lib/jwt";
 // There is no remote/LAN access mode. The deployment binds the dashboard to
 // 127.0.0.1, but this middleware does NOT rely on that — it fails closed even
 // if the server is mis-bound to 0.0.0.0. A valid JWT session gates EVERY route
-// (pages, the node API proxy, and the ghost-pay proxy) so the backend can never
+// (pages and the node API proxy) so the backend can never
 // be reached unauthenticated.
 //
 // We deliberately do NOT consult `X-Forwarded-For` or the `Host` header for any
@@ -102,8 +102,8 @@ export async function middleware(request: NextRequest) {
 }
 
 /**
- * Reject an unauthenticated request. API calls (the node proxy + ghost-pay
- * proxy) get a 401 JSON body so the client's fetch layer surfaces a real
+ * Reject an unauthenticated request. API calls (the node proxy) get a 401
+ * JSON body so the client's fetch layer surfaces a real
  * auth error instead of silently receiving the login HTML. Page navigations
  * are redirected to the login screen.
  */

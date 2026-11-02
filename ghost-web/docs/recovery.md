@@ -26,7 +26,6 @@ A peer with `last_seen` more than 60 seconds old isn't pinging the mesh. More th
 
 ```bash
 sudo systemctl restart ghost-mining
-sudo systemctl restart ghost-pay
 sudo journalctl -u ghost-mining -f --since "1 min ago" | grep -i "peer\|connect"
 ```
 
@@ -54,7 +53,6 @@ Watch for "connected to peer" lines. If they appear, the node has rejoined the m
 ```bash
 # On each offline VM:
 sudo systemctl restart ghost-mining
-sudo systemctl restart ghost-pay
 
 # Verify quorum restored:
 sudo journalctl -u ghost-mining -f | grep -i "voting\|quorum\|payout"
@@ -66,28 +64,17 @@ Within ~30 seconds you should see voting sessions completing. Pending payouts wi
 
 ```bash
 # 1. Provision replacement VM (same OS, same specs)
-# 2. Install ghost-mining + ghost-pay binaries (see /docs/#deployment)
+# 2. Install the ghost-mining binary (see /docs/#deployment)
 
 # 3. Restore database from backup
-sudo systemctl stop ghost-mining ghost-pay
+sudo systemctl stop ghost-mining
 cp /var/backups/ghost/db/ghost-latest.db /home/ghost/.ghost/ghost.db
-cp /var/backups/ghost/db/ghost-pay-latest.db \
-   /home/ghost/.ghost/ghost-pay/ghost-pay.db
 
-# 4. Restore MPC params
-cp -a /var/backups/ghost/mpc/latest/mpc_params/ /home/ghost/.ghost/mpc_params/
-
-# 5. Verify VK files present (these are versioned with the binary, but
-#    the chain of contributions only exists on disk)
-ls /home/ghost/.ghost/mpc_params/note_spend_vk.bin
-ls /home/ghost/.ghost/mpc_params/payout_vk.bin
-ls /home/ghost/.ghost/mpc_params/unshield_vk.bin
-
-# 6. Update /etc/ghost/pool.toml: confirm node_id key matches the
+# 4. Update /etc/ghost/pool.toml: confirm node_id key matches the
 #    one in the restored DB. The seed_nodes list should still be valid.
 
-# 7. Start services
-sudo systemctl start ghost-mining ghost-pay
+# 5. Start services
+sudo systemctl start ghost-mining
 sudo journalctl -u ghost-mining -f | grep -i "peer\|connect\|elder"
 ```
 
@@ -142,7 +129,7 @@ In the WAL-recovery flow, no data is lost — the WAL just hadn't been checkpoin
 **Recover (WAL also corrupt):**
 
 ```bash
-sudo systemctl stop ghost-mining ghost-pay
+sudo systemctl stop ghost-mining
 cp /var/backups/ghost/db/ghost-YYYYMMDDHHMM.db /home/ghost/.ghost/ghost.db
 rm -f /home/ghost/.ghost/ghost.db-wal /home/ghost/.ghost/ghost.db-shm
 sudo systemctl start ghost-mining
@@ -153,60 +140,9 @@ sudo systemctl start ghost-mining
 | Table | Re-syncs from | Notes |
 |---|---|---|
 | `nodes` | Mesh health pings | Automatic, ~10 s per peer |
-| `mpc_params/` | Local backup or peer | The directory must be intact |
-| `l2_notes` | L2 checkpoint broadcasts | Re-syncs from peers' L2 state |
 | `shares` | — | Shares between backup and corruption are **lost**; payouts for that period unrecoverable |
 
-The same procedure applies to `ghost-pay.db`, just with substituted paths.
-
-## 5. MPC parameter loss across all nodes
-
-**Impact:** **Critical.** Every ZK verification fails. Existing L2 notes become unspendable. Forces a full ceremony reset.
-
-**This is a last-resort scenario.** Try every backup before this — local, off-box, peer-shared.
-
-**Reset procedure (every node):**
-
-```bash
-sudo systemctl stop ghost-mining ghost-pay
-
-sqlite3 /home/ghost/.ghost/ghost.db "DELETE FROM mpc_contributions"
-rm -rf /home/ghost/.ghost/mpc_params/
-
-# L2 notes become unspendable on the new params; clear them
-sqlite3 /home/ghost/.ghost/ghost.db "DELETE FROM l2_notes"
-sqlite3 /home/ghost/.ghost/ghost.db "DELETE FROM pending_nullifiers"
-sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA wal_checkpoint(TRUNCATE)"
-```
-
-**Re-bootstrap (one node only — pick the genesis):**
-
-```bash
-ghost-mining --genesis
-```
-
-**Re-bootstrap (every other node, no `--genesis`):**
-
-```bash
-ghost-mining
-```
-
-The other nodes discover the new genesis via `seed_nodes` and begin contributing to a fresh ceremony chain. After 101 contributions (or whatever cap is set), the new params ossify.
-
-**Post-recovery:**
-
-- Verify all three VK files present on every node:
-  ```bash
-  for f in note_spend_vk.bin payout_vk.bin unshield_vk.bin; do
-    ls -la /home/ghost/.ghost/mpc_params/$f
-  done
-  ```
-- Run `backup-mpc-params.sh` on every node **immediately**.
-- L2 users must re-shield funds — old notes are permanently lost. This is unavoidable when MPC params change.
-
-The blast radius of this scenario is the reason MPC backups should be the most paranoid thing in the operator's backup posture. Multiple geographical copies, off-box, encrypted.
-
-## 6. Network partition
+## 5. Network partition
 
 **Impact:** Both sides of the partition see voting timeouts. BFT ensures **safety** — neither side can finalise a payout without the other's votes — but liveness is impaired. Mining continues; shares accumulate; payouts pause until partition heals.
 
@@ -245,8 +181,7 @@ All peers should appear with `last_seen` in the last minute.
 
 | What | Script | Schedule | Retention |
 |---|---|---|---|
-| `ghost.db` + `ghost-pay.db` | `backup-databases.sh` | Daily 03:00 UTC | 7 days local; an off-node copy only if you configure one (see the deployment guide, *Database backups*) |
-| MPC params + VK files | `backup-mpc-params.sh` | After ceremony, on demand | 3 copies, geographically separated |
+| `ghost.db` | `backup-databases.sh` | Daily 03:00 UTC | 7 days local; an off-node copy only if you configure one (see the deployment guide, *Database backups*) |
 | Node identity (`node.key`) | manual | Once at creation | Multiple secure locations |
 | Noise keypair (`noise.key`) | manual | Once at creation | Same as node.key |
 
@@ -267,11 +202,9 @@ sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA wal_checkpoint(TRUNCATE)"
 
 # Recent logs
 sudo journalctl -u ghost-mining -f --since "5 min ago"
-sudo journalctl -u ghost-pay  -f --since "5 min ago"
 
 # Service control
 sudo systemctl restart ghost-mining
-sudo systemctl restart ghost-pay
 
 # Manual backup
 sudo -u ghost /opt/ghost/scripts/backup-databases.sh
@@ -290,6 +223,4 @@ sudo -u ghost /opt/ghost/scripts/backup-databases.sh
 |---|---|
 | `bins/ghost-pool/src/main.rs` | Service lifecycle, restart-safe shutdown |
 | `crates/ghost-storage/src/migrations.rs` | Schema migrations on startup |
-| `crates/ghost-mpc/src/manager.rs` | MPC contribution + recovery flows |
 | `scripts/backup-databases.sh` | Database backup helper |
-| `scripts/backup-mpc-params.sh` | MPC params backup helper |

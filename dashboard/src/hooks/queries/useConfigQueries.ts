@@ -17,12 +17,9 @@ import {
   setBlockPriority,
   type BlockPriorityType,
   setOperatorWindow,
-  getL2PruningStatus,
-  setGhostPayPayoutAddress,
   configureHaze,
   configureShroud,
   restartNode,
-  setGhostPay,
   setMiningPayoutAddress,
   setPoolName,
   setPublicMiningConfig,
@@ -177,20 +174,6 @@ export function useSetBlockPriority() {
   });
 }
 
-// Pruning configuration
-export const pruningKeys = {
-  all: ['pruning'] as const,
-  l2: () => [...pruningKeys.all, 'l2'] as const,
-};
-
-export function useL2PruningStatus() {
-  return useQuery({
-    queryKey: pruningKeys.l2(),
-    queryFn: getL2PruningStatus,
-    staleTime: 60_000,
-  });
-}
-
 export function useSetOperatorWindow() {
   const queryClient = useQueryClient();
 
@@ -198,20 +181,6 @@ export function useSetOperatorWindow() {
     mutationFn: (blocks: number) => setOperatorWindow(blocks),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
-  });
-}
-
-// Payout Address Settings
-export function useSetGhostPayPayoutAddress() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (address: string | null) => setGhostPayPayoutAddress(address),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-      // Also invalidate mining status which may include payout info
-      queryClient.invalidateQueries({ queryKey: ['mining', 'status'] });
     },
   });
 }
@@ -250,15 +219,6 @@ export function useRestartNode() {
   });
 }
 
-export function useSetGhostPay() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (enabled: boolean) => setGhostPay(enabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
-  });
-}
 
 export function useSetMiningPayoutAddress() {
   const queryClient = useQueryClient();

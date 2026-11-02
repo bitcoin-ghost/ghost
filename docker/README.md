@@ -15,14 +15,11 @@ docker-compose up -d
 # Start with SV1 translator
 docker-compose --profile sv1 up -d
 
-# Start with L2 (Ghost Pay)
-docker-compose --profile l2 up -d
-
 # Start with monitoring (Prometheus + Grafana)
 docker-compose --profile monitoring up -d
 
 # Start full stack
-docker-compose --profile sv1 --profile l2 --profile monitoring up -d
+docker-compose --profile sv1 --profile monitoring up -d
 ```
 
 ## Architecture
@@ -39,10 +36,10 @@ docker-compose --profile sv1 --profile l2 --profile monitoring up -d
 │  └─────────────┘  │  :8555-8562 │            │             │
 │                   └──────┬──────┘            │             │
 │                          │                    │             │
-│  ┌─────────────┐  ┌──────┴──────┐  ┌─────────┴───────────┐ │
-│  │ translator  │  │  ghost-pay  │  │      grafana        │ │
-│  │ :3333 SV1   │  │  :8081 L2   │  │      :3000          │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+│  ┌─────────────┐         │           ┌─────────┴───────────┐ │
+│  │ translator  │─────────┘           │      grafana        │ │
+│  │ :3333 SV1   │                     │      :3000          │ │
+│  └─────────────┘                     └─────────────────────┘ │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -53,7 +50,6 @@ docker-compose --profile sv1 --profile l2 --profile monitoring up -d
 |---------|----------|----------|
 | (default) | bitcoind, ghost-pool | Minimal setup |
 | sv1 | + translator | Support SV1 miners |
-| l2 | + ghost-pay | Enable L2 payments |
 | monitoring | + prometheus, grafana | Metrics & dashboards |
 
 ## Configuration Files
@@ -62,7 +58,6 @@ docker-compose --profile sv1 --profile l2 --profile monitoring up -d
 |------|---------|
 | `config/bitcoin.conf` | Bitcoin Core configuration |
 | `config/ghost-pool.toml` | Pool node configuration |
-| `config/ghost-pay.toml` | L2 node configuration |
 | `config/prometheus.yml` | Prometheus scrape configuration |
 
 ## Environment Variables
@@ -75,7 +70,6 @@ See `.env.example` for all available variables.
 |--------|---------|
 | bitcoin-data | Bitcoin blockchain data |
 | ghost-data | Pool database and state |
-| ghostpay-data | L2 database |
 | prometheus-data | Metrics storage |
 | grafana-data | Dashboard storage |
 
@@ -86,7 +80,6 @@ See `.env.example` for all available variables.
 | 3000 | Grafana | HTTP |
 | 3333 | Translator | Stratum V1 |
 | 8080 | Ghost Pool API | HTTP |
-| 8081 | Ghost Pay API | HTTP |
 | 9090 | Prometheus | HTTP |
 | 34255 | Ghost Pool | Stratum V2 |
 | 8555-8562 | Ghost Pool P2P | TCP |

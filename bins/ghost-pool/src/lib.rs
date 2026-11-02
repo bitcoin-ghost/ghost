@@ -1410,9 +1410,6 @@ pub fn mesh_node_list_checkpoint_height() -> u64 {
     *gates::MESH_NODE_LIST_CHECKPOINT.get_or_init(|| MESH_NODE_LIST_CHECKPOINT_HEIGHT)
 }
 
-/// GhostGlyph P2P handler for visual identity registration.
-pub mod glyph_handler;
-
 /// Input validation utilities for security.
 pub mod validation;
 

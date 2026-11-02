@@ -47,11 +47,9 @@ pub mod constants;
 pub mod error;
 pub mod identity;
 pub mod identity_rotation;
-pub mod instant;
 pub mod internal_auth;
 pub mod key_rotation;
 pub mod metrics;
-pub mod mpc;
 
 /// Node pool protocol constants (new names only; nothing live reads them).
 pub mod node_pool_constants;
@@ -92,7 +90,6 @@ pub use constants::*;
 pub use error::*;
 pub use identity::*;
 pub use identity_rotation::*;
-pub use instant::*;
 pub use key_rotation::*;
 pub use sanitize::{sanitize_for_log, sanitize_for_log_with_len};
 pub use signer::*;

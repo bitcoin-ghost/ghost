@@ -928,8 +928,8 @@ impl HealthPingHandler {
         // that actually runs a farm listener (#495).
         self.peers
             .update_tier_ports(&envelope.sender, ping.hobby_port, ping.farm_port);
-        // Swarm-page telemetry: L1 height, trailing-7-day uptime %, this peer's
-        // own peer count, and Ghost Pay L2 height. Older peers omit the Option
+        // Swarm-page telemetry: L1 height, trailing-7-day uptime % and this peer's
+        // own peer count. Older peers omit the Option
         // fields (→ None) and report block_height 0, all handled inside the
         // updater so the mesh stays backward-compatible.
         self.peers.update_node_telemetry(
@@ -937,7 +937,6 @@ impl HealthPingHandler {
             ping.block_height,
             ping.uptime_percent,
             ping.peer_count,
-            ping.l2_height,
         );
         // Best (rarest) share per records window — merged with the local DB
         // best so `/api/v1/pool/records` returns the mesh-wide rarest record.

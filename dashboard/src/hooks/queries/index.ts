@@ -13,9 +13,6 @@ export * from './useConfigQueries';
 // Alerts queries
 export * from './useAlertsQueries';
 
-// Ghost Pay queries
-export * from './useGhostPayQueries';
-
 // Rewards queries
 export * from './useRewardsQueries';
 

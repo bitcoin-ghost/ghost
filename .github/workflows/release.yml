@@ -144,15 +144,7 @@ jobs:
       # release artifacts here.
       - name: Build
         run: |
-          # CRITICAL: ghost-mining must be built with its zk-production feature so
-          # the released binary can run on mainnet. Without it,
-          # is_production_mode() is false and the binary aborts at startup
-          # ("MAINNET SECURITY: ZK consensus on mainnet requires trusted setup
-          # parameters"), so every curl|bash install crash-loops. zk-production
-          # is a compile-time flag with no build-time artefacts (params load at
-          # runtime), so this is safe.
           cargo build --release --target ${{ matrix.target }} \
-            --features ghost-mining/zk-production \
             -p ghost-mining -p ghost-cli -p ghost-miner-proxy \
             -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
 

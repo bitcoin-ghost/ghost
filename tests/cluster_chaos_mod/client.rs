@@ -207,14 +207,4 @@ impl ClusterClient {
         }
         results
     }
-
-    /// Get MPC contribution count from /api/v1/mpc/status.
-    pub async fn get_mpc_contribution_count(&self, ip: &str) -> Result<u64, String> {
-        let json = self.get_json(ip, "/api/v1/mpc/status").await?;
-        json.get("contribution_count")
-            .or_else(|| json.get("contributions"))
-            .or_else(|| json.get("total_contributions"))
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| format!("no contribution count in: {}", json))
-    }
 }

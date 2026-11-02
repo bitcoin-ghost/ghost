@@ -62,8 +62,3 @@ prune_height = 0
 treasury_address = "${TREASURY_ADDRESS}"
 min_payout_sats = 100000
 payout_interval_blocks = 100
-
-[ghost_pay]
-enabled = true
-virtual_block_secs = 10
-epoch_blocks = 2160

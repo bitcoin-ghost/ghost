@@ -101,7 +101,6 @@ These settings can be changed via `POST /api/v1/admin/config` with proper authen
 | `private_mining_password` | `[network]` | Set/change private mode password |
 | `solo_payout_address` | `[network]` | Set destination for solo mode |
 | `profile` | `[policy]` | Switch policy profile |
-| `enabled` | `[ghost_pay]` | Toggle Ghost Pay L2 on/off |
 
 ### Graceful Restart Behavior
 
@@ -149,8 +148,7 @@ Content-Type: application/json
   "mining_mode": "private_solo",
   "private_mining_password": "your-password",
   "solo_payout_address": "bc1p...",
-  "policy_profile": "bitcoin_pure",
-  "ghost_pay_enabled": true
+  "policy_profile": "bitcoin_pure"
 }
 ```
 

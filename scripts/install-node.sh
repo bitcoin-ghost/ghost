@@ -40,21 +40,6 @@ POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
-# ── MPC ceremony: genesis-anchored trust root ────────────────────────────────
-# A fresh community node JOINS a still-rolling MPC ceremony GENESIS-ANCHORED: it
-# trusts the immutable genesis lineage anchor below and accepts whatever params
-# the ceremony has currently rolled to (each contribution is verified to chain
-# back to this anchor) — rather than pinning ONE static position hash. A stale
-# `BLOCK:<hash>` pin makes a late joiner REJECT the ceremony's current params,
-# which is exactly the manual step a fresh node hit before this change.
-#
-# The value below is the mainnet genesis MPC params hash: the IMMUTABLE trust
-# root of the ceremony lineage, hardcoded here exactly like a genesis block hash
-# is baked into a client. It is NEVER fetched from a peer (an untrusted source).
-# The node self-pins automatically once the ceremony ossifies at position 101, so
-# genesis-anchored is the correct startup mode for BOTH the rolling and ossified
-# states — there is deliberately no static ZK_PARAMS_HASH on the join path.
-ZK_GENESIS_PARAMS_HASH="c9c907f688fc11023d2202de44d6826c2b3f320646b70867009696d632515533"
 # Bootstrap peers (the current Elders). The node discovers the rest via gossip.
 SEED_NODES='"83.136.251.162:8555", "85.9.198.212:8555", "213.163.207.46:8555", "95.111.221.169:8555"'
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
@@ -857,22 +842,11 @@ shard_coinbase = true
 
 ${ALERTS_BLOCK}
 
-# Ghost Pay is retired and \`enabled\` is hard-false. The section stays because
-# NodeConfig still reads it.
-[ghost_pay]
-enabled = false
-virtual_block_secs = 10
-epoch_blocks = 100
-
 # NOTE (#760): the keys removed from the blocks above and below were read by NOTHING. There is no
 # \`#[serde(deny_unknown_fields)]\` on NodeConfig, so they parsed, were discarded, and produced no
 # warning — while reading, to anyone opening the file, exactly like settings that were in force:
 #
 #   pool.treasury_fee_percent      no such field on PoolConfig; the split is a constant
-#   ghost_pay.transfer_fee_bps     no such field on GhostPayConfig
-#   ghost_pay.min_transfer_fee_sats  ditto
-#   ghost_pay.wraith_fee_percent   ditto
-#   ghost_pay.http_port            ditto (network.http_port is real; this one was not)
 #   reaper.mode                    no such field on ReaperSettings; the controls are reject_*
 #
 # The whole [tdp] section went with them. TDP is configured on the COMMAND LINE, not in this file:
@@ -922,8 +896,7 @@ if [[ -s /home/ghost/.ghost/node.key ]]; then
     | grep -iE "Node ID" || true
 else
   log "Generating node identity"
-  sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" \
-    /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
+  sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
 fi
 
 # ───────────────────── 7b. SV2 stratum stack config ──────────────────────────
@@ -1362,7 +1335,6 @@ Group=ghost
 WorkingDirectory=/var/lib/ghost
 ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --tdp-enabled --tdp-port 8442 --stratum-port 3333
 Environment=RUST_LOG=info
-Environment=ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params
 Restart=on-failure
 RestartSec=15
 LimitNOFILE=65536
@@ -1370,30 +1342,14 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-# MPC startup mode — GENESIS-ANCHORED (join path), written as a systemd drop-in
-# to match the fleet convention (ghost-mining.service.d/genesis-anchor.conf). A
-# fresh community node joining a still-rolling ceremony must NOT carry a static
-# ZK_PARAMS_HASH pin (a stale pin makes it reject the ceremony's current params);
-# it runs genesis-anchored instead, validating the current params back to the
-# immutable mainnet genesis lineage anchor. `cat >` overwrites on every run, so
-# this is idempotent; the later `systemctl daemon-reload` picks it up.
+# The zk trusted-setup anchor drop-in is gone with zk; remove it from a node installed before.
+rm -f /etc/systemd/system/ghost-mining.service.d/genesis-anchor.conf
 mkdir -p /etc/systemd/system/ghost-mining.service.d
-cat > /etc/systemd/system/ghost-mining.service.d/genesis-anchor.conf <<EOF
-[Service]
-# ZK_GENESIS_PARAMS_HASH is the IMMUTABLE mainnet genesis MPC params hash — the
-# ceremony's trust root, baked into the installer exactly like a genesis block
-# hash is baked into a client. It is NEVER fetched from a peer (untrusted). With
-# this set and NO static ZK_PARAMS_HASH, ghost-mining accepts the ceremony's
-# current rolling params (verified to chain back to this anchor) and self-pins
-# once the ceremony ossifies at position 101 — correct for both states.
-Environment=ZK_GENESIS_PARAMS_HASH=${ZK_GENESIS_PARAMS_HASH}
-EOF
 
 # Journal access — the dashboard Logs console reads the OTHER node binaries'
 # logs (ghostd / dashboard / SV2 stack) out of the systemd journal
 # via journalctl, which requires membership of the `systemd-journal` group.
-# Written as a sibling drop-in (merged with the base unit like genesis-anchor.conf
-# above) so it can ship to existing nodes without rewriting the whole unit; the
+# Written as a drop-in (merged with the base unit) so it can ship to existing nodes without rewriting the whole unit; the
 # later `systemctl daemon-reload` picks it up and it takes effect on the next
 # ghost-mining restart. ghost-mining's own logs come from its in-process ring buffer
 # and need no privilege.
@@ -1477,10 +1433,8 @@ ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
-ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications + MPC contribution/vote exchange)
-ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS (peers fetch MPC params + votes)
-# Ghost Pay L2 (peers issue Ghost Pay verification challenges here) — only
-# when enabled.
+ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications)
+ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
@@ -3684,7 +3638,7 @@ systemctl enable --now ghostd >/dev/null 2>&1
 systemctl enable --now ghost-mining-gate >/dev/null 2>&1
 sleep 5
 
-NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
+NODE_ID="$(sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
 # Solo mode closes Stratum to external miners, so "point a miner at <public IP>" would be wrong.
 if [[ "$MINING_MODE" == "private_solo" ]]; then
   MINER_POINTER="Point a miner running on this host at:  stratum+tcp://127.0.0.1:3333"

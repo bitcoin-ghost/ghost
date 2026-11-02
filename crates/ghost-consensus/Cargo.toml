@@ -55,18 +55,6 @@ libc = { workspace = true }
 default = []
 # Expose test-only constructors for integration testing
 test-utils = []
-# Enable ZK consensus integration with ghost-zkp
-zk-consensus = ["ghost-zkp"]
-# Enable MPC ceremony integration
-mpc-ceremony = ["ghost-mpc"]
-
-[dependencies.ghost-zkp]
-workspace = true
-optional = true
-
-[dependencies.ghost-mpc]
-workspace = true
-optional = true
 
 [dev-dependencies]
 tempfile = "3.10"

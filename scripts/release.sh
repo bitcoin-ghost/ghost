@@ -24,10 +24,6 @@
 #     all; the "successful" build would have failed at deploy. That crate is gone, but the
 #     lesson is not.                                       -> every build verifies the ARTEFACT
 #
-#   * `--features ghost-mining/zk-production` is invalid when the selected packages do not
-#     include ghost-mining. Getting this wrong ships the random trusted setup.
-#                                                          -> per-binary features in ONE table
-#
 # Usage:
 #   scripts/release.sh <version> [--from <phase>] [--dry-run]
 #   scripts/release.sh --status
@@ -63,17 +59,6 @@ PRODUCTION_ONLY=""
 # cargo package name, where it differs from the binary name.
 pkg_for() {
     echo "$1"
-}
-
-# Cargo feature required for a mainnet build of this binary, if any.
-# ⛔ Without this ghost-mining refuses to start on mainnet. A feature named for a package that
-# is not in the selected set is a hard cargo error, so these are grouped by build invocation,
-# never concatenated.
-features_for() {
-    case "$1" in
-        ghost-mining|pool_sv2|translator_sv2) echo "ghost-mining/zk-production" ;;
-        *)                                  echo "" ;;
-    esac
 }
 
 # Addressed explicitly because the publish path uses `gh api`, which — unlike `gh release` — does
@@ -300,21 +285,11 @@ phase_gates() {
 phase_build() {
     step "build every shipped binary at $VERSION"
     $DRY_RUN && { info "[dry-run] would build: $FLEET_BINARIES $PRODUCTION_ONLY"; return 0; }
-    # Grouped by feature set: a feature naming a package outside the selected set is a hard error.
     (cd "$WORKTREE" && cargo build --release --jobs "${BUILD_JOBS:-2}" \
-        --features ghost-mining/zk-production -p ghost-mining -p pool_sv2 -p translator_sv2) \
+        -p ghost-mining -p pool_sv2 -p translator_sv2) \
         || die "mining-stack build failed"
 
     for b in $FLEET_BINARIES $PRODUCTION_ONLY; do assert_binary "$WORKTREE" "$b" "$VERSION"; done
-
-    # zk-production, checked so it can FAIL in both directions. Absence of the insecure marker
-    # alone proves nothing — the symbol may simply have been optimised away.
-    local prod insecure
-    prod=$(grep -ac 'disabled in production builds' "$WORKTREE/target/release/ghost-mining")
-    insecure=$(grep -ac 'Using random trusted setup' "$WORKTREE/target/release/ghost-mining")
-    [ "$prod" -ge 1 ] && [ "$insecure" -eq 0 ] \
-        || die "ghost-mining zk-production check inconclusive (prod=$prod insecure=$insecure)"
-    info "zk-production confirmed in ghost-mining (prod=$prod insecure=$insecure)"
 }
 
 roll_node() {

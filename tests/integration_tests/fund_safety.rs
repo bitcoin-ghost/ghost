@@ -5,7 +5,6 @@
 //! 2. Dust threshold filtering silently dropping payments
 //! 3. BFT threshold edge cases with small clusters
 //! 4. Consensus timeout leaving funds in limbo
-//! 7. L2 settlement fee truncation accumulating losses
 //! 8. Merkle root collisions in settlement batches
 //! 9. Address parsing fallback creating unspendable outputs
 //! 10. Coinbase TXID vs WTXID confusion (regression test)
@@ -491,50 +490,6 @@ fn test_008_timeout_state_has_defined_fund_handling() {
 
     // The safe behavior would be to auto-reject and retry
     // This test documents that TIMEOUT is a dangerous state
-}
-
-// =============================================================================
-// TEST 7: L2 SETTLEMENT FEE VERIFICATION
-// =============================================================================
-// The 0.1% protocol fee has been removed. All settlements are fee-free.
-// Users only pay their share of batch mining costs.
-
-#[test]
-fn test_012_settlements_have_zero_protocol_fee() {
-    use ghost_reconciliation::Settlement;
-
-    // Verify that settlements across various amounts all have zero fees
-    let test_amounts = [
-        10_000u64,
-        50_000,
-        100_000,
-        1_000_000,
-        10_000_000,
-        100_000_000,
-    ];
-
-    for &amount in &test_amounts {
-        let settlement = Settlement::new(
-            "ghost1_fund_safety".to_string(),
-            [42u8; 32],
-            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string(),
-            amount,
-        )
-        .unwrap();
-
-        assert_eq!(
-            settlement.fee_sats(),
-            0,
-            "Settlement for {} sats should have zero protocol fee",
-            amount
-        );
-        assert_eq!(
-            settlement.net_amount_sats(),
-            amount,
-            "Net amount should equal gross amount for {} sats (no fee)",
-            amount
-        );
-    }
 }
 
 // =============================================================================

@@ -138,7 +138,6 @@ export interface FullNodeConfig {
   };
   payout?: {
     address: string | null;
-    ghostpay_address: string | null;
     min_payout: number;
     auto_payout: boolean;
   };
@@ -158,53 +157,6 @@ export interface FullNodeConfig {
   ghost_pay?: boolean;
   elder?: boolean;
   [key: string]: unknown;
-}
-
-// L2 Pruning config (from /api/v1/ghost-pay/pruning). The backend returns the
-// profile-derived enable flag + sat threshold; the *_pruned counters are only
-// populated once a prune has run.
-export interface L2PruningConfig {
-  enabled?: boolean;
-  profile?: string;
-  threshold_sats?: number;
-  last_prune?: number | null;
-  retention_days?: number;
-  auto_prune?: boolean;
-  prune_interval_hours?: number;
-  last_prune_timestamp?: number;
-  payments_pruned?: number;
-  attestations_pruned?: number;
-  locks_pruned?: number;
-  [key: string]: unknown;
-}
-
-// L2 fee-distribution context (from /api/v1/l2/fee-distribution-context) — the
-// treasury pool plus the set of Ghost Pay-capable nodes that share L2 fees.
-export interface L2FeeDistributionNode {
-  node_id: string;
-  address: string;
-  shares: number;
-}
-
-export interface L2FeeDistributionContext {
-  treasury_balance_sats?: number;
-  threshold_reached_at?: number | null;
-  ghost_pay_nodes?: L2FeeDistributionNode[];
-  error?: string;
-}
-
-// L2 commitment-tree state (from /api/v1/l2/tree-state).
-export interface L2TreeState {
-  epoch?: number;
-  tree_root?: string;
-  checkpoint_height?: number;
-  checkpoint_root?: string;
-  checkpoint_tx_count?: number;
-  note_count?: number;
-  recent_finalizations?: number;
-  active_finalizations?: number;
-  roots_match?: boolean;
-  error?: string;
 }
 
 export interface SharesInfo {
@@ -566,23 +518,6 @@ export interface TreasuryStatus {
   blocks_until_full?: number | null;
 }
 
-export interface GhostPayStatus {
-  enabled?: boolean;
-  node_id?: string;
-  protocol_version?: number;
-  network?: string;
-  l2_era?: number;
-  virtual_block?: number;
-  l2_height?: number;
-  block_height?: number;
-  epoch?: number;
-  peer_count?: number;
-  uptime_secs?: number;
-  sync_state?: string;
-  ghostpay_hosts_mixing?: boolean;
-  total_balances?: number;
-}
-
 export interface ElderStatus {
   // Backend fields
   elders?: Array<{
@@ -639,164 +574,6 @@ export interface LogUnitsResponse {
   default: string;
 }
 
-// Ghost Lock types
-export type LockDenomination = "Micro" | "Tiny" | "Small" | "Medium" | "Large" | string;
-export type TimelockTier = "Short" | "Standard" | "Long" | string;
-export type LockStatus = "Active" | "PendingSettlement" | "InMixing" | "Settled" | "Expired" | string;
-
-export interface GhostLock {
-  lock_id: string;
-  denomination: string;
-  balance: number;
-  amount_sats?: number;
-  nonce: number;
-  status: string;
-  state?: string;
-  utxo_txid?: string | null;
-  utxo_vout?: number | null;
-  utxo_confirmed?: boolean;
-  timelock_tier: string;
-  expires_at: number | null;
-  batch_id?: string | null;
-  batch_signatures?: string | null;
-  // Backend fields
-  creation_height?: number;
-  recovery_height?: number;
-  funding_txid?: string | null;
-  next_jump_height?: number | null;
-  created_at?: number;
-}
-
-export interface GhostLockSummary {
-  total_locks?: number;
-  total_balance?: number;
-  available_balance?: number;
-  pending_settlement?: number;
-  in_mixing?: number;
-}
-
-export interface GhostLocksResponse {
-  locks: GhostLock[];
-  // Backend fields
-  enabled?: boolean;
-  active_locks?: number;
-  total_locked_sats?: number;
-  // Dashboard alias
-  summary?: GhostLockSummary;
-}
-
-// Payment types
-export type PaymentType = "IN" | "OUT" | string;
-export type PaymentStatus = "Pending" | "Confirmed" | "Failed" | string;
-
-export interface Payment {
-  // Backend fields
-  id?: string;
-  round_id?: number;
-  recipient?: string;
-  recipient_type?: string;
-  amount_sats?: number;
-  address?: string | null;
-  txid?: string | null;
-  type: string;
-  created_at?: number;
-  // Dashboard fields
-  payment_id: string;
-  lock_id?: string;
-  counterparty_id: string;
-  amount: number | null;
-  status?: string;
-  block_height?: number | null;
-  timestamp: number;
-}
-
-export interface PaymentsResponse {
-  payments: Payment[];
-  total: number;
-  pending_count: number;
-}
-
-// Settlement types
-export type SettlementClass = "Express" | "Standard" | "Economy" | string;
-export type BatchStatus = "Forming" | "CollectingSignatures" | "Ready" | "Broadcast" | "Confirmed" | "Failed" | string;
-
-// Live `/settlement/status` response — a flat object (no nested `stats`/`batches`).
-export interface SettlementResponse {
-  status?: string;
-  pending_settlements?: number;
-  pending_count?: number;
-  batches_24h?: number;
-  last_settlement?: Record<string, unknown> | null;
-  total_settled_sats?: number;
-}
-
-// Node-level settlement service status, derived from the flat SettlementResponse.
-export interface SettlementStatus {
-  status?: string;
-  pending_count?: number;
-  batches_24h?: number;
-  total_settled_sats?: number;
-}
-
-// Jump Queue types
-export interface JumpQueueStats {
-  pending_count?: number;
-  processing_count?: number;
-  total_enqueued?: number;
-  total_completed?: number;
-  total_failed?: number;
-  avg_wait_time_secs?: number;
-  total_volume_sats?: number;
-  liquidity_available_sats?: number;
-}
-
-// Ghost Pay events/alerts
-export type GhostPayEventSeverity = "info" | "warning" | "error";
-
-export interface GhostPayEvent {
-  id?: string;
-  severity?: GhostPayEventSeverity;
-  category?: string;
-  message?: string;
-  timestamp?: string;
-  details?: Record<string, unknown>;
-}
-
-// L2 Mempool types
-export interface L2MempoolStats {
-  pending_count?: number;
-  pending_volume_sats?: number;
-  avg_payment_size_sats?: number;
-  throughput_per_min?: number;
-  avg_wait_secs?: number;
-  avg_fee_sats?: number;
-  total_fees_24h?: number;
-}
-
-export type SizeTier = "micro" | "tiny" | "small" | "medium" | "large" | "xl";
-
-export interface MempoolTransaction {
-  tx_id?: string;
-  size_tier?: SizeTier;
-  fee_sats?: number;
-  age_secs?: number;
-}
-
-export interface BlockLeader {
-  height?: number;
-  leader_node_id?: string;
-  tx_count?: number;
-  timestamp?: number;
-}
-
-// WebSocket mempool events
-export type MempoolEvent =
-  | { type: "mempool_snapshot"; transactions: MempoolTransaction[]; stats: L2MempoolStats }
-  | { type: "tx_added"; transaction: MempoolTransaction }
-  | { type: "tx_removed"; tx_id: string }
-  | { type: "block_confirmed"; block: BlockLeader }
-  | { type: "stats_update"; stats: L2MempoolStats };
-
 // Swarm types
 export interface SwarmNode {
   node_id: string;
@@ -818,7 +595,6 @@ export interface SwarmNode {
   peer_count?: number;
   balance_btc?: number;
   l1_height?: number;
-  l2_height?: number;
   miner_count?: number;
   archive_mode?: boolean;
   ghost_pay?: boolean;
@@ -1045,39 +821,6 @@ export interface NetworkPayoutHistoryResponse {
   // Dashboard aliases
   entries?: NetworkPayoutEntry[];
   summary?: NetworkPayoutSummary;
-}
-
-export interface GhostPayFeeEntry {
-  block_height?: number;
-  batch_id?: string;
-  fee_satoshis?: number;
-  timestamp?: number;
-  recipient_node_id?: string | null;
-}
-
-export interface WraithFeeEntry {
-  block_height?: number;
-  session_id?: string;
-  fee_satoshis?: number;
-  timestamp?: number;
-  recipient_node_id?: string | null;
-}
-
-export interface GhostPayPayoutSummary {
-  total_ghostpay_fees_satoshis: number;
-  total_wraith_fees_satoshis: number;
-  ghostpay_sessions_count: number;
-  wraith_sessions_count: number;
-}
-
-export interface GhostPayPayoutHistoryResponse {
-  // Backend returns
-  payouts?: Record<string, unknown>[];
-  total?: number;
-  // Dashboard aliases
-  ghostpay_fees?: GhostPayFeeEntry[];
-  wraith_fees?: WraithFeeEntry[];
-  summary?: GhostPayPayoutSummary;
 }
 
 export interface NodePayoutEntry {

@@ -6,23 +6,14 @@ import { useToast } from "@/components/ui/Toast";
 import {
   useNodeStatus,
   useConfig,
-  useGhostPayStatus,
   useShares,
   useSetArchiveMode,
   useSetPublicMining,
   useSetReaper,
-  useSetGhostPay,
 } from "@/hooks/queries";
 import { ToggleRow, StatusRow } from "@/app/(dashboard)/settings/shared";
 
 interface CapabilityTogglesProps {
-  /**
-   * How the Ghost Pay row is presented:
-   * - "status" (default): read-only StatusRow — enabling requires a running
-   *   ghost-pay-node, so Settings › Capabilities shows state only.
-   * - "toggle": an editable ToggleRow backed by `useSetGhostPay` (Onboarding).
-   */
-  ghostPayControl?: "status" | "toggle";
   /**
    * When provided, a cross-link to detector-level Reaper configuration is
    * rendered beneath the Reaper toggle (Settings › Capabilities points at
@@ -32,8 +23,7 @@ interface CapabilityTogglesProps {
 }
 
 /**
- * The five canonical node-capability rows (Archive / Ghost Pay / Public Mining /
- * Reaper / Elder) that drive the 5-4-3-2-1 share system. Extracted from the
+ * The node-capability rows (Archive / Public Mining / Reaper / Elder) that drive the 5-4-3-2-1 share system. Extracted from the
  * duplicated markup that Settings › Capabilities and the Onboarding wizard both
  * rendered, so there is a single source of truth wired to the same mutation
  * hooks. Callers wrap this in their own Card/SettingsSection shell.
@@ -45,30 +35,21 @@ interface CapabilityTogglesProps {
  * the same rule with a 409.
  */
 export function CapabilityToggles({
-  ghostPayControl = "status",
   reaperConfigHref,
 }: CapabilityTogglesProps) {
   const { data: status } = useNodeStatus();
   const { data: config } = useConfig();
-  const { data: ghostPayStatus } = useGhostPayStatus();
   const { data: shares } = useShares();
 
   const setArchiveMode = useSetArchiveMode();
   const setPublicMining = useSetPublicMining();
   const setReaper = useSetReaper();
-  const setGhostPay = useSetGhostPay();
 
   const { success, error } = useToast();
 
   const ghostModeActive = status?.ghost_mode ?? false;
   const publicMiningActive = status?.public_mining ?? false;
   const publicMiningBlocked = ghostModeActive && !publicMiningActive;
-
-  // Ghost Pay running-state comes from the explicit `sync_state` flag, NOT
-  // `l2_height` — an L2 height of 0 is a perfectly valid running state (fresh
-  // node), so its truthiness would mislabel a running node as "Not Running".
-  const ghostPayRunning = ghostPayStatus?.sync_state === "synced";
-  const ghostPayEnabled = status?.ghost_pay ?? false;
 
   const archiveEnabled = status?.archive_mode ?? false;
   const reaperEnabled = config?.reaper ?? false;
@@ -77,15 +58,6 @@ export function CapabilityToggles({
     try {
       await setArchiveMode.mutateAsync(enabled);
       success("Saved", `Archive Mode ${enabled ? "enabled" : "disabled"}`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const handleGhostPayToggle = async (enabled: boolean) => {
-    try {
-      await setGhostPay.mutateAsync(enabled);
-      success("Saved", `Ghost Pay ${enabled ? "enabled" : "disabled"}`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -124,41 +96,6 @@ export function CapabilityToggles({
         disabled={setArchiveMode.isPending}
         badge={archiveEnabled ? <Badge variant="success">+5 Shares</Badge> : null}
       />
-
-      {ghostPayControl === "toggle" ? (
-        <ToggleRow
-          label="Ghost Pay"
-          description={`L2 payment network participation — requires ghost-pay-node${
-            ghostPayRunning ? ` (L2 height: ${ghostPayStatus?.l2_height ?? 0})` : ""
-          } (+4 shares bonus)`}
-          enabled={ghostPayEnabled}
-          onChange={handleGhostPayToggle}
-          disabled={setGhostPay.isPending}
-          badge={
-            ghostPayEnabled ? (
-              ghostPayRunning ? (
-                <Badge variant="success">+4 Shares</Badge>
-              ) : (
-                <Badge variant="warning">Not Running</Badge>
-              )
-            ) : null
-          }
-        />
-      ) : (
-        <StatusRow
-          label="Ghost Pay"
-          description={`L2 payment network participation — requires ghost-pay-node${
-            ghostPayRunning ? ` (L2 height: ${ghostPayStatus?.l2_height ?? 0})` : ""
-          }`}
-          badge={
-            ghostPayRunning ? (
-              <Badge variant="success">+4 Shares</Badge>
-            ) : (
-              <Badge variant="warning">Not Running</Badge>
-            )
-          }
-        />
-      )}
 
       <ToggleRow
         label="Public Mining"

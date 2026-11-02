@@ -183,26 +183,6 @@ pub const fn bft_threshold(voters: usize) -> usize {
     ((voters as u64) * BFT_THRESHOLD_PERCENT).div_ceil(100) as usize
 }
 
-/// BFT threshold percentage for MPC ceremony contribution approval (67%).
-///
-/// SINGLE SOURCE OF TRUTH shared by `ghost-mpc` and `ghost-consensus` so the
-/// quorum required to apply a new MPC contribution is computed identically on
-/// every node. A mismatch here is a consensus split: one node would apply a
-/// contribution (advancing the trusted-setup lineage) while another rejects it.
-/// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
-pub const MPC_BFT_THRESHOLD_PERCENT: u32 = 67;
-
-/// Minimum number of MPC contributors before BFT supermajority voting applies.
-///
-/// During bootstrap (fewer than this many contributors) the genesis node may
-/// approve alone (threshold = 1). At or above this count the threshold becomes
-/// a `MPC_BFT_THRESHOLD_PERCENT` supermajority: `ceil(count * percent / 100)`.
-/// Set to 4 because with only 3 contributors `ceil(3 * 67 / 100) = 3` would
-/// require unanimity — too fragile, since any single offline node would block
-/// all further contributions.
-/// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
-pub const MPC_BFT_BOOTSTRAP_COUNT: u32 = 4;
-
 /// Consensus voting timeout in milliseconds
 pub const CONSENSUS_TIMEOUT_MS: u64 = 5000;
 
@@ -353,100 +333,6 @@ pub const MAX_TX_OUTPUTS_BITCOIN_PURE: usize = 50;
 
 /// Maximum transaction size for bitcoin_pure (bytes)
 pub const MAX_TX_SIZE_BITCOIN_PURE: usize = 100_000;
-
-// =============================================================================
-// GHOST PAY L2
-// =============================================================================
-
-/// L2 transfer fee in satoshis (flat fee per NoteSpend transfer)
-/// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
-/// Baked into circuit constraints; changing requires MPC ceremony reset.
-pub const L2_TRANSFER_FEE_SATS: u64 = 10;
-
-/// Virtual block time (seconds)
-pub const L2_VIRTUAL_BLOCK_SECS: u64 = 10;
-
-/// Epoch length in virtual blocks
-pub const L2_EPOCH_BLOCKS: u64 = 2160;
-
-/// Compute the L2 epoch number from a block height.
-/// Ghost-pay tracks block height via RPC; this maps it to the epoch for fee tracking.
-pub fn l2_epoch_from_height(block_height: u64) -> u64 {
-    block_height / L2_EPOCH_BLOCKS
-}
-
-// =============================================================================
-// SETTLEMENT CLASSES
-// =============================================================================
-
-/// Settlement class determines how frequently withdrawals are batched for L1 settlement.
-///
-/// Settlement is triggered at epoch boundaries. Each class settles at a different
-/// frequency, trading speed for cost:
-/// - Express: every epoch (~6h) — 1.5x fee
-/// - Standard: every 4 epochs (~24h) — 1.0x fee
-/// - Economy: every 28 epochs (~7d) — 0.5x fee
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum SettlementClass {
-    Express,
-    #[default]
-    Standard,
-    Economy,
-}
-
-impl SettlementClass {
-    /// All settlement classes, for iteration.
-    pub const ALL: [SettlementClass; 3] = [
-        SettlementClass::Express,
-        SettlementClass::Standard,
-        SettlementClass::Economy,
-    ];
-
-    /// How many epochs between settlements for this class.
-    pub fn epoch_multiplier(self) -> u64 {
-        match self {
-            Self::Express => 1,
-            Self::Standard => 4,
-            Self::Economy => 28,
-        }
-    }
-
-    /// Fee multiplier relative to base fee rate.
-    /// Express pays more for faster settlement; Economy pays less for batching.
-    pub fn fee_multiplier(self) -> f64 {
-        match self {
-            Self::Express => 1.5,
-            Self::Standard => 1.0,
-            Self::Economy => 0.5,
-        }
-    }
-
-    /// Returns true if this class should settle at the given epoch number.
-    pub fn is_due_at_epoch(self, epoch: u64) -> bool {
-        epoch > 0 && epoch.is_multiple_of(self.epoch_multiplier())
-    }
-
-    /// Parse from string (case-insensitive).
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "express" => Some(Self::Express),
-            "standard" => Some(Self::Standard),
-            "economy" => Some(Self::Economy),
-            _ => None,
-        }
-    }
-
-    /// String representation.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Express => "express",
-            Self::Standard => "standard",
-            Self::Economy => "economy",
-        }
-    }
-}
 
 // =============================================================================
 // PROTOCOL VERSIONS
@@ -620,56 +506,5 @@ mod tests {
             // Fee should be exactly 1%
             assert_eq!(fee, subsidy / 100);
         }
-    }
-
-    #[test]
-    fn test_settlement_class_epoch_due() {
-        assert!(!SettlementClass::Express.is_due_at_epoch(0));
-        assert!(SettlementClass::Express.is_due_at_epoch(1));
-        assert!(SettlementClass::Express.is_due_at_epoch(4));
-
-        assert!(!SettlementClass::Standard.is_due_at_epoch(0));
-        assert!(!SettlementClass::Standard.is_due_at_epoch(1));
-        assert!(SettlementClass::Standard.is_due_at_epoch(4));
-        assert!(!SettlementClass::Standard.is_due_at_epoch(5));
-        assert!(SettlementClass::Standard.is_due_at_epoch(8));
-
-        assert!(!SettlementClass::Economy.is_due_at_epoch(0));
-        assert!(!SettlementClass::Economy.is_due_at_epoch(4));
-        assert!(SettlementClass::Economy.is_due_at_epoch(28));
-        assert!(SettlementClass::Economy.is_due_at_epoch(56));
-    }
-
-    #[test]
-    fn test_settlement_class_parse() {
-        assert_eq!(
-            SettlementClass::parse("express"),
-            Some(SettlementClass::Express)
-        );
-        assert_eq!(
-            SettlementClass::parse("standard"),
-            Some(SettlementClass::Standard)
-        );
-        assert_eq!(
-            SettlementClass::parse("economy"),
-            Some(SettlementClass::Economy)
-        );
-        assert_eq!(
-            SettlementClass::parse("Express"),
-            Some(SettlementClass::Express)
-        );
-        assert_eq!(SettlementClass::parse("invalid"), None);
-    }
-
-    #[test]
-    fn test_settlement_class_default() {
-        assert_eq!(SettlementClass::default(), SettlementClass::Standard);
-    }
-
-    #[test]
-    fn test_settlement_class_fee_multiplier() {
-        assert!((SettlementClass::Express.fee_multiplier() - 1.5).abs() < f64::EPSILON);
-        assert!((SettlementClass::Standard.fee_multiplier() - 1.0).abs() < f64::EPSILON);
-        assert!((SettlementClass::Economy.fee_multiplier() - 0.5).abs() < f64::EPSILON);
     }
 }

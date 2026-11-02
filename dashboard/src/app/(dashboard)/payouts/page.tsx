@@ -8,8 +8,8 @@ import { Badge } from "@/components/ui/Badge";
 import { DataTable } from "@/components/ui/DataTable";
 import { SkeletonTable } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { NetworkPayoutHistoryCard, GhostPayPayoutHistoryCard } from "@/components/PayoutHistoryCard";
-import { useNetworkPayoutHistory, useGhostPayPayoutHistory, useNodeBalances } from "@/hooks/queries";
+import { NetworkPayoutHistoryCard } from "@/components/PayoutHistoryCard";
+import { useNetworkPayoutHistory, useNodeBalances } from "@/hooks/queries";
 import { PageLoader } from "@/components/ui/PageLoader";
 import type { NodeBalanceEntry } from "@/lib/api/rewards";
 import type { PayoutHistoryTimeFilter } from "@/types/api";
@@ -25,11 +25,6 @@ const REWARD_SOURCES = [
     name: "Block TX Fees",
     desc: "When your pool finds a block, transaction fees from the block are distributed to the winning node's miners and node operators.",
     color: "bg-orange-500",
-  },
-  {
-    name: "Ghost Pay L2 Fees",
-    desc: "Fees collected from L2 payment channel operations (instant payments, channel opens/closes). Earned by nodes running Ghost Pay.",
-    color: "bg-purple-500",
   },
   {
     name: "Wraith Mixing Fees",
@@ -127,10 +122,8 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
 
 export default function PayoutsPage() {
   const [networkTimeFilter, setNetworkTimeFilter] = useState<PayoutHistoryTimeFilter>("7d");
-  const [gpTimeFilter, setGpTimeFilter] = useState<PayoutHistoryTimeFilter>("7d");
 
   const { data: payoutHistory, isLoading: payoutLoading } = useNetworkPayoutHistory(networkTimeFilter);
-  const { data: gpPayoutHistory, isLoading: gpPayoutLoading } = useGhostPayPayoutHistory(gpTimeFilter);
   const { data: balancesData, isLoading: balancesLoading } = useNodeBalances();
 
   const summary = payoutHistory?.summary ?? {
@@ -193,18 +186,6 @@ export default function PayoutsPage() {
           isLoading={payoutLoading}
           timeFilter={networkTimeFilter}
           onTimeFilterChange={setNetworkTimeFilter}
-        />
-      </SectionErrorBoundary>
-
-      {/* GhostPay Fee History */}
-      <SectionErrorBoundary section="GhostPay Fee History">
-        <GhostPayPayoutHistoryCard
-          ghostpayFees={gpPayoutHistory?.ghostpay_fees ?? []}
-          wraithFees={gpPayoutHistory?.wraith_fees ?? []}
-          summary={gpPayoutHistory?.summary ?? { total_ghostpay_fees_satoshis: 0, total_wraith_fees_satoshis: 0, ghostpay_sessions_count: 0, wraith_sessions_count: 0 }}
-          isLoading={gpPayoutLoading}
-          timeFilter={gpTimeFilter}
-          onTimeFilterChange={setGpTimeFilter}
         />
       </SectionErrorBoundary>
 

@@ -18,7 +18,7 @@ rpc_host = "127.0.0.1"
 rpc_port = 18443                        # regtest default RPC port
 rpc_user = "${BITCOIN_RPC_USER}"
 rpc_password = "${BITCOIN_RPC_PASSWORD}"
-network = "regtest"                     # regtest → no zk-production / MPC params needed
+network = "regtest"
 zmq_hashblock = "tcp://127.0.0.1:28332"
 zmq_hashtx = "tcp://127.0.0.1:28333"
 

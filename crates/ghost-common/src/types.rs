@@ -630,13 +630,6 @@ pub struct HealthPing {
     /// `#[serde(default)]` for backward compatibility.
     #[serde(default)]
     pub peer_count: Option<u32>,
-    /// This node's Ghost Pay L2 virtual-block height, when it runs ghost-pay.
-    /// Gossiped so the Swarm page can show each mesh peer's L2 tip. `None` for
-    /// nodes that don't run ghost-pay (or older peers that predate this field),
-    /// so the frontend renders "—" instead of a fabricated 0. `#[serde(default)]`
-    /// for backward compatibility.
-    #[serde(default)]
-    pub l2_height: Option<u64>,
     /// This node's node-reward payout address (a Bitcoin address string). Gossiped
     /// so EVERY node learns EVERY node's payout address — without this, each node
     /// only knows its own (written from local config), so the qualified-node
@@ -1511,7 +1504,6 @@ mod tests {
             coordinator_sessions: 0,
             uptime_percent: Some(99.5),
             peer_count: Some(3),
-            l2_height: Some(12_345),
             payout_address: Some("bc1qexamplepayoutaddr".to_string()),
         }
     }
@@ -1524,7 +1516,6 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&ping).unwrap()).unwrap();
         assert_eq!(back.uptime_percent, Some(99.5));
         assert_eq!(back.peer_count, Some(3));
-        assert_eq!(back.l2_height, Some(12_345));
     }
 
     #[test]
@@ -1538,11 +1529,9 @@ mod tests {
         let obj = v.as_object_mut().unwrap();
         assert!(obj.remove("uptime_percent").is_some());
         assert!(obj.remove("peer_count").is_some());
-        assert!(obj.remove("l2_height").is_some());
         let back: HealthPing = serde_json::from_value(v).unwrap();
         assert_eq!(back.uptime_percent, None);
         assert_eq!(back.peer_count, None);
-        assert_eq!(back.l2_height, None);
         // Unrelated fields are unaffected.
         assert_eq!(back.miner_count, 2);
         assert_eq!(back.active_miner_id_hashes.len(), 2);

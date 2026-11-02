@@ -984,35 +984,6 @@ pub struct BlockFoundInfo {
 /// commitment but the commitment requires a submitted block.
 pub type BlockFoundFn = Arc<dyn Fn(BlockFoundInfo) + Send + Sync>;
 
-/// Callback for submitting L2 NoteSpend transactions to the mesh
-/// Takes serialized L2ConfidentialTransferMessage JSON bytes, returns Ok(()) on success.
-pub type L2SubmitFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Sync>;
-
-/// Callback for syncing a commitment to the L2 tree and broadcasting to mesh.
-/// Params: (commitment, note_index, block_height)
-pub type L2SyncCommitmentFn = Arc<dyn Fn([u8; 32], u64, u64) -> GhostResult<()> + Send + Sync>;
-
-/// Callback for relaying a glyph claim to the mesh.
-/// Takes serialized GhostGlyphClaimMessage JSON bytes.
-pub type GlyphClaimRelayFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Sync>;
-
-/// Callback for relaying a glyph registration to the mesh.
-/// Takes serialized GhostGlyphRegisteredMessage JSON bytes.
-pub type GlyphRegisteredRelayFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Sync>;
-
-/// Callback for retrieving live L2 tree state from the epoch manager.
-/// Returns (epoch, tree_root, checkpoint_height, note_count).
-pub type L2TreeStateFn = Arc<dyn Fn() -> GhostResult<L2TreeStateInfo> + Send + Sync>;
-
-/// Live L2 tree state info returned by the epoch manager callback.
-#[derive(Debug, Clone)]
-pub struct L2TreeStateInfo {
-    pub epoch: u64,
-    pub tree_root: [u8; 32],
-    pub checkpoint_height: u64,
-    pub note_count: u64,
-}
-
 /// Parse user_identity string to extract payout address and worker name.
 /// Format: <payout_address>.<worker_name>
 /// Returns (payout_address, worker_name) or (user_identity, "default") if no dot found.
@@ -1232,9 +1203,6 @@ pub struct MeshNodeInfo {
     /// The number of mesh peers this node itself reported seeing. `None` when
     /// not reported (older peer) → "—".
     pub peer_count: Option<u32>,
-    /// This node's Ghost Pay L2 virtual-block height. `None` when the node
-    /// doesn't run ghost-pay (or is an older peer) → "—".
-    pub l2_height: Option<u64>,
 }
 
 /// Outcome of the most recent automatic `ghost-setup apply-reaper` run.
@@ -1658,16 +1626,6 @@ pub struct VerificationState {
     max_capacity: AtomicU32,
     /// Prometheus metrics (optional - only present when running as ghost-mining)
     pub metrics: Option<Arc<Metrics>>,
-    /// Callback to submit L2 NoteSpend transactions to the consensus mesh
-    pub l2_submit_fn: Option<L2SubmitFn>,
-    /// Callback to sync a commitment to the L2 tree and broadcast to mesh
-    pub l2_sync_commitment_fn: Option<L2SyncCommitmentFn>,
-    /// Callback to relay glyph claims to the mesh
-    pub glyph_claim_relay_fn: Option<GlyphClaimRelayFn>,
-    /// Callback to relay glyph registrations to the mesh
-    pub glyph_registered_relay_fn: Option<GlyphRegisteredRelayFn>,
-    /// Callback to get live L2 tree state from epoch manager
-    pub l2_tree_state_fn: Option<L2TreeStateFn>,
     /// Cached stratum self-verification results. The verification handler
     /// uses bogus Noise-NK bytes / mining.subscribe to confirm the local
     /// stratum endpoint is up; pool_sv2 logs the rejection as ERROR. Caching
@@ -1945,11 +1903,6 @@ impl VerificationState {
             debug_endpoints_frozen: AtomicBool::new(debug_enabled),
             max_capacity: AtomicU32::new(0),
             metrics: None,
-            l2_submit_fn: None,
-            l2_sync_commitment_fn: None,
-            glyph_claim_relay_fn: None,
-            glyph_registered_relay_fn: None,
-            l2_tree_state_fn: None,
             stratum_verify_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             // 24h of history at the sampler's 30s cadence (2880 samples).
             pool_series: crate::pool_series::PoolSeries::new(2880),
@@ -1963,36 +1916,6 @@ impl VerificationState {
     /// an `Arc` by the time the dispatcher exists.
     pub fn set_alert_dispatcher(&self, dispatcher: Arc<crate::alerts::AlertDispatcher>) {
         let _ = self.alert_dispatcher.set(dispatcher);
-    }
-
-    /// Set the L2 NoteSpend submission callback
-    pub fn with_l2_submit(mut self, f: L2SubmitFn) -> Self {
-        self.l2_submit_fn = Some(f);
-        self
-    }
-
-    /// Set the L2 commitment sync callback
-    pub fn with_l2_sync_commitment(mut self, f: L2SyncCommitmentFn) -> Self {
-        self.l2_sync_commitment_fn = Some(f);
-        self
-    }
-
-    /// Set the glyph claim relay callback
-    pub fn with_glyph_claim_relay(mut self, f: GlyphClaimRelayFn) -> Self {
-        self.glyph_claim_relay_fn = Some(f);
-        self
-    }
-
-    /// Set the glyph registered relay callback
-    pub fn with_glyph_registered_relay(mut self, f: GlyphRegisteredRelayFn) -> Self {
-        self.glyph_registered_relay_fn = Some(f);
-        self
-    }
-
-    /// Set the L2 tree state callback
-    pub fn with_l2_tree_state(mut self, f: L2TreeStateFn) -> Self {
-        self.l2_tree_state_fn = Some(f);
-        self
     }
 
     /// Signal that a restart is needed (config update API)
@@ -2434,7 +2357,7 @@ impl VerificationState {
     /// Set the full node configuration (pool.toml) for config update API
     ///
     /// This allows the config update API to modify settings like mining_mode,
-    /// policy_profile, ghost_pay_enabled, etc. and persist them to disk.
+    /// policy_profile, etc. and persist them to disk.
     ///
     /// # Arguments
     /// * `config` - The full NodeConfig loaded from pool.toml
@@ -2449,11 +2372,9 @@ impl VerificationState {
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.archive_mode = config.storage.archive_mode;
-            // Same rule for GhostPay (#1014). The default is `true`, and with nothing
-            // overwriting it every node reported the +4 as claimed and `/api/v1/node/shares`
-            // answered 10 on a fleet ratified at 6. `ghost_pay_enabled()` is what the
-            // advertised capability is built from, so the display now matches the claim.
-            dashboard.ghost_pay = config.ghost_pay_enabled();
+            // Same rule for GhostPay (#1014): the display matches the claim, and Ghost Pay is
+            // removed, so the node never claims it.
+            dashboard.ghost_pay = false;
         }
         self.full_node_config = Some(parking_lot::RwLock::new(config));
         self.full_node_config_path = Some(path);

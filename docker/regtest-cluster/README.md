@@ -25,9 +25,7 @@ sockets/Noise/ZMQ rather than the in-process harness.
 - `bitcoin-cli` (or `docker exec`) to drive the chain.
 
 ## 2. Build the pool image (regtest, gate-low)
-Two regtest-specific build choices:
-- **No `--features zk-production`** — regtest needs no MPC params (the
-  zk-production start-up guard is mainnet-only).
+One regtest-specific build choice:
 - **Lower `CLUSTER_ENFORCEMENT_HEIGHT`** so the gate actually fires on a short
   regtest chain (the mainnet default is a far-future placeholder). For the
   dry-run, set it to e.g. `100` in `bins/ghost-pool/src/lib.rs` before building

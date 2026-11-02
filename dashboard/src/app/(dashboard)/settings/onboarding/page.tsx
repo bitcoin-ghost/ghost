@@ -16,7 +16,6 @@ import {
   useShares,
   useConfig,
   useFullConfig,
-  useGhostPayStatus,
   useSetPolicyProfile,
 } from "@/hooks/queries";
 import type { PolicyProfileType } from "@/lib/api/config";
@@ -60,7 +59,6 @@ export default function OnboardingPage() {
   const { data: shares } = useShares();
   const { data: config } = useConfig();
   const { data: fullConfig } = useFullConfig();
-  const { data: ghostPay } = useGhostPayStatus();
 
   // Writes — the tier policy still lives here; the five canonical capability
   // rows are driven inside the shared CapabilityToggles component (the SAME
@@ -71,7 +69,6 @@ export default function OnboardingPage() {
   const [reaperWizardOpen, setReaperWizardOpen] = useState(false);
 
   const activePolicyProfile = String(fullConfig?.policy?.profile ?? "permissive");
-  const ghostPayRunning = Boolean(ghostPay?.l2_height);
 
   const handleActivatePreset = async (name: PolicyProfileType) => {
     try {
@@ -163,11 +160,10 @@ export default function OnboardingPage() {
           />
           <div className="space-y-3">
             {/*
-             * The five reward capabilities share their markup + hooks with
-             * Settings › Capabilities. Onboarding presents Ghost Pay as an
-             * editable toggle.
+             * The reward capabilities share their markup + hooks with
+             * Settings › Capabilities.
              */}
-            <CapabilityToggles ghostPayControl="toggle" />
+            <CapabilityToggles />
           </div>
         </Card>
       )}
@@ -259,10 +255,6 @@ export default function OnboardingPage() {
             <StatItem
               label="Archive Mode"
               value={<Badge variant={archiveEnabled ? "success" : "default"}>{archiveEnabled ? "On" : "Off"}</Badge>}
-            />
-            <StatItem
-              label="Ghost Pay"
-              value={<Badge variant={ghostPayRunning ? "success" : "default"}>{ghostPayRunning ? "Running" : "Not Running"}</Badge>}
             />
             <StatItem
               label="Public Mining"

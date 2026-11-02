@@ -54,7 +54,29 @@ const REMOVED_KEYS: &[(&str, &str)] = &[
         "coordinator_fee_address",
         "removed with the in-process Wraith coordinator",
     ),
+    ("virtual_block_secs", "removed with Ghost Pay"),
+    ("epoch_blocks", "removed with Ghost Pay"),
+    ("genesis_password", "removed with the MPC ceremony"),
 ];
+
+/// Sections that were removed whole. Installed configs may still carry them and load (they are
+/// read and ignored), but a template must not offer them.
+const REMOVED_SECTIONS: &[(&str, &str)] = &[("ghost_pay", "removed with Ghost Pay")];
+
+#[test]
+fn no_template_has_a_removed_section() {
+    for p in templates() {
+        let raw = std::fs::read_to_string(&p).expect("readable");
+        let doc: toml::Table = raw.parse().expect("valid TOML");
+        for (section, why) in REMOVED_SECTIONS {
+            assert!(
+                !doc.contains_key(*section),
+                "{} has a `[{section}]` section, which was {why}",
+                p.display()
+            );
+        }
+    }
+}
 
 #[test]
 fn every_shipped_template_parses_as_toml() {
@@ -322,22 +344,38 @@ fn the_installers_alerts_block_parses_in_both_shapes() {
     );
 }
 
-/// A config installed before Wraith was removed must still load.
+/// A config installed before Wraith, Ghost Pay and the MPC ceremony were removed must still load.
 ///
-/// Installed `pool.toml` files carry `[ghost_pay] wraith_enabled` (it used to be required) and,
-/// on nodes that opted in, the `[coordinator]` election and role keys. The structs reject unknown
-/// keys, so the retired keys are accepted explicitly and ignored. If this test fails, upgrading a
-/// node would leave it unable to start.
+/// Installed `pool.toml` files carry a `[ghost_pay]` section (every installer wrote one, with
+/// `wraith_enabled` once required), `[pool] genesis_password` on nodes that guarded the MPC
+/// genesis, and, on nodes that opted in, the `[coordinator]` election and role keys. The structs
+/// reject unknown keys, so the retired keys and the whole `[ghost_pay]` section are accepted
+/// explicitly and ignored. If this test fails, upgrading a node would leave it unable to start.
+///
+/// zk and MPC never had `pool.toml` keys of their own (they were configured through the
+/// `ZK_*` / `MPC_PARAMS_PATH` environment), and no `[l2]` section ever existed, so there is
+/// nothing else to tolerate.
 #[test]
-fn a_config_with_retired_wraith_keys_still_loads() {
+fn a_config_with_retired_keys_still_loads() {
     let mut raw = std::fs::read_to_string(config_dir().join("mainnet.toml")).expect("read");
-    raw = raw.replacen("[ghost_pay]\n", "[ghost_pay]\nwraith_enabled = true\n", 1);
     assert!(
-        raw.contains("wraith_enabled = true"),
-        "the template has no [ghost_pay] section"
+        !raw.contains("[ghost_pay]"),
+        "the template still has a [ghost_pay] section"
+    );
+    raw = raw.replacen("[pool]\n", "[pool]\ngenesis_password = \"retired\"\n", 1);
+    assert!(
+        raw.contains("genesis_password = \"retired\""),
+        "the template has no [pool] section"
     );
     raw.push_str(
-        "\n[coordinator]\n\
+        "\n[ghost_pay]\n\
+         enabled = true\n\
+         virtual_block_secs = 10\n\
+         epoch_blocks = 2160\n\
+         payout_address = \"bc1qexample\"\n\
+         wraith_enabled = true\n\
+         transfer_fee_bps = 10\n\
+         \n[coordinator]\n\
          wraith_election_enabled = true\n\
          coordinator_enabled = true\n\
          advertised_endpoint = \"203.0.113.7:9100\"\n\
@@ -347,17 +385,20 @@ fn a_config_with_retired_wraith_keys_still_loads() {
     );
 
     let cfg: ghost_common::config::NodeConfig = toml::from_str(&raw)
-        .unwrap_or_else(|e| panic!("a config with the retired Wraith keys must load: {e}"));
+        .unwrap_or_else(|e| panic!("a config with the retired keys must load: {e}"));
     assert!(cfg.coordinator.coordinator_enabled);
     assert_eq!(
         cfg.coordinator.advertised_endpoint.as_deref(),
         Some("203.0.113.7:9100")
     );
-    assert!(cfg.ghost_pay.is_some());
 
     // Written back, the retired keys are gone and the rest survives.
     let written = toml::to_string(&cfg).expect("serialize");
     for key in [
+        "ghost_pay",
+        "virtual_block_secs",
+        "epoch_blocks",
+        "genesis_password",
         "wraith_enabled",
         "wraith_election_enabled",
         "coordinator_port",

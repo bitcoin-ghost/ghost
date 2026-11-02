@@ -1,14 +1,12 @@
-//! Category 32: Adversarial Integration Tests (10 tests, 930-939)
+//! Category 32: Adversarial Integration Tests (8 tests, 930-939)
 //!
 //! Tests for adversarial attack vectors against Ghost pool components:
 //! - JSON depth bomb (930)
-//! - Concurrent nullifier double-spend (931)
 //! - Rate limiter exhaustion (932)
 //! - Forged verification signatures (933)
 //! - Self-verification Sybil attack (934)
 //! - Stale verification replay (935)
 //! - Zero-signature envelope (936)
-//! - Crash recovery nullifier persistence (937)
 //! - Replay attack dedup (938)
 //! - Oversized challenge data (939)
 
@@ -16,7 +14,6 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use ghost_common::identity::NodeIdentity;
-use ghost_consensus::epoch_manager::{EpochManager, EpochManagerConfig};
 use ghost_consensus::mesh::MessageId;
 use ghost_consensus::message::{
     CapabilityType, MessageEnvelope, MessageType, VerificationResultMessage,
@@ -126,52 +123,6 @@ fn test_930_deeply_nested_json_rejected() {
             MAX_JSON_DEPTH
         );
     }
-}
-
-// =============================================================================
-// TEST 931: CONCURRENT NULLIFIER DOUBLE-SPEND
-// =============================================================================
-
-#[test]
-fn test_931_concurrent_nullifier_double_spend() {
-    let db = Arc::new(test_db());
-    let config = EpochManagerConfig::default();
-    let em = Arc::new(EpochManager::new(db, config));
-
-    // Initialize genesis epoch so the DB has an active epoch.
-    em.initialize_genesis().expect("genesis init");
-
-    let nullifier = [0xABu8; 32];
-    let thread_count = 10;
-
-    // Spawn 10 threads all trying to spend the same nullifier at once.
-    let handles: Vec<_> = (0..thread_count)
-        .map(|_| {
-            let em = Arc::clone(&em);
-            std::thread::spawn(move || em.spend_nullifier(nullifier, 1).expect("no IO error"))
-        })
-        .collect();
-
-    let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-    let success_count = results.iter().filter(|&&r| r).count();
-    let fail_count = results.iter().filter(|&&r| !r).count();
-
-    assert_eq!(
-        success_count, 1,
-        "Exactly 1 thread should succeed spending nullifier, got {}",
-        success_count
-    );
-    assert_eq!(
-        fail_count,
-        thread_count - 1,
-        "Exactly {} threads should fail, got {}",
-        thread_count - 1,
-        fail_count
-    );
-
-    // Confirm the nullifier is indeed spent.
-    assert!(em.is_nullifier_spent(&nullifier));
 }
 
 // =============================================================================
@@ -336,17 +287,17 @@ async fn test_935_stale_verification_result_rejected() {
 }
 
 // =============================================================================
-// TEST 936: L2 CHECKPOINT VOTE — ZERO SIGNATURE REJECTED
+// TEST 936: VOTE — ZERO SIGNATURE REJECTED
 // =============================================================================
 
 #[test]
-fn test_936_l2_checkpoint_vote_zero_signature() {
+fn test_936_vote_zero_signature() {
     let identity = NodeIdentity::generate();
 
     // Create an envelope with an all-zeros signature.
     let payload = b"{}";
     let envelope = MessageEnvelope::new(
-        MessageType::L2CheckpointVote,
+        MessageType::Vote,
         identity.node_id(),
         payload.to_vec(),
         1,
@@ -360,42 +311,6 @@ fn test_936_l2_checkpoint_vote_zero_signature() {
     match result.unwrap_err() {
         MessageValidationError::ZeroSignature => {} // Expected
         other => panic!("Expected ZeroSignature error, got: {:?}", other),
-    }
-}
-
-// =============================================================================
-// TEST 937: CRASH RECOVERY — NULLIFIER PERSISTENCE
-// =============================================================================
-
-#[test]
-fn test_937_crash_recovery_nullifier_persistence() {
-    // Use a shared in-memory DB (with shared cache so two EpochManagers
-    // can share the same underlying database, simulating crash + restart).
-    let db = Arc::new(test_db());
-    let config = EpochManagerConfig::default();
-
-    // --- Phase 1: Create EpochManager, spend a nullifier, do NOT flush ---
-    let nullifier = [0xDEu8; 32];
-    {
-        let em1 = EpochManager::new(Arc::clone(&db), config.clone());
-        em1.initialize_genesis().expect("genesis init");
-        let ok = em1.spend_nullifier(nullifier, 42).expect("spend");
-        assert!(ok, "First spend should succeed");
-
-        // Deliberately do NOT call flush_pending_nullifiers().
-        // The write-ahead log (pending_nullifiers table) should have the entry.
-    }
-
-    // --- Phase 2: "Crash" — drop em1, create a fresh EpochManager ---
-    {
-        let em2 = EpochManager::new(Arc::clone(&db), config);
-        em2.initialize().expect("initialize from DB");
-
-        // The nullifier should be recovered from the write-ahead log.
-        assert!(
-            em2.is_nullifier_spent(&nullifier),
-            "Nullifier must survive simulated crash via write-ahead log"
-        );
     }
 }
 

@@ -358,10 +358,6 @@ pub struct MeshNetwork {
     /// uptime as a percentage (0-100), gossiped in health pings. Returns `None`
     /// when there are no samples yet; absent provider → `None` in the ping.
     uptime_percent_fn: Option<Arc<dyn Fn() -> Option<f64> + Send + Sync>>,
-    /// Application-provided callback returning this node's Ghost Pay L2
-    /// virtual-block height, gossiped in health pings. `None` when ghost-pay
-    /// isn't running / the tip is unknown; absent provider → `None` in the ping.
-    l2_height_fn: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     /// Application-provided callback reporting whether this node's own Ghost Core is reachable,
     /// gossiped in health pings so peers can route around a node whose `ghostd` is down (#778).
     ///
@@ -1535,7 +1531,6 @@ impl MeshNetwork {
             best_records_fn: None,
             l1_height_fn: None,
             uptime_percent_fn: None,
-            l2_height_fn: None,
             core_healthy_fn: None,
             max_capacity: AtomicU32::new(0),
             coordinator_sessions: AtomicU32::new(0),
@@ -1654,13 +1649,6 @@ impl MeshNetwork {
     /// Returns `None` when there are no samples yet.
     pub fn set_uptime_percent_provider(&mut self, f: Arc<dyn Fn() -> Option<f64> + Send + Sync>) {
         self.uptime_percent_fn = Some(f);
-    }
-
-    /// Set a callback providing this node's Ghost Pay L2 virtual-block height,
-    /// gossiped in health pings. Returns `None` when ghost-pay isn't running or
-    /// the L2 tip isn't known yet.
-    pub fn set_l2_height_provider(&mut self, f: Arc<dyn Fn() -> Option<u64> + Send + Sync>) {
-        self.l2_height_fn = Some(f);
     }
 
     /// Set the provider reporting whether this node's own Ghost Core is reachable (#778).
@@ -2330,22 +2318,7 @@ impl MeshNetwork {
             | MessageType::ShardSampleResponse
             | MessageType::VerificationResult
             | MessageType::ChallengeConvergence
-            | MessageType::EquivocationProof
-            | MessageType::MpcContribution
-            | MessageType::MpcVerificationVote
-            | MessageType::MpcParametersRequest
-            | MessageType::MpcParametersResponse
-            // L2 messages use Noise encryption (contain proofs and encrypted note data)
-            | MessageType::L2ConfidentialTransfer
-            | MessageType::L2TransferConfirmation
-            | MessageType::L2TransferBroadcast
-            | MessageType::L2CheckpointBlock
-            | MessageType::L2CheckpointVote
-            | MessageType::L2TreeSync
-            | MessageType::L2ShieldBroadcast
-            // GhostGlyph messages use Noise (contain identity binding data)
-            | MessageType::GhostGlyphClaim
-            | MessageType::GhostGlyphRegistered => true,
+            | MessageType::EquivocationProof => true,
         }
     }
 
@@ -2574,7 +2547,7 @@ impl MeshNetwork {
     /// Send a message to a specific peer
     ///
     /// Automatically routes messages through Noise encryption for sensitive message types
-    /// (MPC, Elder, Payout, ZK, etc.) or ZMQ for broadcast messages (Discovery, HealthPing).
+    /// (Elder, Payout, ZK, etc.) or ZMQ for broadcast messages (Discovery, HealthPing).
     /// Publish a ZMQ broadcast envelope on the PUB socket exactly once.
     ///
     /// The publisher task ignores the per-message endpoint and routes purely by
@@ -2674,11 +2647,6 @@ impl MeshNetwork {
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            // P2P-C1/C2/C3: Elder registration messages use elder management port
-            | MessageType::MpcContribution
-            | MessageType::MpcVerificationVote
-            | MessageType::MpcParametersRequest
-            | MessageType::MpcParametersResponse => self.config.ports.elder_management,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
             // ZK-BFT messages use consensus voting port
             // Verification results (and their convergence/backfill) use health monitoring port
@@ -2687,13 +2655,7 @@ impl MeshNetwork {
             }
             // P2P-H3: Equivocation proofs use consensus voting port
             MessageType::EquivocationProof => self.config.ports.consensus_voting,
-            // L2 messages use consensus voting port
-            MessageType::L2ConfidentialTransfer
-            | MessageType::L2TransferConfirmation
-            | MessageType::L2TransferBroadcast
-            | MessageType::L2CheckpointBlock
-            | MessageType::L2CheckpointVote
-            | MessageType::PayoutLedgerCheckpoint
+            MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
             | MessageType::PayoutProposalSync
@@ -2712,12 +2674,7 @@ impl MeshNetwork {
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
             | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse
-            | MessageType::L2TreeSync
-            | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
-            // GhostGlyph messages use consensus voting port
-            MessageType::GhostGlyphClaim
-            | MessageType::GhostGlyphRegistered => self.config.ports.consensus_voting,
+            | MessageType::ShardSampleResponse => self.config.ports.consensus_voting,
         };
         format!("tcp://{}:{}", host_only, base_port)
     }
@@ -2816,7 +2773,7 @@ impl MeshNetwork {
     /// Binds the configured `noise_port`, accepts inbound encrypted connections,
     /// completes the Noise handshake, and dispatches every decrypted message
     /// through [`handle_received`](Self::handle_received) to the registered
-    /// handlers. Point-to-point message types (MPC contributions/votes, shares,
+    /// handlers. Point-to-point message types (votes, shares,
     /// consensus votes, payouts, …) are delivered over Noise, so WITHOUT this
     /// loop a node emits Noise traffic but never receives any — the broadcast
     /// reaches the peer's TCP stack but is never dispatched to a handler.
@@ -3261,7 +3218,6 @@ impl MeshNetwork {
             (topics::ZK_PROPOSAL, "zk_proposal"),
             (topics::ZK_VOTE, "zk_vote"),
             (topics::VERIFICATION, "verification"),
-            (topics::MPC, "mpc"), // MPC ceremony messages
         ];
 
         for (topic, name) in additional_topics {
@@ -3440,7 +3396,6 @@ impl MeshNetwork {
                         ("elder", topics::ELDER),
                         ("payout", topics::PAYOUT_PROPOSAL),
                         ("verify", topics::VERIFICATION),
-                        ("mpc", topics::MPC), // MPC ceremony messages
                     ];
 
                     let (topic_name, data): (&str, Vec<u8>) = {
@@ -3480,7 +3435,7 @@ impl MeshNetwork {
                     }
 
                     // M-P2P-1: Validate topic matches envelope's msg_type (post-deser fallback)
-                    // Covers multi-type topics (elder, mpc) that can't use the fast check
+                    // Covers multi-type topics (elder) that can't use the fast check
                     if let Ok(envelope) = MessageEnvelope::deserialize(&data) {
                         let expected_topic = envelope.msg_type.topic_str();
                         if topic_name != expected_topic {
@@ -3531,15 +3486,6 @@ impl MeshNetwork {
                             topic = topic_name,
                             data_len = data.len(),
                             "SUB received verification message"
-                        );
-                    }
-
-                    // Log MPC messages for ceremony debugging
-                    if topic_name == "mpc" {
-                        debug!(
-                            topic = topic_name,
-                            data_len = data.len(),
-                            "SUB received MPC message"
                         );
                     }
 
@@ -3638,12 +3584,11 @@ impl MeshNetwork {
                 .map(|f| f())
                 .unwrap_or_default();
             // Swarm-page telemetry gossiped for peers to render. L1 height comes
-            // from a provider (fallback 0 = "unknown"); uptime % and L2 height
-            // are Option (None when unavailable); peer_count is this node's own
+            // from a provider (fallback 0 = "unknown"); uptime % is
+            // Option (None when unavailable); peer_count is this node's own
             // deduplicated view, matching the self figure the swarm endpoint uses.
             let block_height = self.l1_height_fn.as_ref().map(|f| f()).unwrap_or(0);
             let uptime_percent = self.uptime_percent_fn.as_ref().and_then(|f| f());
-            let l2_height = self.l2_height_fn.as_ref().and_then(|f| f());
             let peer_count = Some(self.peers.unique_peer_count() as u32);
             let ping = ghost_common::types::HealthPing {
                 node_id: self.identity.node_id(),
@@ -3672,7 +3617,6 @@ impl MeshNetwork {
                 coordinator_sessions: self.coordinator_sessions.load(Ordering::Relaxed),
                 uptime_percent,
                 peer_count,
-                l2_height,
                 // Operator-chosen, read from config — advertise our payout address so
                 // every peer's node registry converges (see HealthPing::payout_address).
                 payout_address: self.config.advertised_payout_address.clone(),
@@ -3723,7 +3667,7 @@ impl MeshNetwork {
     }
 
     /// M-9: Map topic name to primary MessageType for pre-deserialization validation.
-    /// Returns None for multi-type topics (elder, mpc) which need post-deser checking.
+    /// Returns None for multi-type topics (elder) which need post-deser checking.
     fn primary_message_type_for_topic(topic: &str) -> Option<MessageType> {
         match topic {
             "health" => Some(MessageType::HealthPing),
@@ -3733,7 +3677,7 @@ impl MeshNetwork {
             "verify" => Some(MessageType::VerificationResult),
             "payout" => Some(MessageType::PayoutProposal),
             // Multi-type topics — skip fast check, rely on post-deser validation
-            "elder" | "mpc" | "l2tx" | "l2chk" | "l2vote" | "l2sync" | "unknown" => None,
+            "elder" | "unknown" => None,
             _ => None,
         }
     }
@@ -3865,17 +3809,8 @@ impl MeshNetwork {
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            MessageType::MpcContribution
-            | MessageType::MpcVerificationVote
-            | MessageType::MpcParametersRequest
-            | MessageType::MpcParametersResponse => self.config.ports.elder_management,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
             MessageType::EquivocationProof
-            | MessageType::L2ConfidentialTransfer
-            | MessageType::L2TransferConfirmation
-            | MessageType::L2TransferBroadcast
-            | MessageType::L2CheckpointBlock
-            | MessageType::L2CheckpointVote
             | MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
@@ -3894,14 +3829,9 @@ impl MeshNetwork {
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
             | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse
-            | MessageType::L2TreeSync
-            | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
+            | MessageType::ShardSampleResponse => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
                 self.config.ports.health_monitoring
-            }
-            MessageType::GhostGlyphClaim | MessageType::GhostGlyphRegistered => {
-                self.config.ports.consensus_voting
             }
         };
         port == expected_port
@@ -3923,7 +3853,7 @@ impl MeshNetwork {
 
         // C-10: Reject Noise-required messages from broadcast_sync entirely.
         // broadcast_sync is a synchronous (non-async) path that sends over ZMQ,
-        // bypassing Noise encryption. Sensitive message types (MPC, votes, shares,
+        // bypassing Noise encryption. Sensitive message types (votes, shares,
         // etc.) MUST use the async smart_broadcast() path that routes through Noise.
         // Allowing them here would silently send secrets in plaintext.
         if self.should_use_noise(msg_type) {
@@ -4828,20 +4758,7 @@ mod tests {
                 | MessageType::ShardSampleResponse
                 | MessageType::VerificationResult
                 | MessageType::ChallengeConvergence
-                | MessageType::EquivocationProof
-                | MessageType::MpcContribution
-                | MessageType::MpcVerificationVote
-                | MessageType::MpcParametersRequest
-                | MessageType::MpcParametersResponse
-                | MessageType::L2ConfidentialTransfer
-                | MessageType::L2TransferConfirmation
-                | MessageType::L2TransferBroadcast
-                | MessageType::L2CheckpointBlock
-                | MessageType::L2CheckpointVote
-                | MessageType::L2TreeSync
-                | MessageType::L2ShieldBroadcast
-                | MessageType::GhostGlyphClaim
-                | MessageType::GhostGlyphRegistered => true,
+                | MessageType::EquivocationProof => true,
             }
         }
 
@@ -4853,16 +4770,6 @@ mod tests {
         assert!(
             !message_type_requires_noise(MessageType::Discovery),
             "Discovery should stay on ZMQ"
-        );
-
-        // MPC-sensitive messages (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::MpcContribution),
-            "MpcContribution must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::MpcVerificationVote),
-            "MpcVerificationVote must use Noise"
         );
 
         // Consensus/voting messages (MUST use Noise)
@@ -4889,32 +4796,6 @@ mod tests {
 
         // Elder management (MUST use Noise)
 
-        // L2 messages (MUST use Noise — contain proofs and encrypted note data)
-        assert!(
-            message_type_requires_noise(MessageType::L2ConfidentialTransfer),
-            "L2ConfidentialTransfer must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2TransferConfirmation),
-            "L2TransferConfirmation must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2TransferBroadcast),
-            "L2TransferBroadcast must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2CheckpointBlock),
-            "L2CheckpointBlock must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2CheckpointVote),
-            "L2CheckpointVote must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2TreeSync),
-            "L2TreeSync must use Noise"
-        );
-
         // ZK messages (MUST use Noise)
         // Verification and security (MUST use Noise)
         assert!(
@@ -4924,16 +4805,6 @@ mod tests {
         assert!(
             message_type_requires_noise(MessageType::EquivocationProof),
             "EquivocationProof must use Noise"
-        );
-
-        // MPC params transfer (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::MpcParametersRequest),
-            "MpcParametersRequest must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::MpcParametersResponse),
-            "MpcParametersResponse must use Noise"
         );
 
         // Share shard (MUST use Noise — the shard IS the payout ledger)

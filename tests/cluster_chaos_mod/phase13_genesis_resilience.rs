@@ -378,21 +378,6 @@ async fn genesis_08_full_restore_and_consistency() {
         heights
     );
 
-    // MPC consistent
-    let mut mpc_counts = Vec::new();
-    for ip in config.all_ips() {
-        if let Ok(c) = client.get_mpc_contribution_count(ip).await {
-            mpc_counts.push(c);
-        }
-    }
-    if mpc_counts.len() == config.nodes.len() {
-        let first = mpc_counts[0];
-        for c in &mpc_counts {
-            assert_eq!(*c, first, "Post dual-kill MPC mismatch: {:?}", mpc_counts);
-        }
-        println!("  MPC contributions consistent: {}", first);
-    }
-
     // Zero panics
     for node in &config.nodes {
         let panics =

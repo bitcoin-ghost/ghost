@@ -381,30 +381,6 @@ min_payout_sats = 100000
 payout_interval_blocks = 100
 
 # =============================================================================
-# [ghost_pay] - Ghost Pay L2 Instant Payments
-# =============================================================================
-[ghost_pay]
-
-# Enable Ghost Pay L2 layer
-# Provides instant off-chain payments with periodic L1 settlement
-# Options: true | false
-# Default: false
-# MUTABLE: Can be changed via dashboard API (triggers graceful restart)
-enabled = true
-
-# Virtual block time in seconds
-# L2 processes transactions every N seconds
-# Options: 1-3600
-# Default: 10
-virtual_block_secs = 10
-
-# Epoch length in virtual blocks
-# L2 settles to L1 after each epoch
-# Options: 1-100000
-# Default: 2160 (~6 hours at 10s blocks)
-epoch_blocks = 2160
-
-# =============================================================================
 # Environment Variables Reference
 # =============================================================================
 #

@@ -54,7 +54,6 @@ ghost-consensus = { workspace = true }
 ghost-accounting = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-verification = { workspace = true }
-ghost-glyph = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -105,15 +104,6 @@ secp256k1 = { version = "0.28.2", features = ["rand"] }
 rand = "0.8"
 
 [features]
-# Both ZK consensus and MPC ceremony enabled by default
-# ZK parameter generation is deferred to background task to avoid blocking startup
-default = ["zk-consensus", "mpc-ceremony"]
-# Enable ZK consensus for block/payout proofs
-zk-consensus = ["ghost-consensus/zk-consensus", "ghost-zkp"]
-# Enable MPC ceremony for ZK parameter generation
-mpc-ceremony = ["ghost-consensus/mpc-ceremony", "ghost-mpc"]
-# Use MPC ceremony parameters for ZK proofs (required for mainnet)
-zk-production = ["ghost-zkp/zk-production"]
 # Heap profiling. OFF by default and adds nothing to a normal build — it swaps in jemalloc
 # with profiling compiled in, which is inert until enabled at runtime via MALLOC_CONF.
 # Used to find what holds ghost-mining's ~2.2GB steady-state working set (see issue #418).
@@ -122,14 +112,6 @@ heap-profiling = ["dep:tikv-jemallocator"]
 [dependencies.tikv-jemallocator]
 version = "0.6"
 features = ["profiling", "unprefixed_malloc_on_supported_platforms"]
-optional = true
-
-[dependencies.ghost-zkp]
-workspace = true
-optional = true
-
-[dependencies.ghost-mpc]
-workspace = true
 optional = true
 
 [dev-dependencies]

@@ -109,8 +109,10 @@ pub struct NodeConfig {
     pub storage: StorageConfig,
     /// Pool configuration (treasury, fees)
     pub pool: PoolConfig,
-    /// Ghost Pay L2 configuration (optional)
-    pub ghost_pay: Option<GhostPayConfig>,
+    /// Retired `[ghost_pay]` section (Ghost Pay was removed), accepted with whatever keys it
+    /// carries so older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "ghost_pay")]
+    pub retired_ghost_pay: Option<IgnoredAny>,
     /// Reaper configuration (dead code detection in witness scripts)
     #[serde(default)]
     pub reaper: ReaperSettings,
@@ -350,19 +352,6 @@ impl ConfigValidationResult {
 }
 
 impl NodeConfig {
-    /// Whether a local ghost-pay L2 daemon is enabled on this node.
-    ///
-    /// Ghost Pay counts as enabled only when the `[ghost_pay]` block is present
-    /// AND its `enabled` flag is true. Pool-only nodes carry a `[ghost_pay]`
-    /// block (setup emits one by default) but with `enabled = false` and never
-    /// run the ghost-pay daemon, so the block's mere presence must NOT be read
-    /// as "ghost-pay is running here". This mirrors `validate_ghost_pay`, which
-    /// likewise treats `enabled = false` as off, and is the single source of
-    /// truth for whether ghost-mining should talk to a local ghost-pay.
-    pub fn ghost_pay_enabled(&self) -> bool {
-        self.ghost_pay.as_ref().is_some_and(|gp| gp.enabled)
-    }
-
     /// Reconcile the mutually-exclusive Ghost Mode / Public Mining pair.
     ///
     /// A Ghost Mode node suppresses the peer transaction-relay path, so its
@@ -415,11 +404,6 @@ impl NodeConfig {
 
         // Validate signer configuration
         self.validate_signer(&mut result);
-
-        // Validate Ghost Pay configuration (if enabled)
-        if let Some(ref gp) = self.ghost_pay {
-            self.validate_ghost_pay(gp, &mut result);
-        }
 
         // CRITICAL: Validate mainnet security requirements (no overrides allowed)
         self.validate_mainnet_security(&mut result);
@@ -966,28 +950,6 @@ impl NodeConfig {
                     "KMS signer is not yet implemented. Use type = \"local\".",
                 );
             }
-        }
-    }
-
-    fn validate_ghost_pay(&self, gp: &GhostPayConfig, result: &mut ConfigValidationResult) {
-        if !gp.enabled {
-            return;
-        }
-
-        // Virtual block time
-        if gp.virtual_block_secs == 0 {
-            result.add_error("ghost_pay.virtual_block_secs", "Cannot be 0");
-        }
-        if gp.virtual_block_secs < 10 {
-            result.add_warning(
-                "ghost_pay.virtual_block_secs",
-                "Very short virtual block time may cause issues",
-            );
-        }
-
-        // Epoch blocks
-        if gp.epoch_blocks == 0 {
-            result.add_error("ghost_pay.epoch_blocks", "Cannot be 0");
         }
     }
 
@@ -1803,37 +1765,6 @@ impl StorageConfig {
     }
 }
 
-/// Ghost Pay L2 configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GhostPayConfig {
-    /// Enable Ghost Pay
-    pub enabled: bool,
-    /// Virtual block time (seconds)
-    pub virtual_block_secs: u64,
-    /// Epoch length (virtual blocks)
-    pub epoch_blocks: u64,
-    /// Operator payout address for GhostPay L2 settlements (None = unset)
-    #[serde(default)]
-    pub payout_address: Option<String>,
-    /// Retired `wraith_enabled` key, accepted so older installed configs still
-    /// load. Never written back.
-    #[serde(default, skip_serializing, rename = "wraith_enabled")]
-    pub retired_wraith_enabled: Option<IgnoredAny>,
-}
-
-impl Default for GhostPayConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            virtual_block_secs: L2_VIRTUAL_BLOCK_SECS,
-            epoch_blocks: L2_EPOCH_BLOCKS,
-            payout_address: None,
-            retired_wraith_enabled: None,
-        }
-    }
-}
-
 /// Reaper settings for dead code detection in witness scripts
 ///
 /// Controls filtering of transactions that contain inscriptions, data stuffing,
@@ -2558,11 +2489,10 @@ pub struct PoolConfig {
     /// If not set, auto-derives from pool_name or mining_mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinbase_extra: Option<String>,
-    /// Optional password required for --genesis flag. When set in the config,
-    /// the operator must also pass --genesis-password on the CLI for genesis to proceed.
-    /// Prevents accidental dual-genesis if someone mistakenly runs --genesis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub genesis_password: Option<String>,
+    /// Retired `genesis_password` key (it guarded the removed MPC genesis), accepted so
+    /// older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "genesis_password")]
+    pub retired_genesis_password: Option<IgnoredAny>,
     /// Block-priority lever: `max_fee` (default) orders the block by package fee
     /// rate; `payments_first` seats BUDS financial txs (T0/T1) ahead of data txs
     /// (T2/T3). Additive with `#[serde(default)]` so existing pool.toml files
@@ -2636,7 +2566,7 @@ impl Default for PoolConfig {
             node_payout_address: None,
             pool_name: None,
             coinbase_extra: None,
-            genesis_password: None,
+            retired_genesis_password: None,
             block_priority: BlockPriority::default(),
             template_refresh_secs: None,
         }
@@ -2852,66 +2782,6 @@ mod tests {
         assert!(!parsed.mempool_congestion && !parsed.fee_spike && !parsed.failed_login);
         // Untouched events keep their default-ON.
         assert!(parsed.node_offline && parsed.block_found);
-    }
-
-    #[test]
-    fn test_ghost_pay_enabled_predicate() {
-        // Pool-only node: no [ghost_pay] block at all → not enabled.
-        let mut config = NodeConfig::default();
-        assert!(config.ghost_pay.is_none());
-        assert!(
-            !config.ghost_pay_enabled(),
-            "absent [ghost_pay] must read as disabled"
-        );
-
-        // Pool-only node: [ghost_pay] block present but enabled = false
-        // (this is exactly what `setup` writes via GhostPayConfig::default()).
-        // The block's presence must NOT be mistaken for a running ghost-pay.
-        config.ghost_pay = Some(GhostPayConfig::default());
-        assert!(!config.ghost_pay.as_ref().unwrap().enabled);
-        assert!(
-            !config.ghost_pay_enabled(),
-            "[ghost_pay] with enabled = false must read as disabled"
-        );
-
-        // Core node: ghost-pay actually enabled.
-        config.ghost_pay = Some(GhostPayConfig {
-            enabled: true,
-            ..GhostPayConfig::default()
-        });
-        assert!(
-            config.ghost_pay_enabled(),
-            "[ghost_pay] with enabled = true must read as enabled"
-        );
-    }
-
-    #[test]
-    fn test_ghost_pay_enabled_from_toml() {
-        // The `enabled` flag round-trips through TOML: a pool-only node writes
-        // `enabled = false`, a core node `enabled = true`. Deserialise the
-        // [ghost_pay] block in isolation to confirm the flag is what the
-        // predicate keys off (NodeConfig sections other than reaper/coordinator
-        // aren't serde(default), so we parse the sub-struct directly).
-        let pool_only: GhostPayConfig = toml::from_str(
-            "enabled = false\nvirtual_block_secs = 10\nepoch_blocks = 2160\nwraith_enabled = true\n",
-        )
-        .unwrap();
-        assert!(!pool_only.enabled);
-
-        let core: GhostPayConfig = toml::from_str(
-            "enabled = true\nvirtual_block_secs = 10\nepoch_blocks = 2160\nwraith_enabled = true\n",
-        )
-        .unwrap();
-        assert!(core.enabled);
-
-        let mut config = NodeConfig {
-            ghost_pay: Some(pool_only),
-            ..Default::default()
-        };
-        assert!(!config.ghost_pay_enabled());
-        // The reassignment is the test: same node, block swapped for an enabled one.
-        config.ghost_pay = Some(core);
-        assert!(config.ghost_pay_enabled());
     }
 
     #[test]
