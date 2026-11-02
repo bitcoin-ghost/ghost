@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { StepIndicator } from "@/components/ui/Wizard";
 import { useToast } from "@/components/ui/Toast";
-import { ToggleRow, StatusRow } from "../shared";
+import { StatusRow } from "../shared";
 import { CapabilityToggles } from "@/components/settings/CapabilityToggles";
 import ReaperWizard from "../wizards/ReaperWizard";
 import {
@@ -17,7 +17,6 @@ import {
   useConfig,
   useFullConfig,
   useGhostPayStatus,
-  useSetWraith,
   useSetPolicyProfile,
 } from "@/hooks/queries";
 import type { PolicyProfileType } from "@/lib/api/config";
@@ -63,10 +62,9 @@ export default function OnboardingPage() {
   const { data: fullConfig } = useFullConfig();
   const { data: ghostPay } = useGhostPayStatus();
 
-  // Writes — Wraith mixing and the tier policy still live here; the five
-  // canonical capability rows are driven inside the shared CapabilityToggles
-  // component (the SAME hooks Settings › Capabilities uses).
-  const setWraith = useSetWraith();
+  // Writes — the tier policy still lives here; the five canonical capability
+  // rows are driven inside the shared CapabilityToggles component (the SAME
+  // hooks Settings › Capabilities uses).
   const setPolicyProfile = useSetPolicyProfile();
 
   // Composed wizard state.
@@ -74,16 +72,6 @@ export default function OnboardingPage() {
 
   const activePolicyProfile = String(fullConfig?.policy?.profile ?? "permissive");
   const ghostPayRunning = Boolean(ghostPay?.l2_height);
-  const wraithEnabled = ghostPay?.wraith_enabled ?? false;
-
-  const handleWraithToggle = async (enabled: boolean) => {
-    try {
-      await setWraith.mutateAsync(enabled);
-      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-mining to apply`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
 
   const handleActivatePreset = async (name: PolicyProfileType) => {
     try {
@@ -177,22 +165,9 @@ export default function OnboardingPage() {
             {/*
              * The five reward capabilities share their markup + hooks with
              * Settings › Capabilities. Onboarding presents Ghost Pay as an
-             * editable toggle and slots its Wraith mixing control in right
-             * after it.
+             * editable toggle.
              */}
-            <CapabilityToggles
-              ghostPayControl="toggle"
-              afterGhostPay={
-                <ToggleRow
-                  label="Wraith Mixing"
-                  description="Let any L2 participant initiate a CoinJoin session through this node. Off means this node won't take part in mixing. Not a reward capability — a restart applies the change."
-                  enabled={wraithEnabled}
-                  onChange={handleWraithToggle}
-                  disabled={setWraith.isPending}
-                  badge={wraithEnabled ? <Badge variant="info">Mixing On</Badge> : null}
-                />
-              }
-            />
+            <CapabilityToggles ghostPayControl="toggle" />
           </div>
         </Card>
       )}

@@ -1355,11 +1355,6 @@ pub struct VerificationState {
     /// Reported by the public status/info endpoints so the dashboard and
     /// wallets see the node's real chain instead of a hardcoded default.
     pub network: ghost_common::config::BitcoinNetwork,
-    /// Operator's Wraith-mixing on/off choice, from `[ghost_pay] wraith_enabled`.
-    /// Reported by the public status endpoints so the dashboard reflects the
-    /// node's actual setting — NOT ghost-pay's internal "hosts CoinJoin sessions"
-    /// signal, which is always false since mixing moved to wraith-coordinator.
-    pub wraith_enabled: bool,
     /// Node identity for signing responses
     identity: Option<Arc<NodeIdentity>>,
     /// Policy engine
@@ -1881,9 +1876,6 @@ impl VerificationState {
             // Defaults to Signet (the historical hardcoded value); production
             // ghost-mining overrides this via `with_network` from pool.toml.
             network: ghost_common::config::BitcoinNetwork::Signet,
-            // Defaults to off; production ghost-mining overrides this via
-            // `with_wraith_enabled` from the `[ghost_pay]` config block.
-            wraith_enabled: false,
             identity: None,
             policy_engine: parking_lot::Mutex::new(PolicyEngine::new(policy_profile)),
             capabilities,
@@ -2500,12 +2492,6 @@ impl VerificationState {
         self
     }
 
-    /// Set the operator's Wraith-mixing setting reported by the status endpoints.
-    pub fn with_wraith_enabled(mut self, wraith_enabled: bool) -> Self {
-        self.wraith_enabled = wraith_enabled;
-        self
-    }
-
     /// Sign a response payload using node identity
     ///
     /// Returns a SignedResponse wrapper if identity is configured, otherwise returns None.
@@ -2821,8 +2807,8 @@ impl VerificationState {
         self
     }
 
-    /// Coordinator-election snapshot for `/api/v1/pool/coordinator`, or
-    /// `{enabled:false}` when the feature is off / not wired. Read-only.
+    /// Coordinator status attested by `/verify/coordinator`. Nothing sets it since the
+    /// Wraith election was removed, so it reads `{enabled:false}` unless a test wires one.
     pub fn coordinator_status(&self) -> serde_json::Value {
         self.get_coordinator_status
             .as_ref()
@@ -2830,8 +2816,7 @@ impl VerificationState {
             .unwrap_or_else(|| serde_json::json!({ "enabled": false }))
     }
 
-    /// Set the coordinator-election snapshot callback (pre-serialized JSON to
-    /// avoid a reverse-dependency on `wraith-protocol`/`ghost-mining`).
+    /// Set the coordinator status callback (pre-serialized JSON).
     pub fn with_coordinator_status(
         mut self,
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,

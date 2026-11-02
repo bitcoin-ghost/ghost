@@ -272,13 +272,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/pool/mesh-leaderboard",
             get(api_pool_mesh_leaderboard_handler),
         )
-        // Read-only decentralised-coordinator election view. Returns
-        // `{enabled:false}` unless the operator turns on
-        // `[coordinator] wraith_election_enabled`.
-        .route(
-            "/api/v1/pool/coordinator",
-            get(api_pool_coordinator_handler),
-        )
         // Treasury + decentralisation-phase state for the Core page.
         // Exposes balance / 21-BTC threshold / decay year / fee split so
         // the website can render the Bootstrap → Decentralising →
@@ -335,7 +328,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         // `/api/v1/payments` moved to `internal_router` — it emits payout addresses and txids.
         .route("/api/v1/backup/history", get(api_backup_history_handler))
-        .route("/api/v1/wraith/sessions", get(api_wraith_sessions_handler))
         .route("/api/v1/network/elder", get(api_network_elder_handler))
         .route(
             "/api/v1/network/public-nodes",
@@ -396,7 +388,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/config/ghost_pay",
             get(api_config_ghost_pay_handler),
         )
-        .route("/api/v1/config/wraith", get(api_config_wraith_handler))
         .route("/api/v1/config/elder", get(api_config_elder_handler))
         .route(
             "/api/v1/config/operator_window",
@@ -624,10 +615,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
-        )
-        .route(
-            "/api/v1/config/wraith",
-            post(api_config_wraith_post_handler),
         )
         .route("/api/v1/config/elder", post(api_config_elder_post_handler))
         // M-14: Miner stats endpoint moved here to require HMAC authentication
@@ -4299,12 +4286,6 @@ async fn api_ghostpay_status_handler(
         "peer_count": health.peer_count,
         "uptime_secs": health.uptime_secs,
         "sync_state": gp.sync_state,
-        // Operator's Wraith setting from config — the user-facing "is Wraith
-        // enabled on this node" flag the dashboard's L2 card reads. Sourced
-        // from `[ghost_pay] wraith_enabled`, NOT ghost-pay's internal host flag
-        // (`gp.wraith_enabled`), which is always false since mixing moved to
-        // the wraith-coordinator binary and would misreport the operator's choice.
-        "wraith_enabled": state.wraith_enabled,
         // Retained internal signal: whether the ghost-pay process itself hosts
         // CoinJoin sessions (always false post-wraith-coordinator split).
         "ghostpay_hosts_mixing": gp.wraith_enabled,
@@ -5792,45 +5773,6 @@ async fn api_backup_history_handler(
         "backups": backups,
         "total": total,
         "backup_dir": canonical_backup_dir.to_string_lossy()
-    }))
-}
-
-/// API v1 Wraith sessions handler (Ghost Pay sessions)
-async fn api_wraith_sessions_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Query database for active wraith rounds if available
-    let (sessions, active_count, total_participants) = if let Some(ref db) = state.database {
-        let rounds = db.get_active_wraith_rounds().unwrap_or_default();
-        let active = rounds.len();
-        let participants: u32 = rounds.iter().map(|r| r.participant_count).sum();
-        let sessions_json: Vec<_> = rounds
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "round_id": r.round_id,
-                    "denomination": r.denomination,
-                    "amount_sats": r.amount_sats,
-                    "participant_count": r.participant_count,
-                    "phase": format!("{:?}", r.phase),
-                    "registration_deadline": r.registration_deadline
-                })
-            })
-            .collect();
-        (sessions_json, active, participants)
-    } else {
-        (vec![], 0, 0)
-    };
-
-    Json(serde_json::json!({
-        "sessions": sessions,
-        "total": sessions.len(),
-        "active": active_count,
-        "active_sessions": active_count,
-        "sessions_completed": 0,
-        "total_sessions": sessions.len(),
-        "sessions_expired": 0,
-        "total_participants": total_participants
     }))
 }
 
@@ -8925,63 +8867,6 @@ async fn api_config_ghost_pay_post_handler(
         "success": true,
         "enabled": payload.enabled,
         "message": "Ghost Pay updated"
-    }))
-}
-
-/// API v1 Config wraith GET handler — reports the operator's Wraith-mixing
-/// on/off choice (`[ghost_pay] wraith_enabled`). Prefers the persisted node
-/// config and falls back to the in-memory mirror surfaced by the status
-/// endpoints.
-async fn api_config_wraith_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let enabled = state
-        .full_node_config
-        .as_ref()
-        .map(|c| c.read().wraith_enabled())
-        .unwrap_or(state.wraith_enabled);
-    Json(serde_json::json!({
-        "enabled": enabled,
-        "message": "Wraith mixing configuration"
-    }))
-}
-
-/// API v1 Config wraith POST handler — sets `[ghost_pay] wraith_enabled` in the
-/// node config (pool.toml) and persists it, mirroring the reaper/ghost_pay
-/// toggles. The wraith flag is read at startup, so a ghost-mining restart applies
-/// the change. Enabling lets any L2 participant initiate a CoinJoin session;
-/// disabling means this node won't participate in mixing.
-async fn api_config_wraith_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ToggleRequest>,
-) -> impl IntoResponse {
-    let mut persisted = false;
-    if let Some(ref full) = state.full_node_config {
-        let mut cfg = full.write();
-        cfg.ghost_pay
-            .get_or_insert_with(Default::default)
-            .wraith_enabled = payload.enabled;
-        if let Some(ref path) = state.full_node_config_path {
-            match cfg.save_atomic(path) {
-                Ok(()) => persisted = true,
-                Err(e) => error!(error = %e, "Failed to persist wraith config"),
-            }
-        }
-    }
-    // The wraith flag is read from config at startup; a restart applies it.
-    if persisted {
-        state.request_restart();
-    }
-    Json(serde_json::json!({
-        "success": true,
-        "persisted": persisted,
-        "enabled": payload.enabled,
-        "restart_required": true,
-        "message": if persisted {
-            "Wraith mixing updated; ghost-mining will restart to apply."
-        } else {
-            "Wraith setting received but no node config path is configured — changes were not persisted."
-        },
     }))
 }
 
@@ -12802,18 +12687,6 @@ async fn api_self_check_handler(State(state): State<Arc<VerificationState>>) -> 
     Json(state.self_check())
 }
 
-/// Read-only decentralised-coordinator election view
-/// (`tasks/plan_decentralised_coordinators.md`). Returns
-/// `{enabled, epoch, tiers, coordinators, my_tiers, my_endpoint, beacon, roster, …}`
-/// when the operator has turned on `[coordinator] wraith_election_enabled`,
-/// else `{enabled:false}`.
-/// This endpoint activates nothing — it only reports the public election draw.
-async fn api_pool_coordinator_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(state.coordinator_status())
-}
-
 /// Detect whether the operator has installed the per-node mempool.space stack
 /// on this VM. The stack is opt-in (extra ~2 GB RAM, ~50 GB disk), so most
 /// nodes won't have it — that's fine. Detection is deliberately cheap:
@@ -14183,88 +14056,6 @@ mod tests {
         assert_eq!(network_field(default_state).await, "signet");
     }
 
-    /// Regression: the ghostpay status endpoint's `wraith_enabled` must reflect
-    /// the operator's `[ghost_pay] wraith_enabled` config choice, not ghost-pay's
-    /// internal "hosts CoinJoin sessions" flag (always false since mixing moved
-    /// to wraith-coordinator). Nodes with wraith_enabled = true were reporting
-    /// false, so the dashboard L2 card showed Wraith "Not enabled" when it was.
-    #[tokio::test]
-    async fn test_ghostpay_status_reports_configured_wraith() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        async fn wraith_field(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
-            let app = super::create_router(state);
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri("/api/v1/ghostpay/status")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
-
-        let make_state = |wraith_enabled| {
-            let state = crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_wraith_enabled(wraith_enabled);
-            // Force the fast in-process path (no ghostpay handler wired in tests)
-            // so the handler does not fall through to the 8800 network probe.
-            state.dashboard_config.write().ghost_pay = false;
-            Arc::new(state)
-        };
-
-        // Operator enabled Wraith → status must report true.
-        let enabled = wraith_field(make_state(true)).await;
-        assert_eq!(
-            enabled["wraith_enabled"].as_bool(),
-            Some(true),
-            "config wraith_enabled = true must surface as wraith_enabled: true"
-        );
-        // The internal host-mixing signal stays distinct and false.
-        assert_eq!(
-            enabled["ghostpay_hosts_mixing"].as_bool(),
-            Some(false),
-            "ghost-pay no longer hosts mixing; host flag must stay false"
-        );
-
-        // Operator disabled Wraith → status must report false.
-        let disabled = wraith_field(make_state(false)).await;
-        assert_eq!(
-            disabled["wraith_enabled"].as_bool(),
-            Some(false),
-            "config wraith_enabled = false must surface as wraith_enabled: false"
-        );
-
-        // Default (no with_wraith_enabled) preserves the historical off value.
-        let default_state = {
-            let state = crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            );
-            state.dashboard_config.write().ghost_pay = false;
-            Arc::new(state)
-        };
-        assert_eq!(
-            wraith_field(default_state).await["wraith_enabled"].as_bool(),
-            Some(false)
-        );
-    }
-
     /// The reaper config POST must auto-apply the ghostd mempool reaper: it
     /// persists the config, then runs `ghost-setup apply-reaper` in the
     /// background and sequences the pool restart after. This exercises both the
@@ -14492,76 +14283,6 @@ mod tests {
             "Config POST with valid auth should succeed"
         );
         std::env::remove_var("GHOST_REAPER_APPLY_TEST_MODE");
-    }
-
-    /// The wraith toggle POST must persist `[ghost_pay] wraith_enabled` to the
-    /// node config on disk so the operator's choice survives a restart. Mirrors
-    /// the reaper toggle's persistence path.
-    #[tokio::test]
-    async fn test_config_wraith_post_persists_to_node_config() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
-        );
-
-        let post_wraith = |enabled: bool| {
-            let app = super::create_router(Arc::clone(&state));
-            let auth = auth.clone();
-            async move {
-                let body = format!(r#"{{"enabled": {enabled}}}"#);
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let signature = auth.sign(timestamp, body.as_bytes());
-                let response = app
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/api/v1/config/wraith")
-                            .header("Content-Type", "application/json")
-                            .header("X-Ghost-Signature", signature)
-                            .header("X-Ghost-Timestamp", timestamp.to_string())
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap();
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-            }
-        };
-
-        // Disable → persisted to disk and reflected in the loaded config.
-        let off = post_wraith(false).await;
-        assert_eq!(off["persisted"].as_bool(), Some(true));
-        assert_eq!(off["enabled"].as_bool(), Some(false));
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert!(!reloaded.wraith_enabled(), "disable must persist to disk");
-
-        // Re-enable → persisted true.
-        let on = post_wraith(true).await;
-        assert_eq!(on["persisted"].as_bool(), Some(true));
-        assert_eq!(on["enabled"].as_bool(), Some(true));
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert!(reloaded.wraith_enabled(), "enable must persist to disk");
     }
 
     /// The policy_profile POST is the real lever for mined BUDS tiers: without
@@ -15574,7 +15295,6 @@ mod tests {
             "/api/v1/config/public_mining",
             "/api/v1/config/reaper",
             "/api/v1/config/ghost_pay",
-            "/api/v1/config/wraith",
             "/api/v1/config/elder",
             "/api/v1/config/operator_window",
         ];

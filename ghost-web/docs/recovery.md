@@ -241,58 +241,6 @@ sqlite3 /home/ghost/.ghost/ghost.db \
 
 All peers should appear with `last_seen` in the last minute.
 
-## 7. Stuck Wraith session
-
-**Impact:** Session participants' funds are locked in the mixing output. Privacy story is preserved; recovery is the operator's job.
-
-**Detect:**
-
-- ghost-pay logs: session started but no completion after the configured timeout.
-- User reports: "my Wraith deposit is stuck".
-
-**Diagnose:**
-
-```bash
-sqlite3 /home/ghost/.ghost/ghost-pay/ghost-pay.db \
-  "SELECT session_id, status, created_at, participant_count
-   FROM wraith_sessions
-   WHERE status NOT IN ('completed', 'failed')
-   ORDER BY created_at DESC"
-```
-
-**Recover:**
-
-1. Identify the funding UTXO:
-
-   ```bash
-   sqlite3 /home/ghost/.ghost/ghost-pay/ghost-pay.db \
-     "SELECT funding_txid, funding_vout, amount_sats
-      FROM wraith_session_inputs
-      WHERE session_id = '<SESSION_ID>'"
-   ```
-
-2. Check if it's still unspent on chain:
-
-   ```bash
-   ghost-cli gettxout <TXID> <VOUT>
-   ```
-
-3. If unspent, the session coordinator constructs a recovery transaction spending the funding UTXO back to participants using the known session keys. The ghost-pay binary exposes a `wraith recover --session-id <ID>` subcommand that builds and broadcasts the refund transaction; run it on the coordinator node (or any elder with read access to the same `ghost-pay.db`).
-
-4. If the coordinator was on the crashed node, any other elder with access to the session DB can take over recovery.
-
-5. Mark the session failed:
-
-   ```bash
-   sqlite3 /home/ghost/.ghost/ghost-pay/ghost-pay.db \
-     "UPDATE wraith_sessions SET status='failed' WHERE session_id='<SESSION_ID>'"
-   ```
-
-**Prevention:**
-
-- ghost-pay's graceful shutdown now includes `db.checkpoint()` to flush WAL.
-- Session timeout auto-fails sessions that don't complete within the configured window.
-
 ## Backup posture (do this before you need it)
 
 | What | Script | Schedule | Retention |

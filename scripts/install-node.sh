@@ -83,13 +83,6 @@ MINING_MODE="public_pool"
 POOL_NAME=""
 REAPER="true"
 ARCHIVE="false"
-# Wraith mixing coordinator. Empty = "auto": ON when Ghost Pay is on, OFF
-# otherwise. --wraith / --no-wraith
-# pin it explicitly.
-WRAITH=""
-# Where a coordinator's per-round service fee lands. Deliberately has NO default —
-# see the [coordinator] block and the validation below.
-COORDINATOR_FEE_ADDRESS=""
 # Tor. OFF by default — a plain clearnet install is completely unchanged.
 #   hybrid   (--tor)      reach outbound peers via Tor AND stay reachable on
 #                         clearnet 8333, plus publish an ephemeral v3 onion.
@@ -152,13 +145,6 @@ Options:
                                 one on the command line wins.
   --no-reaper                 Don't run the mempool reaper    (capability -2)
   --archive                   Full archive node (~720GB, capability +5)
-  --wraith                    Run a Wraith mixing coordinator (needs
-                                --coordinator-fee-address)
-  --coordinator-fee-address <bc1p…>
-                              Where the coordinator's round fee is paid. Required
-                                with --wraith; a mainnet P2TR address that is NOT
-                                the payout address.
-  --no-wraith                 Never run a Wraith mixing coordinator (default)
   --tor                       Route over Tor (hybrid): outbound peers via Tor +
                                 publish an onion, still reachable on clearnet 8333
   --tor-only                  Route over Tor ONLY: no clearnet (onlynet=onion),
@@ -214,9 +200,6 @@ while [[ $# -gt 0 ]]; do
     --no-public-mining) MINING_MODE="private_solo"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --wraith)         WRAITH="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --coordinator-fee-address) COORDINATOR_FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --no-wraith)      WRAITH="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor)            TOR="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor-only)       TOR="true"; TOR_MODE="tor-only"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-tor)         TOR="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -389,26 +372,6 @@ run_wizard() {
   echo "Capabilities (each affects your node's reward share):"
   REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions (+2 path)?" Y)"
   ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk (+5 shares)?" N)"
-  # Wraith mixing coordinator. It used to be gated behind Ghost Pay, which held
-  # the bond escrow it once needed; bonds are gone and so is Ghost Pay, so it
-  # now stands on its own. Off by default: running a coordinator is a
-  # commitment to be online, not a capability box to tick.
-  WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator?" N)"
-  if [[ "$WRAITH" == "true" ]]; then
-    echo "  A coordinator earns a per-round service fee. This must be a FRESH taproot"
-    echo "  address, not your payout address: the payout address is public, so paying"
-    echo "  round fees to it would mark every round you coordinate as yours."
-    while :; do
-      read -rp "  Coordinator fee address (bc1p…): " cfa
-      if [[ ! "$cfa" =~ ^bc1p[a-z0-9]{20,}$ ]]; then
-        echo "  ✗ Must be a mainnet taproot address starting 'bc1p…'."
-      elif [[ "$cfa" == "$PAYOUT_ADDRESS" ]]; then
-        echo "  ✗ That is your payout address. It is public — using it would identify every round."
-      else
-        COORDINATOR_FEE_ADDRESS="$cfa"; break
-      fi
-    done
-  fi
 
   # Tor. Off by default. Hybrid keeps clearnet reachability AND adds an onion;
   # tor-only routes everything over Tor and drops clearnet.
@@ -447,7 +410,6 @@ run_wizard() {
     echo "  Miner password : (generated automatically — shown when install completes)"
   echo "  Reaper         : $REAPER"
   echo "  Archive node   : $ARCHIVE"
-  echo "  Wraith mixing  : $WRAITH"
   echo "  Tor            : $([[ "$TOR" == "true" ]] && echo "$TOR_MODE" || echo "off")"
   echo "  Auto-update    : $AUTO_UPDATE"
   echo "  Backups        : $BACKUPS"
@@ -510,22 +472,6 @@ fi
 [[ -n "$TREASURY_ADDRESS" ]] || { usage; err "--treasury-address is required."; }
 [[ "$TREASURY_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Treasury address doesn't look like a mainnet bech32 address."
 
-# A coordinator's fee address is asked for, never inferred.
-#
-# It used to default to the node's payout address, and that is a privacy leak,
-# not a convenience: a payout address is PUBLIC — it receives this node's mining
-# income on chain — so a round paying it is instantly identifiable as a Wraith
-# round AND attributable to the node that coordinated it. That is the `WL01`
-# marker (#695) rebuilt out of an address.
-#
-# P2TR specifically: every mixed output in a round is taproot (#696), so a
-# bech32v0 fee output is the one output in the transaction that does not look
-# like the others.
-if [[ "$WRAITH" == "true" ]]; then
-  [[ -n "$COORDINATOR_FEE_ADDRESS" ]] || err "--coordinator-fee-address is required with --wraith. A coordinator without one is seated and refuses every round (503 fee_address_not_configured), and it must NOT be the node's payout address — that address is public, so paying it makes every round identifiable and attributable."
-  [[ "$COORDINATOR_FEE_ADDRESS" =~ ^bc1p[a-z0-9]{20,}$ ]] || err "Coordinator fee address must be a mainnet P2TR address (bc1p…). Round outputs are all taproot (#696); a different script type singles the fee output out."
-  [[ "$COORDINATOR_FEE_ADDRESS" != "$PAYOUT_ADDRESS" ]] || err "Coordinator fee address must not be the node's payout address. The payout address is public, so every round paying it is identifiable as a Wraith round and attributable to this node. Use a fresh address."
-fi
 [[ "$(uname -m)" == "x86_64" ]] || err "Only x86_64 is supported by this installer right now."
 case "$SYNC_MODE" in ibd) ;;
   haze) if [[ "$WIZARD_RAN" != "true" ]]; then
@@ -557,12 +503,6 @@ if [[ -n "$POOL_NAME" ]]; then
   else
     err "--pool-name must be printable ASCII (no control characters) and at most 30 characters."
   fi
-fi
-
-# Resolve the
-# "auto" default — track Ghost Pay — and pull Ghost Pay in when Wraith was asked
-if [[ -z "$WRAITH" ]]; then
-  WRAITH="false"
 fi
 
 # ────────────────────────────── 1. packages ──────────────────────────────────
@@ -917,16 +857,12 @@ shard_coinbase = true
 
 ${ALERTS_BLOCK}
 
-# ⚠ The section name is historical. Ghost Pay is retired and \`enabled\` is
-# hard-false; what still lives here is \`wraith_enabled\`, which is where
-# \`NodeConfig::wraith_enabled()\` reads the operator's mixing choice from.
-# Moving it to a section of its own is a config-schema change and therefore a
-# gated fleet roll, not an installer edit.
+# Ghost Pay is retired and \`enabled\` is hard-false. The section stays because
+# NodeConfig still reads it.
 [ghost_pay]
 enabled = false
 virtual_block_secs = 10
 epoch_blocks = 100
-wraith_enabled = ${WRAITH}
 
 # NOTE (#760): the keys removed from the blocks above and below were read by NOTHING. There is no
 # \`#[serde(deny_unknown_fields)]\` on NodeConfig, so they parsed, were discarded, and produced no
@@ -966,62 +902,6 @@ systemctl daemon-reload 2>/dev/null || true
 # If the dashboard is already running, restart it to pick up the aligned key
 # (safe: the dashboard is non-consensus). No-op when the unit isn't installed.
 systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart ghost-dashboard || true
-
-# Wraith mixing coordinator — the `[coordinator]` (CoordinatorConfig) keys
-# ghost-mining reads.
-#
-# The section is written on EVERY node, not only coordinating ones, because an
-# operator cannot opt in to a setting they cannot see. Nodes installed before
-# this had no `[coordinator]` block at all, so the only way to learn the option
-# existed was to read the source — and the live roster ended up with a single
-# member as a result.
-#
-# Opting in is two values:
-#   coordinator_enabled = true   → advertises the capability, so peers put this
-#                                  node in the roster and it can be drawn
-#   coordinator_role_enabled     → actually RUNS the coordinator when drawn
-#
-# Both default false. A node also needs:
-#   - `advertised_endpoint` reachable, or it is skipped when seats are drawn:
-#     a seat nobody can dial is worse than one seat fewer;
-#   - `coordinator_fee_address` set, or every Mix round refuses its inputs
-#     with 503 fee_address_not_configured — seated but unable to coordinate.
-#
-# Participation needs no bond — registration proves control of the input and a
-# disrupting coin goes into cooldown — so a coordinator needs only the node's
-# own ghostd RPC, which it already has.
-COORD_ENABLED=false
-COORD_ROLE=false
-if [[ "$WRAITH" == "true" ]]; then
-  COORD_ENABLED=true
-  COORD_ROLE=true
-fi
-cat >> /etc/ghost/pool.toml <<EOF
-
-[coordinator]
-# Take a coordinator seat when the per-epoch draw picks this node.
-# Set BOTH to true to opt in; see the install notes above.
-coordinator_enabled = ${COORD_ENABLED}
-coordinator_role_enabled = ${COORD_ROLE}
-# Compute and publish the election view (safe to leave on: read-only).
-wraith_election_enabled = true
-# Where wallets dial this node's coordinator. Must be reachable or the node
-# is skipped when seats are drawn. The 9100 firewall rule follows
-# coordinator_role_enabled automatically (ghost-mining-firewall).
-advertised_endpoint = "${PUBIP}:9100"
-coordinator_port = 9100
-# Destination for this coordinator's per-round service fee. NOT optional in
-# practice: a Mix round refuses every input with 503
-# fee_address_not_configured while this is unset, so a coordinator without
-# one is seated and cannot run a round.
-#
-# ⛔ This USED TO default to the node's payout address, and must never do so
-# again. A payout address is public — it receives this node's mining income on
-# chain — so a round paying it is instantly identifiable as a Wraith round and
-# attributable to the node that coordinated it. That is the WL01 marker (#695)
-# rebuilt out of an address. It is now a required, separate input.
-coordinator_fee_address = "${COORDINATOR_FEE_ADDRESS}"
-EOF
 
 # H-11: configs with secrets must be 0600.
 chown ghost:ghost /etc/bitcoin/bitcoin.conf /etc/ghost/pool.toml
@@ -1614,10 +1494,10 @@ ufw --force enable      >/dev/null 2>&1
 # service follows `mining_mode` in pool.toml, and a .path unit re-runs it
 # whenever the config changes — so toggling public mining later (dashboard /
 # ghost-setup / hand edit) updates the firewall live, with no manual ufw step.
-log "Installing mining-firewall reconcile (stratum + coordinator ports follow pool.toml)"
+log "Installing mining-firewall reconcile (stratum ports follow pool.toml)"
 cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'RECONCILE_MINING_FW_EOF'
 #!/usr/bin/env bash
-# Reconcile the Stratum and Wraith coordinator firewall ports to the node's config.
+# Reconcile the Stratum firewall ports to the node's config.
 #
 # Run by `ghost-mining-firewall.service`, triggered at boot and by
 # `ghost-mining-firewall.path` whenever pool.toml changes. Idempotent.
@@ -1666,26 +1546,15 @@ else
   logger -t ghost-mining-firewall "farm tier OFF -> Stratum 4444 CLOSED"
 fi
 
-# Wraith coordinator listen port (9100) follows [coordinator]
-# coordinator_role_enabled, exactly as the Stratum ports follow public mining.
-coord="no"
-if [[ -r "$CONF" ]] \
- && grep -qE '^[[:space:]]*coordinator_role_enabled[[:space:]]*=[[:space:]]*true([[:space:]]|$)' "$CONF" 2>/dev/null; then
-  coord="yes"
-fi
-if [[ "$coord" == "yes" ]]; then
-  ufw allow 9100/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "coordinator role ON -> Wraith 9100 OPEN"
-else
-  ufw delete allow 9100/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "coordinator role OFF -> Wraith 9100 CLOSED"
-fi
+# 9100 was the Wraith coordinator port. Nothing listens on it any more, so a rule
+# left open by an older install is closed.
+ufw delete allow 9100/tcp >/dev/null 2>&1 || true
 RECONCILE_MINING_FW_EOF
 chmod 755 /opt/ghost/bin/reconcile-mining-firewall.sh
 
 cat > /etc/systemd/system/ghost-mining-firewall.service <<'EOF'
 [Unit]
-Description=Ghost mining firewall reconcile (Stratum + Wraith coordinator ports follow pool.toml)
+Description=Ghost mining firewall reconcile (Stratum ports follow pool.toml)
 After=ufw.service network-online.target
 Wants=network-online.target
 [Service]
@@ -1697,7 +1566,7 @@ EOF
 
 cat > /etc/systemd/system/ghost-mining-firewall.path <<'EOF'
 [Unit]
-Description=Watch pool.toml and reconcile the Stratum + Wraith coordinator firewall on change
+Description=Watch pool.toml and reconcile the Stratum firewall on change
 [Path]
 PathModified=/etc/ghost/pool.toml
 Unit=ghost-mining-firewall.service

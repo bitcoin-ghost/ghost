@@ -272,13 +272,12 @@ run_all_tests() {
     test_endpoint "7.2" "/api/v1/rewards/full"              "$pool/api/v1/rewards/full"
     test_endpoint "7.3" "/api/v1/rewards/node-history"      "$pool/api/v1/rewards/node-history"
 
-    # ── Group 8: Privacy - Wraith/Shroud/Haze (3 endpoints) ─────────
+    # ── Group 8: Privacy - Shroud/Haze (2 endpoints) ────────────────
 
-    group_header 8 "Privacy (Wraith/Shroud/Haze)" 3
+    group_header 8 "Privacy (Shroud/Haze)" 2
 
-    test_endpoint "8.1" "/api/v1/wraith/sessions"           "$pool/api/v1/wraith/sessions"
-    test_endpoint "8.2" "/api/v1/shroud/status"             "$pool/api/v1/shroud/status"
-    test_endpoint "8.3" "/api/v1/haze/status"               "$pool/api/v1/haze/status"
+    test_endpoint "8.1" "/api/v1/shroud/status"             "$pool/api/v1/shroud/status"
+    test_endpoint "8.2" "/api/v1/haze/status"               "$pool/api/v1/haze/status"
 
     # ── Group 9: Reaper/Buds (2 endpoints) ───────────────────────────
 

@@ -1288,41 +1288,6 @@ mod combined_attacks {
 mod ghost_pay_l2 {
     use super::*;
 
-    /// Test: Wraith protocol output values don't overflow
-    #[test]
-    fn test_021_wraith_output_values_safe() {
-        // Wraith protocol uses fixed denominations
-        let denominations: Vec<i64> = vec![
-            1_000,       // 0.00001 BTC
-            10_000,      // 0.0001 BTC
-            100_000,     // 0.001 BTC
-            1_000_000,   // 0.01 BTC
-            10_000_000,  // 0.1 BTC
-            100_000_000, // 1 BTC
-        ];
-
-        for denom in &denominations {
-            // Max Wraith session with 100 participants
-            let max_participants = 100;
-            let total = *denom * max_participants;
-
-            assert!(
-                money_range(total),
-                "Wraith denomination {} * {} participants = {} should be in range",
-                denom,
-                max_participants,
-                total
-            );
-        }
-
-        // Even maximum denomination with maximum participants
-        let max_total = denominations.last().unwrap() * 100;
-        assert!(
-            max_total < MAX_MONEY,
-            "Max Wraith total should be well under MAX_MONEY"
-        );
-    }
-
     /// Test: Reconciliation batch can't have duplicate settlements
     #[test]
     fn test_022_reconciliation_no_duplicate_settlements() {

@@ -272,7 +272,7 @@ export default function GhostPayPage() {
             {capabilityQualified
               ? "Your node is verified as Ghost Pay-capable and shares in L2 fee distribution. "
               : "The +4 share counts at payout only once peer challenges qualify the capability. "}
-            L2 fee reference: transfers 10 sats + 0.1%, Wraith mix 1%. Fees accrue to the treasury pool and distribute to qualified nodes.{" "}
+            L2 fee reference: transfers 10 sats + 0.1%. Fees accrue to the treasury pool and distribute to qualified nodes.{" "}
             <a href="/capabilities" className="bare" style={{ color: "var(--accent)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)" }}>
               Capability detail →
             </a>

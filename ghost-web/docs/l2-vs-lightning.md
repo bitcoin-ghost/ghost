@@ -235,6 +235,5 @@ Most of these can coexist. A user who runs Lightning for daily commerce, holds l
 |---|---|
 | `bins/ghost-pay/src/` | Ghost Pay L2 implementation |
 | `crates/ghost-zkp/src/` | The three ZK circuits — see [ZK proofs](#zk) |
-| `crates/wraith-protocol/src/` | Privacy mixer for L2 entry — see [Wraith](#wraith) |
 | `crates/ghost-locks/src/` | The on-chain custody primitive — see [Locks](#locks) |
 | `crates/ghost-reconciliation/src/` | L2 → L1 settlement — see [Reconciliation](#reconciliation) |

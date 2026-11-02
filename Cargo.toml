@@ -35,11 +35,6 @@ members = [
     "crates/ghost-verification",
     "crates/ghost-np-relay",
     # Ghost Pay L2
-    "crates/ghost-keys",
-    "crates/ghost-lock",
-    "bins/ghost-lock-signer",
-    "crates/ghost-entropy",
-    "crates/wraith-protocol",
     "crates/ghost-reconciliation",
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
@@ -53,22 +48,10 @@ members = [
     "bins/ghost-pool",
     "bins/ghost-stats",
     "bins/ghost-cli",
-    # Wraith coordinator (Wraith Lite v1, single-round atomic CoinJoin)
-    "bins/wraith-coordinator",
     # Decentralised mining-discovery shim (miner-side; verifies the signed node-list checkpoint)
     "bins/ghost-miner-proxy",
     # Headless setup CLI
     "bins/ghost-setup",
-    # Mobile Apps
-    "apps/ghost-tap/core",
-    "apps/ghost-tap/tests/integration",
-    "apps/ghost-tap/desktop/src-tauri",
-    # Wraith Wallet (desktop)
-    "apps/wraith-wallet/core",
-    "apps/wraith-wallet/ipc",
-    "apps/wraith-wallet/daemon",
-    "apps/wraith-wallet/cli",
-    "apps/wraith-wallet/gui/src-tauri",
     # SV2 apps (amalgamated from the former sv2-apps submodule)
     "bins/translator-sv2",
     "bins/pool-sv2",
@@ -110,27 +93,14 @@ ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 ghost-np-relay = { path = "crates/ghost-np-relay" }
 # Ghost Pay L2 crates
-ghost-keys = { path = "crates/ghost-keys" }
-ghost-entropy = { path = "crates/ghost-entropy" }
-ghost-lock = { path = "crates/ghost-lock" }
-wraith-protocol = { path = "crates/wraith-protocol" }
-wraith-coordinator = { path = "bins/wraith-coordinator" }
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # ZK-BFT Infrastructure
 ghost-zkp = { path = "crates/ghost-zkp" }
 ghost-mpc = { path = "crates/ghost-mpc" }
 ghost-glyph = { path = "crates/ghost-glyph" }
 # GSP crates
-# Mobile Apps
-ghost-tap-core = { path = "apps/ghost-tap/core" }
-# Wraith Wallet
-wraith-wallet-core = { path = "apps/wraith-wallet/core" }
-wraith-wallet-ipc = { path = "apps/wraith-wallet/ipc" }
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
-# Cross-platform local IPC: Unix-domain sockets on unix, named pipes on Windows,
-# behind one API. Powers the wraithd <-> CLI/GUI transport.
-interprocess = { version = "2.2", features = ["tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -139,15 +109,11 @@ toml = "0.8"
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde"] }
-# BIP-322 generic message signing/verification, from the rust-bitcoin org.
-# Pinned: 0.0.x, and it tracks `bitcoin` closely.
-bip322 = "0.0.11"
 
 # Cryptography
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 sha2 = "0.10"
 hmac = "0.12"
-hkdf = "0.12"
 rand = "0.8"
 hex = "0.4"
 
@@ -194,15 +160,7 @@ base64 = "0.22"
 
 # Cryptography
 snow = "0.9"
-aes-gcm = "0.10"
 getrandom = "0.2"
-scrypt = "0.11"
-argon2 = "0.5"
-
-# BIP standards
-bip39 = "2.0"
-bip32 = { version = "0.6", features = ["alloc"] }
-secp256k1 = { version = "0.29", features = ["rand", "global-context", "serde"] }
 
 # JWT
 jsonwebtoken = "9.0"
@@ -220,13 +178,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 # Additional crypto
-k256 = { version = "0.14", features = ["ecdsa"] }
-bellperson = "0.26"
-blstrs = "0.7"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
-subtle = "2.5"
-ripemd = "0.1"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 secrecy = "0.8"
 
@@ -236,16 +189,8 @@ hyper = { version = "1.0", features = ["full"] }
 # Unix-specific
 libc = "0.2"
 
-# Dev dependencies
-tokio-test = "0.4"
-proptest = "1.4"
-
 # Encoding
 bech32 = "0.11"
-bs58 = "0.5"
-
-# FFI
-uniffi = "0.27"
 
 # Workspace-level package for integration tests
 [package]
@@ -267,7 +212,6 @@ ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-consensus = { workspace = true, features = ["test-utils", "zk-consensus"] }
 ghost-mining = { workspace = true }
-ghost-keys = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }
 ghost-zkp = { workspace = true }

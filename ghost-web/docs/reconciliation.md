@@ -184,7 +184,6 @@ The decay is the same shape as L1 block-subsidy decay, just running on L2 fees r
 
 | Layer | What it does | Doc |
 |---|---|---|
-| Wraith entry | Public BTC → fresh Ghost Locks via mixing | [Wraith](#wraith) |
 | L2 state | Off-chain transfers, balances, mixing | [Ghost Pay](#ghost-pay) |
 | **Settlement** | **L2 state → L1 transaction at epoch boundary** | **this doc** |
 | ZK exit | Unshield proof produces the L1 output | [ZK Proofs](#zk) |

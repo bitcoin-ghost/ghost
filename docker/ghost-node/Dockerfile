@@ -23,9 +23,7 @@ COPY crates/ghost-consensus ./crates/ghost-consensus
 COPY crates/ghost-accounting ./crates/ghost-accounting
 COPY crates/ghost-verification ./crates/ghost-verification
 COPY crates/ghost-template ./crates/ghost-template
-COPY crates/ghost-keys ./crates/ghost-keys
 COPY crates/ghost-locks ./crates/ghost-locks
-COPY crates/wraith-protocol ./crates/wraith-protocol
 COPY crates/ghost-reconciliation ./crates/ghost-reconciliation
 COPY crates/ghost-gsp-proto ./crates/ghost-gsp-proto
 COPY crates/ghost-gsp ./crates/ghost-gsp
@@ -37,7 +35,6 @@ COPY crates/bitcoin-core-sv2 ./crates/bitcoin-core-sv2
 # Copy node binaries ONLY (no wallet binaries)
 COPY bins/ghost-pool ./bins/ghost-pool
 COPY bins/ghost-pay ./bins/ghost-pay
-COPY bins/ghost-coordinator ./bins/ghost-coordinator
 COPY bins/ghost-gsp ./bins/ghost-gsp
 COPY bins/ghost-cli ./bins/ghost-cli
 

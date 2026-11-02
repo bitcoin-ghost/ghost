@@ -209,7 +209,6 @@ Either way, the dictionary never goes through the network, never crosses a bound
 | Identity | [Keys](#keys) | Static Ghost ID; fresh derivation per payment |
 | Visual identity | [Glyphs](#glyphs) | 16×16 avatar bound to the Ghost ID |
 | Receive categorisation | **Labels** | **Encrypted recipient-local payment categories** |
-| Privacy mix | [Wraith](#wraith) | Break input → output graph at L1 |
 | Custody | [Locks](#locks) | Hold funds in P2TR with timelocked recovery |
 
 Labels are the smallest piece in the stack — 80 bytes per payment, no cryptographic load — but they're often the difference between "I know what came in this month" and "scrolling through 200 entries that all say 'incoming'".

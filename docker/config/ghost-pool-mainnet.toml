@@ -74,4 +74,3 @@ min_payout_sats = 10000
 enabled = true
 virtual_block_secs = 10
 epoch_blocks = 100
-wraith_enabled = true

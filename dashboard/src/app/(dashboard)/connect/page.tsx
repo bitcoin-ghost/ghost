@@ -119,7 +119,7 @@ export default function ConnectPage() {
           <ConnectionEntry
             title="Ghost Node"
             badge={<Badge variant="success">Available</Badge>}
-            what="Your node's Ghost HTTP endpoint. Wraith and Ghost light wallets pair to their own node here; other operators can add this address to their swarm."
+            what="Your node's Ghost HTTP endpoint. Ghost light wallets pair to their own node here; other operators can add this address to their swarm."
             connString={httpUrl}
             note={`Network: ${ports.label}. This is the node's :8080 API / swarm address.`}
             extra={

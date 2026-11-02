@@ -7700,11 +7700,6 @@ async fn main() -> Result<()> {
         })
     });
 
-    // Report the operator's Wraith-mixing choice from `[ghost_pay] wraith_enabled`
-    // on the ghostpay status endpoint, so the dashboard's L2 card reflects the
-    // node's actual setting rather than ghost-pay's internal "hosts mixing" flag.
-    verification_state = verification_state.with_wraith_enabled(config.wraith_enabled());
-
     // VER-6: When a peer challenges this node's stratum capability, our
     // handler probes the stratum endpoint to confirm reachability. Without
     // this, the handler falls back to 127.0.0.1, which only proves loopback
@@ -7981,94 +7976,6 @@ async fn main() -> Result<()> {
             serde_json::to_value(self_check_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
         });
     }
-
-    // Decentralised Wraith coordinator election (read-only, gated off by
-    // default). Constructed ONLY when `[coordinator] wraith_election_enabled`
-    // is true; otherwise `None` and the service is inert (zero effect on the
-    // node). It computes/publishes the per-epoch draw — it activates NO
-    // coordinator role and changes no consensus message.
-    let coordinator_election = ghost_pool::coordinator_election::CoordinatorElection::maybe_new(
-        config.coordinator.wraith_election_enabled,
-        &identity,
-        &capabilities,
-        // Self's advertised endpoint enters the roster only when this node opted
-        // in (capabilities.coordinator); harmless to pass through otherwise.
-        config.coordinator.advertised_endpoint.clone(),
-        Arc::clone(&mesh),
-        Arc::clone(&rpc),
-        // No verified-capability provider. It read THIS node's own challenge
-        // ledger, which no two nodes share, so the roster could not converge
-        // (`wraith_protocol::eligibility`, "Why qualification and archive are
-        // not here").
-        //
-        // The agreed roster, when the node-list checkpoint has finalised one. Below the gate
-        // nothing is ever proposed, so the table is empty and this returns `None` — the election
-        // keeps its live-mesh roster. Arming the checkpoint is therefore what moves the election
-        // off node-local state, fleet-wide, in one step (#710).
-        {
-            let db = Arc::clone(&db);
-            Some(Arc::new(move || {
-                let rec = db.get_latest_mesh_node_list_checkpoint().ok().flatten()?;
-                let adverts =
-                    ghost_pool::mesh_node_checkpoint::adverts_from_json_public(&rec.adverts_json);
-                let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
-                if roster.is_empty() {
-                    return None;
-                }
-                Some(
-                    roster
-                        .into_iter()
-                        .map(|e| (e.node_id, e.endpoint))
-                        .collect::<Vec<_>>(),
-                )
-            })
-                as ghost_pool::coordinator_election::CheckpointRosterFn)
-        },
-    );
-    {
-        let coord_for_api = coordinator_election.clone();
-        verification_state = verification_state.with_coordinator_status(move || {
-            coord_for_api
-                .as_ref()
-                .map(|c| c.status_json())
-                .unwrap_or_else(ghost_pool::coordinator_election::disabled_status_json)
-        });
-    }
-
-    // In-process coordinator activation (Inc 4). Off unless
-    // `[coordinator] coordinator_role_enabled`; on mainnet it is refused unless a
-    // real bond ledger is configured (secure-by-default). When elected, the node
-    // runs the coordinator on `coordinator_port`; the supervisor is reconciled
-    // against the election each epoch flip below.
-    let coordinator_supervisor = {
-        let coord_network = match config.bitcoin.network {
-            ghost_common::config::BitcoinNetwork::Mainnet => bitcoin::Network::Bitcoin,
-            ghost_common::config::BitcoinNetwork::Signet => bitcoin::Network::Signet,
-            ghost_common::config::BitcoinNetwork::Testnet => bitcoin::Network::Testnet,
-            ghost_common::config::BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
-        };
-        let listen: std::net::SocketAddr =
-            format!("0.0.0.0:{}", config.coordinator.coordinator_port)
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid coordinator listen addr: {e}"))?;
-        let role_cfg = ghost_pool::coordinator_supervisor::CoordinatorRoleConfig {
-            enabled: config.coordinator.coordinator_role_enabled,
-            network: coord_network,
-            listen,
-            fee_address: config.coordinator.coordinator_fee_address.clone(),
-            ghostd_rpc_url: format!(
-                "http://{}:{}",
-                config.bitcoin.rpc_host, config.bitcoin.rpc_port
-            ),
-            ghostd_rpc_user: config.bitcoin.rpc_user.clone(),
-            ghostd_rpc_password: config.bitcoin.rpc_password.clone(),
-        };
-        ghost_pool::coordinator_supervisor::CoordinatorSupervisor::maybe_new(
-            role_cfg,
-            Arc::clone(&mesh),
-        )
-        .map_err(|e| anyhow::anyhow!(e))?
-    };
 
     // Configure archive handler if archive mode enabled
     if capabilities.archive_mode {
@@ -10340,18 +10247,6 @@ async fn main() -> Result<()> {
                 // #605 H-7: broadcast the address proof at/above the gate, so a claimed
                 // `/24` becomes a majority-attested fact instead of a self-report.
                 .with_address_proof_gate(ghost_pool::address_proof_height())
-                // #736: challenge peers on OUR roster for the Wraith coordinator capability.
-                // Logged on every rotation; broadcast only at/above the gate. Carries no
-                // share weight.
-                .with_coordinator_proof(ghost_pool::coordinator_proof_height(), {
-                    let coord_for_challenges = coordinator_election.clone();
-                    Arc::new(move || {
-                        coord_for_challenges
-                            .as_ref()
-                            .map(|c| c.status_json())
-                            .unwrap_or_else(ghost_pool::coordinator_election::disabled_status_json)
-                    })
-                })
                 .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
@@ -10669,13 +10564,6 @@ async fn main() -> Result<()> {
     // payout path (block-found), which almost never fires, so every per-window
     // best share reported a null block height.
     let db_for_rounds = Arc::clone(&db);
-    // Coordinator-election recompute hook (read-only). `None` when the feature
-    // is off → the recompute below is skipped entirely.
-    let coord_for_events = coordinator_election.clone();
-    // Activation supervisor — reconciled against the election so an elected node
-    // runs the coordinator (and a node that lost its seat stops). `None` when
-    // role activation is off.
-    let supervisor_for_events = coordinator_supervisor.clone();
     // Tip-change payout proposal: arms the coinbase BEFORE a block is won.
     let payout_for_tips = Arc::clone(&payout_handler);
     let identity_for_tips = Arc::clone(&identity);
@@ -11033,20 +10921,6 @@ async fn main() -> Result<()> {
                     };
                     if let Err(e) = db_for_rounds.create_round_if_not_exists(&round_record) {
                         warn!(round_id = round_id, error = %e, "Failed to persist round at start");
-                    }
-
-                    // Refresh the coordinator-election view: re-read the roster,
-                    // rebuild only if it or the epoch changed (a no-op entirely
-                    // when the feature is off). Read-only — activates nothing.
-                    if let Some(ref coord) = coord_for_events {
-                        coord.refresh_for_height(height).await;
-                        // Start/stop the in-process coordinator to match the
-                        // freshly-recomputed election (no-op when role activation
-                        // is off or the seat is unchanged). A seat lost mid-epoch
-                        // is served until the epoch turns — see `should_serve`.
-                        if let Some(ref sup) = supervisor_for_events {
-                            sup.reconcile(coord.should_serve()).await;
-                        }
                     }
 
                     // M-MINE-1: Update template ID for share validation

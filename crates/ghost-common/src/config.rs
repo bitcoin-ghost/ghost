@@ -24,6 +24,7 @@
 //!
 //! All node and pool configuration is defined here.
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -113,11 +114,8 @@ pub struct NodeConfig {
     /// Reaper configuration (dead code detection in witness scripts)
     #[serde(default)]
     pub reaper: ReaperSettings,
-    /// Decentralised Wraith coordinator-election configuration.
-    ///
-    /// Read-only and gated OFF by default: when `wraith_election_enabled` is
-    /// false the election service is never constructed and has zero effect on
-    /// the node (`tasks/plan_decentralised_coordinators.md`, increment 4).
+    /// Coordinator capability advertisement. Older configs also carry the
+    /// retired Wraith election keys here; they are read and ignored.
     #[serde(default)]
     pub coordinator: CoordinatorConfig,
     /// ghostd launch flags this node manages via the `ghost-setup apply-reaper`
@@ -266,66 +264,34 @@ impl NodeLaunchConfig {
     }
 }
 
-/// Decentralised Wraith coordinator-election settings.
+/// Coordinator capability settings.
 ///
-/// This increment only *computes and exposes* the election read-only; it never
-/// activates a coordinator role, touches `coordinator_redundancy`, or changes
-/// any Wraith mixing or consensus message. With `wraith_election_enabled =
-/// false` (the default) it is inert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Only the capability advertisement is left: whether this node claims the
+/// coordinator capability, and the endpoint it advertises. The election, the
+/// in-process coordinator and its fee address were removed with Wraith; their
+/// keys are still accepted from installed `pool.toml` files and ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoordinatorConfig {
-    /// Compute the per-epoch coordinator election and expose it read-only via
-    /// `GET /api/v1/pool/coordinator`. Default false — dead code when off.
-    #[serde(default)]
-    pub wraith_election_enabled: bool,
-    /// Opt in to being an eligible Wraith coordinator — the same opt-in model as
-    /// `public_mining` for miners. When true the node advertises itself as
-    /// coordinator-capable to the mesh and may be elected. Earns the mixing
-    /// service fee, not 5-4-3-2-1 shares. Default false.
+    /// Advertise the coordinator capability to the mesh. Default false.
     #[serde(default)]
     pub coordinator_enabled: bool,
-    /// The reachable coordinator endpoint this node advertises: a public
-    /// `host:port` or a `.onion` hidden service. Operator-controlled so home
-    /// operators can advertise Tor instead of doxxing an IP. Required (non-empty)
-    /// before the node can actually be elected — no endpoint means wallets have
-    /// nowhere to dial.
+    /// The coordinator endpoint this node advertises: a public `host:port` or a
+    /// `.onion` hidden service.
     #[serde(default)]
     pub advertised_endpoint: Option<String>,
-    /// Port the in-process coordinator binds when this node is elected to a seat.
-    #[serde(default = "default_coordinator_port")]
-    pub coordinator_port: u16,
-    /// Actually RUN the coordinator when elected (vs. only advertising + being
-    /// electable). Separate from `coordinator_enabled` so discovery can be on
-    /// without auto-activating. SECURE-BY-DEFAULT: on mainnet, activation is
-    /// refused without a ghostd RPC endpoint — the coordinator verifies every
-    /// participant's input against the chain, and cannot take it on trust.
-    /// Default false.
-    #[serde(default)]
-    pub coordinator_role_enabled: bool,
-    /// Destination address for this coordinator's per-round service fee
-    /// (`service_fee_bps`). Without it rounds run fee-less.
-    #[serde(default)]
-    pub coordinator_fee_address: Option<String>,
-}
-
-/// Default port for the in-process Wraith coordinator (matches the standalone
-/// `wraith-coordinator` binary's default).
-fn default_coordinator_port() -> u16 {
-    9100
-}
-
-impl Default for CoordinatorConfig {
-    fn default() -> Self {
-        Self {
-            wraith_election_enabled: false,
-            coordinator_enabled: false,
-            advertised_endpoint: None,
-            coordinator_port: default_coordinator_port(),
-            coordinator_role_enabled: false,
-            coordinator_fee_address: None,
-        }
-    }
+    /// Retired keys, accepted so older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "wraith_election_enabled")]
+    pub retired_wraith_election_enabled: Option<IgnoredAny>,
+    /// Retired key, see `retired_wraith_election_enabled`.
+    #[serde(default, skip_serializing, rename = "coordinator_port")]
+    pub retired_coordinator_port: Option<IgnoredAny>,
+    /// Retired key, see `retired_wraith_election_enabled`.
+    #[serde(default, skip_serializing, rename = "coordinator_role_enabled")]
+    pub retired_coordinator_role_enabled: Option<IgnoredAny>,
+    /// Retired key, see `retired_wraith_election_enabled`.
+    #[serde(default, skip_serializing, rename = "coordinator_fee_address")]
+    pub retired_coordinator_fee_address: Option<IgnoredAny>,
 }
 
 /// Configuration validation error
@@ -395,17 +361,6 @@ impl NodeConfig {
     /// truth for whether ghost-mining should talk to a local ghost-pay.
     pub fn ghost_pay_enabled(&self) -> bool {
         self.ghost_pay.as_ref().is_some_and(|gp| gp.enabled)
-    }
-
-    /// Whether the operator enabled Wraith mixing on this node.
-    ///
-    /// Sourced from the `[ghost_pay] wraith_enabled` setting — the operator's
-    /// on/off choice. This is what the public status endpoints must surface,
-    /// as opposed to ghost-pay's internal "does this process host CoinJoin
-    /// sessions" signal (always false since mixing moved to wraith-coordinator).
-    /// Reads as false when no `[ghost_pay]` block is present.
-    pub fn wraith_enabled(&self) -> bool {
-        self.ghost_pay.as_ref().is_some_and(|gp| gp.wraith_enabled)
     }
 
     /// Reconcile the mutually-exclusive Ghost Mode / Public Mining pair.
@@ -1858,11 +1813,13 @@ pub struct GhostPayConfig {
     pub virtual_block_secs: u64,
     /// Epoch length (virtual blocks)
     pub epoch_blocks: u64,
-    /// Enable Wraith mixing
-    pub wraith_enabled: bool,
     /// Operator payout address for GhostPay L2 settlements (None = unset)
     #[serde(default)]
     pub payout_address: Option<String>,
+    /// Retired `wraith_enabled` key, accepted so older installed configs still
+    /// load. Never written back.
+    #[serde(default, skip_serializing, rename = "wraith_enabled")]
+    pub retired_wraith_enabled: Option<IgnoredAny>,
 }
 
 impl Default for GhostPayConfig {
@@ -1871,8 +1828,8 @@ impl Default for GhostPayConfig {
             enabled: false,
             virtual_block_secs: L2_VIRTUAL_BLOCK_SECS,
             epoch_blocks: L2_EPOCH_BLOCKS,
-            wraith_enabled: true,
             payout_address: None,
+            retired_wraith_enabled: None,
         }
     }
 }
@@ -2925,36 +2882,6 @@ mod tests {
         assert!(
             config.ghost_pay_enabled(),
             "[ghost_pay] with enabled = true must read as enabled"
-        );
-    }
-
-    #[test]
-    fn test_wraith_enabled_predicate() {
-        // No [ghost_pay] block → Wraith reads as off.
-        let mut config = NodeConfig::default();
-        assert!(config.ghost_pay.is_none());
-        assert!(
-            !config.wraith_enabled(),
-            "absent [ghost_pay] must read wraith as disabled"
-        );
-
-        // Operator disabled Wraith explicitly.
-        config.ghost_pay = Some(GhostPayConfig {
-            wraith_enabled: false,
-            ..GhostPayConfig::default()
-        });
-        assert!(!config.wraith_enabled());
-
-        // Operator enabled Wraith → predicate reflects the choice regardless of
-        // whether ghost-pay's `enabled` flag is set (it's a separate signal).
-        config.ghost_pay = Some(GhostPayConfig {
-            enabled: false,
-            wraith_enabled: true,
-            ..GhostPayConfig::default()
-        });
-        assert!(
-            config.wraith_enabled(),
-            "[ghost_pay] wraith_enabled = true must read as enabled"
         );
     }
 

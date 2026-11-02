@@ -6,9 +6,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import {
   useNodeStatus,
-  useGhostPayStatus,
   useSetGhostMode,
-  useSetWraith,
 } from "@/hooks/queries";
 import { useHazeStatus } from "@/hooks/queries/useHazeQueries";
 import { useShroudStatus } from "@/hooks/queries/useShroudQueries";
@@ -20,12 +18,10 @@ import HazeWizard from "../wizards/HazeWizard";
 
 export default function PrivacySettingsPage() {
   const { data: status } = useNodeStatus();
-  const { data: ghostPayStatus } = useGhostPayStatus();
   const { data: hazeStatus } = useHazeStatus();
   const { data: shroudStatus } = useShroudStatus();
 
   const setGhostMode = useSetGhostMode();
-  const setWraith = useSetWraith();
   const { success, error } = useToast();
 
   const [shroudOpen, setShroudOpen] = useState(false);
@@ -40,23 +36,9 @@ export default function PrivacySettingsPage() {
     }
   };
 
-  const handleWraithToggle = async (enabled: boolean) => {
-    try {
-      await setWraith.mutateAsync(enabled);
-      success(
-        "Saved",
-        `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-mining to apply`
-      );
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
   const hazeMode = hazeStatus?.mode ?? "unknown";
   const hazeModeLabel = hazeMode === "hazed" ? "Hazed" : hazeMode === "full_archive" ? "Full Archive" : hazeMode === "standard" ? "Standard" : "Unknown";
 
-  const gpRunning = ghostPayStatus && ghostPayStatus.sync_state !== "disabled" && ghostPayStatus.sync_state !== "unavailable";
-  const wraithEnabled = ghostPayStatus?.wraith_enabled ?? false;
 
   return (
     <>
@@ -166,31 +148,6 @@ export default function PrivacySettingsPage() {
               Configure
             </Button>
           </div>
-
-          {/* Wraith mixing — an editable toggle (requires ghost-pay running) */}
-          {gpRunning ? (
-            <ToggleRow
-              label="Wraith Protocol"
-              description="CoinJoin mixing on the L2 network — lets any L2 participant initiate a mixing session through this node. Restart ghost-mining to apply."
-              enabled={wraithEnabled}
-              onChange={handleWraithToggle}
-              disabled={setWraith.isPending}
-              badge={wraithEnabled ? <Badge variant="success">Active</Badge> : <Badge variant="default">Available</Badge>}
-            />
-          ) : (
-            <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
-              <div className="flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-[color:var(--fg)] font-medium">Wraith Protocol</span>
-                  <Badge variant="warning">Not Running</Badge>
-                </div>
-                <div className="text-sm text-[color:var(--dim)]">
-                  CoinJoin mixing on the L2 network — breaks transaction linkability. Requires an active
-                  ghost-pay-node.
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       </Card>
 

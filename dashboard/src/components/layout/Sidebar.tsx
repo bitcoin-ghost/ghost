@@ -12,7 +12,6 @@ import {
   Blocks,
   Network as NetworkIcon,
   Crown,
-  Shield,
   Eye,
   Ghost,
   Cloud,
@@ -122,7 +121,6 @@ const GROUPS: NavGroup[] = [
     label: "ghost pay",
     items: [
       { href: "/ghost-pay", label: "Ghost Pay Network", icon: <Crown {...ICON} /> },
-      { href: "/wraith", label: "Wraith", icon: <Shield {...ICON} /> },
     ],
   },
   {

@@ -23,7 +23,6 @@ import {
   configureShroud,
   restartNode,
   setGhostPay,
-  setWraith,
   setMiningPayoutAddress,
   setPoolName,
   setPublicMiningConfig,
@@ -257,18 +256,6 @@ export function useSetGhostPay() {
     mutationFn: (enabled: boolean) => setGhostPay(enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
-  });
-}
-
-export function useSetWraith() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (enabled: boolean) => setWraith(enabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-      // The real wraith_enabled value is surfaced by the ghostpay status.
-      queryClient.invalidateQueries({ queryKey: ['ghostpay'] });
     },
   });
 }

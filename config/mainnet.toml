@@ -404,12 +404,6 @@ virtual_block_secs = 10
 # Default: 2160 (~6 hours at 10s blocks)
 epoch_blocks = 2160
 
-# Enable Wraith Protocol mixing (CoinJoin privacy)
-# Provides transaction unlinkability
-# Options: true | false
-# Default: true
-wraith_enabled = true
-
 # =============================================================================
 # Environment Variables Reference
 # =============================================================================

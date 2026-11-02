@@ -122,38 +122,13 @@ COLLECT='
   printf "farm_listen=%s\n"      "$($SUDO ss -ltn 2>/dev/null | grep -c ":4444")"
   printf "farm_ufw=%s\n"         "$($SUDO ufw status 2>/dev/null | grep -c "4444")"
   printf "mining_mode=%s\n"      "$(grep -oP "^\s*mining_mode\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)"
-  # The Wraith coordinator port. `reconcile-mining-firewall.sh` opens 9100 when
-  # coordinator_role_enabled is true, and a .path unit re-runs it whenever pool.toml changes.
-  # Measured 2026-09-11: all eight opted in, and 9100 was open on TWO. Five nodes ran a copy of
-  # the reconcile script older than its 9100 block and two had no reconcile unit at all, so the
-  # opt-in fired, reconciled Stratum, and silently left the coordinator unreachable.
-  printf "coord_role=%s\n"       "$(grep -cE "^[[:space:]]*coordinator_role_enabled[[:space:]]*=[[:space:]]*true([[:space:]]|$)" /etc/ghost/pool.toml 2>/dev/null)"
+  # 9100 was the Wraith coordinator port. Nothing listens on it now, so it must be closed.
   printf "coord_ufw=%s\n"        "$($SUDO ufw status 2>/dev/null | grep -cE "^9100(/tcp)?[[:space:]]")"
-  printf "coord_listen=%s\n"     "$($SUDO ss -ltn 2>/dev/null | grep -c ":9100 ")"
   # #759: config is never reconciled against what the repo ships, so dead keys survive for months
   # and required ones are absent while the compiled default silently covers for them. Both are
   # "correct by accident" — a value nobody chose. List the names, not just a count, so the report
   # says WHICH.
   printf "dead_keys=%s\n"        "$(grep -ohE "^[[:space:]]*(public_mining|bond_ledger_url|bond_ledger_token)[[:space:]]*=" /etc/ghost/pool.toml /etc/ghost/translator-config.toml 2>/dev/null | tr -d " =" | sort -u | paste -sd, -)"
-  # The coordinator fee address must not be the node payout address. A payout
-  # address is public — it receives this node mining income on chain — so a round
-  # paying it is identifiable as a Wraith round AND attributable to the node that
-  # coordinated it. The installer used to default one to the other, so this is a
-  # real state on already-installed nodes, not a hypothetical.
-  #
-  # NOTE: no apostrophes anywhere in this block. COLLECT is a single-quoted
-  # string, so one apostrophe ends it and the whole remote probe stops parsing —
-  # the failure surfaces as a syntax error hundreds of lines away.
-  #
-  # Reported as a verdict, not the addresses: this output gets pasted into issues.
-  _cfa=$(grep -oP "^\s*coordinator_fee_address\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)
-  _pay=$(grep -oP "^\s*node_payout_address\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)
-  if [ -z "$_cfa" ]; then _fee_verdict=unset
-  elif [ "$_cfa" = "$_pay" ]; then _fee_verdict=LEAK_SAME_AS_PAYOUT
-  elif [ "${_cfa#bc1p}" = "$_cfa" ]; then _fee_verdict=not_p2tr
-  else _fee_verdict=ok
-  fi
-  printf "coord_fee_addr=%s\n" "$_fee_verdict"
   printf "tdp_cfg=%s\n"          "$(grep -cE "^\[tdp\]" /etc/ghost/pool.toml 2>/dev/null)"
   printf "cfg_parses=%s\n"       "$("$GM" --config /etc/ghost/pool.toml --show-identity >/dev/null 2>&1 && echo ok || echo FAIL)"
   # Ops scripts are deployed by NOTHING — `deploy-node.sh` handles ghost-mining, pool_sv2 and
@@ -333,7 +308,7 @@ for n in "${REACHED[@]}"; do
                                         echo "  WARN $n no ghost-mining-gate — ghost-mining must be enabled directly here" ;;
     esac
     # ghost-mining-firewall.path is what makes a port follow its opt-in. Without it, flipping
-    # mining_mode or coordinator_role_enabled changes nothing at the firewall.
+    # mining_mode changes nothing at the firewall.
     boot_units="en_ghostd:ghostd en_mining_fw:ghost-mining-firewall.path"
     $gate_owns || boot_units="$boot_units en_ghostpool:ghost-mining en_sripool:sri-pool en_sritrans:sri-translator"
     for spec in $boot_units; do
@@ -382,15 +357,11 @@ for n in "${REACHED[@]}"; do
     if [ "${fw:-0}" -gt 0 ] 2>/dev/null && [ "${fl:-0}" -eq 0 ] 2>/dev/null; then
         echo "  FAIL $n ufw allows 4444 but NOTHING listens there — an audit by firewall reads this as reachable"; rc=1
     fi
-    # The Wraith coordinator: opt-in, firewall and listener must agree. Opted in with 9100 closed
-    # is the state measured on six of eight nodes on 2026-09-11 — the node is drawn as a tier
-    # leader, the election sends wallets to it, and none of them can connect.
-    cr="${VALUES[$n|coord_role]:-0}"; cw="${VALUES[$n|coord_ufw]:-0}"; cl="${VALUES[$n|coord_listen]:-0}"
-    if [ "${cr:-0}" -gt 0 ] 2>/dev/null; then
-        [ "${cw:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n coordinator opted in but ufw does not allow 9100 — wallets sent here cannot connect"; rc=1; }
-        [ "${cl:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n coordinator opted in but NOTHING listens on :9100"; rc=1; }
-    elif [ "${cw:-0}" -gt 0 ] 2>/dev/null; then
-        echo "  FAIL $n ufw allows 9100 but the coordinator role is off — an open port nothing should answer on"; rc=1
+    # 9100 was the Wraith coordinator port, removed with Wraith. An open rule is a port nothing
+    # answers on.
+    cw="${VALUES[$n|coord_ufw]:-0}"
+    if [ "${cw:-0}" -gt 0 ] 2>/dev/null; then
+        echo "  FAIL $n ufw allows 9100 but the Wraith coordinator is gone — an open port nothing answers on"; rc=1
     fi
 
     # mining_mode decides whether payouts go through BFT. Relying on MiningMode::default() means a

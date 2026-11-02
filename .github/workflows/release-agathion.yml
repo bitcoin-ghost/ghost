@@ -1,7 +1,7 @@
 name: Release Agathion
 
 # Triggered on Agathion-specific tags so the repo-wide `v*` tags (which build
-# ghost-mining / ghost-cli / etc.) and the `wraith-v*` tags don't accidentally cut
+# ghost-mining / ghost-cli / etc.) don't accidentally cut
 # an Agathion Node release. Agathion Node is the operator dashboard and is a
 # SEPARATE download from the node binaries — packaged as a Next.js standalone
 # bundle, launched with its custom auth-relay `server.js`.
@@ -230,7 +230,7 @@ jobs:
           ( cd dist && tar czf "${NAME}.tar.gz" "${NAME}" )
           ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
 
-          # Machine-readable manifest (mirrors the Wraith release manifest shape).
+          # Machine-readable manifest.
           TARBALL_SHA="$(sha256sum "dist/${NAME}.tar.gz" | cut -d' ' -f1)"
           TARBALL_SIZE="$(wc -c < "dist/${NAME}.tar.gz" | tr -d ' ')"
           cat > "dist/${NAME}.manifest.json" <<MEOF
@@ -288,7 +288,7 @@ jobs:
           # Combined checksum file covering the shipped tarball. This is the
           # primary trust anchor a user verifies before running. The release
           # engineer signs it OFFLINE into SHA256SUMS.asc with the release key —
-          # CI never holds the signing key (same model as the Wraith release).
+          # CI never holds the signing key.
           # Entries use the asset name as PUBLISHED (GitHub replaces spaces with
           # '.') so `sha256sum -c SHA256SUMS` matches the downloaded files.
           : > SHA256SUMS

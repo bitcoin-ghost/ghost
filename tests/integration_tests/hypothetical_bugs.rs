@@ -1420,8 +1420,6 @@ mod resource_exhaustion {
 // Hypothesis: Attacker could exploit economic mechanisms for profit.
 
 mod economic_attacks {
-    use super::*;
-
     /// Test: Fee sniping attack
     #[test]
     fn test_024_fee_sniping() {
@@ -1504,61 +1502,6 @@ mod economic_attacks {
         // Very deep reorg - never profitable
         let profitable_deep = chain.is_reorg_profitable(0.99, 0);
         println!("99% miner deep reorg profitable: {}", profitable_deep);
-    }
-
-    /// Test: Griefing attack on Wraith sessions
-    #[test]
-    fn test_025_wraith_griefing() {
-        // Hypothesis: Attacker could join sessions and refuse to complete,
-        // locking legitimate participants' funds
-
-        #[allow(dead_code)]
-        struct WraithGriefAnalysis {
-            session_timeout: Duration,
-            join_cost: u64,    // Cost to join (if any)
-            grief_damage: u64, // Time/opportunity cost to victims
-        }
-
-        impl WraithGriefAnalysis {
-            fn grief_ratio(&self) -> f64 {
-                // Ratio of damage to cost - higher means more attractive attack
-                if self.join_cost == 0 {
-                    return f64::INFINITY;
-                }
-                self.grief_damage as f64 / self.join_cost as f64
-            }
-
-            #[allow(dead_code)]
-            fn is_economically_viable(&self, attacker_budget: u64) -> bool {
-                // Attack is viable if attacker can grief profitably
-                // (In practice, grieving is usually not profitable, just annoying)
-                self.join_cost <= attacker_budget && self.grief_ratio() > 1.0
-            }
-        }
-
-        // Current design: No cost to join
-        let no_cost = WraithGriefAnalysis {
-            session_timeout: Duration::from_secs(600),
-            join_cost: 0,
-            grief_damage: 100_000, // 10 minutes of 5 users' time
-        };
-
-        println!("No-cost join grief ratio: {}", no_cost.grief_ratio());
-
-        // Mitigation: Require refundable deposit
-        let with_deposit = WraithGriefAnalysis {
-            session_timeout: Duration::from_secs(600),
-            join_cost: 10_000, // Small deposit
-            grief_damage: 100_000,
-        };
-
-        println!("With-deposit grief ratio: {}", with_deposit.grief_ratio());
-
-        // With deposit, griefing costs the attacker
-        assert!(
-            with_deposit.grief_ratio() < f64::INFINITY,
-            "Deposit should make griefing have finite cost"
-        );
     }
 
     /// Test: Front-running settlement transactions
@@ -1774,7 +1717,6 @@ fn test_029_hypothetical_bug_summary() {
     println!("║                                                              ║");
     println!("║  CATEGORY 7: ECONOMIC ATTACKS                                ║");
     println!("║  ├─ Fee sniping                                              ║");
-    println!("║  ├─ Wraith session griefing                                  ║");
     println!("║  ├─ Settlement front-running                                 ║");
     println!("║  ├─ Treasury drain                                           ║");
     println!("║  └─ Miner reward manipulation                                ║");

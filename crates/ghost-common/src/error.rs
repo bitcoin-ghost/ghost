@@ -250,9 +250,6 @@ pub enum GhostError {
     #[error("Invalid L2 transfer: {0}")]
     InvalidL2Transfer(String),
 
-    #[error("Wraith mixing error: {0}")]
-    WraithMixing(String),
-
     #[error("Invalid ZK proof: {0}")]
     InvalidZkProof(String),
 

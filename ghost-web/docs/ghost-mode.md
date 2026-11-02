@@ -125,7 +125,6 @@ The two layers can be set independently. Most operators who want the privacy pos
 | **Transaction relay** | **Ghost Mode** | **Whether you relay/announce transactions at all** |
 | Relay timing | [Shroud](#shroud) | When you relay (if you do) |
 | Address linkability | [Keys](#keys) | Recipient address publication |
-| Transaction-graph linkability | [Wraith](#wraith) | Input → output mapping in mixing |
 
 A typical privacy-maximising operator stack:
 

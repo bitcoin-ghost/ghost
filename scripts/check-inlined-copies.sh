@@ -34,7 +34,7 @@ PAIRS = {
     # Added after the two copies were found implementing DIFFERENT RULES (#488): the repo
     # copy closed the Stratum ports on private_pool and keyed off `public_mining`, a config
     # field that no longer exists. Running it on a private pool would have dropped every
-    # miner. It had also never gained the Wraith coordinator block the installer copy has.
+    # miner.
     "RECONCILE_MINING_FW_EOF":         "scripts/reconcile-mining-firewall.sh",
     # Added after config/sri/sri-pool.service was found describing a unit that matches NO
     # live node (#903): it still said `User=ghost`, carried no `ExecStartPre` and no
