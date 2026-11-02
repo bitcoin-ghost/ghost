@@ -1012,8 +1012,7 @@ async fn api_node_status_handler(State(state): State<Arc<VerificationState>>) ->
         "miner_count": health.miner_count,
         "is_synced": true,
         "archive_mode": config.archive_mode,
-        "public_mining": config.public_mining,
-        "private_mining": false,
+        "public_mining": true,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress,
@@ -1042,7 +1041,7 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "peer_count": health.peer_count,
         "miner_count": health.miner_count,
         "archive_mode": config.archive_mode,
-        "public_mining": config.public_mining,
+        "public_mining": true,
         "reaper": config.reaper
     }))
 }
@@ -1297,22 +1296,15 @@ async fn api_mining_status_handler(
         .and_then(|c| c.read().network.sv2_authority_public_key.clone())
         .filter(|k| !k.trim().is_empty());
 
-    // Source the operator's pool name and node-reward payout address from the
-    // REAL persisted config (pool.toml) so the dashboard round-trips the saved
-    // value across a restart. Fall back to the ephemeral mirror only when the
-    // full config is not loaded. (Non-async lock, safe alongside the dashboard
+    // Source the operator's pool name from the REAL persisted config (pool.toml) so the
+    // dashboard round-trips the saved value across a restart. Fall back to the ephemeral mirror
+    // only when the full config is not loaded. (Non-async lock, safe alongside the dashboard
     // config guard held above — no await points follow.)
-    let (real_pool_name, real_payout_address) = state
+    let real_pool_name = state
         .full_node_config
         .as_ref()
-        .map(|c| {
-            let cfg = c.read();
-            (
-                cfg.pool.pool_name.clone(),
-                cfg.pool.node_payout_address.clone(),
-            )
-        })
-        .unwrap_or_else(|| (config.pool_name.clone(), config.payout_address.clone()));
+        .map(|c| c.read().pool.pool_name.clone())
+        .unwrap_or_else(|| config.pool_name.clone());
 
     Json(serde_json::json!({
         // Backend fields
@@ -1327,7 +1319,6 @@ async fn api_mining_status_handler(
         "is_synced": true,
         // Dashboard-compatible aliases
         "enabled": true,
-        "private_mining": config.private_mining.unwrap_or(false),
         "public_mining": true,
         "hashrate_th": mesh_hashrate_th,
         "local_hashrate_th": local_hashrate_th,
@@ -1343,7 +1334,6 @@ async fn api_mining_status_handler(
         "authority_public_key": authority_public_key,
         "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV1_STRATUM_PORT),
         "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV2_STRATUM_PORT),
-        "payout_address": real_payout_address,
         "pool_name": real_pool_name,
         "blocks_found": state.database.as_ref()
             .and_then(|db| db.get_blocks_found_count().ok())
@@ -2880,7 +2870,7 @@ async fn api_config_handler(State(state): State<Arc<VerificationState>>) -> impl
     let config = state.dashboard_config.read();
     Json(serde_json::json!({
         "archive_mode": config.archive_mode,
-        "public_mining": config.public_mining,
+        "public_mining": true,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress
@@ -3204,8 +3194,8 @@ async fn api_public_nodes_handler(
 
     let mut nodes = Vec::new();
 
-    // Add self if public mining is enabled
-    if config.public_mining {
+    // Every node is a pool node, so self is always listed.
+    {
         let host = config
             .stratum_host
             .clone()
@@ -3245,13 +3235,6 @@ async fn api_node_public_info_handler(
 ) -> impl IntoResponse {
     let health = state.get_health().await;
     let config = state.dashboard_config.read();
-
-    if !config.public_mining {
-        return Json(serde_json::json!({
-            "public_mining": false,
-            "message": "This node does not accept public miners"
-        }));
-    }
 
     // Determine status based on miner count vs capacity
     let status = if health.miner_count >= config.max_miners {
@@ -4129,58 +4112,44 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
     // Read the persisted operator settings from the real config (pool.toml).
     // The read guard is held only across this synchronous block — no await
     // points follow — so the !Send parking_lot guard is safe here.
-    let (payout, public_mining, pool_name, archive_mode, pruning) =
-        if let Some(ref full) = state.full_node_config {
-            let cfg = full.read();
-            (
-                serde_json::json!({
-                    "address": cfg.pool.node_payout_address,
-                }),
-                matches!(
-                    cfg.network.mining_mode,
-                    ghost_common::config::MiningMode::PublicPool
-                ),
-                cfg.pool.pool_name.clone(),
-                cfg.storage.archive_mode,
-                serde_json::json!({
-                    // VW/OW/AW model. VW is the mandatory Bitcoin Core prune floor
-                    // (read-only consensus constant); OW is the one editable depth
-                    // knob = `storage.prune_height` (blocks to keep, 0 = keep all);
-                    // AW = `storage.archive_mode`.
-                    "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
-                    "ow_blocks": cfg.storage.prune_height,
-                    "archive_mode": cfg.storage.archive_mode,
-                    // One-shot pruned→archive resync still in flight.
-                    "reindex_pending": cfg.storage.reindex_pending,
-                }),
-            )
-        } else {
-            // No full config loaded (e.g. tests / minimal startup): fall back to
-            // the mirror so the dashboard still renders something coherent.
-            (
-                serde_json::json!({
-                    "address": serde_json::Value::Null,
-                }),
-                config.public_mining,
-                config.pool_name.clone(),
-                config.archive_mode,
-                serde_json::json!({
-                    "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
-                    "ow_blocks": 0,
-                    "archive_mode": config.archive_mode,
-                    "reindex_pending": false,
-                }),
-            )
-        };
+    let (pool_name, archive_mode, pruning) = if let Some(ref full) = state.full_node_config {
+        let cfg = full.read();
+        (
+            cfg.pool.pool_name.clone(),
+            cfg.storage.archive_mode,
+            serde_json::json!({
+                // VW/OW/AW model. VW is the mandatory Bitcoin Core prune floor
+                // (read-only consensus constant); OW is the one editable depth
+                // knob = `storage.prune_height` (blocks to keep, 0 = keep all);
+                // AW = `storage.archive_mode`.
+                "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+                "ow_blocks": cfg.storage.prune_height,
+                "archive_mode": cfg.storage.archive_mode,
+                // One-shot pruned→archive resync still in flight.
+                "reindex_pending": cfg.storage.reindex_pending,
+            }),
+        )
+    } else {
+        // No full config loaded (e.g. tests / minimal startup): fall back to
+        // the mirror so the dashboard still renders something coherent.
+        (
+            config.pool_name.clone(),
+            config.archive_mode,
+            serde_json::json!({
+                "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+                "ow_blocks": 0,
+                "archive_mode": config.archive_mode,
+                "reindex_pending": false,
+            }),
+        )
+    };
 
     Json(serde_json::json!({
         "archive_mode": archive_mode,
-        "public_mining": public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "pruning": pruning,
-        "payout": payout,
         "pool_name": pool_name,
         "policy": policy,
         "block_priority": block_priority_key(&state),
@@ -4511,20 +4480,16 @@ async fn api_config_ghost_mode_post_handler(
 ) -> impl IntoResponse {
     let enabled = payload.enabled;
 
-    // Mutual exclusion with Public Mining. A Ghost Mode node suppresses the
-    // peer transaction-relay path, so its mempool never fills and the blocks it
-    // builds are near-empty — the operator forfeits all transaction-fee income
-    // (fees accrue to the node operator; miners are paid from the subsidy less
-    // the pool fee). Enabling Ghost Mode while Public Mining is active is
-    // therefore self-harming and is refused. Turning Ghost Mode OFF is always
-    // allowed, so this only guards the enable path. No state is mutated on
-    // rejection.
-    if enabled && state.dashboard_config.read().public_mining {
+    // A Ghost Mode node suppresses the peer transaction-relay path, so its mempool never fills
+    // and the blocks it builds are near-empty — the node forfeits all transaction-fee income,
+    // which goes to the node whose miner finds the block. Every node is a pool node, so enabling
+    // Ghost Mode is refused. Turning it OFF is always allowed. No state is mutated on rejection.
+    if enabled {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "success": false,
-                "error": "Public Mining is active. Disable it before enabling Ghost Mode — a Ghost Mode node builds empty blocks and forfeits all transaction-fee income."
+                "error": "Ghost Mode cannot be enabled on a pool node — a Ghost Mode node builds empty blocks and forfeits all transaction-fee income."
             })),
         );
     }
@@ -7013,15 +6978,9 @@ async fn api_auth_token_handler() -> impl IntoResponse {
 /// Request to update mutable configuration settings
 ///
 /// All fields are optional - only specified fields will be updated.
-/// Immutable settings (treasury_address, internal_api_secret, etc.) are rejected.
+/// Immutable settings (internal_api_secret, etc.) are rejected.
 #[derive(Debug, Deserialize)]
 pub struct ConfigUpdateRequest {
-    /// Mining mode: "public_pool", "private_pool", or "private_solo"
-    pub mining_mode: Option<String>,
-    /// Password for private mining modes (required when switching to private modes)
-    pub private_mining_password: Option<String>,
-    /// Payout address for PrivateSolo mode (required when mining_mode = private_solo)
-    pub solo_payout_address: Option<String>,
     /// Policy profile: "bitcoin_pure", "permissive", "full_open", or "custom"
     pub policy_profile: Option<String>,
 }
@@ -7090,19 +7049,6 @@ where
     })
 }
 
-/// Validate a mining mode string
-fn validate_mining_mode(mode: &str) -> Result<ghost_common::config::MiningMode, String> {
-    match mode.to_lowercase().as_str() {
-        "public_pool" | "publicpool" => Ok(ghost_common::config::MiningMode::PublicPool),
-        "private_pool" | "privatepool" => Ok(ghost_common::config::MiningMode::PrivatePool),
-        "private_solo" | "privatesolo" => Ok(ghost_common::config::MiningMode::PrivateSolo),
-        _ => Err(format!(
-            "Invalid mining_mode '{}'. Valid values: public_pool, private_pool, private_solo",
-            mode
-        )),
-    }
-}
-
 /// Validate a policy profile string
 fn validate_policy_profile(profile: &str) -> Result<ghost_common::config::PolicyProfile, String> {
     match profile.to_lowercase().as_str() {
@@ -7114,16 +7060,6 @@ fn validate_policy_profile(profile: &str) -> Result<ghost_common::config::Policy
             "Invalid policy_profile '{}'. Valid values: bitcoin_pure, permissive, full_open, custom",
             profile
         )),
-    }
-}
-
-/// Validate bech32 address prefix for a network
-fn validate_address_prefix(address: &str, network: ghost_common::config::BitcoinNetwork) -> bool {
-    match network {
-        ghost_common::config::BitcoinNetwork::Mainnet => address.starts_with("bc1"),
-        ghost_common::config::BitcoinNetwork::Signet
-        | ghost_common::config::BitcoinNetwork::Testnet => address.starts_with("tb1"),
-        ghost_common::config::BitcoinNetwork::Regtest => address.starts_with("bcrt1"),
     }
 }
 
@@ -7140,9 +7076,6 @@ fn validate_address_prefix(address: &str, network: ghost_common::config::Bitcoin
 /// is signaled. The node will exit with code 100, and systemd will restart it.
 ///
 /// # Mutable Settings
-/// - mining_mode: PublicPool/PrivatePool/PrivateSolo
-/// - private_mining_password: required for private modes
-/// - solo_payout_address: required for PrivateSolo
 /// - policy_profile: bitcoin_pure/permissive/full_open/custom
 async fn api_config_update_handler(
     State(state): State<Arc<VerificationState>>,
@@ -7164,129 +7097,7 @@ async fn api_config_update_handler(
             .into_response();
     };
 
-    // Get current config for validation
     let mut config = full_config_lock.write();
-    let network = config.bitcoin.network;
-
-    // Validate and apply mining_mode
-    if let Some(ref mode_str) = request.mining_mode {
-        match validate_mining_mode(mode_str) {
-            Ok(new_mode) => {
-                // Check if switching to private mode without password
-                if matches!(
-                    new_mode,
-                    ghost_common::config::MiningMode::PrivatePool
-                        | ghost_common::config::MiningMode::PrivateSolo
-                ) {
-                    // Need password either in request or already configured
-                    let has_password = request.private_mining_password.is_some()
-                        || config.network.private_mining_password.is_some();
-                    if !has_password {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ConfigUpdateError {
-                                success: false,
-                                error: format!(
-                                    "private_mining_password required when switching to {}",
-                                    mode_str
-                                ),
-                                code: "MISSING_PASSWORD".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-
-                // Check if switching to PrivateSolo without solo_payout_address
-                if matches!(new_mode, ghost_common::config::MiningMode::PrivateSolo) {
-                    let has_address = request.solo_payout_address.is_some()
-                        || config.network.solo_payout_address.is_some();
-                    if !has_address {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ConfigUpdateError {
-                                success: false,
-                                error: "solo_payout_address required for private_solo mode"
-                                    .to_string(),
-                                code: "MISSING_SOLO_ADDRESS".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-
-                config.network.mining_mode = new_mode;
-                updated_fields.push("mining_mode".to_string());
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ConfigUpdateError {
-                        success: false,
-                        error: e,
-                        code: "INVALID_MINING_MODE".to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Validate and apply private_mining_password
-    // L-17: Enforce minimum password length of 8 characters with an error, not just a warning
-    // Weak passwords expose private mining endpoints to brute-force attacks
-    if let Some(ref password) = request.private_mining_password {
-        if password.len() < 8 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: format!(
-                        "L-17: Password must be at least 8 characters (got {}). \
-                         Weak passwords expose private mining to brute-force attacks.",
-                        password.len()
-                    ),
-                    code: "PASSWORD_TOO_SHORT".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        config.network.private_mining_password = Some(password.clone());
-        updated_fields.push("private_mining_password".to_string());
-    }
-
-    // Validate and apply solo_payout_address
-    if let Some(ref address) = request.solo_payout_address {
-        if address.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: "solo_payout_address cannot be empty".to_string(),
-                    code: "EMPTY_SOLO_ADDRESS".to_string(),
-                }),
-            )
-                .into_response();
-        }
-
-        if !validate_address_prefix(address, network) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: format!(
-                        "Invalid address prefix for {:?} network. Address: {}",
-                        network, address
-                    ),
-                    code: "INVALID_ADDRESS_PREFIX".to_string(),
-                }),
-            )
-                .into_response();
-        }
-
-        config.network.solo_payout_address = Some(address.clone());
-        updated_fields.push("solo_payout_address".to_string());
-    }
 
     // Validate and apply policy_profile
     if let Some(ref profile_str) = request.policy_profile {
@@ -10799,17 +10610,15 @@ mod tests {
     /// persisted config (pool.toml), not the ephemeral dashboard mirror.
     #[tokio::test]
     async fn test_config_full_reads_real_config() {
-        use ghost_common::config::{MiningMode, NodeConfig as FullNodeConfig};
+        use ghost_common::config::NodeConfig as FullNodeConfig;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let mut cfg = FullNodeConfig::default();
-        cfg.pool.node_payout_address = Some("tb1qexamplepayoutaddr".to_string());
         cfg.pool.pool_name = Some("SatoshiPool".to_string());
         cfg.storage.archive_mode = true;
         cfg.storage.prune_height = 5000;
-        cfg.network.mining_mode = MiningMode::PublicPool;
 
         let state = Arc::new(
             crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
@@ -10817,9 +10626,7 @@ mod tests {
                 .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
-        // This test asserts the response carries `node_payout_address` and the Ghost Pay
-        // payout address — which is precisely why the route is no longer public. Sign the
-        // read the way the dashboard proxy does.
+        // The route is internal; sign the read the way the dashboard proxy does.
         let (signature, timestamp) = operator_get_signature();
         let response = super::create_router(Arc::clone(&state))
             .oneshot(
@@ -10838,14 +10645,8 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            json["payout"]["address"].as_str(),
-            Some("tb1qexamplepayoutaddr")
-        );
-        // GhostPay payout address now surfaces from the real config (Group C).
         assert_eq!(json["pool_name"].as_str(), Some("SatoshiPool"));
         assert_eq!(json["archive_mode"].as_bool(), Some(true));
-        assert_eq!(json["public_mining"].as_bool(), Some(true));
         // VW/OW/AW model: OW = prune_height, VW = the read-only floor, AW mirrors
         // archive_mode. The old `prune_profile`/`operator_window` fakes are gone.
         assert_eq!(json["pruning"]["ow_blocks"].as_u64(), Some(5000));

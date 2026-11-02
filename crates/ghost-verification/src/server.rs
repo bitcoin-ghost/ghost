@@ -960,7 +960,6 @@ pub struct DashboardConfig {
     /// Ghost mode local egress: announce/serve our own txs while ghost mode is on
     pub ghost_mode_local_egress: bool,
     pub archive_mode: bool,
-    pub public_mining: bool,
     pub reaper: bool,
     /// Maximum miners this node will accept
     pub max_miners: u32,
@@ -984,8 +983,6 @@ pub struct DashboardConfig {
     // Dashboard-managed fields
     /// Node display nickname
     pub nickname: Option<String>,
-    /// Private mining enabled
-    pub private_mining: Option<bool>,
     /// Payout address for mining rewards
     pub payout_address: Option<String>,
     /// Custom pool name for coinbase tag (formatted as "GHOST {pool_name}")
@@ -1010,8 +1007,7 @@ impl Default for DashboardConfig {
             // `with_full_node_config`; leaving this false means a node whose
             // config does not enable archiving can never claim it.
             archive_mode: false,
-            public_mining: true, // enabled by default
-            reaper: true,        // enabled by default
+            reaper: true, // enabled by default
             max_miners: 1000,
             node_name: None,
             region: None,
@@ -1030,7 +1026,6 @@ impl Default for DashboardConfig {
             backup_dir: "/home/ghost/.ghost/backups".to_string(),
             // Dashboard-managed fields
             nickname: None,
-            private_mining: None,
             payout_address: None,
             pool_name: None,
             tor_mode: false,
@@ -1050,7 +1045,6 @@ impl Default for DashboardConfig {
 pub struct PoolPeerInfo {
     pub public_address: String,
     pub miner_count: u32,
-    pub public_mining: bool,
     pub last_seen: u64,
     /// Peer's effective max miners (derived from CPU/RAM/FD, capped by
     /// operator's `network.max_miners` if set). 0 means the peer hasn't

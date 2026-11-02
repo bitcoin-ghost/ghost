@@ -41,9 +41,8 @@ use tracing::{debug, error, info, warn};
 
 use bitcoin::consensus::deserialize;
 use ghost_buds::{BudsClassifier, BudsTier};
-use ghost_common::config::{BitcoinNetwork, BlockPriority, MiningMode};
+use ghost_common::config::{BitcoinNetwork, BlockPriority};
 use ghost_common::rpc::{BitcoinRpc, BlockTemplate, TemplateTransaction};
-use ghost_common::types::TreasuryAddress;
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
 
@@ -108,20 +107,8 @@ pub struct TemplateConfig {
     /// strips it from the template prefix and stamps each job's own share tag in its place.
     /// `None` leaves the coinbase without one.
     pub node_id: Option<ghost_common::types::NodeId>,
-    /// Treasury address for pool fees (supports multi-sig)
-    pub treasury_address: TreasuryAddress,
-    /// Pool payout address for fallback coinbase (bech32)
-    /// Used when no approved payout proposal exists
-    pub pool_payout_address: String,
     /// Bitcoin network (mainnet, signet, testnet, regtest)
     pub network: BitcoinNetwork,
-    /// Mining mode (PublicPool, PrivatePool, PrivateSolo)
-    pub mining_mode: MiningMode,
-    /// Solo payout address (required for PrivateSolo mode)
-    ///
-    /// Solo uses the same fee model as pool mode (#592): above `COINBASE_FEE_SPLIT_HEIGHT` the 1%
-    /// pool fee is levied on `subsidy + fees` and this address receives the other 99%.
-    pub solo_payout_address: Option<String>,
     /// Whether to enforce the finer per-field policy knobs during tx selection.
     ///
     /// This is `true` ONLY for the operator-defined `Custom` profile. The three
@@ -148,11 +135,7 @@ impl Default for TemplateConfig {
             target_weight: crate::block_limits::MAX_BLOCK_WEIGHT,
             coinbase_extra: "GHOST".to_string(),
             node_id: None,
-            treasury_address: TreasuryAddress::default(), // Must be configured
-            pool_payout_address: String::new(),           // Must be configured
             network: BitcoinNetwork::Mainnet,
-            mining_mode: MiningMode::PublicPool,
-            solo_payout_address: None,
             enforce_custom_policy_fields: false,
             block_priority: BlockPriority::MaxFee,
         }
@@ -160,70 +143,11 @@ impl Default for TemplateConfig {
 }
 
 impl TemplateConfig {
-    /// Validate all configured addresses.
+    /// Validate the configuration.
     ///
-    /// CRIT-10: This MUST be called before creating a TemplateProcessor.
-    /// Invalid addresses would create unspendable outputs, permanently losing funds.
-    ///
-    /// Returns Ok(()) if all addresses are valid, or an error describing which
-    /// address is invalid and why.
+    /// The coinbase pays the node pool's canonical outputs, which pool_sv2 builds per job; the
+    /// only thing configured here that reaches the coinbase is the pool tag.
     pub fn validate(&self) -> Result<(), TemplateError> {
-        // Helper to validate a single address
-        let validate_address = |address: &str, context: &str| -> Result<(), TemplateError> {
-            if address.is_empty() {
-                return Err(TemplateError::InvalidAddress {
-                    address: address.to_string(),
-                    context: context.to_string(),
-                    reason: "address is empty".to_string(),
-                });
-            }
-
-            // Try to parse as a Bitcoin address
-            match address.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>() {
-                Ok(_) => Ok(()),
-                Err(e) => Err(TemplateError::InvalidAddress {
-                    address: address.to_string(),
-                    context: context.to_string(),
-                    reason: format!("failed to parse: {}", e),
-                }),
-            }
-        };
-
-        // Validate treasury address (required for all modes if non-empty)
-        if !self.treasury_address.is_empty() {
-            validate_address(self.treasury_address.address(), "treasury_address")?;
-        }
-
-        // Validate pool_payout_address (required for public/private pool modes)
-        match self.mining_mode {
-            MiningMode::PublicPool | MiningMode::PrivatePool => {
-                if self.pool_payout_address.is_empty() {
-                    return Err(TemplateError::ConfigError(
-                        "pool_payout_address is required for PublicPool and PrivatePool modes"
-                            .to_string(),
-                    ));
-                }
-                validate_address(&self.pool_payout_address, "pool_payout_address")?;
-            }
-            MiningMode::PrivateSolo => {
-                // pool_payout_address not used in solo mode
-            }
-        }
-
-        // Validate solo_payout_address (required for solo mode)
-        if self.mining_mode == MiningMode::PrivateSolo {
-            match &self.solo_payout_address {
-                Some(addr) if !addr.is_empty() => {
-                    validate_address(addr, "solo_payout_address")?;
-                }
-                _ => {
-                    return Err(TemplateError::ConfigError(
-                        "solo_payout_address is required for PrivateSolo mode".to_string(),
-                    ));
-                }
-            }
-        }
-
         // H-MINE-3: Validate coinbase_extra length to prevent script_len truncation
         // Script sig format: height (1-5) + payout tag (21) + coinbase_extra + extranonce.
         //
@@ -2214,7 +2138,6 @@ mod tests {
         let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
         let processor = TemplateProcessor::new(
             TemplateConfig {
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
                 ..Default::default()
             },
             rpc,
@@ -2307,75 +2230,12 @@ mod tests {
         );
     }
 
-    /// CRIT-10-TEST-3: Test config validation catches invalid addresses at startup
-    #[test]
-    fn test_config_validation() {
-        // Empty treasury address is allowed (optional)
-        let config = TemplateConfig {
-            pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            mining_mode: MiningMode::PublicPool,
-            ..Default::default()
-        };
-        assert!(
-            config.validate().is_ok(),
-            "Valid config should pass validation"
-        );
-
-        // Empty pool_payout_address in public pool mode should fail
-        let config = TemplateConfig {
-            pool_payout_address: "".to_string(),
-            mining_mode: MiningMode::PublicPool,
-            ..Default::default()
-        };
-        assert!(
-            config.validate().is_err(),
-            "Empty pool_payout_address should fail in PublicPool mode"
-        );
-
-        // Invalid pool_payout_address should fail
-        let config = TemplateConfig {
-            pool_payout_address: "invalid-address".to_string(),
-            mining_mode: MiningMode::PublicPool,
-            ..Default::default()
-        };
-        assert!(
-            config.validate().is_err(),
-            "Invalid pool_payout_address should fail validation"
-        );
-
-        // Solo mode without solo_payout_address should fail
-        let config = TemplateConfig {
-            pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            mining_mode: MiningMode::PrivateSolo,
-            solo_payout_address: None,
-            ..Default::default()
-        };
-        assert!(
-            config.validate().is_err(),
-            "Solo mode requires solo_payout_address"
-        );
-
-        // Solo mode with valid solo_payout_address should pass
-        let config = TemplateConfig {
-            pool_payout_address: "".to_string(), // Not used in solo mode
-            mining_mode: MiningMode::PrivateSolo,
-            solo_payout_address: Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string()),
-            ..Default::default()
-        };
-        assert!(
-            config.validate().is_ok(),
-            "Valid solo config should pass validation"
-        );
-    }
-
     /// H-MINE-3-TEST-1: Test that excessively long coinbase_extra is rejected at config validation
     #[test]
     fn test_coinbase_extra_length_validation() {
         // Valid short coinbase_extra should pass
         let config = TemplateConfig {
             coinbase_extra: "GHOST".to_string(),
-            pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            mining_mode: MiningMode::PublicPool,
             ..Default::default()
         };
         assert!(
@@ -2392,8 +2252,6 @@ mod tests {
         // 100 - 5 - 20 - 21 = 54.
         let config = TemplateConfig {
             coinbase_extra: "A".repeat(54),
-            pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            mining_mode: MiningMode::PublicPool,
             ..Default::default()
         };
         assert!(
@@ -2403,8 +2261,6 @@ mod tests {
 
         let config = TemplateConfig {
             coinbase_extra: "A".repeat(55),
-            pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            mining_mode: MiningMode::PublicPool,
             ..Default::default()
         };
         assert!(
@@ -2415,8 +2271,6 @@ mod tests {
         // Very long coinbase_extra should definitely fail
         let config = TemplateConfig {
             coinbase_extra: "A".repeat(300),
-            pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            mining_mode: MiningMode::PublicPool,
             ..Default::default()
         };
         let result = config.validate();
@@ -3066,8 +2920,6 @@ mod tests {
         let processor = TemplateProcessor::new(
             TemplateConfig {
                 coinbase_extra: "GHOST PublicPool".to_string(),
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                mining_mode: MiningMode::PublicPool,
                 node_id: Some(node_id),
                 ..Default::default()
             },
@@ -3117,8 +2969,6 @@ mod tests {
         let processor = TemplateProcessor::new(
             TemplateConfig {
                 coinbase_extra: "GHOST PublicPool".to_string(),
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                mining_mode: MiningMode::PublicPool,
                 node_id: Some([0x11u8; 32]),
                 ..Default::default()
             },
@@ -3159,8 +3009,6 @@ mod tests {
             TemplateProcessor::new(
                 TemplateConfig {
                     coinbase_extra: extra.to_string(),
-                    pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                    mining_mode: MiningMode::PublicPool,
                     ..Default::default()
                 },
                 rpc,

@@ -45,9 +45,6 @@ not, build the binary locally `cargo build --release -p ghost-mining` and COPY i
 ## 3. Bring the cluster up (genesis-ordered)
 ```bash
 cd docker/regtest-cluster
-export TREASURY_ADDRESS=$(docker run --rm bitcoin-ghost/ghostd:regtest \
-  bitcoin-cli -regtest -rpcuser=ghost -rpcpassword=ghostpass getnewaddress || echo bcrt1qSETME)
-
 docker compose up -d bitcoind
 # pool1 is the genesis node — start it, wait ~60s for genesis params, THEN the rest
 docker compose up -d pool1

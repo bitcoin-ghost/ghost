@@ -8,45 +8,20 @@
 # standalone over curl and has no repo to read from. check-inlined-copies.sh
 # compares the two byte-for-byte — edit both, or neither.
 set -euo pipefail
-CONF="${GHOST_POOL_CONF:-/etc/ghost/pool.toml}"
 PORTS=(3333 34255)
-# External miners are accepted in public_pool AND private_pool — both open the
-# Stratum ports (public_pool to anyone, private_pool to password-holders). Only
-# private_solo keeps them closed. mining_mode is the single source of truth: the
-# legacy public_mining bool was removed and is ignored by ghost-mining, so we key
-# purely off mining_mode here to stay consistent with the running node.
-accept_miners="no"
-if [[ -r "$CONF" ]] \
- && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?(public_pool|private_pool)"?' "$CONF" 2>/dev/null; then
-  accept_miners="yes"
-fi
-if [[ "$accept_miners" == "yes" ]]; then
-  for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
-  logger -t ghost-mining-firewall "external miners ON (public_pool/private_pool) -> Stratum 3333+34255 OPEN"
-else
-  for p in "${PORTS[@]}"; do ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true; done
-  logger -t ghost-mining-firewall "external miners OFF (private_solo) -> Stratum 3333+34255 CLOSED"
-fi
+# Every node is a public node pool node, so external miners are always accepted.
+# There is no mining mode left to key off: an older pool.toml that still carries a
+# `mining_mode` line is ignored by ghost-mining, and is ignored here too.
+for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
+logger -t ghost-mining-firewall "external miners ON -> Stratum 3333+34255 OPEN"
 
-# Farm/rental tier (#410) listens on 4444 and is enabled ONLY for public_pool — a private
-# or solo node has a known miner set and no rented hashrate to serve. This deliberately uses
-# a narrower condition than the Stratum ports above, which also open for private_pool.
+# Farm/rental tier (#410) listens on 4444 on every node.
 #
-# It must track `install-node.sh`, which emits the [farm_tier] block on the same condition.
-# If these two ever disagree the node either advertises a port nothing listens on, or listens
-# on a port nothing can reach — the second is what the config comment warns about.
-farm_tier="no"
-if [[ -r "$CONF" ]] \
- && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?public_pool"?' "$CONF" 2>/dev/null; then
-  farm_tier="yes"
-fi
-if [[ "$farm_tier" == "yes" ]]; then
-  ufw allow 4444/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "farm tier ON (public_pool) -> Stratum 4444 OPEN"
-else
-  ufw delete allow 4444/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "farm tier OFF -> Stratum 4444 CLOSED"
-fi
+# It must track `install-node.sh`, which always emits the [farm_tier] block. If these two ever
+# disagree the node either advertises a port nothing listens on, or listens on a port nothing
+# can reach — the second is what the config comment warns about.
+ufw allow 4444/tcp >/dev/null 2>&1 || true
+logger -t ghost-mining-firewall "farm tier ON -> Stratum 4444 OPEN"
 
 # 9100 was the Wraith coordinator port. Nothing listens on it any more, so a rule
 # left open by an older install is closed.

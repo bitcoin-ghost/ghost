@@ -5,7 +5,7 @@ set -euo pipefail
 
 : "${NODE_NAME:?NODE_NAME required}"
 : "${SEED_NODES:?SEED_NODES required (comma-separated \"host:8559\" quoted list)}"
-: "${BITCOIN_RPC_USER:?}" "${BITCOIN_RPC_PASSWORD:?}" "${TREASURY_ADDRESS:?}"
+: "${BITCOIN_RPC_USER:?}" "${BITCOIN_RPC_PASSWORD:?}"
 
 mkdir -p /var/lib/ghost/data
 export SIGNING_KEY="${SIGNING_KEY:-$(head -c 32 /dev/urandom | xxd -p -c 32)}"

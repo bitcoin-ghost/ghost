@@ -121,7 +121,6 @@ COLLECT='
   printf "farm_cfg=%s\n"         "$(grep -cE "^\[farm_tier\]" /etc/ghost/translator-config.toml 2>/dev/null)"
   printf "farm_listen=%s\n"      "$($SUDO ss -ltn 2>/dev/null | grep -c ":4444")"
   printf "farm_ufw=%s\n"         "$($SUDO ufw status 2>/dev/null | grep -c "4444")"
-  printf "mining_mode=%s\n"      "$(grep -oP "^\s*mining_mode\s*=\s*\"\K[^\"]+" /etc/ghost/pool.toml 2>/dev/null | head -1)"
   # 9100 was the Wraith coordinator port. Nothing listens on it now, so it must be closed.
   printf "coord_ufw=%s\n"        "$($SUDO ufw status 2>/dev/null | grep -cE "^9100(/tcp)?[[:space:]]")"
   # #759: config is never reconciled against what the repo ships, so dead keys survive for months
@@ -349,11 +348,9 @@ for n in "${REACHED[@]}"; do
     # is the worst of the three states — anything auditing reachability by firewall says yes and
     # is wrong. Seven nodes sat exactly there.
     fc="${VALUES[$n|farm_cfg]:-0}"; fl="${VALUES[$n|farm_listen]:-0}"; fw="${VALUES[$n|farm_ufw]:-0}"
-    mm="${VALUES[$n|mining_mode]:-}"
-    if [ "$mm" = "public_pool" ]; then
-        [ "${fc:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n public_pool but no [farm_tier] in translator-config.toml (#758)"; rc=1; }
-        [ "${fl:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n public_pool but nothing is LISTENING on :4444 (#758)"; rc=1; }
-    fi
+    # Every node is a pool node, so every node runs the farm tier.
+    [ "${fc:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n no [farm_tier] in translator-config.toml (#758)"; rc=1; }
+    [ "${fl:-0}" -gt 0 ] 2>/dev/null || { echo "  FAIL $n nothing is LISTENING on :4444 (#758)"; rc=1; }
     if [ "${fw:-0}" -gt 0 ] 2>/dev/null && [ "${fl:-0}" -eq 0 ] 2>/dev/null; then
         echo "  FAIL $n ufw allows 4444 but NOTHING listens there — an audit by firewall reads this as reachable"; rc=1
     fi
@@ -363,10 +360,6 @@ for n in "${REACHED[@]}"; do
     if [ "${cw:-0}" -gt 0 ] 2>/dev/null; then
         echo "  FAIL $n ufw allows 9100 but the Wraith coordinator is gone — an open port nothing answers on"; rc=1
     fi
-
-    # mining_mode decides whether payouts go through BFT. Relying on MiningMode::default() means a
-    # change to that default silently reconfigures the node.
-    [ -n "$mm" ] || { echo "  FAIL $n mining_mode is not set in pool.toml — running on MiningMode::default() (#758)"; rc=1; }
 
     # #759: keys for features that no longer exist, and required keys covered for by a default.
     dk="${VALUES[$n|dead_keys]:-}"

@@ -8,17 +8,10 @@
 //! ([`refusal_category`]) — but the category is only the explanation. What refuses is absence from
 //! [`SETTABLE`], so a key nobody has categorised yet is refused all the same.
 //!
-//! ⛔ **Capability claims are deliberately absent** — `archive_mode`, `ghost_pay`, `reaper` and the
-//! rest. They feed `NodeCapabilities::total_shares`, so flipping one changes how the node-reward
-//! pool is divided. The decision (2026-09-29) is that a capability is earned by passing its
-//! verification challenges, not granted by setting a flag: if an operator turns a feature on, the
-//! pool should verify it properly and then award the reward, and nothing else. Making the flag
-//! remotely settable would add a second, unverified route to the same money.
-//!
-//! ⚠ `archive_mode` already demonstrates the principle — `should_claim_archive` refuses to
-//! advertise Archive on a hazed or pruned node whatever the config says. `ghost_pay` and `reaper`
-//! have no such evidence gate today, which is the argument for keeping all of them off this list
-//! rather than picking the safe-looking ones.
+//! ⛔ **Node-role switches are deliberately absent** — `archive_mode`, `reaper`, `tor_mode`,
+//! `ghost_mode` and the rest change how ghostd runs, and some (archive, Haze) cannot be undone
+//! without a resync. They are an operator's decision on the box, not a remote toggle. The
+//! capability ladder and node rewards these once fed are gone.
 //!
 //! ## Why it never restarts
 //!
@@ -100,11 +93,11 @@ pub enum RefusalCategory {
     Credential,
     /// Where money is paid.
     MoneyDestination,
-    /// Decides whether payouts go through BFT; `deploy-node.sh` gates on it.
+    /// The retired mining mode.
     MiningMode,
     /// Network, epoch and shard geometry every node must agree on.
     ConsensusGeometry,
-    /// A capability claim or role — it changes the node-reward split.
+    /// A node-role switch that changes how ghostd runs.
     CapabilityClaim,
     /// A path or URL that could redirect data or shares.
     DataRedirection,
@@ -132,16 +125,14 @@ impl RefusalCategory {
                 "it is a credential, and credentials are never set over the network"
             }
             Self::MoneyDestination => "it is a money destination; changing it redirects payouts",
-            Self::MiningMode => {
-                "mining_mode decides whether payouts go through BFT, and deploy-node.sh gates on it"
-            }
+            Self::MiningMode => "mining_mode is retired: every node is a node pool node",
             Self::ConsensusGeometry => {
                 "it is consensus geometry, which every node must agree on; a change on one node \
                  forks it from the rest"
             }
             Self::CapabilityClaim => {
-                "it is a capability claim, which changes the node-reward split. A capability is \
-                 earned by passing its verification challenges, not by setting a flag"
+                "it is a node-role switch that changes how ghostd runs, and is set on the box, \
+                 not over the network"
             }
             Self::DataRedirection => "it is a path or URL that could redirect data or shares",
             Self::NotOnAllowlist => {
@@ -886,41 +877,21 @@ mod tests {
         }
     }
 
-    /// Every field of `NodeCapabilities`, and the config path an operator would have to set to
-    /// claim it. `None` means the claim is not operator-settable by construction.
-    ///
-    /// ⛔ Mirrors the `NodeCapabilities { .. }` initialiser in `bins/ghost-pool/src/main.rs`,
-    /// which is in a crate this one does not depend on — so the mapping cannot be read off a type
-    /// and has to be declared. What CAN be derived is its completeness, and
-    /// `scripts/check-capability-claims-are-not-settable.sh` does that in CI: every field of
-    /// `NodeCapabilities` must appear here, and nothing else may.
-    ///
-    /// It is derived-checked because the hand-written version had already drifted (#963). It named
-    /// `pool.public_mining` — not a field of any settings struct, removed when `mining_mode`
-    /// replaced it, and cited BY NAME in `config.rs` as the key that sat in live configs for
-    /// months meaning nothing — while omitting `network.mining_mode` and
-    /// `coordinator.coordinator_enabled`, the two paths that actually drive a claim.
-    pub(super) const CAPABILITY_CONFIG_PATHS: &[(&str, Option<&str>)] = &[
-        ("archive_mode", Some("storage.archive_mode")),
-        // Ghost Pay is removed and never claimed. No config path sets it.
-        ("ghost_pay", None),
-        // ⚠ NOT `pool.public_mining`. The claim is `matches!(mining_mode, MiningMode::PublicPool)`.
-        ("public_mining", Some("network.mining_mode")),
-        ("reaper", Some("reaper.enabled")),
-        // Registration order — the first 101 nodes. No config path exists to set it.
-        ("elder_status", None),
-        // Earns the Wraith mixing fee rather than 5-4-3-2-1 shares, but it is still a role an
-        // operator must not be able to switch on over HTTP.
-        ("coordinator", Some("coordinator.coordinator_enabled")),
+    /// Paths that switch a node role (how ghostd runs) or the retired mining mode and coordinator
+    /// role. None may be set over HTTP.
+    pub(super) const NODE_ROLE_PATHS: &[&str] = &[
+        "storage.archive_mode",
+        "reaper.enabled",
+        "network.ghost_mode",
+        "network.mining_mode",
+        "coordinator.coordinator_enabled",
     ];
 
-    /// ⛔ The decision this module exists to enforce: a capability is earned by passing its
-    /// verification challenges, never by setting a flag.
+    /// A node-role switch is set on the box, never over HTTP.
     #[test]
-    fn capability_claims_are_refused() {
+    fn node_role_switches_are_refused() {
         let mut checked = 0;
-        for (field, path) in CAPABILITY_CONFIG_PATHS {
-            let Some(k) = path else { continue };
+        for k in NODE_ROLE_PATHS {
             let e = apply(REAL, k, &json!(true)).unwrap_err();
             assert!(
                 matches!(
@@ -931,27 +902,25 @@ mod tests {
                             RefusalCategory::CapabilityClaim | RefusalCategory::MiningMode
                         )
                 ),
-                "{field}: '{k}' must be refused as a capability claim, got {e:?}"
+                "'{k}' must be refused as a node-role switch, got {e:?}"
             );
             checked += 1;
         }
         // A table that lost its entries would pass every assertion above by running none of them.
         assert!(
             checked >= 4,
-            "only {checked} capability path(s) exercised — the table is too short to be the \
-             whole set"
+            "only {checked} node-role path(s) exercised — the table is too short"
         );
     }
 
     /// The allowlist is what does the refusing; the test above only samples it. Nothing in
-    /// `SETTABLE` may be a path that drives a capability claim.
+    /// `SETTABLE` may be a node-role switch.
     #[test]
-    fn no_capability_path_is_on_the_allowlist() {
-        for (field, path) in CAPABILITY_CONFIG_PATHS {
-            let Some(k) = path else { continue };
+    fn no_node_role_path_is_on_the_allowlist() {
+        for k in NODE_ROLE_PATHS {
             assert!(
                 lookup(k).is_none(),
-                "{field}: '{k}' drives a capability claim and must never be in SETTABLE"
+                "'{k}' is a node-role switch and must never be in SETTABLE"
             );
         }
     }

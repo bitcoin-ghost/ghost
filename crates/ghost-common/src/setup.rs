@@ -5,7 +5,6 @@
 
 use crate::config::{HazeMode, NodeConfig, PolicyProfile};
 use crate::identity::NodeIdentity;
-use crate::types::TreasuryAddress;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -73,17 +72,6 @@ pub fn apply_initial_setup(
         .get("nickname")
         .map(|v| v.as_text().to_string())
         .unwrap_or_default();
-    // The wizard's "public_mining" toggle maps to mining_mode = PublicPool.
-    // Disabled → keeps the default mining_mode (PublicPool unless overridden
-    // elsewhere). Operators choosing private modes use a different setup flow.
-    let public_mining_intent = fields
-        .get("public_mining")
-        .map(|v| v.as_bool())
-        .unwrap_or(false);
-    let payout_address = fields
-        .get("payout_address")
-        .map(|v| v.as_text().to_string())
-        .unwrap_or_default();
     let archive_mode = fields
         .get("archive_mode")
         .map(|v| v.as_bool())
@@ -131,18 +119,10 @@ pub fn apply_initial_setup(
     if !nickname.is_empty() {
         config.identity.display_name = Some(nickname);
     }
-    config.network.mining_mode = if public_mining_intent {
-        crate::config::MiningMode::PublicPool
-    } else {
-        crate::config::MiningMode::PrivatePool
-    };
     config.network.noise_enabled = true;
     config.network.internal_api_secret = Some(api_secret);
     config.storage.archive_mode = archive_mode;
     config.policy.profile = profile;
-    if !payout_address.is_empty() {
-        config.pool.treasury_address = TreasuryAddress::from(payout_address);
-    }
     config.reaper.enabled = reaper_enabled;
 
     config
@@ -172,19 +152,6 @@ pub fn apply_change_setup(
             let name = v.as_text().to_string();
             if !name.is_empty() {
                 config.identity.display_name = Some(name);
-            }
-        }
-        if let Some(v) = fields.get("public_mining") {
-            config.network.mining_mode = if v.as_bool() {
-                crate::config::MiningMode::PublicPool
-            } else {
-                crate::config::MiningMode::PrivatePool
-            };
-        }
-        if let Some(v) = fields.get("payout_address") {
-            let addr = v.as_text().to_string();
-            if !addr.is_empty() {
-                config.pool.treasury_address = TreasuryAddress::from(addr);
             }
         }
         if let Some(v) = fields.get("archive_mode") {
@@ -346,28 +313,6 @@ pub fn ghostd_managed_dropin(
         base.join(" "),
         flags.join(" ")
     )
-}
-
-/// Pool setup — configure mining pool settings
-pub fn apply_pool_setup(
-    fields: &HashMap<String, FieldValue>,
-    config_path: &Path,
-) -> Result<String, String> {
-    load_and_modify(config_path, |config| {
-        if let Some(v) = fields.get("public_mining") {
-            config.network.mining_mode = if v.as_bool() {
-                crate::config::MiningMode::PublicPool
-            } else {
-                crate::config::MiningMode::PrivatePool
-            };
-        }
-        if let Some(v) = fields.get("payout_address") {
-            let addr = v.as_text().to_string();
-            if !addr.is_empty() {
-                config.pool.treasury_address = TreasuryAddress::from(addr);
-            }
-        }
-    })
 }
 
 /// Ghost Mode — toggle privacy-enhanced relay

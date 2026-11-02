@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn, Level};
 
 use tracing_subscriber::prelude::*;
 
-use ghost_common::config::{MiningMode, NodeConfig, ReaperSettings};
+use ghost_common::config::{NodeConfig, ReaperSettings};
 use ghost_common::constants::ACTIVE_MINER_WINDOW_SECS;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
@@ -814,16 +814,6 @@ async fn main() -> Result<()> {
         reaper_config.reject_legacy_data_stuffing,
     );
 
-    // Determine effective public_mining from mining_mode
-    // PublicPool = public mining enabled, other modes = private
-    let mining_mode = config.network.mining_mode;
-    let is_public_mining = matches!(mining_mode, MiningMode::PublicPool);
-
-    info!(
-        "Mining mode: {:?} (public_mining={})",
-        mining_mode, is_public_mining
-    );
-
     // Register this node in the database (peer tracking and discovery).
     let node_id_hex = identity.node_id_hex();
     if let Err(e) = db.register_node(
@@ -900,7 +890,7 @@ async fn main() -> Result<()> {
     // Reload the latest round's statistics from the database
     round_manager.reload_from_db(&db);
 
-    // Resolve coinbase tag: coinbase_extra > pool_name formatted > mode default
+    // Resolve coinbase tag: coinbase_extra > pool_name formatted > default
     let coinbase_tag = config
         .pool
         .coinbase_extra
@@ -912,7 +902,7 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|name| format!("GHOST {}", name))
         })
-        .unwrap_or_else(|| mining_mode.default_coinbase_tag().to_string());
+        .unwrap_or_else(|| ghost_common::config::DEFAULT_COINBASE_TAG.to_string());
 
     // Write tag file so SRI pool service can pick it up via ExecStartPre
     let tag_path = data_dir.join("coinbase_tag");
@@ -921,7 +911,7 @@ async fn main() -> Result<()> {
     }
     info!(tag = %coinbase_tag, "Coinbase tag: {}", coinbase_tag);
 
-    // Initialize template processor with treasury and pool payout addresses from config
+    // Initialize the template processor
     // Per-field policy enforcement (max outputs / size / OP_RETURN / witness /
     // content) is the "Advanced" Custom profile only. The three "Basic" presets
     // stay tier-gate-only, so their baked-in field limits are NOT enforced at
@@ -940,13 +930,8 @@ async fn main() -> Result<()> {
         TemplateConfig::default().min_fee_rate
     };
 
-    // Pool payout address defaults to treasury address if not explicitly configured separately
     let template_config = TemplateConfig {
-        treasury_address: config.pool.treasury_address.clone(),
-        pool_payout_address: config.pool.treasury_address.address().to_string(), // Use same as treasury for now
         network: config.bitcoin.network,
-        mining_mode,
-        solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
         // The identity itself, not a pre-hashed commitment: the scriptSig builder derives the
         // tag per build — `node_commitment_plain` below SHARE_TIER_BIND_HEIGHT (byte-identical
@@ -984,19 +969,13 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         ports: config.network.p2p.clone(),
-        // SV1 tier listeners, so peers can route by tier (#495).
-        //
-        // Only advertised when this node actually accepts outside hashpower. A private or solo
-        // node advertising a listener would invite connections it will refuse, and the failure
-        // reads to the sender as an unreachable peer rather than a deliberate policy.
+        // SV1 tier listeners, so peers can route by tier (#495). Every node is a pool node.
         //
         // The farm port is `None` unless the operator configured one. A node that advertises a
         // farm port it does not listen on turns a routing decision into a dropped connection,
         // so the safe direction is to say nothing.
-        advertised_hobby_port: is_public_mining.then_some(config.network.sv1_port),
-        advertised_farm_port: is_public_mining
-            .then_some(config.network.farm_port)
-            .flatten(),
+        advertised_hobby_port: Some(config.network.sv1_port),
+        advertised_farm_port: config.network.farm_port,
         // C-1: Noise Protocol configuration for encrypted P2P
         // Read from config (mainnet validation ensures this is true on mainnet)
         noise_enabled: config.network.noise_enabled,
@@ -1268,7 +1247,6 @@ async fn main() -> Result<()> {
             .map(|p| PoolPeerInfo {
                 public_address: p.public_address.clone(),
                 miner_count: p.miner_count,
-                public_mining: true,
                 last_seen: p.last_seen,
                 max_capacity: p.max_capacity,
                 deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
@@ -3068,26 +3046,6 @@ fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
     let mut config = if path.exists() {
         let content = std::fs::read_to_string(path)?;
 
-        // One-shot deprecation check: the legacy `public_mining` bool was
-        // removed in favour of `mining_mode`. Old pool.toml files still parse
-        // (serde silently ignores unknown fields) but operators should clean
-        // up so the source of truth is unambiguous.
-        if content
-            .lines()
-            .any(|l| l.trim_start().starts_with("public_mining"))
-        {
-            warn!(
-                // The variants deserialise as snake_case. This message used to name them
-                // in CamelCase, so following it exactly produced `unknown variant
-                // `PublicPool`, expected one of `public_pool`, ...` and the node refused
-                // to start — a deprecation notice that broke the config it was telling
-                // you how to fix.
-                "DEPRECATED: `public_mining` in pool.toml is ignored. \
-                 Use `mining_mode = \"public_pool\" | \"private_pool\" | \"private_solo\"` instead. \
-                 Remove the `public_mining` line to silence this warning."
-            );
-        }
-
         let config: NodeConfig = toml::from_str(&content)?;
 
         // Check config file permissions — fails on mainnet if world-readable
@@ -3100,19 +3058,11 @@ fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
         NodeConfig::default()
     };
 
-    // Enforce the Ghost Mode / Public Mining mutual exclusion at load time. A
-    // Ghost Mode node builds near-empty blocks and forfeits all transaction-fee
-    // income, so it must never also run as a public miner. If a config file sets
-    // both, Ghost Mode is disabled (Public Mining, the income-earning
-    // capability, is left active) and the change is logged loudly rather than
-    // silently allowed.
+    // Ghost Mode builds near-empty blocks and forfeits all transaction-fee income, so a pool
+    // node must never run it. If a config file sets it, it is disabled and the change is logged
+    // loudly rather than silently allowed.
     if let Some(warning) = config.reconcile_ghost_mode_mining_exclusion() {
         warn!("{}", warning);
-    }
-
-    // Validate pool configuration
-    if let Err(e) = config.pool.validate() {
-        warn!("Pool configuration warning: {}", e);
     }
 
     Ok(config)
@@ -3323,7 +3273,7 @@ mod tests {
     fn load_config_missing_file_returns_defaults() {
         let result = load_config(Path::new("/nonexistent/ghost.toml")).unwrap();
         let default = NodeConfig::default();
-        assert_eq!(result.pool.min_payout_sats, default.pool.min_payout_sats);
+        assert_eq!(result.pool.pool_name, default.pool.pool_name);
     }
 
     #[test]

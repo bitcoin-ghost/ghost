@@ -4,12 +4,11 @@
 #
 #   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
 #
-# Stands up a full Ghost node (ghostd + ghost-mining) on Ubuntu, joins the mesh,
-# and — while there are still Elder slots free (first 101 nodes) — registers as
-# an Elder. Mirrors the proven production setup; every per-node secret is
-# generated fresh on this machine and never leaves it.
+# Stands up a full Ghost node (ghostd + ghost-mining) on Ubuntu as a public node
+# pool node and joins the mesh. Mirrors the proven production setup; every
+# per-node secret is generated fresh on this machine and never leaves it.
 #
-# Derived from the verified provisioning of mainnet-5 (elder #5).
+# Derived from the verified provisioning of mainnet-5.
 set -euo pipefail
 
 # ─────────────────────────── network constants ───────────────────────────────
@@ -40,30 +39,20 @@ POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
-# Bootstrap peers (the current Elders). The node discovers the rest via gossip.
+# Bootstrap peers. The node discovers the rest via gossip.
 SEED_NODES='"83.136.251.162:8555", "85.9.198.212:8555", "213.163.207.46:8555", "95.111.221.169:8555"'
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
 ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
 # ─────────────────────────────── defaults ────────────────────────────────────
 PAYOUT_ADDRESS=""
-TREASURY_ADDRESS=""
 ALERT_WEBHOOK=""
 ALERT_TOPIC="ghost-node"
 NICKNAME="ghost-node"
 SYNC_MODE="ibd"            # ibd (trustless, default) | haze (IRREVERSIBLE)
-# Mining mode — the single source of truth for who can mine and how rewards are
-# shared. One of: public_pool | private_pool | private_solo (mirrors
-# ghost-common MiningMode and the dashboard PoolSetupWizard). Default is
-# public_pool, unchanged from the historical default.
-#   public_pool  — DNS-registered, ANYONE can mine, pool-aggregated rewards (+3).
-#   private_pool — password-required, NOT in DNS, your miners + invited external
-#                  miners, pool-aggregated (shared) rewards. No +3 DNS capability.
-#   private_solo — password-required, NOT in DNS, Stratum closed to external
-#                  miners; 99% subsidy + ALL fees to the operator's own address.
-MINING_MODE="public_pool"
-# Optional custom pool name. Empty = fall back to the mining-mode default coinbase
-# tag (nothing written to pool.toml). When set it becomes the block coinbase
+# Every node is a public node pool node: there are no mining modes any more.
+# Optional custom pool name. Empty = fall back to the default coinbase tag
+# "GHOST PublicPool" (nothing written to pool.toml). When set it becomes the block coinbase
 # scriptsig tag "- G H O S T - <name>", visible on explorers. ASCII, <=30 chars.
 POOL_NAME=""
 REAPER="true"
@@ -92,10 +81,9 @@ usage() {
 Bitcoin Ghost node installer
 
 Required:
-  --payout-address <bech32>   Where this node's reward share is paid.
-  --treasury-address <bech32> Where THIS node's pool fee accumulates. There is deliberately
-                                no default: a default would silently pay a stranger's fee to
-                                whoever shipped the installer (#982).
+  --payout-address <bech32>   Payout address used by this node's SV2 pool
+                                (coinbase_reward_script) and translator
+                                (default miner user_identity).
 
 Strongly recommended:
   --alert-webhook <url>       Push endpoint for node alerts (e.g. https://ntfy.sh). Without
@@ -108,28 +96,14 @@ Options:
   --pool-name <name>          Custom pool name shown in the block coinbase as
                                 '- G H O S T - <name>' on explorers. ASCII only,
                                 max 30 chars. Distinct from --nickname (the mesh
-                                display name). Default: derived from --mining-mode.
+                                display name). Default tag: "GHOST PublicPool".
   --sync <mode>               ibd | haze                      (default: ibd)
                                 ibd  — full trustless sync + prune (recommended)
                                 haze — strips block data, ~195GB, FAST but
                                        IRREVERSIBLE. You can never serve raw
                                        blocks or go archive without a full resync.
-  --mining-mode <mode>        solo | pool | public            (default: public)
-                                public — Public Pool: DNS-registered, ANYONE can
-                                         mine, pool-aggregated rewards (+3 shares).
-                                pool   — Private Pool: password-required, NOT in
-                                         DNS, your miners + invited external
-                                         miners, shared rewards (no +3 capability).
-                                solo   — Private Solo: password-required, NOT in
-                                         DNS, Stratum closed to external miners,
-                                         99% subsidy + ALL fees to your address.
-                                A miner password is generated automatically for
-                                the private modes and printed at the end.
-  --no-public-mining          Backward-compatible alias for --mining-mode solo.
-                                Prefer --mining-mode. If both are given, the last
-                                one on the command line wins.
-  --no-reaper                 Don't run the mempool reaper    (capability -2)
-  --archive                   Full archive node (~720GB, capability +5)
+  --no-reaper                 Don't run the mempool reaper
+  --archive                   Full archive node (~720GB)
   --tor                       Route over Tor (hybrid): outbound peers via Tor +
                                 publish an onion, still reachable on clearnet 8333
   --tor-only                  Route over Tor ONLY: no clearnet (onlynet=onion),
@@ -165,24 +139,11 @@ NON_INTERACTIVE="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --payout-address) PAYOUT_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --treasury-address) TREASURY_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --alert-webhook)  ALERT_WEBHOOK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --alert-topic)    ALERT_TOPIC="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --pool-name)      POOL_NAME="${2:-}"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --sync)           SYNC_MODE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --mining-mode)
-      case "${2:-}" in
-        solo|private_solo)   MINING_MODE="private_solo";;
-        pool|private_pool)   MINING_MODE="private_pool";;
-        public|public_pool)  MINING_MODE="public_pool";;
-        *) echo "Unknown --mining-mode '${2:-}' (expected: solo | pool | public)" >&2; usage; exit 1;;
-      esac
-      shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    # Backward-compatible alias for --mining-mode solo. Both write the same
-    # MINING_MODE variable, so when --mining-mode and --no-public-mining are both
-    # passed the last one on the command line wins (predictable left-to-right).
-    --no-public-mining) MINING_MODE="private_solo"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor)            TOR="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -213,16 +174,6 @@ is_core_rpc_client() {
   local out
   out="$(timeout "${CLI_IDENTITY_TIMEOUT:-10}" "$1" -version 2>/dev/null)" || return 1
   [[ "${out%%$'\n'*}" == *"RPC client"* ]]
-}
-
-# One-line human label for a mining_mode value (summary + final output).
-mining_mode_label() {
-  case "$1" in
-    public_pool)  echo "Public Pool (DNS-registered, anyone can mine, +3 shares)";;
-    private_pool) echo "Private Pool (password-required, invited miners, not in DNS)";;
-    private_solo) echo "Private Solo (password-required, no external miners, solo rewards)";;
-    *)            echo "$1";;
-  esac
 }
 
 # Strip leading/trailing whitespace (mirrors the dashboard wizard's .trim()).
@@ -260,34 +211,22 @@ prompt_yes_no() {
 }
 
 # Interactive first-run wizard. Collects the SAME variables the flag interface
-# sets (PAYOUT_ADDRESS, SYNC_MODE, MINING_MODE, REAPER, ARCHIVE,
+# sets (PAYOUT_ADDRESS, SYNC_MODE, POOL_NAME, REAPER, ARCHIVE,
 # NICKNAME); the rest of the installer is unchanged. Only ever runs with no
 # config flags, on a TTY, without --non-interactive.
 run_wizard() {
   echo
   log "Bitcoin Ghost — guided node setup"
-  echo "This installs a full Ghost node (ghostd + ghost-mining), joins the mesh, and"
-  echo "registers as an Elder while slots remain. Press Enter to accept each [default]."
+  echo "This installs a full Ghost node (ghostd + ghost-mining) as a public node pool"
+  echo "node and joins the mesh. Press Enter to accept each [default]."
   echo
 
   # Payout address — REQUIRED, no default, re-prompt until valid.
   local addr
   while :; do
-    read -rp "Payout address (mainnet bech32 — where your rewards are paid): " addr || true
+    read -rp "Payout address (mainnet bech32 — used by this node's SV2 pool and translator): " addr || true
     if [[ "$addr" =~ ^bc1[a-z0-9]{20,}$ ]]; then
       PAYOUT_ADDRESS="$addr"; break
-    fi
-    echo "  ✗ That doesn't look like a mainnet bech32 address (must start 'bc1…'). Try again."
-  done
-
-  # Treasury address — REQUIRED, no default (#982). Asked for, never inferred.
-  local taddr
-  echo
-  echo "The treasury address receives this node's pool fee. It must be yours."
-  while :; do
-    read -rp "Treasury address (mainnet bech32): " taddr || true
-    if [[ "$taddr" =~ ^bc1[a-z0-9]{20,}$ ]]; then
-      TREASURY_ADDRESS="$taddr"; break
     fi
     echo "  ✗ That doesn't look like a mainnet bech32 address (must start 'bc1…'). Try again."
   done
@@ -316,47 +255,26 @@ run_wizard() {
     *) echo "  Unrecognised choice — using ibd."; SYNC_MODE="ibd";;
   esac
 
-  # Mining mode — who can mine and how rewards are shared. Default = Public Pool
-  # (option 1), preserving the historical default behaviour.
-  echo
-  echo "Mining mode (who can mine and how rewards are shared):"
-  echo "  1) Public Pool   DNS-registered, ANYONE can mine, pool-aggregated (shared) rewards (+3 shares). RECOMMENDED."
-  echo "  2) Private Pool  Password-required, NOT in DNS; your miners + invited external miners, shared rewards."
-  echo "  3) Private Solo  Password-required, NOT in DNS, closed to external miners; 99% of subsidy + ALL fees to you."
-  local mode_choice
-  read -rp "Choose 1, 2 or 3 [1]: " mode_choice || true
-  mode_choice="${mode_choice:-1}"
-  case "$mode_choice" in
-    1|public|public_pool) MINING_MODE="public_pool";;
-    2|pool|private_pool)  MINING_MODE="private_pool";;
-    3|solo|private_solo)  MINING_MODE="private_solo";;
-    *) echo "  Unrecognised choice — using Public Pool."; MINING_MODE="public_pool";;
-  esac
-
-  # Optional custom pool name — offered for the pool modes (the coinbase tag
-  # identifies a shared pool). Skipped for Private Solo, which has no shared pool
-  # identity; it keeps the mode-default tag (set --pool-name explicitly to change
-  # it). Blank = mode default. Validated/re-prompted to match the dashboard.
+  # Optional custom pool name (the coinbase tag). Blank = the default tag
+  # "GHOST PublicPool". Validated/re-prompted to match the dashboard.
   POOL_NAME=""
-  if [[ "$MINING_MODE" == "public_pool" || "$MINING_MODE" == "private_pool" ]]; then
-    echo
-    echo "Pool name (optional) — shown in the block coinbase as '- G H O S T - <name>'"
-    echo "on block explorers. ASCII only, max 30 characters. Leave blank for the default."
-    while :; do
-      local pn
-      read -rp "Pool name [none]: " pn || true
-      pn="$(_trim "$pn")"
-      [[ -z "$pn" ]] && { POOL_NAME=""; break; }
-      if pool_name_valid "$pn"; then POOL_NAME="$pn"; break; fi
-      echo "  ✗ Must be printable ASCII and at most 30 characters. Try again (or leave blank)."
-    done
-  fi
-
-  # Capabilities.
   echo
-  echo "Capabilities (each affects your node's reward share):"
-  REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions (+2 path)?" Y)"
-  ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk (+5 shares)?" N)"
+  echo "Pool name (optional) — shown in the block coinbase as '- G H O S T - <name>'"
+  echo "on block explorers. ASCII only, max 30 characters. Leave blank for the default."
+  while :; do
+    local pn
+    read -rp "Pool name [none]: " pn || true
+    pn="$(_trim "$pn")"
+    [[ -z "$pn" ]] && { POOL_NAME=""; break; }
+    if pool_name_valid "$pn"; then POOL_NAME="$pn"; break; fi
+    echo "  ✗ Must be printable ASCII and at most 30 characters. Try again (or leave blank)."
+  done
+
+  # ghostd options.
+  echo
+  echo "Node options:"
+  REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions?" Y)"
+  ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk?" N)"
 
   # Tor. Off by default. Hybrid keeps clearnet reachability AND adds an onion;
   # tor-only routes everything over Tor and drops clearnet.
@@ -389,10 +307,7 @@ run_wizard() {
   log "Summary of your choices"
   echo "  Payout address : $PAYOUT_ADDRESS"
   echo "  Sync mode      : $SYNC_MODE"
-  echo "  Mining mode    : $(mining_mode_label "$MINING_MODE")"
   [[ -n "$POOL_NAME" ]] && echo "  Pool name      : $POOL_NAME  (coinbase: - G H O S T - $POOL_NAME)"
-  [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]] && \
-    echo "  Miner password : (generated automatically — shown when install completes)"
   echo "  Reaper         : $REAPER"
   echo "  Archive node   : $ARCHIVE"
   echo "  Tor            : $([[ "$TOR" == "true" ]] && echo "$TOR_MODE" || echo "off")"
@@ -419,10 +334,6 @@ fi
 [[ -n "$PAYOUT_ADDRESS" ]] || { usage; err "--payout-address is required."; }
 [[ "$PAYOUT_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Payout address doesn't look like a mainnet bech32 address."
 
-# ⛔ Required, never defaulted (#982). This installer used to hardcode the author's address, so
-# every third-party node silently accumulated ITS pool fee to someone else — while
-# ghost-web/docs/deployment.md told the operator it was "an address you control". Refusing is the
-# only safe behaviour: a wrong treasury address is invisible until someone audits a coinbase.
 # The [alerts] block. ⛔ Written with `enabled` reflecting whether a channel was actually given:
 # a section that says `enabled = true` with nowhere to deliver is worse than an honest false,
 # because it reads as configured (#985). ghost-mining warns loudly at every start in either case.
@@ -453,9 +364,6 @@ enabled = false
 ALERTS
 )
 fi
-
-[[ -n "$TREASURY_ADDRESS" ]] || { usage; err "--treasury-address is required."; }
-[[ "$TREASURY_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Treasury address doesn't look like a mainnet bech32 address."
 
 [[ "$(uname -m)" == "x86_64" ]] || err "Only x86_64 is supported by this installer right now."
 case "$SYNC_MODE" in ibd) ;;
@@ -646,15 +554,6 @@ if [[ -f /etc/ghost/pool.toml ]] && grep -qE '^signing_key[[:space:]]*=' /etc/gh
 fi
 [[ -n "${SIGNKEY:-}" ]] || SIGNKEY="$(openssl rand -hex 32)"
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
-# Private-mining password. The private modes (private_pool, private_solo) require
-# a miner password — ghost-mining refuses to start without one — so we generate a
-# strong one here (secure by default; well over the 8-char minimum) and surface
-# it to the operator at the end so they can configure their miners. public_pool
-# needs none, so it is left empty and never written to pool.toml.
-PRIVATE_MINING_PASSWORD=""
-if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
-  PRIVATE_MINING_PASSWORD="$(openssl rand -hex 16)"
-fi
 
 # ───────────────────────── 5. ghostd config (sync) ───────────────────────────
 log "Writing /etc/bitcoin/bitcoin.conf (sync mode: ${SYNC_MODE})"
@@ -739,46 +638,30 @@ fi
 
 # ─────────────────────────── 6. pool config ──────────────────────────────────
 log "Writing /etc/ghost/pool.toml"
-# Build the [network] mining block. public_pool emits exactly the historical
-# single line (byte-for-byte unchanged). The private modes append the fields
-# ghost-mining REQUIRES: a miner password for both, plus the operator's solo
-# payout address for private_solo (99% subsidy + all fees route there).
-MINING_BLOCK="mining_mode = \"${MINING_MODE}\""
-# Tell peers about the farm listener, on exactly the nodes that run one.
+# Every node is a public node pool node, so there is no mining_mode to write. Configs from older
+# installs that still carry [network] mining_mode / private_mining_password / solo_payout_address,
+# [pool] treasury_address / min_payout_sats / payout_interval_blocks / node_payout_address /
+# share_shard / shard_*, or a [coordinator] section still load: those keys are read and ignored.
 #
-# The listener itself is the translator's ([farm_tier] port, emitted below for public_pool
-# only); this is ghost-mining's advertisement of it. They are separate processes, so the port is
+# Tell peers about the farm listener (farm_port in [network] below).
+#
+# The listener itself is the translator's ([farm_tier] port, emitted below); this is
+# ghost-mining's advertisement of it. They are separate processes, so the port is
 # duplicated — `scripts/check-stratum-config-agreement.sh` keeps the two in step, because a node
 # advertising a port it does not listen on turns a routing decision into a dropped connection.
 #
 # Without this the listener is open and nobody is told, which is why farm routing has been inert
 # since #494 shipped (#495).
-if [[ "$MINING_MODE" == "public_pool" ]]; then
-  MINING_BLOCK="${MINING_BLOCK}
-farm_port = 4444"
-fi
-case "$MINING_MODE" in
-  private_pool)
-    MINING_BLOCK="${MINING_BLOCK}
-private_mining_password = \"${PRIVATE_MINING_PASSWORD}\""
-    ;;
-  private_solo)
-    MINING_BLOCK="${MINING_BLOCK}
-private_mining_password = \"${PRIVATE_MINING_PASSWORD}\"
-solo_payout_address = \"${PAYOUT_ADDRESS}\""
-    ;;
-esac
-# Build the [pool] node-identity block. The optional custom pool_name is appended
-# only when set, so the default (no pool_name) output is byte-for-byte unchanged.
+# Build the [pool] block body. The section header itself is always written (the config struct
+# requires it); the optional custom pool_name is the only line it carries, and only when set.
 # POOL_NAME is already trimmed + validated (printable ASCII, <=30); we still
 # TOML-escape backslash and double-quote so the written basic string round-trips
 # to exactly the name the dashboard would store (and thus the same coinbase tag).
-POOL_IDENTITY_BLOCK="node_payout_address = \"${PAYOUT_ADDRESS}\""
+POOL_IDENTITY_BLOCK=""
 if [[ -n "$POOL_NAME" ]]; then
   POOL_NAME_ESCAPED="${POOL_NAME//\\/\\\\}"
   POOL_NAME_ESCAPED="${POOL_NAME_ESCAPED//\"/\\\"}"
-  POOL_IDENTITY_BLOCK="${POOL_IDENTITY_BLOCK}
-pool_name = \"${POOL_NAME_ESCAPED}\""
+  POOL_IDENTITY_BLOCK="pool_name = \"${POOL_NAME_ESCAPED}\""
 fi
 cat > /etc/ghost/pool.toml <<EOF
 [identity]
@@ -803,7 +686,7 @@ sv2_port = 34255
 sv1_port = 3333
 http_port = 8080
 max_miners = 1000
-${MINING_BLOCK}
+farm_port = 4444
 seed_nodes = [${SEED_NODES}]
 
 [network.p2p]
@@ -827,18 +710,6 @@ prune_height = 0
 
 [pool]
 ${POOL_IDENTITY_BLOCK}
-treasury_address = "${TREASURY_ADDRESS}"
-min_payout_sats = 10000
-payout_interval_blocks = 100
-
-# The share shard IS the paying ledger (payout.rs:779). All three default to false in
-# NodeConfig, and this installer used to set none of them — so a freshly provisioned node ran
-# with the paying ledger OFF: create_proposal errors, no coinbase commitment is produced, and
-# the H-11 guard then REFUSES TO SUBMIT a block the node just found (#983). The one event the
-# pool exists for was the one that failed. All three are required together.
-share_shard = true
-shard_arm_genesis = true
-shard_coinbase = true
 
 ${ALERTS_BLOCK}
 
@@ -884,9 +755,8 @@ chown -R ghost:ghost /home/ghost /var/lib/ghost /var/lib/bitcoin
 
 # ─────────────────────────── 7. node identity ────────────────────────────────
 # ⛔ NEVER regenerate an identity that already exists (#985). node.key is not a cache: node_id
-# derives from it, its first 32 bytes ARE the TDP authority secret, and the Elder slot is bound to
-# it. `--generate-identity` does not recover an identity, it mints a DIFFERENT node — and nothing
-# backs this file up. Re-running an installer is the most natural operator reflex there is (to
+# derives from it, and its first 32 bytes ARE the TDP authority secret. `--generate-identity` does
+# not recover an identity, it mints a DIFFERENT node — and nothing backs this file up. Re-running an installer is the most natural operator reflex there is (to
 # upgrade, to repair a config, after a failed first attempt), and it used to destroy the one
 # artefact that cannot be recreated. Note this script already preserves internal_api_secret across
 # re-runs, so idempotency was considered for a regenerable value and not for the irreplaceable one.
@@ -960,17 +830,12 @@ fi
 grep -q "^sv2_authority_public_key = \"${SV2_AUTH_PUB}\"$" /etc/ghost/pool.toml \
   || err "Failed to record the SV2 authority public key in pool.toml."
 
-# Farm/rental tier (#410). Emitted ONLY for public_pool: a private or solo node has a
-# known set of miners and no rented hashrate to serve, so a second public listener is
-# surface it does not need. `reconcile-mining-firewall.sh` opens 4444 on the same
-# condition, so the port and the listener can never disagree.
-FARM_TIER_BLOCK=""
-if [[ "$MINING_MODE" == "public_pool" ]]; then
-  FARM_TIER_BLOCK="[farm_tier]
+# Farm/rental tier (#410). Every node is public, so every node runs it;
+# `reconcile-mining-firewall.sh` opens 4444 unconditionally to match.
+FARM_TIER_BLOCK="[farm_tier]
 port = 4444
 min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
 hobby_max_individual_miner_hashrate = 50_000_000_000_000.0"
-fi
 
 # translator_sv2 — accepts SV1 miners on :3333 and forwards SV2 to the local pool.
 # user_identity is this node's own payout address (public, not a secret): it is
@@ -1095,9 +960,8 @@ authority_pubkey = "${SV2_AUTH_PUB}"
 # taking anything from anyone — it just costs this node ~20x the share
 # validation, bandwidth and database writes.
 #
-# Enabled by default on public mining nodes (operator decision, 2026-07-27); the block
-# below is emitted only for mining_mode = "public_pool". Private and solo nodes get no
-# farm listener and no 4444 firewall rule.
+# Enabled on every node (operator decision, 2026-07-27; every node is now a public node
+# pool node), with a matching 4444 firewall rule.
 ${FARM_TIER_BLOCK}
 
 [load_balancer]
@@ -1443,11 +1307,10 @@ if [[ "$TOR" == "true" && "$TOR_MODE" == "tor-only" ]]; then
 fi
 ufw --force enable      >/dev/null 2>&1
 
-# Stratum V1 (3333) + V2 (34255) are exposed ONLY when this node accepts public
-# miners. Instead of a static rule baked at install time, a tiny reconcile
-# service follows `mining_mode` in pool.toml, and a .path unit re-runs it
-# whenever the config changes — so toggling public mining later (dashboard /
-# ghost-setup / hand edit) updates the firewall live, with no manual ufw step.
+# Stratum V1 (3333) + V2 (34255) and the farm tier (4444) are always open: every
+# node is a public node pool node. The reconcile service still runs at boot and
+# whenever pool.toml changes (a .path unit), so a rule removed by hand or left
+# closed by an older private/solo install is put back with no manual ufw step.
 log "Installing mining-firewall reconcile (stratum ports follow pool.toml)"
 cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'RECONCILE_MINING_FW_EOF'
 #!/usr/bin/env bash
@@ -1460,45 +1323,20 @@ cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'RECONCILE_MINING_FW_EOF'
 # standalone over curl and has no repo to read from. check-inlined-copies.sh
 # compares the two byte-for-byte — edit both, or neither.
 set -euo pipefail
-CONF="${GHOST_POOL_CONF:-/etc/ghost/pool.toml}"
 PORTS=(3333 34255)
-# External miners are accepted in public_pool AND private_pool — both open the
-# Stratum ports (public_pool to anyone, private_pool to password-holders). Only
-# private_solo keeps them closed. mining_mode is the single source of truth: the
-# legacy public_mining bool was removed and is ignored by ghost-mining, so we key
-# purely off mining_mode here to stay consistent with the running node.
-accept_miners="no"
-if [[ -r "$CONF" ]] \
- && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?(public_pool|private_pool)"?' "$CONF" 2>/dev/null; then
-  accept_miners="yes"
-fi
-if [[ "$accept_miners" == "yes" ]]; then
-  for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
-  logger -t ghost-mining-firewall "external miners ON (public_pool/private_pool) -> Stratum 3333+34255 OPEN"
-else
-  for p in "${PORTS[@]}"; do ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true; done
-  logger -t ghost-mining-firewall "external miners OFF (private_solo) -> Stratum 3333+34255 CLOSED"
-fi
+# Every node is a public node pool node, so external miners are always accepted.
+# There is no mining mode left to key off: an older pool.toml that still carries a
+# `mining_mode` line is ignored by ghost-mining, and is ignored here too.
+for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
+logger -t ghost-mining-firewall "external miners ON -> Stratum 3333+34255 OPEN"
 
-# Farm/rental tier (#410) listens on 4444 and is enabled ONLY for public_pool — a private
-# or solo node has a known miner set and no rented hashrate to serve. This deliberately uses
-# a narrower condition than the Stratum ports above, which also open for private_pool.
+# Farm/rental tier (#410) listens on 4444 on every node.
 #
-# It must track `install-node.sh`, which emits the [farm_tier] block on the same condition.
-# If these two ever disagree the node either advertises a port nothing listens on, or listens
-# on a port nothing can reach — the second is what the config comment warns about.
-farm_tier="no"
-if [[ -r "$CONF" ]] \
- && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?public_pool"?' "$CONF" 2>/dev/null; then
-  farm_tier="yes"
-fi
-if [[ "$farm_tier" == "yes" ]]; then
-  ufw allow 4444/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "farm tier ON (public_pool) -> Stratum 4444 OPEN"
-else
-  ufw delete allow 4444/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "farm tier OFF -> Stratum 4444 CLOSED"
-fi
+# It must track `install-node.sh`, which always emits the [farm_tier] block. If these two ever
+# disagree the node either advertises a port nothing listens on, or listens on a port nothing
+# can reach — the second is what the config comment warns about.
+ufw allow 4444/tcp >/dev/null 2>&1 || true
+logger -t ghost-mining-firewall "farm tier ON -> Stratum 4444 OPEN"
 
 # 9100 was the Wraith coordinator port. Nothing listens on it any more, so a rule
 # left open by an older install is closed.
@@ -3639,12 +3477,7 @@ systemctl enable --now ghost-mining-gate >/dev/null 2>&1
 sleep 5
 
 NODE_ID="$(sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
-# Solo mode closes Stratum to external miners, so "point a miner at <public IP>" would be wrong.
-if [[ "$MINING_MODE" == "private_solo" ]]; then
-  MINER_POINTER="Point a miner running on this host at:  stratum+tcp://127.0.0.1:3333"
-else
-  MINER_POINTER="Point a miner at:  stratum+tcp://${PUBIP}:3333"
-fi
+MINER_POINTER="Point a miner at:  stratum+tcp://${PUBIP}:3333"
 cat <<EOF
 
   ✅ Bitcoin Ghost node installed.
@@ -3656,31 +3489,10 @@ cat <<EOF
      sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — started by the gate; serves miners on port 3333)
 
   "inactive" is expected for the last three until ghostd finishes syncing. The gate
-  then starts ghost-mining AUTOMATICALLY — your node joins the mesh and registers as
-  an Elder if slots remain (first 101) — followed by the SV2 stratum stack
-  (sri-pool + sri-translator), which serves miners on Stratum port 3333 (SV1) /
-  34255 (SV2). ${MINER_POINTER}
+  then starts ghost-mining AUTOMATICALLY — your node joins the mesh — followed by the
+  SV2 stratum stack (sri-pool + sri-translator), which serves miners on Stratum port
+  3333 (SV1) / 34255 (SV2). ${MINER_POINTER}
   Watch the gate:    sudo journalctl -u ghost-mining-gate -f
   Watch the stratum: sudo journalctl -u sri-pool -u sri-translator -f
 EOF
 
-# Private modes need a miner password — show it now (and where it lives) so the
-# operator can point their mining software at this node.
-if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
-  if [[ "$MINING_MODE" == "private_pool" ]]; then
-    REACH_NOTE="External miners may connect to Stratum on this host's ports 3333 (SV1) / 34255 (SV2)."
-  else
-    REACH_NOTE="Stratum ports 3333 (SV1) / 34255 (SV2) are CLOSED to external miners — only miners you run locally can connect."
-  fi
-cat <<EOF
-
-  🔒 Mining mode: $(mining_mode_label "$MINING_MODE")
-     Miners must authenticate with this password (stored in
-     /etc/ghost/pool.toml as [network] private_mining_password):
-
-         ${PRIVATE_MINING_PASSWORD}
-
-     Keep it safe — anyone with it can mine on this node.
-     ${REACH_NOTE}
-EOF
-fi

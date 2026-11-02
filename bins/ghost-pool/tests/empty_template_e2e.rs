@@ -13,9 +13,8 @@
 
 use std::sync::Arc;
 
-use ghost_common::config::{BitcoinNetwork, MiningMode};
+use ghost_common::config::BitcoinNetwork;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::types::TreasuryAddress;
 use ghost_pool::template::{TemplateConfig, TemplateProcessor};
 use serde_json::json;
 
@@ -29,15 +28,6 @@ fn rpc() -> Option<Arc<BitcoinRpc>> {
     // the mainnet limit. Point the rpc at Regtest so it uses the permissive limit.
     r.set_network(BitcoinNetwork::Regtest);
     Some(Arc::new(r))
-}
-
-fn addr(seed: u8) -> String {
-    use bitcoin::secp256k1::{Secp256k1, SecretKey};
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(&[seed; 32]).expect("sk");
-    let pk = bitcoin::PublicKey::new(sk.public_key(&secp));
-    let cpk = bitcoin::CompressedPublicKey::try_from(pk).expect("cpk");
-    bitcoin::Address::p2wpkh(&cpk, bitcoin::Network::Regtest).to_string()
 }
 
 #[tokio::test]
@@ -106,10 +96,7 @@ async fn empty_template_is_coinbase_only_while_forced_full_includes_mempool() {
 
     let template = Arc::new(TemplateProcessor::new(
         TemplateConfig {
-            treasury_address: TreasuryAddress::single(addr(200)),
-            pool_payout_address: addr(201),
             network: BitcoinNetwork::Regtest,
-            mining_mode: MiningMode::PublicPool,
             ..Default::default()
         },
         rpc,

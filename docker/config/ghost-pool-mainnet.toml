@@ -64,8 +64,3 @@ archive_mode = true
 prune_height = 0
 
 [pool]
-# IMPORTANT: Set your mainnet treasury address (bc1q...)
-# L-10: Must be a SegWit (bc1q...) address you control.
-# NOTE: P2TR (bc1p...) addresses are NOT supported for quantum safety.
-treasury_address = "${TREASURY_ADDRESS}"  # REQUIRED - must be bc1q... address
-min_payout_sats = 10000

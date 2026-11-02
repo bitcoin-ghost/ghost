@@ -34,12 +34,6 @@ struct Args {
     /// Node nickname
     #[arg(long)]
     nickname: Option<String>,
-    /// Enable public mining
-    #[arg(long)]
-    public_mining: bool,
-    /// Payout address (bech32)
-    #[arg(long)]
-    payout_address: Option<String>,
     /// Enable archive mode
     #[arg(long, default_value = "true")]
     archive: bool,
@@ -89,13 +83,6 @@ fn main() {
     let mut fields = HashMap::new();
     if let Some(ref name) = args.nickname {
         fields.insert("nickname".to_string(), FieldValue::Text(name.clone()));
-    }
-    fields.insert(
-        "public_mining".to_string(),
-        FieldValue::Bool(args.public_mining),
-    );
-    if let Some(ref addr) = args.payout_address {
-        fields.insert("payout_address".to_string(), FieldValue::Text(addr.clone()));
     }
     fields.insert("archive_mode".to_string(), FieldValue::Bool(args.archive));
     fields.insert("reaper".to_string(), FieldValue::Bool(args.reaper));
