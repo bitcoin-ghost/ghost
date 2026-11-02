@@ -141,7 +141,7 @@ treasury = S/200 + (Rm - sum(pay))
   **This breaks the rule's own promise.** Every sat of change was earned by miners and is still on their balances, but the coin has gone to the treasury, so the total of all balances can never be paid. On a pool with many stock Antminers the treasury would take 20-33% of the miners' reward. Class-faking gain is gone (1.000 against honest, was +34-39%). **Decided 11-02: keep this rule.** Change goes to the treasury. Miners are sensed per connection and paid according to what their firmware can carry; known low-limit SV1 firmware is warned about, not refused.
 - `queue_since` is the height the balance crossed 1,000 sats, reset only when it falls below 1,000 sats.
 - Balances are stored as blobs, not SQLite i64, which caps at 21.47 BTC in these units.
-- `refimpl_v2.py` implements the draft 6 floating-ratio rule and must be rewritten to this one.
+- `refimpl_v3.py` implements this rule; the older floating-ratio references stay in the design folder only.
 
 Settlement is applied at tip, not at maturity, using Bitcoin ancestry plus the share chain. A block's `parent_anchor[..16]` and table root are on-chain; a node finds the matching anchor, recomputes the canonical outputs and retires only if they match. A block whose anchor a node doesn't have yet, as after a partition, retires provisionally from its coinbase data so its shares are not voided. Anchors with 6-confirmation pool blocks are final. Proposals and signatures go.
 
