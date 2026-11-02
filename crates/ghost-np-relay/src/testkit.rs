@@ -454,6 +454,9 @@ pub struct SimNode {
 /// Decides whether a message in flight is dropped: `(from, to, message)`.
 pub type DropRule = Box<dyn Fn(usize, usize, &Message) -> bool>;
 
+/// Rewrites a message in flight: `(from, to, message)`.
+pub type TamperRule = Box<dyn Fn(usize, usize, Message) -> Message>;
+
 /// An in-process network of relay cores with controllable links.
 pub struct Sim {
     /// The nodes; node `i` is peer `i` to the others.
@@ -466,6 +469,8 @@ pub struct Sim {
     pub now: u64,
     /// Messages to lose.
     pub drop: DropRule,
+    /// Messages to rewrite (a lying peer).
+    pub tamper: TamperRule,
     /// Messages delivered so far.
     pub delivered: usize,
 }
@@ -486,6 +491,7 @@ impl Sim {
             btc,
             now: T0,
             drop: Box::new(|_, _, _| false),
+            tamper: Box::new(|_, _, m| m),
             delivered: 0,
         };
         for i in 0..n {
@@ -569,6 +575,7 @@ impl Sim {
             if !self.linked(f, t) || (self.drop)(f, t, &m) {
                 continue;
             }
+            let m = (self.tamper)(f, t, m);
             self.delivered += 1;
             let outs = self.nodes[t]
                 .relay
@@ -642,6 +649,45 @@ impl Sim {
         } else {
             LocalOutcome::Share
         };
+        assert_eq!(r, Ok(want), "node {i}");
+        let outs = self.nodes[i].relay.take_out();
+        self.route(i, outs);
+        self.run();
+        s
+    }
+
+    /// Node `i`'s miner finds a share on Bitcoin block `prev` at `prev_height` (any branch the
+    /// node has archived), on node `i`'s published job, and node `i` takes it.
+    pub fn mine_on(
+        &mut self,
+        i: usize,
+        prev: [u8; 32],
+        prev_height: u32,
+        anchor: bool,
+    ) -> NetShare {
+        let n = &mut self.nodes[i];
+        let job = n.relay.job_anchor().expect("published");
+        let table = n
+            .relay
+            .block_table_on(&job.parent_anchor, prev_height + 1, &prev)
+            .expect("table");
+        let t = n
+            .relay
+            .required_tier(&job.parent_anchor, prev_height)
+            .expect("tier");
+        let tier = if anchor { t + ANCHOR_TIER_OFFSET } else { t };
+        let mut s = n.miner.build_on(job, &table, prev, prev_height, tier);
+        while !anchor && hash_meets_tier(&s.id(), base(), t + ANCHOR_TIER_OFFSET) {
+            s = n.miner.build_on(job, &table, prev, prev_height, tier);
+        }
+        let want = if anchor {
+            LocalOutcome::Anchor
+        } else {
+            LocalOutcome::Share
+        };
+        let r = n
+            .relay
+            .on_local_share(s.clone(), &self.btc.headers, self.now);
         assert_eq!(r, Ok(want), "node {i}");
         let outs = self.nodes[i].relay.take_out();
         self.route(i, outs);

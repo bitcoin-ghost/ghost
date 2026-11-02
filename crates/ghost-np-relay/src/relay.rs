@@ -979,7 +979,7 @@ impl Relay {
             return Err("already held".into());
         }
         let prev = share.prev_hash();
-        let f = hdr.facts(&prev).ok_or_else(|| {
+        let f = self.facts(hdr, &prev).ok_or_else(|| {
             self.needed_headers.insert(prev);
             "unknown Bitcoin header".to_string()
         })?;
