@@ -33,6 +33,9 @@
 
 pub mod atomic_file;
 pub mod batch_two_phase;
+
+/// Node pool: the canonical payout rule, a port of `docs/node-pool-reference/refimpl_v3.py`.
+pub mod canonical_payout;
 pub mod circuit_breaker;
 pub mod clock;
 pub mod coinbase_tags;
