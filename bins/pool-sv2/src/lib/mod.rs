@@ -41,6 +41,7 @@ pub mod miner_stats;
 mod monitoring;
 pub mod node_pool;
 pub mod node_pool_api;
+pub mod node_pool_genesis_import;
 pub mod node_pool_miner_api;
 pub mod node_pool_relay;
 pub mod share_webhook;
