@@ -307,6 +307,11 @@ impl NodePool {
         Ok(script)
     }
 
+    /// The node id this node's share tags commit.
+    pub fn node_id(&self) -> [u8; 32] {
+        *self.tiers.node_id()
+    }
+
     /// The finder script this node's blocks pay their fees to.
     pub fn finder_script(&self) -> &[u8] {
         &self.finder_script
@@ -366,6 +371,7 @@ impl NodePool {
         tx.send(TableRequest {
             parent,
             height: h,
+            prev: None,
             reply,
         })
         .await

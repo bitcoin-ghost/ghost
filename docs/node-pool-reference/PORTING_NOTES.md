@@ -1,4 +1,4 @@
-# Porting notes: W2.1 pure core, W2.5 relay, W2.13 sync
+# Porting notes: W2.1 pure core, W2.5 relay, W2.9 audit, W2.13 sync
 
 Readings chosen where the spec leaves a detail open. Each one follows the Python reference
 (`refimpl_v3.py`) for the payout rule, or the simulator in the design folder
@@ -215,7 +215,47 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   so a share in a losing anchor's batch is not listed.
 - **Settled or provisional** is settlement's in-memory pending set; a restart re-derives it.
 
+## Miner protection (W2.9, `bins/ghost-audit`, `ghost-np-relay/src/client.rs`)
+- **Opening the tag needs the node.** A job's `GHNT` tag hashes `node_id`, tier, slot class, the
+  payee, `parent_anchor` and `batch_root`. A miner sees the payee (its own), `parent_anchor[..16]`
+  (`GHPP`), and can enumerate tier (256) and class (6), but `node_id` and `batch_root` are known
+  only to the node. So pool_sv2's relay answers a new `GetStamps` (type 16) with `Stamps` (17):
+  its `node_id` and the last 16 `JobAnchor`s it published, newest first (`NotFound` kind 4 from a
+  relay with no pool). Stamps are self-authenticating: one that does not hash to the tag with the
+  miner's script proves nothing, so asking the audited node trusts it for nothing. Rate 1/s,
+  burst 10. A stamp is node-global (every channel is stamped from the same `AnchorDriver`), so
+  disclosing it reveals nothing per miner; `batch_root` becomes public with the anchor anyway.
+- **Share-chain data comes from the auditor's own relay node**, run as pool_sv2 runs one minus
+  the pool (no listen, no `node_id`), syncing from `--relay-peer`s and settling from the miner's
+  Bitcoin node over RPC. The table is `block_table_on(parent, H, prev)` for the job's own
+  `prev_hash`: `TableRequest` gained `prev` (pool_sv2 passes `None`, unchanged); with `prev`, the
+  answer is `None` unless `prev` is archived at `H - 1`. The audited node is never asked for a
+  table. A Bitcoin node is required: a fresh archive has no base without one (see Open).
+- **Height** is `height(prev_hash) + 1` from the miner's Bitcoin node, and the scriptSig must
+  start with its BIP34 push.
+- **Tier check**: a committed tier above `floor(log2(difficulty))` (with 1e-9 slack for a float
+  printed just under its power of two) fails, except at the floor tier 10, which pool_sv2 commits
+  for any difficulty below 1,024 and which `T_net >= 10` makes harmless.
+- **Naming a failure** (`check::classify_outputs`), first match wins: no witness or `GHNP`
+  commitment (malformed); first output not the treasury script (wrong treasury);
+  canonical (pass); canonical for another class (wrong slot class); then, against the canonical
+  miners for the committed class, with the last output read as the finder when its script is not
+  owed: an unowed script carrying exactly a missing payee's amount (relabelled payee); any other
+  unowed script, or an owed one paid more than canonical (inflated balance); treasury plus miners
+  below the subsidy (fee skim); a dropped payee, a wrong treasury amount, rule order, a zero-value
+  finder (outputs not canonical); everything right but the `GHNP` root (wrong ledger root).
+- **Verdicts**: PASS, FAIL, UNCHECKED. UNCHECKED (prev_hash or parent anchor not held yet, or the
+  relay port unreachable) is retried for `--wait` seconds and is never a pass. A tag that does
+  not open is retried once with fresh stamps (the node may have re-stamped in between).
+- **Prober verdict** (`ghost-audit/probe/v1`): `fail` if the relay is on another genesis or
+  version, is not a relay, refuses stamps, the stratum port refuses the payee or speaks garbage,
+  or any job fails (`job_<reason>`); else `unmeasured` if anything could not be measured (relay
+  or stratum unreachable, fewer jobs than asked, a job UNCHECKED); else `pass`. `listable` is
+  `verdict == pass`. A failed advert skips the job check.
+- **Submits nothing.** The SV1 client never sends `mining.submit`; the e2e test server panics if
+  it does.
 
+## Open, not decided here
 - **K = 120.** Resolved for the relay above: the duplicate check reaches back to `S(H)`. The spec's
   constants table still lists K; it should be reworded.
 - **Regtest tier base.** At difficulty 1, `T_net` floor 10 needs about 2^42 hashes a share, out of
@@ -224,6 +264,16 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
 - **Treasury address**, from the user.
 - **Archive peers.** A fresh node cannot validate batches older than every peer's window. Which
   nodes run with `prune` off (all 8 fleet nodes, at least) is the operators' call.
+- **`ghost-audit` without a Bitcoin node.** The auditor's archive needs a trusted base (the
+  blocks at genesis) that only a Bitcoin node supplies today. A peer-only bootstrap (walk back
+  from the job's `prev_hash` with the archive's peer checks applied top-down) is possible but not
+  built.
+- **`ghost-audit` over SV2.** Only SV1 is audited. pool_sv2 builds one coinbase per extended
+  channel either way, but a hostile node could serve SV2 miners differently; an SV2 client (Noise
+  handshake, extended channel) is not built.
+- **Share inclusion.** The docs page promised a proof that an anchor included the miner's share
+  (`share_commit::batch_proof`). The auditor submits nothing, so it has no share to look for; a
+  check from the miner's own share log is not built.
 - **Deep reorgs.** A share-chain fork from below a node's checkpoint is never followed; that node
   must resync from an archive peer. With the default depth (288 blocks, two days) this needs a
   fork kept private for about two days.

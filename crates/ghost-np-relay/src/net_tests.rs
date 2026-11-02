@@ -50,6 +50,15 @@ fn wall() -> u64 {
 }
 
 async fn node(i: u8, btc: &Btc, peers: Vec<std::net::SocketAddr>) -> TestNode {
+    node_with(i, btc, peers, None).await
+}
+
+async fn node_with(
+    i: u8,
+    btc: &Btc,
+    peers: Vec<std::net::SocketAddr>,
+    node_id: Option<[u8; 32]>,
+) -> TestNode {
     let db = Arc::new(Database::in_memory().unwrap());
     let mut p = params();
     p.backstop_secs = 1;
@@ -62,6 +71,7 @@ async fn node(i: u8, btc: &Btc, peers: Vec<std::net::SocketAddr>) -> TestNode {
         peers,
         tick_ms: 100,
         dial_secs: 1,
+        node_id,
         ..NetConfig::default()
     };
     let oracle: Arc<dyn HeaderOracle> = Arc::new(btc.headers.clone());
@@ -170,4 +180,30 @@ async fn a_peer_sending_garbage_is_banned() {
     let mut s = TcpStream::connect(addr).await.unwrap();
     let r = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await;
     assert!(matches!(r, Ok(Ok(0)) | Ok(Err(_))), "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_node_serves_its_job_stamps_and_a_bare_relay_does_not() {
+    use crate::client::{fetch_stamps, ClientError, Session};
+    let btc = Btc::with_time(START_TIP, wall());
+    let a = node_with(1, &btc, vec![], Some([0xA1; 32])).await;
+    let addr = a.handle.listen_addr.unwrap();
+    let t = Duration::from_secs(5);
+    let job = a.job.lock().unwrap().expect("published at start");
+
+    let (hello, stamps) = fetch_stamps(addr, genesis_hash(), "ghost-audit/test", t)
+        .await
+        .unwrap();
+    assert_eq!(hello.genesis, genesis_hash());
+    assert_eq!(stamps.node_id, [0xA1; 32]);
+    assert_eq!(stamps.recent.first(), Some(&job), "newest first");
+
+    // Another share chain is refused by name, before anything is asked.
+    let wrong = Session::open(addr, [9; 32], "ghost-audit/test", t).await;
+    assert!(matches!(wrong, Err(ClientError::Genesis { .. })));
+
+    // A relay with no pool attached has nothing to stamp.
+    let b = node(2, &btc, vec![]).await;
+    let r = fetch_stamps(b.handle.listen_addr.unwrap(), genesis_hash(), "x", t).await;
+    assert!(matches!(r, Err(ClientError::NoStamps)), "{:?}", r.err());
 }

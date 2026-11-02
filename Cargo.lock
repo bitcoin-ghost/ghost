@@ -2105,6 +2105,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-audit"
+version = "1.11.46"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "clap",
+ "ghost-common",
+ "ghost-np-relay",
+ "ghost-storage",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ghost-buds"
 version = "1.11.46"
 dependencies = [

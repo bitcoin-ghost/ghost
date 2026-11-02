@@ -970,7 +970,10 @@ impl Relay {
                     }
                 }
                 NotFoundKind::BtcBlock => self.btc_not_found(peer, h),
+                NotFoundKind::Stamps => {}
             },
+            // Job stamps are the network layer's: it holds what was published to pool_sv2.
+            Message::GetStamps | Message::Stamps(_) => {}
             Message::Tip { hash, work, .. } => self.on_tip(peer, hash, work),
         }
         self.take_out()
