@@ -80,6 +80,8 @@ Flags set the policy (`--list-after`, `--window`, `--delist-after`, `--delist-af
 
 **`node-list.json`** (schema `ghost-audit/node-list/v1`): `generated_at` (RFC 3339) and `generated_at_unix`, `network`, `genesis_anchor`, the `policy` applied, the number of `candidates` and `listed` nodes, and `nodes`, sorted by relay address. Each node has `relay`, `host`, `relay_port`; `sv1` (a `stratum+tcp://` URL) and `sv1_port`; `sv2`, `sv2_port` and `sv2_authority_key` (null when not served); `node_id` (from its job stamps), `user_agent` and `protocol_version` (from its relay); `region` (always null: nothing measured says where a node is); `listed_since`, `last_probe`, `last_verdict`, the last probe's `reasons`; and `recent`, the counts of `pass`, `fail` and `unmeasured` probes in the window with the `pass_rate`.
 
+**The miner page** asks the listed nodes too: [the miner page](/miner.html) reads `node-list.json` and queries each listed `host` through the website's `/api/pool/<host>/` proxy, merging what they say. With no node listed it says so; it has no built-in node list.
+
 **The DNS fragment** is zone-file lines, one per listed IP, sorted: `pool 300 IN A 203.0.113.5` (AAAA for IPv6), after comment lines saying when it was generated and how many nodes it holds. It is a file only; the lister never calls a DNS provider. An empty fragment means no listed node, and publishing it would leave the name with no address.
 
 ## Pointing a miner

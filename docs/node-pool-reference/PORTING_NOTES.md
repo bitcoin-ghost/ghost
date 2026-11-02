@@ -309,6 +309,10 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   which run feeds `bitcoinghost.org/node-list.json` and the pool DNS name, and how the files get
   there, is the operators' call. A node list from a lister the reader does not run is that
   lister's claim; the probe is reproducible by anyone.
+- **The website's `/api/pool/<host>/` proxy.** `miner.js` now asks the hosts in `node-list.json`
+  through it (it used to name vm1-vm4 of the old fleet). The proxy lives on the website server,
+  outside this repo, and must forward only to hosts listed in the current `node-list.json` (and
+  only to the node's public API port), or it is an open proxy. Not built here.
 - **Listing over SV2 only.** A node serving only SV2 is never listed, since the probe speaks SV1.
 - **`ghost-audit` over SV2.** Only SV1 is audited. pool_sv2 builds one coinbase per extended
   channel either way, but a hostile node could serve SV2 miners differently; an SV2 client (Noise
