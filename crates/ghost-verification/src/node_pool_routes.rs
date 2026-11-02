@@ -1,6 +1,8 @@
 //! The node pool's public API routes (W2.11), and the routes of removed features.
 //!
-//! - `GET /api/v1/ledger/{address}` and `GET /api/v1/node-pool/status` are forwarded to
+//! - `GET /api/v1/ledger/{address}`, `GET /api/v1/node-pool/status`, and the miner pages'
+//!   `GET /api/v1/miner/{address}` and `GET /api/v1/miner/{address}/history?window=24h|7d|30d`
+//!   (W2.17) are forwarded to
 //!   pool_sv2's node pool API ([`crate::server::VerificationState::node_pool_api`]), which owns
 //!   the share-chain ledger, its store and the live relay state. ghost-mining cannot read that
 //!   store (pool_sv2 runs as root and writes it 0600) and holds none of the live state, so it
@@ -14,7 +16,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -73,21 +75,68 @@ async fn forward(state: &VerificationState, path: &str) -> Response {
     }
 }
 
+/// The address, if it has only the characters of a Bitcoin address and a sane length; else the
+/// 400 that says so. pool_sv2 checks the rest (checksum, network, payee class) and names what is
+/// wrong.
+fn checked_address(address: &str) -> Result<&str, Response> {
+    let a = address.trim();
+    if a.is_empty() || a.len() > MAX_ADDRESS_LEN || !a.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("{a:?} is not a Bitcoin address"),
+        ));
+    }
+    Ok(a)
+}
+
 /// `GET /api/v1/ledger/{address}`: one miner's balance, queue position, shares and payouts.
 async fn ledger_handler(
     State(state): State<Arc<VerificationState>>,
     Path(address): Path<String>,
 ) -> Response {
-    let a = address.trim();
-    // Only the characters of a Bitcoin address are passed on; pool_sv2 checks the rest
-    // (checksum, network, payee class) and names what is wrong.
-    if a.is_empty() || a.len() > MAX_ADDRESS_LEN || !a.chars().all(|c| c.is_ascii_alphanumeric()) {
+    match checked_address(&address) {
+        Ok(a) => forward(&state, &format!("/api/v1/node-pool/ledger/{a}")).await,
+        Err(r) => r,
+    }
+}
+
+/// `GET /api/v1/miner/{address}`: one miner's workers on this node and its expected wait.
+async fn miner_handler(
+    State(state): State<Arc<VerificationState>>,
+    Path(address): Path<String>,
+) -> Response {
+    match checked_address(&address) {
+        Ok(a) => forward(&state, &format!("/api/v1/node-pool/miner/{a}")).await,
+        Err(r) => r,
+    }
+}
+
+/// History windows pool_sv2 serves.
+const HISTORY_WINDOWS: [&str; 3] = ["24h", "7d", "30d"];
+
+/// `GET /api/v1/miner/{address}/history?window=24h|7d|30d`: hashrate, shares and balance over
+/// time. The window defaults to `24h`; any other value than the three is refused here.
+async fn miner_history_handler(
+    State(state): State<Arc<VerificationState>>,
+    Path(address): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let a = match checked_address(&address) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let w = q.get("window").map_or("24h", |w| w.trim());
+    if !HISTORY_WINDOWS.contains(&w) {
         return json_error(
             StatusCode::BAD_REQUEST,
-            format!("{a:?} is not a Bitcoin address"),
+            format!("window {w:?} is not one of 24h, 7d or 30d"),
         );
     }
-    forward(&state, &format!("/api/v1/node-pool/ledger/{a}")).await
+    forward(
+        &state,
+        &format!("/api/v1/node-pool/miner/{a}/history?window={w}"),
+    )
+    .await
 }
 
 /// `GET /api/v1/node-pool/status`: the pool-wide view.
@@ -99,6 +148,8 @@ async fn status_handler(State(state): State<Arc<VerificationState>>) -> Response
 pub(crate) fn node_pool_router() -> Router<Arc<VerificationState>> {
     Router::new()
         .route("/api/v1/ledger/:address", get(ledger_handler))
+        .route("/api/v1/miner/:address", get(miner_handler))
+        .route("/api/v1/miner/:address/history", get(miner_history_handler))
         .route("/api/v1/node-pool/status", get(status_handler))
 }
 
@@ -314,6 +365,66 @@ mod tests {
         assert!(seen.lock().is_empty(), "nothing malformed reaches pool_sv2");
     }
 
+    /// A stand-in that records the full request URI (path and query).
+    async fn upstream_uri(body: &'static str) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let s = s.clone();
+            async move {
+                s.lock().push(uri.to_string());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn the_miner_routes_are_forwarded_with_their_window() {
+        let (base, seen) = upstream_uri(r#"{"workers":[]}"#).await;
+        let app = crate::routes::create_router(state(&base));
+        let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let (code, v) = call(app.clone(), "GET", &format!("/api/v1/miner/{addr}")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(v["workers"].is_array());
+        for (q, want) in [("", "24h"), ("?window=7d", "7d"), ("?window=30d", "30d")] {
+            let (code, _) = call(
+                app.clone(),
+                "GET",
+                &format!("/api/v1/miner/{addr}/history{q}"),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{q}");
+            assert_eq!(
+                seen.lock().last().unwrap(),
+                &format!("/api/v1/node-pool/miner/{addr}/history?window={want}")
+            );
+        }
+        assert_eq!(seen.lock()[0], format!("/api/v1/node-pool/miner/{addr}"));
+        let n = seen.lock().len();
+
+        // Bad windows and addresses never reach pool_sv2.
+        for uri in [
+            format!("/api/v1/miner/{addr}/history?window=1y"),
+            format!("/api/v1/miner/{addr}/history?window=24h%26x%3D1"),
+            "/api/v1/miner/a%2Fb".to_string(),
+            "/api/v1/miner/a%2Fb/history".to_string(),
+            format!("/api/v1/miner/{}", "q".repeat(101)),
+        ] {
+            let (code, v) = call(app.clone(), "GET", &uri).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(v["error"].is_string(), "{uri}");
+        }
+        assert_eq!(seen.lock().len(), n, "nothing malformed reaches pool_sv2");
+    }
+
     #[tokio::test]
     async fn pool_sv2_not_answering_is_a_503_that_says_so() {
         // A port nothing listens on.
@@ -321,7 +432,12 @@ mod tests {
         let base = format!("http://{}", l.local_addr().unwrap());
         drop(l);
         let app = crate::routes::create_router(state(&base));
-        for uri in ["/api/v1/node-pool/status", "/api/v1/ledger/bcrt1qabc"] {
+        for uri in [
+            "/api/v1/node-pool/status",
+            "/api/v1/ledger/bcrt1qabc",
+            "/api/v1/miner/bcrt1qabc",
+            "/api/v1/miner/bcrt1qabc/history?window=7d",
+        ] {
             let (code, v) = call(app.clone(), "GET", uri).await;
             assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
             assert!(v["error"]
