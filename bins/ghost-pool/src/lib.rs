@@ -106,6 +106,9 @@ pub mod rpc;
 /// Weight, sigop and coinbase-size limits for the blocks this node builds.
 pub mod block_limits;
 
+/// Node pool payee-script classes for miner payout addresses.
+pub mod payee_class;
+
 /// Block template processing with policy filtering.
 pub mod template;
 
