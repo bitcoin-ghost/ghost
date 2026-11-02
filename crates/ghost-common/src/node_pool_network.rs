@@ -27,14 +27,15 @@
 //! Phase 4; empty until migration v64 imports it). Two nodes with different starts run different
 //! share chains and never agree on a balance, so the start is fixed per network:
 //!
-//! - **regtest**: configuration. The default is [`regtest_default_genesis`] at height 0, the
+//! - **regtest**: configuration. The default is [`regtest_default_genesis`](crate::node_pool_network::regtest_default_genesis) at height 0, the
 //!   value the installer writes, so every regtest node shares it without being told.
 //! - **signet**: configuration, required. Our signet's start is published with its launch.
-//! - **mainnet**: compiled in, [`MAINNET_START`]. It is unset until the flag day: a mainnet node
+//! - **mainnet**: compiled in, [`MAINNET_START`](crate::node_pool_network::MAINNET_START). It is unset until the flag day: a mainnet node
 //!   refuses to start rather than guess, and a configured genesis is accepted only when it equals
 //!   the compiled one.
 //!
-//! The genesis table is identified by its [`genesis_table_digest`], the same
+//! The genesis table is identified by its
+//! [`genesis_table_digest`](crate::node_pool_network::genesis_table_digest), the same
 //! [`table_root`](crate::canonical_payout::table_root) a block commits for its snapshot. A start
 //! may pin it; a node then refuses to run on a genesis table whose digest differs.
 //!

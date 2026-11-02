@@ -25,7 +25,7 @@
 //! Nothing here writes. The queries read what the relay ([`crate::node_pool_store`]) and
 //! settlement journalled: a payee's shares as batches carry them, the retirements of applied
 //! blocks, and the applied events themselves. Whether a share was credited on this node's best
-//! chain is the caller's question, answered with [`Database::np_ledger_event_applied`] on the
+//! chain is the caller's question, answered with [`Database::np_ledger_event_applied`](crate::database::Database::np_ledger_event_applied) on the
 //! share's credit event key (the relay's `credit_event_key`), because the key is the relay's
 //! definition, not storage's.
 
