@@ -71,73 +71,31 @@ pub struct ShareWebhookConfig {
     pub max_retries: u32,
 }
 
-/// Configuration for the difficulty-tier commitment (SHARE_TIER_BIND) — pool_sv2's half of the
-/// two-part gate.
+/// `[node_pool]`: the node pool, the only mode this pool runs in. Required: startup refuses a
+/// config without it.
 ///
-/// ghost-mining's half is the height constant `SHARE_TIER_BIND_HEIGHT` (dormant at `u64::MAX`);
-/// this binary has no chain view of its own, so its half is configured here and derives the
-/// per-template decision from the BIP34 height ghost-mining stamps into every template's
-/// `coinbase_prefix` — both binaries then flip at the same BLOCK, not at a restart.
-///
-/// **Absent (the default, and the only shipped state) = dormant**: one group job per template,
-/// plain node tag, byte-identical to today. Both fields are mandatory when the section is
-/// present, so a half-written section fails config parse loudly instead of running half-armed.
-///
-/// Arming requires, in ONE release: this section with `activation_height` equal to ghost-mining's
-/// `SHARE_TIER_BIND_HEIGHT`, `node_id` equal to the identity ghost-mining stamps and verifies, and
-/// the translator shipped with `quantise_to_tiers = true`. A desync is detected and logged, not
-/// silently absorbed — see `tier_binding.rs`.
-#[derive(Clone, Debug, serde::Deserialize)]
-pub struct ShareTierBindingConfig {
-    /// This node's 32-byte identity, hex (64 chars).
-    ///
-    /// **Normally omit this.** Left unset, the identity is read from the co-located ghost-mining at
-    /// startup (see `ghost_pool_health_url`), which is the process that actually derives and
-    /// verifies the coinbase node tags — so the two cannot disagree.
-    ///
-    /// It exists only as an override for a node whose ghost-mining cannot be reached at startup.
-    /// Transcribing it by hand is the highest-risk step in arming: `pool_sv2` cannot recover the
-    /// raw id from the template prefix (that carries `sha256(node_id)[..20]`, one-way), so a
-    /// mistyped value is not detectable from the coinbase — it simply makes every tier-era share
-    /// fail its binding check, silently, for that node's miners only. When set, it is CHECKED
-    /// against ghost-mining's own answer and a mismatch refuses startup.
-    #[serde(default)]
-    pub node_id: Option<String>,
-    /// Where to read this node's identity from. Defaults to the co-located ghost-mining's health
-    /// endpoint on loopback.
-    #[serde(default)]
-    pub ghost_pool_health_url: Option<String>,
-    /// Block height at/above which per-tier jobs are emitted. MUST equal ghost-mining's
-    /// `SHARE_TIER_BIND_HEIGHT` in the same release.
-    pub activation_height: u64,
-}
-
-/// `[node_pool]`: the node pool job layer (W2.3). Absent, the default and the only shipped
-/// state, means none of it runs. Present, it still does nothing until a template's BIP34 height
-/// reaches `activation_height`, which itself defaults to
-/// `ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT` (`u64::MAX`).
-///
-/// When active: per-channel `GhostShare/v2` share tags (with the slot class and the parent
-/// anchor), SV2 standard channels at the full class, and per-miner slot-class sensing. The
-/// translator must run with `quantise_to_tiers = true`, as for `[share_tier_binding]`, and list
-/// the Ghost agent extension (`0x4748`) in its `supported_extensions` for SV1 user agents to
-/// reach the sensing loop. See `node_pool.rs`.
+/// Every channel gets its own job: a `GhostShare/v2` share tag (slot class, parent anchor), the
+/// canonical coinbase of the snapshot table for its slot class (spec 2.1), SV2 standard channels
+/// at the full class, and per-miner slot-class sensing. The translator must run with
+/// `quantise_to_tiers = true` and list the Ghost agent extension (`0x4748`) in its
+/// `supported_extensions` for SV1 user agents to reach the sensing loop. See `node_pool.rs`.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct NodePoolConfig {
-    /// This node's 32-byte identity, hex. Normally omitted: read from ghost-mining exactly as
-    /// `[share_tier_binding]` reads it, and checked against it when pinned.
+    /// This node's 32-byte identity, hex. Normally omitted: read from the co-located
+    /// ghost-mining's health endpoint, and checked against it when pinned.
     #[serde(default)]
     pub node_id: Option<String>,
     /// Where to read this node's identity from. Defaults to the co-located ghost-mining.
     #[serde(default)]
     pub ghost_pool_health_url: Option<String>,
-    /// Template height at/above which the job layer runs. Defaults to the compiled constant.
-    #[serde(default)]
-    pub activation_height: Option<u64>,
+    /// The node operator's fee address: the finder output, which takes every transaction fee of
+    /// a block this node's miners find (spec 1). P2SH, P2WPKH, P2WSH or P2TR.
+    pub fee_address: String,
     /// Valid shares a class needs before a miner is stepped up. Defaults to 20.
     #[serde(default)]
     pub sensing_min_shares: Option<u32>,
-    /// `[node_pool.relay]`: run the share-chain relay. Absent: no relay.
+    /// `[node_pool.relay]`: the share-chain relay and settlement. Required: without it this node
+    /// holds no ledger and cannot build a canonical coinbase.
     #[serde(default)]
     pub relay: Option<crate::node_pool_relay::NodePoolRelayConfig>,
 }
@@ -171,8 +129,6 @@ pub struct PoolConfig {
     #[serde(default)]
     share_webhook: Option<ShareWebhookConfig>,
     #[serde(default)]
-    share_tier_binding: Option<ShareTierBindingConfig>,
-    #[serde(default)]
     node_pool: Option<NodePoolConfig>,
 
     /// Concurrent downstream connections allowed in total. `None` takes
@@ -192,12 +148,7 @@ impl PoolConfig {
         self.share_webhook.as_ref()
     }
 
-    /// The SHARE_TIER_BIND configuration, when present. `None` = dormant, today's behaviour.
-    pub fn share_tier_binding(&self) -> Option<&ShareTierBindingConfig> {
-        self.share_tier_binding.as_ref()
-    }
-
-    /// The node pool configuration, when present. `None` = dormant, today's behaviour.
+    /// The `[node_pool]` section, if the config has one. Startup refuses a config without it.
     pub fn node_pool(&self) -> Option<&NodePoolConfig> {
         self.node_pool.as_ref()
     }
@@ -242,7 +193,6 @@ impl PoolConfig {
             monitoring_cache_refresh_secs,
             jds,
             share_webhook: None,
-            share_tier_binding: None,
             node_pool: None,
             // `None` is DEFAULTED, not unlimited — see the field docs. This constructor is the
             // programmatic path (tests, JDS); the TOML path gets the same defaults through serde.

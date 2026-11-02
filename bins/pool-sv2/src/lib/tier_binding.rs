@@ -1,45 +1,24 @@
-//! pool_sv2's half of the difficulty-tier commitment (SHARE_TIER_BIND).
+//! This node's identity and the difficulty-tier arithmetic the node pool's share tags use.
 //!
-//! ghost-mining gates by block height (`SHARE_TIER_BIND_HEIGHT`, dormant at `u64::MAX`); this
-//! binary has no chain view, so its half is the `[share_tier_binding]` config section — but the
-//! per-template decision is derived from the BIP34 height ghost-mining stamps into every
-//! template's `coinbase_prefix`, so with the SAME height configured both binaries flip at the
-//! same block rather than at whichever moment this process restarted. The remaining desync
-//! surface is a mis-copied height — the identity is no longer transcribed at all, but read from
-//! the co-located ghost-mining at startup ([`TierBinding::resolve`]), which is the process that
-//! derives and verifies the tags, so the two cannot disagree.
-//!
-//! ## What tiered mode changes
-//!
-//! Below the gate (config absent, or template height below `activation_height`): ONE
-//! group-channel job per template, the plain node tag riding in the template's
-//! `coinbase_prefix`, byte-identical to today.
-//!
-//! At/above the gate: per-channel jobs, each built by the channel's own factory with
-//! - the plain node tag STRIPPED from the template prefix ([`strip_plain_node_tag`]), and
-//! - the tier-bound tag `sha256(node_id ‖ tier)[..20]` stamped as an extra scriptSig push via
-//!   the factory's budget-guarded `extra_script_sig` path ([`TierBinding::stamp_for_tier`]).
-//!
-//! Same 25 encoded bytes out, same 25 in — the coinbase length does not move (the live
-//! scriptSig is at 99/100, so this is load-bearing, and pinned by test in both this module and
-//! the vendored crate). Tag extraction on the verifying side is push-aware and
-//! position-independent (`ghost_common::coinbase_tags::extract_node_tag`), so the tag moving
-//! from before the pool tag to after it changes nothing for verification.
+//! pool_sv2 builds a job per channel; the `GhostShare/v2` tag commits the channel's tier, so the
+//! announced target must be exactly a tier's target ([`TierBinding::quantise_target`]). The
+//! identity is read from the co-located ghost-mining at startup ([`TierBinding::resolve`]).
+//! The template's own Ghost tags are taken out of its prefix ([`strip_plain_node_tag`],
+//! `NodePool::prepare_template`) and the per-channel stamp put back, byte for byte.
 
 use ghost_common::coinbase_tags::{
-    difficulty_to_tier_log2, encode_node_tag, node_commitment_for_tier, tier_target_difficulty,
-    NODE_ID_LEN, NODE_TAG_MAGIC, PAYOUT_ID_LEN, PAYOUT_TAG_MAGIC,
+    difficulty_to_tier_log2, tier_target_difficulty, NODE_ID_LEN, NODE_TAG_MAGIC, PAYOUT_ID_LEN,
+    PAYOUT_TAG_MAGIC,
 };
 use stratum_apps::stratum_core::{
     bitcoin::Target, channels_sv2::target::tier_target, template_distribution_sv2::NewTemplate,
 };
 use tracing::warn;
 
-/// The resolved `[share_tier_binding]` config: this node's identity and the arming height.
+/// This node's resolved identity, and the tier arithmetic.
 #[derive(Debug, Clone)]
 pub struct TierBinding {
     node_id: [u8; 32],
-    activation_height: u64,
 }
 
 /// Where this node's identity is read from when the config does not pin one.
@@ -47,11 +26,8 @@ const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:8080/health";
 
 impl TierBinding {
     /// Build from an already-resolved identity.
-    pub fn from_parts(node_id: [u8; 32], activation_height: u64) -> Self {
-        Self {
-            node_id,
-            activation_height,
-        }
+    pub fn from_parts(node_id: [u8; 32]) -> Self {
+        Self { node_id }
     }
 
     /// Parse a 64-hex node id. A malformed id is a refusal to start, not a warning: stamping tags
@@ -59,10 +35,10 @@ impl TierBinding {
     /// check, silently, on every share.
     pub fn parse_node_id(s: &str) -> Result<[u8; 32], String> {
         let bytes = hex::decode(s.trim())
-            .map_err(|e| format!("share_tier_binding.node_id is not valid hex: {e}"))?;
+            .map_err(|e| format!("node_pool.node_id is not valid hex: {e}"))?;
         bytes.try_into().map_err(|b: Vec<u8>| {
             format!(
-                "share_tier_binding.node_id must be 32 bytes (64 hex chars), got {}",
+                "node_pool.node_id must be 32 bytes (64 hex chars), got {}",
                 b.len()
             )
         })
@@ -92,16 +68,12 @@ impl TierBinding {
     ///
     /// A pinned `node_id` is still honoured, but it is CHECKED: a mismatch refuses startup rather
     /// than letting a stale value quietly win.
-    pub async fn resolve(cfg: &crate::config::ShareTierBindingConfig) -> Result<Self, String> {
-        let url = cfg
-            .ghost_pool_health_url
-            .as_deref()
-            .unwrap_or(DEFAULT_HEALTH_URL);
-        let pinned = cfg
-            .node_id
-            .as_deref()
-            .map(Self::parse_node_id)
-            .transpose()?;
+    pub async fn resolve(
+        node_id: Option<&str>,
+        ghost_pool_health_url: Option<&str>,
+    ) -> Result<Self, String> {
+        let url = ghost_pool_health_url.unwrap_or(DEFAULT_HEALTH_URL);
+        let pinned = node_id.map(Self::parse_node_id).transpose()?;
 
         // ghost-mining may still be starting; the deploy order restarts it first.
         let mut fetched: Result<[u8; 32], String> = Err("not attempted".into());
@@ -132,7 +104,7 @@ impl TierBinding {
             // supposed to guard against, so it stops the node rather than picking a winner.
             (Ok(f), Some(p)) if f != p => {
                 return Err(format!(
-                    "share_tier_binding.node_id ({}) does not match the identity ghost-mining \
+                    "node_pool.node_id ({}) does not match the identity ghost-mining \
                      reports ({}). ghost-mining stamps and verifies the coinbase node tags, so the \
                      configured value would reject every tier-era share on this node. Remove the \
                      pin to use ghost-mining's own identity.",
@@ -146,7 +118,7 @@ impl TierBinding {
             (Err(e), Some(p)) => {
                 warn!(
                     error = %e,
-                    "SHARE_TIER_BIND: could not verify node_id against ghost-mining — using the \
+                    "NODE_POOL: could not verify node_id against ghost-mining — using the \
                      configured value UNVERIFIED. If it is wrong, this node's tier-era shares \
                      will all fail their binding check."
                 );
@@ -156,13 +128,13 @@ impl TierBinding {
             // guessed identity is undetectable from the coinbase.
             (Err(e), None) => {
                 return Err(format!(
-                    "share_tier_binding is configured but this node's identity could not be read \
+                    "the node pool needs this node's identity, and it could not be read \
                      from ghost-mining ({e}). Start ghost-mining first, or pin node_id explicitly."
                 ))
             }
         };
 
-        Ok(Self::from_parts(node_id, cfg.activation_height))
+        Ok(Self::from_parts(node_id))
     }
 
     /// This node's identity, as resolved.
@@ -170,52 +142,9 @@ impl TierBinding {
         &self.node_id
     }
 
-    /// The height at/above which per-tier jobs are emitted.
-    pub fn activation_height(&self) -> u64 {
-        self.activation_height
-    }
-
-    /// Whether jobs for `template` must be tiered: its BIP34 height is at/above the configured
-    /// activation height.
-    ///
-    /// An unparseable height fails toward DORMANT, loudly. Dormant is the recoverable direction:
-    /// ghost-mining's verifier rejects above-gate shares that lack a tier (`missing_tier`, a
-    /// counted, visible reject), whereas emitting tier stamps below the gate would put unexpected
-    /// bytes in mined coinbases.
-    pub fn template_is_tiered(&self, template: &NewTemplate<'_>) -> bool {
-        match bip34_height(template.coinbase_prefix.inner_as_ref()) {
-            Some(height) => height >= self.activation_height,
-            None => {
-                warn!(
-                    template_id = template.template_id,
-                    "SHARE_TIER_BIND: cannot parse a BIP34 height from the template's \
-                     coinbase_prefix — treating this template as BELOW the gate. If the chain is \
-                     past the activation height this node is emitting untiered jobs and its \
-                     shares will be rejected (missing_tier) by every verifier"
-                );
-                false
-            }
-        }
-    }
-
     /// The tier a channel currently mines at, from its target.
     pub fn tier_for_target(&self, target: &Target) -> u32 {
         difficulty_to_tier_log2(target.difficulty_float())
-    }
-
-    /// The commitment a job at `tier_log2` must stamp: `(tier_log2, encoded GHNT push)` carrying
-    /// `sha256(node_id ‖ tier_log2)[..20]` — the same 25 encoded bytes as the plain tag this
-    /// replaces.
-    pub fn stamp_for_tier(&self, tier_log2: u32) -> (u32, Vec<u8>) {
-        (
-            tier_log2,
-            encode_node_tag(&node_commitment_for_tier(&self.node_id, tier_log2)),
-        )
-    }
-
-    /// Convenience: the commitment for a channel's current target.
-    pub fn stamp_for_target(&self, target: &Target) -> (u32, Vec<u8>) {
-        self.stamp_for_tier(self.tier_for_target(target))
     }
 
     /// Quantise a channel target to its tier's EXACT target (difficulty floors to `2^tier`,
@@ -329,11 +258,11 @@ pub fn is_tier_shaped(target: &Target) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_common::coinbase_tags::{encode_payout_tag, extract_node_tag, extract_payout_tag};
+    use ghost_common::coinbase_tags::{encode_node_tag, encode_payout_tag};
     use stratum_apps::stratum_core::channels_sv2::target::hash_rate_to_target;
 
-    fn a_binding(height: u64) -> TierBinding {
-        TierBinding::from_parts([0x7Au8; 32], height)
+    fn a_binding() -> TierBinding {
+        TierBinding::from_parts([0x7Au8; 32])
     }
 
     fn ghost_prefix(with_node_tag: bool) -> Vec<u8> {
@@ -381,47 +310,6 @@ mod tests {
         assert_eq!(bip34_height(&[0x03, 0x00]), None);
     }
 
-    /// The gate: strictly below → untiered; at and above → tiered. Same boundary sense as
-    /// ghost-mining's `binds_difficulty_tier`.
-    #[test]
-    fn the_template_gate_flips_at_the_activation_height() {
-        let binding = a_binding(960_000);
-        let below = a_template(vec![0x03, 0xff, 0xa5, 0x0e]); // 959_999
-        let at = a_template(vec![0x03, 0x00, 0xa6, 0x0e]); // 960_000
-        assert!(!binding.template_is_tiered(&below));
-        assert!(binding.template_is_tiered(&at));
-    }
-
-    /// **The zero-byte budget claim, on real bytes.** Stripping the plain tag and stamping the
-    /// tier tag must leave the total scriptSig contribution the same length, and the tag
-    /// readable by the verifying side's push-aware extractor.
-    #[test]
-    fn the_stamp_costs_exactly_the_bytes_the_strip_recovers() {
-        let binding = a_binding(0);
-        let template = a_template(ghost_prefix(true));
-        let stripped = strip_plain_node_tag(&template);
-        let (tier, push) = binding.stamp_for_tier(13);
-
-        assert_eq!(tier, 13);
-        assert_eq!(
-            template.coinbase_prefix.inner_as_ref().len(),
-            stripped.coinbase_prefix.inner_as_ref().len() + push.len(),
-            "strip + stamp must be byte-neutral on the assembled scriptSig"
-        );
-
-        // The payout tag survives the strip; the plain node tag does not.
-        let s = stripped.coinbase_prefix.inner_as_ref();
-        assert_eq!(extract_payout_tag(s), Some([0xC3; 16]));
-        assert_eq!(extract_node_tag(s), None);
-
-        // And the stamped push reads back as the tier-bound commitment, exactly.
-        assert_eq!(
-            extract_node_tag(&push),
-            Some(node_commitment_for_tier(&[0x7Au8; 32], 13)),
-            "the extractor must read the tier commitment out of the stamped push"
-        );
-    }
-
     /// A template with no node tag — treasury-only coinbase, or a foreign TP — passes through
     /// byte-identical. The strip must never damage what it does not recognise.
     #[test]
@@ -443,7 +331,7 @@ mod tests {
     /// Quantisation floors the difficulty to its tier and respects the client's max target.
     #[test]
     fn quantisation_floors_to_the_tier_and_respects_the_client_max() {
-        let binding = a_binding(0);
+        let binding = a_binding();
         let permissive = Target::from_le_bytes([0xff; 32]);
 
         let raw = hash_rate_to_target(4.5e12, 6.0).unwrap();

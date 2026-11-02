@@ -14,8 +14,8 @@ use async_channel::unbounded;
 
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
-    stratum_core::bitcoin::consensus::Encodable, task_manager::TaskManager,
-    tp_type::TemplateProviderType, utils::types::GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    task_manager::TaskManager, tp_type::TemplateProviderType,
+    utils::types::GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
 };
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
@@ -73,11 +73,6 @@ impl PoolSv2 {
     /// Starts the Pool main loop.
     pub async fn start(&self) -> Result<(), PoolErrorKind> {
         let coinbase_outputs = vec![self.config.get_txout()];
-        let mut encoded_outputs = vec![];
-
-        coinbase_outputs
-            .consensus_encode(&mut encoded_outputs)
-            .expect("Invalid coinbase output in config");
 
         let cancellation_token = self.cancellation_token.clone();
 
@@ -186,7 +181,6 @@ impl PoolSv2 {
             channel_manager_to_tp_sender.clone(),
             tp_to_channel_manager_receiver,
             downstream_to_channel_manager_receiver,
-            encoded_outputs.clone(),
             job_declarator,
             share_webhook_sender,
         )

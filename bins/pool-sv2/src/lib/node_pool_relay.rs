@@ -1,4 +1,4 @@
-//! `[node_pool.relay]`: run the share-chain relay (W2.5) inside pool_sv2.
+//! `[node_pool.relay]`: run the share-chain relay (W2.5) and settlement (W2.7) inside pool_sv2.
 //!
 //! pool_sv2 owns both ends the relay needs: the shares miners submit, and the
 //! [`AnchorDriver`](crate::node_pool::AnchorDriver) that re-stamps every channel's jobs. So the
@@ -7,16 +7,19 @@
 //! those at `T_net` and turns one at `T_net + 8` on a published job into an anchor. Every new best
 //! tip, and the 30 s re-batch, is published back to the driver at once.
 //!
-//! Absent, nothing starts. Present, it runs whatever the activation height: below it pool_sv2
-//! builds no node pool jobs, so the relay sees no local shares and only follows its peers.
+//! Settlement runs in the same task over the same store: it follows the local Bitcoin node's
+//! best chain over RPC, retires what pool blocks paid, and is the relay's retirement hook, so
+//! every table a share is checked against and every job pays subtracts what was paid. The job
+//! builder asks the task for its tables ([`crate::node_pool::NodePool::fetch_table`]).
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use ghost_common::{node_pool_u256::U256, rpc::BitcoinRpc, share_commit::diff1_target};
 use ghost_np_relay::{
     headers::{HeaderOracle, RpcHeaderOracle},
-    net::{spawn, NetConfig, RelayHandle},
-    relay::{Genesis, NoRetirements, Relay, RelayParams},
+    net::{spawn_with_settlement, NetConfig, RelayHandle},
+    relay::{Genesis, Relay, RelayParams},
+    settlement::{BlockSource, RpcBlockSource, SettledView, Settlement},
 };
 use ghost_storage::Database;
 use tracing::warn;
@@ -80,21 +83,27 @@ pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHand
         // The imported genesis table is the cutover's (plan, Phase 4); until then, empty.
         table: Default::default(),
     };
-    let db = Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?;
+    let genesis_btc_height = genesis.btc_height;
+    let db = Arc::new(Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?);
+    let view = SettledView::load(&db).map_err(|e| format!("settlement view: {e}"))?;
     let relay = Relay::open(
         RelayParams::new(genesis, tier_base),
-        Arc::new(db),
-        Box::new(NoRetirements),
+        db.clone(),
+        Box::new(view.clone()),
     )
     .map_err(|e| format!("relay: {e}"))?;
-    let rpc = BitcoinRpc::new(
-        &cfg.rpc_host,
-        cfg.rpc_port,
-        &cfg.rpc_user,
-        &cfg.rpc_password,
-    )
-    .map_err(|e| format!("relay rpc: {e}"))?;
-    let oracle: Arc<dyn HeaderOracle> = Arc::new(RpcHeaderOracle::new(rpc));
+    let rpc = || {
+        BitcoinRpc::new(
+            &cfg.rpc_host,
+            cfg.rpc_port,
+            &cfg.rpc_user,
+            &cfg.rpc_password,
+        )
+        .map_err(|e| format!("relay rpc: {e}"))
+    };
+    let oracle: Arc<dyn HeaderOracle> = Arc::new(RpcHeaderOracle::new(rpc()?));
+    let blocks: Arc<dyn BlockSource> = Arc::new(RpcBlockSource::new(rpc()?));
+    let settlement = Settlement::new(db, view, genesis_btc_height);
     let mut peers = Vec::new();
     for p in &cfg.peers {
         match tokio::net::lookup_host(p.as_str()).await {
@@ -109,7 +118,7 @@ pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHand
         ..NetConfig::default()
     };
     let driver = np.anchor_driver();
-    let handle = spawn(
+    let handle = spawn_with_settlement(
         relay,
         net,
         oracle,
@@ -119,10 +128,12 @@ pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHand
                 batch_root: j.batch_root,
             })
         }),
+        Some((settlement, blocks)),
     )
     .await
     .map_err(|e| format!("relay listen: {e}"))?;
     np.set_relay_sink(handle.local.clone(), tier_base);
+    np.set_table_source(handle.tables.clone());
     warn!(
         listen = ?handle.listen_addr,
         "NODE_POOL_RELAY: the share-chain relay is RUNNING"
@@ -149,7 +160,7 @@ mod tests {
 
     fn relay_toml(db: &std::path::Path, extra: &str) -> String {
         format!(
-            "[relay]\nlisten = \"127.0.0.1:0\"\npeers = [\"127.0.0.1:1\"]\ndb_path = {:?}\n\
+            "fee_address = \"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"\n[relay]\nlisten = \"127.0.0.1:0\"\npeers = [\"127.0.0.1:1\"]\ndb_path = {:?}\n\
              genesis_anchor = \"{GENESIS}\"\ngenesis_btc_height = 974400\nrpc_host = \
              \"127.0.0.1\"\nrpc_port = 1\nrpc_user = \"u\"\nrpc_password = \"p\"\n{extra}",
             db.display().to_string()
@@ -165,7 +176,9 @@ mod tests {
         assert_eq!(r.peers, vec!["127.0.0.1:1".to_string()]);
         assert!(r.tier_base.is_none() && r.genesis_tier.is_none());
         assert!(parse(&relay_toml(db, "nonsense = 1\n")).is_err());
-        assert!(parse("").unwrap().relay.is_none(), "absent by default");
+        assert!(parse("").is_err(), "fee_address is required");
+        let bare = parse("fee_address = \"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"").unwrap();
+        assert!(bare.relay.is_none());
     }
 
     #[tokio::test]
@@ -177,7 +190,7 @@ mod tests {
             .unwrap()
             .relay
             .unwrap();
-        let np = NodePool::from_parts([0x7A; 32], u64::MAX, 60.0, 20);
+        let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20);
         let mut bad = cfg.clone();
         bad.genesis_anchor = "zz".into();
         assert!(start(&bad, &np).await.is_err());

@@ -1,14 +1,9 @@
-//! pool_sv2's half of the node pool job layer (W2.3): share tags, slot classes and sensing.
+//! pool_sv2's half of the node pool: share tags, slot classes, sensing, and the canonical
+//! coinbase every job carries (W2.3, W2.6).
 //!
-//! Dark by default: nothing here runs unless the `[node_pool]` config section is present, and
-//! even then only for templates whose BIP34 height reaches the activation height, which defaults
-//! to `NODE_POOL_ACTIVATION_HEIGHT` (`u64::MAX`). Below it every path is the existing one.
-//!
-//! ## What it does when active
-//!
-//! Every channel mines its own job, built by the channel's own factory exactly as
-//! SHARE_TIER_BIND does (`tier_binding.rs`), but the template's `GHPP` and `GHNT` pushes are
-//! both replaced: `GHPP` carries `parent_anchor[..16]` and `GHNT` the `GhostShare/v2` tag
+//! The node pool is the only mode. Every channel mines its own job, built by the channel's own
+//! factory: the template's `GHPP` and `GHNT` pushes are both replaced, `GHPP` with
+//! `parent_anchor[..16]` and `GHNT` with the `GhostShare/v2` tag
 //!
 //! ```text
 //! sha256("GhostShare/v2" || node_id || tier || slot_class || sha256(payee) || parent_anchor
@@ -17,6 +12,22 @@
 //!
 //! from `ghost_common::share_commit`. Same 46 encoded bytes out of the template prefix and back
 //! in through the factory's budget-guarded extra push, so the scriptSig length does not move.
+//!
+//! ## The coinbase (W2.6, spec 2.1)
+//!
+//! Every job pays exactly `canonical_payout::coinbase_outputs` for its height, its slot class
+//! and the snapshot table its parent anchor defines: the treasury (`S/200` plus change), the
+//! miner outputs in rule order with the top balance last, the finder (this node's
+//! `fee_address`, every transaction fee, omitted when there are none), the `GHNP` table-root
+//! commitment and the witness commitment. The template provider hands over the whole coinbase
+//! value (`coinbase_tx_value_remaining` = subsidy + fees) and the witness commitment as its only
+//! output; the channel factory appends that output after the ones built here.
+//!
+//! The table is the relay's rule-4 table at `cut(H) = H - 20` for the job's parent anchor and
+//! height ([`NodePool::fetch_table`], answered by the relay task after settlement has caught up
+//! with the Bitcoin tip). Each job remembers the digest of the outputs it was built with, and a
+//! solved block is submitted only if its coinbase pays exactly those
+//! ([`NodePool::check_block`]).
 //!
 //! - **Anchors.** `parent_anchor` and `batch_root` come from an [`AnchorDriver`], a watch
 //!   channel the relay (W2.5, `node_pool_relay.rs`) publishes to. Every publish re-stamps every
@@ -39,18 +50,10 @@
 //! Sessions are keyed by the channel's user identity and live in memory for the process
 //! lifetime: a reconnecting miner keeps its failed classes, and a settled miner its class; a
 //! drop fails a class only while it is being tested. A native SV2 miner with no agent TLV is
-//! looked up by its `SetupConnection` vendor, hardware_version and firmware. Nothing persists; W2.4 owns storage
-//! through `ghost_common::slot_class_sensing::SensingStore`.
+//! looked up by its `SetupConnection` vendor, hardware_version and firmware.
 //!
-//! ## Not here yet
-//!
-//! - The coinbase OUTPUTS are still the template's; building the canonical outputs for a class
-//!   is W2.6. Until then the class is committed in the tag only.
-//! - The zero-value 31-byte output added to each channel's FIRST job on the open paths
-//!   (`payout_mode.coinbase_outputs` with `coinbase_tx_value_remaining == 0`,
-//!   `mining_message_handler.rs` standard and extended open) is left alone; W2.6 removes it.
-//! - Relaying shares and anchors is `ghost-np-relay`, started by `[node_pool.relay]`
-//!   (`node_pool_relay.rs`); accepted shares reach it through [`NodePool::offer_share`].
+//! Relaying shares and anchors is `ghost-np-relay`, started by `[node_pool.relay]`
+//! (`node_pool_relay.rs`); accepted shares reach it through [`NodePool::offer_share`].
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -59,8 +62,9 @@ use std::{
 };
 
 use ghost_common::{
+    canonical_payout::{coinbase_outputs, outputs_digest, subsidy, CoinbaseOutput, Table},
     coinbase_tags::{encode_node_tag, encode_payout_tag, PAYOUT_ID_LEN, PAYOUT_TAG_MAGIC},
-    node_pool_constants::{NODE_POOL_ACTIVATION_HEIGHT, SLOT_CLASSES},
+    node_pool_constants::SLOT_CLASSES,
     sanitize_for_log,
     share_commit::{payee_script_class, ShareTagPreimage},
     slot_class_sensing::{
@@ -68,11 +72,17 @@ use ghost_common::{
         ShareVerdict, Sv2Device, AGENT_TLV_EXTENSION_TYPE, AGENT_TLV_FIELD_TYPE, FULL_CLASS_INDEX,
     },
 };
+use ghost_np_relay::net::TableRequest;
 use stratum_apps::{
-    stratum_core::{bitcoin::Target, parsers_sv2::Tlv, template_distribution_sv2::NewTemplate},
+    stratum_core::{
+        bitcoin::{Amount, ScriptBuf, Target, Transaction, TxOut},
+        channels_sv2::outputs::deserialize_template_outputs,
+        parsers_sv2::Tlv,
+        template_distribution_sv2::NewTemplate,
+    },
     utils::types::{ChannelId, DownstreamId},
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -139,13 +149,27 @@ const JOBS_KEPT: usize = 64;
 const FUTURE_TEMPLATES_KEPT: usize = 4;
 /// Sensing sessions kept; disconnected ones are evicted beyond this.
 const SESSIONS_KEPT: usize = 4_096;
+/// Snapshot tables kept, by `(parent anchor, height)`.
+const TABLES_KEPT: usize = 8;
+/// How long a job build waits for the relay to answer a table request.
+const TABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One job: the tag preimage it was stamped with, and the digest of the canonical outputs it was
+/// built with (`canonical_payout::outputs_digest`, witness commitment included).
+#[derive(Clone)]
+struct JobRecord {
+    job_id: u32,
+    preimage: ShareTagPreimage,
+    outputs: Option<[u8; 32]>,
+}
 
 struct ChannelSlot {
     kind: ChannelKind,
     payee_script: Vec<u8>,
     session: Option<String>,
     last_stamp: Option<ShareTagPreimage>,
-    jobs: VecDeque<(u32, ShareTagPreimage)>,
+    last_outputs: Option<[u8; 32]>,
+    jobs: VecDeque<JobRecord>,
 }
 
 #[derive(Default)]
@@ -155,6 +179,7 @@ struct State {
     sessions: HashMap<String, ClassSensor>,
     future_templates: VecDeque<NewTemplate<'static>>,
     active_template: Option<NewTemplate<'static>>,
+    tables: VecDeque<(([u8; 32], u32), Arc<Table>)>,
 }
 
 /// The node pool job layer's state.
@@ -165,6 +190,8 @@ pub struct NodePool {
     epoch: Instant,
     state: Mutex<State>,
     relay_sink: Mutex<Option<RelaySink>>,
+    finder_script: Vec<u8>,
+    table_source: Mutex<Option<mpsc::Sender<TableRequest>>>,
 }
 
 /// Where accepted shares go when `[node_pool.relay]` runs: the relay's local queue, and the tier
@@ -175,44 +202,67 @@ struct RelaySink {
 }
 
 impl NodePool {
-    /// Build from an already-resolved identity.
+    /// Build from an already-resolved identity and the finder script (the operator's fee
+    /// address).
     pub fn from_parts(
         node_id: [u8; 32],
-        activation_height: u64,
+        finder_script: Vec<u8>,
         shares_per_minute: f32,
         min_shares: u32,
     ) -> Self {
         Self {
-            tiers: TierBinding::from_parts(node_id, activation_height),
+            tiers: TierBinding::from_parts(node_id),
             params: SensingParams::for_shares_per_minute(shares_per_minute, min_shares),
             anchor: Arc::new(watch::channel(None).0),
             epoch: Instant::now(),
             state: Mutex::new(State::default()),
             relay_sink: Mutex::new(None),
+            finder_script,
+            table_source: Mutex::new(None),
         }
     }
 
-    /// Resolve from config. The identity is read exactly as `[share_tier_binding]` reads it.
+    /// Resolve from config: the identity from the co-located ghost-mining, the finder script
+    /// from `fee_address`.
     pub async fn resolve(
         cfg: &crate::config::NodePoolConfig,
         shares_per_minute: f32,
     ) -> Result<Self, String> {
-        let activation_height = cfg.activation_height.unwrap_or(NODE_POOL_ACTIVATION_HEIGHT);
-        let identity = crate::config::ShareTierBindingConfig {
-            node_id: cfg.node_id.clone(),
-            ghost_pool_health_url: cfg.ghost_pool_health_url.clone(),
-            activation_height,
-        };
-        let tb = TierBinding::resolve(&identity).await?;
+        let finder_script = Self::fee_script(&cfg.fee_address)?;
+        let tb = TierBinding::resolve(cfg.node_id.as_deref(), cfg.ghost_pool_health_url.as_deref())
+            .await?;
         let min_shares = cfg
             .sensing_min_shares
             .unwrap_or(SensingParams::default().min_shares);
         Ok(Self::from_parts(
             *tb.node_id(),
-            activation_height,
+            finder_script,
             shares_per_minute,
             min_shares,
         ))
+    }
+
+    /// The finder script for a fee address: one of the four payee classes, like any payee.
+    pub fn fee_script(fee_address: &str) -> Result<Vec<u8>, String> {
+        let script = match PayoutMode::try_from(fee_address.trim()) {
+            Ok(PayoutMode::Solo { script }) => script.script_pubkey().to_bytes(),
+            _ => {
+                return Err(format!(
+                    "node_pool.fee_address {fee_address:?} is not an address"
+                ))
+            }
+        };
+        if payee_script_class(&script).is_none() {
+            return Err(format!(
+                "node_pool.fee_address {fee_address:?} must be P2SH, P2WPKH, P2WSH or P2TR"
+            ));
+        }
+        Ok(script)
+    }
+
+    /// The finder script this node's blocks pay their fees to.
+    pub fn finder_script(&self) -> &[u8] {
+        &self.finder_script
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -225,15 +275,222 @@ impl NodePool {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// The template height at/above which the job layer runs.
-    pub fn activation_height(&self) -> u64 {
-        self.tiers.activation_height()
+    /// A template's job height, from its BIP34 push.
+    pub fn template_height(template: &NewTemplate<'_>) -> Option<u32> {
+        bip34_height(template.coinbase_prefix.inner_as_ref()).and_then(|h| u32::try_from(h).ok())
     }
 
-    /// Whether `template` is at/above the activation height. An unparseable height is below.
-    pub fn template_is_active(&self, template: &NewTemplate<'_>) -> bool {
-        bip34_height(template.coinbase_prefix.inner_as_ref())
-            .is_some_and(|h| h >= self.tiers.activation_height())
+    /// Where table requests go: the relay task (`[node_pool.relay]`).
+    pub fn set_table_source(&self, tx: mpsc::Sender<TableRequest>) {
+        *self.table_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    }
+
+    fn cached_table(&self, parent: &[u8; 32], h: u32) -> Option<Arc<Table>> {
+        self.lock()
+            .tables
+            .iter()
+            .find(|(k, _)| *k == (*parent, h))
+            .map(|(_, t)| t.clone())
+    }
+
+    /// Put a table in the cache. The relay task's answers land here; tests use it directly.
+    pub fn insert_table(&self, parent: [u8; 32], h: u32, table: Arc<Table>) {
+        let mut st = self.lock();
+        st.tables.retain(|(k, _)| *k != (parent, h));
+        st.tables.push_back(((parent, h), table));
+        while st.tables.len() > TABLES_KEPT {
+            st.tables.pop_front();
+        }
+    }
+
+    /// The table a job on `parent` at height `h` must pay, fetched from the relay task unless
+    /// cached. `None` when there is no relay, it does not answer in time, or it does not hold
+    /// `parent`.
+    pub async fn fetch_table(&self, parent: [u8; 32], h: u32) -> Option<Arc<Table>> {
+        if let Some(t) = self.cached_table(&parent, h) {
+            return Some(t);
+        }
+        let tx = self
+            .table_source
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(TableRequest {
+            parent,
+            height: h,
+            reply,
+        })
+        .await
+        .ok()?;
+        let t = tokio::time::timeout(TABLE_TIMEOUT, rx).await.ok()?.ok()??;
+        self.insert_table(parent, h, t.clone());
+        Some(t)
+    }
+
+    /// Fetch the table the next jobs on the active template need: the current anchor's at the
+    /// template's height. Called before a rebuild takes the channel locks.
+    pub async fn prepare_tables(&self, template: &NewTemplate<'_>) {
+        let (Some(h), Some(a)) = (
+            Self::template_height(template),
+            self.anchor_driver().current(),
+        ) else {
+            return;
+        };
+        if self.fetch_table(a.parent_anchor, h).await.is_none() {
+            warn!(
+                height = h,
+                parent = %hex::encode(a.parent_anchor),
+                "NODE_POOL: no snapshot table for the job; its coinbase pays the whole subsidy \
+                 to the treasury until the relay answers"
+            );
+        }
+    }
+
+    /// What a template gives the coinbase: its height, its witness commitment (its only output)
+    /// and its fees (the value above the subsidy). A template that does not have that shape
+    /// comes from a template provider that is not running the node pool.
+    pub fn template_parts(template: &NewTemplate<'_>) -> Result<(u32, [u8; 32], u64), String> {
+        let h = Self::template_height(template).ok_or("template has no BIP34 height")?;
+        let template_outputs = deserialize_template_outputs(
+            template.coinbase_tx_outputs.to_vec(),
+            template.coinbase_tx_outputs_count,
+        )
+        .map_err(|e| format!("template outputs: {e:?}"))?;
+        let [witness] = template_outputs.as_slice() else {
+            return Err(format!(
+                "the template carries {} outputs; the node pool needs exactly the witness \
+                 commitment",
+                template_outputs.len()
+            ));
+        };
+        let commitment: [u8; 32] = witness
+            .script_pubkey
+            .as_bytes()
+            .strip_prefix(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed][..])
+            .and_then(|c| c.try_into().ok())
+            .ok_or("the template's output is not a witness commitment")?;
+        if witness.value.to_sat() != 0 {
+            return Err("the template's witness commitment carries value".into());
+        }
+        let fees = template
+            .coinbase_tx_value_remaining
+            .checked_sub(subsidy(h))
+            .ok_or_else(|| {
+                format!(
+                    "template value {} is below the subsidy {} at height {h}",
+                    template.coinbase_tx_value_remaining,
+                    subsidy(h)
+                )
+            })?;
+        Ok((h, commitment, fees))
+    }
+
+    /// The canonical coinbase outputs of a job on `parent` with `slot_class` miner outputs for
+    /// `template`, without the witness commitment (the template's own output, which the channel
+    /// factory appends), and the digest of the full list.
+    ///
+    /// The table is the cached one for `(parent, height)`. Missing (no relay answer yet, or an
+    /// anchor the relay does not hold), the job is built on the empty table: the treasury takes
+    /// the whole subsidy and nobody is paid more than owed; the shares of such a job earn nothing
+    /// on peers, so this only ever delays payouts.
+    pub fn canonical_outputs(
+        &self,
+        parent: &[u8; 32],
+        slot_class: u16,
+        template: &NewTemplate<'_>,
+    ) -> Result<(Vec<TxOut>, [u8; 32]), String> {
+        let (h, commitment, fees) = Self::template_parts(template)?;
+        let table = self.cached_table(parent, h).unwrap_or_else(|| {
+            error!(
+                height = h,
+                parent = %hex::encode(parent),
+                "NODE_POOL: building a job without its snapshot table: the treasury takes the \
+                 subsidy"
+            );
+            Arc::new(Table::new())
+        });
+        let (outs, _) = coinbase_outputs(
+            h,
+            &table,
+            slot_class as usize,
+            &self.finder_script,
+            fees,
+            &commitment,
+        )
+        .map_err(|e| format!("canonical outputs: {e}"))?;
+        let digest = outputs_digest(&outs);
+        let reward = outs[..outs.len() - 1]
+            .iter()
+            .map(|(v, s)| TxOut {
+                value: Amount::from_sat(*v),
+                script_pubkey: ScriptBuf::from_bytes(s.clone()),
+            })
+            .collect();
+        Ok((reward, digest))
+    }
+
+    /// The outputs for a channel's next job, built from the channel's last stamp (call
+    /// [`NodePool::stamp`] first). Remembered for [`NodePool::bind_job`].
+    pub fn job_outputs(
+        &self,
+        key: ChannelKey,
+        template: &NewTemplate<'_>,
+    ) -> Result<Vec<TxOut>, String> {
+        let (parent, class) = {
+            let st = self.lock();
+            let p = st
+                .channels
+                .get(&key)
+                .and_then(|s| s.last_stamp.as_ref())
+                .ok_or("channel not stamped")?;
+            (p.parent_anchor, p.slot_class)
+        };
+        let (outs, digest) = self.canonical_outputs(&parent, class, template)?;
+        if let Some(slot) = self.lock().channels.get_mut(&key) {
+            slot.last_outputs = Some(digest);
+        }
+        Ok(outs)
+    }
+
+    /// [`NodePool::check_block`] on a serialized coinbase, as a solved share carries it.
+    pub fn check_block_bytes(
+        &self,
+        key: ChannelKey,
+        job_id: u32,
+        coinbase: &[u8],
+    ) -> Result<(), String> {
+        let tx: Transaction = stratum_apps::stratum_core::bitcoin::consensus::deserialize(coinbase)
+            .map_err(|e| format!("the solved coinbase does not parse: {e}"))?;
+        self.check_block(key, job_id, &tx)
+    }
+
+    /// The submit-time check: a solved block on `job_id` is submitted only if its coinbase pays
+    /// exactly the canonical outputs that job was built with.
+    pub fn check_block(
+        &self,
+        key: ChannelKey,
+        job_id: u32,
+        coinbase: &Transaction,
+    ) -> Result<(), String> {
+        let want = {
+            let st = self.lock();
+            st.channels
+                .get(&key)
+                .and_then(|s| s.jobs.iter().find(|j| j.job_id == job_id))
+                .ok_or("unknown job")?
+                .outputs
+                .ok_or("the job was built without canonical outputs")?
+        };
+        let got: Vec<CoinbaseOutput> = coinbase
+            .output
+            .iter()
+            .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
+            .collect();
+        if outputs_digest(&got) != want {
+            return Err("the coinbase does not pay the job's canonical outputs".into());
+        }
+        Ok(())
     }
 
     /// The anchor feed's publishing handle.
@@ -349,13 +606,17 @@ impl NodePool {
         (tier, push)
     }
 
-    /// Record that `job_id` was built with the channel's last stamp.
+    /// Record that `job_id` was built with the channel's last stamp and last outputs.
     pub fn bind_job(&self, key: ChannelKey, job_id: u32) {
         let mut st = self.lock();
         if let Some(slot) = st.channels.get_mut(&key) {
             if let Some(p) = slot.last_stamp.clone() {
-                slot.jobs.retain(|(id, _)| *id != job_id);
-                slot.jobs.push_back((job_id, p));
+                slot.jobs.retain(|j| j.job_id != job_id);
+                slot.jobs.push_back(JobRecord {
+                    job_id,
+                    preimage: p,
+                    outputs: slot.last_outputs.take(),
+                });
                 while slot.jobs.len() > JOBS_KEPT {
                     slot.jobs.pop_front();
                 }
@@ -370,8 +631,8 @@ impl NodePool {
             .get(&key)?
             .jobs
             .iter()
-            .find(|(id, _)| *id == job_id)
-            .map(|(_, p)| p.clone())
+            .find(|j| j.job_id == job_id)
+            .map(|j| j.preimage.clone())
     }
 
     /// Send accepted shares to the share-chain relay (`[node_pool.relay]`).
@@ -440,8 +701,8 @@ impl NodePool {
         let job_class = slot
             .jobs
             .iter()
-            .find(|(id, _)| *id == job_id)
-            .map(|(_, p)| p.slot_class)?;
+            .find(|j| j.job_id == job_id)
+            .map(|j| j.preimage.slot_class)?;
         let change = st
             .sessions
             .get_mut(&session)?
@@ -492,10 +753,12 @@ impl NodePool {
         out
     }
 
-    /// Track templates so a re-stamp can rebuild against the one miners are working on.
+    /// Track templates so a re-stamp can rebuild against the one miners are working on. Cached
+    /// tables are dropped: a new template may follow a Bitcoin reorg that changed what settled.
     pub fn on_new_template(&self, template: &NewTemplate<'_>) {
         let t = template.clone().into_static();
         let mut st = self.lock();
+        st.tables.clear();
         if t.future_template {
             st.future_templates.push_back(t);
             while st.future_templates.len() > FUTURE_TEMPLATES_KEPT {
@@ -630,6 +893,7 @@ fn register(
             payee_script,
             session,
             last_stamp: None,
+            last_outputs: None,
             jobs: VecDeque::new(),
         },
     );
@@ -673,53 +937,6 @@ pub fn agent_from_tlvs(tlvs: Option<&[Tlv]>) -> Option<String> {
     Some(clamp_agent(&agent).to_string())
 }
 
-/// How a channel's jobs are built when they are built per channel: SHARE_TIER_BIND's tier stamp,
-/// or the node pool's share tag. The tier variant delegates to `TierBinding` unchanged.
-#[derive(Clone)]
-pub(crate) enum PerChannelMode {
-    Tier(Arc<TierBinding>),
-    NodePool(Arc<NodePool>),
-}
-
-impl PerChannelMode {
-    /// Quantise a channel target to its tier's exact target.
-    pub(crate) fn quantise_target(&self, target: &Target, requested_max: &Target) -> Target {
-        match self {
-            PerChannelMode::Tier(tb) => tb.quantise_target(target, requested_max),
-            PerChannelMode::NodePool(np) => np.quantise_target(target, requested_max),
-        }
-    }
-
-    /// The template with the bytes the stamp replaces taken out.
-    pub(crate) fn prepare_template(&self, template: &NewTemplate<'static>) -> NewTemplate<'static> {
-        match self {
-            PerChannelMode::Tier(_) => strip_plain_node_tag(template),
-            PerChannelMode::NodePool(np) => np.prepare_template(template),
-        }
-    }
-
-    /// The `(tier, push)` to stamp into a channel's next job.
-    pub(crate) fn stamp(
-        &self,
-        key: ChannelKey,
-        kind: ChannelKind,
-        user_identity: &str,
-        target: &Target,
-    ) -> (u32, Vec<u8>) {
-        match self {
-            PerChannelMode::Tier(tb) => tb.stamp_for_target(target),
-            PerChannelMode::NodePool(np) => np.stamp(key, kind, user_identity, target),
-        }
-    }
-
-    /// Record the job a stamp went into.
-    pub(crate) fn bind_job(&self, key: ChannelKey, job_id: u32) {
-        if let PerChannelMode::NodePool(np) = self {
-            np.bind_job(key, job_id);
-        }
-    }
-}
-
 /// Channels whose class change needs a rebuild.
 pub(crate) fn changed_keys(changes: &[(ChannelKey, ClassChange)]) -> HashSet<ChannelKey> {
     changes
@@ -741,9 +958,11 @@ mod tests {
     const NODE: [u8; 32] = [0x7A; 32];
     /// A bech32 P2WPKH address (BIP173 test vector) as the miner's username.
     const ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    /// The operator's fee address (BIP173 P2WSH test vector).
+    const FEE: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
 
-    fn pool(height: u64, min_shares: u32) -> NodePool {
-        NodePool::from_parts(NODE, height, 60.0, min_shares)
+    fn pool(min_shares: u32) -> NodePool {
+        NodePool::from_parts(NODE, NodePool::fee_script(FEE).unwrap(), 60.0, min_shares)
     }
 
     fn ghost_prefix(height: [u8; 3]) -> Vec<u8> {
@@ -775,20 +994,228 @@ mod tests {
     }
 
     #[test]
-    fn dark_by_default_and_gated_by_template_height() {
-        let np = pool(NODE_POOL_ACTIVATION_HEIGHT, 20);
+    fn a_template_height_is_its_bip34_push() {
         let t = template(1, true, ghost_prefix([0x00, 0xa6, 0x0e]));
-        assert!(!np.template_is_active(&t), "u64::MAX is never reached");
-        let np = pool(960_000, 20);
-        assert!(np.template_is_active(&t));
-        let below = template(1, true, ghost_prefix([0xff, 0xa5, 0x0e]));
-        assert!(!np.template_is_active(&below));
-        assert!(!np.template_is_active(&template(1, true, vec![0x09])));
+        assert_eq!(NodePool::template_height(&t), Some(960_000));
+        assert_eq!(
+            NodePool::template_height(&template(1, true, vec![0x09])),
+            None
+        );
+    }
+
+    /// A template as the node pool's template provider sends it: the whole value, the witness
+    /// commitment as its only output.
+    fn np_template(value: u64) -> NewTemplate<'static> {
+        let mut t = template(7, true, ghost_prefix([0x00, 0xa6, 0x0e]));
+        let mut w = vec![0u8; 8];
+        w.push(38);
+        w.extend(ghost_common::canonical_payout::witness_script(&[0x11; 32]));
+        t.coinbase_tx_value_remaining = value;
+        t.coinbase_tx_outputs_count = 1;
+        t.coinbase_tx_outputs = w.try_into().unwrap();
+        t
+    }
+
+    const H: u32 = 960_000;
+
+    fn owed_table(n: u32) -> Table {
+        (0..n)
+            .map(|i| {
+                let mut script = vec![0x51, 0x20];
+                script.extend_from_slice(&[(i % 251) as u8; 30]);
+                script.extend_from_slice(&i.to_le_bytes()[..2]);
+                (
+                    script,
+                    ghost_common::canonical_payout::Balance {
+                        owed: (5_000 + i as i128) * ghost_common::node_pool_constants::FACE_PER_SAT,
+                        queue_since: Some(900_000 + i / 7),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn full(reward: &[TxOut]) -> Vec<CoinbaseOutput> {
+        reward
+            .iter()
+            .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
+            .chain([(
+                0,
+                ghost_common::canonical_payout::witness_script(&[0x11; 32]),
+            )])
+            .collect()
+    }
+
+    #[test]
+    fn every_slot_class_builds_the_canonical_coinbase() {
+        let np = pool(1);
+        let parent = [0xAA; 32];
+        let table = owed_table(600);
+        np.insert_table(parent, H, Arc::new(table.clone()));
+        let fees = 4_321;
+        let t = np_template(subsidy(H) + fees);
+        for class in SLOT_CLASSES {
+            let (reward, digest) = np.canonical_outputs(&parent, class, &t).unwrap();
+            let (want, _) = coinbase_outputs(
+                H,
+                &table,
+                class as usize,
+                np.finder_script(),
+                fees,
+                &[0x11; 32],
+            )
+            .unwrap();
+            let got = full(&reward);
+            assert_eq!(got, want, "class {class}");
+            assert_eq!(digest, outputs_digest(&want));
+            // treasury, the class's miners, finder, GHNP, witness
+            assert_eq!(got.len(), class as usize + 4, "class {class}");
+            assert_eq!(
+                reward.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+                t.coinbase_tx_value_remaining,
+                "the factory's sum check: every sat of the template's value"
+            );
+            assert_eq!(got[got.len() - 3], (fees, np.finder_script().to_vec()));
+        }
+    }
+
+    #[test]
+    fn the_finder_output_is_omitted_without_fees() {
+        let np = pool(1);
+        np.insert_table([1; 32], H, Arc::new(owed_table(5)));
+        let (reward, _) = np
+            .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H)))
+            .unwrap();
+        let got = full(&reward);
+        assert_eq!(got.len(), 1 + 5 + 2, "treasury, 5 miners, GHNP, witness");
+        assert!(got.iter().all(|o| o.1 != np.finder_script()));
+        let (reward, _) = np
+            .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H) + 1))
+            .unwrap();
+        assert_eq!(full(&reward)[6], (1, np.finder_script().to_vec()));
+    }
+
+    #[test]
+    fn a_job_without_its_table_pays_the_subsidy_to_the_treasury() {
+        let np = pool(1);
+        let (reward, _) = np
+            .canonical_outputs(&[9; 32], 500, &np_template(subsidy(H) + 7))
+            .unwrap();
+        let got = full(&reward);
+        assert_eq!(got.len(), 4, "treasury, finder, GHNP, witness");
+        assert_eq!(got[0].0, subsidy(H));
+        assert_eq!(
+            got[2].1,
+            ghost_common::canonical_payout::commitment_script(
+                &ghost_common::canonical_payout::table_root(&Table::new())
+            )
+        );
+    }
+
+    #[test]
+    fn a_template_that_cannot_carry_a_canonical_coinbase_is_refused() {
+        let ok = np_template(subsidy(H));
+        assert!(NodePool::template_parts(&ok).is_ok());
+        let low = np_template(subsidy(H) - 1);
+        assert!(NodePool::template_parts(&low)
+            .unwrap_err()
+            .contains("below the subsidy"));
+        let mut no_height = ok.clone();
+        no_height.coinbase_prefix = vec![0x09].try_into().unwrap();
+        assert!(NodePool::template_parts(&no_height).is_err());
+        // The old template provider's shape: every output built, nothing left to the pool.
+        let mut old = ok.clone();
+        let mut outs = vec![];
+        for _ in 0..2 {
+            outs.extend(0u64.to_le_bytes());
+            outs.push(38);
+            outs.extend(ghost_common::canonical_payout::witness_script(&[0x11; 32]));
+        }
+        old.coinbase_tx_outputs_count = 2;
+        old.coinbase_tx_outputs = outs.try_into().unwrap();
+        old.coinbase_tx_value_remaining = 0;
+        assert!(NodePool::template_parts(&old)
+            .unwrap_err()
+            .contains("2 outputs"));
+        let mut not_witness = ok.clone();
+        let mut o = vec![0u8; 8];
+        o.push(34);
+        o.extend(NodePool::fee_script(FEE).unwrap());
+        not_witness.coinbase_tx_outputs = o.try_into().unwrap();
+        assert!(NodePool::template_parts(&not_witness).is_err());
+    }
+
+    #[test]
+    fn a_solved_block_is_submitted_only_with_its_jobs_canonical_coinbase() {
+        use stratum_apps::stratum_core::bitcoin::{
+            absolute::LockTime, transaction::Version, OutPoint, Sequence, TxIn, Witness,
+        };
+        let np = pool(1);
+        let key = (1, 1);
+        np.anchor_driver().publish(AnchorUpdate {
+            parent_anchor: [0xAA; 32],
+            batch_root: [0xBB; 32],
+        });
+        np.insert_table([0xAA; 32], H, Arc::new(owed_table(50)));
+        let t = np_template(subsidy(H) + 99);
+        np.stamp(key, ChannelKind::Standard, ADDR, &target());
+        let reward = np.job_outputs(key, &t).unwrap();
+        np.bind_job(key, 5);
+        let tx = |outs: Vec<TxOut>| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![3, 0, 0xa6, 0x0e]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: outs,
+        };
+        let mut outs = reward.clone();
+        outs.push(TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: ScriptBuf::from_bytes(ghost_common::canonical_payout::witness_script(
+                &[0x11; 32],
+            )),
+        });
+        let good = tx(outs.clone());
+        assert_eq!(np.check_block(key, 5, &good), Ok(()));
+        let bytes = stratum_apps::stratum_core::bitcoin::consensus::serialize(&good);
+        assert_eq!(np.check_block_bytes(key, 5, &bytes), Ok(()));
+        // One sat moved between payees, a payee swapped, the finder skimming the treasury.
+        let mut moved = outs.clone();
+        moved[1].value = moved[1].value - Amount::from_sat(1);
+        moved[2].value += Amount::from_sat(1);
+        assert!(np.check_block(key, 5, &tx(moved)).is_err());
+        let mut swapped = outs.clone();
+        swapped.swap(1, 2);
+        assert!(np.check_block(key, 5, &tx(swapped)).is_err());
+        let mut skim = outs.clone();
+        let n = skim.len();
+        skim[0].value = skim[0].value - Amount::from_sat(10);
+        skim[n - 3].value += Amount::from_sat(10);
+        assert!(np.check_block(key, 5, &tx(skim)).is_err());
+        assert!(np.check_block(key, 6, &good).is_err(), "unknown job");
+        assert!(np.check_block_bytes(key, 5, &[1, 2, 3]).is_err());
+        // A job bound without outputs (stamped, never built) has nothing to submit against.
+        np.stamp(key, ChannelKind::Standard, ADDR, &target());
+        np.bind_job(key, 8);
+        assert!(np.check_block(key, 8, &good).is_err());
+    }
+
+    #[test]
+    fn the_fee_address_is_a_payee_class_script() {
+        let s = NodePool::fee_script(FEE).unwrap();
+        assert_eq!(s.len(), 34, "P2WSH");
+        assert_eq!(pool(1).finder_script(), &s[..]);
+        assert!(NodePool::fee_script("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").is_err());
+        assert!(NodePool::fee_script("not an address").is_err());
     }
 
     #[test]
     fn strip_and_stamp_are_byte_neutral_and_carry_the_v2_tag() {
-        let np = pool(0, 20);
+        let np = pool(20);
         let t = template(1, true, ghost_prefix([0x00, 0xa6, 0x0e]));
         let prepared = np.prepare_template(&t);
         let p = prepared.coinbase_prefix.inner_as_ref();
@@ -828,7 +1255,7 @@ mod tests {
         use stratum_apps::stratum_core::bitcoin::{
             self as btc, block::Header, consensus::serialize, hashes::Hash,
         };
-        let np = pool(0, 20);
+        let np = pool(20);
         let key = (1, 1);
         np.stamp(key, ChannelKind::Standard, ADDR, &target());
         np.bind_job(key, 7);
@@ -884,7 +1311,7 @@ mod tests {
 
     #[test]
     fn a_template_without_a_payout_slot_only_loses_its_node_tag() {
-        let np = pool(0, 20);
+        let np = pool(20);
         let mut prefix = vec![0x03, 0x00, 0xa6, 0x0e];
         prefix.extend(encode_node_tag(&[1; 20]));
         let t = template(1, true, prefix);
@@ -910,7 +1337,7 @@ mod tests {
 
     #[test]
     fn standard_channels_always_carry_the_full_class() {
-        let np = pool(0, 1);
+        let np = pool(1);
         np.stamp((1, 1), ChannelKind::Standard, ADDR, &target());
         assert_eq!(np.slot_class((1, 1)), Some(500));
         assert_eq!(np.tick(), vec![]);
@@ -919,7 +1346,7 @@ mod tests {
 
     #[test]
     fn anchor_updates_change_the_next_stamp() {
-        let np = pool(0, 20);
+        let np = pool(20);
         let key = (1, 2);
         let (_, a) = np.stamp(key, ChannelKind::Extended, ADDR, &target());
         let rx = np.subscribe();
@@ -940,7 +1367,7 @@ mod tests {
 
     #[test]
     fn extended_channels_are_sensed_from_their_agent() {
-        let np = pool(0, 2);
+        let np = pool(2);
         let key = (3, 1);
         np.note_identity(
             key,
@@ -978,7 +1405,7 @@ mod tests {
 
     #[test]
     fn a_reconnecting_miner_keeps_its_session() {
-        let np = pool(0, 1);
+        let np = pool(1);
         np.stamp((1, 1), ChannelKind::Extended, ADDR, &target());
         np.bind_job((1, 1), 1);
         np.on_share((1, 1), 1, ShareVerdict::Valid); // unknown agent: holds at 3
@@ -1004,7 +1431,7 @@ mod tests {
 
     #[test]
     fn a_native_sv2_miner_is_sensed_from_its_setup_connection() {
-        let np = pool(0, 2);
+        let np = pool(2);
         let device = Sv2Device::new("Bitmain", "S21", "1.0");
         // No agent TLV: the SetupConnection fields decide.
         np.note_identity((4, 1), NodePool::identity_for_open(None, device.as_ref()));
@@ -1027,7 +1454,7 @@ mod tests {
 
     #[test]
     fn a_settled_miner_keeps_its_class_across_reconnects_but_a_probe_fails() {
-        let np = pool(0, 1);
+        let np = pool(1);
         // Avalon: ceiling 44. One valid share passes a class at min_shares 1.
         let agent = || Some(MinerIdentity::Agent("Avalon".into()));
         let mut job = 0;
@@ -1072,7 +1499,7 @@ mod tests {
 
     #[test]
     fn templates_become_active_on_their_prev_hash() {
-        let np = pool(0, 20);
+        let np = pool(20);
         np.on_new_template(&template(5, true, vec![0x01, 0x01]));
         assert!(np.active_template().is_none());
         np.on_set_new_prev_hash(5);

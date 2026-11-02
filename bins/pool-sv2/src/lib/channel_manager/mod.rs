@@ -134,8 +134,6 @@ pub struct ChannelManagerData {
     // Mapping of `(downstream_id, channel_id)` → vardiff controller.
     // Each entry manages variable difficulty for a specific downstream channel.
     vardiff: HashMap<VardiffKey, VardiffState>,
-    // Coinbase outputs
-    coinbase_outputs: Vec<u8>,
     // Last new prevhash
     last_new_prev_hash: Option<SetNewPrevHash<'static>>,
     // Last future template
@@ -169,14 +167,9 @@ pub struct ChannelManager {
     job_declarator: Option<JobDeclarator>,
     /// Optional ghost share webhook sender. When Some, every validated share is posted.
     pub(crate) share_webhook_sender: Option<crate::share_webhook::ShareWebhookSender>,
-    /// SHARE_TIER_BIND: this pool's half of the difficulty-tier commitment, when configured.
-    /// `None` — the default and only shipped state — is dormant: one group job per template,
-    /// byte-identical to before the field existed. See `tier_binding.rs`.
-    pub(crate) tier_binding: Option<Arc<crate::tier_binding::TierBinding>>,
-    /// The node pool job layer, when `[node_pool]` is configured. `None` — the default and only
-    /// shipped state — leaves every path as it was. Even when present it acts only on templates
-    /// at/above its activation height. See `node_pool.rs`.
-    pub(crate) node_pool: Option<Arc<crate::node_pool::NodePool>>,
+    /// The node pool: share tags, slot classes and the canonical coinbase of every job. The only
+    /// mode. See `node_pool.rs`.
+    pub(crate) node_pool: Arc<crate::node_pool::NodePool>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -188,7 +181,6 @@ impl ChannelManager {
         tp_sender: Sender<TemplateDistribution<'static>>,
         tp_receiver: Receiver<TemplateDistribution<'static>>,
         downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
-        coinbase_outputs: Vec<u8>,
         job_declarator: Option<JobDeclarator>,
         share_webhook_sender: Option<crate::share_webhook::ShareWebhookSender>,
     ) -> PoolResult<Self, error::ChannelManager> {
@@ -224,7 +216,6 @@ impl ChannelManager {
             extranonce_prefix_factory_standard,
             downstream_id_factory: AtomicUsize::new(1),
             vardiff: HashMap::new(),
-            coinbase_outputs,
             last_future_template: None,
             last_new_prev_hash: None,
         }));
@@ -236,52 +227,35 @@ impl ChannelManager {
             downstream_receiver,
         };
 
-        // SHARE_TIER_BIND: resolve the tier-binding half of the gate, if configured. A malformed
-        // node id refuses startup — stamping tags derived from the wrong identity would have
-        // every tier-era share silently rejected by its binding check.
-        let tier_binding = match config.share_tier_binding() {
-            None => None,
-            Some(cfg) => {
-                let tb = crate::tier_binding::TierBinding::resolve(cfg)
-                    .await
-                    .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
-                warn!(
-                    activation_height = tb.activation_height(),
-                    "SHARE_TIER_BIND: per-tier job generation is CONFIGURED. This is one half of \
-                     a two-part gate: ghost-mining's SHARE_TIER_BIND_HEIGHT must equal this height \
-                     and the translator must run with quantise_to_tiers = true, all in the same \
-                     release — a desync means rejected shares (pool-on/translator-off) or \
-                     unchecked tier-shaped difficulties (translator-on/pool-off)"
-                );
-                Some(Arc::new(tb))
-            }
-        };
-
-        // NODE_POOL: resolve the job layer, if configured. Like the tier binding, a bad identity
-        // refuses startup. Configured, it also accepts the Ghost agent TLV from the translator.
-        let node_pool = match config.node_pool() {
-            None => None,
-            Some(cfg) => {
-                let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
-                    .await
-                    .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
-                warn!(
-                    activation_height = np.activation_height(),
-                    "NODE_POOL: the node pool job layer is CONFIGURED. Templates at/above the \
-                     activation height get per-channel GhostShare/v2 tags and slot-class sensing"
-                );
-                if let Some(relay) = &cfg.relay {
-                    crate::node_pool_relay::start(relay, &np)
-                        .await
-                        .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
-                }
-                Some(Arc::new(np))
-            }
-        };
+        // NODE_POOL: the only mode. A config without `[node_pool]` and its relay, or with a bad
+        // identity or fee address, refuses startup: without them no job can carry a canonical
+        // coinbase.
+        let cfg = config.node_pool().ok_or_else(|| {
+            PoolError::shutdown(PoolErrorKind::Configuration(
+                "the [node_pool] section is required: the node pool is the only mode".into(),
+            ))
+        })?;
+        let relay = cfg.relay.as_ref().ok_or_else(|| {
+            PoolError::shutdown(PoolErrorKind::Configuration(
+                "the [node_pool.relay] section is required: it holds the ledger every coinbase \
+                 pays"
+                    .into(),
+            ))
+        })?;
+        let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
+            .await
+            .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+        crate::node_pool_relay::start(relay, &np)
+            .await
+            .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+        warn!(
+            fee_address = %cfg.fee_address,
+            "NODE_POOL: every job carries its channel's share tag and the canonical coinbase"
+        );
+        let node_pool = Arc::new(np);
         let mut supported_extensions = config.supported_extensions().to_vec();
-        if node_pool.is_some()
-            && !supported_extensions
-                .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE)
+        if !supported_extensions
+            .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE)
         {
             supported_extensions.push(ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE);
         }
@@ -297,7 +271,6 @@ impl ChannelManager {
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,
             share_webhook_sender,
-            tier_binding,
             node_pool,
         };
 
@@ -336,33 +309,13 @@ impl ChannelManager {
             }
         };
 
-        // External-TP / ghost-mining mode: when the Template Provider sets
-        // `coinbase_tx_value_remaining == 0`, it is declaring that it has
-        // already allocated the entire subsidy + fees into the outputs it
-        // supplied in `template.coinbase_tx_outputs`. The pool must then
-        // pass an empty `additional_coinbase_outputs` vector to
-        // `on_new_template` so that:
-        //   (a) the channels_sv2 sum check passes: `sum([]) == 0 == value_remaining`
-        //   (b) the final coinbase consists solely of the TP-provided outputs,
-        //       which `JobFactory::coinbase()` appends automatically after
-        //       the (empty) `additional` list.
-        //
-        // When `value_remaining > 0` we stay on the classic flow and build a
-        // single reward output backed by the pool's `coinbase_reward_script`
-        // that sums to exactly `value_remaining`.
-        let coinbase_outputs: Vec<TxOut> = if last_future_template.coinbase_tx_value_remaining == 0
-        {
-            debug!(
-                "Bootstrap: TP owns coinbase (value_remaining=0, template_outputs_count={})",
-                last_future_template.coinbase_tx_outputs_count
-            );
-            Vec::new()
-        } else {
-            vec![TxOut {
-                value: Amount::from_sat(last_future_template.coinbase_tx_value_remaining),
-                script_pubkey: self.coinbase_reward_script.script_pubkey(),
-            }]
-        };
+        // The group channel tracks templates for its state; its job is never sent (every channel
+        // mines its own canonical job), so a single output for the whole value keeps the job
+        // factory's sum check satisfied.
+        let coinbase_outputs = vec![TxOut {
+            value: Amount::from_sat(last_future_template.coinbase_tx_value_remaining),
+            script_pubkey: self.coinbase_reward_script.script_pubkey(),
+        }];
 
         if let Err(e) = group_channel.on_new_template(last_future_template, coinbase_outputs) {
             error!(error = ?e, "Failed to add template to group channel");
@@ -626,11 +579,9 @@ impl ChannelManager {
             let cm = self.clone();
             let vardiff_future = self.run_vardiff_loop();
             tokio::pin!(vardiff_future);
-            // NODE_POOL: anchor publishes and the sensing clock. Both branches are disabled when
-            // `[node_pool]` is absent, so the loop below is the old loop.
-            let mut anchor_rx = cm.node_pool.as_ref().map(|np| np.subscribe());
-            let mut anchor_open = anchor_rx.is_some();
-            let node_pool_on = cm.node_pool.is_some();
+            // NODE_POOL: anchor publishes and the sensing clock.
+            let mut anchor_rx = cm.node_pool.subscribe();
+            let mut anchor_open = true;
             let mut sensing_clock =
                 tokio::time::interval(std::time::Duration::from_secs(NODE_POOL_TICK_SECS));
             loop {
@@ -666,13 +617,13 @@ impl ChannelManager {
                         }
                     }
                     // Cancellation-safe: `changed()` only marks the value seen when it resolves.
-                    changed = async { anchor_rx.as_mut().expect("guarded").changed().await }, if anchor_open => {
+                    changed = anchor_rx.changed(), if anchor_open => {
                         match changed {
                             Ok(()) => cm.node_pool_rebuild(None).await,
                             Err(_) => anchor_open = false,
                         }
                     }
-                    _ = sensing_clock.tick(), if node_pool_on => {
+                    _ = sensing_clock.tick() => {
                         cm.node_pool_tick().await;
                     }
                     dm = cm_downstreams.channel_manager_channel.downstream_receiver.recv() => {
@@ -705,9 +656,7 @@ impl ChannelManager {
     // 1. Removes the corresponding Downstream from the `downstream` map.
     // 2. Removes the channels of the corresponding Downstream from `vardiff` map.
     pub fn remove_downstream(&self, downstream_id: DownstreamId) {
-        if let Some(np) = &self.node_pool {
-            np.on_downstream_removed(downstream_id);
-        }
+        self.node_pool.on_downstream_removed(downstream_id);
         self.channel_manager_data.super_safe_lock(|cm_data| {
             cm_data.downstream.remove(&downstream_id);
             cm_data
@@ -781,7 +730,7 @@ impl ChannelManager {
         channel_state: &mut ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
-        tier_binding: Option<&crate::node_pool::PerChannelMode>,
+        np: &crate::node_pool::NodePool,
     ) {
         let (hashrate, target, shares_per_minute) = (
             channel_state.get_nominal_hashrate(),
@@ -801,16 +750,14 @@ impl ChannelManager {
 
         match channel_state.update_channel(new_hashrate, None) {
             Ok(()) => {
-                // SHARE_TIER_BIND: in tiered mode the announced target must BE a tier's exact
-                // target, or the coinbase can only commit to (and the miner only be credited)
-                // up to half the difficulty it actually mines at.
-                if let Some(tb) = tier_binding {
-                    let q = tb.quantise_target(
-                        channel_state.get_target(),
-                        channel_state.get_requested_max_target(),
-                    );
-                    channel_state.set_target(q);
-                }
+                // The announced target must BE a tier's exact target, or the share tag can only
+                // commit to (and the miner only be credited) up to half the difficulty it
+                // actually mines at.
+                let q = np.quantise_target(
+                    channel_state.get_target(),
+                    channel_state.get_requested_max_target(),
+                );
+                channel_state.set_target(q);
                 let updated_target = channel_state.get_target();
                 updates.push(
                     (
@@ -837,7 +784,7 @@ impl ChannelManager {
         channel: &mut StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
-        tier_binding: Option<&crate::node_pool::PerChannelMode>,
+        np: &crate::node_pool::NodePool,
     ) {
         let hashrate = channel.get_nominal_hashrate();
         let target = channel.get_target();
@@ -852,15 +799,11 @@ impl ChannelManager {
         if let Some(new_hashrate) = new_hashrate_opt {
             match channel.update_channel(new_hashrate, None) {
                 Ok(()) => {
-                    // SHARE_TIER_BIND: in tiered mode the announced target must BE a tier's
-                    // exact target — see the extended-channel twin above.
-                    if let Some(tb) = tier_binding {
-                        let q = tb.quantise_target(
-                            channel.get_target(),
-                            channel.get_requested_max_target(),
-                        );
-                        channel.set_target(q);
-                    }
+                    // The announced target must BE a tier's exact target — see the
+                    // extended-channel twin above.
+                    let q = np
+                        .quantise_target(channel.get_target(), channel.get_requested_max_target());
+                    channel.set_target(q);
                     let updated_target = channel.get_target();
                     updates.push(
                         (
@@ -911,11 +854,7 @@ impl ChannelManager {
         let mut messages: Vec<RouteMessageTo> = vec![];
         self.channel_manager_data
             .super_safe_lock(|channel_manager_data| {
-                // SHARE_TIER_BIND: quantise retargets only while the chain (as seen through the
-                // last future template's BIP34 height) is at/above the activation height.
-                let tier_binding =
-                    self.per_channel_mode(channel_manager_data.last_future_template.as_ref());
-                let tier_binding = tier_binding.as_ref();
+                let np = &self.node_pool;
                 for (vardiff_key, vardiff_state) in channel_manager_data.vardiff.iter_mut() {
                     let downstream_id = &vardiff_key.downstream_id;
                     let channel_id = &vardiff_key.channel_id;
@@ -932,7 +871,7 @@ impl ChannelManager {
                                 standard_channel,
                                 vardiff_state,
                                 &mut messages,
-                                tier_binding,
+                                np,
                             );
                         }
                         if let Some(extended_channel) = data.extended_channels.get_mut(channel_id) {
@@ -942,7 +881,7 @@ impl ChannelManager {
                                 extended_channel,
                                 vardiff_state,
                                 &mut messages,
-                                tier_binding,
+                                np,
                             );
                         }
                     });

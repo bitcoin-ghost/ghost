@@ -118,7 +118,7 @@ impl Sv2ClientsMonitoring for ChannelManager {
 
         downstream_refs
             .iter()
-            .filter_map(|d| downstream_to_sv2_client_info(d, self.node_pool.as_deref()))
+            .filter_map(|d| downstream_to_sv2_client_info(d, Some(&self.node_pool)))
             .collect()
     }
 
@@ -127,7 +127,7 @@ impl Sv2ClientsMonitoring for ChannelManager {
             .safe_lock(|d| {
                 d.downstream
                     .get(&client_id)
-                    .and_then(|c| downstream_to_sv2_client_info(c, self.node_pool.as_deref()))
+                    .and_then(|c| downstream_to_sv2_client_info(c, Some(&self.node_pool)))
             })
             .unwrap_or(None)
     }

@@ -119,24 +119,30 @@ batch_size = 1
 batch_timeout_ms = 2000
 max_retries = 3
 
-# SHARE_TIER_BIND (difficulty-tier commitment) — pool_sv2's half of a DORMANT two-part gate.
-# LEAVE COMMENTED OUT until the gate arms. Enabling it requires, in the SAME release:
-#   - activation_height equal to ghost-mining's SHARE_TIER_BIND_HEIGHT (a real block height,
-#     currently dormant at u64::MAX),
-#   - node_id equal to THIS node's 32-byte identity (hex) — the one ghost-mining derives its
-#     coinbase node tags from (`ghost-mining --show-identity`),
-#   - the translator shipped with quantise_to_tiers = true (translator-config.toml).
-# At/above the height, jobs are built per channel, each coinbase committing to the channel's
-# power-of-two difficulty tier; below it, behaviour is byte-identical to today.
-# SHARE_TIER_BIND: ARMED at 962100. Must equal ghost-mining's SHARE_TIER_BIND_HEIGHT, and the
-# translator must ship quantise_to_tiers = true in the SAME release — all three flip together.
+# NODE POOL: the only mode. pool_sv2 refuses to start without this section and its relay.
+# Every job carries its channel's GhostShare/v2 tag and the canonical coinbase of its slot class:
+# treasury, the owed miners, the finder (fee_address, every transaction fee), the GHNP table root
+# and the witness commitment. The translator must ship quantise_to_tiers = true.
 #
 # node_id is deliberately NOT set: pool_sv2 reads this node's identity from the co-located
-# ghost-mining's /health at startup, so the tags it stamps and the tags ghost-mining verifies cannot
-# disagree. Set it only if ghost-mining is unreachable at startup; when set it is checked against
-# ghost-mining's answer and a mismatch refuses to start.
-[share_tier_binding]
-activation_height = 962100
+# ghost-mining's /health at startup. Set it only if ghost-mining is unreachable at startup; when
+# set it is checked against ghost-mining's answer and a mismatch refuses to start.
+[node_pool]
+# The node operator's fee address (P2SH, P2WPKH, P2WSH or P2TR).
+fee_address = "${NODE_FEE_ADDRESS}"
+
+# The share-chain relay and settlement, with their own store. The genesis is the network's
+# (regtest, signet, mainnet): where this node's share chain starts.
+[node_pool.relay]
+listen = "0.0.0.0:8566"
+peers = []
+db_path = "/var/lib/ghost/node-pool.db"
+genesis_anchor = "${NODE_POOL_GENESIS_ANCHOR}"
+genesis_btc_height = 0
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_user = "${BITCOIN_RPC_USER}"
+rpc_password = "${BITCOIN_RPC_PASSWORD}"
 
 # Template Provider Configuration
 # Connects to ghost-mining's TDP server

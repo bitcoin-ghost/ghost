@@ -35,7 +35,6 @@ use tracing::{debug, error, warn};
 use crate::{
     error::{self, Action, PoolError, PoolErrorKind, PoolResult},
     io_task::spawn_io_tasks,
-    utils::PayoutMode,
 };
 
 mod common_message_handler;
@@ -56,19 +55,8 @@ pub struct DownstreamData {
     pub standard_channels:
         HashMap<ChannelId, StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>>,
     pub channel_id_factory: AtomicU32,
-    /// SHARE_TIER_BIND: template ids whose jobs were built PER CHANNEL (tiered), and whose group
-    /// job was therefore never broadcast.
-    ///
-    /// Bookkept rather than inferred. It was previously read back off the channels' future jobs at
-    /// activation time, which is wrong whenever no channel still holds that template's future job —
-    /// every channel closed, or the template predates the channel. The inference then said "not
-    /// tiered", the group `SetNewPrevHash` went out naming a job no miner was ever sent, and the
-    /// translator dropped its upstream on `JobIdNotFound`, taking the miner endpoint down with it.
-    pub tiered_template_ids: std::collections::HashSet<u64>,
     /// Extensions that have been successfully negotiated with this client
     pub negotiated_extensions: Vec<u16>,
-    /// Payout mode derived from user_identity (None until channel is opened)
-    pub payout_mode: Option<PayoutMode>,
     /// The client's `SetupConnection` vendor, hardware_version and firmware, when any is set.
     /// Read only by the node pool layer, to look a native SV2 miner up in its firmware table.
     pub setup_device: Option<ghost_common::slot_class_sensing::Sv2Device>,
@@ -161,9 +149,7 @@ impl Downstream {
             standard_channels: HashMap::new(),
             group_channel,
             channel_id_factory,
-            tiered_template_ids: std::collections::HashSet::new(),
             negotiated_extensions: vec![],
-            payout_mode: None,
             setup_device: None,
         }));
 
