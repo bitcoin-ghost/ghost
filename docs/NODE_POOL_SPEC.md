@@ -144,7 +144,7 @@ treasury = S/200 + (Rm - sum(pay))
 - **The top balance absorbs the remainder (user decision, draft 11).** When a block is worth less than its payees are owed, everyone else is paid in full and the largest balance takes the partial payment; the rest of its balance waits for a later block, where it either is top again or ages into the oldest half.
 - **Nobody is overpaid, and nobody loses balance.** A balance falls only by the exact amount paid. Not being in a block just means waiting.
 - **The ratio, `K_R`, `X` and `x` are gone.** Draft 6 redeemed credit at a floating rate, which overpaid some blocks and underpaid others.
-- **Faking a small coinbase should no longer pay.** A faker's block pays at most what the faker is owed, so the gain is being paid sooner, not more. This is reasoning, not yet simulated.
+- **Faking a small coinbase should no longer pay.** A faker's block pays at most what the faker is owed, so the gain is being paid sooner, not more. Measured in W1.3: a faker earns 1.000 times an honest miner (was +34-39% under the draft 6 floating rule).
 - **The treasury is no longer a fixed 0.5%.** It is 0.5% plus any change: whenever the balances in a block's slots add up to less than `Rm`. That happens when few miners are owed much, as at launch (a block found soon after launch sends most of `Rm` to the treasury), after a lucky run, and on small blocks whose top balances are small. Miners carry the unlucky runs as longer waits, and the treasury keeps the lucky ones. Measured in W1.3 (`sims/combined/results/exact_main.json`, 3 seeds each, 1% and 5% of the network):
 
 | Mix | Change to treasury, whole run | First 50 blocks | Unpaid backlog | Bitaxe / 100 TH/s never paid |
@@ -193,7 +193,7 @@ Pinned test cases: the 15 in `test_vectors.json`, plus 503/504-output golden vec
   - **Our path:** 504 outputs (15.8-21.8 KB) passed over SV1 and SV2 on regtest, with no real miner.
   - **Consequence:** a block pays at most as many balances as its finder's firmware allows. Change goes to the treasury.
   - **SV2-native firmware avoids this.** A standard SV2 channel sends the miner only a header, so coinbase size doesn't matter (169-278 B jobs at any size in W0.2). Only SV2 firmware such as Braiins OS can use it; stock Antminers speak SV1 only. This plan currently refuses standard channels; that refusal should be revisited (section 6).
-  - Exact payment should remove the gain from faking a small coinbase, which was 34-39% under the draft 6 floating rule. Not yet simulated.
+  - Exact payment removes the gain from faking a small coinbase, which was 34-39% under the draft 6 floating rule; W1.3 measured 1.000 against honest.
 - **A dead pool leaves balances unpaid.** Nobody holds the money, so balances still owed when the pool stops are never paid.
 
 The build plan is in `NODE_POOL_PLAN.md`. Paths starting `sims/` or `hardware-test/` are in the design working folder, not this repo; the normative payout reference and its vectors are in `docs/node-pool-reference/` (`refimpl_v3.py`, `test_vectors_v3.json`; run the script to self-test).
