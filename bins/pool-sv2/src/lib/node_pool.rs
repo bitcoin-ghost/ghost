@@ -471,11 +471,12 @@ impl NodePool {
 
     /// A solved block on `job_id`: `submit` queues it for the template provider first, always,
     /// whenever there is a template; only then is its coinbase checked against the job's canonical
-    /// outputs ([`NodePool::check_block_bytes`]), and a mismatch is logged and nothing else. A
+    /// outputs ([`NodePool::check_block_bytes`]) on a thread of its own, so it never holds up the
+    /// handler that sends the solution, and a mismatch is logged and nothing else. A
     /// valid Bitcoin block is worth more than any payout mismatch; settlement on every other node
     /// retires nothing for a block that does not match. Returns whether it was submitted.
     pub fn submit_then_check<E>(
-        &self,
+        self: &Arc<Self>,
         key: ChannelKey,
         job_id: u32,
         template_id: Option<u64>,
@@ -486,14 +487,23 @@ impl NodePool {
             return Ok(false);
         };
         submit(template_id)?;
-        if let Err(e) = self.check_block_bytes(key, job_id, coinbase) {
-            error!(
-                downstream_id = key.0,
-                channel_id = key.1,
-                job_id,
-                "NODE_POOL: submitted block's coinbase does not match its job's canonical \
-                 outputs: {e}"
-            );
+        let me = Arc::clone(self);
+        let coinbase = coinbase.to_vec();
+        let spawned = std::thread::Builder::new()
+            .name("np-block-check".into())
+            .spawn(move || {
+                if let Err(e) = me.check_block_bytes(key, job_id, &coinbase) {
+                    error!(
+                        downstream_id = key.0,
+                        channel_id = key.1,
+                        job_id,
+                        "NODE_POOL: submitted block's coinbase does not match its job's canonical \
+                         outputs: {e}"
+                    );
+                }
+            });
+        if let Err(e) = spawned {
+            error!("NODE_POOL: could not start the post-submit coinbase check: {e}");
         }
         Ok(true)
     }
@@ -1189,7 +1199,7 @@ mod tests {
         use stratum_apps::stratum_core::bitcoin::{
             absolute::LockTime, transaction::Version, OutPoint, Sequence, TxIn, Witness,
         };
-        let np = pool(1);
+        let np = Arc::new(pool(1));
         let key = (1, 1);
         np.anchor_driver().publish(AnchorUpdate {
             parent_anchor: [0xAA; 32],
