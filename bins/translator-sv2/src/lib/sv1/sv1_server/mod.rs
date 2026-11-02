@@ -192,6 +192,34 @@ pub(super) fn parse_suggest_difficulty(msg: &Message) -> Option<f64> {
 /// caller omit the TLV entirely. Where the pool has the extension negotiated as *required* that
 /// share is marked unattributable and silently earns nothing, while the miner still receives
 /// `SubmitSharesSuccess`. `mining.authorize` does not currently reject that shape.
+/// The worker name a miner gets when it authorises with its bare payout address (the spec's
+/// username is the payout address; the worker is optional).
+pub(super) const DEFAULT_WORKER: &str = "default";
+
+/// The username as the translator keeps it: any `.d=<difficulty>` directive stripped, and a bare
+/// payout address given the [`DEFAULT_WORKER`], so `addr` and `addr.default` are the same miner.
+/// A bare name that is not an address is left alone (and refused by
+/// [`check_username_attributable`]): it names no payout target, and the config's prefix would
+/// credit the operator's address instead.
+pub(super) fn normalize_username(name: &str) -> (std::borrow::Cow<'_, str>, Option<f64>) {
+    let (name, difficulty) = split_username_difficulty(name);
+    if !name.contains('.') && is_address(name) {
+        (
+            std::borrow::Cow::Owned(format!("{name}.{DEFAULT_WORKER}")),
+            difficulty,
+        )
+    } else {
+        (std::borrow::Cow::Borrowed(name), difficulty)
+    }
+}
+
+/// Whether `s` parses as a Bitcoin address on any network (the pool checks the network and the
+/// script class when the channel opens).
+fn is_address(s: &str) -> bool {
+    use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address};
+    s.parse::<Address<NetworkUnchecked>>().is_ok()
+}
+
 pub(super) fn extract_worker_name(name: &str) -> &str {
     // FIRST dot: the worker is everything after it, so `addr.farm1.rig1` keeps `farm1.rig1`
     // rather than collapsing to `rig1` (#481).
@@ -560,6 +588,36 @@ mod username_difficulty_tests {
         // Refused: no separator at all, which was already the case before #479.
         assert_eq!(check_username_attributable(ADDR), Err(NoSeparator));
         assert_eq!(check_username_attributable(""), Err(NoSeparator));
+    }
+
+    /// The spec's username is the payout address, the worker optional: a bare address is
+    /// accepted as `<address>.default`, with or without a `.d=` directive, and authorize, the
+    /// stored name and every submit agree on it. A bare name that is not an address is still
+    /// refused: it names no payout target.
+    #[test]
+    fn a_bare_payout_address_is_a_username_with_the_default_worker() {
+        for bare in [
+            ADDR,
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+        ] {
+            let (n, d) = normalize_username(bare);
+            assert_eq!(n, format!("{bare}.{DEFAULT_WORKER}"));
+            assert_eq!(d, None);
+            assert_eq!(check_username_attributable(&n), Ok(()));
+            assert_eq!(extract_worker_name(&n), DEFAULT_WORKER);
+            let with_d = format!("{bare}.d=4096");
+            let (n2, d2) = normalize_username(&with_d);
+            assert_eq!((n2, d2), (n.clone(), Some(4096.0)));
+        }
+        let rig = format!("{ADDR}.rig1");
+        assert_eq!(normalize_username(&rig).0, rig, "a worker is kept");
+        assert_eq!(normalize_username("rig1").0, "rig1");
+        assert_eq!(
+            check_username_attributable(&normalize_username("rig1").0),
+            Err(UsernameRejection::NoSeparator)
+        );
     }
 
     /// The address/worker split is on the FIRST dot, so a multi-dot worker survives intact.

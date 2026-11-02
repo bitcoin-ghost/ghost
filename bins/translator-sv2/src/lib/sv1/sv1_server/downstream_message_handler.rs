@@ -137,7 +137,9 @@ impl IsServer<'static> for Sv1Server {
         // enforces.
         // A trailing `.d=<difficulty>` is stripped here so the rest of the checks — and the
         // payout address / worker attribution downstream — see the plain `<address>.<worker>`.
-        let (name, username_difficulty) = super::split_username_difficulty(request.name.as_str());
+        // A bare payout address is accepted as `<address>.default` (the worker is optional).
+        let (name, username_difficulty) = super::normalize_username(request.name.as_str());
+        let name = name.as_ref();
         if let Err(rejection) = super::check_username_attributable(name) {
             warn!(
                 "Down: Rejecting mining.authorize from downstream {} — username '{}' has a missing or empty {} half; expected `<bitcoin_address>.<worker_name>`. Shares from this username could not be attributed and would earn nothing (#479).",
@@ -415,11 +417,11 @@ impl IsServer<'static> for Sv1Server {
             );
             return false;
         };
-        // Compare against the stored name, which has any `.d=` directive stripped.
-        let (name, _) = super::split_username_difficulty(name);
+        // Compare against the stored name: `.d=` stripped, a bare address given its worker.
+        let (name, _) = super::normalize_username(name);
         downstream
             .downstream_data
-            .super_safe_lock(|data| data.authorized_worker_name == *name)
+            .super_safe_lock(|data| data.authorized_worker_name == name.as_ref())
     }
 
     /// Authorizes a Downstream role.
@@ -445,7 +447,8 @@ impl IsServer<'static> for Sv1Server {
         // Store the username WITHOUT any trailing `.d=<difficulty>` directive: this string
         // becomes the channel `user_identity`, from which the pool derives the miner's payout
         // address and worker name. Leaving the directive on would corrupt attribution.
-        let (name, _) = super::split_username_difficulty(name);
+        let (name, _) = super::normalize_username(name);
+        let name = name.as_ref();
         let is_authorized = self.is_authorized(client_id, name);
         downstream.downstream_data.super_safe_lock(|data| {
             if !is_authorized {
