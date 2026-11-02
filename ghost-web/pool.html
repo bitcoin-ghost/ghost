@@ -81,7 +81,7 @@
       nothing to show, and that is the honest reading.
     </p>
     <div class="hero-actions">
-      <a href="#your-miner" class="btn btn-primary">Look up your balance <span class="arrow">→</span></a>
+      <a href="#your-miner" class="btn btn-primary">Your miner stats <span class="arrow">→</span></a>
       <a href="/endpoints.html" class="btn btn-ghost">Node list</a>
     </div>
   </div>
@@ -91,9 +91,9 @@
   <div class="container">
     <div class="section-label">your miner</div>
     <form action="/miner.html" method="get" class="np-lookup">
-      <label for="np-lookup-id" class="np-status-note">Payout address, or address.worker</label>
+      <label for="np-lookup-id" class="np-status-note">Payout address, or address.worker: hashrate and shares per worker, balance over time, your place in the payout queue and every payout</label>
       <div class="hero-actions" style="margin-top:8px;">
-        <input id="np-lookup-id" name="id" type="text" required autocomplete="off" spellcheck="false" placeholder="bc1q…" class="np-lookup-input">
+        <input id="np-lookup-id" name="address" type="text" required autocomplete="off" spellcheck="false" placeholder="bc1q…" class="np-lookup-input">
         <button type="submit" class="btn btn-primary">Look up <span class="arrow">→</span></button>
       </div>
     </form>
@@ -175,7 +175,7 @@
         <li><a href="/">How it works</a></li>
         <li><a href="/pool.html">Pool status</a></li>
         <li><a href="/endpoints.html">Node list</a></li>
-        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/miner.html">Miner stats</a></li>
       </ul>
     </div>
     <div>

@@ -87,6 +87,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::{
+    miner_stats::{now_secs, worker_name, MinerStats, Outcome},
     tier_binding::{bip34_height, strip_plain_node_tag, tag_len_at, TierBinding},
     utils::PayoutMode,
 };
@@ -140,6 +141,8 @@ pub struct ChannelStatus {
     pub kind: ChannelKind,
     /// The payee script its shares credit.
     pub payee_script: Vec<u8>,
+    /// The user identity it opened with (`address.worker`).
+    pub user_identity: String,
     /// Miner outputs its jobs carry.
     pub slot_class: u16,
     /// Sensing state, for extended channels.
@@ -169,6 +172,7 @@ struct JobRecord {
 struct ChannelSlot {
     kind: ChannelKind,
     payee_script: Vec<u8>,
+    user_identity: String,
     session: Option<String>,
     last_stamp: Option<ShareTagPreimage>,
     last_outputs: Option<[u8; 32]>,
@@ -198,6 +202,7 @@ pub struct NodePool {
     relay_sink: Mutex<Option<RelaySink>>,
     finder_script: Vec<u8>,
     table_source: Mutex<Option<mpsc::Sender<TableRequest>>>,
+    stats: Arc<MinerStats>,
 }
 
 /// Where accepted shares go when `[node_pool.relay]` runs: the relay's local queue, and the tier
@@ -225,7 +230,38 @@ impl NodePool {
             relay_sink: Mutex::new(None),
             finder_script,
             table_source: Mutex::new(None),
+            stats: Arc::new(MinerStats::in_memory(now_secs())),
         }
+    }
+
+    /// The same job layer recording shares into `stats` (W2.17).
+    pub fn with_miner_stats(mut self, stats: Arc<MinerStats>) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    /// The per-worker share statistics.
+    pub fn miner_stats(&self) -> &Arc<MinerStats> {
+        &self.stats
+    }
+
+    /// Record a judged share for the miner pages: credited to the channel's payee, counted under
+    /// the worker named in `identity` (the channel's own, or a proxy's per-miner identity).
+    pub fn record_share(&self, key: ChannelKey, identity: &str, outcome: Outcome) {
+        let script = self
+            .lock()
+            .channels
+            .get(&key)
+            .map(|s| s.payee_script.clone());
+        let script = match script {
+            Some(s) => s,
+            None => match Self::payee_for_identity(identity) {
+                Ok(s) => s,
+                Err(_) => return,
+            },
+        };
+        self.stats
+            .record(&script, &worker_name(identity), outcome, now_secs());
     }
 
     /// Resolve from config: the identity from the co-located ghost-mining, the finder script
@@ -849,6 +885,7 @@ impl NodePool {
                 key: *key,
                 kind: slot.kind,
                 payee_script: slot.payee_script.clone(),
+                user_identity: slot.user_identity.clone(),
                 slot_class: class_of(&st, *key),
                 sensing: slot
                     .session
@@ -943,6 +980,7 @@ fn register(
         ChannelSlot {
             kind,
             payee_script,
+            user_identity: crate::miner_stats::clamp_identity(user_identity),
             session,
             last_stamp: None,
             last_outputs: None,

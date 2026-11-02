@@ -25,25 +25,25 @@ use tokio::sync::watch;
 
 use super::*;
 
-const ONE: i128 = FACE_PER_SAT;
+pub(crate) const ONE: i128 = FACE_PER_SAT;
 /// The next block's height in these tests.
-const NEXT: u32 = 1_000;
+pub(crate) const NEXT: u32 = 1_000;
 
-fn payee(b: u8) -> Vec<u8> {
+pub(crate) fn payee(b: u8) -> Vec<u8> {
     let mut s = vec![0x00, 0x14];
     s.extend_from_slice(&[b; 20]);
     s
 }
 
-fn addr(script: &[u8]) -> String {
+pub(crate) fn addr(script: &[u8]) -> String {
     Address::from_script(&ScriptBuf::from_bytes(script.to_vec()), Network::Regtest)
         .unwrap()
         .to_string()
 }
 
-struct Fixed {
-    table: Option<Arc<Table>>,
-    miners: Vec<ChannelStatus>,
+pub(crate) struct Fixed {
+    pub(crate) table: Option<Arc<Table>>,
+    pub(crate) miners: Vec<ChannelStatus>,
 }
 
 impl LiveView for Fixed {
@@ -104,16 +104,16 @@ fn anchor(db: &Database, hash: u8, btc_height: u32) {
 /// A store where payee 1 is credited by anchor 1's batch (applied) and appears in anchor 2's
 /// batch whose credit event is not applied (a losing fork), payee 2 and 3 are credited too,
 /// and two blocks paid payee 1: block 0xB1 settled, block 0xB2 provisional.
-struct World {
-    api: NodePoolApi,
-    table: Arc<Table>,
-    settlement_tx: watch::Sender<SettlementStatus>,
+pub(crate) struct World {
+    pub(crate) api: NodePoolApi,
+    pub(crate) table: Arc<Table>,
+    pub(crate) settlement_tx: watch::Sender<SettlementStatus>,
 }
 
 /// Payee 1's exact credit: 9,000 sats and a fraction.
-const P1_CREDIT: i128 = 9_000 * ONE + 123_456_789;
+pub(crate) const P1_CREDIT: i128 = 9_000 * ONE + 123_456_789;
 
-fn world() -> World {
+pub(crate) fn world() -> World {
     let db = Arc::new(Database::in_memory().unwrap());
     anchor(&db, 1, 900);
     anchor(&db, 2, 901);
@@ -181,6 +181,7 @@ fn world() -> World {
         key: (4, 1),
         kind: ChannelKind::Extended,
         payee_script: payee(1),
+        user_identity: format!("{}.rig1", addr(&payee(1))),
         slot_class: 9,
         sensing: Some(SensingStatus {
             agent: Some("bmminer/2.0.0".into()),

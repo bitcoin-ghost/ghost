@@ -65,6 +65,11 @@ jobs:
       # almost no miner sockets, so the capacity model never saw it.
       - name: Socket-holding units raise LimitNOFILE
         run: ./scripts/check-socket-units-raise-nofile.sh
+      # The miner page is plain JavaScript with no build step: a syntax error ships as a blank
+      # page and a renamed API field as NaN or a made-up zero. Parse every site script and render
+      # the page under node from sample and failed API answers (W2.17).
+      - name: Miner page renders
+        run: ./scripts/check-miner-page.sh
       # The pre-deploy SV1 smoke test's declared-difficulty case could not distinguish
       # "delivered late" from "never delivered" — both printed the floor — which is what
       # misdirected the #455 investigation. This runs that case against fake pools with known

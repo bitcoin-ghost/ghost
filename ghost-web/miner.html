@@ -4,8 +4,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Miner ledger · Bitcoin Ghost</title>
-  <meta name="description" content="A miner's node pool ledger: balance, place in the payout queue, credited shares and payouts.">
+  <title>Miner · Bitcoin Ghost</title>
+  <meta name="description" content="A miner's node pool stats: hashrate and shares per worker, balance over time, place in the payout queue with an honest wait, and every payout.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Miner ledger · Bitcoin Ghost">
@@ -21,7 +21,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20261102">
+  <link rel="stylesheet" href="/style.css?v=20261102b">
   <script>
     (function () {
       var saved = null;
@@ -82,116 +82,117 @@
 </div>
 
 <!-- ───── Lookup ───── -->
-<section class="block mp-hero" id="lookup-mode" style="display:none">
+<section class="block mp-hero" id="lookup-mode" hidden>
   <div class="container">
-    <div class="section-label"><a href="/pool.html" style="color:inherit">← pool</a> · miner ledger</div>
-    <h1 class="mp-worker">Your balance.</h1>
-    <p class="section-lead">Enter the payout address your miner uses as its username. The page reads the node pool's ledger: what you are owed, where you stand in the payout queue, and every payout made to you.</p>
+    <div class="section-label"><a href="/pool.html" style="color:inherit">← pool</a> · miner</div>
+    <h1 class="mp-worker">Your miner.</h1>
+    <p class="section-lead">Enter the payout address your miner uses as its username. You get your balance, every worker's hashrate and shares, your place in the payout queue with an honest wait, and every payout with its block.</p>
     <form class="miner-lookup" id="lookup-form">
       <input id="lookup-input" type="text" placeholder="bc1q… or bc1p… or 3…" autocomplete="off" spellcheck="false" aria-label="Payout address">
       <button type="submit">Look up</button>
     </form>
-  </div>
-</section>
-
-<!-- ───── Ledger ───── -->
-<section class="block mp-hero" id="ledger-mode" style="display:none">
-  <div class="container">
-    <div class="section-label"><a href="/miner.html" style="color:inherit">← lookup</a> · miner ledger</div>
-    <div class="mp-status-row">
-      <div id="lg-status" class="mp-status offline">—</div>
-      <div id="lg-nodeinfo" style="font-family:var(--font-mono); font-size:12px; color:var(--dim)"></div>
-    </div>
-    <h1 class="mp-worker" id="lg-short">—</h1>
-    <div class="mp-full" id="lg-address"></div>
-  </div>
-</section>
-<section class="block" id="ledger-body" style="display:none">
-  <div class="container">
-    <div class="mp-tiles" style="grid-template-columns: repeat(4, 1fr)">
-      <div class="mp-tile">
-        <div class="k k-help" title="Everything your credited shares earned, minus everything blocks have paid you. Counted in units of 2^-32 sat, so nothing is rounded away; whole sats are shown.">balance</div>
-        <div class="v" id="lg-balance">—</div>
-        <div class="sub" id="lg-units">—</div>
-      </div>
-      <div class="mp-tile">
-        <div class="k k-help" title="Your place in the two queues of the table the next block pays: by age (when your balance first reached 1,000 sats) and by size. The largest balance is 'top' and is paid last in every block.">queue position</div>
-        <div class="v" id="lg-queue">—</div>
-        <div class="sub" id="lg-queue-sub">—</div>
-      </div>
-      <div class="mp-tile">
-        <div class="k k-help" title="What the next block would pay you, if it is found by a miner whose firmware carries the full 500 miner outputs. Smaller classes are in the table below.">next block</div>
-        <div class="v" id="lg-next">—</div>
-        <div class="sub" id="lg-next-sub">—</div>
-      </div>
-      <div class="mp-tile">
-        <div class="k">payouts</div>
-        <div class="v" id="lg-paid">—</div>
-        <div class="sub" id="lg-paid-sub">—</div>
-      </div>
-    </div>
-
-    <div class="placeholder-panel" id="lg-firmware" style="display:none; padding: 24px 28px; text-align:left; margin-top: 24px"></div>
-    <div class="payout-note" id="lg-settlement"></div>
-
-    <div style="margin: 40px 0 16px">
-      <div class="section-label">the next block</div>
-      <h2 class="section-title" style="margin:4px 0 0">What it would pay you.</h2>
-    </div>
-    <p class="section-lead" id="lg-next-lead">A block pays as many balances as the firmware of the miner that finds it can carry. Each row is one size of coinbase.</p>
-    <div class="lb-table-wrap">
-      <table class="lb-table payout-table" id="lg-classes"><tbody></tbody></table>
-    </div>
-
-    <div style="margin: 40px 0 16px">
-      <div class="section-label">payouts</div>
-      <h2 class="section-title" style="margin:4px 0 0">Paid from the coinbase.</h2>
-    </div>
-    <div class="lb-table-wrap payout-wrap">
-      <table class="lb-table payout-table" id="lg-payouts"><tbody></tbody></table>
-    </div>
-    <div class="payout-note">
-      <code>settled</code>: this node checked the block against the share chain and it paid exactly what the ledger said.
-      <code>provisional</code>: this node does not hold the block's anchor yet, so it trusted the coinbase for now and will check it when the anchor arrives.
-      A coinbase can be spent after 100 confirmations.
-    </div>
-
-    <div style="margin: 40px 0 16px">
-      <div class="section-label">credited shares</div>
-      <h2 class="section-title" style="margin:4px 0 0">What you earned.</h2>
-    </div>
-    <div class="lb-table-wrap payout-wrap">
-      <table class="lb-table payout-table" id="lg-shares"><tbody></tbody></table>
-    </div>
-    <div class="payout-note">
-      Only shares at or above the network tier are sent between nodes and credited. A share is credited once an anchor's batch includes it, about a minute after it is found.
-    </div>
-  </div>
-</section>
-
-<!-- ───── How it works ───── -->
-<section class="block" id="explain" style="display:none">
-  <div class="container">
-    <div class="section-label">how you get paid</div>
-    <h2 class="section-title">In plain words.</h2>
-    <div class="mp-meta" style="grid-template-columns: 1fr; gap: 6px">
-      <p>Your miner's username is your payout address. Every share it finds that reaches the network tier is credited to that address, in sats worked out from the share's own difficulty. Every node runs the same arithmetic on the same share chain, so every node shows the same balance.</p>
-      <p>When the pool finds a block, the coinbase pays miners directly. Of the subsidy, 0.5% goes to the treasury and 99.5% pays balances, exactly as they stood 20 blocks earlier. All transaction fees go to the node whose miner found the block. Nobody holds your money in between.</p>
-      <p>Half of a block's miner outputs go to the oldest balances (those that reached 1,000 sats first), half to the largest. The largest balance of all is paid last, with whatever is left. Nobody is paid more than they are owed, and a balance falls only by what a block actually paid it. Balances under 1,000 sats wait. When a block cannot fill its outputs, the change goes to the treasury.</p>
-      <p><strong>Firmware matters.</strong> A block can only pay as many balances as the coinbase the finding miner's firmware can carry: a stock Antminer S19 about 9, an S21 about 44, Whatsminer and Avalon about 135-143, Braiins OS and ePIC 364 or more, and SV2 firmware on a standard channel the full 500. Each node senses what a miner can carry and never sends it more. A low-limit miner is warned about, not refused: the blocks it finds pay fewer balances and send the rest to the treasury, so everyone waits longer. Your own balance is never reduced by it.</p>
-      <p>Waits can be long. Without an audit with <code>ghost-audit</code>, you are trusting the node you mine on to credit you.</p>
-    </div>
+    <p class="payout-note">A link to <code>?address=&lt;address&gt;</code> can be bookmarked or shared; add <code>&amp;worker=&lt;name&gt;</code> to open on one worker.</p>
   </div>
 </section>
 
 <!-- ───── Error ───── -->
-<section class="block" id="error-mode" style="display:none">
+<section class="block" id="error-mode" hidden>
   <div class="container">
-    <div class="placeholder-panel" style="padding: 80px 32px">
+    <div class="placeholder-panel" style="padding: 48px 32px">
       <div id="error-msg"></div>
     </div>
   </div>
 </section>
+
+<!-- ───── The miner ───── -->
+<div id="miner-body" hidden>
+  <section class="block mp-hero mp2-hero">
+    <div class="container">
+      <div class="section-label"><a href="/miner.html" style="color:inherit">← lookup</a> · miner</div>
+      <div id="mp-header"></div>
+      <div id="mp-tiles"></div>
+      <div class="mp2-updated" id="mp-updated" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section class="block mp2-section">
+    <div class="container">
+      <div class="mp2-head">
+        <div>
+          <div class="section-label">over time</div>
+          <h2 class="section-title">Hashrate, shares and balance.</h2>
+        </div>
+        <div class="mpc-chips" role="group" aria-label="Time window">
+          <button type="button" class="mpc-chip" data-window="24h">24 h</button>
+          <button type="button" class="mpc-chip" data-window="7d">7 days</button>
+          <button type="button" class="mpc-chip" data-window="30d">30 days</button>
+        </div>
+      </div>
+      <div class="mp2-chart">
+        <h3 class="mp2-h3">Hashrate</h3>
+        <div id="mp-hashrate" class="mp2-plot"></div>
+      </div>
+      <div class="mp2-chart">
+        <h3 class="mp2-h3">Shares</h3>
+        <div id="mp-shares" class="mp2-plot"></div>
+      </div>
+      <div class="mp2-chart">
+        <h3 class="mp2-h3">Balance</h3>
+        <div id="mp-balance" class="mp2-plot"></div>
+      </div>
+      <p class="payout-note">Hashrate is worked out from the difficulty of the shares the nodes accepted, so it is an estimate, and noisy over short spans. Shaded time is before a node began keeping statistics: unknown, not zero.</p>
+    </div>
+  </section>
+
+  <section class="block mp2-section">
+    <div class="container">
+      <div class="section-label">workers</div>
+      <h2 class="section-title">What each machine is doing.</h2>
+      <p class="section-lead">Each node sees only the miners connected to it, so every node is asked. <em>Online</em>: connected and sent a share in the last 10 minutes. <em>Idle</em>: connected, nothing for 10 minutes. <em>Offline</em>: not connected. Pick a worker to see its charts.</p>
+      <div id="mp-workers"></div>
+    </div>
+  </section>
+
+  <section class="block mp2-section">
+    <div class="container">
+      <div class="section-label">getting paid</div>
+      <h2 class="section-title">Where you stand.</h2>
+      <div id="mp-queue"></div>
+    </div>
+  </section>
+
+  <section class="block mp2-section">
+    <div class="container">
+      <div class="section-label">payouts</div>
+      <h2 class="section-title">Paid from the coinbase.</h2>
+      <div id="mp-payouts"></div>
+      <div class="payout-note">
+        <code>settled</code>: the node checked the block against the share chain and it paid exactly what the ledger said.
+        <code>provisional</code>: the node does not hold the block's anchor yet, so it trusted the coinbase for now and will check it when the anchor arrives.
+        A coinbase can be spent after 100 confirmations.
+      </div>
+      <div class="payout-note" id="mp-settlement"></div>
+    </div>
+  </section>
+</div>
+
+<!-- ───── What this means ───── -->
+<section class="block" id="explain" hidden>
+  <div class="container">
+    <div class="section-label">what this means</div>
+    <h2 class="section-title">In plain words.</h2>
+    <div class="np-prose">
+      <p><strong>Your balance.</strong> Your miner's username is your payout address. Every share it finds at or above the network tier is credited to that address, in sats worked out from the share's own difficulty. Every node runs the same arithmetic on the same share chain, so every node shows the same balance.</p>
+      <p><strong>Hashrate and shares.</strong> Your miner sends shares at its own difficulty; the page counts them and works out a hashrate from their difficulty. <em>Stale</em> shares were mined on a block that had just been replaced; a few are normal. <em>Rejected</em> shares failed a check, and the reason is listed. Only the larger shares that reach the network tier earn credit, so a worker can show hashrate before its balance moves.</p>
+      <p><strong>Getting paid.</strong> When the pool finds a block, the coinbase pays miners directly. Of the subsidy, 0.5% goes to the treasury and 99.5% pays balances as they stood 20 blocks earlier. Half of a block's miner outputs go to the oldest balances (those that reached 1,000 sats first), half to the largest; the largest of all is paid last with whatever is left. Nobody is paid more than they are owed, and nobody holds your money in between. Transaction fees go to the node whose miner found the block.</p>
+      <p><strong>The wait is an estimate.</strong> Blocks are found at random. The page uses how often the pool found blocks recently and how many balances they paid; when there is too little to go on, it says <em>unknown</em> instead of inventing a number. Waits can be long.</p>
+      <p><strong>Firmware matters.</strong> A block can only pay as many balances as the coinbase the finding miner's firmware can carry: a stock Antminer S19 about 9, an S21 about 44, Whatsminer and Avalon about 135-143, Braiins OS and ePIC 364 or more, SV2 on a standard channel the full 500. Each node senses what a miner can carry (its <em>slot class</em>) and never sends it more. A low-limit miner is warned about, not refused; your own balance is never reduced by it.</p>
+      <p><strong>Trust.</strong> Without an audit with <code>ghost-audit</code>, you are trusting the node you mine on to credit you.</p>
+    </div>
+  </div>
+</section>
+
+<div class="mp-tip" id="mp-tip" role="tooltip" hidden></div>
 
 <footer class="site-footer">
   <div class="container">
@@ -212,7 +213,7 @@
         <li><a href="/">How it works</a></li>
         <li><a href="/pool.html">Pool status</a></li>
         <li><a href="/endpoints.html">Node list</a></li>
-        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/miner.html">Miner stats</a></li>
       </ul>
     </div>
     <div>
@@ -268,188 +269,8 @@
     });
   })();
 
-  // Nodes the website proxies as /api/pool/<id>/. The share chain gives every node the same
-  // ledger, so the first node that answers is enough; the rest are fallbacks.
-  var POOL_NODES = [
-    { id: 'vm1' }, { id: 'vm2' }, { id: 'vm3' }, { id: 'vm4' }
-  ];
-  var SLOT_CLASS_HARDWARE = {
-    3: 'NiceHash-size coinbase',
-    9: 'stock Antminer S19',
-    44: 'Antminer S21',
-    143: 'Whatsminer, Avalon, S9/S17',
-    364: 'Braiins OS, ePIC',
-    500: 'full: large-coinbase firmware, SV2 standard channels'
-  };
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
-  function fmtSats(s) {
-    if (s == null || !isFinite(s)) return '—';
-    if (Math.abs(s) < 100000) return Number(s).toLocaleString() + '<span class="unit"> sats</span>';
-    return (s / 1e8).toFixed(8) + '<span class="unit"> BTC</span>';
-  }
-  function fmtTs(ts) { return ts ? new Date(ts * 1000).toLocaleString() : '—'; }
-  function shortHash(h) { return h ? h.slice(0, 12) + '…' + h.slice(-6) : '—'; }
-  function show(id) { document.getElementById(id).style.display = 'block'; }
-  function setText(id, t) { document.getElementById(id).textContent = t; }
-  function setHtml(id, h) { document.getElementById(id).innerHTML = h; }
-
-  // Rate-limit notice: a 429 means throttled, not missing; keep what is on screen.
-  var rlNotice = document.getElementById('rl-notice');
-
-  // Ask each node in turn. A 200 or 400 is the ledger's answer; anything else (404 on a node
-  // that does not run the node pool, 503, 429, network error) tries the next node.
-  async function ask(path) {
-    var throttled = false;
-    for (var i = 0; i < POOL_NODES.length; i++) {
-      try {
-        var r = await fetch('/api/pool/' + POOL_NODES[i].id + path);
-        if (r.status === 429) { throttled = true; continue; }
-        if (r.status === 200 || r.status === 400) {
-          if (rlNotice) rlNotice.classList.remove('show');
-          return { status: r.status, body: await r.json(), node: POOL_NODES[i].id };
-        }
-      } catch (e) { /* next node */ }
-    }
-    if (rlNotice && throttled) rlNotice.classList.add('show');
-    return null;
-  }
-
-  var params = new URLSearchParams(location.search);
-  // ?address=<addr>; the old ?id=<address.worker> links still work (the worker is dropped:
-  // the ledger is per address).
-  var address = (params.get('address') || params.get('id') || '').trim().replace(/\.+$/, '');
-  if (address.indexOf('.') >= 0) address = address.split('.')[0];
-
-  document.getElementById('lookup-form').addEventListener('submit', function (e) {
-    e.preventDefault();
-    var a = document.getElementById('lookup-input').value.trim();
-    if (a) location.search = '?address=' + encodeURIComponent(a);
-  });
-
-  if (!address) {
-    show('lookup-mode');
-    show('explain');
-  } else {
-    load();
-    setInterval(load, 60000);
-  }
-
-  var everShown = false;
-  async function load() {
-    var res = await ask('/api/v1/ledger/' + encodeURIComponent(address));
-    if (!res) {
-      if (everShown) return;
-      show('error-mode');
-      setText('error-msg', 'No node answered. The node pool API may be down; try again in a minute.');
-      return;
-    }
-    if (res.status === 400) {
-      show('lookup-mode');
-      show('error-mode');
-      document.getElementById('lookup-input').value = address;
-      setText('error-msg', res.body.error || 'That is not an address the node pool can pay.');
-      return;
-    }
-    everShown = true;
-    render(res.body, res.node);
-    var st = await ask('/api/v1/node-pool/status');
-    if (st && st.status === 200) renderFirmware(st.body);
-  }
-
-  function render(d, node) {
-    show('ledger-mode');
-    show('ledger-body');
-    show('explain');
-    document.title = d.address.slice(0, 10) + '… · Miner ledger · Bitcoin Ghost';
-    var status = document.getElementById('lg-status');
-    status.className = 'mp-status ' + (d.known ? 'online' : 'offline');
-    status.textContent = d.known ? 'on the ledger' : 'not on the ledger';
-    setText('lg-nodeinfo', d.network + ' · read from ' + node);
-    setText('lg-short', d.address.slice(0, 8) + '…' + d.address.slice(-6));
-    setText('lg-address', d.address);
-
-    setHtml('lg-balance', fmtSats(d.balance.sats));
-    setText('lg-units', d.balance.units + ' units of 2⁻³² sat');
-
-    var q = d.queue;
-    if (!q) {
-      setText('lg-queue', '—');
-      setText('lg-queue-sub', d.queue_unavailable || 'not available');
-      setText('lg-next', '—');
-      setText('lg-next-sub', '');
-    } else {
-      if (!q.eligible) {
-        setText('lg-queue', 'waiting');
-        setText('lg-queue-sub', 'under 1,000 sats in the next block\'s table');
-      } else if (q.is_top) {
-        setText('lg-queue', 'top');
-        setText('lg-queue-sub', 'largest of ' + q.eligible_count + ': paid last in every block');
-      } else {
-        setText('lg-queue', '#' + q.age_rank + ' oldest');
-        setText('lg-queue-sub', '#' + q.size_rank + ' by size, of ' + q.eligible_count + ' eligible');
-      }
-      var full = q.next_block[q.next_block.length - 1];
-      setHtml('lg-next', fmtSats(full ? full.sats : 0));
-      setText('lg-next-sub', 'block ' + q.next_block_height + ', counting credits to ' + q.snapshot_height);
-      setHtml('lg-classes', '<tbody>' + q.next_block.map(function (c) {
-        return '<tr>' +
-          '<td class="lb-rank">' + c.slot_class + '</td>' +
-          '<td class="py-miner">' + esc(SLOT_CLASS_HARDWARE[c.slot_class] || '') + '</td>' +
-          '<td class="py-shares">' + (c.in_oldest ? 'in the oldest ' + c.oldest_slots : (q.is_top ? 'top' : '—')) + '</td>' +
-          '<td class="py-sats">' + fmtSats(c.sats) + '</td>' +
-        '</tr>';
-      }).join('') + '</tbody>');
-    }
-
-    var paidTotal = d.payouts.reduce(function (s, p) { return s + p.sats; }, 0);
-    setHtml('lg-paid', fmtSats(paidTotal));
-    setText('lg-paid-sub', d.payouts.length + ' recent payout' + (d.payouts.length === 1 ? '' : 's'));
-    setHtml('lg-payouts', '<tbody>' + (d.payouts.length ? d.payouts.map(function (p) {
-      return '<tr>' +
-        '<td class="lb-rank">' + p.height + '</td>' +
-        '<td class="py-miner" title="' + esc(p.block_hash) + '">' + esc(shortHash(p.block_hash)) + '</td>' +
-        '<td class="py-shares">' + esc(p.status) +
-          (p.confirmations != null ? '<div class="py-shares-sub">' + p.confirmations + ' conf' + (p.mature ? ', spendable' : '') + '</div>' : '') +
-        '</td>' +
-        '<td class="py-sats">' + fmtSats(p.sats) + '</td>' +
-      '</tr>';
-    }).join('') : '<tr><td class="py-miner">No payouts yet.</td></tr>') + '</tbody>');
-
-    setHtml('lg-shares', '<tbody>' + (d.recent_shares.length ? d.recent_shares.map(function (s) {
-      return '<tr>' +
-        '<td class="lb-rank">' + s.job_height + '</td>' +
-        '<td class="py-miner" title="' + esc(s.share_id) + '">' + esc(shortHash(s.share_id)) + '<div class="py-shares-sub">tier ' + s.credited_tier + ' · ' + fmtTs(s.received_at) + '</div></td>' +
-        '<td class="py-sats">' + fmtSats(s.credit.sats) + '<div class="py-shares-sub">' + esc(s.credit.units) + ' units</div></td>' +
-      '</tr>';
-    }).join('') : '<tr><td class="py-miner">' + esc(d.message || 'No credited shares yet.') + '</td></tr>') + '</tbody>');
-
-    var s = d.settlement;
-    setText('lg-settlement', s.caught_up
-      ? 'Settlement is caught up to Bitcoin block ' + s.bitcoin_tip + '.'
-      : 'This node\'s settlement is still catching up (at ' + (s.synced_height == null ? '?' : s.synced_height) +
-        ' of ' + (s.bitcoin_tip == null ? '?' : s.bitcoin_tip) + '): recent payouts may be missing.');
-  }
-
-  // Firmware warnings for this address's connections to the node that answered.
-  function renderFirmware(st) {
-    var el = document.getElementById('lg-firmware');
-    var mine = (st.miners || []).filter(function (m) { return m.address === address; });
-    var warned = mine.filter(function (m) { return m.firmware_warning; });
-    if (!mine.length) { el.style.display = 'none'; return; }
-    el.style.display = 'block';
-    el.innerHTML = mine.map(function (m) {
-      var model = m.sensing && m.sensing.model ? m.sensing.model : (m.kind === 'standard' ? 'SV2 standard channel' : 'unknown model');
-      return '<div>Connected: ' + esc(model) + ', carrying ' + m.slot_class + ' miner outputs (' + esc(m.kind) + ' channel).</div>';
-    }).join('') + warned.map(function (m) {
-      return '<div style="color:var(--fg); margin-top:8px">⚠ ' + esc(m.firmware_warning) + '.</div>';
-    }).join('') + (warned.length ? '<div style="margin-top:8px">Your balance is not reduced by this; blocks this miner finds pay fewer balances, so the pool pays out more slowly. Firmware with room for a larger coinbase, or SV2 firmware, removes the limit.</div>' : '');
-  }
 </script>
+<script src="/miner.js?v=20261102b"></script>
 
 </body>
 </html>

@@ -96,7 +96,130 @@ pub struct NpAppliedBlock {
     pub retirements: Vec<Retirement>,
 }
 
+/// One change to a payee's balance, from the ledger journals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpPayeeLedgerEvent {
+    /// The event's order on this node's chain.
+    pub seq: i64,
+    /// A credit or a block.
+    pub kind: NpLedgerEventKind,
+    /// A credit's job height, or a block's height.
+    pub height: u32,
+    /// When this node applied it, unix seconds.
+    pub applied_at: i64,
+    /// Face units credited, or retired (positive either way).
+    pub amount: i128,
+    /// The balance just before it, face units.
+    pub prior_owed: i128,
+    /// The block, for a block.
+    pub block_hash: Option<[u8; 32]>,
+    /// The Bitcoin time of the event: a block's own header time, or for a credit at job height
+    /// `h` the header time of a block at `h - 1` (the tip it was mined on). `None` when this
+    /// node's archive has no such header.
+    pub chain_time: Option<u32>,
+}
+
+fn header_time(h: Option<Vec<u8>>) -> Option<u32> {
+    let h = h?;
+    let b: [u8; 4] = h.get(68..72)?.try_into().ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
 impl Database {
+    /// Every change to `script`'s balance at height `min_height` or above, in the order this
+    /// node applied them (at most `limit_n`, the newest kept). Credits come from `np_credits`,
+    /// blocks from `np_retirements`; both carry the balance they replaced, so the balance after
+    /// each event is exact.
+    pub fn np_payee_ledger_events(
+        &self,
+        script: &[u8],
+        min_height: u32,
+        limit_n: usize,
+    ) -> GhostResult<Vec<NpPayeeLedgerEvent>> {
+        type Row = (
+            i64,
+            i64,
+            i64,
+            i64,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
+        let rows: Vec<Row> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM ( \
+                       SELECT e.seq, e.kind, e.height, e.applied_at, c.amount, c.prior_owed, \
+                              NULL AS block_hash, \
+                              (SELECT header FROM np_btc_blocks WHERE height = e.height - 1 \
+                               LIMIT 1) AS header \
+                       FROM np_ledger_events e \
+                       JOIN np_credits c ON c.event_key = e.event_key \
+                       WHERE e.kind = 0 AND e.height >= ?2 AND c.script = ?1 \
+                       UNION ALL \
+                       SELECT e.seq, e.kind, e.height, e.applied_at, r.amount, r.prior_owed, \
+                              r.block_hash, \
+                              (SELECT header FROM np_btc_blocks WHERE hash = r.block_hash) \
+                       FROM np_ledger_events e \
+                       JOIN np_retirements r ON r.block_hash = e.event_key \
+                       WHERE e.kind = 1 AND e.height >= ?2 AND r.script = ?1 \
+                     ) ORDER BY seq DESC LIMIT ?3",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(
+                    params![script, i64::from(min_height), limit(limit_n)],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
+                    },
+                )
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err);
+            rows
+        })?;
+        let mut out = rows
+            .into_iter()
+            .map(|(seq, kind, h, at, amount, prior, block, header)| {
+                let kind = match kind {
+                    0 => NpLedgerEventKind::Credit,
+                    1 => NpLedgerEventKind::Block,
+                    k => {
+                        return Err(GhostError::Database(format!(
+                            "np ledger event kind {k} is unknown"
+                        )))
+                    }
+                };
+                Ok(NpPayeeLedgerEvent {
+                    seq,
+                    kind,
+                    height: u32_col(h, "np ledger event height")?,
+                    applied_at: at,
+                    amount: face_from_blob(&amount)?,
+                    prior_owed: prior
+                        .as_deref()
+                        .map(face_from_blob)
+                        .transpose()?
+                        .unwrap_or(0),
+                    block_hash: block.map(|b| blob32(b, "np block hash")).transpose()?,
+                    chain_time: header_time(header),
+                })
+            })
+            .collect::<GhostResult<Vec<_>>>()?;
+        out.reverse();
+        Ok(out)
+    }
+
     /// The latest `limit` batch memberships of shares paying `script`, newest batch first. A
     /// share carried by several batches (a losing anchor's, then the winner's) appears once per
     /// batch; only the batch whose credit event is applied credited it.
@@ -379,5 +502,80 @@ mod tests {
         db.np_undo_block(&[0xB2; 32]).unwrap();
         assert_eq!(db.np_payee_retirements(&payee(7), 10).unwrap().len(), 1);
         assert_eq!(db.np_recent_blocks(5).unwrap().len(), 1);
+    }
+
+    fn btc_block(db: &Database, height: u32, time: u32) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut header = [0u8; 80];
+        header[0] = 0x20;
+        header[36..40].copy_from_slice(&height.to_le_bytes());
+        header[68..72].copy_from_slice(&time.to_le_bytes());
+        let hash: [u8; 32] = Sha256::digest(Sha256::digest(header)).into();
+        db.np_put_btc_block(&crate::node_pool_store::NpBtcBlock {
+            hash,
+            height,
+            header,
+            coinbase: None,
+            received_at: 1,
+        })
+        .unwrap();
+        hash
+    }
+
+    #[test]
+    fn a_payees_ledger_events_carry_the_balance_before_each() {
+        let db = Database::in_memory().unwrap();
+        btc_block(&db, 509, 1_700_000_000);
+        let paid_block = btc_block(&db, 700, 1_700_100_000);
+        let mut deltas = BTreeMap::new();
+        deltas.insert(payee(7), 3_000 * FACE_PER_SAT);
+        deltas.insert(payee(8), 9 * FACE_PER_SAT);
+        db.np_apply_credits(&[0x31; 32], 510, &deltas, 300).unwrap();
+        let mut deltas = BTreeMap::new();
+        deltas.insert(payee(7), 500 * FACE_PER_SAT + 7);
+        db.np_apply_credits(&[0x32; 32], 520, &deltas, 310).unwrap();
+        db.np_apply_block(&paid_block, 700, &[(payee(7), 2_000 * FACE_PER_SAT)], 400)
+            .unwrap();
+
+        let ev = db.np_payee_ledger_events(&payee(7), 0, 100).unwrap();
+        assert_eq!(ev.len(), 3);
+        assert!(ev.windows(2).all(|w| w[0].seq < w[1].seq), "applied order");
+        assert_eq!(ev[0].kind, NpLedgerEventKind::Credit);
+        assert_eq!((ev[0].prior_owed, ev[0].amount), (0, 3_000 * FACE_PER_SAT));
+        assert_eq!(ev[0].chain_time, Some(1_700_000_000), "header of h - 1");
+        assert_eq!(ev[1].prior_owed, 3_000 * FACE_PER_SAT);
+        assert_eq!(ev[1].chain_time, None, "no header at 519");
+        assert_eq!(ev[2].kind, NpLedgerEventKind::Block);
+        assert_eq!(ev[2].prior_owed, 3_500 * FACE_PER_SAT + 7);
+        assert_eq!(ev[2].amount, 2_000 * FACE_PER_SAT);
+        assert_eq!(ev[2].block_hash, Some(paid_block));
+        assert_eq!(
+            ev[2].chain_time,
+            Some(1_700_100_000),
+            "the block's own header"
+        );
+        assert_eq!(ev[2].applied_at, 400);
+
+        // Height floor and the newest-kept limit.
+        assert_eq!(
+            db.np_payee_ledger_events(&payee(7), 515, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        let last = db.np_payee_ledger_events(&payee(7), 0, 1).unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].kind, NpLedgerEventKind::Block);
+        assert_eq!(
+            db.np_payee_ledger_events(&payee(8), 0, 100).unwrap().len(),
+            1
+        );
+
+        // A reorg undoes the block: its event goes with it.
+        db.np_undo_block(&paid_block).unwrap();
+        assert_eq!(
+            db.np_payee_ledger_events(&payee(7), 0, 100).unwrap().len(),
+            2
+        );
     }
 }
