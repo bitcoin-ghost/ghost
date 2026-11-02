@@ -8,7 +8,6 @@ import { StatusDot } from "@/components/ui/StatusDot";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { DataTable, formatDuration, truncateId } from "@/components/ui/DataTable";
 import { usePoolStatus, usePeers } from "@/hooks/queries";
-import { useMeshStatus } from "@/hooks/queries/useMeshQueries";
 import type { PeerInfo } from "@/types/api";
 import type { ColumnDef } from "@tanstack/react-table";
 
@@ -80,7 +79,6 @@ const peerColumns: ColumnDef<PeerInfo>[] = [
 export default function PeersPage() {
   const { data: pool, isLoading: poolLoading } = usePoolStatus();
   const { data: peersData, isLoading: peersLoading } = usePeers();
-  useMeshStatus(); // pre-fetch for mesh data
 
   const peers = peersData?.peers ?? [];
   const syncedPeers = peers.filter((p) => p.synced).length;

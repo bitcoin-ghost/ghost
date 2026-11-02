@@ -3,10 +3,6 @@ import { fetchApi } from './client';
 import type {
   PoolStatus,
   PeersResponse,
-  TreasuryStatus,
-  ElderStatus,
-  NetworkPayoutHistoryResponse,
-  PayoutHistoryTimeFilter,
 } from '@/types/api';
 
 export async function getPoolStatus(): Promise<PoolStatus> {
@@ -20,20 +16,4 @@ export async function getPeers(): Promise<PeersResponse> {
     data.total = data.peer_count;
   }
   return data;
-}
-
-export async function getTreasury(): Promise<TreasuryStatus> {
-  return fetchApi<TreasuryStatus>('/api/v1/network/treasury');
-}
-
-export async function getElderStatus(): Promise<ElderStatus> {
-  return fetchApi<ElderStatus>('/api/v1/network/elder');
-}
-
-export async function getNetworkPayoutHistory(
-  timeFilter: PayoutHistoryTimeFilter = '7d'
-): Promise<NetworkPayoutHistoryResponse> {
-  return fetchApi<NetworkPayoutHistoryResponse>(
-    `/api/v1/network/payout-history?time_filter=${timeFilter}`
-  );
 }

@@ -128,9 +128,8 @@ export default function ConnectPage() {
                   className="p-3 rounded-lg"
                   style={{ background: "var(--surface-2, rgba(120,120,120,0.08))", border: "1px solid var(--rule)" }}
                 >
-                  {/* This is the mesh/consensus node identity. It is NOT the Ghost ID, which is
-                      the node's L2 receive address from ghost-pay and lives in Settings. Labelling
-                      this one "Ghost ID" made two unrelated identifiers look interchangeable. */}
+                  {/* This is the mesh/consensus node identity. Labelling it "Ghost ID"
+                      made it look like an unrelated identifier. */}
                   <div className="text-xs uppercase tracking-wide mb-1" style={{ color: "var(--dim)" }}>
                     Node ID (mesh identity)
                   </div>

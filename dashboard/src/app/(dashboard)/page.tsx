@@ -3,12 +3,11 @@
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
-import { ProgressBar } from "@/components/ui/ProgressBar";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { useNodeInfo, useNodeStatus, useShares, useNickname } from "@/hooks/queries/useNodeQueries";
+import { useNodeInfo, useNodeStatus, useNickname } from "@/hooks/queries/useNodeQueries";
 import { useWatchdogStatus } from "@/hooks/queries/useWatchdogQueries";
 import { useMiningStatus, useBestHash } from "@/hooks/queries/useMiningQueries";
 import { useHazeStatus } from "@/hooks/queries/useHazeQueries";
@@ -21,21 +20,12 @@ const TOOLTIPS = {
   l1_hashrate: "Combined mining hashrate of miners connected to YOUR node's stratum port only. This is just your node, not the whole Ghost pool or the Bitcoin network.",
   pool_hashrate: "Combined mining hashrate of every miner across the entire Ghost pool — all nodes in the mesh aggregated together. This is the whole Ghost pool, not just your node or the Bitcoin network.",
   network_hashrate: "Estimated total hashrate of the Bitcoin network, derived from current difficulty. This is the global network, not just Ghost.",
-  shares: "Your node's share count determines your portion of the node reward pool. Based on the 5-4-3-2-1 system.",
   health: "Overall health of the services running on your node.",
   ghost_mode: "Ghost Mode isolates your node — stops relaying transactions and messages to peers (except block propagation). Useful for privacy.",
   privacy_tor: "Tor Mode routes all P2P connections through the Tor network, hiding your node's IP address from peers.",
   privacy_haze: "Ghost Haze strips privacy-sensitive data (signatures, witness data, inscriptions) from stored blocks.",
   privacy_shroud: "Ghost Shroud adds random delays before relaying transactions, protecting against timing analysis.",
 };
-
-const SHARE_TIERS = [
-  { key: "archive_mode", name: "Archive Mode", bonus: 5 },
-  { key: "ghost_pay", name: "Ghost Pay", bonus: 4 },
-  { key: "public_mining", name: "Public Mining", bonus: 3 },
-  { key: "reaper", name: "Reaper", bonus: 2 },
-  { key: "elder", name: "Elder Status", bonus: 1 },
-] as const;
 
 function InfoIcon() {
   return (
@@ -126,71 +116,6 @@ function L1Card() {
             {isLoading ? "..." : `${mining?.local_connected_miners ?? 0} connected`}
           </div>
         </div>
-      </div>
-    </Card>
-  );
-}
-
-function SharesSection() {
-  const { data: shares, isLoading } = useShares();
-
-  if (isLoading) return <SkeletonCard />;
-  if (!shares) return null;
-
-  const percent = shares.max_shares > 0 ? (shares.total / shares.max_shares) * 100 : 0;
-
-  return (
-    <Card>
-      <CardHeader
-        title="Your Shares"
-        subtitle="5-4-3-2-1 Reward System"
-        action={
-          <Tooltip content={TOOLTIPS.shares}>
-            <span className="text-2xl font-bold text-[color:var(--fg)] inline-flex items-center gap-1.5">
-              <InfoIcon />
-              {shares.total}<span className="text-[color:var(--fainter)] text-lg"> / {shares.max_shares}</span>
-            </span>
-          </Tooltip>
-        }
-      />
-
-      <ProgressBar
-        value={percent}
-        color={shares.uptime_qualified ? "orange" : "red"}
-        size="lg"
-        className="mb-4"
-      />
-
-      {/* Uptime gatekeeper */}
-      {!shares.uptime_qualified && (
-        <div className="mb-4 p-3 rounded-lg bg-[var(--surface)] border border-[color:var(--red)]">
-          <div className="flex items-center gap-2">
-            <span className="text-[color:var(--red)]">&#10007;</span>
-            <span className="text-sm text-[color:var(--dim)]">Uptime below 95%</span>
-            <Badge variant="error">{(shares.uptime_percent ?? 0).toFixed(1)}%</Badge>
-          </div>
-          <p className="text-xs text-[color:var(--red)] mt-1">All shares disabled until uptime recovers</p>
-        </div>
-      )}
-
-      <div className="space-y-1.5">
-        {SHARE_TIERS.map((tier) => {
-          const isActive = shares[tier.key as keyof typeof shares] as boolean;
-          const disabled = !shares.uptime_qualified;
-          return (
-            <div key={tier.key} className="flex items-center justify-between py-1.5 px-2 rounded hover:bg-[var(--surface)]">
-              <div className="flex items-center gap-2">
-                <span className={isActive && !disabled ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}>
-                  {isActive ? "\u2713" : "\u2717"}
-                </span>
-                <span className={isActive && !disabled ? "text-[color:var(--fg)] text-sm" : "text-[color:var(--fainter)] text-sm"}>
-                  {tier.name}
-                </span>
-              </div>
-              <Badge variant={isActive && !disabled ? "success" : "default"}>+{tier.bonus}</Badge>
-            </div>
-          );
-        })}
       </div>
     </Card>
   );
@@ -343,11 +268,6 @@ export default function OverviewPage() {
       {/* L1 hero card */}
       <SectionErrorBoundary section="L1 Status">
         <L1Card />
-      </SectionErrorBoundary>
-
-      {/* Shares */}
-      <SectionErrorBoundary section="Shares">
-        <SharesSection />
       </SectionErrorBoundary>
 
       {/* Health + Privacy */}

@@ -12,7 +12,6 @@ const INITIAL_RECONNECT_DELAY = 1000;
 interface UseWebSocketOptions {
   onStatusChange?: (data: NodeEvent & { type: "StatusChange" }) => void;
   onConfigChange?: (data: NodeEvent & { type: "ConfigChange" }) => void;
-  onSharesUpdate?: (data: NodeEvent & { type: "SharesUpdate" }) => void;
   onHealthChange?: (data: NodeEvent & { type: "HealthChange" }) => void;
   onMessage?: (event: NodeEvent) => void;
   autoReconnect?: boolean;
@@ -75,9 +74,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               break;
             case "ConfigChange":
               callbacksRef.current.onConfigChange?.(data as NodeEvent & { type: "ConfigChange" });
-              break;
-            case "SharesUpdate":
-              callbacksRef.current.onSharesUpdate?.(data as NodeEvent & { type: "SharesUpdate" });
               break;
             case "HealthChange":
               callbacksRef.current.onHealthChange?.(data as NodeEvent & { type: "HealthChange" });

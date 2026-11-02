@@ -6,7 +6,7 @@ import { useCallback, useSyncExternalStore } from 'react';
 // First-run onboarding completion flag
 // ---------------------------------------------------------------------------
 // The ghost-node API exposes only specific, typed config endpoints (archive
-// mode, public mining, reaper, mempool/template profiles, payout address …).
+// mode, reaper, mempool/template profiles …).
 // There is NO generic node-side key/value or dashboard-preferences endpoint we
 // could persist an `onboarding_complete` marker to without inventing a new
 // backend route — which is out of scope for a frontend change and would not be

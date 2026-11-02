@@ -316,7 +316,7 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
                 <div className="p-4 rounded-lg bg-[var(--red)]/20 border border-[var(--red)]">
                   <p className="text-sm text-[color:var(--red)]">
                     Stopping the node will disconnect all miners and peers. The node will not participate
-                    in consensus or earn rewards while stopped.
+                    in the pool while stopped.
                   </p>
                 </div>
               )}

@@ -22,7 +22,7 @@ export default function StoragePage() {
         eyebrow="storage"
         title="Storage & Pruning"
         subtitle="Block-storage pruning for this node — how much recent chain history to keep on disk."
-        actions={archiveMode ? <Badge variant="success">+5 Shares (Archive)</Badge> : undefined}
+        actions={archiveMode ? <Badge variant="success">Archive</Badge> : undefined}
       />
 
       {isLoading ? (

@@ -205,7 +205,7 @@ export function ReaperControls() {
               <div className="t-body" style={{ color: "var(--accent)", fontWeight: 500 }}>Reaper master switch</div>
               <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5", marginTop: "2px" }}>
                 When off, every detector is disabled on both the pool template reaper and the ghostd mempool
-                reaper. When on, the per-vector choices below apply. Running Reaper earns +2 capability shares.
+                reaper. When on, the per-vector choices below apply.
               </div>
             </div>
             <Toggle

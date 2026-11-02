@@ -8,13 +8,9 @@ import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useToast } from '@/components/ui/Toast';
-import { isMainnetBech32Address } from '@/lib/bitcoinAddress';
 import {
   useFullConfig,
   useSetNickname,
-  useSetPublicMiningConfig,
-  useSetMiningPayoutAddress,
-  useSetGhostMode,
   useSetArchiveMode,
   useSetReaper,
   useSetPolicyProfile,
@@ -23,9 +19,6 @@ import { toPolicyProfile } from '@/lib/api/config';
 
 interface ChangeSetupData {
   nickname: string;
-  public_mining: boolean;
-  payout_address: string;
-  ghost_mode: boolean;
   archive_mode: boolean;
   reaper: boolean;
   mempool_profile: string;
@@ -54,16 +47,9 @@ const MEMPOOL_PROFILES = [
   },
 ];
 
-// Ghost is Bitcoin MAINNET (#588). The old regex also accepted `tb1`/`bcrt1`, and its character
-// class was the base58 one applied case-insensitively, so it did not describe bech32 either.
-const isValidBech32 = isMainnetBech32Address;
-
 export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizardProps) {
   const { data: fullConfig, isLoading: configLoading } = useFullConfig();
   const setNickname = useSetNickname();
-  const setPublicMiningConfig = useSetPublicMiningConfig();
-  const setPayoutAddress = useSetMiningPayoutAddress();
-  const setGhostMode = useSetGhostMode();
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
   // The mempool step drives the REAL tier-policy lever (`/config/policy_profile`),
@@ -79,9 +65,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
     if (!fullConfig) {
       return {
         nickname: '',
-        public_mining: false,
-        payout_address: '',
-        ghost_mode: false,
         archive_mode: false,
         reaper: false,
         mempool_profile: 'standard',
@@ -89,9 +72,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
     }
     return {
       nickname: (fullConfig as Record<string, unknown>).nickname as string || '',
-      public_mining: fullConfig.public_mining ?? fullConfig.node?.public_mining ?? false,
-      payout_address: fullConfig.payout?.address || '',
-      ghost_mode: fullConfig.ghost_mode ?? fullConfig.node?.ghost_mode ?? false,
       archive_mode: fullConfig.archive_mode ?? fullConfig.node?.archive_mode ?? false,
       reaper: fullConfig.reaper ?? false,
       // Derive the coarse wizard choice from the REAL tier policy (only "strict"
@@ -122,23 +102,9 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
       },
     },
     {
-      id: 'mining',
-      title: 'Mining',
-      description: 'Update mining settings',
-      validate: (data) => {
-        if (data.public_mining && !data.payout_address.trim()) {
-          return 'Payout address is required when public mining is enabled';
-        }
-        if (data.payout_address.trim() && !isValidBech32(data.payout_address.trim())) {
-          return 'Please enter a valid mainnet bech32 Bitcoin address (starts with bc1)';
-        }
-        return null;
-      },
-    },
-    {
       id: 'modes',
       title: 'Modes',
-      description: 'Update node capabilities',
+      description: 'Update node settings',
     },
     {
       id: 'mempool',
@@ -161,20 +127,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
 
         if (data.nickname.trim() !== original.nickname) {
           await setNickname.mutateAsync(data.nickname.trim());
-          changeCount++;
-        }
-        if (data.public_mining !== original.public_mining) {
-          await setPublicMiningConfig.mutateAsync(data.public_mining);
-          changeCount++;
-        }
-        if (data.payout_address.trim() !== original.payout_address) {
-          if (data.payout_address.trim()) {
-            await setPayoutAddress.mutateAsync(data.payout_address.trim());
-            changeCount++;
-          }
-        }
-        if (data.ghost_mode !== original.ghost_mode) {
-          await setGhostMode.mutateAsync(data.ghost_mode);
           changeCount++;
         }
         if (data.archive_mode !== original.archive_mode) {
@@ -202,8 +154,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
       },
     },
   ], [
-    configLoading, setNickname, setPublicMiningConfig, setPayoutAddress,
-    setGhostMode, setArchiveMode, setReaper,
+    configLoading, setNickname, setArchiveMode, setReaper,
     setPolicyProfile, toast, onClose,
   ]);
 
@@ -236,21 +187,13 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
 
   const NODE_MODES = [
     {
-      key: 'ghost_mode' as const,
-      label: 'Ghost Mode',
-      shares: null,
-      description: 'Enable Ghost protocol features, L2 participation, and node reward eligibility.',
-    },
-    {
       key: 'archive_mode' as const,
       label: 'Archive Mode',
-      shares: '+5 shares',
-      description: 'Store full blockchain history. Enables archive challenges and earns the highest share bonus.',
+      description: 'Store full blockchain history (disables pruning).',
     },
     {
       key: 'reaper' as const,
       label: 'Reaper',
-      shares: '+2 shares',
       description: 'Strict transaction policy filtering. Only accept standard Bitcoin transactions.',
     },
   ];
@@ -304,18 +247,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                         <span className="text-[color:var(--fg)]">{currentConfig.nickname || '--'}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--dim)]">Ghost Mode</span>
-                        <Badge variant={currentConfig.ghost_mode ? 'success' : 'default'}>
-                          {currentConfig.ghost_mode ? 'On' : 'Off'}
-                        </Badge>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--dim)]">Public Mining</span>
-                        <Badge variant={currentConfig.public_mining ? 'success' : 'default'}>
-                          {currentConfig.public_mining ? 'On' : 'Off'}
-                        </Badge>
-                      </div>
-                      <div className="flex items-center justify-between">
                         <span className="text-[color:var(--dim)]">Mempool Profile</span>
                         <Badge variant="warning">{currentConfig.mempool_profile}</Badge>
                       </div>
@@ -357,52 +288,8 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
             </div>
           )}
 
-          {/* Step 2: Mining */}
+          {/* Step 2: Node Modes */}
           {wizard.currentStep === 2 && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="text-[color:var(--fg)] font-medium">Public Mining</span>
-                    <p className="text-sm text-[color:var(--dim)] mt-1">
-                      Open your Stratum port to external miners. Earns +3 shares.
-                    </p>
-                  </div>
-                  <Toggle
-                    enabled={data.public_mining}
-                    onChange={(enabled) => setData({ public_mining: enabled })}
-                    label="Public Mining"
-                  />
-                </div>
-                {hasChanged('public_mining') && (
-                  <div className="mt-2">
-                    <Badge variant="warning">Changed</Badge>
-                  </div>
-                )}
-              </div>
-              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <Input
-                  label="Mining Payout Address"
-                  type="text"
-                  placeholder="bc1q..."
-                  value={data.payout_address}
-                  onChange={(e) => setData({ payout_address: e.target.value })}
-                  helperText="Bitcoin address for receiving mining payouts. Must be bech32 (bc1...)."
-                />
-                {hasChanged('payout_address') && (
-                  <div className="mt-2 flex items-center gap-2">
-                    <Badge variant="warning">Changed</Badge>
-                    <span className="text-xs text-[color:var(--dim)] truncate max-w-[150px]">
-                      from &quot;{original?.payout_address || '--'}&quot;
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Step 3: Node Modes */}
-          {wizard.currentStep === 3 && (
             <div className="space-y-3">
               {NODE_MODES.map((mode) => (
                 <div key={mode.key} className="p-4 rounded-lg bg-[var(--surface)]/50">
@@ -410,9 +297,6 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                     <div className="flex-1 mr-4">
                       <div className="flex items-center gap-2">
                         <span className="text-[color:var(--fg)] font-medium">{mode.label}</span>
-                        {mode.shares && (
-                          <Badge variant="info">{mode.shares}</Badge>
-                        )}
                         {hasChanged(mode.key) && (
                           <Badge variant="warning">Changed</Badge>
                         )}
@@ -430,8 +314,8 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
             </div>
           )}
 
-          {/* Step 4: Mempool Profile */}
-          {wizard.currentStep === 4 && (
+          {/* Step 3: Mempool Profile */}
+          {wizard.currentStep === 3 && (
             <div className="space-y-3">
               {MEMPOOL_PROFILES.map((profile) => (
                 <button
@@ -462,22 +346,13 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
             </div>
           )}
 
-          {/* Step 5: Confirm */}
-          {wizard.currentStep === 5 && (
+          {/* Step 4: Confirm */}
+          {wizard.currentStep === 4 && (
             <div className="space-y-4">
               {(() => {
                 const changes: { label: string; from: string; to: string }[] = [];
                 if (hasChanged('nickname')) {
                   changes.push({ label: 'Nickname', from: original?.nickname || '--', to: data.nickname });
-                }
-                if (hasChanged('public_mining')) {
-                  changes.push({ label: 'Public Mining', from: original?.public_mining ? 'Enabled' : 'Disabled', to: data.public_mining ? 'Enabled' : 'Disabled' });
-                }
-                if (hasChanged('payout_address')) {
-                  changes.push({ label: 'Payout Address', from: original?.payout_address || '--', to: data.payout_address || '--' });
-                }
-                if (hasChanged('ghost_mode')) {
-                  changes.push({ label: 'Ghost Mode', from: original?.ghost_mode ? 'Enabled' : 'Disabled', to: data.ghost_mode ? 'Enabled' : 'Disabled' });
                 }
                 if (hasChanged('archive_mode')) {
                   changes.push({ label: 'Archive Mode', from: original?.archive_mode ? 'Enabled' : 'Disabled', to: data.archive_mode ? 'Enabled' : 'Disabled' });

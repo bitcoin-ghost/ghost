@@ -15,9 +15,7 @@ export interface NodeInfo {
   is_synced?: boolean;
   peer_count?: number;
   miner_count?: number;
-  capabilities?: Record<string, unknown>;
   archive_mode?: boolean;
-  ghost_pay?: boolean;
   public_mining?: boolean;
   reaper?: boolean;
   mempool_profile?: string;
@@ -42,9 +40,7 @@ export interface NodeStatus {
   onion_address?: string;
   archive_mode?: boolean;
   public_mining?: boolean;
-  private_mining?: boolean;
   reaper?: boolean;
-  ghost_pay?: boolean;
 }
 
 // Chain & sync status, sourced from ghostd `getblockchaininfo`
@@ -75,7 +71,6 @@ export interface NodeConfig {
   archive_mode?: boolean;
   reaper?: boolean;
   public_mining?: boolean;
-  ghost_pay?: boolean;
 }
 
 // Pruning configuration — the VW/OW/AW three-window model. Pruning is
@@ -100,10 +95,8 @@ export interface FullNodeConfig {
     ghost_mode: boolean;
     ghost_mode_local_egress?: boolean;
     archive_mode: boolean;
-    public_mining: boolean;
   };
   mining?: {
-    private_mining: boolean;
     stratum_v1_port: number;
     stratum_v2_port: number;
     max_miners: number;
@@ -136,11 +129,6 @@ export interface FullNodeConfig {
       min_fee_rate: number;
     };
   };
-  payout?: {
-    address: string | null;
-    min_payout: number;
-    auto_payout: boolean;
-  };
   // Block-priority lever from pool.toml [pool].block_priority. Governs template
   // ORDERING: `max_fee` (default, revenue) or `payments_first` (seat BUDS
   // financial txs ahead of data txs). Permutation only — weight-safe.
@@ -152,39 +140,8 @@ export interface FullNodeConfig {
   ghost_mode?: boolean;
   ghost_mode_local_egress?: boolean;
   archive_mode?: boolean;
-  public_mining?: boolean;
   reaper?: boolean;
-  ghost_pay?: boolean;
-  elder?: boolean;
   [key: string]: unknown;
-}
-
-export interface SharesInfo {
-  total: number;
-  max_shares: number;
-  uptime_percent?: number;
-  uptime_qualified?: boolean;
-  // 5-4-3-2-1 Share Model
-  archive_mode?: boolean;      // +5
-  ghost_pay?: boolean;         // +4
-  public_mining?: boolean;     // +3
-  reaper?: boolean;      // +2
-  elder?: boolean;             // +1
-  elder_slot?: number | null;
-  estimated_reward_btc?: number | null;
-}
-
-// VERIFIED node capabilities as reported by /health. Unlike the CLAIMED
-// capabilities on /api/v1/node/shares, these reflect what the node has actually
-// proved via challenge-response and is therefore paid for (5-4-3-2-1 model).
-export interface HealthCapabilities {
-  archive_mode?: boolean;   // +5
-  ghost_pay?: boolean;      // +4
-  public_mining?: boolean;  // +3
-  reaper?: boolean;         // +2
-  elder_status?: boolean;   // +1
-  gsp_enabled?: boolean;
-  total_shares?: number;
 }
 
 export interface HealthStatus {
@@ -198,14 +155,12 @@ export interface HealthStatus {
   round_id?: number;
   node_id?: string;
   version?: string;
-  capabilities?: HealthCapabilities;
 }
 
 // WebSocket event types
 export type NodeEvent =
   | { type: "StatusChange"; data: NodeStatusSnapshot }
   | { type: "ConfigChange"; data: { key: string; value: string } }
-  | { type: "SharesUpdate"; data: SharesInfo }
   | { type: "HealthChange"; data: { healthy: boolean; message: string } };
 
 export interface NodeStatusSnapshot {
@@ -226,12 +181,10 @@ export interface MiningStatus {
   active?: boolean;
   miner_count?: number;
   total_hashrate?: number;
-  shares_this_round?: number;
   difficulty?: number;
   best_hash?: string | null;
   // Dashboard-compatible aliases (added to backend)
   enabled?: boolean;
-  private_mining?: boolean;
   public_mining?: boolean;
   hashrate_th?: number;
   local_hashrate_th?: number;
@@ -246,7 +199,6 @@ export interface MiningStatus {
   stratum_v2_port?: number;
   stratum_v1_endpoint?: string;
   stratum_v2_endpoint?: string;
-  payout_address?: string | null;
   pool_name?: string | null;
   block_height?: number;
   sync_height?: number;
@@ -371,8 +323,6 @@ export interface MeshLeaderboardNode {
   name: string;
   hashrate_th: number;
   miner_count: number;
-  shares: number;
-  elder: boolean;
   healthy: boolean;
   is_self: boolean;
 }
@@ -418,48 +368,6 @@ export interface BestHashResponse {
   chain?: string;
 }
 
-// Rewards types
-export interface RewardsCurrent {
-  // Backend fields
-  round_id?: number;
-  block_height?: number;
-  pending_rewards_sats?: number;
-  total_earned_sats?: number;
-  last_credited_round?: number;
-  estimated_share?: number;
-  node_shares?: number;
-  total_network_shares?: number;
-  // Dashboard-compatible aliases
-  estimated_reward_btc?: number;
-  current_round_shares?: number;
-  pool_hashrate_ph?: number;
-  estimated_time_to_payout_hours?: number;
-}
-
-export interface PayoutRecord {
-  // Backend fields
-  round_id?: number;
-  amount_sats?: number;
-  status?: string;
-  created_at?: number;
-  // Dashboard fields
-  txid?: string;
-  amount_btc: number;
-  timestamp: number;
-  block_height?: number;
-  payout_type: string;
-}
-
-export interface RewardsHistory {
-  // Backend returns
-  rewards?: PayoutRecord[];
-  total_rewards?: number;
-  total_earned_sats?: number;
-  // Dashboard aliases
-  total_earned_btc?: number;
-  payouts?: PayoutRecord[];
-}
-
 // Network types
 export interface PoolStatus {
   // Backend fields
@@ -470,7 +378,6 @@ export interface PoolStatus {
   miner_count?: number;
   round_id?: number;
   uptime_secs?: number;
-  total_shares?: number;
   // Dashboard aliases
   connected?: boolean;
   pool_hashrate_ph?: number;
@@ -495,49 +402,6 @@ export interface PeerInfo {
 export interface PeersResponse {
   total: number;
   peers: PeerInfo[];
-}
-
-export interface TreasuryStatus {
-  // Backend fields
-  treasury_address?: string;
-  treasury_balance_sats?: number;
-  fee_percent?: number;
-  total_fees_collected?: number;
-  total_payouts?: number;
-  // Shared fields
-  phase?: "bootstrap" | "decay" | "ossified" | string;
-  decay_started?: boolean;
-  accumulated_btc?: number;
-  target_btc?: number;
-  progress_percent?: number;
-  treasury_percent?: number;
-  node_pool_percent?: number;
-  // Dashboard aliases
-  decay_year?: number | null;
-  decay_rate?: number | null;
-  blocks_until_full?: number | null;
-}
-
-export interface ElderStatus {
-  // Backend fields
-  elders?: Array<{
-    node_id: string;
-    display_name: string;
-    elder_order: number;
-    first_seen: number;
-    last_seen: number;
-    is_self: boolean;
-  }>;
-  total_elders?: number;
-  max_elders?: number;
-  spots_remaining?: number;
-  // Shared
-  is_elder?: boolean;
-  elder_slot?: number | null;
-  active_elders?: number;
-  registered_at?: number | null;
-  downtime_warning?: boolean;
-  consecutive_downtime_days?: number;
 }
 
 // Logs types
@@ -588,24 +452,13 @@ export interface SwarmNode {
   // "offline" merely because its dashboard API is unreachable); "manual" (or
   // undefined) = an operator-added node polled via its own dashboard API.
   source?: "mesh" | "manual";
-  // Capability fields
-  shares?: number;
-  max_shares?: number;
   uptime_percent?: number;
   peer_count?: number;
-  balance_btc?: number;
   l1_height?: number;
   miner_count?: number;
-  archive_mode?: boolean;
-  ghost_pay?: boolean;
-  public_mining?: boolean;
-  reaper?: boolean;
-  elder?: boolean;
-  elder_slot?: number | null;
   hashrate_th?: number;
   watchdog_health?: string;
   watchdog_errors?: number;
-  capabilities?: Record<string, unknown>;
 }
 
 export interface SwarmAlert {
@@ -620,9 +473,6 @@ export interface SwarmStats {
   total_nodes?: number;
   online_nodes?: number;
   offline_nodes?: number;
-  combined_shares?: number;
-  max_combined_shares?: number;
-  total_balance_btc?: number;
   avg_uptime_percent?: number;
   combined_hashrate_th?: number;
 }
@@ -693,62 +543,6 @@ export interface BackupHistoryResponse {
   backup_dir?: string;
 }
 
-// Enhanced Rewards types
-export interface EarningsSummary {
-  total_earned_all_time?: number;
-  pending_btc?: number;
-  earned_this_month?: number;
-  earned_this_week?: number;
-  earned_today?: number;
-  daily_average?: number;
-}
-
-export interface EarningsProjection {
-  daily?: number;
-  weekly?: number;
-  monthly?: number;
-  yearly?: number;
-  daily_with_all_shares?: number;
-  potential_increase_percent?: number;
-}
-
-export interface ShareContribution {
-  tier?: string;
-  bonus?: number;
-  enabled?: boolean;
-  contribution_percent?: number | null;
-}
-
-export interface RewardsFullResponse {
-  // Backend fields
-  round_id?: number;
-  block_height?: number;
-  node_shares?: number;
-  total_network_shares?: number;
-  estimated_reward_sats?: number;
-  lifetime_rewards_sats?: number;
-  pending_rewards_sats?: number;
-  total_withdrawals_sats?: number;
-  last_credited_round?: number;
-  last_payout?: Record<string, unknown> | null;
-  rewards_history?: PayoutRecord[];
-  capabilities?: Record<string, boolean>;
-  // Dashboard aliases
-  summary?: EarningsSummary;
-  shares?: SharesInfo;
-  share_contributions?: ShareContribution[];
-  network_total_shares?: number;
-  your_share_of_pool_percent?: number;
-  projections?: EarningsProjection;
-  payouts?: PayoutRecord[];
-  daily_earnings?: DailyEarning[];
-}
-
-export interface DailyEarning {
-  date: string;
-  amount_btc: number;
-}
-
 // Watchdog types (defined here instead of re-exporting)
 export interface ComponentHealth {
   name: string;
@@ -779,68 +573,6 @@ export interface WatchdogStatus {
   overall_health?: 'healthy' | 'degraded' | 'unhealthy' | string;
   healthy?: boolean;
   uptime_secs?: number;
-}
-
-// ============================================================================
-// Payout History Types (for transparency)
-// ============================================================================
-
-export type PayoutHistoryTimeFilter = "24h" | "7d" | "all";
-
-export interface NetworkPayoutEntry {
-  // Backend fields
-  round_id?: number;
-  recipient_id?: string;
-  recipient_type?: string;
-  amount_sats?: number;
-  address?: string | null;
-  txid?: string | null;
-  status?: string;
-  created_at?: number;
-  // Dashboard fields
-  block_height?: number;
-  block_hash?: string | null;
-  timestamp?: number;
-  entry_type?: string;
-  amount_satoshis?: number;
-  recipient_address?: string | null;
-  recipient_node_id?: string | null;
-}
-
-export interface NetworkPayoutSummary {
-  total_treasury_satoshis: number;
-  total_node_rewards_satoshis: number;
-  total_miner_rewards_satoshis: number;
-  blocks_in_period: number;
-}
-
-export interface NetworkPayoutHistoryResponse {
-  // Backend returns
-  payouts?: NetworkPayoutEntry[];
-  total?: number;
-  // Dashboard aliases
-  entries?: NetworkPayoutEntry[];
-  summary?: NetworkPayoutSummary;
-}
-
-export interface NodePayoutEntry {
-  // Backend fields
-  node_id?: string;
-  balance_sats?: number;
-  last_credited_round?: number;
-  total_credits_sats?: number;
-  total_withdrawals_sats?: number;
-  is_self?: boolean;
-  created_at?: number;
-  updated_at?: number;
-  // Dashboard fields
-  block_height?: number;
-  block_hash?: string | null;
-  timestamp?: number;
-  payout_type?: string;
-  amount_satoshis?: number;
-  share_count?: number | null;
-  share_percentage?: number | null;
 }
 
 // Ghost Haze — storage privacy status from Ghost Core

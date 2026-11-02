@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMiningStatus, getMiningTemplate, getMiningCoinbase, getMiners, getBestHash, setPrivateMining, setPublicMining, setPayoutAddress, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
+import { useQuery } from '@tanstack/react-query';
+import { getMiningStatus, getMiningTemplate, getMiningCoinbase, getMiners, getBestHash, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
 
 export const miningKeys = {
   all: ['mining'] as const,
@@ -69,41 +69,5 @@ export function useBestHash(options?: { refetchInterval?: number }) {
     queryKey: miningKeys.bestHash(),
     queryFn: getBestHash,
     refetchInterval: options?.refetchInterval ?? 10_000, // Poll every 10 seconds
-  });
-}
-
-export function useSetPrivateMining() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (enabled: boolean) => setPrivateMining(enabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: miningKeys.status() });
-    },
-  });
-}
-
-export function useSetPublicMining() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (enabled: boolean) => setPublicMining(enabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: miningKeys.status() });
-      // Also invalidate node status since public_mining is part of it
-      queryClient.invalidateQueries({ queryKey: ['node', 'status'] });
-      queryClient.invalidateQueries({ queryKey: ['config'] });
-    },
-  });
-}
-
-export function useSetPayoutAddress() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (address: string | null) => setPayoutAddress(address),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: miningKeys.status() });
-    },
   });
 }

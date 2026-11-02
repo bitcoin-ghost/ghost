@@ -92,8 +92,8 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
                   </Badge>
                 </div>
                 <p className="text-sm text-[color:var(--dim)] mt-1">
-                  Ghost Mode enables Ghost protocol features including L2 participation,
-                  privacy tools, and node reward eligibility.
+                  Ghost Mode suppresses unconfirmed-transaction relay. Pool nodes refuse to enable
+                  it (it would forfeit all fee income); disabling it is always allowed.
                 </p>
               </div>
               <div className="p-4 rounded-lg bg-[var(--surface)]/50">
@@ -102,18 +102,6 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
                   <li className="flex items-center gap-2">
                     <span className="text-[color:var(--accent)]">--</span>
                     Signals your node as a Ghost protocol participant
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-[color:var(--accent)]">--</span>
-                    Enables node capability verification eligibility
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-[color:var(--accent)]">--</span>
-                    Individual capabilities (Ghost Pay, Archive, etc.) are configured separately
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-[color:var(--accent)]">--</span>
-                    Does not grant shares on its own — shares come from verified capabilities
                   </li>
                 </ul>
               </div>
@@ -140,15 +128,14 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
               {data.enabled && (
                 <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
                   <p className="text-sm text-[color:var(--green)]">
-                    Your node will join the Ghost network and become eligible for node rewards.
+                    Your node will stop relaying unconfirmed transactions. Pool nodes refuse this.
                   </p>
                 </div>
               )}
               {!data.enabled && (
                 <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
                   <p className="text-sm text-[color:var(--accent)]">
-                    Disabling Ghost Mode will disconnect your node from the Ghost network.
-                    You will no longer earn node rewards or participate in L2 services.
+                    Disabling Ghost Mode resumes standard transaction relay.
                   </p>
                 </div>
               )}

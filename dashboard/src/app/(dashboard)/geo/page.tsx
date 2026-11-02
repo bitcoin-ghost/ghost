@@ -199,7 +199,6 @@ export default function GeoPage() {
                   <tr style={{ textAlign: "left", color: "var(--dim)" }}>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Address</th>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Country</th>
-                    <th style={{ padding: "8px 10px", fontWeight: 500 }}>Role</th>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Status</th>
                   </tr>
                 </thead>
@@ -231,13 +230,6 @@ export default function GeoPage() {
                           )}
                           {!r.geo.plottable && (
                             <span className="t-caption" style={{ marginLeft: 8, color: "var(--fainter)" }}>not plotted</span>
-                          )}
-                        </td>
-                        <td style={{ padding: "8px 10px", color: "var(--dim)" }}>
-                          {r.node.elder ? (
-                            <span style={{ color: "var(--accent)" }}>Elder</span>
-                          ) : (
-                            "Node"
                           )}
                         </td>
                         <td style={{ padding: "8px 10px" }}>

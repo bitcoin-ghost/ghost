@@ -13,9 +13,6 @@ export * from './useConfigQueries';
 // Alerts queries
 export * from './useAlertsQueries';
 
-// Rewards queries
-export * from './useRewardsQueries';
-
 // Swarm queries
 export * from './useSwarmQueries';
 
@@ -57,9 +54,6 @@ export * from './useReaperQueries';
 
 // Filtering-activity queries
 export * from './useFilteringQueries';
-
-// Capability self-check queries
-export * from './useSelfCheckQueries';
 
 // Geo (offline GeoIP database) queries
 export * from './useGeoQueries';

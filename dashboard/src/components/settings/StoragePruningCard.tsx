@@ -156,10 +156,10 @@ export function StoragePruningCard() {
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-[color:var(--fg)] font-medium">Archive Mode</span>
-                {archiveMode && <Badge variant="success">+5 Shares</Badge>}
+                {archiveMode && <Badge variant="success">On</Badge>}
               </div>
               <p className="text-sm text-[color:var(--dim)] mt-1">
-                Store complete blockchain history. Disables all pruning and earns bonus shares.
+                Store complete blockchain history. Disables all pruning.
               </p>
             </div>
             <Button
@@ -241,7 +241,7 @@ export function StoragePruningCard() {
               {archiveMode ? "All history retained" : "Data beyond OW is deleted"}
             </div>
             <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
-              {archiveMode ? "Full chain storage enabled" : "Enable Archive Mode for +5 shares"}
+              {archiveMode ? "Full chain storage enabled" : "Enable Archive Mode to keep full history"}
             </div>
           </div>
         </div>

@@ -7,12 +7,8 @@ import { Input } from '@/components/ui/Input';
 import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-import { isMainnetBech32Address } from '@/lib/bitcoinAddress';
 import {
   useSetNickname,
-  useSetPublicMiningConfig,
-  useSetMiningPayoutAddress,
-  useSetGhostMode,
   useSetArchiveMode,
   useSetReaper,
   useSetPolicyProfile,
@@ -21,9 +17,6 @@ import { toPolicyProfile } from '@/lib/api/config';
 
 interface InitialSetupData {
   nickname: string;
-  public_mining: boolean;
-  payout_address: string;
-  ghost_mode: boolean;
   archive_mode: boolean;
   reaper: boolean;
   mempool_profile: string;
@@ -52,14 +45,8 @@ const MEMPOOL_PROFILES = [
   },
 ];
 
-// Ghost is Bitcoin MAINNET (#588). Previously accepted `tb1`/`bcrt1` as well.
-const isValidBech32 = isMainnetBech32Address;
-
 export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWizardProps) {
   const setNickname = useSetNickname();
-  const setPublicMiningConfig = useSetPublicMiningConfig();
-  const setPayoutAddress = useSetMiningPayoutAddress();
-  const setGhostMode = useSetGhostMode();
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
   // The mempool step drives the REAL tier-policy lever (`/config/policy_profile`),
@@ -85,23 +72,9 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
       },
     },
     {
-      id: 'mining',
-      title: 'Mining',
-      description: 'Configure mining settings',
-      validate: (data) => {
-        if (data.public_mining && !data.payout_address.trim()) {
-          return 'Payout address is required when public mining is enabled';
-        }
-        if (data.payout_address.trim() && !isValidBech32(data.payout_address.trim())) {
-          return 'Please enter a valid mainnet bech32 Bitcoin address (starts with bc1)';
-        }
-        return null;
-      },
-    },
-    {
       id: 'modes',
       title: 'Modes',
-      description: 'Enable node capabilities',
+      description: 'Choose node settings',
     },
     {
       id: 'mempool',
@@ -119,11 +92,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
       onSubmit: async (data) => {
         // Fire all config mutations sequentially
         await setNickname.mutateAsync(data.nickname.trim());
-        await setPublicMiningConfig.mutateAsync(data.public_mining);
-        if (data.payout_address.trim()) {
-          await setPayoutAddress.mutateAsync(data.payout_address.trim());
-        }
-        await setGhostMode.mutateAsync(data.ghost_mode);
         await setArchiveMode.mutateAsync(data.archive_mode);
         await setReaper.mutateAsync(data.reaper);
         await setPolicyProfile.mutateAsync(toPolicyProfile(data.mempool_profile));
@@ -135,19 +103,14 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
       },
     },
   ], [
-    setNickname, setPublicMiningConfig, setPayoutAddress,
-    setGhostMode, setArchiveMode, setReaper,
+    setNickname, setArchiveMode, setReaper,
     setPolicyProfile, toast, onClose,
   ]);
 
   const wizard = useWizard<InitialSetupData>({
     steps,
-    // Default: Max Privacy/Shares (15/15) — all capabilities enabled
     initialData: {
       nickname: '',
-      public_mining: true,
-      payout_address: '',
-      ghost_mode: true,
       archive_mode: true,
       reaper: true,
       mempool_profile: 'standard',
@@ -156,21 +119,13 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
 
   const NODE_MODES = [
     {
-      key: 'ghost_mode' as const,
-      label: 'Ghost Mode',
-      shares: null,
-      description: 'Enable Ghost protocol features and node reward eligibility. Required for most other features.',
-    },
-    {
       key: 'archive_mode' as const,
       label: 'Archive Mode',
-      shares: '+5 shares',
-      description: 'Store full blockchain history. Enables archive challenges and earns the highest share bonus.',
+      description: 'Store full blockchain history (disables pruning).',
     },
     {
       key: 'reaper' as const,
       label: 'Reaper',
-      shares: '+2 shares',
       description: 'Strict transaction policy filtering. Only accept standard Bitcoin transactions.',
     },
   ];
@@ -192,18 +147,9 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                 <h4 className="text-[color:var(--fg)] font-medium mb-2">Welcome to Ghost Pool</h4>
                 <p className="text-sm text-[color:var(--dim)]">
                   This wizard will guide you through the initial configuration of your Ghost node.
-                  All capabilities are enabled by default for maximum privacy and shares (15/15).
-                  You can disable anything you don&apos;t need.
+                  Archive Mode and Reaper are enabled by default. You can disable anything you
+                  don&apos;t need.
                 </p>
-                <div className="mt-3 text-sm text-[color:var(--fainter)]">
-                  <p className="font-medium text-[color:var(--dim)] mb-1">Share breakdown:</p>
-                  <ul className="space-y-1 ml-2">
-                    <li>Archive Mode: +5 shares</li>
-                    <li>Public Mining: +3 shares</li>
-                    <li>Reaper: +2 shares</li>
-                    <li>Elder: +1 share (automatic via MPC ceremony)</li>
-                  </ul>
-                </div>
               </div>
               <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <h4 className="text-[color:var(--fg)] font-medium mb-2">What we will set up</h4>
@@ -214,14 +160,10 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   </li>
                   <li className="flex items-center gap-2">
                     <span className="text-[color:var(--accent)]">2.</span>
-                    Mining configuration and payout address
+                    Node settings (Archive Mode, Reaper)
                   </li>
                   <li className="flex items-center gap-2">
                     <span className="text-[color:var(--accent)]">3.</span>
-                    Node capabilities (Ghost Mode, Archive, Pure, Pay)
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-[color:var(--accent)]">4.</span>
                     Mempool transaction policy
                   </li>
                 </ul>
@@ -257,47 +199,8 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
             </div>
           )}
 
-          {/* Step 2: Mining */}
+          {/* Step 2: Node Modes */}
           {wizard.currentStep === 2 && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="text-[color:var(--fg)] font-medium">Public Mining</span>
-                    <p className="text-sm text-[color:var(--dim)] mt-1">
-                      Open your Stratum port to external miners. Earns +3 shares in the node reward pool.
-                    </p>
-                  </div>
-                  <Toggle
-                    enabled={data.public_mining}
-                    onChange={(enabled) => setData({ public_mining: enabled })}
-                    label="Public Mining"
-                  />
-                </div>
-              </div>
-              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <Input
-                  label="Mining Payout Address"
-                  type="text"
-                  placeholder="bc1q..."
-                  value={data.payout_address}
-                  onChange={(e) => setData({ payout_address: e.target.value })}
-                  helperText="Bitcoin address for receiving mining payouts. Must be a bech32 address (bc1...). Required if public mining is enabled."
-                />
-              </div>
-              {data.public_mining && !data.payout_address && (
-                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
-                  <p className="text-sm text-[color:var(--accent)]">
-                    A payout address is required for public mining. Miners connecting to your pool
-                    will contribute shares to this address.
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Step 3: Node Modes */}
-          {wizard.currentStep === 3 && (
             <div className="space-y-3">
               {NODE_MODES.map((mode) => (
                 <div key={mode.key} className="p-4 rounded-lg bg-[var(--surface)]/50">
@@ -305,9 +208,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                     <div className="flex-1 mr-4">
                       <div className="flex items-center gap-2">
                         <span className="text-[color:var(--fg)] font-medium">{mode.label}</span>
-                        {mode.shares && (
-                          <Badge variant="info">{mode.shares}</Badge>
-                        )}
                       </div>
                       <p className="text-sm text-[color:var(--dim)] mt-1">{mode.description}</p>
                     </div>
@@ -319,17 +219,11 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   </div>
                 </div>
               ))}
-              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <p className="text-sm text-[color:var(--dim)]">
-                  Capabilities are verified by the network through challenge-response checks.
-                  Earning share bonuses requires passing verification with 95% accuracy over 7 days.
-                </p>
-              </div>
             </div>
           )}
 
-          {/* Step 4: Mempool Profile */}
-          {wizard.currentStep === 4 && (
+          {/* Step 3: Mempool Profile */}
+          {wizard.currentStep === 3 && (
             <div className="space-y-3">
               {MEMPOOL_PROFILES.map((profile) => (
                 <button
@@ -355,8 +249,8 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
             </div>
           )}
 
-          {/* Step 5: Confirm */}
-          {wizard.currentStep === 5 && (
+          {/* Step 4: Confirm */}
+          {wizard.currentStep === 4 && (
             <div className="space-y-4">
               <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <h4 className="text-[color:var(--fg)] font-medium mb-3">Setup Summary</h4>
@@ -365,39 +259,19 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                     <span className="text-[color:var(--dim)]">Nickname</span>
                     <span className="text-[color:var(--fg)] font-medium">{data.nickname || '--'}</span>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Public Mining</span>
-                    <Badge variant={data.public_mining ? 'success' : 'default'}>
-                      {data.public_mining ? 'Enabled' : 'Disabled'}
-                    </Badge>
-                  </div>
-                  {data.payout_address && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-[color:var(--dim)]">Payout Address</span>
-                      <span className="text-[color:var(--fg)] text-sm font-mono truncate max-w-[200px]">
-                        {data.payout_address}
-                      </span>
-                    </div>
-                  )}
                 </div>
               </div>
               <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <h4 className="text-[color:var(--fg)] font-medium mb-3">Node Capabilities</h4>
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Node Settings</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Ghost Mode</span>
-                    <Badge variant={data.ghost_mode ? 'success' : 'default'}>
-                      {data.ghost_mode ? 'Enabled' : 'Disabled'}
-                    </Badge>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Archive Mode (+5)</span>
+                    <span className="text-[color:var(--dim)]">Archive Mode</span>
                     <Badge variant={data.archive_mode ? 'success' : 'default'}>
                       {data.archive_mode ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Reaper (+2)</span>
+                    <span className="text-[color:var(--dim)]">Reaper</span>
                     <Badge variant={data.reaper ? 'success' : 'default'}>
                       {data.reaper ? 'Enabled' : 'Disabled'}
                     </Badge>

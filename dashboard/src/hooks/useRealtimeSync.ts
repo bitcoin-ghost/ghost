@@ -15,7 +15,6 @@ import type { NodeEvent } from '@/types/api';
 export function useRealtimeSync() {
   const queryClient = useQueryClient();
   const setNodeStatus = useNodeStore((s) => s.setNodeStatus);
-  const setShares = useNodeStore((s) => s.setShares);
   const setConnected = useNodeStore((s) => s.setConnected);
   const connectedRef = useRef(false);
 
@@ -25,18 +24,6 @@ export function useRealtimeSync() {
       if (data) {
         queryClient.setQueryData(nodeKeys.status(), data);
         setNodeStatus(data);
-      }
-    },
-    onSharesUpdate: (event) => {
-      const data = (event as NodeEvent & { type: 'SharesUpdate' }).data;
-      if (data) {
-        // The pushed payload carries CLAIMED capabilities. Writing it straight
-        // into the cache would overwrite the verified merge getShares() performs
-        // (see lib/api/node.ts), re-showing archive-on / 15-15. Invalidate so the
-        // query refetches the verified view instead of trusting the raw push.
-        queryClient.invalidateQueries({ queryKey: nodeKeys.shares() });
-        queryClient.invalidateQueries({ queryKey: nodeKeys.health() });
-        setShares(data);
       }
     },
     onConfigChange: () => {

@@ -8,12 +8,10 @@ import { Badge } from "@/components/ui/Badge";
 import { StepIndicator } from "@/components/ui/Wizard";
 import { useToast } from "@/components/ui/Toast";
 import { StatusRow } from "../shared";
-import { CapabilityToggles } from "@/components/settings/CapabilityToggles";
 import ReaperWizard from "../wizards/ReaperWizard";
 import {
   useNodeStatus,
   useHealth,
-  useShares,
   useConfig,
   useFullConfig,
   useSetPolicyProfile,
@@ -32,7 +30,6 @@ const POLICY_PRESETS: { name: PolicyProfileType; desc: string }[] = [
 
 const STEPS = [
   { id: "welcome", title: "Welcome" },
-  { id: "capabilities", title: "Capabilities" },
   { id: "policy", title: "Policy" },
   { id: "finish", title: "Finish" },
 ];
@@ -56,13 +53,10 @@ export default function OnboardingPage() {
   // Reads — current node state, used to pre-fill every step.
   const { data: status } = useNodeStatus();
   const { data: health } = useHealth();
-  const { data: shares } = useShares();
   const { data: config } = useConfig();
   const { data: fullConfig } = useFullConfig();
 
-  // Writes — the tier policy still lives here; the five canonical capability
-  // rows are driven inside the shared CapabilityToggles component (the SAME
-  // hooks Settings › Capabilities uses).
+  // Writes — the tier policy.
   const setPolicyProfile = useSetPolicyProfile();
 
   // Composed wizard state.
@@ -91,14 +85,13 @@ export default function OnboardingPage() {
 
   const reaperEnabled = config?.reaper ?? false;
   const archiveEnabled = status?.archive_mode ?? false;
-  const publicMiningEnabled = status?.public_mining ?? false;
 
   return (
     <div className="space-y-6">
       <Card>
         <CardHeader
           title="Node Setup"
-          subtitle="Review and confirm your node's capabilities and policy. Everything is pre-filled with your node's current values — adjust what you like, or accept the sane defaults."
+          subtitle="Review and confirm your node's transaction policy. Everything is pre-filled with your node's current values — adjust what you like, or accept the sane defaults."
         />
         <div className="py-2">
           <StepIndicator steps={STEPS} currentStep={step} />
@@ -133,43 +126,12 @@ export default function OnboardingPage() {
                 )
               }
             />
-            <StatItem
-              label="Elder status"
-              value={
-                shares?.elder ? (
-                  <Badge variant="success">Elder #{shares.elder_slot ?? "?"}</Badge>
-                ) : (
-                  <Badge variant="default">Not Elder</Badge>
-                )
-              }
-            />
-            <StatItem
-              label="Reward shares"
-              value={`${shares?.total ?? 0} / ${shares?.max_shares ?? 15}`}
-            />
           </div>
         </Card>
       )}
 
-      {/* Step 2: Capabilities */}
+      {/* Step 2: Policy */}
       {step === 1 && (
-        <Card>
-          <CardHeader
-            title="Capabilities"
-            subtitle="Capabilities earn shares in the node reward pool (5-4-3-2-1). Toggles are pre-set to your node's current values and save immediately."
-          />
-          <div className="space-y-3">
-            {/*
-             * The reward capabilities share their markup + hooks with
-             * Settings › Capabilities.
-             */}
-            <CapabilityToggles />
-          </div>
-        </Card>
-      )}
-
-      {/* Step 3: Policy */}
-      {step === 2 && (
         <div className="space-y-6">
           <Card>
             <CardHeader
@@ -181,7 +143,7 @@ export default function OnboardingPage() {
                 <div className="p-3 bg-[color-mix(in_srgb,var(--yellow)_18%,transparent)] border border-[color-mix(in_srgb,var(--yellow)_45%,transparent)] rounded-lg">
                   <div className="text-[color:var(--yellow)] font-medium">Locked by Reaper Mode</div>
                   <div className="text-sm text-[color:var(--yellow)]/80">
-                    Disable Reaper Mode in the previous step to change the tier policy.
+                    Disable Reaper Mode on the Reaper page to change the tier policy.
                   </div>
                 </div>
               )}
@@ -247,18 +209,14 @@ export default function OnboardingPage() {
         </div>
       )}
 
-      {/* Step 4: Finish */}
-      {step === 3 && (
+      {/* Step 3: Finish */}
+      {step === 2 && (
         <Card>
           <CardHeader title="All Set" subtitle="Here's your node's configuration. Finishing marks setup complete." />
           <div className="space-y-3">
             <StatItem
               label="Archive Mode"
               value={<Badge variant={archiveEnabled ? "success" : "default"}>{archiveEnabled ? "On" : "Off"}</Badge>}
-            />
-            <StatItem
-              label="Public Mining"
-              value={<Badge variant={publicMiningEnabled ? "success" : "default"}>{publicMiningEnabled ? "On" : "Off"}</Badge>}
             />
             <StatItem
               label="Ghost Reaper"
@@ -274,7 +232,6 @@ export default function OnboardingPage() {
                 )
               }
             />
-            <StatItem label="Reward shares" value={`${shares?.total ?? 0} / ${shares?.max_shares ?? 15}`} />
           </div>
         </Card>
       )}

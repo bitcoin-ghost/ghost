@@ -7,19 +7,9 @@
 
 import { fetchApi } from "./client";
 
-export interface MeshNodeCapabilities {
-  archive: boolean;
-  ghost_pay: boolean;
-  public_mining: boolean;
-  reaper: boolean;
-  elder: boolean;
-}
-
 export interface MeshNode {
   node_id: string;
   address: string;
-  elder: boolean;
-  capabilities: MeshNodeCapabilities;
   hashrate_th: number;
   // Raw connection count — a load-balancer routing view that double-counts a
   // miner failing over between nodes. Kept for reference; NOT summed.

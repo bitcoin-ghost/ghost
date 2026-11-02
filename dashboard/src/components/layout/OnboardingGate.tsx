@@ -8,9 +8,8 @@
  * The only completion signal available to the dashboard is the client-side
  * `ghost_dashboard_onboarded` localStorage flag (see `useOnboarding`) — the
  * ghost-node API exposes no "onboarded"/"configured" marker, and the node's
- * capability config CANNOT stand in for one: every capability defaults to `true`
- * server-side (`DashboardConfig::default`: archive/ghost_pay/public_mining/reaper
- * all on, mempool_profile "permissive"), so a heavily-configured production node
+ * config CANNOT stand in for one: the settings default on server-side
+ * (archive/reaper on, mempool_profile "permissive"), so a heavily-configured production node
  * is byte-for-byte indistinguishable from a brand-new install over the API.
  *
  * The previous gate keyed the first-run redirect purely on that per-browser

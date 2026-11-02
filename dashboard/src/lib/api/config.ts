@@ -151,13 +151,6 @@ export async function setArchiveMode(enabled: boolean): Promise<ArchiveModeRespo
   });
 }
 
-export async function setPublicMiningConfig(enabled: boolean): Promise<NodeConfig> {
-  return fetchApi<NodeConfig>('/api/v1/config/public_mining', {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  });
-}
-
 // Per-vector Ghost Reaper configuration. Field names match pool.toml [reaper].
 export interface ReaperSettings {
   enabled: boolean;
@@ -399,14 +392,6 @@ export async function configureShroud(config: {
 export async function restartNode(): Promise<{ success: boolean; message: string }> {
   return fetchApi('/api/v1/node/restart', {
     method: 'POST',
-  });
-}
-
-// Mining payout address
-export async function setMiningPayoutAddress(address: string): Promise<{ success: boolean; message: string }> {
-  return fetchApi('/api/v1/mining/payout_address', {
-    method: 'POST',
-    body: JSON.stringify({ address }),
   });
 }
 

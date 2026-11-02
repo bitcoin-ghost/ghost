@@ -2,8 +2,8 @@
  * Overlay: Node Vitals
  *
  * CONCEPT — a calm mission-control board for this node: block height ticking
- * up, a heartbeat pulse on each new block, current hashrate, the 5-4-3-2-1
- * capability ring, peer count, uptime, and a sync progress bar. It also carries
+ * up, a heartbeat pulse on each new block, current hashrate, a breathing
+ * ring, peer count, uptime, and a sync progress bar. It also carries
  * a compact row of watchdog service LEDs (one dot per monitored service) and
  * CPU / memory / disk resource gauges, so the Home screen is a full glance-able
  * health board. Big, legible, ambient — designed to be read from across a room.
@@ -13,7 +13,7 @@
  * ring, two drifting nebula washes and a capped, low-contrast speck field.
  * Because real block updates are rare (~10 min), the board keeps a quiet
  * heartbeat of its own: an ambient pulse emanates from the centre every few
- * seconds, the capability arcs breathe, and a slow highlight sweep travels
+ * seconds, the ring breathes, and a slow highlight sweep travels
  * around the ring — so it always reads as alive, never frozen. A genuine new
  * block still fires a stronger, brighter pulse (and re-beats the number).
  *
@@ -28,12 +28,12 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { useNodeStatus, useShares } from '@/hooks/queries/useNodeQueries';
+import { useNodeStatus } from '@/hooks/queries/useNodeQueries';
 import { useMiningStatus, useBestHash } from '@/hooks/queries/useMiningQueries';
 import { useWatchdogStatus } from '@/hooks/queries/useWatchdogQueries';
 import { useResourceStatus } from '@/hooks/queries/useResourceQueries';
 import { formatHashrate, formatDuration } from '@/components/ui/DataTable';
-import type { SharesInfo, WatchdogStatus } from '@/types/api';
+import type { WatchdogStatus } from '@/types/api';
 
 /**
  * The scene honours `active`: it runs its rAF animation loop and lets its data
@@ -50,60 +50,15 @@ interface OverlayProps {
 // it directly without reading it back out of the DOM every frame.
 const ACCENT_RGB = '247, 147, 26';
 // The rotating highlight sweep is green so it stays distinct from the orange
-// capability arcs — obvious even now that the glow band is thin.
+// accent — obvious even now that the glow band is thin.
 const SWEEP_RGB = '92, 199, 126';
 // A cool tint blended into one nebula wash so the depth field isn't monochrome.
 const COOL = { r: 70, g: 110, b: 190 };
-
-// The 1-2-3-4-5 capability ring. Array order is the on-ring order: starting at
-// the top (12 o'clock) and going CLOCKWISE the bonus ASCENDS — Elder (+1) first,
-// then Reaper (+2), Mining (+3), GhostPay (+4), Archive (+5). Both the arcs and
-// the outer labels iterate this array by index, so this order drives both.
-// `key` indexes SharesInfo's boolean capability flags.
-const CAPS: { key: keyof SharesInfo; label: string; bonus: number }[] = [
-  { key: 'elder', label: 'ELDER', bonus: 1 },
-  { key: 'reaper', label: 'REAPER', bonus: 2 },
-  { key: 'public_mining', label: 'MINING', bonus: 3 },
-  { key: 'ghost_pay', label: 'GHOSTPAY', bonus: 4 },
-  { key: 'archive_mode', label: 'ARCHIVE', bonus: 5 },
-];
 
 // Ring geometry (SVG userspace units; viewBox is 0 0 400 400).
 const CENTER = 200;
 const RING_R = 150;
 const RING_STROKE = 13;
-const SEG_SLOT = 100 / CAPS.length; // pathLength=100 → 20 units per capability
-const SEG_GAP = 3; // units of gap between arcs
-const SEG_VISIBLE = SEG_SLOT - SEG_GAP;
-// Labels curve along invisible arcs concentric with the ring. The name rides an
-// outer arc, the "+bonus" an inner arc; both radii are chosen so that even where
-// a bottom-half label's glyphs extend inward (toward the ring), they still clear
-// the ring's outer edge (RING_R + RING_STROKE/2 = 156.5) with comfortable margin.
-const LABEL_NAME_R = RING_R + 34; // 184
-const LABEL_BONUS_R = RING_R + 18; // 168
-
-// Build an SVG arc `d` for a label baseline: a minor arc (≤180°) of radius `r`
-// centred on the ring angle `thetaDeg` (clockwise from 12 o'clock), spanning
-// `span` degrees. On the TOP half the arc runs clockwise (sweep=1) so text reads
-// upright with glyphs pointing outward; on the BOTTOM half it runs
-// counter-clockwise (sweep=0) so text stays upright (never mirrored) with glyphs
-// pointing gently inward. textPath + startOffset 50% + text-anchor middle then
-// centres each label exactly on its capability's 72° segment midpoint.
-function labelArc(thetaDeg: number, r: number, bottom: boolean, span = 120): string {
-  const pt = (a: number): [number, number] => {
-    const phi = ((a - 90) * Math.PI) / 180; // 12 o'clock = 0°, clockwise positive
-    return [CENTER + r * Math.cos(phi), CENTER + r * Math.sin(phi)];
-  };
-  const half = span / 2;
-  if (bottom) {
-    const [x1, y1] = pt(thetaDeg + half);
-    const [x2, y2] = pt(thetaDeg - half);
-    return `M ${x1} ${y1} A ${r} ${r} 0 0 0 ${x2} ${y2}`; // CCW → upright at bottom
-  }
-  const [x1, y1] = pt(thetaDeg - half);
-  const [x2, y2] = pt(thetaDeg + half);
-  return `M ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2}`; // CW → upright at top
-}
 
 interface Vitals {
   height: number; // node's synced height (the big ticking number)
@@ -258,7 +213,6 @@ function usageTone(value: number, warn: number, crit: number): Tone {
 export function NodeVitalsOverlay({ active }: OverlayProps) {
   const { data: status, isLoading: statusLoading } = useNodeStatus();
   const { data: mining } = useMiningStatus();
-  const { data: shares } = useShares();
   const { data: bestHash } = useBestHash();
   const { data: watchdog } = useWatchdogStatus();
   const { data: resources } = useResourceStatus();
@@ -306,9 +260,6 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       0,
   };
 
-  const uptimeQualified = shares?.uptime_qualified ?? true;
-  const totalShares = shares?.total ?? 0;
-  const maxShares = shares?.max_shares ?? 15;
   const hasStatus = !!status;
 
   // ── Watchdog service LEDs (real per-service health, or empty until it loads).
@@ -675,7 +626,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       {/* Watchdog service LEDs — one dot per monitored service. */}
       <WatchdogLeds leds={leds} />
 
-      {/* Medallion: capability ring wrapping the big ticking block height. */}
+      {/* Medallion: ring wrapping the big ticking block height. */}
       <div
         ref={wrapRef}
         className="relative flex items-center justify-center"
@@ -718,7 +669,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
           aria-hidden
         />
 
-        {/* Capability ring. */}
+        {/* Ring. */}
         <svg
           viewBox="0 0 400 400"
           className="absolute inset-0"
@@ -736,110 +687,6 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
             opacity={0.5}
             style={{ animation: active ? 'nv-track 6s ease-in-out infinite' : undefined }}
           />
-          {/* Two composed rotations, applied as one angle:
-              -90° brings the SVG circle's 3-o'clock path start to 12 o'clock,
-              and a further -(SEG_VISIBLE/2 path-units → degrees) recentres each
-              segment on its slot boundary. Segment i's visible dash occupies the
-              path interval [i·SEG_SLOT, i·SEG_SLOT+SEG_VISIBLE]; without this
-              extra turn its *centre* sits at i·72°+SEG_VISIBLE/2·3.6° (~30.6°
-              clockwise of where it should). Rotating the whole group back by that
-              half-arc lands each centre exactly on i·72° — Elder at the top,
-              then Reaper/Mining/GhostPay/Archive clockwise — while every dash
-              stays inside [i·20, i·20+17] (max 97 < 100), so none straddles the
-              path's 0/100 seam and no segment splits at the top. */}
-          <g
-            transform={`rotate(${-(90 + (SEG_VISIBLE / 2) * (360 / 100))} ${CENTER} ${CENTER})`}
-          >
-            {CAPS.map((cap, i) => {
-              const qualified = !!shares?.[cap.key] && uptimeQualified;
-              const claimed = !!shares?.[cap.key] && !uptimeQualified;
-              const color = qualified
-                ? `rgb(${ACCENT_RGB})`
-                : claimed
-                  ? 'var(--red)'
-                  : 'var(--rule-strong)';
-              return (
-                <circle
-                  key={cap.key}
-                  cx={CENTER}
-                  cy={CENTER}
-                  r={RING_R}
-                  fill="none"
-                  stroke={color}
-                  strokeWidth={RING_STROKE}
-                  strokeLinecap="round"
-                  pathLength={100}
-                  strokeDasharray={`${SEG_VISIBLE} ${100 - SEG_VISIBLE}`}
-                  strokeDashoffset={-(i * SEG_SLOT)}
-                  style={{
-                    filter: qualified
-                      ? `drop-shadow(0 0 5px rgba(${ACCENT_RGB}, 0.7))`
-                      : 'none',
-                    transition: 'stroke 0.4s ease',
-                    animation: active
-                      ? `${qualified ? 'nv-arc' : 'nv-arc-dim'} 3.6s ease-in-out infinite`
-                      : undefined,
-                    animationDelay: `${i * 0.24}s`,
-                  }}
-                />
-              );
-            })}
-          </g>
-        </svg>
-
-        {/* Capability labels — curved along arcs just outside the ring so the
-            text follows the ring's curvature and never overlaps the arcs. */}
-        <svg
-          viewBox="0 0 400 400"
-          className="absolute inset-0"
-          style={{ width: '100%', height: '100%', overflow: 'visible' }}
-          aria-hidden
-        >
-          <defs>
-            {CAPS.map((cap, i) => {
-              const theta = ((i * SEG_SLOT) / 100) * 360; // segment centre: i·72° clockwise from top
-              const bottom = theta > 90 && theta < 270; // lower half → keep upright
-              return (
-                <g key={cap.key}>
-                  <path id={`nv-lbl-${cap.key}`} d={labelArc(theta, LABEL_NAME_R, bottom)} fill="none" />
-                  <path id={`nv-bns-${cap.key}`} d={labelArc(theta, LABEL_BONUS_R, bottom)} fill="none" />
-                </g>
-              );
-            })}
-          </defs>
-          {CAPS.map((cap) => {
-            const qualified = !!shares?.[cap.key] && uptimeQualified;
-            return (
-              <g key={cap.key}>
-                <text
-                  dominantBaseline="middle"
-                  style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 12,
-                    letterSpacing: '0.12em',
-                    fill: qualified ? 'var(--fg)' : 'var(--fainter)',
-                  }}
-                >
-                  <textPath href={`#nv-lbl-${cap.key}`} startOffset="50%" textAnchor="middle">
-                    {cap.label}
-                  </textPath>
-                </text>
-                <text
-                  dominantBaseline="middle"
-                  style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 11,
-                    fontWeight: 600,
-                    fill: qualified ? `rgb(${ACCENT_RGB})` : 'var(--fainter)',
-                  }}
-                >
-                  <textPath href={`#nv-bns-${cap.key}`} startOffset="50%" textAnchor="middle">
-                    +{cap.bonus}
-                  </textPath>
-                </text>
-              </g>
-            );
-          })}
         </svg>
 
         {/* Centre readout. */}
@@ -883,40 +730,6 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
               }}
             >
               / {v.target.toLocaleString()} · {v.syncPct.toFixed(1)}%
-            </div>
-          )}
-          <div
-            style={{
-              fontFamily: 'var(--font-mono)',
-              fontSize: 'clamp(11px, 1.6vh, 14px)',
-              letterSpacing: '0.1em',
-              color: uptimeQualified ? 'var(--dim)' : 'var(--red)',
-              marginTop: 10,
-            }}
-          >
-            {shares ? (
-              <>
-                <span style={{ color: uptimeQualified ? 'var(--fg)' : 'var(--red)', fontWeight: 600 }}>
-                  {totalShares}
-                </span>
-                <span style={{ color: 'var(--fainter)' }}> / {maxShares} shares</span>
-              </>
-            ) : (
-              <span style={{ color: 'var(--fainter)' }}>— / {maxShares} shares</span>
-            )}
-          </div>
-          {shares && !uptimeQualified && (
-            <div
-              style={{
-                fontFamily: 'var(--font-mono)',
-                fontSize: '10px',
-                textTransform: 'uppercase',
-                letterSpacing: '0.18em',
-                color: 'var(--red)',
-                marginTop: 4,
-              }}
-            >
-              uptime below 95% · shares paused
             </div>
           )}
         </div>

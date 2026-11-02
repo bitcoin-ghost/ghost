@@ -6,7 +6,6 @@ import {
   Pickaxe,
   Activity,
   RefreshCw,
-  ShieldCheck,
   Gauge,
   Boxes,
   Blocks,
@@ -21,9 +20,6 @@ import {
   MapPin,
   HeartPulse,
   ScrollText,
-  Users,
-  CreditCard,
-  Banknote,
   Smartphone,
   HardDrive,
   Search,
@@ -76,12 +72,6 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "identity",
-    items: [
-      { href: "/elders", label: "Elders & MPC", icon: <Users {...ICON} /> },
-    ],
-  },
-  {
     label: "privacy",
     items: [
       { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
@@ -117,18 +107,10 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "financial",
-    items: [
-      { href: "/payouts", label: "Payouts", icon: <Banknote {...ICON} /> },
-      { href: "/treasury", label: "Treasury", icon: <CreditCard {...ICON} /> },
-    ],
-  },
-  {
     label: "system",
     items: [
       { href: "/system", label: "System", icon: <Cpu {...ICON} /> },
       { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
-      { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
       { href: "/peers", label: "Peers", icon: <NetworkIcon {...ICON} /> },
       { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/watchdog", label: "Watchdog", icon: <HeartPulse {...ICON} /> },

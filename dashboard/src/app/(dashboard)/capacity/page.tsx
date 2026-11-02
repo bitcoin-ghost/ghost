@@ -268,11 +268,6 @@ function MeshRow({ node }: { node: MeshNode }) {
             you
           </Badge>
         )}
-        {!node.capabilities?.public_mining && (
-          <Badge variant="warning" className="ml-2">
-            non-public
-          </Badge>
-        )}
         {!known && (
           <Badge variant="warning" className="ml-2">
             capacity unknown

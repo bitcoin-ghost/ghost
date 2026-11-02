@@ -72,25 +72,3 @@ export async function getMiners(): Promise<MinersResponse> {
 export async function getBestHash(): Promise<BestHashResponse> {
   return fetchApi<BestHashResponse>('/api/v1/mining/best-hash');
 }
-
-export async function setPrivateMining(enabled: boolean): Promise<MiningStatus> {
-  return fetchApi<MiningStatus>('/api/v1/mining/private', {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  });
-}
-
-export async function setPublicMining(enabled: boolean): Promise<MiningStatus> {
-  return fetchApi<MiningStatus>('/api/v1/mining/public', {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  });
-}
-
-export async function setPayoutAddress(address: string | null): Promise<MiningStatus> {
-  return fetchApi<MiningStatus>('/api/v1/mining/payout_address', {
-    method: 'POST',
-    body: JSON.stringify({ address }),
-  });
-}
-

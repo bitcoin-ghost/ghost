@@ -20,9 +20,7 @@ import {
   configureHaze,
   configureShroud,
   restartNode,
-  setMiningPayoutAddress,
   setPoolName,
-  setPublicMiningConfig,
 } from '@/lib/api/config';
 import { nodeKeys } from './useNodeQueries';
 
@@ -220,17 +218,6 @@ export function useRestartNode() {
 }
 
 
-export function useSetMiningPayoutAddress() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (address: string) => setMiningPayoutAddress(address),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-      queryClient.invalidateQueries({ queryKey: ['mining'] });
-    },
-  });
-}
-
 export function useSetPoolName() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -238,16 +225,6 @@ export function useSetPoolName() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
       queryClient.invalidateQueries({ queryKey: ['mining'] });
-    },
-  });
-}
-
-export function useSetPublicMiningConfig() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (enabled: boolean) => setPublicMiningConfig(enabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
     },
   });
 }
