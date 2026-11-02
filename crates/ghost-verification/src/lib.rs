@@ -43,6 +43,7 @@ pub mod fleet_auth;
 pub mod journal;
 pub mod log_buffer;
 pub mod node_config;
+pub mod node_pool_routes;
 
 pub mod maxconnections;
 pub mod pool_series;
