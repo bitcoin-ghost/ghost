@@ -79,7 +79,8 @@ use ghost_common::anchor_chain::{
     AncestryError, AnchorChain, AnchorError, AnchorHash, AnchorHeader, ShareId,
 };
 use ghost_common::canonical_payout::{
-    cut, provisional_retirements, table_for_from, table_root, Halving, Retirement, Script, Table,
+    cut, first_earning_height, provisional_retirements, table_for_from, table_root, Halving,
+    Retirement, Script, Table,
 };
 use ghost_common::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use ghost_common::error::{GhostError, GhostResult};
@@ -1017,6 +1018,15 @@ impl Relay {
             self.needed_headers.insert(prev);
             "unknown Bitcoin header".to_string()
         })?;
+        // Void work (rule 6: no snapshot anchor below the cut) is neither relayed nor made an
+        // anchor: every node would refuse it.
+        let first = first_earning_height(self.p.genesis.btc_height);
+        if f.height.saturating_add(1) < first {
+            return Err(format!(
+                "void: job height {} is below the first earning height {first} (genesis + 21)",
+                f.height.saturating_add(1)
+            ));
+        }
         let parent = share.tag.parent_anchor;
         let t_net = self
             .required_tier(&parent, f.height)

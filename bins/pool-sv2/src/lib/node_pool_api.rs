@@ -82,6 +82,10 @@ pub trait LiveView: Send + Sync {
     fn node_id(&self) -> Option<[u8; 32]> {
         None
     }
+    /// The job height miners are working on now, if a template is active.
+    fn job_height(&self) -> Option<u32> {
+        None
+    }
 }
 
 impl LiveView for NodePool {
@@ -91,6 +95,12 @@ impl LiveView for NodePool {
 
     fn node_id(&self) -> Option<[u8; 32]> {
         Some(NodePool::node_id(self))
+    }
+
+    fn job_height(&self) -> Option<u32> {
+        self.active_template()
+            .as_ref()
+            .and_then(|t| NodePool::template_height(t))
     }
 
     fn next_table(&self) -> NextTableFuture<'_> {
@@ -509,6 +519,43 @@ pub struct StatusResponse {
     pub recent_blocks: Vec<BlockView>,
     /// Connected miners.
     pub miners: Vec<MinerView>,
+    /// Whether work served now earns.
+    pub earning: EarningView,
+}
+
+/// Whether work on the current jobs earns. Shares of a job height below the first earning
+/// height (the genesis anchor's height + 21) are void: no snapshot anchor sits below their cut.
+/// Jobs are still served there, and a block found pays the genesis table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EarningView {
+    /// The first job height whose shares earn.
+    pub first_earning_height: u32,
+    /// The job height being served now, if a template is active.
+    pub job_height: Option<u32>,
+    /// `false` while the jobs served now earn nothing; `null` when no template is active.
+    pub earns: Option<bool>,
+    /// Plain words for the miner page and the dashboard while `earns` is `false`.
+    pub notice: Option<String>,
+}
+
+impl EarningView {
+    /// The reading for a share chain started at `genesis_btc_height`, serving `job_height`.
+    pub fn new(genesis_btc_height: u32, job_height: Option<u32>) -> EarningView {
+        let first = ghost_common::canonical_payout::first_earning_height(genesis_btc_height);
+        let earns = job_height.map(|h| h >= first);
+        EarningView {
+            first_earning_height: first,
+            job_height,
+            earns,
+            notice: (earns == Some(false)).then(|| {
+                format!(
+                    "Work on this node earns nothing until Bitcoin height {first}: the node pool \
+                     credits shares from 21 blocks after its genesis. Jobs are served so blocks \
+                     can be found, and a block found now pays the carried-over balances."
+                )
+            }),
+        }
+    }
 }
 
 /// The API over a running relay and job layer.
@@ -883,6 +930,7 @@ impl NodePoolApi {
             ledger_rows: db.np_ledger_rows().map_err(internal)?,
             recent_blocks,
             miners,
+            earning: EarningView::new(start.genesis_btc_height, self.live.job_height()),
         })
     }
 }

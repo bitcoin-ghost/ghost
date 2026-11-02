@@ -163,6 +163,18 @@ test('a balance carried over at the cutover is named, and absent when there is n
   assert(!/NaN|undefined/.test(out.queue));
 });
 
+test('work before the first earning height is called out, and only then', () => {
+  const st = goodState();
+  assert(!MP.renderAll(st, 640).header.includes('mp-void'), 'no notice while work earns');
+  const body = minerBody(LISTED[0], [worker('rig1', 'online')]);
+  body.earning = { first_earning_height: 21, job_height: 9, earns: false,
+                   notice: 'Work on this node earns nothing until Bitcoin height 21.' };
+  st.miners = MP.mergeMiners([{ node: LISTED[0], ok: true, body }]);
+  const out = MP.renderAll(st, 640);
+  assert(out.header.includes('earns nothing until Bitcoin height 21'), out.header);
+  noJunk(out.header, 'header');
+});
+
 test('a selected worker gets its own chart and row highlight', () => {
   const st = goodState(MP.parseQuery('?id=' + ADDR + '.rig2'));
   const out = MP.renderAll(st, 640);

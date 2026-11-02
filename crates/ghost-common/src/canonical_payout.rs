@@ -168,6 +168,17 @@ pub fn cut(h: u32) -> Option<u32> {
     h.checked_sub(SNAPSHOT_CUT_LAG)
 }
 
+/// The first job height whose shares earn on a share chain whose genesis anchor is at
+/// `genesis_btc_height`: `genesis + 21`. A share of job height `H` is paid from `S(H)`, the last
+/// anchor below `cut(H) = H - 20`; the first anchor of all is genesis, so `S(H)` exists only once
+/// `H - 20 > genesis`. Work on a lower height is void (rule 6), and every node refuses an anchor
+/// built on it. Blocks found there are still valid and pay the genesis table.
+pub fn first_earning_height(genesis_btc_height: u32) -> u32 {
+    genesis_btc_height
+        .saturating_add(SNAPSHOT_CUT_LAG)
+        .saturating_add(1)
+}
+
 /// `(O oldest, L largest)` with `O = ceil(N/2)`.
 pub fn split_slots(n: usize) -> (usize, usize) {
     let o = n.div_ceil(2);
@@ -1177,6 +1188,10 @@ mod tests {
         assert_eq!(split(1_050_000, Halving::MAINNET), (781_250, 155_468_750));
         assert_eq!(cut(H), Some(H - 20));
         assert_eq!(cut(19), None);
+        assert_eq!(first_earning_height(0), 21);
+        assert_eq!(first_earning_height(974_500), 974_521);
+        // The rule-6 boundary it names: no anchor below cut(H) until H = genesis + 21.
+        assert_eq!((cut(20), cut(21)), (Some(0), Some(1)));
         assert_eq!(subsidy(64 * HALVING_INTERVAL, Halving::MAINNET), 0);
         let mut want = p2tr("placeholder treasury, compiled constant, see plan section 5");
         assert_eq!(

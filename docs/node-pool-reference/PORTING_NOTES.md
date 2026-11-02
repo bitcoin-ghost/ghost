@@ -131,6 +131,14 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
   table arrives (retried on every anchor publish and every 5 s); a channel opened meanwhile is
   refused with `node-pool-no-snapshot-table`. A sustained hold means the relay or its Bitcoin RPC
   is broken.
+- **Work before genesis + 21 is void** (`canonical_payout::first_earning_height`): no anchor
+  sits below `cut(H)` for `H <= genesis + 20`, so rule 6 fails every such share. Jobs are still
+  served (miners need work, and a block found there is valid and pays the genesis table), and
+  pool_sv2 logs `NODE_POOL_VOID_WORK` once per height; the relay neither relays nor anchors a
+  local share there (`on_local_share`: "void"), so no node sees an anchor it must refuse. The
+  status and miner APIs carry `earning` (`first_earning_height`, `job_height`, `earns`,
+  `notice`), shown by the dashboard's health checks and the miner page. Mainnet's genesis anchor
+  is set at least 20 blocks before launch (plan, Phase 4) so no live work is void.
 - **Outputs**: `coinbase_outputs(H, table, slot_class, fee_script, value - subsidy(H),
   witness)` minus the witness output, which the channel factory appends from the template.
 - **The finder** is `[node_pool] fee_address`, required to be one of the four payee classes

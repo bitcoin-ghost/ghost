@@ -624,3 +624,23 @@ async fn balances_include_the_genesis_table() {
     let r = world().api.ledger(&addr(&payee(4))).await.unwrap();
     assert!(!r.known && r.genesis.is_none());
 }
+
+/// Finding E: work below the first earning height (genesis + 21) earns nothing; the status and
+/// miner pages say so in plain words while it lasts, and nothing once it is over.
+#[test]
+fn work_before_the_first_earning_height_is_flagged() {
+    use crate::node_pool_api::EarningView;
+    let early = EarningView::new(0, Some(20));
+    assert_eq!((early.first_earning_height, early.earns), (21, Some(false)));
+    assert!(early
+        .notice
+        .unwrap()
+        .contains("earns nothing until Bitcoin height 21"));
+    let paid = EarningView::new(0, Some(21));
+    assert_eq!((paid.earns, paid.notice), (Some(true), None));
+    let idle = EarningView::new(974_500, None);
+    assert_eq!(
+        (idle.first_earning_height, idle.earns, idle.notice),
+        (974_521, None, None)
+    );
+}

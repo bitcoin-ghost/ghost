@@ -464,6 +464,7 @@ pub async fn start_with_parts(
     .await
     .map_err(|e| format!("relay listen: {e}"))?;
     np.set_relay_sink(handle.local.clone(), tier_base);
+    np.set_genesis_height(genesis_btc_height);
     np.set_table_source(handle.tables.clone());
     warn!(
         listen = ?handle.listen_addr,

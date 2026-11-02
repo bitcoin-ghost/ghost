@@ -52,6 +52,9 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         // the anchor they build on. No table in time: the template is not served (see
         // `NodePool::prepare_job_basis`), and miners keep their current job.
         let served = np.prepare_job_basis(&msg).await;
+        if let Some(h) = crate::node_pool::NodePool::template_height(&msg) {
+            np.note_job_height(h);
+        }
         if served {
             np.mark_served(msg.template_id);
         } else {

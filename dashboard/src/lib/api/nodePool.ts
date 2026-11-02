@@ -131,6 +131,15 @@ export interface NodePoolStatus {
   ledger_rows: number;
   recent_blocks: NpBlock[];
   miners: NpMinerChannel[];
+  earning?: NpEarning;
+}
+
+/** Whether work served now earns: nothing before the genesis anchor's height + 21. */
+export interface NpEarning {
+  first_earning_height: number;
+  job_height: number | null;
+  earns: boolean | null;
+  notice: string | null;
 }
 
 export interface NpClassPayout {

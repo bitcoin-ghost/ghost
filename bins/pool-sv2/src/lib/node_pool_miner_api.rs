@@ -261,6 +261,8 @@ pub struct MinerResponse {
     pub workers: Vec<WorkerView>,
     /// How long until it is next paid.
     pub expected_wait: ExpectedWait,
+    /// Whether work served now earns (it does not before the first earning height).
+    pub earning: crate::node_pool_api::EarningView,
 }
 
 /// Series aligned with a history's buckets.
@@ -1033,6 +1035,10 @@ impl NodePoolApi {
             summary,
             workers,
             expected_wait,
+            earning: crate::node_pool_api::EarningView::new(
+                self.parts.start.genesis_btc_height,
+                self.live.job_height(),
+            ),
         })
     }
 

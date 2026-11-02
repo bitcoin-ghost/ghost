@@ -162,6 +162,12 @@
       if (s.last_share_at != null && (out.summary.last_share_at == null || s.last_share_at > out.summary.last_share_at)) {
         out.summary.last_share_at = s.last_share_at;
       }
+      // Work before the share chain's first earning height (its genesis + 21) earns nothing:
+      // any node serving such jobs says so, and the page repeats it.
+      if (b.earning && b.earning.earns === false && !out.voidNotice) {
+        out.voidNotice = b.earning.notice ||
+          ('Work earns nothing until Bitcoin height ' + b.earning.first_earning_height + '.');
+      }
       // The wait comes from the share chain; every node computes it alike. Prefer a known one.
       if (b.expected_wait && (!out.wait || (!out.wait.known && b.expected_wait.known))) out.wait = b.expected_wait;
     });
@@ -565,7 +571,8 @@
       '<div class="mp2-nodeinfo">' + info + '</div></div>' +
       '<h1 class="mp-worker">' + esc(a.slice(0, 8) + '…' + a.slice(-6)) + (st.query.worker ? '<span class="mp2-worker">.' + esc(st.query.worker) + '</span>' : '') + '</h1>' +
       '<div class="mp-full">' + esc(a) + '</div>' +
-      (L && !L.known ? '<p class="payout-note">' + esc(L.message || '') + '</p>' : '');
+      (L && !L.known ? '<p class="payout-note">' + esc(L.message || '') + '</p>' : '') +
+      (st.miners && st.miners.voidNotice ? '<p class="payout-note mp-void" role="alert">⚠ ' + esc(st.miners.voidNotice) + '</p>' : '');
   }
 
   // Everything the page shows, from the fetched state. Pure.

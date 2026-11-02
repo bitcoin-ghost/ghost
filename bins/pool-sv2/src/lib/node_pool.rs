@@ -206,6 +206,10 @@ struct State {
     /// payee arrives with the miner's authorize ([`NodePool::await_payee`]). No job is built for
     /// them until then.
     awaiting_payee: HashSet<ChannelKey>,
+    /// The first job height whose shares earn (`canonical_payout::first_earning_height` of the
+    /// relay's genesis), once the relay has started; and the last height warned about below it.
+    first_earning: Option<u32>,
+    void_warned: Option<u32>,
     /// A new tip whose template was not served: its `SetNewPrevHash` waits here, unsent, until
     /// the table arrives ([`NodePool::take_pending_tip`]).
     pending_tip: Option<SetNewPrevHash<'static>>,
@@ -525,6 +529,40 @@ impl NodePool {
                     && t.r#type.field_type == PAYEE_TLV_FIELD_TYPE
             })
             .and_then(|t| String::from_utf8(t.value.clone()).ok())
+    }
+
+    /// The share chain starts at `genesis_btc_height`: shares of a job height below
+    /// `genesis + 21` earn nothing (see [`NodePool::note_job_height`]).
+    pub fn set_genesis_height(&self, genesis_btc_height: u32) {
+        self.lock().first_earning = Some(ghost_common::canonical_payout::first_earning_height(
+            genesis_btc_height,
+        ));
+    }
+
+    /// The first job height whose shares earn, once known.
+    pub fn first_earning_height(&self) -> Option<u32> {
+        self.lock().first_earning
+    }
+
+    /// Jobs are being served at height `h`. Below the first earning height their shares are
+    /// void (rule 6 has no snapshot anchor below `cut(h)` until genesis + 21), yet the jobs are
+    /// still served: blocks found on them are valid and pay the genesis table. Said once per
+    /// height, loudly, so no operator mistakes it for paid work.
+    pub fn note_job_height(&self, h: u32) {
+        let mut st = self.lock();
+        let Some(first) = st.first_earning else {
+            return;
+        };
+        if h < first && st.void_warned != Some(h) {
+            st.void_warned = Some(h);
+            warn!(
+                height = h,
+                first_earning_height = first,
+                "NODE_POOL_VOID_WORK: shares on jobs at this height earn nothing: the share chain \
+                 credits work from height {first} (its genesis + 21). Jobs are still served, and \
+                 a block found here pays the genesis table"
+            );
+        }
     }
 
     /// `template_id` was served after all (a held tip, once its table arrived).

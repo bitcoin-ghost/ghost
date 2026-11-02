@@ -115,6 +115,27 @@ test("overview: no relay peers is a warning, a mismatched block an error", () =>
   assert.equal(h.checks.find((c) => c.label === "Mismatched blocks").level, "error");
 });
 
+test("overview: work before the first earning height is flagged, and only then", () => {
+  need();
+  const status = fixture("node-pool-status.json");
+  status.settlement.provisional = [];
+  status.share_chain.unseen_anchors = 0;
+  status.earning = {
+    first_earning_height: 21,
+    job_height: 12,
+    earns: false,
+    notice: "Work on this node earns nothing until Bitcoin height 21.",
+  };
+  const h = views.view.nodePoolHealth(status, undefined);
+  assert.equal(h.level, "warn");
+  assert.equal(h.checks.find((c) => c.label === "Work earns nothing yet").level, "warn");
+  assert.match(text(html(views.OverviewView, { status })), /earns nothing until Bitcoin height 21/);
+  status.earning = { first_earning_height: 21, job_height: 30, earns: true, notice: null };
+  const ok = views.view.nodePoolHealth(status, undefined);
+  assert.equal(ok.level, "ok");
+  assert.equal(ok.checks.find((c) => c.label === "Work earns nothing yet"), undefined);
+});
+
 test("overview: a failed API shows unavailable and unknown, never healthy or zero", () => {
   need();
   const m = html(views.OverviewView, { statusError: FAILED, nodeError: new Error("API error: 502") });

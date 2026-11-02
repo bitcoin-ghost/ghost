@@ -166,6 +166,16 @@ export function nodePoolHealth(
       detail: `${st.mismatched} pool block(s) did not pay their anchor's table since start`,
     });
   }
+  // Work below the first earning height (genesis + 21) is void: say so as long as it lasts.
+  if (status.earning?.earns === false) {
+    checks.push({
+      label: "Work earns nothing yet",
+      level: "warn",
+      detail:
+        status.earning.notice ??
+        `shares are credited from Bitcoin height ${fmtInt(status.earning.first_earning_height)}`,
+    });
+  }
   if (status.share_chain.unseen_anchors > 0) {
     checks.push({
       label: "Share-chain sync",
