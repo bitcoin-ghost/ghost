@@ -140,8 +140,8 @@ impl DifficultyCalculator {
     ///
     /// [`Self::verify_pow_preimage`] credits `claimed_difficulty`, a figure supplied alongside the
     /// share rather than derived from anything a remote node can recompute. This function instead
-    /// credits a tier the share committed to inside its hashed coinbase (see
-    /// [`ghost_common::share_binding::verify_share_tier_binding`]), fixed before the hash exists, and
+    /// credits a tier the share committed to inside its hashed coinbase, fixed before the hash
+    /// exists, and
     /// credits **exactly that committed tier** — never the achieved difficulty.
     ///
     /// Given the raw header, its expected internal-order hash, and the committed

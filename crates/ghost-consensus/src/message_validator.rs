@@ -55,7 +55,6 @@ pub const MAX_DISCOVERY_SIZE: usize = 50_000;
 /// to send is worse than a small one, because the chain cannot skip the sequence.
 pub const MAX_SHARE_BATCH_SIZE: usize = MAX_ENVELOPE_SIZE;
 
-
 pub const fn share_batch_pack_budget() -> usize {
     const JSON_EXPANSION_NUMERATOR: usize = 10;
     const JSON_EXPANSION_DENOMINATOR: usize = 31; // ~3.1x

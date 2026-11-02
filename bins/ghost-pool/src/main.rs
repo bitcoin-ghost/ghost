@@ -1218,7 +1218,7 @@ async fn main() -> Result<()> {
     // Miner count now comes from share notifications via SRI forwarder
     verification_state = verification_state.with_callbacks(
         move || rm_for_height.current_height(),
-        move || rm_for_round.current_round_id() as u64,
+        move || rm_for_round.current_round_id(),
         move || {
             rm_for_miners
                 .round_stats(rm_for_miners.current_round_id())
@@ -1790,7 +1790,7 @@ async fn main() -> Result<()> {
                     let peer_count = mesh_for_ws.peers().unique_peer_count() as u32;
                     let event = ghost_verification::WsEvent::HealthUpdate {
                         block_height: rm_for_ws.current_height(),
-                        round_id: rm_for_ws.current_round_id() as u64,
+                        round_id: rm_for_ws.current_round_id(),
                         miner_count,
                         peer_count,
                         uptime_secs: start_time.elapsed().as_secs(),
