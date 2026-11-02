@@ -44,6 +44,19 @@ pub struct NpGenesisMeta {
     pub imported_at: i64,
 }
 
+/// One payee's row in the imported genesis table: the balance carried over at the cutover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NpGenesisBalance {
+    /// The row as imported.
+    pub balance: Balance,
+    /// The export's height (the freeze height): when the balance was carried over.
+    pub export_height: u64,
+    /// When the table was imported into this store, unix seconds.
+    pub imported_at: i64,
+    /// The header time of this node's archived block at `export_height`, if it holds one.
+    pub chain_time: Option<u32>,
+}
+
 /// The `np_*` tables that must be empty for an import: the genesis table is the base every one
 /// of them was computed on, so it cannot change under them.
 const LEDGER_TABLES: &[&str] = &[
@@ -143,6 +156,55 @@ impl Database {
     /// The imported genesis table's provenance, or `None` before the import.
     pub fn np_genesis_meta(&self) -> GhostResult<Option<NpGenesisMeta>> {
         self.with_connection(read_meta)
+    }
+
+    /// `script`'s row in the imported genesis table, `None` if it has none (or nothing was
+    /// imported). One row, read without recomputing the table's root: the relay checked the
+    /// whole table against its pin when it started on this store.
+    pub fn np_genesis_balance(&self, script: &[u8]) -> GhostResult<Option<NpGenesisBalance>> {
+        self.with_connection(|conn| {
+            let Some(m) = read_meta(conn)? else {
+                return Ok(None);
+            };
+            let row = conn
+                .query_row(
+                    "SELECT owed, queue_since, \
+                            (SELECT header FROM np_btc_blocks WHERE height = ?2 LIMIT 1) \
+                     FROM np_genesis WHERE script = ?1",
+                    params![script, i64::try_from(m.export_height).unwrap_or(i64::MAX)],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(db_err)?;
+            let Some((owed, q, header)) = row else {
+                return Ok(None);
+            };
+            let queue_since = q
+                .map(|q| {
+                    u32::try_from(q)
+                        .map_err(|_| GhostError::Database(format!("np_genesis queue_since {q}")))
+                })
+                .transpose()?;
+            Ok(Some(NpGenesisBalance {
+                balance: Balance {
+                    owed: face_from_blob(&owed)?,
+                    queue_since,
+                },
+                export_height: m.export_height,
+                imported_at: m.imported_at,
+                chain_time: header
+                    .as_deref()
+                    .and_then(|h| h.get(68..72))
+                    .and_then(|t| <[u8; 4]>::try_from(t).ok())
+                    .map(u32::from_le_bytes),
+            }))
+        })
     }
 
     /// The genesis table: empty before the import. Refuses rows with no provenance, and a table
@@ -311,6 +373,21 @@ mod tests {
         let e = db.np_import_genesis(&t, &meta(&t)).unwrap_err().to_string();
         assert!(e.contains("np_ledger"), "{e}");
         assert!(db.np_genesis_table().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_payees_genesis_row_reads_with_its_export_height() {
+        let db = Database::in_memory().unwrap();
+        assert_eq!(db.np_genesis_balance(&[0x00, 0x14, 2]).unwrap(), None);
+        let t = table();
+        db.np_import_genesis(&t, &meta(&t)).unwrap();
+        let g = db.np_genesis_balance(&[0x00, 0x14, 2]).unwrap().unwrap();
+        assert_eq!(g.balance, t[&vec![0x00, 0x14, 2]]);
+        assert_eq!(
+            (g.export_height, g.imported_at, g.chain_time),
+            (974_500, 1, None)
+        );
+        assert_eq!(db.np_genesis_balance(&[0x00, 0x14, 9]).unwrap(), None);
     }
 
     #[test]

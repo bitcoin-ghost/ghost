@@ -28,11 +28,21 @@
 //! chain is the caller's question, answered with [`Database::np_ledger_event_applied`](crate::database::Database::np_ledger_event_applied) on the
 //! share's credit event key (the relay's `credit_event_key`), because the key is the relay's
 //! definition, not storage's.
+//!
+//! **The genesis table.** `np_ledger` holds only what the share chain changed: it starts empty,
+//! and settlement folds it onto the imported genesis table (`np_genesis`, migration v65). So a
+//! payee's balance is its genesis row folded with its ledger events
+//! ([`Database::np_payee_balance`](crate::database::Database::np_payee_balance), through the
+//! pure core's `apply_credits` and `apply_block`, never a re-implementation), and the balance
+//! before each event is the journalled one plus its genesis amount (owed is additive; only
+//! `queue_since` needs the fold).
 
 use rusqlite::{params, OptionalExtension};
 
+use std::collections::BTreeMap;
+
 use ghost_common::anchor_chain::{AnchorHash, ShareId};
-use ghost_common::canonical_payout::Retirement;
+use ghost_common::canonical_payout::{apply_block, apply_credits, Balance, Retirement, Table};
 use ghost_common::error::{GhostError, GhostResult};
 
 use crate::address_key::blob32;
@@ -126,10 +136,69 @@ fn header_time(h: Option<Vec<u8>>) -> Option<u32> {
 }
 
 impl Database {
+    /// `script`'s balance: its imported genesis row (if any) with every applied credit and
+    /// retirement of it folded on, in applied order, by the pure core's `apply_credits` and
+    /// `apply_block`. `None` if it has neither a genesis row nor a ledger row. With no genesis
+    /// row this is the stored ledger row ([`Database::np_balance`]), read directly.
+    pub fn np_payee_balance(&self, script: &[u8]) -> GhostResult<Option<Balance>> {
+        let Some(g) = self.np_genesis_balance(script)? else {
+            return self.np_balance(script);
+        };
+        type Row = (i64, i64, Vec<u8>);
+        let rows: Vec<Row> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, height, amount FROM ( \
+                       SELECT e.seq, c.position, e.kind, e.height, c.amount \
+                       FROM np_ledger_events e \
+                       JOIN np_credits c ON c.event_key = e.event_key \
+                       WHERE e.kind = 0 AND c.script = ?1 \
+                       UNION ALL \
+                       SELECT e.seq, r.position, e.kind, e.height, r.amount \
+                       FROM np_ledger_events e \
+                       JOIN np_retirements r ON r.block_hash = e.event_key \
+                       WHERE e.kind = 1 AND r.script = ?1 \
+                     ) ORDER BY seq, position",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![script], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err);
+            rows
+        })?;
+        let arith = |e: ghost_common::canonical_payout::PayoutError| {
+            GhostError::PayoutCalculation(e.to_string())
+        };
+        let mut t = Table::new();
+        t.insert(script.to_vec(), g.balance);
+        for (kind, h, amount) in rows {
+            let amount = face_from_blob(&amount)?;
+            let h = u32_col(h, "np ledger event height")?;
+            match kind {
+                0 => {
+                    let d: BTreeMap<_, _> = [(script.to_vec(), amount)].into();
+                    apply_credits(&mut t, &d, h).map_err(arith)?;
+                }
+                1 => {
+                    apply_block(&mut t, &[(script.to_vec(), amount)]).map_err(arith)?;
+                }
+                k => {
+                    return Err(GhostError::Database(format!(
+                        "np ledger event kind {k} is unknown"
+                    )))
+                }
+            }
+        }
+        Ok(t.remove(script))
+    }
+
     /// Every change to `script`'s balance at height `min_height` or above, in the order this
     /// node applied them (at most `limit_n`, the newest kept). Credits come from `np_credits`,
     /// blocks from `np_retirements`; both carry the balance they replaced, so the balance after
-    /// each event is exact.
+    /// each event is exact. That balance includes `script`'s genesis row: the journals record
+    /// the share chain's own table, which starts empty, so its genesis amount is added.
     pub fn np_payee_ledger_events(
         &self,
         script: &[u8],
@@ -188,6 +257,9 @@ impl Database {
                 .map_err(db_err);
             rows
         })?;
+        let genesis = self
+            .np_genesis_balance(script)?
+            .map_or(0, |g| g.balance.owed);
         let mut out = rows
             .into_iter()
             .map(|(seq, kind, h, at, amount, prior, block, header)| {
@@ -206,11 +278,12 @@ impl Database {
                     height: u32_col(h, "np ledger event height")?,
                     applied_at: at,
                     amount: face_from_blob(&amount)?,
-                    prior_owed: prior
-                        .as_deref()
-                        .map(face_from_blob)
-                        .transpose()?
-                        .unwrap_or(0),
+                    prior_owed: genesis
+                        + prior
+                            .as_deref()
+                            .map(face_from_blob)
+                            .transpose()?
+                            .unwrap_or(0),
                     block_hash: block.map(|b| blob32(b, "np block hash")).transpose()?,
                     chain_time: header_time(header),
                 })
@@ -377,12 +450,18 @@ impl Database {
             .collect()
     }
 
-    /// Rows in the materialised balance table.
+    /// Payees with a balance row: in the imported genesis table, the share chain's ledger, or
+    /// both (counted once).
     pub fn np_ledger_rows(&self) -> GhostResult<u64> {
         self.with_connection(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM np_ledger", [], |r| r.get::<_, i64>(0))
-                .map(|n| n.max(0) as u64)
-                .map_err(db_err)
+            conn.query_row(
+                "SELECT COUNT(*) FROM (SELECT script FROM np_ledger \
+                 UNION SELECT script FROM np_genesis)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)
+            .map_err(db_err)
         })
     }
 }
@@ -576,6 +655,123 @@ mod tests {
         assert_eq!(
             db.np_payee_ledger_events(&payee(7), 0, 100).unwrap().len(),
             2
+        );
+    }
+
+    /// A store with an imported genesis table: payee 7 carried over below the floor, payee 9
+    /// above it, payee 8 not at all.
+    fn with_genesis() -> (Database, Table) {
+        use crate::node_pool_genesis::NpGenesisMeta;
+        use ghost_common::canonical_payout::table_root;
+        let db = Database::in_memory().unwrap();
+        let mut g = Table::new();
+        g.insert(
+            payee(7),
+            Balance {
+                owed: 900 * FACE_PER_SAT,
+                queue_since: None,
+            },
+        );
+        g.insert(
+            payee(9),
+            Balance {
+                owed: 5_000 * FACE_PER_SAT + 3,
+                queue_since: Some(400),
+            },
+        );
+        db.np_import_genesis(
+            &g,
+            &NpGenesisMeta {
+                export_digest: [7; 32],
+                network: "regtest".into(),
+                export_height: 400,
+                queue_since: 400,
+                row_count: 2,
+                table_root: table_root(&g),
+                imported_at: 1,
+            },
+        )
+        .unwrap();
+        (db, g)
+    }
+
+    #[test]
+    fn a_payees_balance_folds_its_genesis_row_with_the_share_chains_events() {
+        use ghost_common::canonical_payout::table_for_from;
+        let (db, g) = with_genesis();
+        btc_block(&db, 400, 1_699_000_000);
+        let mut d1 = BTreeMap::new();
+        d1.insert(payee(7), 200 * FACE_PER_SAT);
+        d1.insert(payee(8), 50 * FACE_PER_SAT);
+        db.np_apply_credits(&[0x31; 32], 510, &d1, 300).unwrap();
+        let mut d2 = BTreeMap::new();
+        d2.insert(payee(9), 7);
+        db.np_apply_credits(&[0x32; 32], 520, &d2, 310).unwrap();
+        let paid = vec![
+            (payee(9), 5_000 * FACE_PER_SAT),
+            (payee(7), 100 * FACE_PER_SAT),
+        ];
+        db.np_apply_block(&[0xB1; 32], 700, &paid, 400).unwrap();
+
+        // The same events folded onto the genesis table by the pure core.
+        let credits: BTreeMap<u32, BTreeMap<Vec<u8>, i128>> = [(510, d1), (520, d2)].into();
+        let blocks: BTreeMap<u32, Vec<(Vec<u8>, i128)>> = [(700, paid)].into();
+        let want = table_for_from(g, 10_000, &credits, &blocks).unwrap();
+        for p in [7, 8, 9] {
+            assert_eq!(
+                db.np_payee_balance(&payee(p)).unwrap().as_ref(),
+                want.get(&payee(p)),
+                "payee {p}"
+            );
+        }
+        // Payee 7 crossed the floor only with its genesis amount: the share chain's own row
+        // (200 sats credited, 100 paid) never did.
+        let seven = db.np_payee_balance(&payee(7)).unwrap().unwrap();
+        assert_eq!(seven.owed, 1_000 * FACE_PER_SAT);
+        assert_eq!(seven.queue_since, Some(510));
+        assert_eq!(db.np_balance(&payee(7)).unwrap().unwrap().queue_since, None);
+        // Payee 9 was paid its carried-over balance down to 10 units: off the queue.
+        assert_eq!(
+            db.np_payee_balance(&payee(9)).unwrap(),
+            Some(Balance {
+                owed: 10,
+                queue_since: None
+            })
+        );
+        // No genesis row: the stored ledger row.
+        assert_eq!(
+            db.np_payee_balance(&payee(8)).unwrap(),
+            db.np_balance(&payee(8)).unwrap()
+        );
+        assert_eq!(db.np_payee_balance(&payee(99)).unwrap(), None);
+        // 7, 8 and 9 hold rows; 7 and 9 are in both tables.
+        assert_eq!(db.np_ledger_rows().unwrap(), 3);
+
+        // A carried-over payee with no events yet: its genesis row.
+        let (db, g) = with_genesis();
+        assert_eq!(
+            db.np_payee_balance(&payee(9)).unwrap().as_ref(),
+            g.get(&payee(9))
+        );
+        assert_eq!(db.np_ledger_rows().unwrap(), 2);
+    }
+
+    #[test]
+    fn ledger_events_carry_the_balance_with_the_genesis_amount() {
+        let (db, _) = with_genesis();
+        let mut d = BTreeMap::new();
+        d.insert(payee(7), 200 * FACE_PER_SAT);
+        db.np_apply_credits(&[0x31; 32], 510, &d, 300).unwrap();
+        db.np_apply_block(&[0xB1; 32], 700, &[(payee(7), 1_000 * FACE_PER_SAT)], 400)
+            .unwrap();
+        let ev = db.np_payee_ledger_events(&payee(7), 0, 100).unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].prior_owed, 900 * FACE_PER_SAT, "the genesis amount");
+        assert_eq!(ev[1].prior_owed, 1_100 * FACE_PER_SAT);
+        assert_eq!(
+            ev[1].prior_owed - ev[1].amount,
+            db.np_payee_balance(&payee(7)).unwrap().unwrap().owed,
+            "the last event ends at the balance"
         );
     }
 }
