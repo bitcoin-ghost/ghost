@@ -57,6 +57,7 @@ use ghost_np_relay::headers::{HeaderOracle, MemHeaders};
 use ghost_np_relay::net::{spawn_with_settlement, NetConfig, RelayHandle};
 use ghost_np_relay::relay::{Genesis, JobAnchor, Relay, RelayParams};
 use ghost_np_relay::settlement::{BlockSource, MemBlocks, SettledView, Settlement};
+use ghost_np_relay::wire::NodeAdvert;
 use ghost_storage::Database;
 
 const GENESIS: [u8; 32] = [0xEE; 32];
@@ -140,6 +141,18 @@ async fn relay(
     node_id: Option<[u8; 32]>,
     stamp: Arc<Mutex<Option<JobAnchor>>>,
 ) -> RelayHandle {
+    relay_with(blocks, listen, node_id, stamp, None, vec![]).await
+}
+
+/// [`relay`], advertising `advert` and dialling `peers`.
+async fn relay_with(
+    blocks: &MemBlocks,
+    listen: bool,
+    node_id: Option<[u8; 32]>,
+    stamp: Arc<Mutex<Option<JobAnchor>>>,
+    advert: Option<NodeAdvert>,
+    peers: Vec<std::net::SocketAddr>,
+) -> RelayHandle {
     let db = Arc::new(Database::in_memory().unwrap());
     let params = RelayParams::new(
         Genesis {
@@ -162,6 +175,9 @@ async fn relay(
             listen: listen.then(|| "127.0.0.1:0".parse().unwrap()),
             tick_ms: 100,
             node_id,
+            advert,
+            peers,
+            dial_secs: 1,
             ..NetConfig::default()
         },
         oracle,
@@ -250,7 +266,11 @@ fn notify(id: usize, prev: [u8; 32], stamp: JobAnchor, payee: &[u8], how: Hostil
 
 /// An SV1 server that answers subscribe and authorize, then sends `jobs` on every connection.
 async fn stratum(jobs: Vec<Vec<Value>>) -> String {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    stratum_on(TcpListener::bind("127.0.0.1:0").await.unwrap(), jobs)
+}
+
+/// [`stratum`] on a listener already bound.
+fn stratum_on(l: TcpListener, jobs: Vec<Vec<Value>>) -> String {
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(async move {
         loop {
@@ -492,4 +512,191 @@ async fn the_prober_verdict_has_its_shape() {
     assert_eq!(r.verdict, ProbeVerdict::Unmeasured, "{:?}", r.reasons);
     assert!(!r.listable);
     assert!(r.reasons.contains(&"relay_unreachable".to_string()));
+}
+
+/// Wait for a relay's job stamp.
+async fn stamp_of(stamp: &Arc<Mutex<Option<JobAnchor>>>) -> JobAnchor {
+    for _ in 0..100 {
+        if let Some(s) = *stamp.lock().unwrap() {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no job stamp published");
+}
+
+/// Open listing end to end: two nodes found from relay gossip alone (the lister is told only
+/// the first), each read for its advert and probed on the advertised SV1 port over several
+/// rounds. The honest one is listed with its advertised endpoints; the one serving a coinbase
+/// with the wrong treasury is probed every round and never listed; a relay that advertises no
+/// stratum port is a candidate that is never listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
+    use ghost_audit::discover::{ask, Limits};
+    use ghost_audit::lister::{run_round, LiveProber, RoundConfig};
+    use ghost_audit::listing::{
+        render_dns, render_node_list, DnsConfig, ListMeta, ListState, Policy,
+    };
+
+    let blocks = bitcoin_chain();
+    let prev = blocks.at(TIP).unwrap().hash();
+    let me = p2tr("the lister");
+
+    // The cheat, its stratum port bound first so its relay can advertise it.
+    let cheat_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cheat_sv1 = cheat_l.local_addr().unwrap().port();
+    let cheat_stamp = Arc::new(Mutex::new(None));
+    let cheat = relay_with(
+        &blocks,
+        true,
+        Some(NODE_ID),
+        cheat_stamp.clone(),
+        Some(NodeAdvert {
+            sv1_port: cheat_sv1,
+            sv2_port: 0,
+            sv2_authority_key: String::new(),
+        }),
+        vec![],
+    )
+    .await;
+    let cs = stamp_of(&cheat_stamp).await;
+    stratum_on(
+        cheat_l,
+        vec![
+            notify(1, prev, cs, &me, Hostile::Honest),
+            notify(2, prev, cs, &me, Hostile::WrongTreasury),
+        ],
+    );
+
+    // A relay with no pool: no advert.
+    let bare = relay_with(
+        &blocks,
+        true,
+        None,
+        Arc::new(Mutex::new(None)),
+        None,
+        vec![],
+    )
+    .await;
+
+    // The honest node, which dials the other two, so its gossip names them.
+    let honest_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let honest_sv1 = honest_l.local_addr().unwrap().port();
+    let honest_stamp = Arc::new(Mutex::new(None));
+    let honest = relay_with(
+        &blocks,
+        true,
+        Some(NODE_ID),
+        honest_stamp.clone(),
+        Some(NodeAdvert {
+            sv1_port: honest_sv1,
+            sv2_port: 34255,
+            sv2_authority_key: "the-authority-key".into(),
+        }),
+        vec![cheat.listen_addr.unwrap(), bare.listen_addr.unwrap()],
+    )
+    .await;
+    let hs = stamp_of(&honest_stamp).await;
+    stratum_on(
+        honest_l,
+        vec![
+            notify(1, prev, hs, &me, Hostile::Honest),
+            notify(2, prev, hs, &me, Hostile::Honest),
+        ],
+    );
+    // Let the honest node connect to both.
+    for _ in 0..100 {
+        if honest.status.borrow().peers >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        honest.status.borrow().peers >= 2,
+        "the honest node reached its peers"
+    );
+
+    let mine = relay(&blocks, false, None, Arc::new(Mutex::new(None))).await;
+    let chain = RelayChain::from_handle(mine, Arc::new(blocks));
+    let prober = Arc::new(LiveProber {
+        genesis: GENESIS,
+        address: "bcrt1p-the-lister".into(),
+        payee: me.clone(),
+        user_agent: "ghost-audit-list/test".into(),
+        jobs: 2,
+        wait: Duration::from_secs(20),
+        timeout: Duration::from_secs(10),
+        data: Arc::new(chain),
+    });
+    let cfg = RoundConfig {
+        seeds: vec![honest.listen_addr.unwrap()],
+        limits: Limits {
+            allow_private: true,
+            max_per_ip: 8,
+            timeout: Duration::from_secs(5),
+            ..Limits::default()
+        },
+        policy: Policy::default(),
+        probe_concurrency: 3,
+        forget_after_secs: 3_600,
+    };
+    let mut state = ListState::default();
+    for round in 0..4u64 {
+        let r = run_round(
+            &mut state,
+            &cfg,
+            |a| ask(a, GENESIS, Duration::from_secs(5)),
+            prober.clone(),
+            round,
+        )
+        .await;
+        assert_eq!(r.candidates, 3, "round {round}: {r:?}");
+        assert_eq!(r.probed, 3);
+        assert_eq!(
+            r.outcomes,
+            (1, 1, 1),
+            "round {round}: {:?}",
+            state.candidates
+        );
+    }
+    let h = honest.listen_addr.unwrap();
+    let listed: Vec<_> = state.listed().map(|c| c.relay).collect();
+    assert_eq!(listed, vec![h]);
+    let cheat_c = &state.candidates[&cheat.listen_addr.unwrap()];
+    assert_eq!(cheat_c.counts(), (0, 4, 0));
+    assert_eq!(
+        cheat_c.history.back().unwrap().reasons,
+        ["job_wrong_treasury"]
+    );
+    let bare_c = &state.candidates[&bare.listen_addr.unwrap()];
+    assert_eq!(bare_c.counts(), (0, 0, 4));
+    assert_eq!(bare_c.history.back().unwrap().reasons, ["advert_none"]);
+
+    let meta = ListMeta {
+        generated_at: 1_793_620_800,
+        network: "regtest".into(),
+        genesis_anchor: hex::encode(GENESIS),
+        policy: Policy::default(),
+    };
+    let v: Value = serde_json::from_str(&render_node_list(&state, &meta)).unwrap();
+    assert_eq!(v["listed"], 1);
+    assert_eq!(v["candidates"], 3);
+    let n = &v["nodes"][0];
+    assert_eq!(n["relay"], h.to_string());
+    assert_eq!(n["sv1"], format!("stratum+tcp://127.0.0.1:{honest_sv1}"));
+    assert_eq!(n["sv2"], "127.0.0.1:34255");
+    assert_eq!(n["sv2_authority_key"], "the-authority-key");
+    assert_eq!(n["node_id"], hex::encode(NODE_ID));
+    assert_eq!(n["protocol_version"], 1);
+    assert_eq!(n["recent"]["pass"], 4);
+    let dns = render_dns(
+        &state,
+        &DnsConfig {
+            sv1_port: honest_sv1,
+            ..DnsConfig::default()
+        },
+        0,
+    );
+    let records: Vec<&str> = dns.lines().filter(|l| !l.starts_with(';')).collect();
+    assert_eq!(records, ["pool 300 IN A 127.0.0.1"]);
 }
