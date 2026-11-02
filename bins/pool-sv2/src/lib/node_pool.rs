@@ -179,8 +179,11 @@ struct State {
     sessions: HashMap<String, ClassSensor>,
     future_templates: VecDeque<NewTemplate<'static>>,
     active_template: Option<NewTemplate<'static>>,
-    tables: VecDeque<(([u8; 32], u32), Arc<Table>)>,
+    tables: VecDeque<(TableKey, Arc<Table>)>,
 }
+
+/// A cached table's key: the job's parent anchor and height.
+type TableKey = ([u8; 32], u32);
 
 /// The node pool job layer's state.
 pub struct NodePool {
@@ -1185,7 +1188,7 @@ mod tests {
         assert_eq!(np.check_block_bytes(key, 5, &bytes), Ok(()));
         // One sat moved between payees, a payee swapped, the finder skimming the treasury.
         let mut moved = outs.clone();
-        moved[1].value = moved[1].value - Amount::from_sat(1);
+        moved[1].value -= Amount::from_sat(1);
         moved[2].value += Amount::from_sat(1);
         assert!(np.check_block(key, 5, &tx(moved)).is_err());
         let mut swapped = outs.clone();
@@ -1193,7 +1196,7 @@ mod tests {
         assert!(np.check_block(key, 5, &tx(swapped)).is_err());
         let mut skim = outs.clone();
         let n = skim.len();
-        skim[0].value = skim[0].value - Amount::from_sat(10);
+        skim[0].value -= Amount::from_sat(10);
         skim[n - 3].value += Amount::from_sat(10);
         assert!(np.check_block(key, 5, &tx(skim)).is_err());
         assert!(np.check_block(key, 6, &good).is_err(), "unknown job");

@@ -34,7 +34,6 @@
 //! - [`rpc`] - JSON-RPC request parsing for Stratum protocol
 //! - [`template`] - Block template processing with BUDS filtering
 //! - [`template_provider`] - Template Distribution Protocol (TDP) server
-//! - [`treasury`] - Treasury state and fee distribution tracking
 //! - [`validation`] - Input validation for miner credentials and shares
 
 /// Periodic operator-alert monitors (behind-tip / update-available).
@@ -113,9 +112,6 @@ pub mod template;
 
 /// Template Distribution Protocol (TDP) for SRI integration.
 pub mod template_provider;
-
-/// Treasury and fee distribution state.
-pub mod treasury;
 
 /// P2P share proof handling for cross-node share propagation.
 pub mod share_handler;

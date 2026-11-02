@@ -227,10 +227,13 @@ impl BlockSource for RpcBlockSource {
     }
 }
 
+/// Blocks by height: hash and coinbase.
+type BlocksByHeight = BTreeMap<u32, ([u8; 32], Transaction)>;
+
 /// An in-memory best chain: tests, and a node handed its blocks.
 #[derive(Clone, Default)]
 pub struct MemBlocks {
-    inner: Arc<Mutex<BTreeMap<u32, ([u8; 32], Transaction)>>>,
+    inner: Arc<Mutex<BlocksByHeight>>,
 }
 
 impl MemBlocks {
@@ -244,7 +247,7 @@ impl MemBlocks {
         let _dropped = self.lock().split_off(&(h + 1));
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, ([u8; 32], Transaction)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BlocksByHeight> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
