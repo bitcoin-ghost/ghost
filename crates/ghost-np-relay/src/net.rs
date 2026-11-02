@@ -32,8 +32,11 @@
 //! Peers come from configuration and from `Addr` gossip: any reachable node that completes the
 //! handshake is a peer. The transport is plain TCP: everything carried is public and checked on
 //! arrival, so nothing relies on the channel being private or authenticated.
+//!
+//! The task also answers `GetStamps` with the job stamps it published to pool_sv2 (W2.9), when
+//! [`NetConfig::node_id`] is set.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,7 +56,8 @@ use crate::peers::{penalty, AddrBook, AddrSource, PeerState};
 use crate::relay::{JobAnchor, Out, PeerId, Relay, RelayStatus};
 use crate::settlement::{BlockSource, Settlement};
 use crate::wire::{
-    Hello, Message, NetShare, WireError, FRAME_HEADER_LEN, MAX_ADDRS, PROTOCOL_VERSION,
+    Hello, JobStamps, Message, NetShare, NotFoundKind, WireError, FRAME_HEADER_LEN, MAX_ADDRS,
+    MAX_STAMPS, PROTOCOL_VERSION,
 };
 
 /// Transport settings.
@@ -77,6 +81,10 @@ pub struct NetConfig {
     pub tick_ms: u64,
     /// How often to top up outbound connections, seconds.
     pub dial_secs: u64,
+    /// The node id pool_sv2 stamps its jobs with. Set, the node answers `GetStamps` with it and
+    /// its recent job stamps so a miner's `ghost-audit` can open its job's tag; `None` (a relay
+    /// with no pool, such as the auditor's own) answers `NotFound`.
+    pub node_id: Option<[u8; 32]>,
 }
 
 impl Default for NetConfig {
@@ -91,6 +99,7 @@ impl Default for NetConfig {
             user_agent: format!("ghost-np-relay/{}", env!("CARGO_PKG_VERSION")),
             tick_ms: 1_000,
             dial_secs: 5,
+            node_id: None,
         }
     }
 }
@@ -99,12 +108,16 @@ impl Default for NetConfig {
 pub type Publisher = Arc<dyn Fn(JobAnchor) + Send + Sync>;
 
 /// pool_sv2 asking for the table a job must pay: [`Relay::block_table`] after settlement has
-/// caught up with the Bitcoin tip.
+/// caught up with the Bitcoin tip; or, with `prev`, [`Relay::block_table_on`] that Bitcoin block
+/// (`ghost-audit`, judging a job on whatever `prev_hash` it names).
 pub struct TableRequest {
     /// The anchor the job builds on.
     pub parent: AnchorHash,
     /// The job's height.
     pub height: u32,
+    /// The job's `prev_hash`, internal byte order. `None`: this node's best-chain block at
+    /// `height - 1`. Given, the answer is `None` unless it is an archived block at `height - 1`.
+    pub prev: Option<[u8; 32]>,
     /// Where the answer goes; `None` if the anchor is not held.
     pub reply: tokio::sync::oneshot::Sender<Option<Arc<Table>>>,
 }
@@ -240,6 +253,7 @@ pub async fn spawn_with_settlement(
         ev_tx,
         status_tx,
         settlement,
+        stamps: VecDeque::new(),
     };
     let task = tokio::spawn(node.run(ev_rx, local_rx, tables_rx));
     Ok(RelayHandle {
@@ -266,6 +280,8 @@ struct Node {
     ev_tx: mpsc::Sender<Event>,
     status_tx: watch::Sender<RelayStatus>,
     settlement: Option<SettlementParts>,
+    /// Job stamps published to pool_sv2, newest first, at most [`MAX_STAMPS`].
+    stamps: VecDeque<JobAnchor>,
 }
 
 impl Node {
@@ -292,7 +308,22 @@ impl Node {
                 }
                 Some(req) = tables_rx.recv() => {
                     self.settle().await;
-                    let t = self.relay.block_table(&req.parent, req.height);
+                    let t = match req.prev {
+                        None => self.relay.block_table(&req.parent, req.height),
+                        Some(prev) => {
+                            let at = self.relay.archive().get(&prev).map(|b| b.height);
+                            match at {
+                                Some(h) if h.checked_add(1) == Some(req.height) => {
+                                    self.relay.block_table_on(&req.parent, req.height, &prev)
+                                }
+                                Some(_) => None,
+                                None => {
+                                    self.fetch_blocks(vec![prev]).await;
+                                    None
+                                }
+                            }
+                        }
+                    };
                     let _ = req.reply.send(t);
                 }
                 _ = tick.tick() => {
@@ -537,6 +568,17 @@ impl Node {
                     }
                 }
             }
+            Message::GetStamps => {
+                let reply = match self.cfg.node_id {
+                    Some(node_id) if !self.stamps.is_empty() => Message::Stamps(JobStamps {
+                        node_id,
+                        recent: self.stamps.iter().copied().collect(),
+                    }),
+                    _ => Message::NotFound(NotFoundKind::Stamps, [0; 32]),
+                };
+                self.send(conn, &reply);
+            }
+            Message::Stamps(_) => {}
             m => {
                 let prevs: Vec<[u8; 32]> = match &m {
                     Message::Share(s) => vec![s.prev_hash()],
@@ -577,7 +619,12 @@ impl Node {
                     score,
                     reason,
                 } => self.penalize(peer, score, &reason),
-                Out::Publish(job) => (self.publish)(job),
+                Out::Publish(job) => {
+                    self.stamps.retain(|j| *j != job);
+                    self.stamps.push_front(job);
+                    self.stamps.truncate(MAX_STAMPS);
+                    (self.publish)(job)
+                }
             }
         }
     }

@@ -158,6 +158,8 @@ pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHand
         listen: cfg.listen,
         advertise_port: cfg.advertise_port,
         peers,
+        // Answer `GetStamps`, so miners can open their jobs' tags with `ghost-audit` (W2.9).
+        node_id: Some(np.node_id()),
         ..NetConfig::default()
     };
     let driver = np.anchor_driver();

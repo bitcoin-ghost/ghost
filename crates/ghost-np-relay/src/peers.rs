@@ -116,6 +116,7 @@ pub fn limits_for(t: MsgType) -> (f64, f64) {
         GetAddr | Addr => (0.1, 4.0),
         GetHeaders | Headers => (4.0, 40.0),
         GetBtcBlocks | BtcBlocks => (10.0, 100.0),
+        GetStamps | Stamps => (1.0, 10.0),
     }
 }
 

@@ -31,6 +31,7 @@
 //! - [`peers`]: rate limits, ban scores, the address book.
 //! - [`headers`]: the Bitcoin header facts share checks need.
 //! - [`net`]: the TCP transport that drives the core.
+//! - [`client`]: a one-shot client that reads a node's advert and job stamps (W2.9).
 //! - [`settlement`]: retiring what pool blocks paid into the stored ledger.
 //! - [`archive`]: the Bitcoin block archive, stale branches included, that share checks and
 //!   settlement read (W2.13).
@@ -41,6 +42,7 @@
 
 pub mod archive;
 pub mod checkpoint;
+pub mod client;
 pub mod headers;
 pub mod net;
 pub mod peers;
