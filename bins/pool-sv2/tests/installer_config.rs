@@ -7,8 +7,8 @@
 //!   `[node_pool]` and `[node_pool.relay]` sections startup requires;
 //! - on regtest, whose genesis the installer defines, [`NodePool::resolve`] accepts it and the
 //!   relay starts on it and publishes the genesis anchor;
-//! - on mainnet, whose genesis is not published, the `UNSET` placeholder is refused by name, and
-//!   a genesis passed to the installer is accepted;
+//! - on mainnet, whose start is compiled into pool_sv2 and not set yet, the `UNSET` placeholder
+//!   is refused by name, and a genesis passed to the installer is refused too (W2.8);
 //! - the shell's fee address check agrees with [`NodePool::fee_script`] plus the network on every
 //!   address class, so the installer neither writes an address pool_sv2 refuses nor refuses one
 //!   it accepts.
@@ -129,7 +129,17 @@ async fn regtest_config_is_accepted_by_resolve_and_starts_the_relay() {
     );
     assert_eq!(relay.genesis_btc_height, 0);
     assert!(relay.tier_base.is_some(), "regtest needs an easier tier 0");
+    assert_eq!(relay.network.as_deref(), Some("regtest"));
     let genesis = relay.genesis_hash().expect("regtest's genesis is defined");
+    let start = relay
+        .network_start()
+        .expect("regtest starts on its genesis");
+    assert_eq!(start.genesis_anchor, genesis);
+    assert_eq!(
+        genesis,
+        ghost_common::node_pool_network::regtest_default_genesis(),
+        "the installer writes regtest's default"
+    );
 
     let node_id = [0x5C; 32];
     np_cfg.ghost_pool_health_url = Some(health_server(node_id).await);
@@ -174,18 +184,23 @@ fn mainnet_config_parses_and_its_unset_genesis_is_refused_by_name() {
     assert_eq!(relay.genesis_anchor, GENESIS_UNSET);
     assert!(relay.peers.is_empty());
     assert!(relay.tier_base.is_none(), "mainnet tier 0 is difficulty 1");
+    assert_eq!(relay.network.as_deref(), Some("mainnet"));
     let e = relay.genesis_hash().unwrap_err();
     assert!(e.contains("has not been published"), "{e}");
     assert!(
         e.contains("--genesis-anchor"),
         "the refusal names the fix: {e}"
     );
+    assert_eq!(relay.network_start().unwrap_err(), e, "the same refusal");
 
+    // A genesis passed on mainnet is written, and refused: mainnet's start is compiled in.
     let given = "cd".repeat(32);
     let config = load(&render("mainnet", MAINNET_FEE, "", Some((&given, 975_000))));
     let relay = config.node_pool().unwrap().relay.clone().unwrap();
     assert_eq!(relay.genesis_hash().unwrap(), [0xcd; 32]);
     assert_eq!(relay.genesis_btc_height, 975_000);
+    let e = relay.network_start().unwrap_err();
+    assert!(e.contains("compiled into pool_sv2"), "{e}");
 }
 
 #[test]
@@ -195,7 +210,10 @@ fn signet_config_parses() {
     let np_cfg = config.node_pool().unwrap();
     assert_eq!(np_cfg.fee_address, fee);
     NodePool::fee_script(fee).unwrap();
-    assert!(np_cfg.relay.as_ref().unwrap().genesis_hash().is_err());
+    let relay = np_cfg.relay.as_ref().unwrap();
+    assert_eq!(relay.network.as_deref(), Some("signet"));
+    assert!(relay.genesis_hash().is_err());
+    assert!(relay.network_start().is_err());
 }
 
 /// One address of each class, for a network.

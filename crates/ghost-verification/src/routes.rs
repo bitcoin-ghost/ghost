@@ -264,7 +264,9 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/filtering/activity",
             get(api_filtering_activity_handler),
         )
-        // `/api/v1/payments` moved to `internal_router` — it emits payout addresses and txids.
+        // The old payout reads (`/api/v1/payments`, `/payouts`, payout history) are gone with the
+        // old ledger: `node_pool_routes::removed_router` answers them 410, and a miner's payouts
+        // are `/api/v1/ledger/{address}`.
         .route("/api/v1/backup/history", get(api_backup_history_handler))
         .route(
             "/api/v1/network/public-nodes",
@@ -324,7 +326,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // Auth endpoint (returns empty token for dashboard compatibility)
         .route("/auth/token", get(api_auth_token_handler))
         // Prometheus metrics endpoint
-        .route("/metrics", get(metrics_handler));
+        .route("/metrics", get(metrics_handler))
+        // The node pool's ledger and status (W2.11), forwarded to pool_sv2, and `410 Gone` for
+        // the routes of every feature the node pool removed.
+        .merge(crate::node_pool_routes::node_pool_router())
+        .merge(crate::node_pool_routes::removed_router());
 
     // Localhost-only endpoints: SRI Pool share webhook (no HMAC required)
     // SRI Pool runs on localhost and doesn't support HMAC auth headers.
@@ -1135,12 +1141,11 @@ async fn api_mining_template_handler(
     }
 }
 
-/// Categorised coinbase breakdown for the block currently being built: the
-/// miner pool, node reward pool, treasury and finder tx-fees, plus per-recipient
-/// entries. Operator-authed callers (dashboard proxy signing over an empty body,
-/// same as `/api/v1/mining/miners`) see full recipient addresses; everyone else
-/// gets the amounts and counts with addresses stripped (`addresses_redacted`).
-/// `{ "available": false }` until a payout has been agreed for the round.
+/// The coinbase split of the block currently being built: subsidy, the treasury's base share,
+/// the miners' share and the transaction fees to the finder (ghost-mining's template). Which
+/// miners a block pays is decided per job by pool_sv2; see `/api/v1/node-pool/status`. Any
+/// per-recipient `miners`/`nodes` entries are stripped of addresses for callers without the
+/// operator signature (`addresses_redacted`). `{ "available": false }` until there is a template.
 async fn api_mining_coinbase_handler(
     State(state): State<Arc<VerificationState>>,
     headers: HeaderMap,
@@ -10786,9 +10791,7 @@ mod tests {
             "/api/v1/config/ghost_mode_local_egress",
             "/api/v1/config/policy_profile",
             "/api/v1/config/policy_custom",
-            "/api/v1/config/public_mining",
             "/api/v1/config/reaper",
-            "/api/v1/config/elder",
             "/api/v1/config/operator_window",
         ];
 
@@ -10801,7 +10804,6 @@ mod tests {
                     r#"{"allow_t0": true, "allow_t1": true, "allow_t2": false, "allow_t3": false, "allow_inscriptions": false, "allow_runes": false, "allow_brc20": false, "max_op_return_size": 40, "max_witness_per_input": 500, "max_tx_outputs": 8, "max_tx_size": 90000, "min_fee_rate": 1.0}"#
                 }
                 "/api/v1/config/operator_window" => r#"{"blocks": 2016}"#,
-                "/api/v1/config/elder" => r#"{"enabled": true, "slot": 1}"#,
                 _ => r#"{"enabled": true}"#,
             };
 
@@ -11183,9 +11185,6 @@ mod tests {
         let locked_endpoints = [
             "/shares",
             "/rounds",
-            "/payouts",
-            "/api/v1/payments",
-            "/api/v1/network/payout-history",
             "/api/v1/config/full",
             "/api/v1/config/alerts",
         ];
@@ -11220,7 +11219,7 @@ mod tests {
     async fn test_payout_identity_get_endpoints_accept_operator_signature() {
         let state = create_test_state_with_auth();
 
-        for endpoint in ["/payouts", "/api/v1/config/full"] {
+        for endpoint in ["/shares", "/api/v1/config/full"] {
             let app = super::create_router(Arc::clone(&state));
             let (signature, timestamp) = operator_get_signature();
 

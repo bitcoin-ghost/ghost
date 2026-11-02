@@ -138,6 +138,8 @@ pub struct ChannelStatus {
     pub key: ChannelKey,
     /// Its kind.
     pub kind: ChannelKind,
+    /// The payee script its shares credit.
+    pub payee_script: Vec<u8>,
     /// Miner outputs its jobs carry.
     pub slot_class: u16,
     /// Sensing state, for extended channels.
@@ -840,6 +842,7 @@ impl NodePool {
             .map(|(key, slot)| ChannelStatus {
                 key: *key,
                 kind: slot.kind,
+                payee_script: slot.payee_script.clone(),
                 slot_class: class_of(&st, *key),
                 sensing: slot
                     .session

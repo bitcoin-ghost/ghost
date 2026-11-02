@@ -134,6 +134,8 @@ fee_address = "${NODE_FEE_ADDRESS}"
 # The share-chain relay and settlement, with their own store. The genesis is the network's
 # (regtest, signet, mainnet): where this node's share chain starts.
 [node_pool.relay]
+# mainnet runs only on the start compiled into pool_sv2; signet and regtest use genesis_anchor.
+network = "${NODE_POOL_NETWORK}"
 listen = "0.0.0.0:8566"
 peers = []
 db_path = "/var/lib/ghost/node-pool.db"

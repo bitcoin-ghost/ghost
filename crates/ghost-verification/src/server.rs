@@ -1196,6 +1196,10 @@ pub type RecordsCache = Arc<
     >,
 >;
 
+/// pool_sv2's monitoring listener, as `scripts/install-node.sh` configures it
+/// (`monitoring_address = "127.0.0.1:9090"`): where the node pool API is served.
+pub const DEFAULT_NODE_POOL_API: &str = "http://127.0.0.1:9090";
+
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -1368,11 +1372,15 @@ pub struct VerificationState {
     /// `WorkState` type. `None` (or a `None` result) means no template yet.
     #[allow(clippy::type_complexity)]
     template_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
-    /// Provider returning a JSON snapshot of how the coinbase for the block
-    /// currently being built splits across recipients (miner pool, node reward
-    /// pool, treasury, tx fees to finder) plus per-recipient entries. A closure
-    /// so this crate needn't depend on ghost-mining's payout types. `None` (or a
-    /// `None` result) means no payout has been agreed for the current round yet.
+    /// Base URL of pool_sv2's node pool API (W2.11), which owns the share-chain ledger. The
+    /// public `/api/v1/ledger/{address}` and `/api/v1/node-pool/status` routes forward to it.
+    /// Defaults to [`DEFAULT_NODE_POOL_API`], the loopback monitoring listener the installer
+    /// configures.
+    pub node_pool_api: String,
+    /// Provider returning a JSON snapshot of the coinbase for the block currently being built:
+    /// the subsidy, the treasury's base share, the miners' share and the transaction fees to the
+    /// finder. A closure so this crate needn't depend on ghost-mining's template types. `None`
+    /// (or a `None` result) means there is no template yet.
     #[allow(clippy::type_complexity)]
     coinbase_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
     /// Seconds elapsed in the current mining round (time working the current
@@ -1610,6 +1618,7 @@ impl VerificationState {
             template_refresh_ms: None,
             template_snapshot: None,
             coinbase_snapshot: None,
+            node_pool_api: DEFAULT_NODE_POOL_API.to_string(),
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
@@ -2096,6 +2105,12 @@ impl VerificationState {
             "signing identity must match the state's node_id"
         );
         self.identity = Some(identity);
+        self
+    }
+
+    /// Where pool_sv2's node pool API listens (`http://host:port`).
+    pub fn with_node_pool_api(mut self, base_url: impl Into<String>) -> Self {
+        self.node_pool_api = base_url.into();
         self
     }
 

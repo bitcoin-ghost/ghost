@@ -23,15 +23,15 @@
   // Candidate paths per displayed field, first match wins. Arrays are shown
   // as their length.
   var FIELDS = {
-    tip_height:   ['share_chain.tip_height', 'share_chain.height', 'tip.height', 'anchor_height', 'tip_height', 'anchors'],
+    tip_height:   ['share_chain.anchor_height', 'share_chain.tip_height', 'share_chain.height', 'tip.height', 'anchor_height', 'tip_height', 'anchors'],
     btc_height:   ['btc_height', 'bitcoin_height', 'tip.btc_height', 'share_chain.btc_height', 'block_height'],
     hashrate:     ['pool_hashrate_ths', 'hashrate_ths', 'pool_hashrate_hs', 'hashrate_hs', 'pool_hashrate', 'hashrate'],
     peers:        ['relay.peer_count', 'relay.peers', 'peer_count', 'peers'],
     miners:       ['miners.connected', 'connected_miners', 'active_miners', 'miner_count', 'miners'],
     blocks_found: ['blocks_found', 'pool_blocks', 'blocks.found', 'blocks'],
-    network_tier: ['t_net', 'network_tier', 'tier'],
+    network_tier: ['share_chain.t_net', 't_net', 'network_tier', 'tier'],
     owed_sats:    ['ledger.total_owed_sats', 'total_owed_sats', 'owed_sats'],
-    balances:     ['ledger.balances', 'ledger.eligible', 'balances', 'eligible_balances']
+    balances:     ['ledger_rows', 'ledger.balances', 'ledger.eligible', 'balances', 'eligible_balances']
   };
 
   function get(obj, path) {

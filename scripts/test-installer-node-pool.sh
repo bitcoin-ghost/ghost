@@ -91,6 +91,7 @@ has "the peers, as a TOML list"    'peers = ["a.example:8566", "10.0.0.2:9000"]'
 has "regtest genesis"              'genesis_anchor = "8d8cd561340ff83e99410e115619d64ad94516264d3e5cd6a991109c69f1229c"' "$out"
 has "regtest tier base"            'tier_base = "7fffff' "$out"
 has "the relay store"              'db_path = "/var/lib/ghost/node-pool.db"' "$out"
+has "the relay's network"          'network = "regtest"' "$out"
 has "the coinbase_reward_script"   'coinbase_reward_script = "addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080)"' "$out"
 hasnt "no placeholder warning on regtest" 'PLACEHOLDER' "$out"
 is "the [node_pool] section comes before [node_pool.relay]" yes \
@@ -129,7 +130,7 @@ has "P2P port line"      "[PASS] port 8333 is free" "$out"
 has "fresh Bitcoin line" "[PASS] no Bitcoin node yet" "$out"
 has "relay firewall line" "[PASS] relay port 8566/tcp will be opened on ufw" "$out"
 has "peer line"          "[PASS] relay peer peer.example:8566 resolves" "$out"
-has "genesis line"       "[PASS] share-chain genesis abcdcdcdcdcdcdcd… at height 975000" "$out"
+has "a mainnet genesis warns" "[WARN] share-chain genesis abcdcdcdcdcdcdcd… is configured on mainnet: pool_sv2 runs mainnet only on the start compiled into it" "$out"
 has "webhook line"       "[PASS] alert webhook https://ntfy.sh" "$out"
 hasnt "no FAIL line"     "[FAIL]" "$out"
 
@@ -177,6 +178,7 @@ has "a webhook that is not a URL fails" "[FAIL] alert webhook 'ntfy.sh' is not a
 ALERT_WEBHOOK=https://ntfy.sh
 NETWORK=regtest; FEE_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080; MEM=2000; DISK=10; pf
 is "regtest has small floors" 0 "$rc"
+has "a regtest genesis passes" "[PASS] share-chain genesis abcdcdcdcdcdcdcd… at height 975000" "$out"
 has "regtest P2P port is checked" "[PASS] port 18444 is free" "$out"
 NETWORK=testnet; pf
 is "an unknown network fails" 1 "$rc"

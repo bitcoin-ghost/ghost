@@ -166,6 +166,8 @@ pub struct ChannelManager {
     /// The node pool: share tags, slot classes and the canonical coinbase of every job. The only
     /// mode. See `node_pool.rs`.
     pub(crate) node_pool: Arc<crate::node_pool::NodePool>,
+    /// The node pool's ledger and status API (W2.11), served on the monitoring listener.
+    pub(crate) node_pool_api: Arc<crate::node_pool_api::NodePoolApi>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -237,15 +239,17 @@ impl ChannelManager {
                     .into(),
             ))
         })?;
-        // A placeholder genesis (the installer's `UNSET`, for a network whose share chain has
-        // not been published) refuses here, by name, before anything is opened or fetched.
+        // Where the share chain starts (W2.8): a placeholder genesis (the installer's `UNSET`,
+        // for a network whose share chain has not been published), a mainnet node without a
+        // compiled start, or a configured genesis mainnet does not carry, refuses here, by name,
+        // before anything is opened or fetched.
         relay
-            .genesis_hash()
+            .network_start()
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
         let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
             .await
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
-        crate::node_pool_relay::start(relay, &np)
+        let (_relay_handle, relay_parts) = crate::node_pool_relay::start_with_parts(relay, &np)
             .await
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
         warn!(
@@ -253,6 +257,11 @@ impl ChannelManager {
             "NODE_POOL: every job carries its channel's share tag and the canonical coinbase"
         );
         let node_pool = Arc::new(np);
+        let node_pool_api = Arc::new(crate::node_pool_api::NodePoolApi::new(
+            relay_parts,
+            cfg.fee_address.clone(),
+            node_pool.clone(),
+        ));
         let mut supported_extensions = config.supported_extensions().to_vec();
         if !supported_extensions
             .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE)
@@ -271,6 +280,7 @@ impl ChannelManager {
             required_extensions: config.required_extensions().to_vec(),
             share_webhook_sender,
             node_pool,
+            node_pool_api,
         };
 
         Ok(channel_manager)
