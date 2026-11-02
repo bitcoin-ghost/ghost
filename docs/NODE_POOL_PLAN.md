@@ -12,9 +12,11 @@ This branch strips the old system out as it builds the new one. It does not keep
 - **Removal waves**, on this branch, each leaving the workspace building and tested:
   1. Wraith (wallet app, coordinator, protocol), Ghost Tap, ghost-lock and its signer, and anything reachable only from them.
   2. zk, MPC, L2 and glyph, with the zk start gate and the `zk-production` build feature.
-  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables. Code removed 11-02 on `feat/node-pool-rm3` (not merged); the tables stay until migration v64 imports the genesis table. ghost-miner-proxy went with the elder-signed node-list checkpoint it verified; W2.9/W2.10 rebuild the miner-side tool against open listing.
+  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, the job-declaration path, old tables. Code removed and merged 11-02 (`95aa0d48e`); the tables stay until migration v64 imports the genesis table. ghost-miner-proxy went with the elder-signed node-list checkpoint it verified; W2.9/W2.10 rebuild the miner-side tool against open listing.
   4. ghostd to stock Bitcoin Core; the dashboard, docs and website overhauls are W2.14-W2.16.
 - Phase 4's Release A / Release B dual running is replaced by this. Phases 3 (regtest, signet) still come before any mainnet use.
+- **Side by side, 11-02 (user):** the node pool launches on its own servers beside the old 8-node fleet, which keeps running main until the handover. The two networks share nothing: the node pool has no MPC, elders, votes or old mesh seeds, and its share chain runs on its own relay port and protocol. Never co-host both on one server (same unit names, paths and ports). Miners move by repointing; their old balances arrive through the genesis table.
+- **Old fleet with 4 nodes:** checkpoint quorum is 67% of a voter set that never drops below the 8 elders, so with only vm1-4 running no checkpoint finalises again (read from `payout_checkpoint.rs` on main, not observed). Mining continues; the old ledger's agreed record freezes. Back up the databases of any node before it is switched off: they feed the genesis comparison and hold the MPC lineage.
 
 ## 3. Work plan
 
@@ -31,71 +33,60 @@ Sizes assume one engineer. Workers run in isolated worktrees. Every merge, roll 
 - **W1.2** DONE, 11-02. One simulator covering corrections 3-6, slot classes, partitions, flood and launch. Results in `sims/combined/`. The `K_R` cap test was stopped unfinished.
 - **W1.3** Finish the rule (about 2 days). Rewrite `refimpl_v2.py` to exact payment with change to treasury, measure treasury change, waits and class-faking under it, set 250 + 250, `cut(H) = H-20` and classes 3/9/44/143/364/500 in `refimpl_v2.py`, remove the unused cap modes, regenerate vectors, and rerun partitions at the fixed cut.
 
-### Phase 2: build (6-10 weeks, merges dark behind `u64::MAX`)
+### Phase 2: build (6-10 weeks; the node pool is the only mode, no dark gates)
 Parallel streams, after W2.1 merges:
 - **W2.1 Pure core** (about 1,300 lines): `share_commit.rs`, `anchor_chain.rs`, `canonical_payout.rs`, Rust port of the payout rule, vectors. No I/O.
 - **W2.2 Limits** (about 200 lines, new constants only; `MAX_MINER_OUTPUTS` feeds live selection at `payout.rs:385` and `:2690`, so it changes only at H): `blockreservedweight=90000` in `bitcoin.conf`, read `target_weight` and the template constraints, script-class limits, and a 22 KB coinbase ceiling.
 - **W2.3 SV2 layer** DONE 11-02 (merged `0bc997816`): tag stamping, re-stamp on anchor via `AnchorDriver`, standard channels at the full class, the sensing loop in pool_sv2, the translator user-agent extension 0x4748, low-limit warnings in monitoring.
 - **W2.4 Storage** DONE 11-02 (`573ef32ae`): migration v63, `np_*` tables, typed API with exact reorg undo.
-- **W2.5 Relay** (1,100): NS and anchor messages, tip tracking, batching, job push. Built 11-02 on `feat/node-pool-w25`, not merged: `crates/ghost-np-relay`, run by pool_sv2 under `[node_pool.relay]`; readings in `node-pool-reference/PORTING_NOTES.md`. Until W2.6 builds canonical outputs, every real share fails rule 4, so the relay accepts nothing from a live pool.
-- **W2.6 Coinbase** (300): canonical build, post-submit coinbase alarm, finder output excluded from discharge. Built 11-02 on `feat/node-pool-w26`, not merged: every pool_sv2 job pays `canonical_payout::coinbase_outputs` for its slot class on the relay's table, the finder is `[node_pool] fee_address`, the zero-value first-job output is gone, a solved block is always submitted at once and its coinbase checked against the job's canonical outputs afterwards, as an alarm. ghost-mining's template carries the whole value and the witness commitment only; the old proposal coinbase, fee drift, payout handler, proposal sync and tip-change proposer are deleted. No activation gate: the node pool is the only mode. Readings in `node-pool-reference/PORTING_NOTES.md`.
+- **W2.5 Relay** (1,100): NS and anchor messages, tip tracking, batching, job push. DONE 11-02 (merged `62eaa481e`): `crates/ghost-np-relay`, run by pool_sv2 under `[node_pool.relay]`; readings in `node-pool-reference/PORTING_NOTES.md`. Until W2.6 builds canonical outputs, every real share fails rule 4, so the relay accepts nothing from a live pool.
+- **W2.6 Coinbase** (300): canonical build, post-submit coinbase alarm, finder output excluded from discharge. DONE 11-02 (merged with W2.7, head `acce18ae0`): every pool_sv2 job pays `canonical_payout::coinbase_outputs` for its slot class on the relay's table, the finder is `[node_pool] fee_address`, the zero-value first-job output is gone, a solved block is always submitted at once (user rule: never hold a block back) and its coinbase checked against the job's canonical outputs afterwards, on its own thread, as an alarm. ghost-mining's template carries the whole value and the witness commitment only; the old proposal coinbase, fee drift, payout handler, proposal sync and tip-change proposer are deleted. No activation gate: the node pool is the only mode. Readings in `node-pool-reference/PORTING_NOTES.md`.
 - **W2.7 Settlement** (250): ancestry fold at tip. Built with W2.6: `ghost_np_relay::settlement`, in the relay task; it is the relay's retirement hook.
-- **W2.8 Gate** (250): shadow mode, snapshot genesis column, gate logging.
-- **W2.9 Miner protection** (200 + tool): proxy tag check, `ghost-audit`, public prober.
+- **W2.8 Network start config** (small): shadow mode is dropped (no dual running). What remains: per-network share-chain start (genesis anchor, height, genesis table digest) as config for regtest and signet and a compiled constant for mainnet once the flag day is set, and logging it at start-up.
+- **W2.9 Miner protection** (200 + tool): `ghost-audit` (a miner checks a node's jobs pay the canonical coinbase for their slot class), public prober. ghost-miner-proxy was deleted in wave 3, so the tag check lives in `ghost-audit`, not a proxy.
 - **W2.10 Open listing:** any node with a valid advert that passes an external probe is listed. DNS and `endpoints.html` become generated output. The shim stops trusting the 8 keys.
 - **W2.11 Visibility:** `/api/v1/ledger/{address}`, fix legacy routes, rewrite `miner.html`, `ghost-node status`.
-- **W2.12 Installer:** remove the treasury prompt and capability flags, add `--fee-address`, preflight, alert webhook prompt.
-- **W2.13 Share-chain sync** (not sized yet, expect 800+): initial sync, batch retention and pruning, stale header and coinbase archive, recoverable checkpoint. An outside node cannot reproduce the root without it.
+- **W2.12 Installer:** remove the treasury prompt and capability flags, add `--fee-address`, write `[node_pool]` and `[node_pool.relay]`, preflight, alert webhook prompt, no old-fleet seed nodes. Running 11-02 on `feat/node-pool-w212`.
+- **W2.13 Share-chain sync** (not sized yet, expect 800+): initial sync, batch retention and pruning, stale header and coinbase archive, recoverable checkpoint. An outside node cannot reproduce the root without it. Also closes the W2.7 gap: settlement must not depend on each node's own Bitcoin tip. Running 11-02 on `feat/node-pool-w213`.
 - **W2.14 Node dashboard overhaul** (user, 11-02): rebuild the operator dashboard for the node pool only. Shows: node status and peers, share-chain tip and anchors, connected miners with their sensed slot class and any firmware warning, per-miner shares and ledger balance, queue position and expected wait, recent pool blocks with their payouts and the treasury change, settlement status. Removes every page for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2.
 - **W2.15 Docs overhaul** (user, 11-02): rewrite operator and miner docs from `NODE_POOL_SPEC.md`: what the pool is, running a node, pointing a miner, the payout rule in plain words, firmware compatibility and the sensing loop, auditing your node with `ghost-audit`, the honest-reading section. Delete docs for removed features.
 - **W2.16 Website overhaul** (user, 11-02): rewrite the website for the node pool: one clear explainer, live pool stats, the miner page (`/api/v1/ledger/{address}`), node list, firmware compatibility table, and the required launch wording from Phase 6. Remove pages for removed features.
 
-Safe early removal, tested to leave the coinbase byte-identical:
-- **R1** `apps/*` and ghost-keys (~53k lines).
-- **R2** Solo and private modes, still parsing `mining_mode` (~2k).
-- **R3** L2, zk, MPC, glyph (~26k). Keeps `get_mpc_elder_node_ids` until cutover, because elder share still shifts the coinbase. Removes in the same PR: the mainnet zk start gate at `main.rs:5036`, `zk-production` in `release.sh:305` and `release.yml:155`, and the `ghost_pay` config field, or tolerates it, since `NodeConfig` is `deny_unknown_fields` and installed configs carry it. Prove `checkpoint_voter_set.hash` and `ledger_root` unchanged on a canary.
-- **R4** Mesh `ShareBatch*` messages only, and dead constants. `ShareBatch` is also the live webhook (`share_webhook.rs:91`, `routes.rs:10355`), which stays.
+Removal status (replaces R1-R11): waves 1-3 merged 11-02 (about 330k lines removed in all). Still to go: migration v64; the leftover Noise mesh listener, which no longer sends anything; the `capability_drift` alert field; ghostd to stock Bitcoin Core (wave 4).
 
 ### Phase 3: prove it (about 4 weeks)
 Nothing reaches mainnet until every stage here passes, in this order: regtest, then signet. Positive markers only; a missing reading is UNMEASURED, not a pass.
 
 | Stage | Pass |
 |---|---|
-| Regtest 8-node e2e, wins at H-1, H, H+1, reorg across H, every slot class | Every node logs settlement for each block; roots equal; exact output sums |
-| Hostile build: inflated balance, relabel, wrong treasury, fee skim, withheld shares, old format after H | Each honest node logs a named rejection; no honest node convicted |
-| Our own signet, 8+ nodes, real wins on demand, 500 synthetic payees | Wins, reorgs and the cutover all settle on every node; roots equal; 24 h soak; proposals cross a real mesh |
+| Regtest multi-node e2e from an imported genesis table, wins, reorgs, every slot class, a fresh node syncing from scratch | Every node logs settlement for each block; roots equal; exact output sums |
+| Hostile build: inflated balance, relabel, wrong treasury, fee skim, withheld shares, lying sync peer | Each honest node logs a named rejection; no honest node convicted |
+| Our own signet, several nodes, real wins on demand, 500 synthetic payees, a rehearsed genesis import from a copy of the old fleet's export | Wins, reorgs and the import all settle on every node; roots equal; 24 h soak |
 | Signet, Bitaxe sensing run, then the user's S19 | Sensing mode (`hardware-test/coinbase_probe.py --sense`, selftest passes 10 simulated cases) climbs to each miner's highest safe class. |
 | Signet, volunteer hardware ladder | A test endpoint serves coinbases from 700 B to 22 KB in both extranonce layouts and checks every share. Owners point each model at it for 15 minutes, stopping below known overflow sizes. The stock S19 (Amlogic) comes first. No miner is taken past its known overflow point |
 
 Mainnet will not produce a win, so win evidence comes only from these. Signet is ours to run: we sign blocks and set difficulty, so a miner of any size can find one. The pool code handles the signet network, but the full stack has not been run on it yet.
 
-### Phase 4: cutover (about 2 weeks, plus ninth node)
-- **Release A:** all code, gates at `u64::MAX`. Canaries vm5-8, then vm4-1.
-- **Migration:** in-place. Take the genesis table near H-36 from a unanimous finalised checkpoint, using `shard-anchor-rehearsal.sh`. Only ~1.6% of heights qualified when last surveyed, so budget a search. Convert each miner's work to sats at one published rate. Pin the digest in code and publish the table. Waiving balances is out: the website says work "never expires". This table is the ledger's one trusted input: a stranger can verify only the digest.
-- **No double credit:** shadow anchors between S and H are dry and never counted, or that week is credited twice. Old-format blocks discharge at tip from their actual outputs, because a block at H-1 would otherwise discharge at H+99 while the new fold is already paying.
-- **Release B:** arms S and H = S + 1,008, only at 8/8. S to H-1 pays the old way while nodes emit shadow shares and compare dry coinbases and roots.
-- **Soak pass:** dry coinbase and root match 8/8 for all 1,008 blocks, counted positively.
-- **At H:** new format only, keyed on job template height. A late node's blocks stay valid but its miners earn nothing.
-- **Rollback:** gate to `u64::MAX` any time before H. After H, forward fixes only.
-- **Ninth node:** separate person, machine and identity, public docs only, parallel with Release A soak. Must reproduce the root, get its miner credited and have its cheat refused. This also needs a real outside operator as a user dependency.
+### Phase 4: cutover (flag day)
+- **Launch beside the old fleet.** The node pool runs on its own servers; the old 8 keep running main, untouched, until the handover.
+- **Freeze.** At an agreed height the old release stops crediting work. Each old node finishes syncing to that height.
+- **Export** (`feat/ledger-export`, on main): every old node exports its balances at that height, read-only. Open (user, 11-02): export from the full shard balance table rather than a checkpoint, because checkpoints since 963,388 hold only the top 200 and a checkpoint's stored root matches its miner list at only ~2% of heights.
+- **Compare.** All exports should give the same digest. If they differ, a fixed rule settles each differing miner (for example the median) and the differences are published.
+- **Pin and import.** Convert work to sats at one published rate (the user's call), pin the table digest in the node pool binary, publish the table. Migration v64 imports it as the genesis table and drops the old tables; it halts on non-zero rows in `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`. Rehearsed on database copies first. Waiving balances is out: the website says work "never expires".
+- **Repoint miners** to the node pool. The old fleet is switched off only after its databases are backed up.
+- **Ninth node:** an outside operator, public docs only, must reproduce the root, get its miner credited and have its cheat refused.
+- **Rollback:** before the import, keep running the old fleet. After it, forward fixes only.
 
-Order of publication: spec, tag A, snapshot table and notice of H, tag B after 8/8, installer docs at S, payout text at H, retire old docs after H+100.
+Order of publication: spec, export digest and table, notice of the freeze height, installer docs, payout text, retire old docs after the handover.
 
-### Phase 5: after H
-- **R5** Remove the qualified set from the mesh checkpoint; then the checkpoint when the shim no longer needs it.
-- **R6** `payout_checkpoint.rs`, vote handlers, fee drift (~9k).
-- **R7** Challenges, qualification, reverify (~12k). `ghost-verification` keeps API and `fleet_auth`.
-- **R8** Wraith, coordinator, ghost-lock, signer (~38k).
-- **R9** Migration v64 one release later (v63 is the node pool storage added by W2.4), rehearsed on a DB copy. Halts on non-zero rows in `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`.
-- **R10** ghostd to stock Bitcoin Core over GBT and ZMQ, without sv2-tp, one canary first. Measure `getmempoolfilterstats` first. Haze datadirs need resync; the updater and `release.sh` need changing.
-- **R11** Remaining gates and docs.
-
-Do not forget: 26 `deny_unknown_fields` structs versus `[ghost_pay]`, `[coordinator]`, `[reaper]` in installed `pool.toml`; `zk-production` in `release.yml` and `release.sh`; `record-tests.sh`; CI jobs; check scripts; `deploy-node.sh` swaps binaries only, so unit changes must share a restart.
+### Phase 5: after the handover
+- Wave 4: ghostd to stock Bitcoin Core over GBT and ZMQ, without sv2-tp, one node first. Measure `getmempoolfilterstats` first; the updater and `release.sh` need changing.
+- Remaining docs.
 
 ### Phase 6: public launch
 Website and docs rewrite, remove the "NOT READY" banner only after Phases 3 and 4 pass. Required wording: no block has ever been found, no payout ever made, your balance may stay unpaid for a long time, an unaudited node can cheat you, use an established pool if you need steady income.
 
-Launch blockers: W2.1-W2.9, W2.11, W2.13-W2.16, Phases 3 and 4, ninth node.
+Launch blockers: W2.1-W2.9, W2.11-W2.16, migration v64, Phases 3 and 4, ninth node.
 
 ## 4. Total size
 About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to end for one engineer. Soak, signet and hardware are elapsed-time bound whoever does the work.
@@ -104,14 +95,14 @@ About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to e
 1. Treasury address, compiled in by W1.1. A single key is a single point of loss; a multisig address is possible.
 2. Hardware access for the signet stage of Phase 3.
 3. A real outside operator for the ninth-node stage.
-4. Every merge, roll, and the value of H.
+4. Every merge, roll, and the freeze height.
+5. The work-to-sats rate and the export source (full shard table recommended).
 
 ## 6. Open design items for spec freeze
 - **SV2 standard channels are allowed (decided 11-02).** An SV2 miner on a standard channel receives only a header, so it always gets the full 500-output class. W2.3 must stamp the per-channel tag in the pool-built coinbase.
 - Change goes to the treasury (decided 11-02). Known low-limit SV1 firmware gets a warning at connect and on the miner page, naming the model and the expected cost; it is not refused.
 - Sub-NS credit for small miners above about 1 EH/s: at 100 EH/s, 85% of 1.2 TH/s miners earn nothing in a month.
 - The table root goes in one OP_RETURN output (`x` no longer exists). ScriptSig is 99/100 full, so the coinbase carries 504 outputs at most.
-- ghost-miner-proxy role: optional tool or the default for protected miners.
 - Cost of the 90,000 WU reserve: about 20,500 vB of block space, roughly 20,500 sats per full block at 1 sat/vB, or 1.2% of the average fee. Estimate, not measured. It falls on the finder, and every template pays it whatever the slot class.
 
 ## 7. The honest reading
