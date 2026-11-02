@@ -60,16 +60,16 @@ bad()  { echo "  FAIL $1"; shift; printf '         %s\n' "$@"; fail=$((fail + 1)
 # A case runs the script against its own BACKUP_DIR. The dir is patched rather than parameterised
 # because the real one is /var/backups and this test must never touch it.
 make_case() {
-    local dir="$1"
+    local dir="$1" version="${2:-59}"
     rm -rf "$dir"
     mkdir -p "$dir/.ghost/ghost-pay" "$dir/backups"
-    python3 - "$dir" <<'PY'
+    python3 - "$dir" "$version" <<'PY'
 import sqlite3, sys
 root = sys.argv[1]
 for p in (f"{root}/.ghost/ghost.db", f"{root}/.ghost/ghost-pay/ghost-pay.db"):
     c = sqlite3.connect(p)
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA user_version=59")
+    c.execute(f"PRAGMA user_version={int(sys.argv[2])}")
     c.execute("CREATE TABLE t(x BLOB)")
     c.executemany("INSERT INTO t VALUES (?)", [(b"A" * 4096,) for _ in range(300)])
     c.commit(); c.close()
@@ -125,6 +125,16 @@ else
         *) bad "happy path reports a count, not silence" "$out" ;;
     esac
 fi
+
+# ------------------------------------------------- 1b. a v65 database (version stored negated)
+# From migration v65 `user_version` is stored negated (-65) so pre-cutover binaries refuse the
+# database; the copy check must read that as a version, not as a corrupt copy.
+C="$TMP/v65"; make_case "$C" -65
+out="$(run_case "$C")"; rc=$?
+case "$rc:$out" in
+    0:*"user_version=-65"*"quick_check=ok"*) ok "a v65 database (user_version -65) backs up and verifies" ;;
+    *) bad "a v65 database backs up" "exit $rc" "$out" ;;
+esac
 
 # ---------------------------------------------------------------- 2. no room: must REFUSE
 C="$TMP/nospace"; make_case "$C"
