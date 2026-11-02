@@ -326,7 +326,9 @@ np_fee_address_check() {
 #   NP_MIN_RAM_MB / NP_WARN_RAM_MB, NP_MIN_DISK_GB   the preflight's floors
 #
 # ⛔ No share-chain genesis is published for mainnet or signet yet. They get UNSET, which
-# pool_sv2 refuses at startup by name (`NodePoolRelayConfig::genesis_hash`). Guessing one would
+# pool_sv2 refuses at startup by name (`NodePoolRelayConfig::genesis_hash`). Mainnet's start is
+# compiled into pool_sv2 (`node_pool_network::MAINNET_START`, W2.8): when it is set, these values
+# must equal it, and pool_sv2 refuses any other configured mainnet genesis. Guessing one would
 # start a private share chain that no other node joins. Regtest is a local test chain, so it gets
 # a fixed genesis every regtest node shares: sha256("GhostNodePool/genesis/regtest"), height 0, and
 # regtest's own proof-of-work limit as tier 0 so CPU-mined shares reach T_net.
@@ -432,6 +434,9 @@ fee_address = "${FEE_ADDRESS}"
 # The share-chain relay and settlement (${NETWORK}). Peers dial the listen port, so it is opened
 # on the firewall. More peers are learned from the ones listed.
 [node_pool.relay]
+# The network decides where the share chain may start: mainnet runs only on the start compiled
+# into pool_sv2; signet and regtest take the genesis below.
+network = "${NETWORK}"
 listen = "0.0.0.0:${RELAY_PORT}"
 peers = [${peers}]
 db_path = "/var/lib/ghost/node-pool.db"
@@ -552,6 +557,9 @@ np_preflight() {
   fi
   if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
     pf_line WARN "no share-chain genesis is published for ${NETWORK}: pool_sv2 will refuse to start until one is set (--genesis-anchor/--genesis-height)"
+  elif [[ "$NETWORK" == mainnet && "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$
+          && "$GENESIS_ANCHOR" != "${NP_GENESIS_ANCHOR:-UNSET}" ]]; then
+    pf_line WARN "share-chain genesis ${GENESIS_ANCHOR:0:16}… is configured on mainnet: pool_sv2 runs mainnet only on the start compiled into it and refuses any other"
   elif [[ "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$ ]]; then
     pf_line PASS "share-chain genesis ${GENESIS_ANCHOR:0:16}… at height ${GENESIS_HEIGHT}"
   else

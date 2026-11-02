@@ -267,6 +267,7 @@ else:
         "fee_address": "per-node, installer substitutes ${FEE_ADDRESS}",
         "listen": "the relay port is --relay-port (default 8566, as in the reference)",
         "peers": "per-node, from --relay-peer",
+        "network": "per-node, from --network",
         "genesis_anchor": "per-network, from np_network_defaults or --genesis-anchor",
         "genesis_btc_height": "per-network, from np_network_defaults or --genesis-height",
         "rpc_user": "per-node RPC credentials",
