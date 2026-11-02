@@ -1044,7 +1044,13 @@ impl Sv1Server {
                     "Down: Queuing Sv1 message until channel is established (downstream {})",
                     downstream_id
                 );
+                // The agent is needed by the channel open, which happens before this queue is
+                // drained (see `subscribe_agent`).
+                let agent = super::subscribe_agent(&downstream_message);
                 downstream.downstream_data.super_safe_lock(|data| {
+                    if agent.is_some() {
+                        data.user_agent = agent;
+                    }
                     data.queued_sv1_handshake_messages
                         .push(downstream_message.clone())
                 });

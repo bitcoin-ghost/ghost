@@ -44,6 +44,23 @@ pub(super) fn is_mining_subscribe(msg: &Message) -> bool {
     }
 }
 
+/// The agent a `mining.subscribe` names (its first parameter), clamped like any agent.
+///
+/// Read when the subscribe is QUEUED, not when it is processed: the queue drains only after the
+/// channel opens, and the open (on authorize, or the subscribe debounce) is what carries the
+/// agent TLV to the pool's sensing loop. Read at processing time, the agent arrived after the
+/// open, and every SV1 miner was sensed as the translator itself.
+pub(super) fn subscribe_agent(msg: &Message) -> Option<String> {
+    match msg {
+        json_rpc::Message::StandardRequest(r) if r.method == "mining.subscribe" => r
+            .params
+            .get(0)
+            .and_then(|a| a.as_str())
+            .map(|a| clamp_agent(a).to_string()),
+        _ => None,
+    }
+}
+
 /// Check if Sv1 message is mining.suggest_difficulty.
 ///
 /// Like `mining.configure`, this must be processed IMMEDIATELY rather than queued behind
@@ -636,6 +653,33 @@ mod ghost_agent_tlv_tests {
         assert_eq!(GHOST_AGENT_EXTENSION_TYPE, 0x4748);
         assert_eq!(GHOST_AGENT_FIELD_TYPE, 0x01);
         assert_eq!(MAX_AGENT_LEN, 255);
+    }
+
+    /// The agent is read from a subscribe as it is queued; nothing else names one.
+    #[test]
+    fn a_queued_subscribe_yields_its_agent() {
+        let msg = |s: &str| serde_json::from_str::<Message>(s).unwrap();
+        assert_eq!(
+            subscribe_agent(&msg(
+                r#"{"id":1,"method":"mining.subscribe","params":["bitaxe/v2.10.0"]}"#
+            )),
+            Some("bitaxe/v2.10.0".to_string())
+        );
+        assert_eq!(
+            subscribe_agent(&msg(r#"{"id":1,"method":"mining.subscribe","params":[]}"#)),
+            None
+        );
+        assert_eq!(
+            subscribe_agent(&msg(
+                r#"{"id":2,"method":"mining.authorize","params":["a.w","x"]}"#
+            )),
+            None
+        );
+        let long = format!(
+            r#"{{"id":1,"method":"mining.subscribe","params":["{}"]}}"#,
+            "é".repeat(200)
+        );
+        assert!(subscribe_agent(&msg(&long)).unwrap().len() <= MAX_AGENT_LEN);
     }
 
     #[test]
