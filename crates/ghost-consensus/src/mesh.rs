@@ -54,7 +54,7 @@ use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tmq::{publish, subscribe, Context, Multipart};
 use tokio::sync::mpsc;
@@ -68,10 +68,7 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::NodeId;
 
-use crate::message::{
-    envelope_version_for_height, mesh_envelope_v2_height, MessageEnvelope, MessageType,
-    DEFAULT_MESSAGE_TTL, ENVELOPE_VERSION_V1,
-};
+use crate::message::{MessageEnvelope, MessageType, DEFAULT_MESSAGE_TTL, EMITTED_ENVELOPE_VERSION};
 use crate::message_validator::{validate_and_verify, ValidationStats};
 use crate::noise_pool::{NoiseConnectionPool, NoisePoolConfig};
 use crate::peer::{Peer, PeerManager};
@@ -294,9 +291,6 @@ pub struct MeshNetwork {
     /// Serialises lease extensions (the rare on-disk ceiling write) so only one
     /// thread persists at a time.
     sequence_lease_lock: std::sync::Mutex<()>,
-    /// Last envelope signing version this node logged, so the gate crossing is announced once
-    /// rather than on every message.
-    last_logged_envelope_version: AtomicU8,
     /// Seen message cache for deduplication (P2P-L1: O(1) eviction)
     seen_messages: RwLock<SeenMessageCache>,
     /// Message handlers
@@ -1484,7 +1478,6 @@ impl MeshNetwork {
             peers,
             sequence: AtomicU64::new(init_sequence),
             sequence_ceiling: AtomicU64::new(init_ceiling),
-            last_logged_envelope_version: AtomicU8::new(ENVELOPE_VERSION_V1),
             sequence_lease_lock: std::sync::Mutex::new(()),
             seen_messages: RwLock::new(SeenMessageCache::with_high_water(
                 config.max_seen_messages,
@@ -2024,30 +2017,6 @@ impl MeshNetwork {
         seen.validate_and_update_sequence(&msg_id.sender, msg_id.sequence);
     }
 
-    /// Which mesh envelope signing format this node emits right now.
-    ///
-    /// Reads the L1 tip through the same provider the health ping uses. That provider is optional
-    /// and falls back to 0, and 0 is below every real gate — so a node with no height source
-    /// keeps emitting v1. That is the only safe direction: emitting v2 at a peer that verifies v1
-    /// is a silent, total rejection at the far end (see [`crate::message::MESH_ENVELOPE_V2_HEIGHT`]).
-    fn envelope_version(&self) -> u8 {
-        let height = self.l1_height_fn.as_ref().map(|f| f()).unwrap_or(0);
-        let version = envelope_version_for_height(height);
-        if version
-            != self
-                .last_logged_envelope_version
-                .swap(version, Ordering::Relaxed)
-        {
-            info!(
-                envelope_version = version,
-                l1_height = height,
-                gate = mesh_envelope_v2_height(),
-                "Mesh envelope signing format"
-            );
-        }
-        version
-    }
-
     /// Create a message envelope
     pub fn create_envelope<T: serde::Serialize>(
         &self,
@@ -2067,7 +2036,7 @@ impl MeshNetwork {
     ) -> GhostResult<MessageEnvelope> {
         let sequence = self.next_sequence();
         MessageEnvelope::signed(
-            self.envelope_version(),
+            EMITTED_ENVELOPE_VERSION,
             msg_type,
             self.identity.node_id(),
             payload,
@@ -5001,39 +4970,13 @@ mod high_water_tests {
             .expect("create envelope");
 
         assert_eq!(
-            env.version, ENVELOPE_VERSION_V1,
-            "with the gate dormant and no height provider wired, this node must emit v1"
+            env.version,
+            crate::message::ENVELOPE_VERSION_V2,
+            "this node emits v2 whatever the height"
         );
         assert!(
             crate::message_validator::verify_envelope_signature(&env).is_ok(),
             "the envelope this node actually broadcasts must verify against the shared preimage"
-        );
-    }
-
-    /// Wired the other way: with a height provider past the gate, the same path emits v2 and it
-    /// still verifies. Without this the emit-side gate could be dead code and every test above
-    /// would still pass.
-    #[test]
-    fn a_height_past_the_gate_switches_the_real_signing_path_to_v2() {
-        let identity = Arc::new(NodeIdentity::generate());
-        let config = MeshConfig {
-            noise_enabled: false,
-            noise_required: false,
-            ..Default::default()
-        };
-        let mut mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
-
-        let gate = mesh_envelope_v2_height();
-        mesh.set_l1_height_provider(Arc::new(move || gate));
-
-        let env = mesh
-            .create_envelope_raw(MessageType::HealthPing, b"ping".to_vec())
-            .expect("create envelope");
-
-        assert_eq!(env.version, crate::message::ENVELOPE_VERSION_V2);
-        assert!(
-            crate::message_validator::verify_envelope_signature(&env).is_ok(),
-            "a v2 envelope from the real signing path must verify"
         );
     }
 

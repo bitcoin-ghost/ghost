@@ -86,92 +86,12 @@ fn is_envelope_v1(version: &u8) -> bool {
     *version == ENVELOPE_VERSION_V1
 }
 
-/// Height at and above which this node SIGNS mesh envelopes with [`ENVELOPE_VERSION_V2`].
+/// The signing format this node emits: always [`ENVELOPE_VERSION_V2`].
 ///
-/// `u64::MAX` = never. **DORMANT.** Arming is a separate, observed change and must not ride the
-/// release that introduces the tolerance.
-///
-/// This is an emit-side gate only. There is deliberately no matching verify-side gate: a receiver
-/// picks the preimage from the envelope's own `v` field, so a v2 node accepts v1 and v2
-/// simultaneously and forever, and needs no notion of height to do it.
-/// [`crate::message_validator::validate_and_verify`] is a free function over `&[u8]` with no
-/// access to a chain tip, and threading one into it would have bought nothing.
-///
-/// ⛔ Why a height and not a config flag: a node that signs v2 while a peer still verifies v1
-/// has every one of its messages rejected as `InvalidSignature` by that peer — silently, from the
-/// sender's point of view, because rejection happens at the far end. `CapabilityType` already
-/// taught this fleet the cost of emitting before every receiver tolerates (see
-/// `ghost-mining`'s `ADDRESS_PROOF_HEIGHT`). A height makes the flip simultaneous across eight nodes
-/// that do not coordinate restarts.
-///
-/// The order is fixed and cannot be shortened:
-/// 1. ship this release — every node VERIFIES both formats, every node EMITS v1;
-/// 2. roll all eight and confirm each is on the new binary;
-/// 3. only then set this constant to a height at least a few hundred blocks out, ship that, roll
-///    again, and let the gate fire.
-///
-/// If the gate is armed while any node is on an older binary, that node rejects every mesh
-/// message from every upgraded peer — total mesh partition, not degradation. There is no
-/// self-healing path back other than upgrading it.
-///
-/// What to watch after it fires: `bad_signature` in [`crate::message_validator::ValidationStats`]
-/// must stay flat, and `"Mesh envelope signing format"` is logged once per node at the flip.
-///
-/// ARMED at 966_400 on 2026-09-01. The fixed order above was completed, not shortened:
-///
-/// 1. The tolerance shipped in #740 (`d829c32f8`), which is an ancestor of the deployed commit —
-///    so every node already VERIFIES both formats and EMITS v1.
-/// 2. All eight were rolled to v1.11.33 at `bf3f822b5` and confirmed individually through
-///    `--version`, which names the commit (#820) rather than only the version string.
-/// 3. This is that separate, observed change. Observation before arming: `bad_signature` /
-///    `InvalidSignature` were **0 across 6 hours** on the rolled binary.
-///
-/// 966_400 is deliberately ~400 blocks (~2.7 days) AFTER `ADDRESS_PROOF_HEIGHT`'s 966_000 rather
-/// than sharing it. Both ride the same release, so if the mesh misbehaves in that window the
-/// separation is what allows it to be attributed to one gate rather than two — the same reasoning
-/// that placed `STRATUM_HANDSHAKE_PROOF_HEIGHT` clear of the gates already scheduled around it.
-///
-/// ⛔ The roll must reach ALL EIGHT before this height. This gate does not degrade: a node left
-/// on an older binary rejects every mesh message from every upgraded peer, which is a partition,
-/// and the only way back is to upgrade it.
-pub const MESH_ENVELOPE_V2_HEIGHT: u64 = 966_400;
-
-/// `ghost-mining`'s `ADDRESS_PROOF_HEIGHT`, mirrored so the separation between the two gates armed
-/// in v1.11.34 can be asserted here.
-///
-/// A mirror, not an import: `ghost-consensus` sits BELOW `ghost-mining` in the dependency graph and
-/// cannot reach it. Duplicating a consensus height is normally how the two drift apart, so this
-/// exists only to be asserted against and is checked by
-/// `bins/ghost-pool`'s `the_mirror_in_ghost_consensus_matches`.
-pub const ADDRESS_PROOF_SEPARATION_REFERENCE: u64 = 966_000;
-
-/// Resolved gate, so off-mainnet runs can rehearse the flip. Set once at startup by
-/// `ghost_pool::init_activation_heights`; falls back to the shipped constant when unset.
-static MESH_ENVELOPE_V2_GATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-/// Install the resolved [`MESH_ENVELOPE_V2_HEIGHT`] for this run. Call once, before the mesh
-/// starts. Later calls are ignored, as are calls after the first read.
-pub fn set_mesh_envelope_v2_height(height: u64) {
-    let _ = MESH_ENVELOPE_V2_GATE.set(height);
-}
-
-/// The height at and above which this node signs [`ENVELOPE_VERSION_V2`].
-pub fn mesh_envelope_v2_height() -> u64 {
-    *MESH_ENVELOPE_V2_GATE.get_or_init(|| MESH_ENVELOPE_V2_HEIGHT)
-}
-
-/// Which signing format this node emits at `height`.
-///
-/// One predicate for the three places that build a signed envelope, so they cannot disagree about
-/// which format is in force at a given block. An unknown height (0, the fallback when no L1
-/// height provider is wired) resolves to v1 — the direction that cannot partition a mesh.
-pub fn envelope_version_for_height(height: u64) -> u8 {
-    if height >= mesh_envelope_v2_height() {
-        ENVELOPE_VERSION_V2
-    } else {
-        ENVELOPE_VERSION_V1
-    }
-}
+/// The v2 emission gate armed at 966_400 and every node verifies both formats, so the height is
+/// no longer consulted. A receiver still picks the preimage from the envelope's own `v` field and
+/// accepts v1 as before.
+pub const EMITTED_ENVELOPE_VERSION: u8 = ENVELOPE_VERSION_V2;
 
 /// Failure to build a signing preimage.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -807,84 +727,5 @@ mod envelope_signing_tests {
                 "v{version} envelope did not verify against its own preimage"
             );
         }
-    }
-
-    /// The gate ships DORMANT. Arming it while any node is on an older binary partitions the mesh
-    /// completely, so the value it ships with is the whole safety argument for this release.
-    #[test]
-    fn v2_emission_gate_is_armed_at_the_reviewed_height() {
-        // Was `v2_emission_gate_ships_dormant`, asserting `u64::MAX`. It has done its job: it held
-        // the gate closed until the fixed order in `MESH_ENVELOPE_V2_HEIGHT`'s docs was actually
-        // completed — tolerance shipped in #740, all eight rolled to v1.11.33 (`bf3f822b5`) and
-        // confirmed per binary, `bad_signature` observed at 0 over 6h. Arming is that separate
-        // change, so the assertion flips rather than being deleted: the height still may not move
-        // without review.
-        assert_eq!(
-            MESH_ENVELOPE_V2_HEIGHT, 966_400,
-            "the envelope v2 emission height changed — this requires a fleet roll, see the docs"
-        );
-    }
-
-    /// The boundary is inclusive at the gate height, matching every other gate in the codebase,
-    /// and an unknown height (0, the health-ping provider's fallback) resolves to v1 — the only
-    /// direction that cannot partition a mesh.
-    #[test]
-    fn emission_gate_boundary_is_inclusive_and_fails_closed() {
-        let gate = mesh_envelope_v2_height();
-
-        assert_eq!(envelope_version_for_height(0), ENVELOPE_VERSION_V1);
-        assert_eq!(
-            envelope_version_for_height(gate.saturating_sub(1)),
-            ENVELOPE_VERSION_V1
-        );
-        assert_eq!(envelope_version_for_height(gate), ENVELOPE_VERSION_V2);
-    }
-}
-
-#[cfg(test)]
-mod mesh_envelope_v2_arming_tests {
-    use super::{ADDRESS_PROOF_SEPARATION_REFERENCE, MESH_ENVELOPE_V2_HEIGHT};
-
-    /// The armed height is consensus-visible and must not drift silently.
-    #[test]
-    fn the_armed_height_is_pinned() {
-        assert_eq!(
-            MESH_ENVELOPE_V2_HEIGHT, 966_400,
-            "changing an armed mesh-envelope height requires a fleet roll — see the const's docs"
-        );
-    }
-
-    /// Guards the arming being UNDONE. `u64::MAX` reads as an ordinary value, so a revert would
-    /// leave any test that merely checks "the constant exists" passing while v2 never flips.
-    #[test]
-    fn the_gate_is_armed_not_dormant() {
-        assert_ne!(
-            MESH_ENVELOPE_V2_HEIGHT,
-            u64::MAX,
-            "MESH_ENVELOPE_V2_HEIGHT is dormant again — arming was reverted"
-        );
-    }
-
-    /// The two gates riding this release must NOT share a height.
-    ///
-    /// Both are armed in v1.11.34. If the mesh misbehaves in that window, separated heights are
-    /// what make the cause attributable to one gate rather than two — and this gate's failure
-    /// mode is a partition, so attribution is not a nicety.
-    #[test]
-    fn it_does_not_share_a_height_with_the_address_proof_gate() {
-        // Read through `black_box`: comparing two `const`s folds at compile time, which clippy
-        // flags as `assertions_on_constants` — and it is right to, because a tautology that
-        // cannot fail is not a check. This keeps the comparison a real runtime one.
-        let envelope = std::hint::black_box(MESH_ENVELOPE_V2_HEIGHT);
-        let address = std::hint::black_box(ADDRESS_PROOF_SEPARATION_REFERENCE);
-        assert!(
-            envelope > address,
-            "must fire AFTER the address-proof gate ({address}), got {envelope}"
-        );
-        assert!(
-            envelope - address >= 200,
-            "the two gates are too close to attribute a divergence to one of them: {} blocks",
-            envelope - address
-        );
     }
 }
