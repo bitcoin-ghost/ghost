@@ -34,7 +34,7 @@
 //! arrival, so nothing relies on the channel being private or authenticated.
 //!
 //! The task also answers `GetStamps` with the job stamps it published to pool_sv2 (W2.9), when
-//! [`NetConfig::node_id`](crate::net::NetConfig::node_id) is set.
+//! [`crate::net::NetConfig::node_id`] is set.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};

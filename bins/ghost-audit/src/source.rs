@@ -22,7 +22,7 @@
 
 //! Where the auditor's share-chain data comes from: its own relay node, never the audited node.
 //!
-//! [`start_share_chain`](crate::source::start_share_chain) opens a store in the auditor's data
+//! [`crate::source::start_share_chain`] opens a store in the auditor's data
 //! directory and runs a `ghost-np-relay` node exactly as pool_sv2 runs one, minus the pool: it
 //! dials the relay peers the miner names, syncs anchors, batches and shares from them (W2.13:
 //! `GetHeaders`, `GetBatch`, `GetShares`, `GetBtcBlocks`), checks every share against its
