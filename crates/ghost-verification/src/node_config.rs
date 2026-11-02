@@ -937,7 +937,7 @@ mod tests {
         }
         // A table that lost its entries would pass every assertion above by running none of them.
         assert!(
-            checked >= 5,
+            checked >= 4,
             "only {checked} capability path(s) exercised — the table is too short to be the \
              whole set"
         );

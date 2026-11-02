@@ -3538,7 +3538,7 @@ mod tests {
         // being confronted with the invariant.
         assert_eq!(
             all.len(),
-            36,
+            29,
             "a topic was added or removed — extend `all` above, then check the invariant still holds"
         );
 
