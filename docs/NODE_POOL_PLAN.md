@@ -13,7 +13,7 @@ This branch strips the old system out as it builds the new one. It does not keep
   1. Wraith (wallet app, coordinator, protocol), Ghost Tap, ghost-lock and its signer, and anything reachable only from them.
   2. zk, MPC, L2 and glyph, with the zk start gate and the `zk-production` build feature.
   3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables.
-  4. ghostd to stock Bitcoin Core, and the dashboard and website rewrite.
+  4. ghostd to stock Bitcoin Core; the dashboard, docs and website overhauls are W2.14-W2.16.
 - Phase 4's Release A / Release B dual running is replaced by this. Phases 3 (regtest, signet) still come before any mainnet use.
 
 ## 3. Work plan
@@ -46,6 +46,9 @@ Parallel streams, after W2.1 merges:
 - **W2.11 Visibility:** `/api/v1/ledger/{address}`, fix legacy routes, rewrite `miner.html`, `ghost-node status`.
 - **W2.12 Installer:** remove the treasury prompt and capability flags, add `--fee-address`, preflight, alert webhook prompt.
 - **W2.13 Share-chain sync** (not sized yet, expect 800+): initial sync, batch retention and pruning, stale header and coinbase archive, recoverable checkpoint. An outside node cannot reproduce the root without it.
+- **W2.14 Node dashboard overhaul** (user, 11-02): rebuild the operator dashboard for the node pool only. Shows: node status and peers, share-chain tip and anchors, connected miners with their sensed slot class and any firmware warning, per-miner shares and ledger balance, queue position and expected wait, recent pool blocks with their payouts and the treasury change, settlement status. Removes every page for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2.
+- **W2.15 Docs overhaul** (user, 11-02): rewrite operator and miner docs from `NODE_POOL_SPEC.md`: what the pool is, running a node, pointing a miner, the payout rule in plain words, firmware compatibility and the sensing loop, auditing your node with `ghost-audit`, the honest-reading section. Delete docs for removed features.
+- **W2.16 Website overhaul** (user, 11-02): rewrite the website for the node pool: one clear explainer, live pool stats, the miner page (`/api/v1/ledger/{address}`), node list, firmware compatibility table, and the required launch wording from Phase 6. Remove pages for removed features.
 
 Safe early removal, tested to leave the coinbase byte-identical:
 - **R1** `apps/*` and ghost-keys (~53k lines).
