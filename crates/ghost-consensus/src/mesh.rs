@@ -2331,10 +2331,6 @@ impl MeshNetwork {
             | MessageType::VerificationResult
             | MessageType::ChallengeConvergence
             | MessageType::EquivocationProof
-            | MessageType::MpcContribution
-            | MessageType::MpcVerificationVote
-            | MessageType::MpcParametersRequest
-            | MessageType::MpcParametersResponse
             // L2 messages use Noise encryption (contain proofs and encrypted note data)
             | MessageType::L2ConfidentialTransfer
             | MessageType::L2TransferConfirmation
@@ -2571,7 +2567,7 @@ impl MeshNetwork {
     /// Send a message to a specific peer
     ///
     /// Automatically routes messages through Noise encryption for sensitive message types
-    /// (MPC, Elder, Payout, ZK, etc.) or ZMQ for broadcast messages (Discovery, HealthPing).
+    /// (Elder, Payout, ZK, etc.) or ZMQ for broadcast messages (Discovery, HealthPing).
     /// Publish a ZMQ broadcast envelope on the PUB socket exactly once.
     ///
     /// The publisher task ignores the per-message endpoint and routes purely by
@@ -2671,11 +2667,6 @@ impl MeshNetwork {
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            // P2P-C1/C2/C3: Elder registration messages use elder management port
-            | MessageType::MpcContribution
-            | MessageType::MpcVerificationVote
-            | MessageType::MpcParametersRequest
-            | MessageType::MpcParametersResponse => self.config.ports.elder_management,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
             // ZK-BFT messages use consensus voting port
             // Verification results (and their convergence/backfill) use health monitoring port
@@ -2810,7 +2801,7 @@ impl MeshNetwork {
     /// Binds the configured `noise_port`, accepts inbound encrypted connections,
     /// completes the Noise handshake, and dispatches every decrypted message
     /// through [`handle_received`](Self::handle_received) to the registered
-    /// handlers. Point-to-point message types (MPC contributions/votes, shares,
+    /// handlers. Point-to-point message types (votes, shares,
     /// consensus votes, payouts, …) are delivered over Noise, so WITHOUT this
     /// loop a node emits Noise traffic but never receives any — the broadcast
     /// reaches the peer's TCP stack but is never dispatched to a handler.
@@ -3255,7 +3246,6 @@ impl MeshNetwork {
             (topics::ZK_PROPOSAL, "zk_proposal"),
             (topics::ZK_VOTE, "zk_vote"),
             (topics::VERIFICATION, "verification"),
-            (topics::MPC, "mpc"), // MPC ceremony messages
         ];
 
         for (topic, name) in additional_topics {
@@ -3434,7 +3424,6 @@ impl MeshNetwork {
                         ("elder", topics::ELDER),
                         ("payout", topics::PAYOUT_PROPOSAL),
                         ("verify", topics::VERIFICATION),
-                        ("mpc", topics::MPC), // MPC ceremony messages
                     ];
 
                     let (topic_name, data): (&str, Vec<u8>) = {
@@ -3525,15 +3514,6 @@ impl MeshNetwork {
                             topic = topic_name,
                             data_len = data.len(),
                             "SUB received verification message"
-                        );
-                    }
-
-                    // Log MPC messages for ceremony debugging
-                    if topic_name == "mpc" {
-                        debug!(
-                            topic = topic_name,
-                            data_len = data.len(),
-                            "SUB received MPC message"
                         );
                     }
 
@@ -3727,7 +3707,7 @@ impl MeshNetwork {
             "verify" => Some(MessageType::VerificationResult),
             "payout" => Some(MessageType::PayoutProposal),
             // Multi-type topics — skip fast check, rely on post-deser validation
-            "elder" | "mpc" | "l2tx" | "l2chk" | "l2vote" | "l2sync" | "unknown" => None,
+            "elder" | "l2tx" | "l2chk" | "l2vote" | "l2sync" | "unknown" => None,
             _ => None,
         }
     }
@@ -3859,10 +3839,6 @@ impl MeshNetwork {
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            MessageType::MpcContribution
-            | MessageType::MpcVerificationVote
-            | MessageType::MpcParametersRequest
-            | MessageType::MpcParametersResponse => self.config.ports.elder_management,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
             MessageType::EquivocationProof
             | MessageType::L2ConfidentialTransfer
@@ -3914,7 +3890,7 @@ impl MeshNetwork {
 
         // C-10: Reject Noise-required messages from broadcast_sync entirely.
         // broadcast_sync is a synchronous (non-async) path that sends over ZMQ,
-        // bypassing Noise encryption. Sensitive message types (MPC, votes, shares,
+        // bypassing Noise encryption. Sensitive message types (votes, shares,
         // etc.) MUST use the async smart_broadcast() path that routes through Noise.
         // Allowing them here would silently send secrets in plaintext.
         if self.should_use_noise(msg_type) {
@@ -4820,10 +4796,6 @@ mod tests {
                 | MessageType::VerificationResult
                 | MessageType::ChallengeConvergence
                 | MessageType::EquivocationProof
-                | MessageType::MpcContribution
-                | MessageType::MpcVerificationVote
-                | MessageType::MpcParametersRequest
-                | MessageType::MpcParametersResponse
                 | MessageType::L2ConfidentialTransfer
                 | MessageType::L2TransferConfirmation
                 | MessageType::L2TransferBroadcast
@@ -4842,16 +4814,6 @@ mod tests {
         assert!(
             !message_type_requires_noise(MessageType::Discovery),
             "Discovery should stay on ZMQ"
-        );
-
-        // MPC-sensitive messages (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::MpcContribution),
-            "MpcContribution must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::MpcVerificationVote),
-            "MpcVerificationVote must use Noise"
         );
 
         // Consensus/voting messages (MUST use Noise)
@@ -4913,16 +4875,6 @@ mod tests {
         assert!(
             message_type_requires_noise(MessageType::EquivocationProof),
             "EquivocationProof must use Noise"
-        );
-
-        // MPC params transfer (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::MpcParametersRequest),
-            "MpcParametersRequest must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::MpcParametersResponse),
-            "MpcParametersResponse must use Noise"
         );
 
         // Share shard (MUST use Noise — the shard IS the payout ledger)

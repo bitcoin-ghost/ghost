@@ -11,7 +11,7 @@
 #                         -- -D warnings -A clippy::derivable_impls ... (six allows)
 #
 # Two consequences. Without `--all-features`, feature-gated code — `zk-consensus`,
-# `mpc-ceremony`, `zk-production`, and there is a lot of it — was never linted locally.
+# `zk-production`, and there is a lot of it — was never linted locally.
 # Without `-D warnings`, clippy exits 0 on warnings, so the gate recorded success on a commit
 # CI would then reject. A commit could pass the deploy gate and turn main red.
 #

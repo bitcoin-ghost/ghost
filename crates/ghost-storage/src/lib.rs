@@ -41,7 +41,6 @@ pub mod database;
 pub mod encryption;
 pub mod migrations;
 pub mod models;
-pub mod mpc_lineage;
 pub mod node_pool_store;
 pub mod queries;
 pub mod shard_store;

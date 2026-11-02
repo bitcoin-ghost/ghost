@@ -326,7 +326,6 @@ async fn load_07_mixed_realistic_traffic() {
         "/api/v1/node/status",
         "/api/v1/network/peers",
         "/api/v1/mining/miners",
-        "/api/v1/mpc/status",
     ];
     let users = 4;
     let duration = Duration::from_secs(30);

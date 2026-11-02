@@ -422,24 +422,5 @@ async fn core_chaos_08_post_chaos_consistency() {
         println!("  {} ghost-core — zero crashes", node.name);
     }
 
-    // MPC consistent
-    let mut mpc_counts = Vec::new();
-    for ip in config.all_ips() {
-        if let Ok(c) = client.get_mpc_contribution_count(ip).await {
-            mpc_counts.push(c);
-        }
-    }
-    if mpc_counts.len() == config.nodes.len() {
-        let first = mpc_counts[0];
-        for c in &mpc_counts {
-            assert_eq!(
-                *c, first,
-                "Post-chaos MPC mismatch with Tor+clearnet: {:?}",
-                mpc_counts
-            );
-        }
-        println!("  MPC contributions consistent: {}", first);
-    }
-
     println!("  Full consistency verified with Tor + clearnet Ghost Core modes");
 }

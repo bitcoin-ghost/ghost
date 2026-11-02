@@ -512,7 +512,7 @@ run_dashboard_test() {
     # HTTP-only dashboard check: hit key endpoints via direct curl
     local ok=0 fail=0
     for i in $(seq 0 $((VM_COUNT - 1))); do
-        for ep in "/health" "/api/v1/l2/tree-state" "/api/v1/mpc/params/manifest"; do
+        for ep in "/health" "/api/v1/l2/tree-state"; do
             if curl -sf --connect-timeout 5 --max-time 10 \
                 "http://${VM_IPS[$i]}:${POOL_PORT}${ep}" > /dev/null 2>&1; then
                 ok=$((ok + 1))
@@ -1690,27 +1690,6 @@ print(dk.hex())
             ((failures++))
         fi
     done
-
-    # MPC contributor count consistency
-    log "MPC contributor consistency..."
-    local mpc_counts=()
-    for i in $(seq 0 $((VM_COUNT - 1))); do
-        local mc
-        mc=$(pool_api "$i" "/api/v1/mpc/contributors" | jq -r '.count // empty' 2>/dev/null)
-        mpc_counts+=("${mc:-?}")
-    done
-    local first_mpc="${mpc_counts[0]}"
-    local mpc_ok=true
-    for mc in "${mpc_counts[@]}"; do
-        if [[ "$mc" != "$first_mpc" ]]; then
-            mpc_ok=false
-        fi
-    done
-    if $mpc_ok; then
-        log "  MPC contributors consistent: $first_mpc"
-    else
-        log "  ${YELLOW}MPC contributor mismatch: ${mpc_counts[*]}${RESET}"
-    fi
 
     # Binary version consistency
     log "Binary version consistency..."

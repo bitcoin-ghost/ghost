@@ -59,9 +59,6 @@ pub mod verification_handler;
 pub mod vote_handler;
 pub mod voting;
 
-#[cfg(feature = "mpc-ceremony")]
-pub mod mpc_handler;
-
 pub use ban_manager::*;
 pub use discovery_handler::*;
 pub use epoch::*;
@@ -81,6 +78,3 @@ pub use shard_handler::*;
 pub use verification_handler::*;
 pub use vote_handler::*;
 pub use voting::*;
-
-#[cfg(feature = "mpc-ceremony")]
-pub use mpc_handler::*;

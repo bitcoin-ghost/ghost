@@ -144,42 +144,6 @@ async fn recovery_05_no_panics_in_logs() {
 
 #[tokio::test]
 #[ignore]
-async fn recovery_06_mpc_consistent() {
-    let client = setup();
-    let mut counts = Vec::new();
-
-    for ip in client.config.all_ips() {
-        // Retry to handle 429s
-        let mut result = Err("not attempted".to_string());
-        for _ in 0..5 {
-            result = client.get_mpc_contribution_count(ip).await;
-            if result.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        match result {
-            Ok(c) => {
-                println!("  {} MPC contributions: {}", ip, c);
-                counts.push(c);
-            }
-            Err(e) => panic!("Post-chaos: {} MPC status failed: {}", ip, e),
-        }
-    }
-
-    let first = counts[0];
-    for (i, c) in counts.iter().enumerate() {
-        assert_eq!(
-            *c, first,
-            "Post-chaos: node {} has {} MPC contributions, expected {}",
-            i, c, first
-        );
-    }
-    println!("Post-chaos MPC consistent: {} contributions", first);
-}
-
-#[tokio::test]
-#[ignore]
 async fn recovery_07_response_times_acceptable() {
     let client = setup();
     let endpoints = ["/health", "/api/v1/node/status", "/api/v1/network/peers"];

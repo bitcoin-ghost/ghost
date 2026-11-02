@@ -51,7 +51,6 @@ pub mod instant;
 pub mod internal_auth;
 pub mod key_rotation;
 pub mod metrics;
-pub mod mpc;
 
 /// Node pool protocol constants (new names only; nothing live reads them).
 pub mod node_pool_constants;

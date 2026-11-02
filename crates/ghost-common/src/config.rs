@@ -2558,11 +2558,10 @@ pub struct PoolConfig {
     /// If not set, auto-derives from pool_name or mining_mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinbase_extra: Option<String>,
-    /// Optional password required for --genesis flag. When set in the config,
-    /// the operator must also pass --genesis-password on the CLI for genesis to proceed.
-    /// Prevents accidental dual-genesis if someone mistakenly runs --genesis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub genesis_password: Option<String>,
+    /// Retired `genesis_password` key (it guarded the removed MPC genesis), accepted so
+    /// older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "genesis_password")]
+    pub retired_genesis_password: Option<IgnoredAny>,
     /// Block-priority lever: `max_fee` (default) orders the block by package fee
     /// rate; `payments_first` seats BUDS financial txs (T0/T1) ahead of data txs
     /// (T2/T3). Additive with `#[serde(default)]` so existing pool.toml files
@@ -2636,7 +2635,7 @@ impl Default for PoolConfig {
             node_payout_address: None,
             pool_name: None,
             coinbase_extra: None,
-            genesis_password: None,
+            retired_genesis_password: None,
             block_priority: BlockPriority::default(),
             template_refresh_secs: None,
         }

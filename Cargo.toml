@@ -38,9 +38,6 @@ members = [
     "crates/ghost-reconciliation",
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
-    "crates/ghost-mpc",
-    # Cross-process MPC ceremony contribution harness (test-only, feature-gated)
-    "crates/mpc-xproc-harness",
     # GSP
     # Node Binaries
     "bins/ghost-pool",
@@ -94,7 +91,6 @@ ghost-np-relay = { path = "crates/ghost-np-relay" }
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # ZK-BFT Infrastructure
 ghost-zkp = { path = "crates/ghost-zkp" }
-ghost-mpc = { path = "crates/ghost-mpc" }
 # GSP crates
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }

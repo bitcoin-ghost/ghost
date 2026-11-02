@@ -2379,7 +2379,6 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "ghost-common",
- "ghost-mpc",
  "ghost-reconciliation",
  "ghost-storage",
  "ghost-zkp",
@@ -2439,7 +2438,6 @@ dependencies = [
  "ghost-build-info",
  "ghost-common",
  "ghost-consensus",
- "ghost-mpc",
  "ghost-policy",
  "ghost-reaper",
  "ghost-reconciliation",
@@ -2466,33 +2464,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "ghost-mpc"
-version = "0.1.0"
-dependencies = [
- "bellperson",
- "blstrs",
- "ff",
- "getrandom 0.2.17",
- "ghost-common",
- "ghost-storage",
- "ghost-zkp",
- "group",
- "hex",
- "pairing",
- "parking_lot",
- "rand 0.8.6",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -3583,26 +3554,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mpc-xproc-harness"
-version = "0.1.0"
-dependencies = [
- "axum 0.7.9",
- "bellperson",
- "blstrs",
- "ghost-common",
- "ghost-mpc",
- "ghost-policy",
- "ghost-verification",
- "ghost-zkp",
- "hex",
- "rand 0.8.6",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

@@ -144,14 +144,6 @@ pub const MAX_ELDER_REGISTRATION_PROPOSAL_SIZE: usize = 1_000;
 pub const MAX_ELDER_LIST_PROPOSAL_SIZE: usize = 100_000;
 /// P2P-C3: Elder list approval (signature + epoch + merkle root)
 pub const MAX_ELDER_LIST_APPROVAL_SIZE: usize = 500;
-/// MPC-C1: MPC contribution (proof + params hash + signature)
-pub const MAX_MPC_CONTRIBUTION_SIZE: usize = 50_000;
-/// MPC-C2: MPC verification vote (signature + approval)
-pub const MAX_MPC_VERIFICATION_VOTE_SIZE: usize = 500;
-/// MPC-C3: MPC parameters request (hash + chunk indices)
-pub const MAX_MPC_PARAMS_REQUEST_SIZE: usize = 5_000;
-/// MPC-C4: MPC parameters response (chunked data ~1MB)
-pub const MAX_MPC_PARAMS_RESPONSE_SIZE: usize = 1_100_000;
 /// L2 confidential transfer (~490 bytes per tx + envelope overhead)
 pub const MAX_L2_TRANSFER_SIZE: usize = 2_000;
 /// L2 transfer confirmation (receipt ~200 bytes)
@@ -527,10 +519,6 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::VerificationResult => MAX_VERIFICATION_SIZE,
         MessageType::ChallengeConvergence => MAX_CHALLENGE_CONVERGENCE_SIZE,
         MessageType::EquivocationProof => MAX_EQUIVOCATION_PROOF_SIZE,
-        MessageType::MpcContribution => MAX_MPC_CONTRIBUTION_SIZE,
-        MessageType::MpcVerificationVote => MAX_MPC_VERIFICATION_VOTE_SIZE,
-        MessageType::MpcParametersRequest => MAX_MPC_PARAMS_REQUEST_SIZE,
-        MessageType::MpcParametersResponse => MAX_MPC_PARAMS_RESPONSE_SIZE,
         MessageType::L2ConfidentialTransfer => MAX_L2_TRANSFER_SIZE,
         MessageType::L2TransferConfirmation => MAX_L2_CONFIRMATION_SIZE,
         MessageType::L2TransferBroadcast => MAX_L2_BROADCAST_SIZE,

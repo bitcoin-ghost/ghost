@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # Regtest-cluster entrypoint: render the per-node config from env, then start
-# ghost-pool. Pool1 starts with --genesis (it bootstraps the MPC/elder set);
-# pools 2-4 join without it. See README.md for the start ordering.
+# ghost-pool. See README.md for the start ordering.
 set -euo pipefail
 
 : "${NODE_NAME:?NODE_NAME required}"
 : "${SEED_NODES:?SEED_NODES required (comma-separated \"host:8559\" quoted list)}"
 : "${BITCOIN_RPC_USER:?}" "${BITCOIN_RPC_PASSWORD:?}" "${TREASURY_ADDRESS:?}"
-GENESIS_ARG="${GENESIS_ARG:-}"
 
 mkdir -p /var/lib/ghost/data
 export SIGNING_KEY="${SIGNING_KEY:-$(head -c 32 /dev/urandom | xxd -p -c 32)}"
@@ -47,6 +45,6 @@ done
 # pool_sv2 gets templates. Left empty everywhere else.
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-echo "[$NODE_NAME] starting ghost-pool (genesis='${GENESIS_ARG}' extra='${EXTRA_ARGS}') on regtest"
+echo "[$NODE_NAME] starting ghost-pool (extra='${EXTRA_ARGS}') on regtest"
 # shellcheck disable=SC2086
-exec /usr/local/bin/ghost-pool ${GENESIS_ARG} ${EXTRA_ARGS} --config /etc/ghost/config.toml
+exec /usr/local/bin/ghost-pool ${EXTRA_ARGS} --config /etc/ghost/config.toml

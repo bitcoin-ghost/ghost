@@ -114,13 +114,6 @@ collect_node() {
     [[ -z "$peers" ]] && peers="?"
     echo "peers=$peers" >> "$out"
 
-    # MPC contributors from /api/v1/mpc/contributors
-    local mpc
-    mpc=$(curl -sf --connect-timeout 3 "$base/api/v1/mpc/contributors" 2>/dev/null \
-        | jq 'if type == "array" then length else .contributors | length end' 2>/dev/null) || mpc="?"
-    [[ -z "$mpc" ]] && mpc="?"
-    echo "mpc_contributors=$mpc" >> "$out"
-
     # Binary version from /api/v1/system/version
     local version
     version=$(curl -sf --connect-timeout 3 "$base/api/v1/system/version" 2>/dev/null \
@@ -162,7 +155,7 @@ wait
 # ---------------------------------------------------------------------------
 # Read results into arrays
 # ---------------------------------------------------------------------------
-declare -a R_BLOCK R_L2 R_PEERS R_MPC R_VERSION R_MODE R_REAPER_EN R_REAPER_MODE R_NETWORK
+declare -a R_BLOCK R_L2 R_PEERS R_VERSION R_MODE R_REAPER_EN R_REAPER_MODE R_NETWORK
 declare -a R_TREE_ROOT R_ROOTS_MATCH R_NOTE_COUNT R_RECENT_FINAL
 
 read_val() {
@@ -178,7 +171,6 @@ for i in "${!VM_IPS[@]}"; do
     R_BLOCK[$i]=$(read_val "$out" block_height)
     R_L2[$i]=$(read_val "$out" l2_height)
     R_PEERS[$i]=$(read_val "$out" peers)
-    R_MPC[$i]=$(read_val "$out" mpc_contributors)
     R_VERSION[$i]=$(read_val "$out" version)
     R_MODE[$i]=$(read_val "$out" ghost_mode)
     R_REAPER_EN[$i]=$(read_val "$out" reaper_enabled)
@@ -411,26 +403,6 @@ fi
 SECTIONS+=("$section")
 SECTION_HAS_ISSUE+=("$has_issue")
 
-# --- MPC Contributors ---
-section=""
-has_issue=false
-
-section+="  ${BOLD}MPC Contributors:${RESET}\n    "
-for i in "${!VM_IPS[@]}"; do
-    (( i > 0 )) && section+="   "
-    section+="${VM_NAMES[$i]}: ${R_MPC[$i]}"
-done
-section+="\n"
-
-if ! all_identical "${R_MPC[@]}"; then
-    has_issue=true
-    section+="    ${YELLOW}→ WARNING: MPC contributor counts differ across nodes${RESET}\n"
-    (( WARNINGS++ ))
-else
-    section+="    ${GREEN}→ OK: All nodes agree${RESET}\n"
-fi
-SECTIONS+=("$section")
-SECTION_HAS_ISSUE+=("$has_issue")
 
 # --- Binary Version ---
 section=""

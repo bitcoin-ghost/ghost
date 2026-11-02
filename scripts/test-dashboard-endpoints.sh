@@ -247,13 +247,11 @@ run_all_tests() {
     test_endpoint "4.12" "/api/v1/config/profiles/mempool"  "$pool/api/v1/config/profiles/mempool"
     test_endpoint "4.13" "/api/v1/config/profiles/template" "$pool/api/v1/config/profiles/template"
 
-    # ── Group 5: Elders/MPC (3 endpoints) ────────────────────────────
+    # ── Group 5: Elders (1 endpoint) ─────────────────────────────────
 
-    group_header 5 "Elders/MPC" 3
+    group_header 5 "Elders" 1
 
     test_endpoint "5.1" "/api/v1/network/elder"             "$pool/api/v1/network/elder"
-    test_endpoint "5.2" "/api/v1/mpc/status"                "$pool/api/v1/mpc/status"
-    test_endpoint "5.3" "/api/v1/mpc/contributors"          "$pool/api/v1/mpc/contributors"
 
     # ── Group 6: System (4 endpoints) ────────────────────────────────
 

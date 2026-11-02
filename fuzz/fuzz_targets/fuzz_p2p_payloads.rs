@@ -54,12 +54,6 @@ fuzz_target!(|data: &[u8]| {
     // Byzantine evidence
     let _ = serde_json::from_slice::<EquivocationProofMessage>(data);
 
-    // MPC ceremony
-    let _ = serde_json::from_slice::<MpcContributionMessage>(data);
-    let _ = serde_json::from_slice::<MpcVerificationVoteMessage>(data);
-    let _ = serde_json::from_slice::<MpcParametersRequestMessage>(data);
-    let _ = serde_json::from_slice::<MpcParametersResponseMessage>(data);
-
     // L2 layer
     let _ = serde_json::from_slice::<L2ConfidentialTransferMessage>(data);
     let _ = serde_json::from_slice::<L2TransferConfirmationMessage>(data);

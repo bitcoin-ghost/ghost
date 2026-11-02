@@ -546,7 +546,7 @@ fn test_pool_config_validate_success() {
         node_payout_address: None,
         pool_name: None,
         coinbase_extra: None,
-        genesis_password: None,
+        retired_genesis_password: None,
         block_priority: Default::default(),
         template_refresh_secs: None,
     };

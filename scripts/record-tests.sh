@@ -143,7 +143,7 @@ run_gate() {
 #
 #     cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A ...
 #
-# so feature-gated code (`zk-consensus`, `mpc-ceremony`, `zk-production`) was never linted
+# so feature-gated code (`zk-consensus`, `zk-production`) was never linted
 # locally, and without `-D warnings` clippy exited 0 on warnings — `run_gate` recorded success
 # on a commit CI would reject, and the deploy gate passed it as tested.
 #
@@ -184,10 +184,9 @@ if grep -qE "FAILED" <<<"$test_out"; then
 fi
 
 # Feature-gated consensus modules. `--lib --bins` above does NOT compile these, because
-# ghost-consensus has `default = []` and gates two modules behind features:
+# ghost-consensus has `default = []` and gates modules behind a feature:
 #
 #   #[cfg(feature = "zk-consensus")]  pub mod nullifier_route_handler;   <- L2 tree sync
-#   #[cfg(feature = "mpc-ceremony")]  pub mod mpc_handler;
 #
 # Without them the run reports ~286 tests while ~71 more are not even compiled — including
 # every test for the L2 tree-sync and nullifier-routing code that is live on all 8 production
@@ -198,7 +197,7 @@ fi
 # ghost-verification's `allow-insecure` (changing what the security tests assert) and
 # `zk-production` (which needs trusted-setup params).
 echo "==> tests (feature-gated consensus modules)"
-feat_out="$(cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony 2>&1)" || {
+feat_out="$(cargo test -p ghost-consensus --lib --features zk-consensus 2>&1)" || {
     echo "$feat_out" | grep -E "FAILED|^error|panicked at|assertion|left ==|right ==|left:|right:" \
         | head -40 >&2
     echo "FAILED: feature-gated consensus tests" >&2; exit 1; }
