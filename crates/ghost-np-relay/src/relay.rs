@@ -620,6 +620,15 @@ impl Relay {
                 continue;
             }
             let Some(batch) = self.db.np_get_batch(&rec.hash)? else {
+                // Pruned under a checkpoint that no longer verifies, or stored without it: fetch
+                // it from peers like any unseen anchor's.
+                self.awaiting.insert(
+                    rec.hash,
+                    Awaiting {
+                        since: 0,
+                        asked: Vec::new(),
+                    },
+                );
                 continue;
             };
             let mut ids = Vec::with_capacity(batch.shares.len());
