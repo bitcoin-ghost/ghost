@@ -64,7 +64,7 @@ mempool policy.
 | 34255 | Stratum V2 — via SRI pool |
 | 8566 | Node pool share-chain relay |
 | 8080 | REST API |
-| 8555–8562 | P2P mesh (health pings, discovery) |
+| 8555–8562 | P2P mesh of the old network (closed on node pool nodes) |
 | 8900 | GSP WebSocket (light-wallet backend) |
 
 ## Running a node

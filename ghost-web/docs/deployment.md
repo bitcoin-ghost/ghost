@@ -72,13 +72,13 @@ curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \
 
 That gives you the defaults: mainnet, full trustless sync with pruning, the node pool (the only mode), the mempool Reaper on, no archive, no Tor, no automatic updates.
 
-The installer always installs the latest published GitHub release. To pin one, set `GHOST_VERSION` — after `sudo`, so it survives into the root shell:
+**The release must be pinned.** Every release published on GitHub so far is the old network's, which keeps running beside the node pool, so the installer does not track the latest release: it refuses to install without `GHOST_VERSION` naming a node pool release. Set it after `sudo`, so it survives into the root shell:
 
 ```bash
-curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=v1.11.46 bash -s -- --fee-address ...
+curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=<node pool release tag> bash -s -- --fee-address ...
 ```
 
-If the GitHub API can't be reached and no version is pinned, the installer stops rather than guessing.
+**No contact with the old network.** A node pool node writes no mesh seed nodes (`seed_nodes = []` in `pool.toml`) and keeps the old mesh ports (8555–8563) and 8443 closed, so it neither dials nor accepts the old fleet's mesh. Its peers are share-chain relay peers only (`--relay-peer`). Automatic updates are off and `--auto-update` is ignored with a warning: the updater tracks the latest GitHub release, which is the old network's.
 
 **Reading it first.** The installer is one self-contained shell script. To read it before it runs as root, download it and run the file:
 
@@ -127,7 +127,7 @@ On a fresh install there is no Bitcoin node yet; ghostd is installed, and the in
 | `--tor` | off | Hybrid Tor: ghostd peers via Tor and publishes an onion, still reachable on clearnet 8333. |
 | `--tor-only` | off | ghostd uses Tor only (`onlynet=onion`) and 8333 is closed. Implies `--tor`. |
 | `--no-tor` | | Never use Tor (the default). |
-| `--auto-update` | off | Apply newer signed releases automatically. See *Automatic updates*, below. |
+| `--auto-update` | off | Ignored on node pool nodes for now, with a warning: the updater tracks the latest GitHub release, which is the old network's. |
 | `--no-auto-update` | | Never auto-update (the default). |
 | `--backups` | on | Back up the node database every night at 03:00 UTC, kept 7 days. See *Database backups*, below. |
 | `--no-backups` | | No nightly backups. The job is still installed; switch it on later with `sudo systemctl enable --now ghost-backup.timer`. |
@@ -187,7 +187,7 @@ With `UNSET` the install completes, the preflight warns, the config carries a ma
 
 ### Networks
 
-`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"` and no seed nodes (the seeds are mainnet nodes), and `assumevalid` is written only on mainnet.
+`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"`, and `assumevalid` is written only on mainnet.
 
 ### Tor
 
@@ -260,9 +260,8 @@ The installer enables `ufw` and allows:
 | 8566/tcp | Node pool share-chain relay | `--relay-port` |
 | 8080/tcp | ghost-mining HTTP API | |
 | 8442/tcp | ghost-mining TDP | |
-| 8443/tcp | Verification HTTPS | Peers fetch MPC params and votes |
-| 8555–8562/tcp | Mesh | Share propagation, blocks, health, discovery |
-| 8563/tcp | Noise mesh | Verifications and MPC exchange |
+
+8555–8562 (the old mesh), 8563 (Noise mesh) and 8443 (verification HTTPS) are **not** opened, and a rule an older install left is deleted: ghost-mining still listens on them, but a node pool node has no mesh seeds and must not be reachable by the old network's mesh.
 
 Three more ports are always open: 3333/tcp (SV1), 34255/tcp (SV2) and 4444/tcp (farm tier). `ghost-mining-firewall.path` re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever `pool.toml` changes, so a rule removed by hand, or closed by an older private or solo install, is put back.
 
@@ -333,6 +332,8 @@ The installer does not install the node dashboard. It writes `/etc/systemd/syste
 Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
 
 ## Automatic updates
+
+⚠ **Not on node pool nodes yet.** The updater resolves the latest GitHub release, which is the old network's, so the installer leaves it off and ignores `--auto-update`. Do not switch it on from the dashboard either: it would replace the node pool binaries. The rest of this section describes the updater as it works on the old network.
 
 Off by default. A node never upgrades itself unless you opt in, with `--auto-update` at install time or later:
 
@@ -410,7 +411,7 @@ The [Recovery runbook](#recovery) covers what to do when a running node breaks (
 ## What this guide isn't
 
 - **It isn't a tuning guide.** The installer's defaults are what the reference fleet runs.
-- **It isn't multi-node coordination.** A second node runs the same installer on a different host; it bootstraps from the seed nodes built into the installer and discovers the rest through gossip. There's no centralised registry or membership flow.
+- **It isn't multi-node coordination.** A second node runs the same installer on a different host; it finds other node pool nodes through the share-chain relay peers it is given (`--relay-peer`) and the peers they pass on. There's no centralised registry or membership flow.
 - **It isn't a config reference.** It covers the keys the installer's flags set; other fields keep their defaults.
 - **It isn't a security review.** [Security](/security.html) covers the disclosure flow. Keep `pool.toml`, `bitcoin.conf`, `pool-config.toml` and `node.key` off public repos and backups you don't control.
 

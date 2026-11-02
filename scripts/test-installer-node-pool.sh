@@ -252,7 +252,7 @@ is "the alert webhook is optional" "mainnet|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7k
 is "it does not ask for a treasury" 0 "$(printf '%s\n' "$wiz" | $G -ci treasury || true)"
 
 echo "7. validation and re-runs"
-validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&&/^\[\[ "\$PREFLIGHT_ONLY" == "true" \]\] && exit 0$/{exit}' "$INSTALLER")"
+validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&&/^  AUTO_UPDATE="false"$/{getline; print; exit}' "$INSTALLER")"
 is "the validation step is present" yes "$([ -n "$validate" ] && echo yes)"
 old="$TMP/pool-config.toml"
 eval "$($G '^_trim() ' "$INSTALLER")"
@@ -270,7 +270,7 @@ printf 'coinbase_reward_script = "addr(bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t
 validated_vars() {
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
       FEE_ADDRESS="" NETWORK=mainnet RELAY_PEERS="" RELAY_PORT=8566 GENESIS_ANCHOR="" GENESIS_HEIGHT=""
-      PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
+      PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false GHOST_VERSION=v9.9.9 AUTO_UPDATE=false
       eval "${validate//\/etc\/ghost\/pool-config.toml/$old}"
       echo "$FEE_ADDRESS|$RELAY_PEERS|$GENESIS_ANCHOR|$GENESIS_HEIGHT" )
 }
@@ -284,6 +284,28 @@ is "a genesis anchor needs its height" "ERR --genesis-anchor needs --genesis-hei
    "$(validated bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 mainnet "$(printf 'ab%.0s' {1..32})")"
 is "--preflight-only exits after the preflight" "" "$(validated bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4)"
 is "an unknown network is refused" "ERR --network must be mainnet, signet or regtest." "$(validated x testnet)"
+pinned() {
+    ( log() { echo "LOG $*"; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
+      FEE_ADDRESS=bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 NETWORK=mainnet RELAY_PEERS="" RELAY_PORT=8566
+      GENESIS_ANCHOR="" GENESIS_HEIGHT="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
+      GHOST_VERSION="$1" AUTO_UPDATE="$2"
+      eval "${validate//\/etc\/ghost\/pool-config.toml/$old}"
+      echo "AUTO_UPDATE=$AUTO_UPDATE" ) 2>&1 | tr '\n' ' '
+}
+has "an unpinned release is refused (latest is the old network's)" "ERR Pin the node pool release to install" "$(pinned '' false)"
+has "a pinned release proceeds" "AUTO_UPDATE=false" "$(pinned v9.9.9 false)"
+has "--auto-update is turned off, and says so" "not available for node pool nodes yet" "$(pinned v9.9.9 true)"
+has "... and is off" "AUTO_UPDATE=false" "$(pinned v9.9.9 true)"
+is "the installer no longer tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*releases/latest' "$INSTALLER" || true)"
+
+echo "8. isolation from the old network"
+for ip in 83.136.251.162 85.9.198.212 213.163.207.46 95.111.221.169; do
+    is "no old fleet address $ip" 0 "$($G -cF "$ip" "$INSTALLER" || true)"
+done
+is "pool.toml is written with no mesh seeds" 1 "$($G -cx 'seed_nodes = \[\]' "$INSTALLER" || true)"
+is "no SEED_NODES list is left" 0 "$($G -c 'SEED_NODES' "$INSTALLER" || true)"
+is "the old mesh ports are not opened" 0 "$($G -cE '^ufw allow (8555|8563|8443)' "$INSTALLER" || true)"
+is "they are closed on a re-run" 3 "$($G -cE '^ufw delete allow (8555:8562|8563|8443)/tcp' "$INSTALLER" || true)"
 
 echo
 echo "test-installer-node-pool: $pass passed, $fail failed"

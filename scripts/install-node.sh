@@ -13,21 +13,13 @@
 set -euo pipefail
 
 # ─────────────────────────── network constants ───────────────────────────────
-# GHOST_VERSION auto-tracks the latest signed GitHub release, so cutting a new
-# release needs no installer edit (releases follow a version bump automatically).
-# Override with the GHOST_VERSION env var; falls back to a known-good pin when the
-# GitHub API is unreachable. The release tarball is GPG-verified below regardless
-# of how the version resolves, so auto-tracking never lowers the security bar.
-GHOST_VERSION="${GHOST_VERSION:-$(curl -fsSL --max-time 10 https://api.github.com/repos/bitcoin-ghost/ghost/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)}"
-# ⛔ No stale fallback. This used to pin v1.10.16 — roughly 27 releases behind current — so a
-# momentary GitHub API failure silently installed an ancient binary, GPG-verified and wrong.
-# "I could not determine the latest release" must stop, not guess: an operator can re-run, or pin
-# GHOST_VERSION deliberately.
-if [[ -z "${GHOST_VERSION}" ]]; then
-  echo "ERROR: could not determine the latest release from the GitHub API." >&2
-  echo "       Re-run when reachable, or pin one explicitly: GHOST_VERSION=v1.11.43 $0 ..." >&2
-  exit 1
-fi
+# ⛔ GHOST_VERSION must be PINNED. This installer used to track the latest GitHub release, but
+# every release published so far is the old network's (`main`), which keeps running beside the node
+# pool: tracking `latest` would install old-network binaries, without the node pool, onto a node
+# pool node. There is no node pool release channel yet, so the operator names the release and the
+# installer refuses without one (checked after the preflight, so --help and --preflight-only work).
+# The tarball is GPG-verified below regardless.
+GHOST_VERSION="${GHOST_VERSION:-}"
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
@@ -40,8 +32,10 @@ POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
-# Bootstrap peers. The node discovers the rest via gossip.
-SEED_NODES='"83.136.251.162:8555", "85.9.198.212:8555", "213.163.207.46:8555", "95.111.221.169:8555"'
+# ⛔ No mesh seed nodes. The old network's eight nodes keep running `main` beside node pool nodes,
+# and the two must never talk: this list used to name the old fleet, so every install dialled its
+# mesh. A node pool node agrees on its ledger over the share-chain relay (`[node_pool.relay]`,
+# `--relay-peer`), so it writes `seed_nodes = []` and keeps the old mesh ports closed (below).
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
 ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
@@ -832,6 +826,14 @@ fi
 # ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
 np_preflight || err "Preflight failed — fix the FAIL lines above and re-run."
 [[ "$PREFLIGHT_ONLY" == "true" ]] && exit 0
+[[ -n "$GHOST_VERSION" ]] || err "Pin the node pool release to install: GHOST_VERSION=<tag> $0 ... The latest GitHub release is the old network's and is not installed by default."
+# Automatic updates track the latest GitHub release too, which is the old network's: on a node
+# pool node they would replace its binaries with ones that have no node pool. Off until a node
+# pool release channel exists.
+if [[ "$AUTO_UPDATE" == "true" ]]; then
+  log "WARNING: --auto-update is not available for node pool nodes yet (it tracks the old network's releases) — leaving it off."
+  AUTO_UPDATE="false"
+fi
 
 # The [alerts] block. ⛔ Written with `enabled` reflecting whether a channel was actually given:
 # a section that says `enabled = true` with nowhere to deliver is worse than an honest false,
@@ -1143,9 +1145,7 @@ fi
 
 # ─────────────────────────── 6. pool config ──────────────────────────────────
 log "Writing /etc/ghost/pool.toml"
-# The seed nodes are mainnet nodes; a signet or regtest node starts with none.
-MESH_SEEDS=""
-[[ "$NETWORK" == mainnet ]] && MESH_SEEDS="${SEED_NODES}"
+
 # Every node is a public node pool node, so there is no mining_mode to write. Configs from older
 # installs that still carry [network] mining_mode / private_mining_password / solo_payout_address,
 # [pool] treasury_address / min_payout_sats / payout_interval_blocks / node_payout_address /
@@ -1195,7 +1195,9 @@ sv1_port = 3333
 http_port = 8080
 max_miners = 1000
 farm_port = 4444
-seed_nodes = [${MESH_SEEDS}]
+# No mesh seeds, on purpose: see the note at the top of install-node.sh. Share-chain peers are in
+# /etc/ghost/pool-config.toml, [node_pool.relay] peers.
+seed_nodes = []
 
 [network.p2p]
 share_propagation = 8555
@@ -1739,9 +1741,12 @@ ufw allow "${NP_P2P_PORT}/tcp" >/dev/null 2>&1   # bitcoin P2P
 ufw allow "${RELAY_PORT}/tcp" >/dev/null 2>&1   # node pool share-chain relay
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
-ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
-ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications)
-ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS
+# The old mesh (8555-8562 ZMQ, 8563 Noise) and verification HTTPS (8443) stay CLOSED. ghost-mining
+# still listens on them, but a node pool node has no mesh seeds and must not be reachable by the
+# old fleet's mesh, which keeps running `main`. A rule left by an older install is removed.
+ufw delete allow 8555:8562/tcp >/dev/null 2>&1 || true
+ufw delete allow 8563/tcp      >/dev/null 2>&1 || true
+ufw delete allow 8443/tcp      >/dev/null 2>&1 || true
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
