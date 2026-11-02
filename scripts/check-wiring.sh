@@ -45,9 +45,9 @@ import re, subprocess, pathlib, sys
 # if an allowlisted variant gains a dispatch arm, this script fails too, so the list cannot rot
 # into a place where real gaps hide.
 ALLOWLIST: dict[str, str] = {
-    # (empty) Every Shard message type is currently dispatched. An entry here needs the reason it
-    # is deliberately ignored, and the check fails if an allowlisted type gains a dispatch arm, so
-    # the list cannot quietly rot into a hiding place.
+    # (empty) Every message type is currently dispatched. An entry here needs the reason it is
+    # deliberately ignored, and the check fails if an allowlisted type gains a dispatch arm, so the
+    # list cannot quietly rot into a hiding place.
 }
 
 src = pathlib.Path("crates/ghost-consensus/src/message.rs").read_text()
@@ -59,17 +59,8 @@ if not m:
 
 all_variants = re.findall(r"^\s{4}([A-Z][A-Za-z0-9]*)\s*(?:=\s*\d+\s*)?,", m.group(1), re.M)
 
-# Scoped to the Shard family — for now.
-#
-# This is where all four unwired-core failures happened, and it is the set whose dispatch state I
-# have actually verified. Running it across all 46 variants today flags eight more (BlockFound,
-# ElderUpdate, the Zk and ElderList families): those are candidates, not verdicts — several are
-# likely routed through callbacks rather than a `MessageHandler`, and asserting they are dead
-# without checking would be exactly the over-broad check this file argues against.
-#
-# ⚠ Widen this when someone has triaged the rest. An honest narrow check that fails for real
-# reasons beats a broad one whose failures get muted.
-variants = [v for v in all_variants if v.startswith("Shard")]
+# Every variant. The mesh carries health pings and discovery only, so the whole set is triaged.
+variants = list(all_variants)
 if not variants:
     print("check-wiring: parsed ZERO variants — refusing to report success on an empty set.")
     sys.exit(1)
@@ -114,7 +105,7 @@ stale = [v for v in ALLOWLIST if v in dispatched]
 # exists to argue against — the gap is stated plainly. An arm that exists but is never reached
 # still needs a human or a real end-to-end test to catch.
 
-print(f"  {len(variants)} Shard message types of {len(all_variants)} total; "
+print(f"  {len(variants)} message types; "
       f"{len(dispatched & set(variants))} dispatched, {len(ALLOWLIST)} allowlisted")
 
 failed = False

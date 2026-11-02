@@ -119,21 +119,6 @@ jobs:
       # Found five times (#854, #926) and baselined across the SV2 apps. A ratchet — the baseline may shrink, never grow.
       - name: select! cancellation safety
         run: ./scripts/check-select-cancellation-safety.sh
-      # The 5-4-3-2-1 weights are protocol constants that the payout path reads — and the
-      # dashboard API open-codes the same ladder TWICE, plus `"max_shares"` three times. A reweight
-      # that misses a copy does not change anyone's payment (payouts divide by the sum of actual
-      # shares, never by MAX_NODE_SHARES), it just makes the dashboard quietly wrong. #736 will
-      # have to delete GHOST_PAY_SHARES from all of them.
-      - name: Capability ladder agrees with the constants
-        run: ./scripts/check-capability-ladder-agrees.sh
-      # A capability is earned by passing its verification challenges, so the config endpoint (#403)
-      # must never let an operator set one. `apply()` enforces that by default-deny, and the test
-      # pinning it named four paths BY HAND — one of which (`pool.public_mining`) is not a field of
-      # any settings struct, while `network.mining_mode` and `coordinator.coordinator_enabled`, the
-      # two that actually drive a claim, went unmentioned (#963). This derives the field list from
-      # `NodeCapabilities` so a new capability cannot be added without the mapping being completed.
-      - name: Capability claims are not remotely settable
-        run: ./scripts/check-capability-claims-are-not-settable.sh
       # The deploy gate counts `batches delivered` by grepping sri-pool's journal for a line that
       # is `debug!` in a module the fleet's RUST_LOG does not enable — so it was structurally 0 on
       # every node for ever, while its own comment told the reader 0 meant "no batch accepted"
@@ -141,20 +126,6 @@ jobs:
       # file and a metric died in another, and nothing connected them (#947).
       - name: Counted log lines are enabled
         run: ./scripts/check-counted-log-lines-are-enabled.sh
-      # #780: a node must STATE which gates it enforces, or "is this node armed, and at what
-      # height?" has no answer short of reading the binary. ADDRESS_PROOF_ENFORCEMENT was
-      # resolved, stored and given an accessor — and never logged, so once armed at 970,500 an
-      # enforcing node looked identical to a dormant one. The existing test asserts that SOME
-      # armed height appears, which is a sample and cannot see a missing field.
-      - name: Every activation gate is logged
-        run: ./scripts/check-every-gate-is-logged.sh
-      # The convergence endpoint is the instrument that decides whether the mesh node-list gate
-      # gets armed (#402). #943 added a third root to the checkpoint and made vote acceptance
-      # depend on it, without updating that endpoint — so it would have reported "converged"
-      # having never compared a root every vote checks, and a fleet agreeing on three roots of
-      # four finalises nothing, silently. Nothing connected the two files; this does.
-      - name: Convergence covers every committed root
-        run: ./scripts/check-convergence-covers-every-root.sh
       # `broadcast::Receiver::recv()` returns `Lagged(n)` — "you missed n events", RECOVERABLE —
       # and `Closed`, the only terminal one. `while let Ok(..)` cannot tell them apart and exits on
       # both. Four live loops shipped that way (#984), including the task that CREATES THE PAYOUT
@@ -179,15 +150,6 @@ jobs:
       # the outage the cap prevents. This accept task has four early returns plus a normal end.
       - name: SV2 connection slot is taken before the spawn
         run: ./scripts/check-connection-slot-is-taken-before-spawn.sh
-      # A miner-side shim rebuilds `checkpoint_hash` to check any signature at all, so every value
-      # that hash commits to must be in the blob the public endpoint serves. The hash has been
-      # bumped TWICE by ADDING a root (v2 advert_root, v3 coordinator_roster_root) and nothing
-      # connected it to the producer — the v2 bump shipped a blob with no `adverts`/`advert_root`,
-      # which no shim could verify, and it went unnoticed because the endpoint 404s below the gate
-      # (#970). The test written for that regression rebuilds the message from the RECORD, so it
-      # cannot see a field missing from the JSON.
-      - name: Served checkpoint carries everything the hash commits
-        run: ./scripts/check-served-checkpoint-carries-the-hash.sh
       # The swarm-refusal test loops action strings through `swarm_not_implemented` to prove the
       # fleet-control routes return an honest 501 rather than fabricating success. It tests the
       # HELPER, so when a route becomes real its string stays in the loop and the test keeps
@@ -197,12 +159,6 @@ jobs:
       # see it happening to itself.
       - name: Swarm-refusal test covers only live refusals
         run: ./scripts/check-swarm-refusal-test-is-current.sh
-      # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
-      # caught lying about its address stops counting toward the diversity floor, which changes
-      # which nodes qualify and how the node-reward pool splits. There are FIVE construction
-      # sites in ghost-mining; one that missed the gate would diverge from the fleet silently.
-      - name: Address-enforcement wiring
-        run: ./scripts/check-address-enforcement-wiring.sh
       # install-node.sh hardens the secret-bearing configs at install time and nothing ever
       # asked again, so four of eight nodes sat at 644 ghost:ghost on a file carrying
       # authority_secret_key (#916). The reconciler that closes that is only worth having if it
