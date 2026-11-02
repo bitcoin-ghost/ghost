@@ -2027,17 +2027,6 @@ impl Sv1Server {
         downstream.downstream_id
     }
 
-    /// Handles cleanup when a downstream connection disconnects.
-    ///
-    /// This method should be called from the main loop when a `State::DownstreamShutdown`
-    /// status message is received. It:
-    /// - Removes the downstream from the downstreams map
-    /// - Removes vardiff state (if enabled)
-    /// - Sends UpdateChannel if needed (aggregated mode with vardiff)
-    /// - Sends CloseChannel message to ChannelManager (non-aggregated mode)
-    ///
-    /// # Arguments
-    /// * `downstream_id` - The ID of the downstream that disconnected
     /// Bind a provisionally opened channel to its miner once the miner has authorised and the
     /// channel is open: an `UpdateChannel` carrying the Ghost payee TLV (`<address>.<worker>`).
     /// The node pool builds no job for the channel until then, since a job credits its payee.
@@ -2090,6 +2079,17 @@ impl Sv1Server {
         }
     }
 
+    /// Handles cleanup when a downstream connection disconnects.
+    ///
+    /// This method should be called from the main loop when a `State::DownstreamShutdown`
+    /// status message is received. It:
+    /// - Removes the downstream from the downstreams map
+    /// - Removes vardiff state (if enabled)
+    /// - Sends UpdateChannel if needed (aggregated mode with vardiff)
+    /// - Sends CloseChannel message to ChannelManager (non-aggregated mode)
+    ///
+    /// # Arguments
+    /// * `downstream_id` - The ID of the downstream that disconnected
     pub async fn handle_downstream_disconnect(&self, downstream_id: DownstreamId) {
         if self.config.downstream_difficulty_config.enable_vardiff {
             // Only remove from vardiff map if vardiff is enabled

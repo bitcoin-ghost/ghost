@@ -744,8 +744,11 @@ mod one_miner_channel_tests {
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
+    /// What the SV1 server sends the channel manager.
+    type ToChannelManager = Receiver<(Mining<'static>, Option<Vec<Tlv>>)>;
+
     /// A server, and what it sends the channel manager.
-    fn server() -> (Sv1Server, Receiver<(Mining<'static>, Option<Vec<Tlv>>)>) {
+    fn server() -> (Sv1Server, ToChannelManager) {
         use crate::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
         use stratum_apps::key_utils::Secp256k1PublicKey;
         let pubkey =
