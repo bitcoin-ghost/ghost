@@ -25,7 +25,8 @@
 //!
 //! The table is the relay's rule-4 table at `cut(H) = H - 20` for the job's parent anchor and
 //! height ([`NodePool::fetch_table`], answered by the relay task after settlement has caught up
-//! with the Bitcoin tip). Each job remembers the digest of the outputs it was built with. A solved
+//! with the Bitcoin tip). [`NodePool::prepare_job_basis`] fetches it before every build and fixes
+//! the anchor the build stamps; a job is never built without its table. Each job remembers the digest of the outputs it was built with. A solved
 //! block is always submitted at once; its coinbase is checked against those outputs only after the
 //! solution is queued, as an alarm ([`NodePool::submit_then_check`]). The real enforcement is
 //! settlement on every other node, which retires nothing for a block that does not match.
@@ -79,7 +80,7 @@ use stratum_apps::{
         bitcoin::{Amount, ScriptBuf, Target, Transaction, TxOut},
         channels_sv2::outputs::deserialize_template_outputs,
         parsers_sv2::Tlv,
-        template_distribution_sv2::NewTemplate,
+        template_distribution_sv2::{NewTemplate, SetNewPrevHash},
     },
     utils::types::{ChannelId, DownstreamId},
 };
@@ -157,8 +158,15 @@ const FUTURE_TEMPLATES_KEPT: usize = 4;
 const SESSIONS_KEPT: usize = 4_096;
 /// Snapshot tables kept, by `(parent anchor, height)`.
 const TABLES_KEPT: usize = 8;
-/// How long a job build waits for the relay to answer a table request.
+/// How long a job build waits for the relay to answer one table request.
 const TABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a new job waits, in all, for its anchor's table on its height before falling back
+/// (see [`NodePool::prepare_job_basis`]).
+pub const TABLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Between asks while waiting for a table the relay does not have yet.
+const TABLE_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+/// Templates remembered as not served (no table for their height).
+const UNSERVED_KEPT: usize = 16;
 
 /// One job: the tag preimage it was stamped with, and the digest of the canonical outputs it was
 /// built with (`canonical_payout::outputs_digest`, witness commitment included).
@@ -187,6 +195,15 @@ struct State {
     future_templates: VecDeque<NewTemplate<'static>>,
     active_template: Option<NewTemplate<'static>>,
     tables: VecDeque<(TableKey, Arc<Table>)>,
+    /// The anchor the next stamps build on: the one whose table the last
+    /// [`NodePool::prepare_job_basis`] found, so a job is never stamped with an anchor whose
+    /// table it was not built from. `None` until the first prepare.
+    job_anchor: Option<AnchorUpdate>,
+    /// Templates no table could be had for in time: no channel got a job on them.
+    unserved: VecDeque<u64>,
+    /// A new tip whose template was not served: its `SetNewPrevHash` waits here, unsent, until
+    /// the table arrives ([`NodePool::take_pending_tip`]).
+    pending_tip: Option<SetNewPrevHash<'static>>,
 }
 
 /// A cached table's key: the job's parent anchor and height.
@@ -393,23 +410,115 @@ impl NodePool {
         Some(t)
     }
 
-    /// Fetch the table the next jobs on the active template need: the current anchor's at the
-    /// template's height. Called before a rebuild takes the channel locks.
-    pub async fn prepare_tables(&self, template: &NewTemplate<'_>) {
-        let (Some(h), Some(a)) = (
-            Self::template_height(template),
-            self.anchor_driver().current(),
-        ) else {
-            return;
+    /// Fetch the table the next jobs on `template` pay, before a build takes the channel locks,
+    /// and choose the anchor they build on. Returns whether the template can be served.
+    ///
+    /// The anchor is the relay's latest ([`AnchorDriver::current`]). Its table at the template's
+    /// height is asked for until it arrives or [`TABLE_WAIT`] passes: the relay settles the new
+    /// Bitcoin tip before it answers, so on a new tip the answer is the table that tip defines.
+    /// When the wait runs out:
+    ///
+    /// 1. **The previous job anchor**, if its table at this height can be had: the jobs build on
+    ///    it, as valid as on the newest anchor (a share is judged against its own parent's
+    ///    table); only the batch it locks in is older.
+    /// 2. **Otherwise the template is not served**: no job is built from an empty or mismatched
+    ///    table. Such a job would pay the whole subsidy to the treasury while every peer refused
+    ///    its shares and its block's retirements, turning the miners' work into treasury income.
+    ///    Miners keep their current job until the table arrives; the caller retries.
+    ///
+    /// Every stamp after a successful prepare uses the anchor chosen here, never a newer one
+    /// published since: that is what keeps a job's anchor and its table together.
+    pub async fn prepare_job_basis(&self, template: &NewTemplate<'_>) -> bool {
+        let Some(h) = Self::template_height(template) else {
+            return false;
         };
-        if self.fetch_table(a.parent_anchor, h).await.is_none() {
-            warn!(
-                height = h,
-                parent = %hex::encode(a.parent_anchor),
-                "NODE_POOL: no snapshot table for the job; its coinbase pays the whole subsidy \
-                 to the treasury until the relay answers"
-            );
+        let Some(latest) = self.anchor_driver().current() else {
+            // No relay has published: nothing to stamp but zeros, and no table. Tests only.
+            return self.table_source_missing();
+        };
+        let deadline = tokio::time::Instant::now() + TABLE_WAIT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.fetch_table(latest.parent_anchor, h)).await
+            {
+                Ok(Some(_)) => {
+                    self.lock().job_anchor = Some(latest);
+                    return true;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if tokio::time::Instant::now() + TABLE_RETRY > deadline {
+                break;
+            }
+            tokio::time::sleep(TABLE_RETRY).await;
         }
+        let previous = self.lock().job_anchor;
+        if let Some(prev) = previous.filter(|p| p.parent_anchor != latest.parent_anchor) {
+            let ask = self.fetch_table(prev.parent_anchor, h);
+            if let Ok(Some(_)) = tokio::time::timeout(5 * TABLE_RETRY, ask).await {
+                warn!(
+                    height = h,
+                    anchor = %hex::encode(latest.parent_anchor),
+                    previous = %hex::encode(prev.parent_anchor),
+                    "NODE_POOL: no snapshot table for the newest anchor within {TABLE_WAIT:?}; \
+                     jobs build on the previous anchor, whose table this height has"
+                );
+                return true;
+            }
+        }
+        error!(
+            height = h,
+            anchor = %hex::encode(latest.parent_anchor),
+            template_id = template.template_id,
+            "NODE_POOL_NO_TABLE: no snapshot table for this height within {TABLE_WAIT:?}; the \
+             template is not served (miners keep their current job until the relay answers)"
+        );
+        false
+    }
+
+    /// Without a relay (tests), the stamps carry the last published anchor or zeros, and tables
+    /// come only from [`NodePool::insert_table`].
+    fn table_source_missing(&self) -> bool {
+        self.table_source
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+    }
+
+    /// Remember that no channel got a job on `template_id`.
+    pub fn mark_unserved(&self, template_id: u64) {
+        let mut st = self.lock();
+        st.unserved.retain(|t| *t != template_id);
+        st.unserved.push_back(template_id);
+        while st.unserved.len() > UNSERVED_KEPT {
+            st.unserved.pop_front();
+        }
+    }
+
+    /// `template_id` was served after all (a held tip, once its table arrived).
+    pub fn mark_served(&self, template_id: u64) {
+        self.lock().unserved.retain(|t| *t != template_id);
+    }
+
+    /// Whether `template_id` was not served.
+    pub fn is_unserved(&self, template_id: u64) -> bool {
+        self.lock().unserved.contains(&template_id)
+    }
+
+    /// A new tip whose template was not served: its `SetNewPrevHash` waits until the table
+    /// arrives. Replaces any older one.
+    pub fn hold_tip(&self, tip: SetNewPrevHash<'static>) {
+        self.lock().pending_tip = Some(tip);
+    }
+
+    /// The tip waiting for its table, if any.
+    pub fn pending_tip(&self) -> Option<SetNewPrevHash<'static>> {
+        self.lock().pending_tip.clone()
+    }
+
+    /// Stop holding a tip: it was served, or a newer tip replaced it.
+    pub fn clear_pending_tip(&self) {
+        self.lock().pending_tip = None;
     }
 
     /// What a template gives the coinbase: its height, its witness commitment (its only output)
@@ -458,10 +567,9 @@ impl NodePool {
     /// `template`, without the witness commitment (the template's own output, which the channel
     /// factory appends), and the digest of the full list.
     ///
-    /// The table is the cached one for `(parent, height)`. Missing (no relay answer yet, or an
-    /// anchor the relay does not hold), the job is built on the empty table: the treasury takes
-    /// the whole subsidy and nobody is paid more than owed; the shares of such a job earn nothing
-    /// on peers, so this only ever delays payouts.
+    /// The table is the cached one for `(parent, height)`, put there by
+    /// [`NodePool::prepare_job_basis`]. Missing, the job is refused: a job is never built from an
+    /// empty or another anchor's table, since every peer would refuse its shares and its block.
     pub fn canonical_outputs(
         &self,
         parent: &[u8; 32],
@@ -469,15 +577,12 @@ impl NodePool {
         template: &NewTemplate<'_>,
     ) -> Result<(Vec<TxOut>, [u8; 32]), String> {
         let (h, commitment, fees) = self.template_parts(template)?;
-        let table = self.cached_table(parent, h).unwrap_or_else(|| {
-            error!(
-                height = h,
-                parent = %hex::encode(parent),
-                "NODE_POOL: building a job without its snapshot table: the treasury takes the \
-                 subsidy"
-            );
-            Arc::new(Table::new())
-        });
+        let table = self.cached_table(parent, h).ok_or_else(|| {
+            format!(
+                "no snapshot table for anchor {} at height {h}: the job is not built",
+                hex::encode(parent)
+            )
+        })?;
         let (outs, _) = coinbase_outputs(
             h,
             self.halving,
@@ -690,12 +795,14 @@ impl NodePool {
         target: &Target,
     ) -> (u32, Vec<u8>) {
         let tier = self.tiers.tier_for_target(target);
-        let anchor = self.anchor.borrow().unwrap_or(AnchorUpdate {
+        let published = *self.anchor.borrow();
+        let now = self.now_ms();
+        let mut st = self.lock();
+        // The anchor the last prepare found a table for; before any (no relay), the published one.
+        let anchor = st.job_anchor.or(published).unwrap_or(AnchorUpdate {
             parent_anchor: [0; 32],
             batch_root: [0; 32],
         });
-        let now = self.now_ms();
-        let mut st = self.lock();
         if !st.channels.contains_key(&key) {
             register(&mut st, key, kind, user_identity, self.params, now);
         }
@@ -1230,24 +1337,116 @@ mod tests {
     }
 
     #[test]
-    fn a_job_without_its_table_pays_the_subsidy_to_the_treasury() {
+    fn a_job_without_its_table_is_refused_not_built_on_an_empty_table() {
         let np = pool(1);
-        let (reward, _) = np
-            .canonical_outputs(
-                &[9; 32],
-                500,
-                &np_template(subsidy(H, Halving::MAINNET) + 7),
-            )
-            .unwrap();
-        let got = full(&reward);
-        assert_eq!(got.len(), 4, "treasury, finder, GHNP, witness");
-        assert_eq!(got[0].0, subsidy(H, Halving::MAINNET));
-        assert_eq!(
-            got[2].1,
-            ghost_common::canonical_payout::commitment_script(
-                &ghost_common::canonical_payout::table_root(&Table::new())
-            )
+        let t = np_template(subsidy(H, Halving::MAINNET) + 7);
+        let e = np.canonical_outputs(&[9; 32], 500, &t).unwrap_err();
+        assert!(e.contains("no snapshot table"), "{e}");
+        np.insert_table([9; 32], H, Arc::new(owed_table(3)));
+        assert!(np.canonical_outputs(&[9; 32], 500, &t).is_ok());
+    }
+
+    /// A stand-in relay task: answers a table request from `tables` once `ready` says the
+    /// anchor's table exists (by then), else `None`; counts the requests.
+    fn relay_stub(
+        np: &NodePool,
+        ready: impl Fn([u8; 32], std::time::Duration) -> bool + Send + 'static,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let (tx, mut rx) = mpsc::channel::<TableRequest>(16);
+        np.set_table_source(tx);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = asked.clone();
+        let t0 = Instant::now();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let t = ready(req.parent, t0.elapsed()).then(|| Arc::new(owed_table(3)));
+                let _ = req.reply.send(t);
+            }
+        });
+        asked
+    }
+
+    fn publish(np: &NodePool, a: u8) {
+        np.anchor_driver().publish(AnchorUpdate {
+            parent_anchor: [a; 32],
+            batch_root: [a; 32],
+        });
+    }
+
+    fn stamped_parent(np: &NodePool, key: ChannelKey) -> [u8; 32] {
+        let (_, push) = np.stamp(key, ChannelKind::Extended, ADDR, &target());
+        let tag = extract_payout_tag(&push).unwrap();
+        let mut p = [0u8; 32];
+        p[..16].copy_from_slice(&tag);
+        p
+    }
+
+    /// The harness's bug A: an anchor published between the table fetch and the stamp made the
+    /// job carry an anchor whose table was never fetched, so it paid the empty table. The stamp
+    /// now carries the anchor the prepare found a table for, and the job is canonical.
+    #[tokio::test]
+    async fn a_job_is_stamped_with_the_anchor_its_table_was_fetched_for() {
+        let np = pool(2);
+        relay_stub(&np, |_, _| true);
+        publish(&np, 1);
+        let t = np_template(subsidy(H, Halving::MAINNET) + 7);
+        assert!(np.prepare_job_basis(&t).await);
+        publish(&np, 2); // lands before the build, as in the harness run
+        let key = (1, 1);
+        assert_eq!(stamped_parent(&np, key)[..16], [1; 16]);
+        np.job_outputs(key, &t)
+            .expect("the job builds on the table that was fetched");
+        // The next prepare moves to the newest anchor.
+        assert!(np.prepare_job_basis(&t).await);
+        assert_eq!(stamped_parent(&np, key)[..16], [2; 16]);
+        np.job_outputs(key, &t).unwrap();
+    }
+
+    /// The new tip's table is not there at once (settlement still catching up): the job waits,
+    /// a bounded time, and builds on the newest anchor when it comes.
+    #[tokio::test]
+    async fn a_job_waits_a_bounded_time_for_its_table() {
+        let np = pool(2);
+        let asked = relay_stub(&np, |_, at| at >= std::time::Duration::from_millis(300));
+        publish(&np, 1);
+        let t = np_template(subsidy(H, Halving::MAINNET));
+        let t0 = Instant::now();
+        assert!(np.prepare_job_basis(&t).await);
+        assert!(t0.elapsed() < TABLE_WAIT);
+        assert!(
+            asked.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "asked again"
         );
+        assert_eq!(stamped_parent(&np, (1, 1))[..16], [1; 16]);
+    }
+
+    /// When the bound expires: the previous anchor, whose table this height has, else nothing.
+    #[tokio::test]
+    async fn when_the_wait_expires_jobs_fall_back_to_the_previous_anchor_or_are_not_served() {
+        let np = pool(2);
+        // Only anchor 1's tables ever exist.
+        relay_stub(&np, |a, _| a == [1; 32]);
+        publish(&np, 1);
+        let t = np_template(subsidy(H, Halving::MAINNET));
+        assert!(np.prepare_job_basis(&t).await);
+        publish(&np, 2);
+        assert!(
+            np.prepare_job_basis(&t).await,
+            "anchor 2 has no table: the jobs stay on anchor 1, which is valid"
+        );
+        assert_eq!(stamped_parent(&np, (1, 1))[..16], [1; 16]);
+        np.job_outputs((1, 1), &t).unwrap();
+
+        // No anchor has a table: the template is not served.
+        let none = pool(2);
+        relay_stub(&none, |_, _| false);
+        publish(&none, 3);
+        assert!(!none.prepare_job_basis(&t).await);
+        none.mark_unserved(t.template_id);
+        assert!(none.is_unserved(t.template_id));
+        none.mark_served(t.template_id);
+        assert!(!none.is_unserved(t.template_id));
     }
 
     #[test]

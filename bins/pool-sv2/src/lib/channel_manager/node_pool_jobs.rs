@@ -3,8 +3,10 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use stratum_apps::stratum_core::parsers_sv2::Mining;
-use tracing::error;
+use stratum_apps::stratum_core::{
+    handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync, parsers_sv2::Mining,
+};
+use tracing::{error, info};
 
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo},
@@ -22,12 +24,52 @@ impl ChannelManager {
         self.node_pool.anchor_driver()
     }
 
-    /// Run the sensing clocks and rebuild the jobs of channels whose class changed.
+    /// Run the sensing clocks and rebuild the jobs of channels whose class changed; retry a
+    /// held tip.
     pub(crate) async fn node_pool_tick(&self) {
+        if self.node_pool_serve_held_tip().await {
+            return;
+        }
         let keys = changed_keys(&self.node_pool.tick());
         if !keys.is_empty() {
             self.node_pool_rebuild(Some(&keys)).await;
         }
+    }
+
+    /// Serve a tip held for its snapshot table (`NodePool::hold_tip`): once the table can be had,
+    /// every channel gets a job on the active template and then its `SetNewPrevHash`, as if the
+    /// template provider had sent them just now. Returns whether a tip is still held, or was
+    /// just served (either way the caller's own rebuild is not needed).
+    pub(crate) async fn node_pool_serve_held_tip(&self) -> bool {
+        let np = self.node_pool.clone();
+        let Some(tip) = np.pending_tip() else {
+            return false;
+        };
+        let Some(active) = np.active_template() else {
+            return true;
+        };
+        let mut future = active.clone();
+        future.future_template = true;
+        if !np.prepare_job_basis(&future).await {
+            return true;
+        }
+        np.clear_pending_tip();
+        let mut tip = tip;
+        tip.template_id = active.template_id;
+        let mut cm = self.clone();
+        if let Err(e) = cm.handle_new_template(None, future, None).await {
+            error!(error = ?e, "NODE_POOL: serving the held tip's jobs failed");
+            return true;
+        }
+        if let Err(e) = cm.handle_set_new_prev_hash(None, tip, None).await {
+            error!(error = ?e, "NODE_POOL: activating the held tip failed");
+            return true;
+        }
+        info!(
+            template_id = active.template_id,
+            "NODE_POOL: the held tip is served: its snapshot table arrived"
+        );
+        true
     }
 
     /// Re-stamp channels and push each a fresh job built on the active template: every channel
@@ -38,12 +80,19 @@ impl ChannelManager {
     /// channel that fails to rebuild keeps its current job and the error is logged: this path
     /// never disconnects or shuts down.
     pub(crate) async fn node_pool_rebuild(&self, only: Option<&HashSet<ChannelKey>>) {
+        // A held tip first: the channels are not on the active template's prev hash yet.
+        if self.node_pool_serve_held_tip().await {
+            return;
+        }
         let np = self.node_pool.clone();
         let Some(active) = np.active_template() else {
             return;
         };
-        // The new anchor's table, fetched before the channel locks are taken.
-        np.prepare_tables(&active).await;
+        // The new anchor's table, fetched before the channel locks are taken. Without one, every
+        // channel keeps its current job (see `NodePool::prepare_job_basis`).
+        if !np.prepare_job_basis(&active).await {
+            return;
+        }
         let prepared = np.prepare_template(&active);
         let wanted = |key: &ChannelKey| only.is_none_or(|keys| keys.contains(key));
 

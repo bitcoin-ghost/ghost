@@ -113,11 +113,24 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
   `GHNT` tag, both replaced per job, so the scriptSig length is fixed before any job is built. A
   template of any other shape stops pool_sv2: it cannot carry a canonical coinbase.
 - **A job's table** is the relay's for `(parent_anchor of the job's stamp, BIP34 height of the
-  template)`, fetched over the relay task's request channel after settlement has caught up with
-  the Bitcoin tip. In the first 20 blocks after genesis no anchor sits below the cut; the table is
-  then the genesis table with settled retirements (`Relay::block_table`). If no table can be had
-  (relay down, unknown anchor), the job is built on the empty table: the treasury takes the
-  subsidy, nobody is overpaid, and the job's shares earn nothing on peers. Logged as an error.
+  template)`, fetched over the relay task's request channel. The request is the new-tip event:
+  pool_sv2 sends it the moment a template arrives, and the relay settles the Bitcoin tip (and
+  moves its view of the tip) before answering; the relay's 5 s poll is only a backstop. In the
+  first 20 blocks after genesis no anchor sits below the cut; the table is then the genesis
+  table with settled retirements (`Relay::block_table`).
+- **The stamp carries the anchor the table was fetched for** (`NodePool::prepare_job_basis`),
+  never one published since. The Phase 3 harness found 3 of 80 blocks paying the whole subsidy
+  to the treasury: an anchor published between the fetch and the stamp left the job without its
+  table, so it was built on the empty one and every peer refused it.
+- **No table within 2 s** (`TABLE_WAIT`, asked every 100 ms): the jobs build on the previous
+  job anchor if its table at this height can be had (valid: a share is judged against its own
+  parent's table; only its batch is older). Else the template is not served: no job is built from
+  an empty or mismatched table, since every peer would refuse its shares and its block's
+  retirements while its coinbase paid the subsidy to the treasury. Miners keep their current job;
+  a new tip's `SetNewPrevHash` is held (`NODE_POOL_NO_TABLE`) and sent with fresh jobs once the
+  table arrives (retried on every anchor publish and every 5 s); a channel opened meanwhile is
+  refused with `node-pool-no-snapshot-table`. A sustained hold means the relay or its Bitcoin RPC
+  is broken.
 - **Outputs**: `coinbase_outputs(H, table, slot_class, fee_script, value - subsidy(H),
   witness)` minus the witness output, which the channel factory appends from the template.
 - **The finder** is `[node_pool] fee_address`, required to be one of the four payee classes

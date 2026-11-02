@@ -263,9 +263,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let future_template = self
             .channel_manager_data
             .super_safe_lock(|data| data.last_future_template.clone());
-        if let Some(t) = &future_template {
-            self.node_pool.prepare_tables(t).await;
-        }
+        // No table in time: the channel is refused on its own (OpenMiningChannelError), never
+        // given a job built from an empty table; the miner retries.
+        let unserved = match &future_template {
+            Some(t) => !self.node_pool.prepare_job_basis(t).await,
+            None => false,
+        };
         let np = self.node_pool.clone();
 
         let messages = self
@@ -299,7 +302,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 // NODE_POOL: standard channels are allowed and always carry the full class; the miner
                 // only hashes a header. The channel must credit a payee the ledger accepts (its
                 // username is its payout address), checked before anything is allocated.
-                if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
+                let refused = crate::node_pool::NodePool::payee_for_identity(&user_identity)
+                    .err()
+                    .or(unserved.then_some("node-pool-no-snapshot-table"));
+                if let Some(code) = refused {
                     error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
                     let open_standard_mining_channel_error = OpenMiningChannelError {
                         request_id,
@@ -560,9 +566,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let future_template = self
             .channel_manager_data
             .super_safe_lock(|data| data.last_future_template.clone());
-        if let Some(t) = &future_template {
-            self.node_pool.prepare_tables(t).await;
-        }
+        // No table in time: the channel is refused on its own (OpenMiningChannelError), never
+        // given a job built from an empty table; the miner retries.
+        let unserved = match &future_template {
+            Some(t) => !self.node_pool.prepare_job_basis(t).await,
+            None => false,
+        };
         let np = self.node_pool.clone();
 
         let messages = self
@@ -579,7 +588,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                         // NODE_POOL: the channel must credit a payee the ledger accepts. Checked
                         // before the prefix is minted, for the reason given just below.
-                        if let Err(code) = crate::node_pool::NodePool::payee_for_identity(&user_identity) {
+                        let refused = crate::node_pool::NodePool::payee_for_identity(&user_identity)
+                            .err()
+                            .or(unserved.then_some("node-pool-no-snapshot-table"));
+                        if let Some(code) = refused {
                             error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
                             let open_extended_mining_channel_error = OpenMiningChannelError {
                                 request_id,

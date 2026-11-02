@@ -375,13 +375,20 @@ impl Node {
         }
     }
 
-    /// Settlement catches up with the Bitcoin best chain.
+    /// Settlement catches up with the Bitcoin best chain. Run on every table request, which
+    /// pool_sv2 sends the moment a template on a new Bitcoin tip arrives, so the new tip is
+    /// settled (and the relay's view of the tip moved) before that tip's jobs are built; the
+    /// 5 s tick is only the backstop.
     async fn settle(&mut self) {
         if let Some((s, src)) = self.settlement.as_mut() {
             if let Err(e) = s.sync(&mut self.relay, src.as_ref()).await {
                 warn!("NP_SETTLE: sync failed: {e}");
             }
-            self.settlement_tx.send_replace(s.status());
+            let st = s.status();
+            if let Some(tip) = st.bitcoin_tip {
+                self.relay.set_btc_tip(tip);
+            }
+            self.settlement_tx.send_replace(st);
         }
     }
 

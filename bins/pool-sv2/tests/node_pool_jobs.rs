@@ -141,6 +141,14 @@ fn script_sig(tx: &Transaction) -> Vec<u8> {
 /// Stamp, build an active job against the active template, bind it, return the job.
 fn rebuild(np: &NodePool, channel: &mut Extended) -> ExtendedJob<'static> {
     let template = np.active_template().expect("active template");
+    // What the relay would answer for the anchor the stamp carries (no relay here: the last
+    // published one): its table, empty in these tests.
+    let parent = np
+        .anchor_driver()
+        .current()
+        .map_or([0; 32], |a| a.parent_anchor);
+    let h = NodePool::template_height(&template).unwrap();
+    np.insert_table(parent, h, Arc::new(Table::new()));
     let stamp = np.stamp(
         KEY,
         ChannelKind::Extended,
@@ -168,6 +176,13 @@ fn the_miner_is_handed_the_tag_of_its_jobs_preimage() {
     let np = node_pool();
     let template = ghost_template(1, true);
     np.on_new_template(&template);
+    // No anchor published, so the jobs build on zeros: on the (empty) table the relay
+    // would answer for it. A job is never built without its table.
+    np.insert_table(
+        [0; 32],
+        NodePool::template_height(&template).unwrap(),
+        Arc::new(Table::new()),
+    );
 
     // The same channel today, untouched, for the length comparison.
     let mut today = extended();
@@ -264,6 +279,13 @@ fn a_standard_channel_is_stamped_at_the_full_class() {
     let np = node_pool();
     let template = ghost_template(1, true);
     np.on_new_template(&template);
+    // No anchor published, so the jobs build on zeros: on the (empty) table the relay
+    // would answer for it. A job is never built without its table.
+    np.insert_table(
+        [0; 32],
+        NodePool::template_height(&template).unwrap(),
+        Arc::new(Table::new()),
+    );
     let mut channel: Standard = StandardChannel::new_for_pool(
         2,
         ADDR.to_string(),

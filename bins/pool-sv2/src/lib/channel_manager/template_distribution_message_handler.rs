@@ -48,8 +48,20 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         np.on_new_template(&msg);
-        // The table this template's jobs pay, fetched before the channel locks are taken.
-        np.prepare_tables(&msg).await;
+        // The table this template's jobs pay, fetched before the channel locks are taken, and
+        // the anchor they build on. No table in time: the template is not served (see
+        // `NodePool::prepare_job_basis`), and miners keep their current job.
+        let served = np.prepare_job_basis(&msg).await;
+        if served {
+            np.mark_served(msg.template_id);
+        } else {
+            np.mark_unserved(msg.template_id);
+        }
+        // A template on the current tip while that tip is held for its table: its jobs would
+        // build on a prev hash the channels were never given. The held tip is served from the
+        // active template once the table arrives (`node_pool_serve_held_tip`).
+        let held = !msg.future_template && np.pending_tip().is_some();
+        let serve = served && !held;
         // The template's Ghost tags taken out of the prefix, making room, byte for byte, for
         // what each channel's factory stamps back in.
         let prepared = np.prepare_template(&msg.clone().into_static());
@@ -60,6 +72,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             }
 
             let mut messages: Vec<RouteMessageTo> = Vec::new();
+            let mut skipped = 0usize;
 
             // The group channel tracks every template so its state stays coherent, but its job
             // is never sent: one coinbase cannot carry every channel's share tag and slot class.
@@ -79,6 +92,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                     // quantised to its tier, share tag stamped as the factory's extra push, the
                     // canonical outputs of its slot class.
                     let mut messages: Vec<RouteMessageTo> = vec![];
+                    if !serve {
+                        skipped += data.standard_channels.len() + data.extended_channels.len();
+                        return Ok(messages);
+                    }
 
                     for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
                         let q = np.quantise_target(
@@ -179,6 +196,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
 
                 messages.extend(messages_);
             }
+            if skipped > 0 {
+                warn!(
+                    template_id = msg.template_id,
+                    channels = skipped,
+                    served,
+                    "NODE_POOL: no job sent on this template; miners keep their current job"
+                );
+            }
             Ok::<Vec<RouteMessageTo<'_>>, Self::Error>(messages)
         })?;
 
@@ -223,6 +248,31 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
 
         self.node_pool.on_set_new_prev_hash(msg.template_id);
+
+        // The new tip's template was not served (no snapshot table in time): no channel has a
+        // job on it, so nothing is activated or sent. The tip is held and served, with its jobs,
+        // as soon as the table arrives (`node_pool_serve_held_tip`); until then miners keep
+        // their current job.
+        if self.node_pool.is_unserved(msg.template_id) {
+            error!(
+                template_id = msg.template_id,
+                "NODE_POOL_NO_TABLE: the new Bitcoin tip is held: its jobs wait for their \
+                 snapshot table"
+            );
+            self.node_pool.hold_tip(msg.clone().into_static());
+            return self.channel_manager_data.super_safe_lock(|data| {
+                data.last_new_prev_hash = Some(msg.clone().into_static());
+                for downstream in data.downstream.values_mut() {
+                    downstream.downstream_data.super_safe_lock(|d| {
+                        d.group_channel
+                            .on_set_new_prev_hash(msg.clone().into_static())
+                            .map_err(PoolError::shutdown)
+                    })?;
+                }
+                Ok(())
+            });
+        }
+        self.node_pool.clear_pending_tip();
 
         let messages = self.channel_manager_data.super_safe_lock(|data| {
             data.last_new_prev_hash = Some(msg.clone().into_static());
