@@ -127,7 +127,8 @@ backup takes the node down for a reason unrelated to backups."
     local ver
     ver="$(sqlite3 "file:$dest?mode=ro" 'PRAGMA user_version;' 2>/dev/null)" \
         || die "$label: the copy at $dest does not open as a database"
-    case "$ver" in
+    # From v65 the version is stored negated (`-65`); either sign is a version.
+    case "${ver#-}" in
         ''|*[!0-9]*) die "$label: the copy at $dest reports user_version='$ver'" ;;
     esac
     local integ

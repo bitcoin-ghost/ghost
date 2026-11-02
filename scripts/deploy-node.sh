@@ -1124,7 +1124,9 @@ echo BACKUP \$dest ver=\$(sudo -u ghost sqlite3 \"file:\$dest?mode=ro\" 'PRAGMA 
 " 2>&1)" || die "pre-migration backup FAILED on $NODE — refusing to migrate without one:
 $(printf '%s\n' "$BK_OUT" | sed 's/^/        /')"
 
-            BK_VER="$(printf '%s\n' "$BK_OUT" | sed -nE 's/.*ver=([0-9]+) .*/\1/p' | head -1)"
+            # The copy's raw user_version; from v65 it is stored negated (`-65`), so drop the sign
+            # to compare it with the gate's decoded live version.
+            BK_VER="$(printf '%s\n' "$BK_OUT" | sed -nE 's/.*ver=-?([0-9]+) .*/\1/p' | head -1)"
             if [ "${BK_VER:-}" != "$2" ]; then
                 die "the pre-migration backup on $NODE reports user_version='${BK_VER:-}' but the live
 database is at v$2. A backup that does not round-trip its own schema version is not a backup:

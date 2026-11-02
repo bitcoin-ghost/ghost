@@ -32,6 +32,7 @@ clap = { version = "4.5.39", features = ["derive"] }
 ghost-build-info.workspace = true
 bitcoin_core_sv2 = { path = "../../crates/bitcoin-core-sv2" }
 hex = "0.4.3"
+sha2 = { workspace = true }
 hotpath = "0.14.0"
 
 [features]

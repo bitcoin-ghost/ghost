@@ -105,10 +105,6 @@ pub const MAX_EQUIVOCATION_PROOF_SIZE: usize = 100 * 1024;
 /// At most this should be ~500 bytes, so 10KB provides generous headroom.
 pub const MAX_ROTATION_PROOF_SIZE: usize = 10 * 1024;
 
-/// M-2: Maximum size for kv_store values (1 MB)
-/// Prevents storage exhaustion attacks through the key-value store API.
-pub const MAX_KV_VALUE_SIZE: usize = 1024 * 1024;
-
 /// L-1: Maximum length for node display_name field (128 chars)
 pub const MAX_DISPLAY_NAME_LEN: usize = 128;
 
@@ -130,26 +126,6 @@ pub const MAX_CHALLENGE_ID_SIZE: usize = 128;
 // =============================================================================
 // SAFE TYPE CONVERSIONS
 // =============================================================================
-
-/// SEC-DATA-2: Safely convert i64 to u32 for counts, rejecting negative/overflow
-fn i64_to_u32_count(value: i64, field_name: &str) -> Result<u32, rusqlite::Error> {
-    if value < 0 || value > u32::MAX as i64 {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Integer,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid {} value: {} (expected 0-{})",
-                    field_name,
-                    value,
-                    u32::MAX
-                ),
-            )),
-        ));
-    }
-    Ok(value as u32)
-}
 
 /// 4.19 SECURITY: Generic i64 to u64 conversion for non-satoshi values (epochs, timestamps, heights)
 ///
@@ -2126,61 +2102,6 @@ fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<NodeRecord> {
 impl Database {}
 
 // =============================================================================
-// KEY-VALUE STORE
-// =============================================================================
-
-impl Database {
-    /// Get a value from the key-value store
-    pub fn kv_get(&self, key: &str) -> GhostResult<Option<String>> {
-        self.with_connection(|conn| {
-            let value: Option<String> = conn
-                .query_row("SELECT value FROM kv_store WHERE key = ?1", [key], |row| {
-                    row.get(0)
-                })
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(value)
-        })
-    }
-
-    /// Set a value in the key-value store
-    ///
-    /// M-2 FIX: Validates value size to prevent storage exhaustion attacks.
-    /// Maximum value size is 1 MB (MAX_KV_VALUE_SIZE).
-    pub fn kv_set(&self, key: &str, value: &str) -> GhostResult<()> {
-        // M-2 FIX: Validate value size before storing
-        if value.len() > MAX_KV_VALUE_SIZE {
-            return Err(GhostError::Database(format!(
-                "M-2: KV value exceeds maximum size: {} > {} bytes",
-                value.len(),
-                MAX_KV_VALUE_SIZE
-            )));
-        }
-
-        let now = chrono::Utc::now().timestamp();
-
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT INTO kv_store (key, value, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
-                params![key, value, now],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Delete a key from the key-value store
-    pub fn kv_delete(&self, key: &str) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute("DELETE FROM kv_store WHERE key = ?1", [key])
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-}
-
-// =============================================================================
 // PEER QUERIES
 // =============================================================================
 
@@ -2544,50 +2465,6 @@ impl Database {
     // =========================================================================
 }
 
-// =============================================================================
-// MPC CEREMONY QUERIES
-// =============================================================================
-
-impl Database {
-    // =========================================================================
-    // ELDER STATUS (MPC-BASED)
-    // =========================================================================
-    // Elder status is determined by MPC contribution.
-    // If a node contributed to the MPC ceremony (position 1-101), they are an elder.
-    // This replaces the complex canonical elder list system.
-
-    /// Get all MPC elders (contributors)
-    ///
-    /// Returns list of (node_id, position) for all MPC contributors.
-    pub fn get_all_mpc_elders(&self) -> GhostResult<Vec<(String, u32)>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT contributor_node_id, elder_position FROM mpc_contributions
-                     ORDER BY elder_position ASC",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let rows = stmt
-                .query_map([], |row| {
-                    let node_id: String = row.get(0)?;
-                    let position: i64 = row.get(1)?;
-                    Ok((node_id, position))
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let mut elders = Vec::new();
-            for row in rows {
-                let (node_id, pos) = row.map_err(|e| GhostError::Database(e.to_string()))?;
-                let position = i64_to_u32_count(pos, "elder_position")
-                    .map_err(|e| GhostError::Database(e.to_string()))?;
-                elders.push((node_id, position));
-            }
-            Ok(elders)
-        })
-    }
-}
-
 impl Database {
     // =========================================================================
     // PAYOUT PROPOSAL PERSISTENCE
@@ -2919,49 +2796,6 @@ mod tests {
             .expect("LOW-STOR-8: Failed to get round")
             .expect("LOW-STOR-8: Round should exist");
         assert_eq!(fetched.block_height, 100);
-    }
-
-    #[test]
-    fn test_kv_store() {
-        let db = Database::in_memory().expect("MED-STOR-2: Failed to create in-memory database");
-
-        db.kv_set("test_key", "test_value")
-            .expect("LOW-STOR-8: Failed to set key-value");
-        let value = db
-            .kv_get("test_key")
-            .expect("LOW-STOR-8: Failed to get key");
-        assert_eq!(value, Some("test_value".to_string()));
-
-        db.kv_delete("test_key")
-            .expect("LOW-STOR-8: Failed to delete key");
-        let value = db
-            .kv_get("test_key")
-            .expect("LOW-STOR-8: Failed to get deleted key");
-        assert_eq!(value, None);
-    }
-
-    #[test]
-    fn test_kv_store_size_limit() {
-        // M-2: Test that oversized values are rejected
-        let db = Database::in_memory().expect("MED-STOR-2: Failed to create in-memory database");
-
-        // Value at the limit should succeed
-        let max_value = "x".repeat(super::MAX_KV_VALUE_SIZE);
-        db.kv_set("max_key", &max_value)
-            .expect("LOW-STOR-8: Max size value should succeed");
-
-        // Value over the limit should fail
-        let oversized_value = "x".repeat(super::MAX_KV_VALUE_SIZE + 1);
-        let result = db.kv_set("oversized_key", &oversized_value);
-        assert!(result.is_err());
-        let err_msg = result
-            .expect_err("LOW-STOR-8: Oversized value should fail")
-            .to_string();
-        assert!(
-            err_msg.contains("M-2"),
-            "Expected M-2 error, got: {}",
-            err_msg
-        );
     }
 
     #[test]

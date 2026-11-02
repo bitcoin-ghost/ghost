@@ -149,8 +149,10 @@ pub async fn start_share_chain(cfg: &ChainConfig) -> Result<RelayChain, String> 
         hash: cfg.genesis_anchor,
         btc_height: cfg.genesis_height,
         tier: cfg.genesis_tier,
-        // The cutover's imported genesis table (plan, Phase 4) is not published yet; pool_sv2
-        // starts from the empty table too.
+        // ⚠ The cutover's genesis table: pool_sv2 now starts from the table imported into its
+        // store (`--np-import-genesis`), but the auditor has no import yet and starts from the
+        // empty table. Until it does, its tables differ from a node's on any network whose
+        // genesis table is not empty.
         table: Default::default(),
     };
     let view = SettledView::load(&db).map_err(|e| format!("settlement view: {e}"))?;

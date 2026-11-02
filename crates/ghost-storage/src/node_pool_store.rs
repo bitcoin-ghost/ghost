@@ -2565,8 +2565,8 @@ mod tests {
         };
         assert_eq!(
             names.len(),
-            12,
-            "v63 and v64 create twelve tables: {names:?}"
+            14,
+            "v63 and v64 create twelve tables, v65 two: {names:?}"
         );
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         for n in names {
@@ -2596,9 +2596,9 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             rewind_to_v62(&conn);
             conn.execute(
-                "INSERT INTO shard_settled (address_hash, address_enc, settled_micro, last_height) \
-                 VALUES (?1, 'enc', 42, 974000)",
-                params![vec![7u8; 32]],
+                "INSERT INTO miners (miner_id, payout_address, first_seen, last_seen) \
+                 VALUES ('m1', 'a', 42, 974000)",
+                [],
             )
             .unwrap();
             let v: u32 = conn
@@ -2611,22 +2611,19 @@ mod tests {
         let (v, mode): (u32, String) = db
             .with_connection(|c| {
                 Ok((
-                    c.query_row("PRAGMA user_version", [], |r| r.get(0))
-                        .map_err(db_err)?,
+                    crate::migrations::schema_version(c)?,
                     c.query_row("PRAGMA journal_mode", [], |r| r.get(0))
                         .map_err(db_err)?,
                 ))
             })
             .unwrap();
-        assert_eq!(v, 64);
+        assert_eq!(v, crate::migrations::LATEST_SCHEMA_VERSION);
         assert_eq!(mode, "wal");
         let kept: (i64, i64) = db
             .with_connection(|c| {
-                c.query_row(
-                    "SELECT settled_micro, last_height FROM shard_settled",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                c.query_row("SELECT first_seen, last_seen FROM miners", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .map_err(db_err)
             })
             .unwrap();
@@ -2660,12 +2657,9 @@ mod tests {
         }
         let db = Database::open_encrypted(&path, &key).expect("reopen migrates");
         let v: u32 = db
-            .with_connection(|c| {
-                c.query_row("PRAGMA user_version", [], |r| r.get(0))
-                    .map_err(db_err)
-            })
+            .with_connection(crate::migrations::schema_version)
             .unwrap();
-        assert_eq!(v, 64);
+        assert_eq!(v, crate::migrations::LATEST_SCHEMA_VERSION);
         db.np_apply_block(&h(0xA0), 121, &[(script(1), BIG)], 0)
             .unwrap();
         assert_eq!(db.np_balance(&script(1)).unwrap().expect("row").owed, -BIG);

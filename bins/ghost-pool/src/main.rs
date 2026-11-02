@@ -1641,17 +1641,7 @@ async fn main() -> Result<()> {
                         Ok(Ok(result)) => {
                             tracing::info!(
                                 rounds = result.rounds_deleted,
-                                pings = result.pings_deleted,
-                                votes = result.votes_deleted,
                                 uptime = result.uptime_deleted,
-                                challenges = result.challenges_deleted.total(),
-                                // The single largest prune, and it was absent from this line:
-                                // `verification_ledger` is the second biggest object in the
-                                // database after the frozen `shares_archive`, so a retention
-                                // change here was invisible in the logs that would show whether
-                                // it worked.
-                                verification_ledger = result.verification_ledger_deleted,
-                                verifications = result.verifications_deleted,
                                 // Without this the two numbers that matter cannot be paired.
                                 // MEASURED on vm1, 2026-10-04: two consecutive passes each
                                 // deleted ~5,280 rows and `db_size_mb` read 2433 both times —

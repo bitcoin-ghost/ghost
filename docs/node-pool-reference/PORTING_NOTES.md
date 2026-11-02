@@ -200,7 +200,8 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   `UNSET` is refused by its existing message and a configured genesis by a second one. Once set,
   a configured genesis must equal it, and `tier_base` may not be set.
 - **The genesis table digest** is the table's `table_root`, the same digest a block commits. A
-  pinned digest is checked before the store opens. The table is empty until migration v65.
+  pinned digest is checked against the table the store holds (`np_genesis`, empty until the
+  genesis import) before the relay is built on it.
 - **Regtest** with `UNSET` uses its default anchor, and then refuses any height but 0.
 
 ## Ledger and status API (W2.11, pool_sv2 `node_pool_api.rs`)
@@ -292,7 +293,30 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   set: the relay accepts any peer on the genesis, the Noise mesh's `trusted_peers` is empty, and
   `fleet_auth` is one operator's key controlling that operator's own node, not listing.
 
-## Open, not decided here
+## Genesis import and migration v65 (plan Phase 4)
+- **Migration v65** (`crates/ghost-storage/src/migration_v65.rs`) drops the old system's 62
+  tables (payout ledger and proposals, settlement, shard, votes, elders, rotation, capabilities
+  and challenges, MPC, L2, Wraith, Ghost Pay, locks, glyphs, node-list checkpoints, key-value
+  store) and creates `np_genesis` and `np_genesis_meta`. Kept, because code still reads them:
+  `miners`, `shares`, `shares_archive` (and the `shares_all` view), `rounds`, `nodes`, `peers`,
+  `uptime_samples`, `won_blocks`, and every `np_*` table.
+- **It refuses, changing nothing,** on any row in `withdrawal_requests`, `ghost_locks`, `l2_*` or
+  `wraith_*`, and when a table it drops holds rows but no verified copy exists: it takes one
+  itself (`<db>.pre-v65`, `VACUUM INTO`, twice the database free required), reuses a verifying
+  one, and never overwrites one that does not verify.
+- **Space**: with `auto_vacuum = INCREMENTAL` the free list is drained step by step after the
+  commit. At `auto_vacuum = 0` nothing is run; a `VACUUM` needs about twice the database free.
+- **Old binaries refuse a v65 database**: the version is stored negated (`-65`), and every
+  pre-v65 binary reads `user_version` as `u32` at open and fails. The shell gates decode it.
+- **Import**: `pool_sv2 -c CONFIG --np-import-genesis DIR --np-export-digest HEX`, offline, into
+  `[node_pool.relay] db_path`, once, before the relay first runs on the store. It checks the
+  binary's sha256, the JSON against the binary's genesis rows (rows and totals are the binary's
+  tail, so the import reads nothing from the checkpoint fields and does not depend on the export's
+  source), the network, and a configured pin. `queue_since` is the export's height for every row at
+  or above the 1,000-sat floor, none below. It prints the `table_root` to pin;
+  `--np-verify-genesis` recomputes and compares without writing. The relay loads the stored table
+  at start and holds it to the pin.
+
 - **K = 120.** Resolved for the relay above: the duplicate check reaches back to `S(H)`. The spec's
   constants table still lists K; it should be reworded.
 - **Regtest tier base.** At difficulty 1, `T_net` floor 10 needs about 2^42 hashes a share, out of
