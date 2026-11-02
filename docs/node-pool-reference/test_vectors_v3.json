@@ -1,0 +1,1759 @@
+{
+ "constants": {
+  "SLOT_CLASSES": {
+   "0": 3,
+   "1": 9,
+   "2": 44,
+   "3": 143,
+   "4": 364,
+   "5": 500
+  },
+  "OLDEST_LARGEST": {
+   "3": [
+    2,
+    1
+   ],
+   "9": [
+    5,
+    4
+   ],
+   "44": [
+    22,
+    22
+   ],
+   "143": [
+    72,
+    71
+   ],
+   "364": [
+    182,
+    182
+   ],
+   "500": [
+    250,
+    250
+   ]
+  },
+  "MIN_PAY": 1000,
+  "CUT_LAG": 20,
+  "TREASURY_DIV": 200,
+  "UNIT": "2^-32 sat"
+ },
+ "rule": "refimpl_v3.py docstring; pay in whole sats, retired = pay * 2^32",
+ "generators": {
+  "gen": "Portable table: row i has script p2tr(f\"{seed}/{i}\"); b = sha256(f\"g{seed}/{i}\");\n    e = b[0] % 8; if e == 0 the row is below the floor: owed = int(b[1:9]) % FLOOR, queue_since None;\n    else owed = (1000 + int(b[1:9]) % (1000 << 2e)) * 2^32 + int(b[9:13]), queue_since = q0 + int(b[13:15]) % 5000.\n    int() is big-endian unsigned. Rows at e >= 1 are 1,000 sats to 16.4M sats.",
+  "flat": "n equal balances of `sats`, queue_since 900,000 + i // 450, scripts p2tr(f\"{tag}{i}\")."
+ },
+ "digest": "sha256(json.dumps([treasury, [[script_hex, sats]...], [[script_hex, str(retired_face)]...]]))",
+ "share_face": {
+  "name": "share_face",
+  "tier": 10,
+  "nbits": "0x17021be5",
+  "height": 974500,
+  "face": "10246338",
+  "tier40": "11001922676017395",
+  "after_halving": "5123169",
+  "before_halving": "10246338"
+ },
+ "vectors": [
+  {
+   "name": "empty table: whole subsidy to treasury",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 0,
+   "treasury": 312500000,
+   "change": 310937500,
+   "n_miner_outputs": 0,
+   "n_oldest_selected": 0,
+   "n_largest_selected": 0,
+   "miner_total": 0,
+   "table_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "digest": "5a6d45acece5eb90d53662ce8bcfea4fe4f043278ccb2120ea232c99f1933eaa",
+   "outputs": [],
+   "input": {}
+  },
+  {
+   "name": "all below floor or non-positive: whole subsidy to treasury",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 3,
+   "treasury": 312500000,
+   "change": 310937500,
+   "n_miner_outputs": 0,
+   "n_oldest_selected": 0,
+   "n_largest_selected": 0,
+   "miner_total": 0,
+   "table_root": "79d967ba80c32f2fc0bee620272dd2e419a24ad9c0233593fd487b98713b3fd3",
+   "digest": "5a6d45acece5eb90d53662ce8bcfea4fe4f043278ccb2120ea232c99f1933eaa",
+   "outputs": [],
+   "input": {
+    "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb": [
+     "-5",
+     null
+    ],
+    "51203e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d": [
+     "0",
+     null
+    ],
+    "51202e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6": [
+     "4294967295999",
+     null
+    ]
+   }
+  },
+  {
+   "name": "launch: four eligible balances, 68.0M owed of 310.9M, change to treasury",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 6,
+   "treasury": 244499000,
+   "change": 242936500,
+   "n_miner_outputs": 4,
+   "n_oldest_selected": 3,
+   "n_largest_selected": 1,
+   "miner_total": 68001000,
+   "table_root": "204a330bba73d1144eb4cbcfb49925322f50e468ccadf4f7beeb56575dbcb20d",
+   "digest": "efcc113c45b4d9373509f8f206f30601c66deead466e8d9a13b3d8724eae75f4",
+   "outputs": [
+    [
+     "5120f71cb0bb381d3ccb332373840b0424f6bceb863a732cd968d8498a8808d8edf0",
+     25000000
+    ],
+    [
+     "512090ac16783fbc54c3689c63b3ab89b39cea28f8743a88ff34e6a1c61ed746d0e2",
+     3000000
+    ],
+    [
+     "5120d805912d29387e829faa8b17e8712213f168741a5852e9038423c147d9dab7a9",
+     1000
+    ],
+    [
+     "5120ca0667af548100c9cffd30529b3a3a346d6452f103594ee7cf64e1db0558f516",
+     40000000
+    ]
+   ],
+   "input": {
+    "5120ca0667af548100c9cffd30529b3a3a346d6452f103594ee7cf64e1db0558f516": [
+     "171798691840000077",
+     974470
+    ],
+    "5120f71cb0bb381d3ccb332373840b0424f6bceb863a732cd968d8498a8808d8edf0": [
+     "107374182400000000",
+     974475
+    ],
+    "512090ac16783fbc54c3689c63b3ab89b39cea28f8743a88ff34e6a1c61ed746d0e2": [
+     "12884901888000005",
+     974478
+    ],
+    "5120d805912d29387e829faa8b17e8712213f168741a5852e9038423c147d9dab7a9": [
+     "4294967296000",
+     974479
+    ],
+    "5120bb7e07310039b2a38ec34c55aed60c822be686f249c184d7f145847938b2f4fe": [
+     "2576980377600",
+     null
+    ],
+    "5120d7824560c2c80939ded55053af85b915241ad853c21ce65d24655b9950aac39b": [
+     "4294967295999",
+     null
+    ]
+   }
+  },
+  {
+   "name": "launch: same table on a class-3 block, the 3 selected are paid in full",
+   "height": 974500,
+   "slots": 3,
+   "n_input": 6,
+   "treasury": 244500000,
+   "change": 242937500,
+   "n_miner_outputs": 3,
+   "n_oldest_selected": 2,
+   "n_largest_selected": 1,
+   "miner_total": 68000000,
+   "table_root": "204a330bba73d1144eb4cbcfb49925322f50e468ccadf4f7beeb56575dbcb20d",
+   "digest": "8dde1c6da37ed1da08052c9b24fac1aa8fb87b170a688c929259d3cf3bb3d4c4",
+   "outputs": [
+    [
+     "5120f71cb0bb381d3ccb332373840b0424f6bceb863a732cd968d8498a8808d8edf0",
+     25000000
+    ],
+    [
+     "512090ac16783fbc54c3689c63b3ab89b39cea28f8743a88ff34e6a1c61ed746d0e2",
+     3000000
+    ],
+    [
+     "5120ca0667af548100c9cffd30529b3a3a346d6452f103594ee7cf64e1db0558f516",
+     40000000
+    ]
+   ],
+   "input": {
+    "5120ca0667af548100c9cffd30529b3a3a346d6452f103594ee7cf64e1db0558f516": [
+     "171798691840000077",
+     974470
+    ],
+    "5120f71cb0bb381d3ccb332373840b0424f6bceb863a732cd968d8498a8808d8edf0": [
+     "107374182400000000",
+     974475
+    ],
+    "512090ac16783fbc54c3689c63b3ab89b39cea28f8743a88ff34e6a1c61ed746d0e2": [
+     "12884901888000005",
+     974478
+    ],
+    "5120d805912d29387e829faa8b17e8712213f168741a5852e9038423c147d9dab7a9": [
+     "4294967296000",
+     974479
+    ],
+    "5120bb7e07310039b2a38ec34c55aed60c822be686f249c184d7f145847938b2f4fe": [
+     "2576980377600",
+     null
+    ],
+    "5120d7824560c2c80939ded55053af85b915241ad853c21ce65d24655b9950aac39b": [
+     "4294967295999",
+     null
+    ]
+   }
+  },
+  {
+   "name": "launch: one balance of 1,234.0000002 sats",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 1,
+   "treasury": 312498766,
+   "change": 310936266,
+   "n_miner_outputs": 1,
+   "n_oldest_selected": 0,
+   "n_largest_selected": 1,
+   "miner_total": 1234,
+   "table_root": "0bad31e3f646facec04c422a403ab4a97bee52c6da68d1b168649f6fc36e4a33",
+   "digest": "7c474b3a2e0e350eac46ad2293a2e7d6de01cbf78def06efa202c1bff6f1bac9",
+   "outputs": [
+    [
+     "5120a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
+     1234
+    ]
+   ],
+   "input": {
+    "5120a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e": [
+     "5299989644263",
+     974479
+    ]
+   }
+  },
+  {
+   "name": "floor boundary: owed == 1,000 sats paid, one face unit less is not eligible",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 2,
+   "treasury": 312499000,
+   "change": 310936500,
+   "n_miner_outputs": 1,
+   "n_oldest_selected": 0,
+   "n_largest_selected": 1,
+   "miner_total": 1000,
+   "table_root": "67417f14f41437d4ac93d3dfe958b8dfa68016e26673689ed4c8e65df26a2671",
+   "digest": "476b7e5e2e801c2a8b533a81097520d68445578013e77c4a14685df371f641f6",
+   "outputs": [
+    [
+     "5120b1d6b91b67c2afa5e322988d9462638d354ddf8a1ef79dba987f815c22b4baee",
+     1000
+    ]
+   ],
+   "input": {
+    "5120b1d6b91b67c2afa5e322988d9462638d354ddf8a1ef79dba987f815c22b4baee": [
+     "4294967296000",
+     10
+    ],
+    "51208ada24bf6bf3139273899fed85010be710367bbd1f8a176f19da97a62bc3bc65": [
+     "4294967295999",
+     null
+    ]
+   }
+  },
+  {
+   "name": "class 3: 900 mixed balances",
+   "height": 974500,
+   "slots": 3,
+   "n_input": 900,
+   "treasury": 296381497,
+   "change": 294818997,
+   "n_miner_outputs": 3,
+   "n_oldest_selected": 2,
+   "n_largest_selected": 1,
+   "miner_total": 16118503,
+   "table_root": "16337f4a3b16aa50eea555ddf1fcd6c7f3c99aea17aad06726ba2300836f2026",
+   "digest": "0e6cb0b73ecf6ee30e4bc679c95d102472cf82469c015de56fae004891461a61",
+   "outputs": [
+    [
+     "512031abd97a1b1a87ec4d7a614051c9df06a157e17605cd1df70e18bc734ef55149",
+     2590
+    ],
+    [
+     "5120b165a3a812a5d9481c50a94310b74fa2bcece10ece5c2e7f8964e3de54bf1be5",
+     10963
+    ],
+    [
+     "5120cc7e55bb6ecb43d954829ecd7cb7a17ce6c30e5dd2e048c0acfbd1faa84c138f",
+     16104950
+    ]
+   ],
+   "input": "gen(7, 900)"
+  },
+  {
+   "name": "class 9: 900 mixed balances",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 900,
+   "treasury": 248678231,
+   "change": 247115731,
+   "n_miner_outputs": 9,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 63821769,
+   "table_root": "16337f4a3b16aa50eea555ddf1fcd6c7f3c99aea17aad06726ba2300836f2026",
+   "digest": "9d0a5253a1c5b5a69f0bec76f6a3f5eec8dc2777e3b30eacf7b36b72fb3ddf04",
+   "outputs": [
+    [
+     "512031abd97a1b1a87ec4d7a614051c9df06a157e17605cd1df70e18bc734ef55149",
+     2590
+    ],
+    [
+     "5120b165a3a812a5d9481c50a94310b74fa2bcece10ece5c2e7f8964e3de54bf1be5",
+     10963
+    ],
+    [
+     "5120b2f5abbbf82bc9c05725451fd975c13f5594d90d854ccc19c900cf1bd29a6f0a",
+     4453
+    ],
+    [
+     "51200f4b0e3a70ec0845632218f2dd119c9bcb79cc6b88b1155d4e2b135f21b5f40c",
+     1319
+    ],
+    [
+     "51208e68cfc2f15e3bcd8de8cf46282257c088873ab4e8d6659a99b2c3b2fa697d99",
+     159630
+    ],
+    [
+     "512008923e4c1603ba51298b6f61d2bd947e6611e8376ca6b95e4681747356059501",
+     15987761
+    ],
+    [
+     "5120531ab6a425970f67b26d2c3f21dc2bf1bfe4a51ec43a24ce73bd529b39e057b5",
+     15918040
+    ],
+    [
+     "5120f0966d9d4bb2c46de374a2d70befe972151c671fd1cb50219441a5cc09b486e7",
+     15632063
+    ],
+    [
+     "5120cc7e55bb6ecb43d954829ecd7cb7a17ce6c30e5dd2e048c0acfbd1faa84c138f",
+     16104950
+    ]
+   ],
+   "input": "gen(7, 900)"
+  },
+  {
+   "name": "class 44: 900 mixed balances",
+   "height": 974500,
+   "slots": 44,
+   "n_input": 900,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 42,
+   "n_oldest_selected": 22,
+   "n_largest_selected": 22,
+   "miner_total": 310937500,
+   "table_root": "16337f4a3b16aa50eea555ddf1fcd6c7f3c99aea17aad06726ba2300836f2026",
+   "digest": "324719e05a32cf382eb154298b2220159b51fa7eb08faf4dca833d97aa03ef3a",
+   "first_outputs": [
+    [
+     "512031abd97a1b1a87ec4d7a614051c9df06a157e17605cd1df70e18bc734ef55149",
+     2590
+    ],
+    [
+     "5120b165a3a812a5d9481c50a94310b74fa2bcece10ece5c2e7f8964e3de54bf1be5",
+     10963
+    ],
+    [
+     "5120b2f5abbbf82bc9c05725451fd975c13f5594d90d854ccc19c900cf1bd29a6f0a",
+     4453
+    ]
+   ],
+   "last_output": [
+    [
+     "5120309f7aa1bdaa75108c06734bb871db84cb3590db2650080a828287509d96a463",
+     6902059
+    ]
+   ],
+   "input": "gen(7, 900)"
+  },
+  {
+   "name": "class 143: 900 mixed balances",
+   "height": 974500,
+   "slots": 143,
+   "n_input": 900,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 87,
+   "n_oldest_selected": 72,
+   "n_largest_selected": 71,
+   "miner_total": 310937500,
+   "table_root": "16337f4a3b16aa50eea555ddf1fcd6c7f3c99aea17aad06726ba2300836f2026",
+   "digest": "cead8ab65b8bd104b1904456959007977c5d7252b7c617efad5d5ddcee74fbbb",
+   "first_outputs": [
+    [
+     "512031abd97a1b1a87ec4d7a614051c9df06a157e17605cd1df70e18bc734ef55149",
+     2590
+    ],
+    [
+     "5120b165a3a812a5d9481c50a94310b74fa2bcece10ece5c2e7f8964e3de54bf1be5",
+     10963
+    ],
+    [
+     "5120b2f5abbbf82bc9c05725451fd975c13f5594d90d854ccc19c900cf1bd29a6f0a",
+     4453
+    ]
+   ],
+   "last_output": [
+    [
+     "51202e525074f4517a0aeffbd3c6c416752e407595f6ba20cfe2c6477096e2336bcd",
+     12015515
+    ]
+   ],
+   "input": "gen(7, 900)"
+  },
+  {
+   "name": "class 364: 900 mixed balances",
+   "height": 974500,
+   "slots": 364,
+   "n_input": 900,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 183,
+   "n_oldest_selected": 182,
+   "n_largest_selected": 182,
+   "miner_total": 310937500,
+   "table_root": "16337f4a3b16aa50eea555ddf1fcd6c7f3c99aea17aad06726ba2300836f2026",
+   "digest": "950487d8a10323a6ffde26891c106dec2227a67f42a0b2143ba992d2e89f50d2",
+   "first_outputs": [
+    [
+     "512031abd97a1b1a87ec4d7a614051c9df06a157e17605cd1df70e18bc734ef55149",
+     2590
+    ],
+    [
+     "5120b165a3a812a5d9481c50a94310b74fa2bcece10ece5c2e7f8964e3de54bf1be5",
+     10963
+    ],
+    [
+     "5120b2f5abbbf82bc9c05725451fd975c13f5594d90d854ccc19c900cf1bd29a6f0a",
+     4453
+    ]
+   ],
+   "last_output": [
+    [
+     "512008923e4c1603ba51298b6f61d2bd947e6611e8376ca6b95e4681747356059501",
+     4455305
+    ]
+   ],
+   "input": "gen(7, 900)"
+  },
+  {
+   "name": "class 500: 900 mixed balances",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 900,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 190,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 310937500,
+   "table_root": "16337f4a3b16aa50eea555ddf1fcd6c7f3c99aea17aad06726ba2300836f2026",
+   "digest": "75c8e68ecc4ad08570896243ff77626cbac9f5fc785d725463bc7ead8df961e8",
+   "first_outputs": [
+    [
+     "512031abd97a1b1a87ec4d7a614051c9df06a157e17605cd1df70e18bc734ef55149",
+     2590
+    ],
+    [
+     "5120b165a3a812a5d9481c50a94310b74fa2bcece10ece5c2e7f8964e3de54bf1be5",
+     10963
+    ],
+    [
+     "5120b2f5abbbf82bc9c05725451fd975c13f5594d90d854ccc19c900cf1bd29a6f0a",
+     4453
+    ]
+   ],
+   "last_output": [
+    [
+     "512084f16eff49e78b92b698089101dae1158089a13b715daaaeb6eec19feed1c239",
+     459459
+    ]
+   ],
+   "input": "gen(7, 900)"
+  },
+  {
+   "name": "class 9: 23,000 flat 18,000-sat balances, change to treasury",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 23000,
+   "treasury": 312338000,
+   "change": 310775500,
+   "n_miner_outputs": 9,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 162000,
+   "table_root": "9597ea366812030e95161aada46e8a0a2c453a34a8d804b125e475377eaae6c1",
+   "digest": "f22704378bf05040a2f0556cbf994817743a6527c4317c7a4e2a7391b768b9c1",
+   "outputs": [
+    [
+     "5120004a38e1cfb15a9ce4fa3ea1b1458421fa977dcef319566de00b5a70e8767340",
+     18000
+    ],
+    [
+     "5120010e0f593289c148f8bfc738af066dd8c63233e7b4e556e10911e3386d5f733e",
+     18000
+    ],
+    [
+     "51200113a636ce524fa801eef0d127781860a34b5d1ed1b84a09fc985651cd44bef3",
+     18000
+    ],
+    [
+     "5120011a8ed1c69714961b52b1009fbcf8e04a65d7d3de80055d65c581de5160b12b",
+     18000
+    ],
+    [
+     "512002c1e1377ac631491b90b55fcdaca1e749129321fa8cdaca6d2b30467bcc55da",
+     18000
+    ],
+    [
+     "5120000119a0f0eb6b5229d9d76e7af3ffaa516c209f3b3cedd418d9f1cf1fcc39cf",
+     18000
+    ],
+    [
+     "51200003d1bb8332b5b4de25af2538a4bc3f45ffec12810a14f46cce4456b2624a8f",
+     18000
+    ],
+    [
+     "5120000487862e2dd1deb3c4bd43339f18a86d717fda63e9ecfc964ae329632e0299",
+     18000
+    ],
+    [
+     "51200001175a21340b14ec7c367015a5a31fc674630d4b88ab7506f7e299f0f3d076",
+     18000
+    ]
+   ],
+   "input": "flat(23000, 18000)"
+  },
+  {
+   "name": "class 500: 23,000 flat 18,000-sat balances, change to treasury",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 23000,
+   "treasury": 303500000,
+   "change": 301937500,
+   "n_miner_outputs": 500,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 9000000,
+   "table_root": "9597ea366812030e95161aada46e8a0a2c453a34a8d804b125e475377eaae6c1",
+   "digest": "5f71c09aad909344c93393884c67162ca9ceaee567f6a9ade7a1817879940e79",
+   "first_outputs": [
+    [
+     "5120004a38e1cfb15a9ce4fa3ea1b1458421fa977dcef319566de00b5a70e8767340",
+     18000
+    ],
+    [
+     "5120010e0f593289c148f8bfc738af066dd8c63233e7b4e556e10911e3386d5f733e",
+     18000
+    ],
+    [
+     "51200113a636ce524fa801eef0d127781860a34b5d1ed1b84a09fc985651cd44bef3",
+     18000
+    ]
+   ],
+   "last_output": [
+    [
+     "51200001175a21340b14ec7c367015a5a31fc674630d4b88ab7506f7e299f0f3d076",
+     18000
+    ]
+   ],
+   "input": "flat(23000, 18000)"
+  },
+  {
+   "name": "class 9: 5 oldest then 4 largest, all paid in full (top w5 last), change to treasury",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 14,
+   "treasury": 112475990,
+   "change": 110913490,
+   "n_miner_outputs": 9,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 200024010,
+   "table_root": "d5fbc1f8e5edb9f40a777eb3ac67f3988afc6b6ae18f3d965e2908b98e217c28",
+   "digest": "18d309a8792edabc43ae46478d81c72f59812dabdf060e869b0483607d10f11f",
+   "outputs": [
+    [
+     "5120e9b55f2aead906fe90c9c48eeaae3995c2f1c7606f70f93f8d527cd269aeb37d",
+     2000
+    ],
+    [
+     "51202352da7280f1decc3acf1ba84eb945c9fc2b7b541094e1d0992dbffd1b6664cc",
+     2001
+    ],
+    [
+     "51209250b9912ee91d6b46e23299459ecd6eb8154451d62558a3a0a708a77926ad04",
+     2002
+    ],
+    [
+     "5120de2d91dc0a2580414e9a70f7dfc76af727b69cac0838f2cbe0a88d12642efcbf",
+     2003
+    ],
+    [
+     "51201b2501a20fe1bcd82b48c8db1e0f9dd2da9de58d6b618fa04a81c51c3a86cea2",
+     2004
+    ],
+    [
+     "5120879cc67a846b570c4241f1880f79e6ed1646abd9eca44882782cb6c8c568ab53",
+     50004000
+    ],
+    [
+     "512055eae50b75e2b2990f2c18be84ca079727a85f61b839c3359249801fe1ab9e9c",
+     50003000
+    ],
+    [
+     "512006f8faea3b5f697691b6d063a07ba4ffaf1ece9a1d473c588565231cdc8e59cc",
+     50002000
+    ],
+    [
+     "5120bb349f269976d971294e3cdd5847b128917eb85d2834cc5320a5142f8cc579b8",
+     50005000
+    ]
+   ],
+   "input": {
+    "5120e9b55f2aead906fe90c9c48eeaae3995c2f1c7606f70f93f8d527cd269aeb37d": [
+     "8589934592000",
+     100
+    ],
+    "51202352da7280f1decc3acf1ba84eb945c9fc2b7b541094e1d0992dbffd1b6664cc": [
+     "8594229559296",
+     101
+    ],
+    "51209250b9912ee91d6b46e23299459ecd6eb8154451d62558a3a0a708a77926ad04": [
+     "8598524526592",
+     102
+    ],
+    "5120de2d91dc0a2580414e9a70f7dfc76af727b69cac0838f2cbe0a88d12642efcbf": [
+     "8602819493888",
+     103
+    ],
+    "51201b2501a20fe1bcd82b48c8db1e0f9dd2da9de58d6b618fa04a81c51c3a86cea2": [
+     "8607114461184",
+     104
+    ],
+    "5120e6670506c75ce37bd5321e28454d69024c547fa4f435368d758cb55f900a75e1": [
+     "8611409428480",
+     105
+    ],
+    "5120c2d6ae581bd7abe7c84817a8aa3d42498a51cfe7c3319c355efd6793f61b3b29": [
+     "8615704395776",
+     106
+    ],
+    "5120a2e311a40a4871818b07957c4a88b8843906b51802bfee4b2a075d96b913b8ed": [
+     "8619999363072",
+     107
+    ],
+    "5120762036e1ef0cea7232acd90a28bde9177f7a48a74143f27ad78cadd89bffc467": [
+     "214748364800000000",
+     500
+    ],
+    "512060c5590f72eef292f9545afc28bf63ca91d2016a0a288f90f9a32f89d3fffcaf": [
+     "214752659767296000",
+     500
+    ],
+    "512006f8faea3b5f697691b6d063a07ba4ffaf1ece9a1d473c588565231cdc8e59cc": [
+     "214756954734592000",
+     500
+    ],
+    "512055eae50b75e2b2990f2c18be84ca079727a85f61b839c3359249801fe1ab9e9c": [
+     "214761249701888000",
+     500
+    ],
+    "5120879cc67a846b570c4241f1880f79e6ed1646abd9eca44882782cb6c8c568ab53": [
+     "214765544669184000",
+     500
+    ],
+    "5120bb349f269976d971294e3cdd5847b128917eb85d2834cc5320a5142f8cc579b8": [
+     "214769839636480000",
+     500
+    ]
+   }
+  },
+  {
+   "name": "Rm runs out inside the oldest list: 4th oldest paid in part, no largest paid",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 9,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 4,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 310937500,
+   "table_root": "3c01470c586c536df89cf5aac00416d1eec2d9c2131f0a165f5762df60a9ff6d",
+   "digest": "6bf6bca4d745bf7dff3812161dc762e8d4f3be2aba3e62cb678cd10f8bf60ec0",
+   "outputs": [
+    [
+     "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be",
+     100000000
+    ],
+    [
+     "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+     100000000
+    ],
+    [
+     "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+     100000000
+    ],
+    [
+     "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291",
+     10937500
+    ]
+   ],
+   "input": {
+    "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be": [
+     "429496729600000000",
+     10
+    ],
+    "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb": [
+     "429496729600000001",
+     11
+    ],
+    "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1": [
+     "429496729600000002",
+     12
+    ],
+    "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291": [
+     "429496729600000003",
+     13
+    ],
+    "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a": [
+     "429496729600000004",
+     14
+    ],
+    "512048dbc45a6738318c9e35db13781199f18495e5a61272ff94b60b30b8079da5c1": [
+     "3865470566400000000",
+     50
+    ],
+    "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740": [
+     "3865470566400000000",
+     50
+    ],
+    "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041": [
+     "3865470566400000000",
+     50
+    ],
+    "512010dacdccfe877dc064d57442e6fa7a4e3085dc94e11a29819c2290fc3d788724": [
+     "3865470566400000000",
+     50
+    ]
+   }
+  },
+  {
+   "name": "Rm runs out inside the largest list before top: 3rd largest paid in part, top waits",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 9,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 7,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 310937500,
+   "table_root": "0e669ad0b3389a7e372458471294aa10b3064c2a2e78e9d5f45537d9cc65178b",
+   "digest": "0794e9c4dd84b8f6ada160411c736b324f58bb7982c81c2cb290db45eefb463d",
+   "outputs": [
+    [
+     "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be",
+     1000000
+    ],
+    [
+     "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+     1000000
+    ],
+    [
+     "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+     1000000
+    ],
+    [
+     "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291",
+     1000000
+    ],
+    [
+     "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a",
+     1000000
+    ],
+    [
+     "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740",
+     199999999
+    ],
+    [
+     "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041",
+     105937501
+    ]
+   ],
+   "input": {
+    "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be": [
+     "4294967296000000",
+     10
+    ],
+    "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb": [
+     "4294967296000000",
+     11
+    ],
+    "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1": [
+     "4294967296000000",
+     12
+    ],
+    "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291": [
+     "4294967296000000",
+     13
+    ],
+    "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a": [
+     "4294967296000000",
+     14
+    ],
+    "512048dbc45a6738318c9e35db13781199f18495e5a61272ff94b60b30b8079da5c1": [
+     "858993459200000000",
+     50
+    ],
+    "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740": [
+     "858993454905032704",
+     50
+    ],
+    "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041": [
+     "858993450610065408",
+     50
+    ],
+    "512010dacdccfe877dc064d57442e6fa7a4e3085dc94e11a29819c2290fc3d788724": [
+     "858993446315098112",
+     50
+    ]
+   }
+  },
+  {
+   "name": "top absorbs: all others paid in full, top (largest) paid the remainder in part, last output",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 9,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 9,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 310937500,
+   "table_root": "f2074572b2106e4a018fef8e4616a68f11a32dfd769380f875d0954edc7fba1e",
+   "digest": "ae9ecb5306ee11b0a47f0360180bd35455a8abe073cafabe0f31ebcde1c74885",
+   "outputs": [
+    [
+     "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be",
+     1000000
+    ],
+    [
+     "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+     1000000
+    ],
+    [
+     "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+     1000000
+    ],
+    [
+     "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291",
+     1000000
+    ],
+    [
+     "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a",
+     1000000
+    ],
+    [
+     "512010dacdccfe877dc064d57442e6fa7a4e3085dc94e11a29819c2290fc3d788724",
+     10000000
+    ],
+    [
+     "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740",
+     10000000
+    ],
+    [
+     "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041",
+     10000000
+    ],
+    [
+     "512048dbc45a6738318c9e35db13781199f18495e5a61272ff94b60b30b8079da5c1",
+     275937500
+    ]
+   ],
+   "input": {
+    "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be": [
+     "4294967296000000",
+     10
+    ],
+    "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb": [
+     "4294967296000000",
+     11
+    ],
+    "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1": [
+     "4294967296000000",
+     12
+    ],
+    "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291": [
+     "4294967296000000",
+     13
+    ],
+    "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a": [
+     "4294967296000000",
+     14
+    ],
+    "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740": [
+     "42949672960000000",
+     50
+    ],
+    "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041": [
+     "42949672960000000",
+     50
+    ],
+    "512010dacdccfe877dc064d57442e6fa7a4e3085dc94e11a29819c2290fc3d788724": [
+     "42949672960000000",
+     50
+    ],
+    "512048dbc45a6738318c9e35db13781199f18495e5a61272ff94b60b30b8079da5c1": [
+     "2147483648000000003",
+     60
+    ]
+   }
+  },
+  {
+   "name": "all 9 slots paid in full including top, change to treasury",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 9,
+   "treasury": 227500000,
+   "change": 225937500,
+   "n_miner_outputs": 9,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 85000000,
+   "table_root": "2484bb5e5585d2302fdc79ec22de0ed1d5575daa7d187715bae94500de791110",
+   "digest": "19ea33c594632c2a40737d594d380a2509dabc6920f66aff5d07362e9aa73cf7",
+   "outputs": [
+    [
+     "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be",
+     1000000
+    ],
+    [
+     "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+     1000000
+    ],
+    [
+     "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+     1000000
+    ],
+    [
+     "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291",
+     1000000
+    ],
+    [
+     "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a",
+     1000000
+    ],
+    [
+     "512010dacdccfe877dc064d57442e6fa7a4e3085dc94e11a29819c2290fc3d788724",
+     10000000
+    ],
+    [
+     "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740",
+     10000000
+    ],
+    [
+     "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041",
+     10000000
+    ],
+    [
+     "512048dbc45a6738318c9e35db13781199f18495e5a61272ff94b60b30b8079da5c1",
+     50000000
+    ]
+   ],
+   "input": {
+    "5120341c0a3e67c3146720fa1b9504927ece5f5daefadaad467dddfd2ff04ba039be": [
+     "4294967296000000",
+     10
+    ],
+    "5120c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb": [
+     "4294967296000000",
+     11
+    ],
+    "5120bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1": [
+     "4294967296000000",
+     12
+    ],
+    "512058e2791934fdd9cfdd6d0e892cb6ca4894abc58559de0ec04d51bc2801bad291": [
+     "4294967296000000",
+     13
+    ],
+    "5120112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a": [
+     "4294967296000000",
+     14
+    ],
+    "51202804bad6fe94a55f18b2b37e300919a5fd517b95aa81e95db574c0ba069a3740": [
+     "42949672960000000",
+     50
+    ],
+    "51208a1cee436cbac1489a1883c9d886fcfc46f302c55ed4106ae31729e4f4eb9041": [
+     "42949672960000000",
+     50
+    ],
+    "512010dacdccfe877dc064d57442e6fa7a4e3085dc94e11a29819c2290fc3d788724": [
+     "42949672960000000",
+     50
+    ],
+    "512048dbc45a6738318c9e35db13781199f18495e5a61272ff94b60b30b8079da5c1": [
+     "214748364800000003",
+     60
+    ]
+   }
+  },
+  {
+   "name": "stop rule: 1,000 sats left still pays the next payee 1,000",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 3,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 2,
+   "n_oldest_selected": 2,
+   "n_largest_selected": 1,
+   "miner_total": 310937500,
+   "table_root": "5a5f9964f89e244a4f2950788751d2fe3ced640e35e9f3258554b53b8d7edcc3",
+   "digest": "65e92787ddda40815d9d8097a8c72eb4dde194e4d3d0011824bed667c5403119",
+   "outputs": [
+    [
+     "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+     310936500
+    ],
+    [
+     "51203e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+     1000
+    ]
+   ],
+   "input": {
+    "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb": [
+     "1335462098632704000",
+     1
+    ],
+    "51203e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d": [
+     "21474836480000",
+     2
+    ],
+    "51202e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6": [
+     "3865470566400000000",
+     3
+    ]
+   }
+  },
+  {
+   "name": "stop rule: 999 sats left stops, 999 to treasury, payee b and top c wait",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 3,
+   "treasury": 1563499,
+   "change": 999,
+   "n_miner_outputs": 1,
+   "n_oldest_selected": 2,
+   "n_largest_selected": 1,
+   "miner_total": 310936501,
+   "table_root": "1a82a42b1df723fe8ccf74808cd443e075cd44c70bb466822caf25bc4fd04b2f",
+   "digest": "eb340cfa0f764d0837eb81f068509ab91eb4a4dac6b3ef9068c3a9252c4183fd",
+   "outputs": [
+    [
+     "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+     310936501
+    ]
+   ],
+   "input": {
+    "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb": [
+     "1335462102927671296",
+     1
+    ],
+    "51203e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d": [
+     "21474836480000",
+     2
+    ],
+    "51202e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6": [
+     "3865470566400000000",
+     3
+    ]
+   }
+  },
+  {
+   "name": "ties: queue_since, then owed desc, then script asc (class 3)",
+   "height": 974500,
+   "slots": 3,
+   "n_input": 8,
+   "treasury": 312487500,
+   "change": 310925000,
+   "n_miner_outputs": 3,
+   "n_oldest_selected": 2,
+   "n_largest_selected": 1,
+   "miner_total": 12500,
+   "table_root": "9a15b45a9aecd7c653fe4894cf08326d48280ff4155c4b4c2ac5d5155c536742",
+   "digest": "342200c892579d066f167efe96fe20bd6bae6c4c81dea2f8a0a0ec31b832b0b2",
+   "outputs": [
+    [
+     "5120da925a30e31f7fdaa7044e3e5ba4ae17670de82d677b0e7adf5700428a137a36",
+     1500
+    ],
+    [
+     "51200bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6",
+     5000
+    ],
+    [
+     "51209e5db53b5cf0dace033c64479e32fd987a0d9a592bc3f22e6360e9e7c2bbfbe4",
+     6000
+    ]
+   ],
+   "input": {
+    "5120594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06": [
+     "21474836480000",
+     7
+    ],
+    "5120a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa": [
+     "21474836480000",
+     7
+    ],
+    "51202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881": [
+     "21474836480000",
+     7
+    ],
+    "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326": [
+     "21474836480000",
+     7
+    ],
+    "51204c94485e0c21ae6c41ce1dfe7b6bfaceea5ab68e40a2476f50208e526f506080": [
+     "21474836480000",
+     7
+    ],
+    "51200bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6": [
+     "21474836480000",
+     7
+    ],
+    "51209e5db53b5cf0dace033c64479e32fd987a0d9a592bc3f22e6360e9e7c2bbfbe4": [
+     "25769803776000",
+     7
+    ],
+    "5120da925a30e31f7fdaa7044e3e5ba4ae17670de82d677b0e7adf5700428a137a36": [
+     "6442450944000",
+     6
+    ]
+   }
+  },
+  {
+   "name": "ties: equal largest broken by script bytes",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 10,
+   "treasury": 312435000,
+   "change": 310872500,
+   "n_miner_outputs": 9,
+   "n_oldest_selected": 5,
+   "n_largest_selected": 4,
+   "miner_total": 65000,
+   "table_root": "61081cb4bfea8f8ebdd4b9bc41c86b6e1f80d2af887ab1fdb69e3103125381b6",
+   "digest": "6cc2f6326b37ae64a030401a6e82010a9a287456b3109306bab8d55128ff84fb",
+   "outputs": [
+    [
+     "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+     5000
+    ],
+    [
+     "51203e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+     5000
+    ],
+    [
+     "51202e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6",
+     5000
+    ],
+    [
+     "512018ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4",
+     5000
+    ],
+    [
+     "51202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+     9000
+    ],
+    [
+     "51204c94485e0c21ae6c41ce1dfe7b6bfaceea5ab68e40a2476f50208e526f506080",
+     9000
+    ],
+    [
+     "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326",
+     9000
+    ],
+    [
+     "5120594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06",
+     9000
+    ],
+    [
+     "51200bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6",
+     9000
+    ]
+   ],
+   "input": {
+    "5120ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb": [
+     "21474836480000",
+     0
+    ],
+    "51203e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d": [
+     "21474836480000",
+     1
+    ],
+    "51202e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6": [
+     "21474836480000",
+     2
+    ],
+    "512018ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4": [
+     "21474836480000",
+     3
+    ],
+    "5120594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06": [
+     "38654705664000",
+     99
+    ],
+    "5120a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa": [
+     "38654705664000",
+     99
+    ],
+    "51202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881": [
+     "38654705664000",
+     99
+    ],
+    "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326": [
+     "38654705664000",
+     99
+    ],
+    "51204c94485e0c21ae6c41ce1dfe7b6bfaceea5ab68e40a2476f50208e526f506080": [
+     "38654705664000",
+     99
+    ],
+    "51200bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6": [
+     "38654705664000",
+     99
+    ]
+   }
+  },
+  {
+   "name": "class 500: 600 mixed balances",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 600,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 205,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 310937500,
+   "table_root": "1d5080d1bff92c547b841249ebd71666cb8f75e136bf48452752bd6cc80b8976",
+   "digest": "cd06e278c41d55ae7f87ce40c8648a0e2587fd3544c749e8a3cbae5454b9db7c",
+   "first_outputs": [
+    [
+     "5120771fecff56333215402df3dc6377d711de127179b5e65f41b5c7ac976d4e25a6",
+     12816653
+    ],
+    [
+     "51208b23880ee8ddbb52adb419ea4501525fee14bf72d8e13eb71c1931dca56ac762",
+     242924
+    ],
+    [
+     "5120c9c5c85a63bbc0d81f904b558b0cc8f2b675434f10f8a764f52f689eade9f087",
+     60589
+    ]
+   ],
+   "last_output": [
+    [
+     "5120ed0c2b22ca267f81b0e67f8f88a57722890bc895dcd94fc06ec1e4c2737a1ecc",
+     5291821
+    ]
+   ],
+   "input": "gen(5, 600)"
+  },
+  {
+   "name": "504 outputs, P2TR, finder 123456",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 700,
+   "treasury": 161137750,
+   "change": 159575250,
+   "n_miner_outputs": 500,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 151362250,
+   "table_root": "ea35eeadc52e34fb479fc975bd6918b8781a047f34e0f114e999f519a80291b2",
+   "digest": "bb5414bc5c2be95f9339d23d9ab408c8fbfb5b49e595fca2c31a5ca7e941229c",
+   "first_outputs": [
+    [
+     "5120a8522a4d800d08d190a51254527b350b32585548386172c796c358449861574c",
+     5399
+    ],
+    [
+     "5120369862a5c4917119009a47798030118d6604f7e9893791f90e07ef8a9fa0407d",
+     5398
+    ],
+    [
+     "5120205f129e7b52bbc7e1990c3d3bba35f12832c0b62d8be829bcc910dadb2f2841",
+     5397
+    ]
+   ],
+   "last_output": [
+    [
+     "512037eb2b8ddc09098dd1b7a58b0ee6f437b688666e714a8d4ad5808bf9642dffb3",
+     600299
+    ]
+   ],
+   "input": "400 x (p2tr('gt'+i), (5000+i) sats, 900000+i//450) + 300 x (p2tr('topt'+i), (600000+i) sats, 900100)",
+   "coinbase_outputs": 504,
+   "output_section_bytes": 21683,
+   "output_digest": "6cf8ab724e25c37b9ad04f3f07017fca5356f7f5b70b3fc5bf536cbc592a1500"
+  },
+  {
+   "name": "503 outputs, P2TR, finder 0",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 700,
+   "treasury": 161137750,
+   "change": 159575250,
+   "n_miner_outputs": 500,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 151362250,
+   "table_root": "ea35eeadc52e34fb479fc975bd6918b8781a047f34e0f114e999f519a80291b2",
+   "digest": "bb5414bc5c2be95f9339d23d9ab408c8fbfb5b49e595fca2c31a5ca7e941229c",
+   "first_outputs": [
+    [
+     "5120a8522a4d800d08d190a51254527b350b32585548386172c796c358449861574c",
+     5399
+    ],
+    [
+     "5120369862a5c4917119009a47798030118d6604f7e9893791f90e07ef8a9fa0407d",
+     5398
+    ],
+    [
+     "5120205f129e7b52bbc7e1990c3d3bba35f12832c0b62d8be829bcc910dadb2f2841",
+     5397
+    ]
+   ],
+   "last_output": [
+    [
+     "512037eb2b8ddc09098dd1b7a58b0ee6f437b688666e714a8d4ad5808bf9642dffb3",
+     600299
+    ]
+   ],
+   "input": "400 x (p2tr('gt'+i), (5000+i) sats, 900000+i//450) + 300 x (p2tr('topt'+i), (600000+i) sats, 900100)",
+   "coinbase_outputs": 503,
+   "output_section_bytes": 21640,
+   "output_digest": "1cb16fceeca90571c25bf20d400698bc281bc7d1217883afc328d11d4b8be9dc"
+  },
+  {
+   "name": "504 outputs, P2WPKH, finder 123456",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 700,
+   "treasury": 161137750,
+   "change": 159575250,
+   "n_miner_outputs": 500,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 151362250,
+   "table_root": "5fb15c23957e5f4f56576b4ec7ff15d32a3a68c3484e3b5478acc690498ba7af",
+   "digest": "ff8172b6f93d8c90d030af5cae8b59e3fc51d05fbe312188366f0ffe03346788",
+   "first_outputs": [
+    [
+     "0014f896448f0da2e657778c97ee6266f04464afec72",
+     5399
+    ],
+    [
+     "0014b9cb20fe37b2a766590151c3f3c9678d0f3b160b",
+     5398
+    ],
+    [
+     "0014c2748501792af81100a12c96e3d6bfb7ce1a0579",
+     5397
+    ]
+   ],
+   "last_output": [
+    [
+     "0014b178bbe55444e2d5b8c69d417c70edc939508708",
+     600299
+    ]
+   ],
+   "input": "400 x (p2wpkh('gw'+i), (5000+i) sats, 900000+i//450) + 300 x (p2wpkh('topw'+i), (600000+i) sats, 900100)",
+   "coinbase_outputs": 504,
+   "output_section_bytes": 15671,
+   "output_digest": "b232b73fef4193dd1e7663922cf3b053daede8cac87706a44e21828362ce62e9"
+  },
+  {
+   "name": "503 outputs, P2WPKH, finder 0",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 700,
+   "treasury": 161137750,
+   "change": 159575250,
+   "n_miner_outputs": 500,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 151362250,
+   "table_root": "5fb15c23957e5f4f56576b4ec7ff15d32a3a68c3484e3b5478acc690498ba7af",
+   "digest": "ff8172b6f93d8c90d030af5cae8b59e3fc51d05fbe312188366f0ffe03346788",
+   "first_outputs": [
+    [
+     "0014f896448f0da2e657778c97ee6266f04464afec72",
+     5399
+    ],
+    [
+     "0014b9cb20fe37b2a766590151c3f3c9678d0f3b160b",
+     5398
+    ],
+    [
+     "0014c2748501792af81100a12c96e3d6bfb7ce1a0579",
+     5397
+    ]
+   ],
+   "last_output": [
+    [
+     "0014b178bbe55444e2d5b8c69d417c70edc939508708",
+     600299
+    ]
+   ],
+   "input": "400 x (p2wpkh('gw'+i), (5000+i) sats, 900000+i//450) + 300 x (p2wpkh('topw'+i), (600000+i) sats, 900100)",
+   "coinbase_outputs": 503,
+   "output_section_bytes": 15640,
+   "output_digest": "ab92a5113fd0c2a8542dc1cf41051f4cc5962a2005e0d9fb100022b95a5b9c88"
+  },
+  {
+   "name": "cut: block H sees credits through H-20 only",
+   "height": 974500,
+   "slots": 9,
+   "n_input": 2,
+   "treasury": 312495000,
+   "change": 310932500,
+   "n_miner_outputs": 2,
+   "n_oldest_selected": 1,
+   "n_largest_selected": 1,
+   "miner_total": 5000,
+   "table_root": "8593a817013f34cfa56dcce9ebcabdc72343547eee9a2b4ada4ebe4e2d4e4f42",
+   "digest": "d5e0572eafacc99edce3174b58b1175110b4dc233799989cd168a8e079a6c188",
+   "outputs": [
+    [
+     "51201b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9",
+     2000
+    ],
+    [
+     "512062c66a7a5dd70c3146618063c344e531e6d4b59e379808443ce962b3abd63c5a",
+     3000
+    ]
+   ],
+   "input": {
+    "512062c66a7a5dd70c3146618063c344e531e6d4b59e379808443ce962b3abd63c5a": [
+     "12884901888000",
+     974475
+    ],
+    "51201b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9": [
+     "8589934592000",
+     974480
+    ]
+   },
+   "credits": {
+    "974475": {
+     "512062c66a7a5dd70c3146618063c344e531e6d4b59e379808443ce962b3abd63c5a": "12884901888000"
+    },
+    "974480": {
+     "51201b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9": "8589934592000"
+    },
+    "974481": {
+     "5120089001a35679a33ef3db0ca350db9b9a2f0136e0e327577b04b3b98127470961": "38654705664000"
+    }
+   }
+  },
+  {
+   "name": "cut: block H+1 sees block H retired and the credit at H-19",
+   "height": 974501,
+   "slots": 9,
+   "n_input": 3,
+   "treasury": 312491000,
+   "change": 310928500,
+   "n_miner_outputs": 1,
+   "n_oldest_selected": 0,
+   "n_largest_selected": 1,
+   "miner_total": 9000,
+   "table_root": "085aab1c8093083b4903f14d1819ea8b28c0464d776293959a175cb6c790f681",
+   "digest": "7b9b8841ba9c5097a632a291c3d2a42582b313db5bf3ecec16a30625d0f2a59a",
+   "outputs": [
+    [
+     "5120089001a35679a33ef3db0ca350db9b9a2f0136e0e327577b04b3b98127470961",
+     9000
+    ]
+   ],
+   "input": {
+    "512062c66a7a5dd70c3146618063c344e531e6d4b59e379808443ce962b3abd63c5a": [
+     "0",
+     null
+    ],
+    "51201b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9": [
+     "0",
+     null
+    ],
+    "5120089001a35679a33ef3db0ca350db9b9a2f0136e0e327577b04b3b98127470961": [
+     "38654705664000",
+     974481
+    ]
+   }
+  },
+  {
+   "name": "two blocks, no new credits: first",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 1520,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 258,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 310937500,
+   "table_root": "c735598bd86d830f3b91fdb2f2afed3badde9700afcd8cc40ff773a81fd3d080",
+   "digest": "91517ce6552d7db903149dcebbc5e283aae2ba415b666a6203429b009b64bcd4",
+   "first_outputs": [
+    [
+     "5120be2538265e89d049043c3f80ab1151ccf4f0703f5c92ba90a028e2c968db6c61",
+     11991
+    ],
+    [
+     "51204937b52f6441cc0e3b331d6fb9081d47147289a341a6ba2b00c665eaf2f29f18",
+     11954
+    ],
+    [
+     "512095edef5c2f03f34d6ac179cf190bfdcaf1f429db3f59af3540ca78d7d2c7afc1",
+     11917
+    ]
+   ],
+   "last_output": [
+    [
+     "51200b6effbc36731b846115fac02fe35e0051ea53c1b6f39343e572692c1e59c7db",
+     29054845
+    ]
+   ],
+   "input": "see main(): snap",
+   "snapshot_root": "c735598bd86d830f3b91fdb2f2afed3badde9700afcd8cc40ff773a81fd3d080"
+  },
+  {
+   "name": "two blocks, no new credits: second, retired through H",
+   "height": 974501,
+   "slots": 143,
+   "n_input": 1520,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 80,
+   "n_oldest_selected": 72,
+   "n_largest_selected": 71,
+   "miner_total": 310937500,
+   "table_root": "2796a49f04453c5f765540de396c4f6b9c85df9d19bfd56c624a0f298bc0b7d3",
+   "digest": "1f4a4dd5912cebf04b7b14c2a1f49ba8dd6c793ae805f27a3e76be00db50807b",
+   "first_outputs": [
+    [
+     "512017deca254f1935d36518081ff61072c3f961d52e75daaa2aacbc175524c8755b",
+     3916
+    ],
+    [
+     "5120eefefd2b42ee468b46da4597e68fd6f69d89b0caeca05ca96b5014abef6b5cdd",
+     3888
+    ],
+    [
+     "51204735590d36955334a3ca0285b779ccc3e89b61e6cbd009e5b809199a0fba88dc",
+     3879
+    ]
+   ],
+   "last_output": [
+    [
+     "5120de403bf48168b6de147ee3c1ee1711d2c253ee33d01998d64c4c3732190acdb9",
+     30509494
+    ]
+   ],
+   "input": "snap after block 1",
+   "snapshot_root": "c735598bd86d830f3b91fdb2f2afed3badde9700afcd8cc40ff773a81fd3d080"
+  },
+  {
+   "name": "reorg: block A undone, block B (class 44) on the restored table",
+   "height": 974500,
+   "slots": 44,
+   "n_input": 800,
+   "treasury": 312350422,
+   "change": 310787922,
+   "n_miner_outputs": 44,
+   "n_oldest_selected": 22,
+   "n_largest_selected": 22,
+   "miner_total": 149578,
+   "table_root": "8db18b57f4a583936671a02995fa2d3b6778003ef1416f38c017287c179ed292",
+   "digest": "67376c191cca4c10bdc61b58a5ddb6373899579aeaa57ed4e6508fb3de16a6e9",
+   "first_outputs": [
+    [
+     "5120e9b55f2aead906fe90c9c48eeaae3995c2f1c7606f70f93f8d527cd269aeb37d",
+     3000
+    ],
+    [
+     "51202352da7280f1decc3acf1ba84eb945c9fc2b7b541094e1d0992dbffd1b6664cc",
+     3001
+    ],
+    [
+     "51209250b9912ee91d6b46e23299459ecd6eb8154451d62558a3a0a708a77926ad04",
+     3002
+    ]
+   ],
+   "last_output": [
+    [
+     "5120ead3316a55bd778d17121c5c69b9fe2c6d10970b80e450ca8471885c9b49ffc5",
+     3799
+    ]
+   ],
+   "input": "800 x (p2tr('o'+i), (3000+i) sats, 900000+i)",
+   "root_before": "8db18b57f4a583936671a02995fa2d3b6778003ef1416f38c017287c179ed292",
+   "root_after_A": "a2cb5628400e6c8d040007b8847093b6aa2ee73944ef3e44fff1c66e2dba1912",
+   "root_after_undo": "8db18b57f4a583936671a02995fa2d3b6778003ef1416f38c017287c179ed292"
+  },
+  {
+   "name": "last block before halving",
+   "height": 1049999,
+   "slots": 500,
+   "n_input": 600,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 223,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 310937500,
+   "table_root": "7cbd32617152cab06e16321dbcc46ec16f49bd19fabd90b2e1490ead261c4886",
+   "digest": "86c305a440baf277065a36dc5988e79a48700a4ed47077fbe63dbe0aea0ba3e5",
+   "first_outputs": [
+    [
+     "51207a3ce2f6fb370834401b0ffcc849290355d57e1e92b26f9bc08a4c775f8df371",
+     582665
+    ],
+    [
+     "512058785c16c9219a5552e548906bd81f2bdbe2c276283b7933a1dfe82402975cdd",
+     477971
+    ],
+    [
+     "5120a9912570fb34dd7d3d50db877c06dc4539213980651681d3043bed98f7c2a4b1",
+     4411
+    ]
+   ],
+   "last_output": [
+    [
+     "5120cee28c921a9495d2b724f20a1309dc459ecb3a9e83c470573b6b41d625d078f2",
+     94496
+    ]
+   ],
+   "input": "gen(6, 600)"
+  },
+  {
+   "name": "halving block: Rm halves, fewer payees",
+   "height": 1050000,
+   "slots": 500,
+   "n_input": 600,
+   "treasury": 781250,
+   "change": 0,
+   "n_miner_outputs": 99,
+   "n_oldest_selected": 250,
+   "n_largest_selected": 250,
+   "miner_total": 155468750,
+   "table_root": "7cbd32617152cab06e16321dbcc46ec16f49bd19fabd90b2e1490ead261c4886",
+   "digest": "0a87070afc6a863ecae2525d957f114c4af479bee01aa8d9d7b9c3f879bad380",
+   "first_outputs": [
+    [
+     "51207a3ce2f6fb370834401b0ffcc849290355d57e1e92b26f9bc08a4c775f8df371",
+     582665
+    ],
+    [
+     "512058785c16c9219a5552e548906bd81f2bdbe2c276283b7933a1dfe82402975cdd",
+     477971
+    ],
+    [
+     "5120a9912570fb34dd7d3d50db877c06dc4539213980651681d3043bed98f7c2a4b1",
+     4411
+    ]
+   ],
+   "last_output": [
+    [
+     "512095b9884b04484a2bb4c48edfefc8de37a3552cc72a207106a4fe0604022a83e7",
+     546896
+    ]
+   ],
+   "input": "gen(6, 600)"
+  },
+  {
+   "name": "halving block: whale paid in part at the new Rm",
+   "height": 1050000,
+   "slots": 9,
+   "n_input": 2,
+   "treasury": 781250,
+   "change": 0,
+   "n_miner_outputs": 2,
+   "n_oldest_selected": 1,
+   "n_largest_selected": 1,
+   "miner_total": 155468750,
+   "table_root": "fb1dc2446f2e12f00b28938256d424c18383ff1f3f9b464fa666f5bc399eb647",
+   "digest": "f774ded2d75865f65f349faa46df88adb34be68537aeb436ef53406cb911076b",
+   "outputs": [
+    [
+     "51202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+     2000
+    ],
+    [
+     "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326",
+     155466750
+    ]
+   ],
+   "input": {
+    "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326": [
+     "858993459200000000",
+     5
+    ],
+    "51202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881": [
+     "8589934592000",
+     4
+    ]
+   }
+  },
+  {
+   "name": "total supply in one script: paid Rm, partial",
+   "height": 974500,
+   "slots": 500,
+   "n_input": 1,
+   "treasury": 1562500,
+   "change": 0,
+   "n_miner_outputs": 1,
+   "n_oldest_selected": 0,
+   "n_largest_selected": 1,
+   "miner_total": 310937500,
+   "table_root": "49cb68f6d7b712ff06feb319506917e2adfd1807b3abde2b047ac18a3e9d3d43",
+   "digest": "3a9b6dacc3fc6934ba6285a8a38113c64837cc9ed1dcbb0f47a4d201a6a49bb3",
+   "outputs": [
+    [
+     "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326",
+     310937500
+    ]
+   ],
+   "input": {
+    "512050e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326": [
+     "9019431321600000000000000",
+     1
+    ]
+   }
+  }
+ ]
+}

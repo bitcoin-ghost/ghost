@@ -107,7 +107,7 @@ Mandatory corrections from simulation:
 Bandwidth estimate at 10 EH/s: about 3.7 KB/s per link, 320 MB/day. An SV1 notify with 500 outputs is about 44 KB, so 1,000 miners on 30 s jobs is about 1.5 MB/s of egress. Anchor pushes raise this; measure it.
 
 ### 2.3 Ledger and payout
-The normative reference is `sims/combined/refimpl_v2.py`; vectors are `sims/combined/test_vectors_v2.json` (32 pass, and all 15 draft-1 digests reproduce). A Rust port must match it exactly. Its `SLOT_CLASSES` and oldest/largest split are out of date; W1.3 fixes both.
+The normative reference is `docs/node-pool-reference/refimpl_v3.py`; vectors are `docs/node-pool-reference/test_vectors_v3.json` (37 vectors). A Rust port must match it exactly.
 
 Balances are in units of 2^-32 sat, fixed at share time from the share's own header `nBits`, so all nodes agree without a vote.
 
@@ -181,4 +181,4 @@ Pinned test cases: the 15 in `test_vectors.json`, plus 503/504-output golden vec
   - Exact payment should remove the gain from faking a small coinbase, which was 34-39% under the draft 6 floating rule. Not yet simulated.
 - **A dead pool leaves balances unpaid.** Nobody holds the money, so balances still owed when the pool stops are never paid.
 
-The build plan is in `NODE_POOL_PLAN.md`. Paths starting `sims/` or `hardware-test/` are in the design working folder, not this repo; the normative payout reference and its vectors move into the repo with W2.1.
+The build plan is in `NODE_POOL_PLAN.md`. Paths starting `sims/` or `hardware-test/` are in the design working folder, not this repo; the normative payout reference and its vectors are in `docs/node-pool-reference/` (`refimpl_v3.py`, `test_vectors_v3.json`; run the script to self-test).
