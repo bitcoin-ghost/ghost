@@ -120,6 +120,15 @@ pub fn validate_sv1_share(
         return Ok(true);
     }
 
+    // A hash that meets the job's network target is a block, whatever the downstream target:
+    // forward it. The pool checks the network target before the share target, so it submits
+    // the block. Dropping it here threw blocks away wherever the network target is easier than
+    // the share target (regtest, a low-difficulty signet), against the rule that a solved block
+    // is never held back.
+    if Target::from_compact(CompactTarget::from_consensus(job.bits.0)).is_met_by(hash) {
+        return Ok(true);
+    }
+
     Ok(false)
 }
 
@@ -203,12 +212,69 @@ pub struct UpstreamEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stratum_apps::stratum_core::sv1_api::utils::{Extranonce, HexBytes, PrevHash};
 
     #[test]
     fn test_proxy_extranonce_prefix_len() {
         assert_eq!(proxy_extranonce_prefix_len(8, 4), 4);
         assert_eq!(proxy_extranonce_prefix_len(10, 6), 4);
         assert_eq!(proxy_extranonce_prefix_len(4, 4), 0);
+    }
+
+    fn job(bits: u32) -> Notify<'static> {
+        Notify {
+            job_id: "1".into(),
+            prev_hash: PrevHash::try_from("00".repeat(32).as_str()).unwrap(),
+            // A coinbase whose scriptSig is the 8 extranonce bytes (4 + 4).
+            coin_base1: HexBytes::try_from(
+                format!("0100000001{}ffffffff08", "00".repeat(32)).as_str(),
+            )
+            .unwrap(),
+            // sequence, one empty output of 0 sats, lock time.
+            coin_base2: HexBytes::try_from(
+                format!("ffffffff01{}00{}", "00".repeat(8), "00".repeat(4)).as_str(),
+            )
+            .unwrap(),
+            merkle_branch: vec![],
+            version: HexU32Be(0x2000_0000),
+            bits: HexU32Be(bits),
+            time: HexU32Be(0x6000_0000),
+            clean_jobs: true,
+        }
+    }
+
+    fn submit(nonce: u32) -> client_to_server::Submit<'static> {
+        client_to_server::Submit {
+            user_name: "u".into(),
+            job_id: "1".into(),
+            extra_nonce2: Extranonce::try_from("00000000").unwrap(),
+            time: HexU32Be(0x6000_0000),
+            nonce: HexU32Be(nonce),
+            version_bits: None,
+            id: 1,
+        }
+    }
+
+    /// A share that solves a block is forwarded even when it misses the downstream target: on
+    /// regtest's limit (`0x207fffff`) about half of all hashes are blocks, and a share target of
+    /// difficulty 1 is met by none of the first few nonces.
+    #[test]
+    fn a_block_below_the_share_target_is_forwarded() {
+        let hard = Target::from_compact(CompactTarget::from_consensus(0x1d00_ffff));
+        let mut blocks = 0;
+        for nonce in 0..16 {
+            let as_block =
+                validate_sv1_share(&submit(nonce), hard, vec![0; 4], None, job(0x207f_ffff))
+                    .unwrap();
+            // The same share on a network whose target is the share target's: never a block.
+            let as_share =
+                validate_sv1_share(&submit(nonce), hard, vec![0; 4], None, job(0x1d00_ffff))
+                    .unwrap();
+            assert!(!as_share, "nonce {nonce} cannot meet difficulty 1");
+            blocks += as_block as u32;
+        }
+        assert!(blocks > 0, "about half of 16 regtest hashes are blocks");
+        assert!(blocks < 16, "and about half are not");
     }
 }
 
