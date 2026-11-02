@@ -78,13 +78,13 @@ async fn forward(state: &VerificationState, path: &str) -> Response {
 /// The address, if it has only the characters of a Bitcoin address and a sane length; else the
 /// 400 that says so. pool_sv2 checks the rest (checksum, network, payee class) and names what is
 /// wrong.
-fn checked_address(address: &str) -> Result<&str, Response> {
+fn checked_address(address: &str) -> Result<&str, Box<Response>> {
     let a = address.trim();
     if a.is_empty() || a.len() > MAX_ADDRESS_LEN || !a.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(json_error(
+        return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
             format!("{a:?} is not a Bitcoin address"),
-        ));
+        )));
     }
     Ok(a)
 }
@@ -96,7 +96,7 @@ async fn ledger_handler(
 ) -> Response {
     match checked_address(&address) {
         Ok(a) => forward(&state, &format!("/api/v1/node-pool/ledger/{a}")).await,
-        Err(r) => r,
+        Err(r) => *r,
     }
 }
 
@@ -107,7 +107,7 @@ async fn miner_handler(
 ) -> Response {
     match checked_address(&address) {
         Ok(a) => forward(&state, &format!("/api/v1/node-pool/miner/{a}")).await,
-        Err(r) => r,
+        Err(r) => *r,
     }
 }
 
@@ -123,7 +123,7 @@ async fn miner_history_handler(
 ) -> Response {
     let a = match checked_address(&address) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let w = q.get("window").map_or("24h", |w| w.trim());
     if !HISTORY_WINDOWS.contains(&w) {
