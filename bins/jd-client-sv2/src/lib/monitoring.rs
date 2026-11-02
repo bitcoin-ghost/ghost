@@ -91,6 +91,8 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     last_batch_work_sum: share_accounting.get_last_batch_work_sum(),
                     share_batch_size: share_accounting.get_share_batch_size(),
                     blocks_found: share_accounting.get_blocks_found(),
+                    slot_class: None,
+                    slot_class_warning: None,
                 });
             }
 
