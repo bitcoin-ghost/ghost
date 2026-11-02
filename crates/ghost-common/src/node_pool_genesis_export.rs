@@ -26,12 +26,12 @@
 //! 3. The JSON's network must equal the binary's, and must be a node pool network.
 //! 4. Rows strictly ascending by script, no empty script, every amount at most `i128::MAX` face
 //!    units. Units are taken as they are: the export already converted work to `2^-32` sat.
-//! 5. **`queue_since`**: every row owed at least the payout floor ([`PAYOUT_FLOOR_FACE`]) gets
+//! 5. **`queue_since`**: every row owed at least the payout floor ([`PAYOUT_FLOOR_FACE`](crate::node_pool_constants::PAYOUT_FLOOR_FACE)) gets
 //!    `queue_since = H`, the export's height (the freeze height); rows below the floor get none.
 //!    Derived, not a parameter: every node reading the same digest builds the same table and the
 //!    same `table_root`, with nothing to mistype.
 //!
-//! The result's [`GenesisExport::table_root`] is the digest a node pins
+//! The result's [`GenesisExport::table_root`](crate::node_pool_genesis_export::GenesisExport::table_root) is the digest a node pins
 //! (`genesis_table_digest`, [`crate::node_pool_network::NetworkStart::check_table`]).
 
 use std::path::Path;
