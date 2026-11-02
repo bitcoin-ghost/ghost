@@ -91,7 +91,7 @@ Constants, changed from the first design by simulation:
 | Anchor spacing | 54 s | 1.8-4% orphans with pushed jobs; 18-28% on a 30 s timer |
 | Job refresh | Push on every anchor within ~2 s; 30 s backstop | As above |
 | `T_net` floor | 10 (about 20 TH/s) | Judgement call |
-| K | 120, not 10 | K=10 voids 27% of work in a 30-minute 30/70 split; K=120 voids none |
+| K | 120, not 10 | K=10 voids 27% of work in a 30-minute 30/70 split; K=120 voids none. Decided 11-02: every window is measured from the INCLUDING anchor (rule 5), never from "the first anchor that carried the share", which depends on what each node has seen and could split nodes. A share stays includable while its job height is within 12 of the including anchor and in the same era; K bounds how far back the duplicate check looks. |
 | Snapshot cut | `cut(H) = H-20`, fixed (user decision) | Lag 6-11 let a 30% attacker reorg past the cut on 0.7% of cycles; 0 of 16k at 12-23. Costs about 3.3 h of payout delay. By arithmetic a 120-minute partition (about 12 blocks) rarely reaches a fixed 20-block cut; not simulated at this value |
 | Retarget | 36-block non-overlapping window, +/-1 tier, jump if 6 blocks read >=3 tiers off | Overlapping windows reached 31% outside the band |
 
