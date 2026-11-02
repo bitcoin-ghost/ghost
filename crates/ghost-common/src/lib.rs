@@ -31,6 +31,8 @@
 
 #![deny(unreachable_pub)]
 
+/// Node pool anchor chain: fork choice, ancestry and retarget, in memory.
+pub mod anchor_chain;
 pub mod atomic_file;
 pub mod batch_two_phase;
 
