@@ -47,9 +47,12 @@
 //! | 15 | `BtcBlocks` | count u16, [`BtcBlockMsg`]s |
 //! | 16 | `GetStamps` | empty |
 //! | 17 | `Stamps` | node_id 32, count u8, (parent_anchor 32, batch_root 32) newest first |
+//! | 18 | `GetAdvert` | empty |
+//! | 19 | `Advert` | SV1 port u16, SV2 port u16, SV2 authority key (u8 len, UTF-8) |
 //!
 //! `NotFound` kind 3 is a Bitcoin block; kind 4 (hash all zeros) answers `GetStamps` from a node
-//! that does not stamp jobs. Messages 12 to 15 are share-chain sync (W2.13): a node
+//! that does not stamp jobs; kind 5 (hash all zeros) answers `GetAdvert` from a node that serves
+//! no miners. Messages 12 to 15 are share-chain sync (W2.13): a node
 //! behind its peers asks for anchor headers after the last locator hash on the peer's best chain,
 //! then fetches their batches with `GetBatch` / `GetShares`, and fetches from the archive any
 //! Bitcoin block its own Bitcoin node does not have (stale blocks, which Bitcoin peers never
@@ -60,6 +63,12 @@
 //! `ghost-audit` opens its job's tag with them; without them the tag is a hash the miner cannot
 //! check. They are self-authenticating: a stamp that does not hash to the tag in the coinbase
 //! proves nothing, so the auditor trusts the audited node for nothing by asking it.
+//!
+//! Messages 18 and 19 are the mining advert (W2.10): the stratum ports this node serves miners
+//! on. They carry ports only, never a host: the endpoints are on the IP the asker reached the
+//! relay at, so an advert cannot point a lister or a miner at a third party's machine. Open
+//! listing reads the advert, probes those ports with `ghost-audit probe`, and lists the node only
+//! on a pass; the advert itself is a claim, worth nothing until the probe measures it.
 //!
 //! A [`NetShare`] is `header 80 || coinbase (u32 len) || merkle branch (u8 count, 32 each) ||
 //! node_id 32 || tier u8 || slot_class u16 || payee_script (u8 len) || parent_anchor 32 ||
@@ -112,6 +121,8 @@ pub const MAX_BTC_BLOCKS_PER_MESSAGE: usize = 16;
 
 /// Most job stamps in one `Stamps`: about 8 minutes of re-batches at the 30 s backstop.
 pub const MAX_STAMPS: usize = 16;
+/// Longest SV2 authority key string in an `Advert` (base58check of a 32-byte key is about 53).
+pub const MAX_AUTHORITY_KEY_LEN: usize = 64;
 
 /// Largest encoded [`NetShare`].
 pub const MAX_SHARE_BYTES: usize = 80
@@ -170,6 +181,10 @@ pub enum MsgType {
     GetStamps = 16,
     /// The node's recent job stamps.
     Stamps = 17,
+    /// Ask for the node's mining advert.
+    GetAdvert = 18,
+    /// The node's mining advert.
+    Advert = 19,
 }
 
 impl MsgType {
@@ -195,6 +210,8 @@ impl MsgType {
             15 => BtcBlocks,
             16 => GetStamps,
             17 => Stamps,
+            18 => GetAdvert,
+            19 => Advert,
             _ => return None,
         })
     }
@@ -220,6 +237,8 @@ impl MsgType {
             BtcBlocks => 2 + MAX_BTC_BLOCKS_PER_MESSAGE * MAX_BTC_BLOCK_BYTES,
             GetStamps => 0,
             Stamps => 32 + 1 + 64 * MAX_STAMPS,
+            GetAdvert => 0,
+            Advert => 2 + 2 + 1 + MAX_AUTHORITY_KEY_LEN,
         }
     }
 }
@@ -399,6 +418,20 @@ pub enum NotFoundKind {
     BtcBlock = 3,
     /// Job stamps: this node does not stamp jobs (no pool attached).
     Stamps = 4,
+    /// A mining advert: this node serves no miners (no pool attached, or nothing advertised).
+    Advert = 5,
+}
+
+/// The stratum ports a node serves miners on, on the IP its relay port was reached at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeAdvert {
+    /// SV1 stratum port, 0 for none.
+    pub sv1_port: u16,
+    /// SV2 port, 0 for none.
+    pub sv2_port: u16,
+    /// The SV2 authority public key miners check the Noise handshake against, as pool_sv2
+    /// prints it (base58check). Empty for none. At most [`MAX_AUTHORITY_KEY_LEN`] bytes.
+    pub sv2_authority_key: String,
 }
 
 /// What a node's mining jobs commit to in their share tag, besides each miner's own payee, tier
@@ -462,6 +495,10 @@ pub enum Message {
     GetStamps,
     /// The node's job stamps.
     Stamps(JobStamps),
+    /// Ask for the node's mining advert.
+    GetAdvert,
+    /// The node's mining advert.
+    Advert(NodeAdvert),
 }
 
 impl Message {
@@ -486,6 +523,8 @@ impl Message {
             Message::BtcBlocks(_) => MsgType::BtcBlocks,
             Message::GetStamps => MsgType::GetStamps,
             Message::Stamps(_) => MsgType::Stamps,
+            Message::GetAdvert => MsgType::GetAdvert,
+            Message::Advert(_) => MsgType::Advert,
         }
     }
 
@@ -543,7 +582,12 @@ impl Message {
                 p.extend_from_slice(&work.to_be_bytes());
                 p.extend_from_slice(&height.to_le_bytes());
             }
-            Message::GetAddr | Message::GetStamps => {}
+            Message::GetAddr | Message::GetStamps | Message::GetAdvert => {}
+            Message::Advert(a) => {
+                p.extend_from_slice(&a.sv1_port.to_le_bytes());
+                p.extend_from_slice(&a.sv2_port.to_le_bytes());
+                put_str(p, &a.sv2_authority_key, MAX_AUTHORITY_KEY_LEN);
+            }
             Message::Stamps(s) => {
                 p.extend_from_slice(&s.node_id);
                 p.push(s.recent.len() as u8);
@@ -645,6 +689,7 @@ impl Message {
                     2 => NotFoundKind::Share,
                     3 => NotFoundKind::BtcBlock,
                     4 => NotFoundKind::Stamps,
+                    5 => NotFoundKind::Advert,
                     _ => return Err(WireError::Truncated),
                 };
                 Message::NotFound(k, r.arr32()?)
@@ -656,6 +701,12 @@ impl Message {
             },
             MsgType::GetAddr => Message::GetAddr,
             MsgType::GetStamps => Message::GetStamps,
+            MsgType::GetAdvert => Message::GetAdvert,
+            MsgType::Advert => Message::Advert(NodeAdvert {
+                sv1_port: r.u16()?,
+                sv2_port: r.u16()?,
+                sv2_authority_key: r.string(MAX_AUTHORITY_KEY_LEN)?,
+            }),
             MsgType::Stamps => {
                 let node_id = r.arr32()?;
                 let n = r.u8()? as usize;
@@ -984,7 +1035,39 @@ mod tests {
                 recent: vec![],
             }),
             Message::NotFound(NotFoundKind::Stamps, [0; 32]),
+            Message::GetAdvert,
+            Message::Advert(NodeAdvert {
+                sv1_port: 3333,
+                sv2_port: 34255,
+                sv2_authority_key: "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".into(),
+            }),
+            Message::Advert(NodeAdvert::default()),
+            Message::NotFound(NotFoundKind::Advert, [0; 32]),
         ]
+    }
+
+    #[test]
+    fn an_advert_is_pinned_and_capped() {
+        let f = Message::Advert(NodeAdvert {
+            sv1_port: 0x0D05,
+            sv2_port: 0x85CF,
+            sv2_authority_key: "ab".into(),
+        })
+        .encode();
+        assert_eq!(&f[..5], &[7, 0, 0, 0, 19]);
+        assert_eq!(&f[5..], &[0x05, 0x0D, 0xCF, 0x85, 2, b'a', b'b']);
+        // A key longer than the cap is cut on encode and refused on decode.
+        let long = Message::Advert(NodeAdvert {
+            sv2_authority_key: "k".repeat(MAX_AUTHORITY_KEY_LEN + 10),
+            ..NodeAdvert::default()
+        })
+        .encode();
+        assert_eq!(long.len(), FRAME_HEADER_LEN + 5 + MAX_AUTHORITY_KEY_LEN);
+        let mut p = vec![0u8; 4];
+        p.push((MAX_AUTHORITY_KEY_LEN + 1) as u8);
+        p.extend(vec![b'k'; MAX_AUTHORITY_KEY_LEN + 1]);
+        assert!(Message::decode_payload(MsgType::Advert, &p).is_err());
+        assert!(Message::decode_header(&[1, 0, 0, 0, 18]).is_err());
     }
 
     #[test]

@@ -438,6 +438,10 @@ fee_address = "${FEE_ADDRESS}"
 # into pool_sv2; signet and regtest take the genesis below.
 network = "${NETWORK}"
 listen = "0.0.0.0:${RELAY_PORT}"
+# The stratum ports told to anyone who asks the relay port (open listing reads them, probes them,
+# and lists this node only if the probe passes). SV1 is the translator's; SV2 defaults to
+# pool_sv2's own listen port and authority key.
+advertise_sv1_port = 3333
 peers = [${peers}]
 db_path = "/var/lib/ghost/node-pool.db"
 ${genesis_note}

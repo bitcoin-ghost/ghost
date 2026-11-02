@@ -39,6 +39,7 @@ use ghost_np_relay::{
     net::{spawn_with_settlement, NetConfig, RelayHandle},
     relay::{Genesis, Relay, RelayParams, RelayStatus},
     settlement::{BlockSource, RpcBlockSource, SettledView, Settlement, SettlementStatus},
+    wire::NodeAdvert,
 };
 use ghost_storage::Database;
 use tokio::sync::watch;
@@ -61,6 +62,15 @@ pub struct NodePoolRelayConfig {
     /// The port peers should dial, when it differs from `listen`'s.
     #[serde(default)]
     pub advertise_port: Option<u16>,
+    /// The SV1 stratum port miners reach this node on (the translator's, usually 3333), told to
+    /// anyone who asks the relay port (`GetAdvert`, W2.10). Open listing probes it and lists the
+    /// node only if the probe passes. Absent: no SV1 port is advertised, and the node cannot be
+    /// listed, since the public probe speaks SV1.
+    #[serde(default)]
+    pub advertise_sv1_port: Option<u16>,
+    /// The SV2 port to advertise. Absent: pool_sv2's own listen port. 0: none.
+    #[serde(default)]
+    pub advertise_sv2_port: Option<u16>,
     /// Peers to dial, `host:port`. More are learned from them.
     #[serde(default)]
     pub peers: Vec<String>,
@@ -130,6 +140,26 @@ impl NodePoolRelayConfig {
 }
 
 impl NodePoolRelayConfig {
+    /// The mining advert this node's relay serves (W2.10): the configured SV1 port, the SV2 port
+    /// (`advertise_sv2_port`, else `sv2_listen_port`), and the SV2 authority key. `None` when
+    /// neither port is set: the relay then answers `GetAdvert` with `NotFound`.
+    pub fn advert(&self, sv2_listen_port: Option<u16>, authority_key: &str) -> Option<NodeAdvert> {
+        let sv1_port = self.advertise_sv1_port.unwrap_or(0);
+        let sv2_port = self.advertise_sv2_port.or(sv2_listen_port).unwrap_or(0);
+        if sv1_port == 0 && sv2_port == 0 {
+            return None;
+        }
+        Some(NodeAdvert {
+            sv1_port,
+            sv2_port,
+            sv2_authority_key: if sv2_port == 0 {
+                String::new()
+            } else {
+                authority_key.to_string()
+            },
+        })
+    }
+
     /// The configured network; absent is mainnet.
     pub fn network(&self) -> Result<NodePoolNetwork, String> {
         match &self.network {
@@ -310,15 +340,18 @@ pub struct RelayParts {
 }
 
 /// Open the store and start the relay, publishing to `np`'s anchor driver and taking its
-/// offered shares.
+/// offered shares. The advert carries the configured ports only (no SV2 listen port or key).
 pub async fn start(cfg: &NodePoolRelayConfig, np: &NodePool) -> Result<RelayHandle, String> {
-    start_with_parts(cfg, np).await.map(|(h, _)| h)
+    start_with_parts(cfg, np, cfg.advert(None, ""))
+        .await
+        .map(|(h, _)| h)
 }
 
-/// [`start`], also returning what the API reads.
+/// [`start`], serving `advert` on `GetAdvert`, and also returning what the API reads.
 pub async fn start_with_parts(
     cfg: &NodePoolRelayConfig,
     np: &NodePool,
+    advert: Option<NodeAdvert>,
 ) -> Result<(RelayHandle, RelayParts), String> {
     let net_start = cfg.network_start()?;
     let tier_base = match &cfg.tier_base {
@@ -384,6 +417,8 @@ pub async fn start_with_parts(
         peers,
         // Answer `GetStamps`, so miners can open their jobs' tags with `ghost-audit` (W2.9).
         node_id: Some(np.node_id()),
+        // Answer `GetAdvert`, so open listing can find the stratum ports and probe them (W2.10).
+        advert,
         ..NetConfig::default()
     };
     let driver = np.anchor_driver();
@@ -526,6 +561,25 @@ mod tests {
     }
 
     #[test]
+    fn the_advert_is_the_configured_ports_and_the_pools_own_sv2() {
+        let mut r = relay_cfg(Some("regtest"), GENESIS_UNSET, 0);
+        // Nothing configured and no SV2 listener known: nothing advertised.
+        assert_eq!(r.advert(None, "key"), None);
+        // SV2 defaults to pool_sv2's own listen port, with its key.
+        let a = r.advert(Some(34255), "key").unwrap();
+        assert_eq!((a.sv1_port, a.sv2_port), (0, 34255));
+        assert_eq!(a.sv2_authority_key, "key");
+        r.advertise_sv1_port = Some(3333);
+        let a = r.advert(Some(34255), "key").unwrap();
+        assert_eq!((a.sv1_port, a.sv2_port), (3333, 34255));
+        // An explicit SV2 port wins; 0 advertises none, and then no key either.
+        r.advertise_sv2_port = Some(0);
+        let a = r.advert(Some(34255), "key").unwrap();
+        assert_eq!((a.sv1_port, a.sv2_port), (3333, 0));
+        assert_eq!(a.sv2_authority_key, "");
+    }
+
+    #[test]
     fn mainnet_refuses_while_its_start_is_not_compiled_in() {
         assert!(MAINNET_START.is_none(), "these cases cover the unset build");
         // An absent network is mainnet.
@@ -646,7 +700,7 @@ mod tests {
         cfg.genesis_table_digest = Some(hex::encode(
             ghost_common::node_pool_network::genesis_table_digest(&Table::new()),
         ));
-        let (h, parts) = start_with_parts(&cfg, &np).await.unwrap();
+        let (h, parts) = start_with_parts(&cfg, &np, None).await.unwrap();
         assert_eq!(
             parts.start.pinned_table_digest,
             Some(parts.genesis_table_digest)

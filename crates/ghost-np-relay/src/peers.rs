@@ -117,6 +117,7 @@ pub fn limits_for(t: MsgType) -> (f64, f64) {
         GetHeaders | Headers => (4.0, 40.0),
         GetBtcBlocks | BtcBlocks => (10.0, 100.0),
         GetStamps | Stamps => (1.0, 10.0),
+        GetAdvert | Advert => (1.0, 10.0),
     }
 }
 
@@ -170,6 +171,9 @@ struct AddrInfo {
 
 /// Most learned addresses kept.
 pub const MAX_LEARNED_ADDRS: usize = 1_024;
+/// Most learned addresses kept on one IP. A node is one relay port; a few allow for several
+/// nodes behind one NAT. Without it one peer could fill the whole book with ports of one host.
+pub const MAX_LEARNED_PER_IP: usize = 4;
 
 /// Known peer addresses and banned IPs.
 #[derive(Debug, Default)]
@@ -189,10 +193,16 @@ impl AddrBook {
             .values()
             .filter(|i| i.source == AddrSource::Learned)
             .count();
+        let on_ip = self
+            .addrs
+            .iter()
+            .filter(|(k, i)| i.source == AddrSource::Learned && k.ip() == a.ip())
+            .count();
         match self.addrs.get_mut(&a) {
             Some(i) if source == AddrSource::Configured => i.source = source,
             Some(_) => {}
-            None if source == AddrSource::Learned && learned >= MAX_LEARNED_ADDRS => {}
+            None if source == AddrSource::Learned
+                && (learned >= MAX_LEARNED_ADDRS || on_ip >= MAX_LEARNED_PER_IP) => {}
             None => {
                 self.addrs.insert(
                     a,
@@ -255,8 +265,10 @@ impl AddrBook {
         v.into_iter().map(|(_, a)| a).collect()
     }
 
-    /// Up to `n` addresses to tell a peer about.
+    /// Up to `n` addresses to tell a peer about, chosen at random among those not failing, so
+    /// that over repeated `GetAddr`s every known address is told, not only the lowest `n`.
     pub fn sample(&self, n: usize) -> Vec<SocketAddr> {
+        use rand::seq::SliceRandom;
         let mut v: Vec<SocketAddr> = self
             .addrs
             .iter()
@@ -264,7 +276,11 @@ impl AddrBook {
             .map(|(a, _)| *a)
             .collect();
         v.sort();
-        v.truncate(n);
+        if v.len() > n {
+            v.shuffle(&mut rand::thread_rng());
+            v.truncate(n);
+            v.sort();
+        }
         v
     }
 }
@@ -329,5 +345,37 @@ mod tests {
             b.add(a, AddrSource::Learned);
         }
         assert_eq!(b.sample(usize::MAX).len(), MAX_LEARNED_ADDRS + 1);
+    }
+
+    #[test]
+    fn one_ip_cannot_fill_the_book() {
+        let mut b = AddrBook::default();
+        for port in 1..=100u16 {
+            b.add(SocketAddr::from(([10, 9, 9, 9], port)), AddrSource::Learned);
+        }
+        assert_eq!(b.sample(usize::MAX).len(), MAX_LEARNED_PER_IP);
+        // Configured addresses are not capped, and other IPs are unaffected.
+        b.add("10.9.9.9:500".parse().unwrap(), AddrSource::Configured);
+        b.add("10.9.9.8:1".parse().unwrap(), AddrSource::Learned);
+        assert_eq!(b.sample(usize::MAX).len(), MAX_LEARNED_PER_IP + 2);
+    }
+
+    #[test]
+    fn gossip_samples_reach_beyond_the_lowest_addresses() {
+        let mut b = AddrBook::default();
+        for i in 0..200u16 {
+            let a = SocketAddr::from(([10, 2, (i >> 8) as u8, i as u8], 8566));
+            b.add(a, AddrSource::Learned);
+        }
+        let mut told = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let s = b.sample(crate::wire::MAX_ADDRS);
+            assert_eq!(s.len(), crate::wire::MAX_ADDRS);
+            assert!(s.windows(2).all(|w| w[0] < w[1]), "sorted, no repeats");
+            told.extend(s);
+        }
+        // 50 random draws of 64 from 200 miss a given address with probability (136/200)^50,
+        // about 4e-9: every address is told.
+        assert_eq!(told.len(), 200);
     }
 }

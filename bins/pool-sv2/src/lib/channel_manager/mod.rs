@@ -257,9 +257,15 @@ impl ChannelManager {
         ));
         miner_stats.spawn_saver();
         let np = np.with_miner_stats(miner_stats.clone());
-        let (_relay_handle, relay_parts) = crate::node_pool_relay::start_with_parts(relay, &np)
-            .await
-            .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+        // The mining advert (W2.10): SV2 defaults to this pool's own listen port and key.
+        let advert = relay.advert(
+            Some(config.listen_address().port()),
+            &config.authority_public_key().to_string(),
+        );
+        let (_relay_handle, relay_parts) =
+            crate::node_pool_relay::start_with_parts(relay, &np, advert)
+                .await
+                .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
         warn!(
             fee_address = %cfg.fee_address,
             "NODE_POOL: every job carries its channel's share tag and the canonical coinbase"

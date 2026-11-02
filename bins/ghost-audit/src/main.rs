@@ -24,17 +24,23 @@
 //!
 //! `ghost-audit audit` connects to a node's stratum port like a miner, with your payout address,
 //! and judges every job it is sent. `ghost-audit probe` is the public prober: it checks a node's
-//! relay advert and jobs and prints a JSON verdict. Neither submits a share.
+//! relay advert and jobs and prints a JSON verdict. `ghost-audit list` is open listing (W2.10):
+//! it finds nodes from relay gossip, probes them on a schedule, and writes the website's
+//! `node-list.json` and a DNS fragment. None of them submits a share.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use ghost_audit::check::{JobReport, Verdict};
+use ghost_audit::check::{JobReport, ShareChainData, Verdict};
+use ghost_audit::discover::Limits;
+use ghost_audit::lister::{now_secs, run_round, write_atomic, LiveProber, RoundConfig};
+use ghost_audit::listing::{render_dns, render_node_list, DnsConfig, ListMeta, ListState, Policy};
 use ghost_audit::probe::{probe, ProbeConfig, ProbeVerdict};
 use ghost_audit::source::{start_share_chain, ChainConfig};
 use ghost_audit::sv1::Sv1Config;
@@ -70,6 +76,9 @@ enum Cmd {
     Audit(AuditArgs),
     /// Probe a node's advert and jobs and print a JSON verdict (for open listing).
     Probe(ProbeArgs),
+    /// Open listing: find nodes from relay gossip, probe them on a schedule, and write the
+    /// website's node-list.json and a DNS fragment.
+    List(ListArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -199,6 +208,88 @@ struct ProbeArgs {
     /// Jobs to judge.
     #[arg(long, default_value_t = 2)]
     jobs: usize,
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[command(flatten)]
+    chain: ChainArgs,
+    /// A relay to start discovery from, `host:port`, besides the --relay-peer ones. Repeat for
+    /// more.
+    #[arg(long = "seed")]
+    seeds: Vec<String>,
+    /// The payout address the probes log in with; every job must credit it.
+    #[arg(long)]
+    address: String,
+    /// User agent sent in mining.subscribe.
+    #[arg(long)]
+    user_agent: Option<String>,
+    /// The lister's state (candidates and probe history). Default: <data dir>/list-state.json.
+    #[arg(long)]
+    state: Option<PathBuf>,
+    /// Where to write node-list.json. Not written if absent.
+    #[arg(long)]
+    out_json: Option<PathBuf>,
+    /// Where to write the DNS zone fragment. Not written if absent.
+    #[arg(long)]
+    out_dns: Option<PathBuf>,
+    /// Run one round, write, and exit.
+    #[arg(long)]
+    once: bool,
+    /// Seconds between the starts of rounds.
+    #[arg(long, default_value_t = 600)]
+    interval: u64,
+    /// Passes needed within the window to be listed.
+    #[arg(long, default_value_t = 3)]
+    list_after: usize,
+    /// Probes of history per node that listing looks at.
+    #[arg(long, default_value_t = 6)]
+    window: usize,
+    /// Probes in a row that are not a pass (fail or unmeasured) that delist a listed node.
+    #[arg(long, default_value_t = 3)]
+    delist_after: usize,
+    /// Failed probes in a row that delist a listed node.
+    #[arg(long, default_value_t = 1)]
+    delist_after_fail: usize,
+    /// Most candidates kept.
+    #[arg(long, default_value_t = 1_024)]
+    max_candidates: usize,
+    /// Most candidates on one IP.
+    #[arg(long, default_value_t = 2)]
+    max_per_ip: usize,
+    /// Most relays asked for addresses in one round.
+    #[arg(long, default_value_t = 256)]
+    max_crawl: usize,
+    /// Accept private and loopback addresses from gossip. Always on for regtest.
+    #[arg(long)]
+    allow_private: bool,
+    /// Nodes probed at once.
+    #[arg(long, default_value_t = 4)]
+    probe_concurrency: usize,
+    /// Jobs judged per probe.
+    #[arg(long, default_value_t = 2)]
+    jobs: usize,
+    /// Seconds to keep retrying a job the prober cannot judge yet.
+    #[arg(long, default_value_t = 120)]
+    wait: u64,
+    /// Seconds to wait for each connection and each job.
+    #[arg(long, default_value_t = 60)]
+    timeout: u64,
+    /// Forget an unlisted candidate discovery has not seen for this many seconds.
+    #[arg(long, default_value_t = 7 * 24 * 3_600)]
+    forget_after: u64,
+    /// DNS owner name for the fragment (relative to the zone, or absolute with a final dot).
+    #[arg(long, default_value = "pool")]
+    dns_name: String,
+    /// DNS TTL, seconds.
+    #[arg(long, default_value_t = 300)]
+    dns_ttl: u32,
+    /// Only listed nodes serving SV1 on this port go in the DNS fragment.
+    #[arg(long, default_value_t = 3333)]
+    dns_sv1_port: u16,
+    /// Most records in the DNS fragment.
+    #[arg(long, default_value_t = 32)]
+    dns_max: usize,
 }
 
 fn hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
@@ -404,6 +495,121 @@ async fn run_probe(p: ProbeArgs) -> Result<ExitCode, String> {
     })
 }
 
+async fn run_list(a: ListArgs) -> Result<ExitCode, String> {
+    let policy = Policy {
+        list_after: a.list_after,
+        window: a.window,
+        delist_after: a.delist_after,
+        delist_after_fail: a.delist_after_fail,
+        interval_secs: a.interval,
+    };
+    policy.check()?;
+    let payee = payee_script(&a.address, a.chain.network)?;
+    let chain_cfg = a.chain.config().await?;
+    let mut seeds = chain_cfg.relay_peers.clone();
+    for s in &a.seeds {
+        seeds.push(resolve(s).await?);
+    }
+    seeds.sort();
+    seeds.dedup();
+    let limits = Limits {
+        max_candidates: a.max_candidates,
+        max_per_ip: a.max_per_ip.max(1),
+        max_crawl: a.max_crawl,
+        allow_private: a.allow_private || matches!(a.chain.network, Network::Regtest),
+        timeout: Duration::from_secs(a.timeout.min(30)),
+        ..Limits::default()
+    };
+    let state_path = a
+        .state
+        .clone()
+        .unwrap_or_else(|| chain_cfg.data_dir.join("list-state.json"));
+    let mut state = match std::fs::read_to_string(&state_path) {
+        Ok(s) => ListState::from_json(&s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ListState::default(),
+        Err(e) => return Err(format!("{}: {e}", state_path.display())),
+    };
+    let data: Arc<dyn ShareChainData> = Arc::new(start_share_chain(&chain_cfg).await?);
+    let prober = Arc::new(LiveProber {
+        genesis: chain_cfg.genesis_anchor,
+        address: a.address.clone(),
+        payee,
+        user_agent: a
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| format!("ghost-audit-list/{}", env!("CARGO_PKG_VERSION"))),
+        jobs: a.jobs.max(1),
+        wait: Duration::from_secs(a.wait),
+        timeout: Duration::from_secs(a.timeout),
+        data,
+    });
+    let round_cfg = RoundConfig {
+        seeds,
+        limits: limits.clone(),
+        policy,
+        probe_concurrency: a.probe_concurrency,
+        forget_after_secs: a.forget_after,
+    };
+    let dns = DnsConfig {
+        name: a.dns_name.clone(),
+        ttl: a.dns_ttl,
+        sv1_port: a.dns_sv1_port,
+        max_records: a.dns_max,
+    };
+    let genesis = chain_cfg.genesis_anchor;
+    let timeout = limits.timeout;
+    eprintln!(
+        "ghost-audit list: probes submit no shares. Listing: {} passes in {} probes, delist          after {} non-passes or {} fails.",
+        policy.list_after, policy.window, policy.delist_after, policy.delist_after_fail
+    );
+    loop {
+        let started = std::time::Instant::now();
+        let r = run_round(
+            &mut state,
+            &round_cfg,
+            move |relay| ghost_audit::discover::ask(relay, genesis, timeout),
+            prober.clone(),
+            now_secs(),
+        )
+        .await;
+        let now = now_secs();
+        let meta = ListMeta {
+            generated_at: now,
+            network: a.chain.network.name().to_string(),
+            genesis_anchor: hex::encode(genesis),
+            policy,
+        };
+        write_atomic(&state_path, &state.to_json())
+            .map_err(|e| format!("{}: {e}", state_path.display()))?;
+        if let Some(p) = &a.out_json {
+            write_atomic(p, &render_node_list(&state, &meta))
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+        if let Some(p) = &a.out_dns {
+            write_atomic(p, &render_dns(&state, &dns, now))
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+        eprintln!(
+            "round: {} relays answered, {} candidates, {} probed ({} pass, {} fail, {}              unmeasured), {} listed; listed {:?}, delisted {:?}, forgot {}",
+            r.answered,
+            r.candidates,
+            r.probed,
+            r.outcomes.0,
+            r.outcomes.1,
+            r.outcomes.2,
+            state.listed().count(),
+            r.listed,
+            r.delisted,
+            r.forgotten
+        );
+        if a.once {
+            return Ok(ExitCode::SUCCESS);
+        }
+        let next = Duration::from_secs(a.interval).saturating_sub(started.elapsed());
+        tokio::time::sleep(next).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -416,6 +622,7 @@ async fn main() -> ExitCode {
     let r = match Cli::parse().cmd {
         Cmd::Audit(a) => run_audit(a).await,
         Cmd::Probe(p) => run_probe(p).await,
+        Cmd::List(l) => run_list(l).await,
     };
     r.unwrap_or_else(|e| {
         eprintln!("ghost-audit: {e}");

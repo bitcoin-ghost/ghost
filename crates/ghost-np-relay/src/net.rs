@@ -34,7 +34,8 @@
 //! arrival, so nothing relies on the channel being private or authenticated.
 //!
 //! The task also answers `GetStamps` with the job stamps it published to pool_sv2 (W2.9), when
-//! [`crate::net::NetConfig::node_id`] is set.
+//! [`crate::net::NetConfig::node_id`] is set, and `GetAdvert` with the stratum ports in
+//! [`crate::net::NetConfig::advert`] (W2.10), so open listing can find and probe the node.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -56,8 +57,8 @@ use crate::peers::{penalty, AddrBook, AddrSource, PeerState};
 use crate::relay::{JobAnchor, Out, PeerId, Relay, RelayStatus};
 use crate::settlement::{BlockSource, Settlement, SettlementStatus};
 use crate::wire::{
-    Hello, JobStamps, Message, NetShare, NotFoundKind, WireError, FRAME_HEADER_LEN, MAX_ADDRS,
-    MAX_STAMPS, PROTOCOL_VERSION,
+    Hello, JobStamps, Message, NetShare, NodeAdvert, NotFoundKind, WireError, FRAME_HEADER_LEN,
+    MAX_ADDRS, MAX_STAMPS, PROTOCOL_VERSION,
 };
 
 /// Transport settings.
@@ -85,6 +86,9 @@ pub struct NetConfig {
     /// its recent job stamps so a miner's `ghost-audit` can open its job's tag; `None` (a relay
     /// with no pool, such as the auditor's own) answers `NotFound`.
     pub node_id: Option<[u8; 32]>,
+    /// The stratum ports this node serves miners on. Set, the node answers `GetAdvert` with
+    /// them (W2.10, open listing); `None` answers `NotFound`.
+    pub advert: Option<NodeAdvert>,
 }
 
 impl Default for NetConfig {
@@ -100,6 +104,7 @@ impl Default for NetConfig {
             tick_ms: 1_000,
             dial_secs: 5,
             node_id: None,
+            advert: None,
         }
     }
 }
@@ -587,6 +592,14 @@ impl Node {
                 self.send(conn, &reply);
             }
             Message::Stamps(_) => {}
+            Message::GetAdvert => {
+                let reply = match &self.cfg.advert {
+                    Some(a) if a.sv1_port != 0 || a.sv2_port != 0 => Message::Advert(a.clone()),
+                    _ => Message::NotFound(NotFoundKind::Advert, [0; 32]),
+                };
+                self.send(conn, &reply);
+            }
+            Message::Advert(_) => {}
             m => {
                 let prevs: Vec<[u8; 32]> = match &m {
                     Message::Share(s) => vec![s.prev_hash()],

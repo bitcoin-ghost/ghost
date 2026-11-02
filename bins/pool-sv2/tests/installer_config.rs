@@ -122,6 +122,15 @@ async fn regtest_config_is_accepted_by_resolve_and_starts_the_relay() {
     let mut relay = np_cfg.relay.clone().expect("[node_pool.relay] is required");
     assert_eq!(relay.listen, Some("0.0.0.0:8566".parse().unwrap()));
     assert_eq!(relay.peers, vec!["127.0.0.1:1", "peer.invalid:8566"]);
+    // The mining advert open listing probes (W2.10): the translator's SV1 port, and pool_sv2's
+    // own SV2 port and key.
+    assert_eq!(relay.advertise_sv1_port, Some(3333));
+    assert_eq!(relay.advertise_sv2_port, None);
+    let advert = relay
+        .advert(Some(config.listen_address().port()), PUB)
+        .expect("the installer advertises its stratum ports");
+    assert_eq!((advert.sv1_port, advert.sv2_port), (3333, 34255));
+    assert_eq!(advert.sv2_authority_key, PUB);
     assert_eq!(
         relay.db_path,
         PathBuf::from("/var/lib/ghost/node-pool.db"),

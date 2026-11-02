@@ -44,11 +44,17 @@
 //!
 //! [`crate::probe`] is the public prober: the same checks plus the node's relay advert, with a
 //! machine-readable verdict that open listing (W2.10) calls to decide whether to list a node.
+//! Open listing itself is [`crate::discover`] (candidates from relay gossip), [`crate::listing`]
+//! (the policy and the generated `node-list.json` and DNS fragment) and [`crate::lister`] (one
+//! round), run by `ghost-audit list`.
 
 #![warn(missing_docs)]
 
 pub mod check;
+pub mod discover;
 pub mod job;
+pub mod lister;
+pub mod listing;
 pub mod probe;
 pub mod source;
 pub mod sv1;
