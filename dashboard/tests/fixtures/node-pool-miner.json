@@ -1,0 +1,40 @@
+{
+  "address": "bcrt1qminerone000000000000000000000000000",
+  "network": "regtest",
+  "script_hex": "0014aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "node_id": "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+  "generated_at": 1800000000,
+  "collecting_since": 1799990000,
+  "summary": {
+    "workers": 1, "online": 1, "idle": 0, "offline": 0,
+    "hashrate_hs": { "15m": 120000000000000, "1h": 110000000000000, "24h": null },
+    "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1, "reject_reasons": { "duplicate-share": 1 } },
+    "last_share_at": 1799999990
+  },
+  "workers": [
+    {
+      "name": "rig1", "status": "online", "last_share_at": 1799999990, "last_submit_at": 1799999990,
+      "hashrate_hs": { "15m": 120000000000000, "1h": 110000000000000, "24h": null },
+      "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1, "reject_reasons": { "duplicate-share": 1 } },
+      "slot_class": 9,
+      "firmware_warning": "Stock Antminer firmware carries at most 9 miner outputs (about 730 B)",
+      "connections": [
+        { "downstream_id": 4, "channel_id": 1, "kind": "extended", "slot_class": 9, "model": "Stock Antminer",
+          "firmware": "2.0.0", "ceiling_class": 9, "settled": true,
+          "firmware_warning": "Stock Antminer firmware carries at most 9 miner outputs (about 730 B)" }
+      ]
+    }
+  ],
+  "expected_wait": {
+    "known": false,
+    "reason": "fewer than 3 pool blocks in 30 days",
+    "seconds": null,
+    "blocks_needed": null,
+    "pool_blocks_counted": 2,
+    "pool_block_interval_secs": null,
+    "typical_outputs_per_block": 1,
+    "sats_to_floor": null,
+    "credited_sats_24h": 9000,
+    "assumptions": []
+  }
+}
