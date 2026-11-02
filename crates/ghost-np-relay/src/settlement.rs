@@ -176,6 +176,13 @@ impl RpcBlockSource {
     }
 }
 
+/// The coinbase of a block given as `getblock <hash> 0` hex.
+fn coinbase_of_raw_block(raw_hex: &str) -> Option<Transaction> {
+    let block: bitcoin::Block =
+        bitcoin::consensus::deserialize(&hex::decode(raw_hex).ok()?).ok()?;
+    block.txdata.into_iter().next()
+}
+
 fn display_hex(hash: &[u8; 32]) -> String {
     let mut be = *hash;
     be.reverse();
@@ -221,13 +228,22 @@ impl BlockSource for RpcBlockSource {
             .rpc
             .call_raw(
                 "getrawtransaction",
-                vec![txid.into(), false.into(), block.into()],
+                vec![txid.into(), false.into(), block.clone().into()],
             )
             .await
-            .ok()?;
-        let tx: Transaction =
-            bitcoin::consensus::deserialize(&hex::decode(raw.as_str()?).ok()?).ok()?;
-        let mut tx = tx;
+            .ok();
+        let tx = match raw {
+            Some(raw) => bitcoin::consensus::deserialize(&hex::decode(raw.as_str()?).ok()?).ok()?,
+            // Bitcoin Core will not serve the genesis block's coinbase as a transaction ("not
+            // considered an ordinary transaction"), and settlement archives the blocks at and
+            // below a genesis anchor near height 0 (regtest's is at 0): read it from the raw
+            // block instead, or settlement never starts.
+            None => {
+                let raw = self.rpc.get_block(&block, 0).await.ok()?;
+                coinbase_of_raw_block(raw.as_str()?)?
+            }
+        };
+        let mut tx: Transaction = tx;
         for i in &mut tx.input {
             i.witness.clear();
         }
@@ -758,6 +774,22 @@ mod tests {
     };
     use bitcoin::consensus::deserialize;
     use ghost_common::canonical_payout::Table;
+
+    /// The genesis block's coinbase, which `getrawtransaction` refuses, is read from the raw
+    /// block: settlement archives the blocks at a genesis anchor near height 0 before anything
+    /// else, and stopped there for good on regtest.
+    #[test]
+    fn the_genesis_coinbase_is_read_from_the_raw_block() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let raw = hex::encode(bitcoin::consensus::serialize(&genesis));
+        let cb = coinbase_of_raw_block(&raw).expect("genesis has a coinbase");
+        assert_eq!(
+            cb.compute_txid().to_string(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+        assert!(coinbase_of_raw_block("00").is_none());
+        assert!(coinbase_of_raw_block("not hex").is_none());
+    }
 
     /// A relay with its archive, and the settlement over its store.
     fn settled() -> (Relay, Settlement) {
