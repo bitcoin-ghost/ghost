@@ -203,7 +203,6 @@ bitcoin = { workspace = true }
 tempfile = "3.10"
 hex = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }

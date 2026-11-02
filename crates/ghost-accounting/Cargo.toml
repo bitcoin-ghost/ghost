@@ -31,10 +31,6 @@ description = "Economics and payout calculations for Bitcoin Ghost"
 [dependencies]
 ghost-common = { workspace = true }
 bitcoin = { workspace = true }
-tracing = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

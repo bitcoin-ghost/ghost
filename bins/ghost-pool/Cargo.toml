@@ -51,7 +51,6 @@ ghost-reaper = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-storage = { workspace = true }
 ghost-consensus = { workspace = true }
-ghost-accounting = { workspace = true }
 ghost-verification = { workspace = true }
 
 # Async runtime
@@ -77,7 +76,6 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 hex = { workspace = true }
-async-trait = { workspace = true }
 sha2 = { workspace = true }
 bitcoin = { workspace = true }
 getrandom = { workspace = true }
@@ -100,7 +98,6 @@ stratum-apps = { path = "../../crates/stratum-apps", features = ["network", "cor
 # Key utilities
 bs58 = { version = "0.4.0", features = ["check"] }
 secp256k1 = { version = "0.28.2", features = ["rand"] }
-rand = "0.8"
 
 [features]
 # Heap profiling. OFF by default and adds nothing to a normal build — it swaps in jemalloc

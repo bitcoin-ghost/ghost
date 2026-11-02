@@ -31,7 +31,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
 
 # Local crates to fuzz
 ghost-consensus = { path = "../crates/ghost-consensus" }

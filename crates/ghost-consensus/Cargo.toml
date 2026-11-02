@@ -43,8 +43,6 @@ chrono = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
-sha2 = { workspace = true }
-hmac = { workspace = true }
 snow = { workspace = true }
 getrandom = { workspace = true }
 x25519-dalek = { workspace = true }

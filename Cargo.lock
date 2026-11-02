@@ -621,7 +621,6 @@ name = "bitcoin-ghost-tests"
 version = "1.11.46"
 dependencies = [
  "bitcoin",
- "chrono",
  "futures-util",
  "ghost-buds",
  "ghost-common",
@@ -2103,10 +2102,6 @@ dependencies = [
  "bitcoin",
  "ed25519-dalek",
  "ghost-common",
- "hex",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -2180,13 +2175,11 @@ dependencies = [
  "ghost-common",
  "ghost-storage",
  "hex",
- "hmac",
  "libc",
  "once_cell",
  "parking_lot",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "snow",
  "tempfile",
  "thiserror 1.0.69",
@@ -2203,7 +2196,6 @@ version = "1.11.46"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
- "async-trait",
  "binary_sv2 5.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitcoin",
  "bs58",
@@ -2213,7 +2205,6 @@ dependencies = [
  "common_messages_sv2 6.0.2",
  "framing_sv2 6.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "getrandom 0.2.17",
- "ghost-accounting",
  "ghost-buds",
  "ghost-build-info",
  "ghost-common",
@@ -2226,7 +2217,6 @@ dependencies = [
  "libc",
  "noise_sv2 1.4.1",
  "parking_lot",
- "rand 0.8.6",
  "reqwest",
  "rustls",
  "secp256k1 0.28.2",
@@ -2342,7 +2332,6 @@ dependencies = [
  "ghost-buds",
  "ghost-build-info",
  "ghost-common",
- "ghost-policy",
  "ghost-storage",
  "governor",
  "hex",
@@ -2360,7 +2349,6 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
  "toml",
