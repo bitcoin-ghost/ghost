@@ -104,9 +104,23 @@ impl Sv1Session {
             next_id: 1,
             pending: Vec::new(),
         };
-        let sub = s
-            .call("mining.subscribe", json!([cfg.user_agent]), cfg.timeout)
+        // Subscribe and authorize back to back, as most miners do. A client that waits for the
+        // subscribe answer first is a "serialising" miner to the translator: it is answered with
+        // a placeholder extranonce (corrected only by mining.set_extranonce, which it sends only
+        // to clients that asked for it), so every coinbase built from it failed to parse, or,
+        // with open_channel_on_subscribe, its channel opened under a provisional identity that
+        // the node pool refuses.
+        let mut answers = s
+            .calls(
+                &[
+                    ("mining.subscribe", json!([cfg.user_agent])),
+                    ("mining.authorize", json!([cfg.username, cfg.password])),
+                ],
+                cfg.timeout,
+            )
             .await?;
+        let auth = answers.pop().unwrap_or(Value::Null);
+        let sub = answers.pop().unwrap_or(Value::Null);
         let arr = sub
             .as_array()
             .ok_or_else(|| Sv1Error::Protocol("subscribe result is not an array".into()))?;
@@ -119,13 +133,6 @@ impl Sv1Session {
             arr.get(2).and_then(Value::as_u64).ok_or_else(|| {
                 Sv1Error::Protocol("subscribe result has no extranonce2 size".into())
             })? as usize;
-        let auth = s
-            .call(
-                "mining.authorize",
-                json!([cfg.username, cfg.password]),
-                cfg.timeout,
-            )
-            .await?;
         if auth != Value::Bool(true) {
             return Err(Sv1Error::Refused(format!(
                 "mining.authorize for {} answered {auth}",
@@ -205,18 +212,22 @@ impl Sv1Session {
         Ok(())
     }
 
-    async fn call(
+    /// Send every request at once, then wait for every answer, in whatever order they come.
+    async fn calls(
         &mut self,
-        method: &str,
-        params: Value,
+        reqs: &[(&str, Value)],
         timeout: Duration,
-    ) -> Result<Value, Sv1Error> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(&json!({"id": id, "method": method, "params": params}))
-            .await?;
+    ) -> Result<Vec<Value>, Sv1Error> {
+        let first = self.next_id;
+        for (method, params) in reqs {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.send(&json!({"id": id, "method": method, "params": params}))
+                .await?;
+        }
+        let mut answers: Vec<Option<Value>> = vec![None; reqs.len()];
         let wait = async {
-            loop {
+            while answers.iter().any(Option::is_none) {
                 let m = self.read_message().await?;
                 if let Some(meth) = m.get("method").and_then(Value::as_str) {
                     let params = m
@@ -227,17 +238,29 @@ impl Sv1Session {
                     self.on_notification(meth, &params)?;
                     continue;
                 }
-                if m.get("id").and_then(Value::as_u64) == Some(id) {
-                    if let Some(e) = m.get("error").filter(|e| !e.is_null()) {
-                        return Err(Sv1Error::Refused(format!("{method}: {e}")));
-                    }
-                    return Ok(m.get("result").cloned().unwrap_or(Value::Null));
+                let Some(k) = m
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .and_then(|id| id.checked_sub(first))
+                    .map(|k| k as usize)
+                    .filter(|k| *k < reqs.len())
+                else {
+                    continue;
+                };
+                if let Some(e) = m.get("error").filter(|e| !e.is_null()) {
+                    return Err(Sv1Error::Refused(format!("{}: {e}", reqs[k].0)));
                 }
+                answers[k] = Some(m.get("result").cloned().unwrap_or(Value::Null));
             }
+            Ok(())
         };
         tokio::time::timeout(timeout, wait)
             .await
-            .map_err(|_| Sv1Error::Timeout("an answer"))?
+            .map_err(|_| Sv1Error::Timeout("an answer"))??;
+        Ok(answers
+            .into_iter()
+            .map(|a| a.unwrap_or(Value::Null))
+            .collect())
     }
 
     /// The next job, in the order the node sent them.
@@ -264,5 +287,52 @@ impl Sv1Session {
         tokio::time::timeout(timeout, wait)
             .await
             .map_err(|_| Sv1Error::Timeout("a job"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// The translator answers a subscribe only once the channel is open, and opens it on
+    /// authorize: a client that waits for the subscribe answer before authorizing gets a
+    /// placeholder extranonce. The handshake sends both at once and takes the answers in any
+    /// order. This server answers nothing until both arrived, authorize first.
+    #[tokio::test]
+    async fn subscribe_and_authorize_go_out_together() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (r, mut w) = sock.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let a: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let b: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(a["method"], "mining.subscribe");
+            assert_eq!(b["method"], "mining.authorize");
+            for m in [
+                json!({"id": b["id"], "result": true, "error": null}),
+                json!({"id": a["id"], "result": [[], "0a0b0c0d", 8], "error": null}),
+            ] {
+                w.write_all(format!("{m}\n").as_bytes()).await.unwrap();
+            }
+            w
+        });
+        let s = Sv1Session::connect(&Sv1Config {
+            addr: addr.to_string(),
+            username: "bcrt1q.w".into(),
+            password: "x".into(),
+            user_agent: "test/1".into(),
+            timeout: Duration::from_secs(5),
+        })
+        .await
+        .expect("handshake");
+        assert_eq!(s.extranonce1, vec![0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(s.extranonce2_size, 8);
+        drop(server.await.unwrap());
     }
 }
