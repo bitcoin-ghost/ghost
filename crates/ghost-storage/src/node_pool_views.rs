@@ -206,7 +206,11 @@ impl Database {
                     height: u32_col(h, "np ledger event height")?,
                     applied_at: at,
                     amount: face_from_blob(&amount)?,
-                    prior_owed: prior.as_deref().map(face_from_blob).transpose()?.unwrap_or(0),
+                    prior_owed: prior
+                        .as_deref()
+                        .map(face_from_blob)
+                        .transpose()?
+                        .unwrap_or(0),
                     block_hash: block.map(|b| blob32(b, "np block hash")).transpose()?,
                     chain_time: header_time(header),
                 })
@@ -545,18 +549,33 @@ mod tests {
         assert_eq!(ev[2].prior_owed, 3_500 * FACE_PER_SAT + 7);
         assert_eq!(ev[2].amount, 2_000 * FACE_PER_SAT);
         assert_eq!(ev[2].block_hash, Some(paid_block));
-        assert_eq!(ev[2].chain_time, Some(1_700_100_000), "the block's own header");
+        assert_eq!(
+            ev[2].chain_time,
+            Some(1_700_100_000),
+            "the block's own header"
+        );
         assert_eq!(ev[2].applied_at, 400);
 
         // Height floor and the newest-kept limit.
-        assert_eq!(db.np_payee_ledger_events(&payee(7), 515, 100).unwrap().len(), 2);
+        assert_eq!(
+            db.np_payee_ledger_events(&payee(7), 515, 100)
+                .unwrap()
+                .len(),
+            2
+        );
         let last = db.np_payee_ledger_events(&payee(7), 0, 1).unwrap();
         assert_eq!(last.len(), 1);
         assert_eq!(last[0].kind, NpLedgerEventKind::Block);
-        assert_eq!(db.np_payee_ledger_events(&payee(8), 0, 100).unwrap().len(), 1);
+        assert_eq!(
+            db.np_payee_ledger_events(&payee(8), 0, 100).unwrap().len(),
+            1
+        );
 
         // A reorg undoes the block: its event goes with it.
         db.np_undo_block(&paid_block).unwrap();
-        assert_eq!(db.np_payee_ledger_events(&payee(7), 0, 100).unwrap().len(), 2);
+        assert_eq!(
+            db.np_payee_ledger_events(&payee(7), 0, 100).unwrap().len(),
+            2
+        );
     }
 }

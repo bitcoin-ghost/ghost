@@ -35,6 +35,7 @@ use serde::Serialize;
 use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address, Script};
 
 use crate::{
+    miner_stats::{now_secs, MinerStats},
     node_pool::{ChannelKind, ChannelStatus, NodePool},
     node_pool_relay::RelayParts,
 };
@@ -71,11 +72,19 @@ pub trait LiveView: Send + Sync {
     fn miners(&self) -> Vec<ChannelStatus>;
     /// The table the next block pays, if the relay can give one now.
     fn next_table(&self) -> NextTableFuture<'_>;
+    /// This node's identity, if it has one.
+    fn node_id(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 impl LiveView for NodePool {
     fn miners(&self) -> Vec<ChannelStatus> {
         self.channel_status()
+    }
+
+    fn node_id(&self) -> Option<[u8; 32]> {
+        Some(*NodePool::node_id(self))
     }
 
     fn next_table(&self) -> NextTableFuture<'_> {
@@ -121,7 +130,7 @@ impl ApiError {
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(format!("node pool store: {e}"))
 }
 
@@ -135,7 +144,7 @@ pub struct Amount {
 }
 
 impl Amount {
-    fn of(units: i128) -> Amount {
+    pub(crate) fn of(units: i128) -> Amount {
         let sats = units.div_euclid(FACE_PER_SAT);
         Amount {
             units: units.to_string(),
@@ -331,6 +340,8 @@ pub struct MinerView {
     pub kind: &'static str,
     /// The payee its shares credit.
     pub address: String,
+    /// The worker name: what follows the first `.` of its user identity.
+    pub worker: String,
     /// Miner outputs its jobs carry.
     pub slot_class: u16,
     /// Sensing state, for extended channels.
@@ -430,12 +441,16 @@ pub struct StatusResponse {
 
 /// The API over a running relay and job layer.
 pub struct NodePoolApi {
-    parts: RelayParts,
+    pub(crate) parts: RelayParts,
     fee_address: String,
-    live: Arc<dyn LiveView>,
+    pub(crate) live: Arc<dyn LiveView>,
+    /// Per-worker share statistics (W2.17), for the miner pages.
+    pub(crate) stats: Arc<MinerStats>,
+    /// Unix seconds now; a fixed clock in tests.
+    pub(crate) clock: fn() -> u64,
 }
 
-fn display_hash(h: &[u8; 32]) -> String {
+pub(crate) fn display_hash(h: &[u8; 32]) -> String {
     let mut b = *h;
     b.reverse();
     hex::encode(b)
@@ -452,14 +467,28 @@ impl NodePoolApi {
             parts,
             fee_address,
             live,
+            stats: Arc::new(MinerStats::in_memory(now_secs())),
+            clock: now_secs,
         }
     }
 
-    fn network(&self) -> NodePoolNetwork {
+    /// The same API reading `stats` for the miner pages.
+    pub fn with_miner_stats(mut self, stats: Arc<MinerStats>) -> NodePoolApi {
+        self.stats = stats;
+        self
+    }
+
+    /// The same API on a fixed clock (tests).
+    pub fn with_clock(mut self, clock: fn() -> u64) -> NodePoolApi {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn network(&self) -> NodePoolNetwork {
         self.parts.start.network
     }
 
-    fn address_of(&self, script: &[u8]) -> String {
+    pub(crate) fn address_of(&self, script: &[u8]) -> String {
         Address::from_script(Script::from_bytes(script), self.network().bitcoin_network())
             .map(|a| a.to_string())
             .unwrap_or_else(|_| hex::encode(script))
@@ -486,7 +515,7 @@ impl NodePoolApi {
         Ok(script)
     }
 
-    fn settlement_brief(&self) -> SettlementBrief {
+    pub(crate) fn settlement_brief(&self) -> SettlementBrief {
         let s = self.parts.settlement.borrow();
         SettlementBrief {
             caught_up: s.caught_up(),
@@ -686,6 +715,7 @@ impl NodePoolApi {
                     ChannelKind::Extended => "extended",
                 },
                 address: self.address_of(&c.payee_script),
+                worker: crate::miner_stats::worker_name(&c.user_identity),
                 slot_class: c.slot_class,
                 firmware_warning: c
                     .sensing
@@ -786,4 +816,4 @@ pub fn router(api: Arc<NodePoolApi>) -> stratum_apps::monitoring::axum::Router {
 
 #[cfg(test)]
 #[path = "node_pool_api_tests.rs"]
-mod tests;
+pub(crate) mod tests;

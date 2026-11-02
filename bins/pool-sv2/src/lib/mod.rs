@@ -36,10 +36,12 @@ pub mod connection_limit;
 pub mod downstream;
 pub mod error;
 mod io_task;
+pub mod miner_stats;
 #[cfg(feature = "monitoring")]
 mod monitoring;
 pub mod node_pool;
 pub mod node_pool_api;
+pub mod node_pool_miner_api;
 pub mod node_pool_relay;
 pub mod share_webhook;
 pub mod template_receiver;
@@ -131,6 +133,10 @@ impl PoolSv2 {
             .expect("Failed to initialize monitoring server")
             // The node pool's ledger and status API (W2.11), on the same loopback listener.
             .with_routes(crate::node_pool_api::router(
+                channel_manager.node_pool_api.clone(),
+            ))
+            // The miner pages' API (W2.17).
+            .with_routes(crate::node_pool_miner_api::router(
                 channel_manager.node_pool_api.clone(),
             ));
 

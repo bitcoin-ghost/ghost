@@ -917,6 +917,20 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let res = standard_channel.validate_share(msg.clone());
                 vardiff.increment_shares_since_last_update();
 
+                // NODE_POOL: every judged share feeds the miner pages' statistics (W2.17), at
+                // the difficulty of the job it was mined on.
+                {
+                    let difficulty = match standard_channel.job_target(msg.job_id) {
+                        Some(t) => t.difficulty_float(),
+                        None => standard_channel.get_target().difficulty_float(),
+                    };
+                    self.node_pool.record_share(
+                        (downstream_id, channel_id),
+                        standard_channel.get_user_identity(),
+                        crate::miner_stats::Outcome::of(&res, difficulty),
+                    );
+                }
+
                 // NODE_POOL_RELAY: an accepted share goes to the share-chain relay, which keeps it
                 // if it meets T_net.
                 if let Ok(ShareValidationResult::Valid(_, header80) | ShareValidationResult::BlockFound(_, _, _, header80)) = &res {
@@ -1269,6 +1283,20 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                          with no usable worker TLV — share accepted for the miner but NOT \
                          credited, as the payout target is unknown",
                         channel_id, channel_identity
+                    );
+                }
+
+                // NODE_POOL: every judged share feeds the miner pages' statistics (W2.17), under
+                // the per-miner identity when a proxy sends one, at its job's difficulty.
+                {
+                    let difficulty = match extended_channel.job_target(msg.job_id) {
+                        Some(t) => t.difficulty_float(),
+                        None => extended_channel.get_target().difficulty_float(),
+                    };
+                    self.node_pool.record_share(
+                        (downstream_id, channel_id),
+                        webhook_identity.as_deref().unwrap_or(&channel_identity),
+                        crate::miner_stats::Outcome::of(&res, difficulty),
                     );
                 }
 

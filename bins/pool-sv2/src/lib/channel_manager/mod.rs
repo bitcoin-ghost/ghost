@@ -249,6 +249,14 @@ impl ChannelManager {
         let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
             .await
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+        // Per-worker share statistics for the miner pages (W2.17), saved beside the relay's
+        // store so a restart keeps the history.
+        let miner_stats = Arc::new(crate::miner_stats::MinerStats::open(
+            crate::miner_stats::MinerStats::path_beside(&relay.db_path),
+            crate::miner_stats::now_secs(),
+        ));
+        miner_stats.spawn_saver();
+        let np = np.with_miner_stats(miner_stats.clone());
         let (_relay_handle, relay_parts) = crate::node_pool_relay::start_with_parts(relay, &np)
             .await
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
@@ -257,11 +265,14 @@ impl ChannelManager {
             "NODE_POOL: every job carries its channel's share tag and the canonical coinbase"
         );
         let node_pool = Arc::new(np);
-        let node_pool_api = Arc::new(crate::node_pool_api::NodePoolApi::new(
-            relay_parts,
-            cfg.fee_address.clone(),
-            node_pool.clone(),
-        ));
+        let node_pool_api = Arc::new(
+            crate::node_pool_api::NodePoolApi::new(
+                relay_parts,
+                cfg.fee_address.clone(),
+                node_pool.clone(),
+            )
+            .with_miner_stats(miner_stats),
+        );
         let mut supported_extensions = config.supported_extensions().to_vec();
         if !supported_extensions
             .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE)
