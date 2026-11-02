@@ -868,7 +868,10 @@ mod tests {
     #[test]
     fn every_halt_table_is_a_dropped_one() {
         for t in HALT_TABLES.iter().chain(HALT_WHERE.iter().map(|(t, _)| t)) {
-            assert!(DROPPED_TABLES.contains(t), "{t} is halted on but not dropped");
+            assert!(
+                DROPPED_TABLES.contains(t),
+                "{t} is halted on but not dropped"
+            );
         }
     }
 
@@ -883,7 +886,15 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(money_tables(&c).unwrap().iter().find(|(t, _)| t == "node_rewards").unwrap().1, 0);
+        assert_eq!(
+            money_tables(&c)
+                .unwrap()
+                .iter()
+                .find(|(t, _)| t == "node_rewards")
+                .unwrap()
+                .1,
+            0
+        );
         refuse_money_rows(&c).unwrap();
 
         c.execute(
@@ -905,7 +916,8 @@ mod tests {
         assert_eq!(count(&c, "SELECT COUNT(*) FROM votes"), 3);
 
         // Paid back to zero, it migrates.
-        c.execute("UPDATE node_rewards SET balance_sats = 0", []).unwrap();
+        c.execute("UPDATE node_rewards SET balance_sats = 0", [])
+            .unwrap();
         run_migrations(&c).unwrap();
         assert_eq!(raw_version(&c), -65);
     }

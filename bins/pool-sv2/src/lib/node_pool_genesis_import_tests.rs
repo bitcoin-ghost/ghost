@@ -11,7 +11,10 @@
 use super::*;
 use crate::config::NodePoolConfig;
 use crate::node_pool::NodePool;
-use ghost_common::node_pool_constants::FACE_PER_SAT;
+use ghost_common::node_pool_constants::{FACE_PER_SAT, PAYOUT_FLOOR_FACE};
+use ghost_common::node_pool_genesis_export::{
+    parse_export, sample_export, EXPORT_BIN, EXPORT_JSON,
+};
 use ghost_common::node_pool_network::genesis_table_digest;
 
 const H: u64 = 974_500;
@@ -34,58 +37,15 @@ struct Export {
     digest: [u8; 32],
 }
 
-/// An export as `ghost-mining --np-export` writes it: the full layout, with filler where the
-/// import does not look (checkpoint, rate, miners) and the rows and totals where it does.
+/// An export as `ghost-mining --np-export` writes it (the shared sample layout).
 fn export_with(
     network: &str,
     height: u64,
     rows: &[(Vec<u8>, u128)],
     json_rows: &[(Vec<u8>, u128)],
 ) -> Export {
-    let mut b = Vec::new();
-    b.extend_from_slice(LEDGER_MAGIC);
-    b.extend_from_slice(&(network.len() as u16).to_be_bytes());
-    b.extend_from_slice(network.as_bytes());
-    b.extend_from_slice(&height.to_be_bytes());
-    b.extend_from_slice(&1_700_000_000i64.to_be_bytes()); // cutoff_ts
-    b.extend_from_slice(&[0x11; 96]); // ledger_root, adopted_root, canonical_payout_sha256
-    b.extend_from_slice(&1u32.to_be_bytes()); // one node
-    b.extend_from_slice(&[0x22; 32]);
-    b.extend_from_slice(&5i32.to_be_bytes());
-    for v in [1u128, 1, 1_000_000, 1u128 << 32] {
-        b.extend_from_slice(&v.to_be_bytes()); // rate
-    }
-    b.extend_from_slice(&(rows.len() as u32).to_be_bytes()); // miners: one per row
-    for (i, (s, f)) in rows.iter().enumerate() {
-        let addr = format!("addr{i}");
-        b.extend_from_slice(&(addr.len() as u16).to_be_bytes());
-        b.extend_from_slice(addr.as_bytes());
-        b.extend_from_slice(&(s.len() as u16).to_be_bytes());
-        b.extend_from_slice(s);
-        b.extend_from_slice(&(i as u128 + 1).to_be_bytes());
-        b.extend_from_slice(&f.to_be_bytes());
-    }
-    b.extend_from_slice(&encode_rows(rows).unwrap());
-    let total: u128 = rows.iter().map(|r| r.1).sum();
-    for v in [3u128, total, 0, 0, 1, total] {
-        b.extend_from_slice(&v.to_be_bytes());
-    }
-    let digest: [u8; 32] = Sha256::digest(&b).into();
-    let json = serde_json::json!({
-        "format": "ghost-ledger-export/v1",
-        "digest_sha256": hex::encode(digest),
-        "network": network,
-        "checkpoint": { "height": height },
-        "genesis_table": json_rows.iter().map(|(s, f)| serde_json::json!({
-            "script_hex": hex::encode(s),
-            "face_units": f.to_string(),
-        })).collect::<Vec<_>>(),
-    });
-    Export {
-        bin: b,
-        json: serde_json::to_vec_pretty(&json).unwrap(),
-        digest,
-    }
+    let (bin, json, digest) = sample_export(network, height, rows, json_rows);
+    Export { bin, json, digest }
 }
 
 fn export(network: &str) -> Export {
