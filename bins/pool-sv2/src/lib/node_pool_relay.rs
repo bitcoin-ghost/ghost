@@ -360,11 +360,21 @@ pub async fn start_with_parts(
     };
     // The genesis table is the cutover's, imported into the store by `--np-import-genesis`
     // (plan Phase 4, migration v65); empty until then. Its digest is checked against the pinned
-    // one before the relay is built on it.
-    let db = Arc::new(Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?);
-    let table: Table = db
-        .np_genesis_table()
-        .map_err(|e| format!("genesis table: {e}"))?;
+    // one before the relay is built on it. A store that does not exist yet holds no import, so
+    // it is not created for a start that the pin refuses.
+    let opened = if cfg.db_path.exists() {
+        Some(Arc::new(
+            Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?,
+        ))
+    } else {
+        None
+    };
+    let table: Table = match &opened {
+        Some(db) => db
+            .np_genesis_table()
+            .map_err(|e| format!("genesis table: {e}"))?,
+        None => Table::new(),
+    };
     let table_digest = net_start.check_table(&table)?;
     let genesis_tier = cfg
         .genesis_tier
@@ -386,6 +396,10 @@ pub async fn start_with_parts(
         table,
     };
     let genesis_btc_height = genesis.btc_height;
+    let db = match opened {
+        Some(db) => db,
+        None => Arc::new(Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?),
+    };
     let view = SettledView::load(&db).map_err(|e| format!("settlement view: {e}"))?;
     let archive = BtcArchive::open(db.clone()).map_err(|e| format!("bitcoin archive: {e}"))?;
     let mut params = RelayParams::new(genesis, tier_base);
