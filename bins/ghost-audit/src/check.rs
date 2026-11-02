@@ -116,6 +116,11 @@ pub enum FailReason {
     /// Any other difference from the canonical outputs (order, a dropped payee, the treasury
     /// overpaid, a zero-value finder).
     OutputsNotCanonical,
+    /// An SV2 standard job, which shows only its merkle root: no canonical coinbase crediting
+    /// the miner, under any stamp the node discloses, slot class or tier, rebuilt from the node's
+    /// own extended job on the same template, hashes to it ([`crate::sv2::rebuild_standard`]).
+    /// Which part is wrong (tag, outputs) cannot be told from a hash.
+    StandardJobNotCanonical,
 }
 
 impl FailReason {
@@ -133,6 +138,7 @@ impl FailReason {
             FailReason::WrongSlotClass => "wrong slot class",
             FailReason::WrongLedgerRoot => "wrong ledger root",
             FailReason::OutputsNotCanonical => "outputs not canonical",
+            FailReason::StandardJobNotCanonical => "standard job not canonical",
         }
     }
 }
@@ -930,6 +936,7 @@ pub(crate) mod tests {
             FailReason::WrongSlotClass,
             FailReason::WrongLedgerRoot,
             FailReason::OutputsNotCanonical,
+            FailReason::StandardJobNotCanonical,
         ]
         .iter()
         .map(|r| {
@@ -953,7 +960,8 @@ pub(crate) mod tests {
                 "inflated_balance",
                 "wrong_slot_class",
                 "wrong_ledger_root",
-                "outputs_not_canonical"
+                "outputs_not_canonical",
+                "standard_job_not_canonical"
             ]
         );
         assert_eq!(
