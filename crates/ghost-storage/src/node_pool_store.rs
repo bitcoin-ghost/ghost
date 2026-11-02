@@ -40,7 +40,7 @@
 //! differs is an error, and an insert that was ignored for any other reason (OR IGNORE also
 //! swallows CHECK and NOT NULL failures) is an error. Nothing here discards a database error.
 //!
-//! Dark: nothing in the running node calls this yet.
+//! The relay (`ghost-np-relay`) applies credits; settlement applies and undoes blocks.
 
 use std::collections::BTreeMap;
 
@@ -1210,6 +1210,86 @@ impl Database {
         self.transaction(|tx| undo_event_conn(tx, NpLedgerEventKind::Block, block_hash))
     }
 
+    /// Undo a block's retirements wherever it sits in the event log (settlement: a Bitcoin reorg,
+    /// or a provisional block that turned out not to match). Every event applied after it is
+    /// undone first, newest first, and re-applied in its original order afterwards, all in one
+    /// transaction, so the result is exactly the log without the block.
+    pub fn np_undo_block_anywhere(&self, block_hash: &[u8; 32]) -> GhostResult<()> {
+        self.transaction(|tx| {
+            let target =
+                get_event_conn(tx, NpLedgerEventKind::Block, block_hash)?.ok_or_else(|| {
+                    GhostError::Database(format!(
+                        "np block {} is not applied",
+                        hex::encode(block_hash)
+                    ))
+                })?;
+            let mut above = Vec::new();
+            while let Some(ev) = last_event_conn(tx)? {
+                if ev.seq == target.seq {
+                    break;
+                }
+                let entries = journal_entries_conn(tx, ev.kind, &ev.key)?;
+                undo_event_conn(tx, ev.kind, &ev.key)?;
+                above.push((ev, entries));
+            }
+            undo_event_conn(tx, NpLedgerEventKind::Block, block_hash)?;
+            for (ev, entries) in above.into_iter().rev() {
+                match ev.kind {
+                    NpLedgerEventKind::Credit => {
+                        let deltas: BTreeMap<Script, i128> = entries.iter().cloned().collect();
+                        apply_event_conn(
+                            tx,
+                            ev.kind,
+                            &ev.key,
+                            ev.height,
+                            &entries,
+                            ev.applied_at,
+                            |t| {
+                                apply_credits(t, &deltas, ev.height)
+                                    .map_err(|e| GhostError::PayoutCalculation(e.to_string()))
+                            },
+                        )?;
+                    }
+                    NpLedgerEventKind::Block => {
+                        apply_event_conn(
+                            tx,
+                            ev.kind,
+                            &ev.key,
+                            ev.height,
+                            &entries,
+                            ev.applied_at,
+                            |t| {
+                                apply_block(t, &entries)
+                                    .map_err(|e| GhostError::PayoutCalculation(e.to_string()))
+                            },
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Every applied block as `(height, block hash)`, by height.
+    pub fn np_applied_blocks(&self) -> GhostResult<Vec<(u32, [u8; 32])>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT height, event_key FROM np_ledger_events WHERE kind = 1 \
+                     ORDER BY height",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .map(|(h, k)| Ok((u32_col(h, "np block height")?, blob32(k, "np block hash")?)))
+                .collect()
+        })
+    }
+
     /// A block's recorded retirements in pay order, if the block is applied.
     pub fn np_block_retirements(
         &self,
@@ -1914,6 +1994,53 @@ mod tests {
         ] {
             assert_eq!(count(&db, t), 0, "{t}");
         }
+    }
+
+    #[test]
+    fn a_block_under_later_events_undoes_as_if_it_never_happened() {
+        let replay = |with_block: bool| {
+            let db = db();
+            db.np_apply_credits(&h(1), 100, &credits(&[(1, 2_000 * FACE_PER_SAT)]), 0)
+                .unwrap();
+            if with_block {
+                db.np_apply_block(&h(0xA0), 121, &[(script(1), 1_500 * FACE_PER_SAT)], 0)
+                    .unwrap();
+            }
+            db.np_apply_credits(&h(2), 101, &credits(&[(1, 3_000 * FACE_PER_SAT)]), 0)
+                .unwrap();
+            db.np_apply_block(&h(0xB0), 122, &[(script(1), 2_000 * FACE_PER_SAT)], 0)
+                .unwrap();
+            db.np_apply_credits(&h(3), 102, &credits(&[(2, 4_000 * FACE_PER_SAT)]), 0)
+                .unwrap();
+            db
+        };
+        let db = replay(true);
+        assert_eq!(
+            db.np_applied_blocks().unwrap(),
+            vec![(121, h(0xA0)), (122, h(0xB0))]
+        );
+        db.np_undo_block_anywhere(&h(0xA0)).unwrap();
+        let without = replay(false);
+        assert_eq!(
+            db.np_ledger_table().unwrap(),
+            without.np_ledger_table().unwrap()
+        );
+        assert_eq!(db.np_applied_blocks().unwrap(), vec![(122, h(0xB0))]);
+        assert_eq!(
+            db.np_block_retirements(&h(0xB0)).unwrap(),
+            Some(vec![(script(1), 2_000 * FACE_PER_SAT)])
+        );
+        assert_eq!(
+            db.np_table_for_block(200).unwrap(),
+            without.np_table_for_block(200).unwrap()
+        );
+        // The re-applied events keep their order: the last is still credit 3, and LIFO undo
+        // still works from it.
+        let last = db.np_last_ledger_event().unwrap().unwrap();
+        assert_eq!((last.kind, last.key), (NpLedgerEventKind::Credit, h(3)));
+        db.np_undo_credits(&h(3)).unwrap();
+        db.np_undo_block(&h(0xB0)).unwrap();
+        assert!(db.np_undo_block_anywhere(&h(0xA0)).is_err(), "not applied");
     }
 
     #[test]
