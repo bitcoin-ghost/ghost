@@ -1,6 +1,11 @@
 /* Bitcoin Ghost: the miner page (miner.html).
  *
- * Reads, through the website's per-node proxy (/api/pool/<node>/...):
+ * Which nodes: the listed ones in /node-list.json, written by `ghost-audit list` (open listing,
+ * W2.10). A node is addressed by its listed host, through the website's per-node proxy
+ * (/api/pool/<host>/...), which must forward only to hosts in that file. With no listed node
+ * the page says so; it never falls back to a fixed list.
+ *
+ * Reads, from each node:
  *   /api/v1/ledger/{address}                    the share chain's ledger: the same on every node
  *   /api/v1/miner/{address}                     workers on that node, expected wait
  *   /api/v1/miner/{address}/history?window=...  hashrate, shares and balance over time
@@ -15,7 +20,7 @@
 (function (root) {
   'use strict';
 
-  var NODES = ['vm1', 'vm2', 'vm3', 'vm4'];
+  var NODE_LIST_URL = '/node-list.json';
   var REFRESH_MS = 60000;
   var TIMEOUT_MS = 10000;
   var WINDOWS = ['24h', '7d', '30d'];
@@ -561,7 +566,33 @@
   }
 
   // Everything the page shows, from the fetched state. Pure.
+  // The nodes to ask: every listed node's host, from a parsed /node-list.json. Only IP literals
+  // are taken (they go into a URL path), sorted and without repeats. Anything missing or
+  // malformed gives an empty list, never a default.
+  function nodesFromList(list) {
+    var nodes = (list && Array.isArray(list.nodes)) ? list.nodes : [];
+    var out = [];
+    nodes.forEach(function (n) {
+      var h = n && typeof n.host === 'string' ? n.host : '';
+      if (/^[0-9A-Fa-f:.]{2,45}$/.test(h) && out.indexOf(h) < 0) out.push(h);
+    });
+    return out.sort();
+  }
+
+  function noNodesHtml() {
+    return '<div class="mpc-empty">No node is listed yet, so there is no node to ask. Nodes appear on ' +
+      '<a href="/endpoints.html">the node list</a> once they pass the public probe.</div>';
+  }
+
   function renderAll(st, width) {
+    if (st.noNodes) {
+      var msg = noNodesHtml();
+      return {
+        header: '<div class="mp-status-row"><div class="mp-status offline">no node listed</div></div>' +
+          '<div class="mp-full">' + esc(st.query.address) + '</div>' + msg,
+        tiles: '', workers: msg, hashrate: msg, shares: msg, balance: msg, queue: msg, payouts: msg, settlement: ''
+      };
+    }
     return {
       header: renderHeader(st),
       tiles: renderTiles(st),
@@ -586,8 +617,8 @@
     }, function () { clearTimeout(timer); return { status: 0, body: null }; });
   }
 
-  function askAll(path) {
-    return Promise.all(NODES.map(function (n) {
+  function askAll(nodes, path) {
+    return Promise.all(nodes.map(function (n) {
       return fetchJson('/api/pool/' + n + path).then(function (r) {
         return { node: n, ok: r.status === 200 && !!r.body, status: r.status, body: r.body };
       });
@@ -595,13 +626,13 @@
   }
 
   // The ledger from the first node whose answer is the ledger's (200, or 400 for a bad address).
-  function askLedger(address) {
+  function askLedger(nodes, address) {
     var path = '/api/v1/ledger/' + encodeURIComponent(address);
     var i = 0;
     var throttled = false;
     function next() {
-      if (i >= NODES.length) return Promise.resolve({ ok: false, throttled: throttled });
-      var n = NODES[i++];
+      if (i >= nodes.length) return Promise.resolve({ ok: false, throttled: throttled });
+      var n = nodes[i++];
       return fetchJson('/api/pool/' + n + path).then(function (r) {
         if (r.status === 429) throttled = true;
         if ((r.status === 200 || r.status === 400) && r.body) return { ok: r.status === 200, status: r.status, body: r.body, node: n };
@@ -656,12 +687,24 @@
       if (loading) return;
       loading = true;
       var addr = encodeURIComponent(q.address);
-      Promise.all([
-        askLedger(q.address),
-        askAll('/api/v1/miner/' + addr),
-        askAll('/api/v1/miner/' + addr + '/history?window=' + q.window)
-      ]).then(function (r) {
+      fetchJson(NODE_LIST_URL).then(function (l) {
+        var nodes = l.status === 200 ? nodesFromList(l.body) : [];
+        state.noNodes = !nodes.length;
+        if (state.noNodes) return null;
+        return Promise.all([
+          askLedger(nodes, q.address),
+          askAll(nodes, '/api/v1/miner/' + addr),
+          askAll(nodes, '/api/v1/miner/' + addr + '/history?window=' + q.window)
+        ]);
+      }).then(function (r) {
         loading = false;
+        if (!r) {
+          show('miner-body', true);
+          show('explain', true);
+          $('mp-updated').textContent = 'Checked ' + new Date().toLocaleTimeString() + '. Refreshes every minute.';
+          paint();
+          return;
+        }
         var rl = $('rl-notice');
         if (rl) rl.classList.toggle('show', !!r[0].throttled);
         if (r[0].status === 400) {
@@ -759,7 +802,7 @@
   var api = {
     parseQuery: parseQuery, queryString: queryString, mergeMiners: mergeMiners, mergeHistories: mergeHistories,
     chartSvg: chartSvg, renderAll: renderAll, tipHtml: tipHtml, fmtHashrate: fmtHashrate, fmtDuration: fmtDuration,
-    blockUrl: blockUrl, NODES: NODES
+    blockUrl: blockUrl, nodesFromList: nodesFromList
   };
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

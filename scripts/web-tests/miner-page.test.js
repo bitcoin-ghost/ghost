@@ -74,19 +74,21 @@ function historyBody(node, workers) {
   };
 }
 
+const LISTED = ['203.0.113.10', '203.0.113.20'];
+
 function goodState(query) {
   const miners = MP.mergeMiners([
-    { node: 'vm1', ok: true, status: 200, body: minerBody('vm1', [worker('rig1', 'online'), worker('rig2', 'offline', { slot_class: null, firmware_warning: null, connections: [] })]) },
-    { node: 'vm2', ok: true, status: 200, body: minerBody('vm2', [worker('rig2', 'online', { slot_class: 500, firmware_warning: null })]) },
-    { node: 'vm3', ok: false, status: 503, body: { error: 'down' } },
-    { node: 'vm4', ok: false, status: 0, body: null }
+    { node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', [worker('rig1', 'online'), worker('rig2', 'offline', { slot_class: null, firmware_warning: null, connections: [] })]) },
+    { node: '203.0.113.20', ok: true, status: 200, body: minerBody('203.0.113.20', [worker('rig2', 'online', { slot_class: 500, firmware_warning: null })]) },
+    { node: '203.0.113.30', ok: false, status: 503, body: { error: 'down' } },
+    { node: '203.0.113.40', ok: false, status: 0, body: null }
   ]);
   const history = MP.mergeHistories([
-    { node: 'vm1', ok: true, status: 200, body: historyBody('vm1', ['rig1']) },
-    { node: 'vm2', ok: true, status: 200, body: historyBody('vm2', ['rig2']) },
-    { node: 'vm3', ok: false, status: 503, body: null }
+    { node: '203.0.113.10', ok: true, status: 200, body: historyBody('203.0.113.10', ['rig1']) },
+    { node: '203.0.113.20', ok: true, status: 200, body: historyBody('203.0.113.20', ['rig2']) },
+    { node: '203.0.113.30', ok: false, status: 503, body: null }
   ]);
-  return { query: query || MP.parseQuery('?address=' + ADDR), ledger: { ok: true, status: 200, body: ledger(), node: 'vm1' }, miners, history, now: NOW };
+  return { query: query || MP.parseQuery('?address=' + ADDR), ledger: { ok: true, status: 200, body: ledger(), node: '203.0.113.10' }, miners, history, now: NOW };
 }
 
 function noJunk(html, where) {
@@ -105,9 +107,9 @@ test('the URL: ?address, ?id=address.worker and the window', () => {
 
 test('workers from every node are merged, tagged with their node, offline duplicates dropped', () => {
   const m = goodState().miners;
-  assert.deepStrictEqual(m.answered, ['vm1', 'vm2']);
-  assert.deepStrictEqual(m.failed, ['vm3', 'vm4']);
-  assert.deepStrictEqual(m.workers.map((w) => w.name + '@' + w.node + ':' + w.status), ['rig1@vm1:online', 'rig2@vm2:online']);
+  assert.deepStrictEqual(m.answered, ['203.0.113.10', '203.0.113.20']);
+  assert.deepStrictEqual(m.failed, ['203.0.113.30', '203.0.113.40']);
+  assert.deepStrictEqual(m.workers.map((w) => w.name + '@' + w.node + ':' + w.status), ['rig1@203.0.113.10:online', 'rig2@203.0.113.20:online']);
   assert.strictEqual(m.summary.shares_24h.accepted, 1200);
   assert.strictEqual(m.summary.hashrate_hs['1h'], 2 * 7.1e14);
   assert.strictEqual(m.wait.known, false);
@@ -115,7 +117,7 @@ test('workers from every node are merged, tagged with their node, offline duplic
 
 test('histories are summed per bucket and unknown stays unknown', () => {
   const h = goodState().history;
-  assert.deepStrictEqual(h.answered, ['vm1', 'vm2']);
+  assert.deepStrictEqual(h.answered, ['203.0.113.10', '203.0.113.20']);
   assert.strictEqual(h.total.accepted[0], null, 'before collection: null, not 0');
   assert.strictEqual(h.total.accepted[287], 10);
   assert.strictEqual(h.total.hashrate_hs[287], 1.4e15);
@@ -130,10 +132,10 @@ test('the page renders every section from sample answers', () => {
   assert(out.tiles.includes('6,500'), 'balance tile');
   assert(out.tiles.includes('1.42<span class="unit">PH/s'), 'hashrate tile: ' + out.tiles);
   assert(out.tiles.includes('unknown'), 'the wait is unknown, said so');
-  assert(out.workers.includes('rig1') && out.workers.includes('node vm2'));
+  assert(out.workers.includes('rig1') && out.workers.includes('node 203.0.113.20'));
   assert(out.workers.includes('Stock Antminer firmware carries at most 9'), 'firmware warning');
   assert(out.workers.includes('stock Antminer S19'), 'slot class in words');
-  assert(out.workers.includes('Not answering: vm3, vm4'));
+  assert(out.workers.includes('Not answering: 203.0.113.30, 203.0.113.40'));
   assert(out.hashrate.includes('<svg') && out.hashrate.includes('class="mpc-line s1"'));
   assert(out.hashrate.includes('not collected yet'), 'the unknown stretch is marked');
   assert(out.shares.includes('mpc-bar s1') && out.shares.includes('duplicate-share'));
@@ -167,8 +169,8 @@ test('a failed API shows unavailable everywhere and invents nothing', () => {
   const st = {
     query: MP.parseQuery('?address=' + ADDR),
     ledger: { ok: false },
-    miners: MP.mergeMiners(MP.NODES.map((n) => ({ node: n, ok: false, status: 0, body: null }))),
-    history: MP.mergeHistories(MP.NODES.map((n) => ({ node: n, ok: false, status: 503, body: { error: 'x' } }))),
+    miners: MP.mergeMiners(LISTED.map((n) => ({ node: n, ok: false, status: 0, body: null }))),
+    history: MP.mergeHistories(LISTED.map((n) => ({ node: n, ok: false, status: 503, body: { error: 'x' } }))),
     now: NOW
   };
   const out = MP.renderAll(st, 640);
@@ -185,8 +187,8 @@ test('a failed API shows unavailable everywhere and invents nothing', () => {
 test('a node pool that has seen nothing yet says so plainly', () => {
   const st = goodState();
   st.ledger.body = Object.assign(ledger(), { known: false, message: 'This address has no balance', balance: { units: '0', sats: 0 }, payouts: [] });
-  st.miners = MP.mergeMiners([{ node: 'vm1', ok: true, status: 200, body: minerBody('vm1', []) }]);
-  st.history = MP.mergeHistories([{ node: 'vm1', ok: true, status: 200, body: Object.assign(historyBody('vm1', []), {
+  st.miners = MP.mergeMiners([{ node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', []) }]);
+  st.history = MP.mergeHistories([{ node: '203.0.113.10', ok: true, status: 200, body: Object.assign(historyBody('203.0.113.10', []), {
     total: { hashrate_hs: buckets.map(() => null), accepted: buckets.map(() => null), stale: buckets.map(() => null), rejected: buckets.map(() => null) }
   }) }]);
   const out = MP.renderAll(st, 360);
@@ -194,6 +196,29 @@ test('a node pool that has seen nothing yet says so plainly', () => {
   assert(out.payouts.includes('No payouts yet'));
   assert(out.hashrate.includes('No shares in this window'));
   assert(out.header.includes('not on the ledger yet'));
+});
+
+test('the nodes asked come from node-list.json, never a fixed list', () => {
+  const list = { schema: 'ghost-audit/node-list/v1', nodes: [
+    { host: '203.0.113.20' }, { host: '2a01:4f8::1' }, { host: '203.0.113.10' }, { host: '203.0.113.10' },
+    { host: '../../admin' }, { host: 'evil.example' }, { host: null }, {}
+  ] };
+  assert.deepStrictEqual(MP.nodesFromList(list), ['203.0.113.10', '203.0.113.20', '2a01:4f8::1'],
+    'listed IP hosts only, sorted, once each');
+  for (const bad of [null, undefined, {}, { nodes: null }, { nodes: [] }, 'x', { placeholder: true, nodes: [] }]) {
+    assert.deepStrictEqual(MP.nodesFromList(bad), [], 'no list means no nodes: ' + JSON.stringify(bad));
+  }
+  assert(!('NODES' in MP), 'no hard-coded node list is exported');
+  const src = fs.readFileSync(path.join(web, 'miner.js'), 'utf8');
+  assert(!/\bvm[1-8]\b/.test(src), 'miner.js names no old-fleet node');
+});
+
+test('with no node listed the page says so and asks nobody', () => {
+  const out = MP.renderAll({ query: MP.parseQuery('?address=' + ADDR), noNodes: true, ledger: null, miners: null, history: null, now: NOW }, 640);
+  for (const k of ['header', 'workers', 'hashrate', 'shares', 'balance', 'queue', 'payouts']) {
+    assert(out[k].includes('No node is listed yet'), k + ' says no node is listed');
+  }
+  for (const k of Object.keys(out)) assert(!/NaN|undefined/.test(out[k]), k + ' invents nothing');
 });
 
 test('charts fit a phone and only link blocks on mainnet', () => {
