@@ -179,8 +179,6 @@ In order:
 9. **Units.** Installs the units below, the firewall, the restart-loop watchdog and the auto-updater.
 10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else.
 
-ghost-mining runs genesis-anchored to the MPC ceremony: the drop-in `/etc/systemd/system/ghost-mining.service.d/genesis-anchor.conf` sets `ZK_GENESIS_PARAMS_HASH`, the immutable hash of the ceremony's genesis parameters, and `ZK_PARAMS_PATH` is `/home/ghost/.ghost/mpc_params`. There is no per-release parameter hash for you to set.
-
 ### Files
 
 | Path | What |

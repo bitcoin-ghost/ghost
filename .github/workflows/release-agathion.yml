@@ -139,7 +139,6 @@ jobs:
           | `PORT` | no | `3000` | Listen port. |
           | `HOSTNAME` | no | `127.0.0.1` | Bind address. Loopback by design — reach it via SSH tunnel: `ssh -L 3000:localhost:3000 <node>`. Set `0.0.0.0` only for deliberate LAN exposure (password still enforced). |
           | `NEXT_PUBLIC_API_URL` | no | `http://127.0.0.1:8080` | Ghost node REST/WS backend. |
-          | `GHOST_PAY_URL` | no | — | Ghost Pay (L2) backend URL; the L2 pages log a startup notice when unset but the server still runs. |
 
           Then open http://localhost:3000 (through your SSH tunnel).
 

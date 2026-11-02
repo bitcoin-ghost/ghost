@@ -11,7 +11,6 @@ import { SkeletonCard } from "@/components/ui/Skeleton";
 import { useNodeInfo, useNodeStatus, useShares, useNickname } from "@/hooks/queries/useNodeQueries";
 import { useWatchdogStatus } from "@/hooks/queries/useWatchdogQueries";
 import { useMiningStatus, useBestHash } from "@/hooks/queries/useMiningQueries";
-import { useGhostPayStatus } from "@/hooks/queries/useGhostPayQueries";
 import { useHazeStatus } from "@/hooks/queries/useHazeQueries";
 import { useShroudStatus } from "@/hooks/queries/useShroudQueries";
 import { formatHashrate } from "@/components/ui/DataTable";
@@ -22,8 +21,6 @@ const TOOLTIPS = {
   l1_hashrate: "Combined mining hashrate of miners connected to YOUR node's stratum port only. This is just your node, not the whole Ghost pool or the Bitcoin network.",
   pool_hashrate: "Combined mining hashrate of every miner across the entire Ghost pool — all nodes in the mesh aggregated together. This is the whole Ghost pool, not just your node or the Bitcoin network.",
   network_hashrate: "Estimated total hashrate of the Bitcoin network, derived from current difficulty. This is the global network, not just Ghost.",
-  l2_height: "The current block height of the Ghost Pay L2 network. Format: era:block. During IBD, shows syncing state.",
-  l2_peers: "Number of Ghost Pay L2 peers your node is connected to.",
   shares: "Your node's share count determines your portion of the node reward pool. Based on the 5-4-3-2-1 system.",
   health: "Overall health of the services running on your node.",
   ghost_mode: "Ghost Mode isolates your node — stops relaying transactions and messages to peers (except block propagation). Useful for privacy.",
@@ -127,60 +124,6 @@ function L1Card() {
           <div className="text-xs text-[color:var(--fainter)] mb-1">Your Miners</div>
           <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
             {isLoading ? "..." : `${mining?.local_connected_miners ?? 0} connected`}
-          </div>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-function L2Card() {
-  const { data: gp, isLoading } = useGhostPayStatus();
-
-  const isRunning = gp && gp.sync_state !== "disabled" && gp.sync_state !== "unavailable";
-  const isSyncing = isRunning && gp?.sync_state !== "synced";
-  const height = gp ? `${gp.l2_era ?? 1}:${(gp.virtual_block ?? gp.block_height ?? 0).toLocaleString()}` : "--";
-
-  return (
-    <Card>
-      <CardHeader
-        title={<span>L2 &middot; Ghost Pay</span>}
-        action={
-          isRunning != null && (
-            <StatusDot
-              status={isRunning ? "online" : "offline"}
-              pulse={!!isRunning}
-              label={isRunning ? (isSyncing ? "Syncing" : "Synced") : "Offline"}
-            />
-          )
-        }
-      />
-      <div className="grid grid-cols-2 gap-3">
-        <Tooltip content={TOOLTIPS.l2_height}>
-          <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> L2 Height</div>
-            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-              {isLoading ? "..." : isSyncing ? <span className="text-[color:var(--dim)]">Syncing...</span> : height}
-            </div>
-            {isSyncing && (
-              <div className="text-xs text-[color:var(--dim)] mt-0.5">
-                {height}
-              </div>
-            )}
-          </div>
-        </Tooltip>
-        <Tooltip content={TOOLTIPS.l2_peers}>
-          <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> L2 Peers</div>
-            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-              {isLoading ? "..." : `${gp?.peer_count ?? 0} connected`}
-            </div>
-          </div>
-        </Tooltip>
-        <div className="p-3 bg-[var(--surface)] rounded-lg">
-          <div className="text-xs text-[color:var(--fainter)] mb-1">Status</div>
-          <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-            {isLoading ? "..." : isRunning ? "Active" : "Not enabled"}
           </div>
         </div>
       </div>
@@ -397,15 +340,10 @@ export default function OverviewPage() {
         }
       />
 
-      {/* L1 + L2 hero cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <SectionErrorBoundary section="L1 Status">
-          <L1Card />
-        </SectionErrorBoundary>
-        <SectionErrorBoundary section="L2 Status">
-          <L2Card />
-        </SectionErrorBoundary>
-      </div>
+      {/* L1 hero card */}
+      <SectionErrorBoundary section="L1 Status">
+        <L1Card />
+      </SectionErrorBoundary>
 
       {/* Shares */}
       <SectionErrorBoundary section="Shares">

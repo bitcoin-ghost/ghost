@@ -69,7 +69,6 @@ const TOOLTIPS = {
   uptime: "Trailing-7-day uptime %. Capabilities only count at ≥95%. — means this peer did not gossip it.",
   peers: "Mesh peers this node is connected to. — means not gossiped.",
   l1Height: "Bitcoin (L1) chain height. — means not gossiped.",
-  l2Height: "Ghost-Pay (L2) chain height. — means not gossiped.",
   shares: "Qualified capability shares, out of a maximum of 15.",
   capabilities: "Capabilities in the 5-4-3-2-1 model. Green = qualified; red = claimed but not yet verified.",
   // Status badges
@@ -89,7 +88,7 @@ const TOOLTIPS = {
 };
 
 // Em-dash placeholder for values a mesh peer does not gossip (uptime %, mesh
-// peer count, L1/L2 heights, balance). These are genuinely unknown from here,
+// peer count, L1 height, balance). These are genuinely unknown from here,
 // so we render "—" rather than a misleading 0.
 const NO_VALUE = "—";
 
@@ -571,12 +570,6 @@ export default function SwarmPage() {
                       <span className="text-[color:var(--dim)]">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
                     </div>
                   </Tooltip>
-                  <Tooltip content={TOOLTIPS.l2Height}>
-                    <div>
-                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L2:</span>{" "}
-                      <span className="text-[color:var(--dim)]">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
-                    </div>
-                  </Tooltip>
                   <Tooltip content={TOOLTIPS.peers}>
                     <div>
                       <span className="text-[color:var(--fainter)]"><InfoIcon /> Peers:</span>{" "}
@@ -708,12 +701,6 @@ export default function SwarmPage() {
                     <div>
                       <span className="text-[color:var(--fainter)]"><InfoIcon /> L1 Height</span>
                       <div className="text-[color:var(--fg)] font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
-                    </div>
-                  </Tooltip>
-                  <Tooltip content={TOOLTIPS.l2Height}>
-                    <div>
-                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L2 Height</span>
-                      <div className="text-[color:var(--fg)] font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
                     </div>
                   </Tooltip>
                 </div>

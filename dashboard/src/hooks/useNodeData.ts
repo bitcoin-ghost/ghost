@@ -8,7 +8,6 @@ import type {
   NodeConfig,
   NodeEvent,
   TreasuryStatus,
-  GhostPayStatus,
 } from "@/types/api";
 import * as api from "@/lib/api";
 
@@ -140,31 +139,6 @@ export function useTreasury() {
   return { data, loading, error, refresh };
 }
 
-export function useGhostPayStatus() {
-  const [data, setData] = useState<GhostPayStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
-
-  const refresh = useCallback(() => {
-    api.getGhostPayStatus()
-      .then((newData) => {
-        setData(newData);
-        setError(null);
-      })
-      .catch((err) => {
-        setError(err);
-      })
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => {
-    queueMicrotask(refresh);
-    const interval = setInterval(refresh, 10000);
-    return () => clearInterval(interval);
-  }, [refresh]);
-
-  return { data, loading, error, refresh };
-}
 
 export function useWebSocket(onEvent: (event: NodeEvent) => void) {
   useEffect(() => {

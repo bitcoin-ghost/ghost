@@ -20,7 +20,7 @@ export default function StorageSettingsPage() {
 
       <Card>
         <p className="text-sm text-[color:var(--dim)]">
-          Looking for L2 (Ghost Pay) pruning status and the full storage breakdown? See{" "}
+          Looking for the full storage breakdown? See{" "}
           <Link href="/storage" className="text-[color:var(--accent)] hover:text-[color:var(--accent)] underline">
             Storage
           </Link>

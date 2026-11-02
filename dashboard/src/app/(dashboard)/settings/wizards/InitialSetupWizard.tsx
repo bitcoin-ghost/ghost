@@ -15,7 +15,6 @@ import {
   useSetGhostMode,
   useSetArchiveMode,
   useSetReaper,
-  useSetGhostPay,
   useSetPolicyProfile,
 } from '@/hooks/queries';
 import { toPolicyProfile } from '@/lib/api/config';
@@ -27,7 +26,6 @@ interface InitialSetupData {
   ghost_mode: boolean;
   archive_mode: boolean;
   reaper: boolean;
-  ghost_pay: boolean;
   mempool_profile: string;
 }
 
@@ -64,7 +62,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
   const setGhostMode = useSetGhostMode();
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
-  const setGhostPay = useSetGhostPay();
   // The mempool step drives the REAL tier-policy lever (`/config/policy_profile`),
   // which persists to pool.toml and applies on the next graceful restart.
   const setPolicyProfile = useSetPolicyProfile();
@@ -129,7 +126,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
         await setGhostMode.mutateAsync(data.ghost_mode);
         await setArchiveMode.mutateAsync(data.archive_mode);
         await setReaper.mutateAsync(data.reaper);
-        await setGhostPay.mutateAsync(data.ghost_pay);
         await setPolicyProfile.mutateAsync(toPolicyProfile(data.mempool_profile));
         toast.success(
           'Setup Complete',
@@ -140,7 +136,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
     },
   ], [
     setNickname, setPublicMiningConfig, setPayoutAddress,
-    setGhostMode, setArchiveMode, setReaper, setGhostPay,
+    setGhostMode, setArchiveMode, setReaper,
     setPolicyProfile, toast, onClose,
   ]);
 
@@ -154,7 +150,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
       ghost_mode: true,
       archive_mode: true,
       reaper: true,
-      ghost_pay: true,
       mempool_profile: 'standard',
     },
   });
@@ -164,7 +159,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
       key: 'ghost_mode' as const,
       label: 'Ghost Mode',
       shares: null,
-      description: 'Enable Ghost protocol features, L2 participation, and node reward eligibility. Required for most other features.',
+      description: 'Enable Ghost protocol features and node reward eligibility. Required for most other features.',
     },
     {
       key: 'archive_mode' as const,
@@ -177,12 +172,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
       label: 'Reaper',
       shares: '+2 shares',
       description: 'Strict transaction policy filtering. Only accept standard Bitcoin transactions.',
-    },
-    {
-      key: 'ghost_pay' as const,
-      label: 'Ghost Pay',
-      shares: '+4 shares',
-      description: 'Participate in the Ghost Pay L2 instant payment network. Requires L2 block storage.',
     },
   ];
 
@@ -210,7 +199,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   <p className="font-medium text-[color:var(--dim)] mb-1">Share breakdown:</p>
                   <ul className="space-y-1 ml-2">
                     <li>Archive Mode: +5 shares</li>
-                    <li>Ghost Pay: +4 shares</li>
                     <li>Public Mining: +3 shares</li>
                     <li>Reaper: +2 shares</li>
                     <li>Elder: +1 share (automatic via MPC ceremony)</li>
@@ -412,12 +400,6 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                     <span className="text-[color:var(--dim)]">Reaper (+2)</span>
                     <Badge variant={data.reaper ? 'success' : 'default'}>
                       {data.reaper ? 'Enabled' : 'Disabled'}
-                    </Badge>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Ghost Pay (+4)</span>
-                    <Badge variant={data.ghost_pay ? 'success' : 'default'}>
-                      {data.ghost_pay ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                 </div>

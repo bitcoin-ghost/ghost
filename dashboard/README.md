@@ -38,7 +38,6 @@ The dashboard provides:
 The dashboard queries the ghost-node REST API, which in turn:
 - Reads node configuration and status directly
 - Queries the ghost-mining SQLite database for challenge stats and payouts
-- Connects to ghost-pay-node for L2 status
 - Aggregates data from configured swarm nodes
 
 ## Development
@@ -133,7 +132,6 @@ and is out of scope for this dashboard change.
 | `/` | Overview with key metrics |
 | `/mining` | Stratum mining status and connected miners |
 | `/rewards` | Share breakdown, earnings, payout history |
-| `/ghost-pay` | L2 network status |
 | `/operator/mesh` | BFT consensus and verification challenges |
 | `/operator/rewards` | Detailed share contributions and network stats |
 | `/operator/swarm` | Multi-node fleet management |
@@ -173,7 +171,6 @@ const { data } = useRewards({ refetchInterval: 60_000 });
 - `GET /api/v1/mesh/status` - Consensus and challenge stats
 - `GET /api/v1/rewards/full` - Complete rewards breakdown
 - `GET /api/v1/rewards/node-history` - Payout history for this node
-- `GET /api/v1/ghostpay/status` - L2 network status
 - `GET /api/v1/swarm` - Fleet node status
 
 ## Deployment
@@ -224,8 +221,7 @@ Three details are load-bearing, and each has bitten us:
 
 Secrets do **not** belong in this unit — keep them in a root-only drop-in at
 `/etc/systemd/system/ghost-dashboard.service.d/override.conf`, which is where
-`DASHBOARD_PASSWORD`, `DASHBOARD_TOKEN_TTL_SECS`, `INTERNAL_AUTH_KEY`,
-`GHOST_PAY_URL` and `GHOST_PAY_API_SECRET` live:
+`DASHBOARD_PASSWORD`, `DASHBOARD_TOKEN_TTL_SECS` and `INTERNAL_AUTH_KEY` live:
 
 ```ini
 [Service]

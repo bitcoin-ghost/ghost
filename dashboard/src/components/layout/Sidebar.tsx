@@ -11,7 +11,6 @@ import {
   Boxes,
   Blocks,
   Network as NetworkIcon,
-  Crown,
   Eye,
   Ghost,
   Cloud,
@@ -115,12 +114,6 @@ const GROUPS: NavGroup[] = [
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
       { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
-    ],
-  },
-  {
-    label: "ghost pay",
-    items: [
-      { href: "/ghost-pay", label: "Ghost Pay Network", icon: <Crown {...ICON} /> },
     ],
   },
   {
