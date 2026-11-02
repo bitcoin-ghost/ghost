@@ -513,7 +513,8 @@ impl Database {
             .map_err(|e| GhostError::Database(format!("Cannot read DB: {}", e)))?;
 
         // Read schema version before export (PRAGMA user_version is not copied by sqlcipher_export)
-        let schema_version: u32 = conn
+        // Raw, not decoded: it is written back verbatim below (from v65 it is negative).
+        let schema_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .map_err(|e| GhostError::Database(format!("Read user_version: {}", e)))?;
 
@@ -1393,7 +1394,9 @@ impl Database {
         };
 
         let schema_version: u32 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .ok()
+            .and_then(|raw| crate::migrations::decode_schema_version(raw).ok())
             .unwrap_or(0);
 
         let valid = integrity_ok && missing_tables.is_empty();
@@ -1490,59 +1493,6 @@ impl Database {
         })
     }
 
-    /// Prune old health pings
-    ///
-    /// Deletes health pings older than the specified number of days.
-    ///
-    /// L-2 FIX: Uses transaction for atomicity and consistent read visibility.
-    /// Ensures the DELETE is rolled back on any failure.
-    pub fn prune_old_health_pings(&self, keep_days: u32) -> GhostResult<usize> {
-        self.transaction(|tx| {
-            let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86400);
-
-            let deleted = tx
-                .execute("DELETE FROM health_pings WHERE timestamp < ?1", [cutoff])
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if deleted > 0 {
-                info!(deleted, keep_days, "Pruned old health pings");
-            }
-
-            Ok(deleted)
-        })
-    }
-
-    /// Prune old vote records
-    ///
-    /// Deletes vote records for rounds older than the specified number.
-    ///
-    /// L-2 FIX: Uses transaction to ensure atomicity between reading the max round
-    /// and deleting votes. This prevents race conditions where votes could be
-    /// incorrectly pruned if a new round is created between the SELECT and DELETE.
-    pub fn prune_old_votes(&self, keep_rounds: u64) -> GhostResult<usize> {
-        self.transaction(|tx| {
-            let current_round: Option<u64> = tx
-                .query_row("SELECT MAX(round_id) FROM rounds", [], |row| row.get(0))
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let Some(current) = current_round else {
-                return Ok(0);
-            };
-
-            let min_round_to_keep = current.saturating_sub(keep_rounds);
-
-            let deleted = tx
-                .execute("DELETE FROM votes WHERE round_id < ?1", [min_round_to_keep])
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if deleted > 0 {
-                info!(deleted, min_round = min_round_to_keep, "Pruned old votes");
-            }
-
-            Ok(deleted)
-        })
-    }
-
     /// Prune old uptime samples
     ///
     /// Deletes uptime samples older than the specified number of days.
@@ -1568,123 +1518,6 @@ impl Database {
         })
     }
 
-    /// Prune old challenge results
-    ///
-    /// Deletes challenge records older than the specified number of days from all
-    /// challenge tables: archive_challenges, policy_challenges, stratum_challenges,
-    /// and ghostpay_challenges.
-    /// STOR-2/3/4/5: Each table grows ~864/day without cleanup.
-    ///
-    /// M-11: Wraps all DELETEs in a single transaction for atomicity.
-    /// If any DELETE fails, all changes are rolled back to prevent inconsistent state.
-    pub fn prune_old_challenges(&self, keep_days: u32) -> GhostResult<ChallengesPruneResult> {
-        // M-11: Use transaction() for atomic multi-table pruning
-        self.transaction(|tx| {
-            let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86400);
-
-            let archive = tx
-                .execute(
-                    "DELETE FROM archive_challenges WHERE timestamp < ?1",
-                    [cutoff],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let policy = tx
-                .execute(
-                    "DELETE FROM policy_challenges WHERE timestamp < ?1",
-                    [cutoff],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let stratum = tx
-                .execute(
-                    "DELETE FROM stratum_challenges WHERE timestamp < ?1",
-                    [cutoff],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let ghostpay = tx
-                .execute(
-                    "DELETE FROM ghostpay_challenges WHERE timestamp < ?1",
-                    [cutoff],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let total = archive + policy + stratum + ghostpay;
-            if total > 0 {
-                info!(
-                    archive,
-                    policy, stratum, ghostpay, keep_days, "Pruned old challenges"
-                );
-            }
-
-            Ok(ChallengesPruneResult {
-                archive,
-                policy,
-                stratum,
-                ghostpay,
-            })
-        })
-    }
-
-    /// Prune old verification records
-    ///
-    /// Deletes verification records older than the specified number of days.
-    /// STOR-6: verifications grows ~864/day without cleanup.
-    ///
-    /// LOW FIX: Uses transaction for consistency with other prune operations.
-    pub fn prune_old_verifications(&self, keep_days: u32) -> GhostResult<usize> {
-        self.transaction(|tx| {
-            let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86400);
-
-            let deleted = tx
-                .execute(
-                    "DELETE FROM verifications WHERE completed_at < ?1 OR (completed_at IS NULL AND started_at < ?1)",
-                    [cutoff],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if deleted > 0 {
-                info!(deleted, keep_days, "Pruned old verifications");
-            }
-
-            Ok(deleted)
-        })
-    }
-
-    /// Prune old rows from the converged `verification_ledger` (v42).
-    ///
-    /// The ledger accrues one signed proof per (challenger, target, capability,
-    /// timestamp) and otherwise grows without bound. `keep_days` MUST stay above BOTH
-    /// seven-day windows — qualification reads `UPTIME_WINDOW_DAYS` (7) and convergence
-    /// separately reconciles the last 7 — so that (a) qualification never reads a pruned
-    /// row and (b) a peer that has not pruned yet cannot re-fetch a row this node already
-    /// dropped, which would make the two ledgers oscillate.
-    ///
-    /// The default is **18** (`MaintenanceConfig::default`), against a floor of 14.
-    /// `challenge_retention_never_drops_below_two_seven_day_windows` enforces both ends: at
-    /// least 2x the uptime window, and at most 3x that floor — a retention policy wide enough
-    /// never to delete anything is not a retention policy.
-    ///
-    /// ⚠ This said `= 30` until 2026-09-30, and it was never 30. A wrong number in a doc whose
-    /// whole job is to reason about safety margin is worse than no number: it invites someone to
-    /// "restore" a value the guard would then reject.
-    pub fn prune_old_verification_ledger(&self, keep_days: u32) -> GhostResult<usize> {
-        self.transaction(|tx| {
-            let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86400);
-            let deleted = tx
-                .execute(
-                    "DELETE FROM verification_ledger WHERE timestamp < ?1",
-                    [cutoff],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            if deleted > 0 {
-                info!(deleted, keep_days, "Pruned old verification ledger rows");
-            }
-            Ok(deleted)
-        })
-    }
-
     /// Run full maintenance (prune + checkpoint + optimize)
     ///
     /// This should be called periodically (e.g., once per hour).
@@ -1696,13 +1529,7 @@ impl Database {
         // share-pruning task), which protects active and recently-dark miners'
         // unpaid ledgers. `prune_old_rounds` only removes already-empty rounds.
         let rounds_deleted = self.prune_old_rounds(config.keep_rounds)?;
-        let pings_deleted = self.prune_old_health_pings(config.keep_health_ping_days)?;
-        let votes_deleted = self.prune_old_votes(config.keep_rounds)?;
         let uptime_deleted = self.prune_old_uptime_samples(config.keep_uptime_sample_days)?;
-        let challenges_deleted = self.prune_old_challenges(config.keep_challenge_days)?;
-        let verification_ledger_deleted =
-            self.prune_old_verification_ledger(config.keep_challenge_days)?;
-        let verifications_deleted = self.prune_old_verifications(config.keep_verification_days)?;
 
         // Checkpoint WAL
         self.checkpoint()?;
@@ -1720,13 +1547,7 @@ impl Database {
         };
 
         // Optimize if significant data was deleted
-        let total_deleted = rounds_deleted
-            + pings_deleted
-            + votes_deleted
-            + uptime_deleted
-            + challenges_deleted.total()
-            + verification_ledger_deleted
-            + verifications_deleted;
+        let total_deleted = rounds_deleted + uptime_deleted;
         if total_deleted > 1000 || config.force_optimize {
             self.optimize()?;
         }
@@ -1735,12 +1556,7 @@ impl Database {
 
         info!(
             rounds_deleted,
-            pings_deleted,
-            votes_deleted,
             uptime_deleted,
-            challenges_deleted = challenges_deleted.total(),
-            verification_ledger_deleted,
-            verifications_deleted,
             pages_reclaimed,
             db_size_mb = stats.size_mb(),
             "Database maintenance complete"
@@ -1748,12 +1564,7 @@ impl Database {
 
         Ok(MaintenanceResult {
             rounds_deleted,
-            pings_deleted,
-            votes_deleted,
             uptime_deleted,
-            challenges_deleted,
-            verification_ledger_deleted,
-            verifications_deleted,
             pages_reclaimed,
             db_size_bytes: stats.size_bytes,
         })
@@ -1761,18 +1572,15 @@ impl Database {
 }
 
 /// Configuration for database maintenance
+///
+/// The health-ping, vote, challenge, verification and verification-ledger prunes went with their
+/// tables (migration v65).
 #[derive(Debug, Clone)]
 pub struct MaintenanceConfig {
     /// Number of rounds to keep
     pub keep_rounds: u64,
-    /// Number of days to keep health pings
-    pub keep_health_ping_days: u32,
     /// Number of days to keep uptime samples (STOR-1)
     pub keep_uptime_sample_days: u32,
-    /// Number of days to keep challenge results (STOR-2/3/4/5)
-    pub keep_challenge_days: u32,
-    /// Number of days to keep verification records (STOR-6)
-    pub keep_verification_days: u32,
     /// Force optimize even if little was deleted
     pub force_optimize: bool,
 }
@@ -1781,33 +1589,7 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             keep_rounds: 1000,          // Keep ~1000 rounds of data
-            keep_health_ping_days: 7,   // 7 days of health pings
             keep_uptime_sample_days: 7, // 7 days of uptime samples (STOR-1)
-            // 18 days of challenge results and verification_ledger rows (STOR-2/3/4/5).
-            //
-            // The floor is TWO seven-day windows, not one: qualification reads 7 days
-            // (`UPTIME_WINDOW_DAYS`), and convergence reconciles the last 7 — so a row must
-            // survive long enough that a peer which has not pruned yet cannot re-fetch one this
-            // node has already dropped. 14 is that floor; 18 leaves four days of margin.
-            //
-            // It was 30, which is well clear of the floor but four times the read window.
-            // Measured on ghost-vm8, 2026-08-24: `verification_ledger` held 837,222 rows at
-            // 27,907/day, of which 672,224 (80%) were older than anything that reads them. The
-            // table plus its indexes was 1,249 MB of a 5.0 GB database — the second largest
-            // object in it after the frozen `shares_archive`.
-            //
-            // At 18 days this prunes ~386,000 rows (~46%, ~540 MB).
-            //
-            // ⚠ Whether that SHRINKS the file depends on when the database was created. Files made
-            // since `initialize_connection` gained `auto_vacuum = INCREMENTAL` have `run_maintenance`
-            // hand the freed pages straight back (`Database::incremental_vacuum`). Files made before
-            // it are stuck at `auto_vacuum = 0` — measured on ghost-vm8, 2026-08-24, with
-            // `freelist_count=0` — where pruning stops the growth and nothing returns a byte,
-            // because only VACUUM can, and VACUUM needs twice the database free, which took
-            // ghost-vm6 down once already. Those nodes need
-            // `scripts/ops/enable-incremental-autovacuum.sh` run once (MEASURED 79s on 3.5 GB).
-            keep_challenge_days: 18,
-            keep_verification_days: 30, // 30 days of verification records (STOR-6)
             force_optimize: false,
         }
     }
@@ -1817,32 +1599,11 @@ impl Default for MaintenanceConfig {
 #[derive(Debug, Clone)]
 pub struct MaintenanceResult {
     pub rounds_deleted: usize,
-    pub pings_deleted: usize,
-    pub votes_deleted: usize,
     pub uptime_deleted: usize,
-    pub challenges_deleted: ChallengesPruneResult,
-    pub verification_ledger_deleted: usize,
-    pub verifications_deleted: usize,
     /// Pages handed back to the filesystem this pass. 0 on a database that predates
     /// `auto_vacuum = INCREMENTAL` — see `Database::incremental_vacuum`.
     pub pages_reclaimed: i64,
     pub db_size_bytes: i64,
-}
-
-/// Result of pruning challenge tables
-#[derive(Debug, Clone, Default)]
-pub struct ChallengesPruneResult {
-    pub archive: usize,
-    pub policy: usize,
-    pub stratum: usize,
-    pub ghostpay: usize,
-}
-
-impl ChallengesPruneResult {
-    /// Get total challenges deleted across all tables
-    pub fn total(&self) -> usize {
-        self.archive + self.policy + self.stratum + self.ghostpay
-    }
 }
 
 /// Database statistics
@@ -1907,34 +1668,6 @@ mod tests {
         );
     }
 
-    /// ⛔ The retention floor is TWO seven-day windows, not one.
-    ///
-    /// `keep_challenge_days` governs both `prune_old_challenges` and
-    /// `prune_old_verification_ledger`. Qualification reads `UPTIME_WINDOW_DAYS` (7); convergence
-    /// separately reconciles the last 7. A row must therefore outlive BOTH, or a peer that has not
-    /// pruned yet re-fetches a row this node already dropped and the ledgers oscillate.
-    ///
-    /// This exists because the obvious optimisation is to set it to the read window. Measured
-    /// 2026-08-24, 80% of `verification_ledger` was older than anything that reads it, which makes
-    /// "just set it to 7" look correct and is exactly the change this test refuses.
-    #[test]
-    fn challenge_retention_never_drops_below_two_seven_day_windows() {
-        let floor = (ghost_common::constants::UPTIME_WINDOW_DAYS as u32) * 2;
-        let actual = MaintenanceConfig::default().keep_challenge_days;
-        assert!(
-            actual >= floor,
-            "keep_challenge_days is {actual}, below the {floor}-day floor \
-             (qualification window {w} + convergence window {w}). A row pruned inside that floor \
-             can be re-fetched from a peer that has not pruned it yet.",
-            w = ghost_common::constants::UPTIME_WINDOW_DAYS
-        );
-        // And it should not be so wide that it stops being a retention policy at all.
-        assert!(
-            actual <= floor * 3,
-            "keep_challenge_days is {actual}, more than 3x the {floor}-day floor — that is not \
-             margin, it is an unbounded table with extra steps"
-        );
-    }
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1998,9 +1731,8 @@ mod tests {
             db.with_connection(|conn| {
                 for i in from..to {
                     conn.execute(
-                        "INSERT INTO verification_ledger
-                             (challenger_id, target_node_id, capability, passed, timestamp, proof)
-                         VALUES ('c', ?1, 'address', 1, ?2, x'00')",
+                        "INSERT INTO uptime_samples (node_id, sample_time, was_online)
+                         VALUES (?1, ?2, 1)",
                         rusqlite::params![format!("t{}", i % 8), i],
                     )
                     .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -2008,19 +1740,19 @@ mod tests {
                 // An indexed lookup, so the planner consults this table's statistics and
                 // `PRAGMA optimize` considers it.
                 conn.query_row(
-                    "SELECT COUNT(*) FROM verification_ledger WHERE target_node_id = 't1'",
+                    "SELECT COUNT(*) FROM uptime_samples WHERE node_id = 't1'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))
             })
-            .expect("insert ledger rows")
+            .expect("insert uptime rows")
         };
         let stat = || -> Option<String> {
             db.with_connection(|conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_vled_target_cap_ts_cover'",
+                        "SELECT stat FROM sqlite_stat1 WHERE idx = 'sqlite_autoindex_uptime_samples_1'",
                         [],
                         |row| row.get(0),
                     )
