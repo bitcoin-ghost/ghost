@@ -29,35 +29,13 @@
 
 use ghost_common::types::NodeId;
 
-/// The checkpoint's miner work taken from the SHARD instead of the legacy unpaid ledger.
+/// The checkpoint's miner work, from the share shard: `(address, weight)` sorted work-desc then
+/// address-asc, the input of [`compute_ledger_root`]. The weight is `owed` micro-work.
 ///
-/// The counterpart to [`select_ledger_miner_work`], and the whole of the checkpoint half of the
-/// cutover. Same output shape — `(address, weight)` sorted work-desc then address-asc — so every
-/// downstream consumer (the root, `payouts_agree`, the adopted list the coinbase builds from) is
-/// unchanged code on both sides of the gate.
-///
-/// **Why this exists.** Migration v56 handed `shares` to the shard and disabled the GHOST-03
-/// ledger sweep that repaired it, while the checkpoint carried on recomputing from that same
-/// table. Holes in it became permanent, so no two nodes agreed a per-address total and every
-/// proposal was rejected — 25% apart on the live fleet, against a 2% tolerance, with no
-/// mechanism left to converge. The shard has one, and uses it: the per-address totals are
-/// BYTE-IDENTICAL across vm1/vm2/vm3 today.
-///
-/// The weight is `owed` micro-work rather than `WORK_SCALE`-quantised work. Only the ratios
-/// matter — the coinbase distributes `pool_sats * work / total` — and the tolerance terms that
-/// are not scale-invariant stay inert at these magnitudes (`ABS_TOL` sits ~165x below the
-/// 0.2%-of-pool floor). ⚠ That inertness is a property of the magnitudes, not of the code: if
-/// total owed ever fell below ~5e14 micro, `ABS_TOL` would silently become the governing bound.
-///
-/// Non-positive balances are dropped. `owed()` is `accrued − settled` and is documented to go
-/// negative transiently; the `i64 → u128` cast would otherwise wrap a small negative into a
-/// number larger than the entire pool. Mirrors `shard_miner_payouts`, which filters the same way
-/// on the paying side.
-///
-/// No dust filter here, unlike the legacy path: dust is applied when the coinbase is built
-/// (`shard_miner_payouts`, which knows the actual pool sats), and applying a subsidy-estimated
-/// one here as well would drop addresses the payer would have kept. The cap is
-/// `MAX_MINER_OUTPUTS` so the adopted list can never exceed what a coinbase is able to pay.
+/// Non-positive balances are dropped: `owed()` is `accrued − settled` and can go negative
+/// transiently, and the `i64 → u128` cast would otherwise wrap a small negative into a number
+/// larger than the entire pool. Capped at `MAX_MINER_OUTPUTS`, which the checkpoint root has
+/// always used; no coinbase is built from this list any more.
 pub fn select_shard_miner_work(
     owed: &std::collections::BTreeMap<String, i64>,
 ) -> Vec<(String, u128)> {
