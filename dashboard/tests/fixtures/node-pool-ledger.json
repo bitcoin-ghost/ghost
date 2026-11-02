@@ -5,6 +5,11 @@
   "known": true,
   "message": null,
   "balance": { "units": "27494408335681", "sats": 6501 },
+  "genesis": {
+    "owed": { "units": "2147483648000", "sats": 500 },
+    "export_height": 850,
+    "queue_since": null
+  },
   "queue_since": 901,
   "min_payout_sats": 1000,
   "units_per_sat": 4294967296,

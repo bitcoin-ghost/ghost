@@ -505,6 +505,9 @@
     if (q) {
       words.push('The next block (height ' + esc(q.next_block_height) + ') pays balances as they stood at height ' + esc(q.snapshot_height) + ', 20 blocks earlier, so credits from the last few hours are not in it yet.');
     }
+    if (L.genesis && L.genesis.owed) {
+      words.push('Your balance includes ' + esc(fmtSatsText(L.genesis.owed.sats)) + ' carried over from the old pool at height ' + esc(L.genesis.export_height) + ', when the node pool started.');
+    }
     var est;
     if (!wait) {
       est = '<p><strong>Expected wait: unavailable.</strong> No node answered.</p>';
