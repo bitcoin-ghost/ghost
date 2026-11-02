@@ -146,7 +146,8 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p ghost-mining -p ghost-cli \
-            -p translator_sv2 -p pool_sv2
+            -p translator_sv2 -p pool_sv2 \
+            -p ghost-audit
 
       # Build ghostd (the C++ Bitcoin Core daemon) so the node binaries ship in
       # ONE signed release at ONE version and can never drift apart. Linux only — the pool/elder fleet is
@@ -206,7 +207,9 @@ jobs:
           mkdir -p dist
 
           # Copy binaries (check actual names from target directory)
-          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 ghost-light-wallet ghost-light-wallet-tui; do
+          # ghost-audit is the miner's tool (W2.9): it ships in the archive for miners to run and
+          # is never rolled onto a node (scripts/release.sh FLEET_BINARIES).
+          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 ghost-audit ghost-light-wallet ghost-light-wallet-tui; do
             if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi

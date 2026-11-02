@@ -53,6 +53,9 @@ cd "$REPO_ROOT" || exit 1
 # `pool_sv2` leads `ghost-mining` because of the #742 webhook hazard: the SENDER of the share
 # signature must be current before the VERIFIER is. Wrong order is not "shares are delayed",
 # it is a 401 per batch and the batch is DISCARDED.
+#
+# `ghost-audit` (W2.9) is not here on purpose: it is the miner's tool, built and packaged into
+# the release archive by .github/workflows/release.yml, and never rolled onto a node.
 FLEET_BINARIES="pool_sv2 ghost-mining translator_sv2"
 PRODUCTION_ONLY=""
 
