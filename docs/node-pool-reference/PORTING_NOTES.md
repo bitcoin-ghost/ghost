@@ -1,4 +1,4 @@
-# Porting notes: W2.1 pure core, W2.5 relay, W2.9 audit, W2.13 sync
+# Porting notes: W2.1 pure core, W2.5 relay, W2.9 audit, W2.10 listing, W2.13 sync
 
 Readings chosen where the spec leaves a detail open. Each one follows the Python reference
 (`refimpl_v3.py`) for the payout rule, or the simulator in the design folder
@@ -255,6 +255,43 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
 - **Submits nothing.** The SV1 client never sends `mining.submit`; the e2e test server panics if
   it does.
 
+## Open listing (W2.10, `bins/ghost-audit/src/{discover,listing,lister}.rs`)
+- **The advert** is a relay message, `GetAdvert` (18) / `Advert` (19): SV1 port, SV2 port, SV2
+  authority key. Ports only: a host in the advert would let a node point the lister (or miners
+  reading the list) at a third party's machine. The `Hello` was left alone, so the handshake and
+  its version did not change. pool_sv2 serves `[node_pool.relay] advertise_sv1_port` (the
+  translator's port, which pool_sv2 cannot see) and its own SV2 listen port and key.
+- **Discovery** is the existing `GetAddr`/`Addr` gossip, crawled by the lister from `--relay-peer`
+  and `--seed` relays. Gossip is untrusted: literal IPs only (a host name is never resolved, so
+  gossip cannot make the lister query names an attacker picks), publicly routable unless
+  `--allow-private` or regtest, at most `--max-candidates` 1,024 and `--max-per-ip` 2, and at
+  most `--max-crawl` 256 relays asked a round. On the relay side, `Addr` replies are now a
+  random sample (they were always the lowest 64 addresses, so a node above them was never
+  gossiped) and one IP may hold at most 4 learned addresses (`MAX_LEARNED_PER_IP`).
+- **Probing** reads the advert first: unreachable relay `unmeasured` (`relay_unreachable`); other
+  genesis, version or not a relay `fail`; no advert (`advert_none`), no answer
+  (`advert_unanswered`) or no SV1 port (`advert_no_sv1`) `unmeasured`, so a relay with no pool is
+  a candidate that is never listed. Otherwise `probe::probe` on `relay IP:sv1_port`.
+- **Policy** (flags, defaults): listed after `list_after` 3 passes in the last `window` 6 probes,
+  the latest a pass, no `fail` in the window, and after a delisting only passes since it;
+  delisted after `delist_after` 3 non-passes in a row or `delist_after_fail` 1 fails in a row.
+  So a node that fails once is off the list at the next write and needs the fail to age out of
+  6 probes plus 3 new passes to return. Unlisted candidates unseen by discovery for
+  `--forget-after` (7 days) are dropped. History is per relay address, not per `node_id`, which
+  is self-declared.
+- **Outputs**, written atomically after every round: `node-list.json` (`ghost-audit/node-list/v1`)
+  and a zone-file fragment (`<name> <ttl> IN A|AAAA <ip>`), both sorted. The fragment holds only
+  listed nodes on `--dns-sv1-port` 3333 (a DNS name carries no port), one record per IP, at most
+  `--dns-max` 32 chosen by pass rate, then time listed, then address. `region` is always null.
+- **The shim.** "The shim" in the plan is ghost-miner-proxy (#599): a miner-side proxy that
+  verified an elder-signed mesh node-list checkpoint against `config/genesis-signers.txt`, the 8
+  fleet `node.key`s with 6 required. Both were deleted in wave 3 (`99d27fb88`) with the
+  checkpoint's producer. What is left is inert: migration v47's `mesh_node_list_checkpoints`
+  table (dropped with the old tables by v65), and `/api/v1/pool/mesh-node-list-checkpoint`,
+  which answers 410 Gone. No code on the node pool path checks a signature against a fixed key
+  set: the relay accepts any peer on the genesis, the Noise mesh's `trusted_peers` is empty, and
+  `fleet_auth` is one operator's key controlling that operator's own node, not listing.
+
 ## Open, not decided here
 - **K = 120.** Resolved for the relay above: the duplicate check reaches back to `S(H)`. The spec's
   constants table still lists K; it should be reworded.
@@ -268,6 +305,11 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   blocks at genesis) that only a Bitcoin node supplies today. A peer-only bootstrap (walk back
   from the job's `prev_hash` with the archive's peer checks applied top-down) is possible but not
   built.
+- **Who runs the lister, and where its outputs are published.** Anyone can run `ghost-audit list`;
+  which run feeds `bitcoinghost.org/node-list.json` and the pool DNS name, and how the files get
+  there, is the operators' call. A node list from a lister the reader does not run is that
+  lister's claim; the probe is reproducible by anyone.
+- **Listing over SV2 only.** A node serving only SV2 is never listed, since the probe speaks SV1.
 - **`ghost-audit` over SV2.** Only SV1 is audited. pool_sv2 builds one coinbase per extended
   channel either way, but a hostile node could serve SV2 miners differently; an SV2 client (Noise
   handshake, extended channel) is not built.
