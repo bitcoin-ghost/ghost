@@ -41,8 +41,6 @@ members = [
     "bins/ghost-pool",
     "bins/ghost-stats",
     "bins/ghost-cli",
-    # Decentralised mining-discovery shim (miner-side; verifies the signed node-list checkpoint)
-    "bins/ghost-miner-proxy",
     # Headless setup CLI
     "bins/ghost-setup",
     # SV2 apps (amalgamated from the former sv2-apps submodule)

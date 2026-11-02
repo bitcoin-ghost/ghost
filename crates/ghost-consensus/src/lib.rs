@@ -24,16 +24,12 @@
 //!
 //! This crate provides the consensus layer for Bitcoin Ghost:
 //!
-//! - **P2P Mesh**: ZMQ PUB/SUB for discovery/health, Noise-encrypted TCP for sensitive traffic
+//! - **P2P Mesh**: ZMQ PUB/SUB for discovery/health, Noise-encrypted TCP for point-to-point traffic
 //! - **Peer Discovery**: Gossip-based peer discovery
-//! - **Share Propagation**: Distribute shares across nodes
-//! - **Block Announcements**: Notify peers of block found events
-//! - **BFT Voting**: 67% threshold Byzantine fault-tolerant voting
-//! - **Payout Consensus**: Pre-consensus on coinbase before mining
 //! - **Health Monitoring**: Peer health pings and liveness
 //!
-//! Discovery and health pings use ZMQ PUB/SUB; sensitive messages (shares, blocks,
-//! votes, payouts) go over point-to-point Noise-encrypted TCP (see `mesh` / `noise_pool`).
+//! Votes, payout checkpoints and share gossip are gone: miners' balances are the node pool
+//! relay's, which has its own transport.
 
 #![deny(unreachable_pub)]
 
@@ -48,10 +44,6 @@ pub mod noise;
 pub mod noise_fragment;
 pub mod noise_pool;
 pub mod peer;
-pub mod shard_handler;
-pub mod verification_handler;
-pub mod vote_handler;
-pub mod voting;
 
 pub use ban_manager::*;
 pub use discovery_handler::*;
@@ -62,7 +54,3 @@ pub use message_validator::*;
 pub use noise::*;
 pub use noise_pool::*;
 pub use peer::*;
-pub use shard_handler::*;
-pub use verification_handler::*;
-pub use vote_handler::*;
-pub use voting::*;

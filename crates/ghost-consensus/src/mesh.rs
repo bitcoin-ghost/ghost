@@ -2277,48 +2277,7 @@ impl MeshNetwork {
         match msg_type {
             // P-7: Discovery must remain plaintext for bootstrap (can't encrypt to unknown peers).
             // HealthPing stays plaintext for broadcast scaling but sensitive fields removed (P-1).
-            // All financial operations (payouts, votes, shares) require Noise.
             MessageType::Discovery | MessageType::HealthPing => false,
-
-            // Sensitive messages use Noise encryption
-            MessageType::ShareBatchPrevote
-            | MessageType::ShareBatchPrecommit
-            | MessageType::ShareProof
-            | MessageType::ShareConvergence
-            | MessageType::Vote
-            | MessageType::PayoutProposal
-            | MessageType::PayoutLedgerCheckpoint
-            | MessageType::PayoutLedgerCheckpointVote
-            | MessageType::PayoutLedgerCheckpointSync
-            | MessageType::PayoutProposalSync
-            // The batch chain decides who gets paid, so it is at least as sensitive as the
-            // payout messages beside it. Defaulting a new financial message to plaintext is the
-            // kind of omission that never announces itself.
-            | MessageType::ShareBatchProposal
-            | MessageType::ShareBatchVote
-            | MessageType::ShareBatchSync
-            | MessageType::MeshNodeListCheckpoint
-            | MessageType::MeshNodeListCheckpointVote
-            | MessageType::MeshNodeListCheckpointSync
-            // The endpoint advert feeds that checkpoint's node list, so it rides the same
-            // consensus/voting port. ⚠ This arm exists TWICE — `endpoint_for_message` and
-            // `is_valid_msg_type_for_port` — and they must mirror, or a message is sent to a
-            // port that then rejects it as cross-channel injection.
-            | MessageType::MeshEndpointAdvertisement
-            // The shard IS the payout ledger — who is owed what, per address. Financial data
-            // defaults to Noise here for the same reason the batch chain does: a new financial
-            // message that falls to plaintext is the kind of omission that never announces
-            // itself. The sample pair additionally carries the AUDIT: which leaves are being
-            // pulled must not be readable in flight, or an on-path observer hands the sampled
-            // node its answers early.
-            | MessageType::ShardEpochSummary
-            | MessageType::ShardTableSync
-            | MessageType::ShardEvidence
-            | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse
-            | MessageType::VerificationResult
-            | MessageType::ChallengeConvergence
-            | MessageType::EquivocationProof => true,
         }
     }
 
@@ -2634,47 +2593,8 @@ impl MeshNetwork {
         let host_only = host.split(':').next().unwrap_or(host);
 
         let base_port = match msg_type {
-            MessageType::ShareProof
-            | MessageType::ShareConvergence
-            // The batch chain is the share ledger, so its traffic belongs on the share port
-            // rather than a new one: adding a port would mean a firewall change on every node
-            // before a single batch could flow, which is a deployment step that buys nothing.
-            | MessageType::ShareBatchProposal
-            | MessageType::ShareBatchSync => self.config.ports.share_propagation,
-            MessageType::ShareBatchVote
-            | MessageType::ShareBatchPrevote
-            | MessageType::ShareBatchPrecommit => self.config.ports.consensus_voting,
-            MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            MessageType::PayoutProposal => self.config.ports.payout_proposal,
-            // ZK-BFT messages use consensus voting port
-            // Verification results (and their convergence/backfill) use health monitoring port
-            MessageType::VerificationResult | MessageType::ChallengeConvergence => {
-                self.config.ports.health_monitoring
-            }
-            // P2P-H3: Equivocation proofs use consensus voting port
-            MessageType::EquivocationProof => self.config.ports.consensus_voting,
-            MessageType::PayoutLedgerCheckpoint
-            | MessageType::PayoutLedgerCheckpointVote
-            | MessageType::PayoutLedgerCheckpointSync
-            | MessageType::PayoutProposalSync
-            | MessageType::MeshNodeListCheckpoint
-            | MessageType::MeshNodeListCheckpointVote
-            | MessageType::MeshNodeListCheckpointSync
-            // The endpoint advert feeds that checkpoint's node list, so it rides the same
-            // consensus/voting port. ⚠ This arm exists TWICE — `endpoint_for_message` and
-            // `is_valid_msg_type_for_port` — and they must mirror, or a message is sent to a
-            // port that then rejects it as cross-channel injection.
-            | MessageType::MeshEndpointAdvertisement
-            // Share shard: the consensus/voting port, like the payout-ledger machinery it
-            // replaces — the summaries and table decide who gets paid, and reusing the port
-            // means no fleet-wide firewall change before a single summary can flow.
-            | MessageType::ShardEpochSummary
-            | MessageType::ShardTableSync
-            | MessageType::ShardEvidence
-            | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse => self.config.ports.consensus_voting,
         };
         format!("tcp://{}:{}", host_only, base_port)
     }
@@ -3203,22 +3123,12 @@ impl MeshNetwork {
             .set_reconnect_ivl_max(5000) // Max reconnect interval: 5 seconds
             .bind(&dummy_endpoint)
             .map_err(|e| GhostError::P2PMessage(format!("Failed to create SUB socket: {}", e)))?
-            .subscribe(topics::SHARE)
-            .map_err(|e| GhostError::P2PMessage(format!("Failed to subscribe to share: {}", e)))?;
+            .subscribe(topics::HEALTH)
+            .map_err(|e| GhostError::P2PMessage(format!("Failed to subscribe to health: {}", e)))?;
 
         // P2P4-5: Subscribe to remaining topics using mutable Subscribe reference
         // After the first subscribe(), we have a Subscribe struct that takes &mut self
-        let additional_topics: &[(&[u8], &str)] = &[
-            (topics::BLOCK, "block"),
-            (topics::VOTE, "vote"),
-            (topics::HEALTH, "health"),
-            (topics::DISCOVERY, "discovery"),
-            (topics::ELDER, "elder"),
-            (topics::PAYOUT_PROPOSAL, "payout_proposal"),
-            (topics::ZK_PROPOSAL, "zk_proposal"),
-            (topics::ZK_VOTE, "zk_vote"),
-            (topics::VERIFICATION, "verification"),
-        ];
+        let additional_topics: &[(&[u8], &str)] = &[(topics::DISCOVERY, "discovery")];
 
         for (topic, name) in additional_topics {
             sub_socket.subscribe(topic).map_err(|e| {
@@ -3385,18 +3295,10 @@ impl MeshNetwork {
                     }
 
                     // Find where the payload starts (after the topic)
-                    // Topics are known fixed strings: health, share, block, vote, discovery, elder, payout
+                    // Topics are known fixed strings: health, discovery
                     use crate::message::topics;
-                    let known_topics: &[(&str, &[u8])] = &[
-                        ("health", topics::HEALTH),
-                        ("share", topics::SHARE),
-                        ("block", topics::BLOCK),
-                        ("vote", topics::VOTE),
-                        ("discovery", topics::DISCOVERY),
-                        ("elder", topics::ELDER),
-                        ("payout", topics::PAYOUT_PROPOSAL),
-                        ("verify", topics::VERIFICATION),
-                    ];
+                    let known_topics: &[(&str, &[u8])] =
+                        &[("health", topics::HEALTH), ("discovery", topics::DISCOVERY)];
 
                     let (topic_name, data): (&str, Vec<u8>) = {
                         let mut found: Option<(&str, Vec<u8>)> = None;
@@ -3671,13 +3573,7 @@ impl MeshNetwork {
     fn primary_message_type_for_topic(topic: &str) -> Option<MessageType> {
         match topic {
             "health" => Some(MessageType::HealthPing),
-            "share" => Some(MessageType::ShareProof),
-            "vote" => Some(MessageType::Vote),
             "discovery" => Some(MessageType::Discovery),
-            "verify" => Some(MessageType::VerificationResult),
-            "payout" => Some(MessageType::PayoutProposal),
-            // Multi-type topics — skip fast check, rely on post-deser validation
-            "elder" | "unknown" => None,
             _ => None,
         }
     }
@@ -3796,43 +3692,8 @@ impl MeshNetwork {
     /// should use this method to validate after deserialization.
     pub fn is_valid_msg_type_for_port(&self, msg_type: MessageType, port: u16) -> bool {
         let expected_port = match msg_type {
-            MessageType::ShareProof
-            | MessageType::ShareConvergence
-            // The batch chain is the share ledger, so its traffic belongs on the share port
-            // rather than a new one: adding a port would mean a firewall change on every node
-            // before a single batch could flow, which is a deployment step that buys nothing.
-            | MessageType::ShareBatchProposal
-            | MessageType::ShareBatchSync => self.config.ports.share_propagation,
-            MessageType::ShareBatchVote
-            | MessageType::ShareBatchPrevote
-            | MessageType::ShareBatchPrecommit => self.config.ports.consensus_voting,
-            MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
             MessageType::Discovery => self.config.ports.discovery,
-            MessageType::PayoutProposal => self.config.ports.payout_proposal,
-            MessageType::EquivocationProof
-            | MessageType::PayoutLedgerCheckpoint
-            | MessageType::PayoutLedgerCheckpointVote
-            | MessageType::PayoutLedgerCheckpointSync
-            | MessageType::PayoutProposalSync
-            | MessageType::MeshNodeListCheckpoint
-            | MessageType::MeshNodeListCheckpointVote
-            | MessageType::MeshNodeListCheckpointSync
-            // The endpoint advert feeds that checkpoint's node list, so it rides the same
-            // consensus/voting port. ⚠ This arm exists TWICE — `endpoint_for_message` and
-            // `is_valid_msg_type_for_port` — and they must mirror, or a message is sent to a
-            // port that then rejects it as cross-channel injection.
-            | MessageType::MeshEndpointAdvertisement
-            // Share shard rides the consensus/voting port — must mirror the endpoint match
-            // above, or Noise-delivered shard messages get rejected as cross-channel injection.
-            | MessageType::ShardEpochSummary
-            | MessageType::ShardTableSync
-            | MessageType::ShardEvidence
-            | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse => self.config.ports.consensus_voting,
-            MessageType::VerificationResult | MessageType::ChallengeConvergence => {
-                self.config.ports.health_monitoring
-            }
         };
         port == expected_port
     }
@@ -4713,159 +4574,6 @@ mod tests {
             rx.try_recv().is_ok(),
             "a PUB-socket message must be enqueued even with zero peers"
         );
-    }
-
-    #[test]
-    fn test_should_use_noise_routing() {
-        // Verify the message type → Noise routing logic.
-        //
-        // Since should_use_noise() returns false when noise_pool is None,
-        // and constructing a real Noise pool requires key infrastructure,
-        // we test the routing logic by directly verifying the message type
-        // categorization. The match arms in should_use_noise() define:
-        //
-        //   - Discovery, HealthPing → ZMQ (false)
-        //   - All other message types → Noise (true)
-        //
-        // We verify this by testing message_type_requires_noise() which
-        // extracts the pure routing logic without the noise_pool gate.
-
-        // Helper that mirrors should_use_noise() match arms without the noise_pool check
-        fn message_type_requires_noise(msg_type: MessageType) -> bool {
-            match msg_type {
-                MessageType::Discovery | MessageType::HealthPing => false,
-                MessageType::ShareProof
-                | MessageType::ShareConvergence
-                | MessageType::Vote
-                | MessageType::PayoutProposal
-                | MessageType::PayoutLedgerCheckpoint
-                | MessageType::PayoutLedgerCheckpointVote
-                | MessageType::PayoutLedgerCheckpointSync
-                | MessageType::PayoutProposalSync
-                | MessageType::ShareBatchProposal
-                | MessageType::ShareBatchVote
-                | MessageType::ShareBatchPrevote
-                | MessageType::ShareBatchPrecommit
-                | MessageType::ShareBatchSync
-                | MessageType::MeshNodeListCheckpoint
-                | MessageType::MeshNodeListCheckpointVote
-                | MessageType::MeshNodeListCheckpointSync
-                | MessageType::MeshEndpointAdvertisement
-                | MessageType::ShardEpochSummary
-                | MessageType::ShardTableSync
-                | MessageType::ShardEvidence
-                | MessageType::ShardSampleRequest
-                | MessageType::ShardSampleResponse
-                | MessageType::VerificationResult
-                | MessageType::ChallengeConvergence
-                | MessageType::EquivocationProof => true,
-            }
-        }
-
-        // ZMQ broadcast messages (should NOT use Noise)
-        assert!(
-            !message_type_requires_noise(MessageType::HealthPing),
-            "HealthPing should stay on ZMQ"
-        );
-        assert!(
-            !message_type_requires_noise(MessageType::Discovery),
-            "Discovery should stay on ZMQ"
-        );
-
-        // Consensus/voting messages (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::PayoutProposal),
-            "PayoutProposal must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::Vote),
-            "Vote must use Noise"
-        );
-
-        // Share propagation (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::ShareProof),
-            "ShareProof must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ShareConvergence),
-            "ShareConvergence must use Noise"
-        );
-
-        // Block/mining messages (MUST use Noise)
-
-        // Elder management (MUST use Noise)
-
-        // ZK messages (MUST use Noise)
-        // Verification and security (MUST use Noise)
-        assert!(
-            message_type_requires_noise(MessageType::VerificationResult),
-            "VerificationResult must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::EquivocationProof),
-            "EquivocationProof must use Noise"
-        );
-
-        // Share shard (MUST use Noise — the shard IS the payout ledger)
-        assert!(
-            message_type_requires_noise(MessageType::ShardEpochSummary),
-            "ShardEpochSummary must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ShardTableSync),
-            "ShardTableSync must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ShardEvidence),
-            "ShardEvidence must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ShardSampleRequest),
-            "ShardSampleRequest must use Noise — the audit's leaf choice must not be readable in flight"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::ShardSampleResponse),
-            "ShardSampleResponse must use Noise"
-        );
-    }
-
-    /// Registration check for the share-shard message types: they must route to the
-    /// consensus/voting port on BOTH port matches (outbound endpoint and inbound M-9
-    /// validation). A variant missing from either match cannot compile — the matches are
-    /// exhaustive — but a variant added to the WRONG arm compiles fine and strands the
-    /// message on a port nobody serves, which is exactly the silent failure this pins.
-    #[test]
-    fn shard_messages_route_to_the_consensus_voting_port() {
-        let identity = Arc::new(NodeIdentity::generate());
-        let mut config = MeshConfig::default();
-        config.noise_enabled = false;
-        config.noise_required = false;
-        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
-
-        let voting = mesh.config.ports.consensus_voting;
-        let health = mesh.config.ports.health_monitoring;
-        for msg_type in [
-            MessageType::ShardEpochSummary,
-            MessageType::ShardTableSync,
-            MessageType::ShardEvidence,
-            MessageType::ShardSampleRequest,
-            MessageType::ShardSampleResponse,
-        ] {
-            assert!(
-                mesh.is_valid_msg_type_for_port(msg_type, voting),
-                "{msg_type:?} must be accepted on the consensus/voting port"
-            );
-            assert!(
-                !mesh.is_valid_msg_type_for_port(msg_type, health),
-                "{msg_type:?} must be rejected on any other port"
-            );
-            let endpoint = mesh.endpoint_for_message("203.0.113.7", msg_type);
-            assert!(
-                endpoint.ends_with(&format!(":{voting}")),
-                "{msg_type:?} outbound endpoint must target the consensus/voting port, got {endpoint}"
-            );
-        }
     }
 
     #[test]

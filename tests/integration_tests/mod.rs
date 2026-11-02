@@ -19,7 +19,6 @@
 //! cargo test --test integration edge_cases
 //! ```
 
-pub mod adversarial;
 pub mod buds_classification;
 pub mod config_validation;
 pub mod consensus;
@@ -38,5 +37,4 @@ pub mod round_management;
 pub mod rpc_client;
 pub mod security;
 pub mod storage;
-pub mod stratum_payout_consensus;
 pub mod stratum_validation;

@@ -2181,7 +2181,6 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "ghost-common",
- "ghost-reconciliation",
  "ghost-storage",
  "hex",
  "hmac",
@@ -2199,23 +2198,6 @@ dependencies = [
  "tracing",
  "x25519-dalek",
  "zeroize",
-]
-
-[[package]]
-name = "ghost-miner-proxy"
-version = "1.11.46"
-dependencies = [
- "anyhow",
- "clap",
- "ghost-common",
- "ghost-consensus",
- "hex",
- "reqwest",
- "rustls",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

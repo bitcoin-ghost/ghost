@@ -386,14 +386,8 @@ pub fn extract_message_type_fast(
             // neighbours — which is what keeps a mixed fleet reading the same bytes the same way.
             // Never renumber to close a gap: an old peer's byte would then decode as a different
             // type entirely.
-            0 => Some(MessageType::ShareProof),
-            2 => Some(MessageType::PayoutProposal),
-            3 => Some(MessageType::Vote),
             4 => Some(MessageType::HealthPing),
             5 => Some(MessageType::Discovery),
-            7 => Some(MessageType::ShareConvergence),
-            12 => Some(MessageType::VerificationResult),
-            13 => Some(MessageType::EquivocationProof),
             _ => None,
         };
         return Ok(msg_type);
@@ -449,14 +443,8 @@ pub fn extract_message_type_fast(
 
     // Map string to MessageType
     let msg_type = match type_str {
-        "ShareProof" => MessageType::ShareProof,
-        "ShareConvergence" => MessageType::ShareConvergence,
-        "Vote" => MessageType::Vote,
         "HealthPing" => MessageType::HealthPing,
         "Discovery" => MessageType::Discovery,
-        "PayoutProposal" => MessageType::PayoutProposal,
-        "VerificationResult" => MessageType::VerificationResult,
-        "EquivocationProof" => MessageType::EquivocationProof,
         _ => return Ok(None), // Unknown type
     };
 
@@ -498,46 +486,8 @@ pub fn validate_topic_before_deser(
 /// Get the maximum allowed payload size for a message type
 pub fn max_payload_size(msg_type: MessageType) -> usize {
     match msg_type {
-        MessageType::ShareProof => MAX_SHARE_PROOF_SIZE,
-        MessageType::ShareConvergence => MAX_SHARE_CONVERGENCE_SIZE,
-        MessageType::Vote => MAX_VOTE_SIZE,
         MessageType::HealthPing => MAX_HEALTH_PING_SIZE,
         MessageType::Discovery => MAX_DISCOVERY_SIZE,
-        MessageType::PayoutProposal => MAX_PAYOUT_PROPOSAL_SIZE,
-        MessageType::VerificationResult => MAX_VERIFICATION_SIZE,
-        MessageType::ChallengeConvergence => MAX_CHALLENGE_CONVERGENCE_SIZE,
-        MessageType::EquivocationProof => MAX_EQUIVOCATION_PROOF_SIZE,
-        // The checkpoint carries the CANONICAL payout (top-N miner addresses + top-N node
-        // shares) so the fleet can adopt it on finalise (option c); bounded but not tiny.
-        // The vote is just a hash + signature.
-        MessageType::PayoutLedgerCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
-        // NOT MAX_VOTE_SIZE — the vote now reports the voter's own per-address work (#606).
-        MessageType::PayoutLedgerCheckpointVote => MAX_PAYOUT_LEDGER_VOTE_SIZE,
-        MessageType::PayoutLedgerCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
-        // One proposal per response, so the existing proposal bound applies.
-        MessageType::PayoutProposalSync => MAX_PAYOUT_PROPOSAL_SIZE,
-        MessageType::ShareBatchProposal => MAX_SHARE_BATCH_SIZE,
-        MessageType::ShareBatchVote
-        | MessageType::ShareBatchPrevote
-        | MessageType::ShareBatchPrecommit => MAX_SHARE_BATCH_VOTE_SIZE,
-        MessageType::ShareBatchSync => MAX_SHARE_BATCH_SYNC_SIZE,
-        MessageType::MeshNodeListCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
-        MessageType::MeshNodeListCheckpointVote => MAX_VOTE_SIZE,
-        MessageType::MeshNodeListCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
-        // One advert: a 32-byte id, a host string, two ports, a flag, a seq and a 64-byte
-        // signature — a few hundred bytes hex-encoded. Its OWN bound rather than borrowing a
-        // neighbour's: a type that falls into someone else's limit is how an oversized payload
-        // gets through the one check meant to stop it.
-        MessageType::MeshEndpointAdvertisement => MAX_MESH_ENDPOINT_ADVERT_SIZE,
-        // Share shard: each type has its own derived bound — see the constants for the
-        // arithmetic. A type that silently falls into someone else's bound is how a payload
-        // ends up rejected for a reason nobody wrote down.
-        MessageType::ShardEpochSummary => MAX_SHARD_SUMMARY_SIZE,
-        MessageType::ShardTableSync => MAX_SHARD_TABLE_SYNC_SIZE,
-        MessageType::ShardEvidence => MAX_SHARD_EVIDENCE_SIZE,
-        MessageType::ShardSampleRequest => MAX_SHARD_SAMPLE_REQUEST_SIZE,
-        MessageType::ShardSampleResponse => MAX_SHARD_SAMPLE_RESPONSE_SIZE,
-        // ShieldCommitment: 32-byte commitment + u64 index + u64 height
     }
 }
 
@@ -1047,92 +997,6 @@ mod tests {
         );
     }
 
-    /// Every batch-chain type has its own limit rather than inheriting a default. A message type
-    /// that silently falls into someone else's bound is how a payload ends up rejected for a
-    /// reason nobody wrote down.
-    #[test]
-    fn every_batch_message_type_has_its_own_bound() {
-        assert_eq!(
-            max_payload_size(MessageType::ShareBatchProposal),
-            MAX_SHARE_BATCH_SIZE
-        );
-        assert_eq!(
-            max_payload_size(MessageType::ShareBatchVote),
-            MAX_SHARE_BATCH_VOTE_SIZE
-        );
-        assert_eq!(
-            max_payload_size(MessageType::ShareBatchSync),
-            MAX_SHARE_BATCH_SYNC_SIZE
-        );
-        assert!(
-            max_payload_size(MessageType::ShareBatchVote)
-                < max_payload_size(MessageType::ShareBatchProposal),
-            "a vote is a hash and a signature; if it is bounded like a batch, something is wrong"
-        );
-    }
-
-    /// A convergence BATCH must not be bounded by the SINGLE-proof limit.
-    ///
-    /// #558: `ShareConvergence` mapped to `MAX_SHARE_PROOF_SIZE` (10 KB). A real share proof
-    /// averages ~1169 bytes and the payload expands ~3.1x as JSON, so that ceiling could not
-    /// carry even one proof — every window-convergence response was rejected as oversized and
-    /// historical ledger divergence was never repaired.
-    #[test]
-    fn share_convergence_is_not_bounded_by_the_single_proof_limit() {
-        assert_ne!(
-            max_payload_size(MessageType::ShareConvergence),
-            MAX_SHARE_PROOF_SIZE,
-            "ShareConvergence carries a batch; bounding it by the single-proof limit makes \
-             window convergence structurally impossible (#558)"
-        );
-
-        // Headroom for a realistic batch: ~1169 raw bytes per proof, ~3.1x JSON expansion.
-        const REAL_PROOF_BYTES: usize = 1169;
-        const JSON_EXPANSION: usize = 4; // conservative
-        let one_proof = REAL_PROOF_BYTES * JSON_EXPANSION;
-        assert!(
-            max_payload_size(MessageType::ShareConvergence) >= one_proof * 50,
-            "limit {} cannot carry a useful batch (one proof is ~{} bytes encoded)",
-            max_payload_size(MessageType::ShareConvergence),
-            one_proof
-        );
-    }
-
-    /// Every share-shard type resolves to its OWN derived bound, and the bound is enforced at
-    /// exactly the declared cap. A type that silently falls into someone else's bound is how a
-    /// payload ends up rejected for a reason nobody wrote down (#558).
-    #[test]
-    fn shard_caps_are_dedicated_and_enforced() {
-        let cases = [
-            (MessageType::ShardEpochSummary, MAX_SHARD_SUMMARY_SIZE),
-            (MessageType::ShardTableSync, MAX_SHARD_TABLE_SYNC_SIZE),
-            (MessageType::ShardEvidence, MAX_SHARD_EVIDENCE_SIZE),
-            (
-                MessageType::ShardSampleRequest,
-                MAX_SHARD_SAMPLE_REQUEST_SIZE,
-            ),
-            (
-                MessageType::ShardSampleResponse,
-                MAX_SHARD_SAMPLE_RESPONSE_SIZE,
-            ),
-        ];
-        for (msg_type, cap) in cases {
-            assert_eq!(
-                max_payload_size(msg_type),
-                cap,
-                "{msg_type:?} bound mismatch"
-            );
-            assert!(
-                validate_payload_size(msg_type, cap).is_ok(),
-                "{msg_type:?}: a payload AT the cap must pass"
-            );
-            assert!(
-                validate_payload_size(msg_type, cap + 1).is_err(),
-                "{msg_type:?}: one byte over the cap must be refused"
-            );
-        }
-    }
-
     /// The other half of #558: `MessageEnvelope.payload` is `Vec<u8>`, serialised as decimal
     /// integers (~3.7x for ASCII JSON), and the ENVELOPE has its own 1 MB cap. A per-type cap
     /// the envelope cannot carry after expansion is a message that validates locally and never
@@ -1157,75 +1021,6 @@ mod tests {
         }
     }
 
-    /// The summary cap is derived from a stated budget — 1,000 addresses, max-length bech32m,
-    /// i64-max values — so MEASURE that budget against the cap instead of trusting the comment's
-    /// arithmetic. If an encoding change inflates rows, this fails here rather than in the fleet.
-    #[test]
-    fn a_budgeted_worst_case_summary_fits_its_cap() {
-        use ghost_common::share_shard::{EpochDelta, EpochSummary};
-        use std::collections::BTreeMap;
-
-        let mut deltas = BTreeMap::new();
-        for i in 0..1_000u32 {
-            // 62-char addresses — the bech32m maximum.
-            let addr = format!("bc1q{:058}", i);
-            assert_eq!(addr.len(), 62);
-            deltas.insert(
-                addr,
-                EpochDelta {
-                    delta_micro: i64::MAX,
-                    total_micro: i64::MAX,
-                },
-            );
-        }
-        let msg = crate::message::ShardEpochSummaryMessage {
-            summary: EpochSummary {
-                epoch: u64::MAX,
-                node_id: [0xAB; 32],
-                deltas,
-                genesis_marker: None,
-                share_count: u32::MAX,
-                share_root: [0xCD; 32],
-                signature: vec![0xEE; 64],
-            },
-        };
-        let payload = serde_json::to_vec(&msg).expect("serialises");
-        assert!(
-            payload.len() <= MAX_SHARD_SUMMARY_SIZE,
-            "budgeted worst-case summary is {} bytes against the {MAX_SHARD_SUMMARY_SIZE} cap",
-            payload.len()
-        );
-    }
-
-    /// Same discipline for the table sync, whose payload is nodes × addresses — it grows with
-    /// fleet size in a way a summary does not. Budget: 8 nodes × 300 max-length addresses at
-    /// i64-max, i.e. today's fleet with ~75x the live payout-address count.
-    #[test]
-    fn a_budgeted_worst_case_table_sync_fits_its_cap() {
-        use crate::message::{ShardColumn, ShardTableSyncMessage};
-
-        let columns: Vec<ShardColumn> = (0..8u8)
-            .map(|n| ShardColumn {
-                node_id: [n; 32],
-                cells: (0..300u32)
-                    .map(|i| (format!("bc1q{:058}", i), i64::MAX))
-                    .collect(),
-            })
-            .collect();
-        let msg = ShardTableSyncMessage::Response {
-            responding_node: [0xAA; 32],
-            columns,
-            table_root: [0xBB; 32],
-            signature: vec![0xCC; 64],
-        };
-        let payload = serde_json::to_vec(&msg).expect("serialises");
-        assert!(
-            payload.len() <= MAX_SHARD_TABLE_SYNC_SIZE,
-            "budgeted worst-case table sync is {} bytes against the {MAX_SHARD_TABLE_SYNC_SIZE} cap",
-            payload.len()
-        );
-    }
-
     /// An evidence message must be able to carry ANY summary that itself passed the summary
     /// cap, plus a maximal share and Merkle path — otherwise the biggest liars are exactly the
     /// ones that cannot be reported.
@@ -1244,120 +1039,6 @@ mod tests {
                     + MAX_MERKLE_PATH_BYTES
                     + EVIDENCE_FIXED_OVERHEAD,
             "evidence cap cannot carry a cap-sized summary plus its share and path"
-        );
-    }
-
-    /// The sample-request cap is derived from a stated budget — [`MAX_SAMPLE_REQUEST_INDICES`]
-    /// ten-digit indices plus the fixed fields — so MEASURE that budget against the cap instead
-    /// of trusting the comment's arithmetic.
-    #[test]
-    fn a_budgeted_worst_case_sample_request_fits_its_cap() {
-        use crate::message::ShardSampleRequestMessage;
-
-        let msg = ShardSampleRequestMessage {
-            epoch: u64::MAX,
-            target_node: [0xAB; 32],
-            share_root: [0xCD; 32],
-            // Every index at the ten-digit u32 maximum — the widest a legal index serialises.
-            leaf_indices: vec![u32::MAX; MAX_SAMPLE_REQUEST_INDICES],
-            requesting_node: [0xEF; 32],
-        };
-        let payload = serde_json::to_vec(&msg).expect("serialises");
-        assert!(
-            payload.len() <= MAX_SHARD_SAMPLE_REQUEST_SIZE,
-            "budgeted worst-case sample request is {} bytes against the \
-             {MAX_SHARD_SAMPLE_REQUEST_SIZE} cap",
-            payload.len()
-        );
-    }
-
-    /// Both halves of the sample-response derivation, measured:
-    ///
-    /// - the guaranteed floor — 17 leaves each carrying a CAP-SIZED share and a maximal path —
-    ///   must fit, or the biggest liars are exactly the ones that cannot be sampled;
-    /// - a realistic default sample — λ = 20 leaves at live share size — must fit comfortably,
-    ///   or the default exchange needs pagination on day one.
-    #[test]
-    fn a_budgeted_worst_case_sample_response_fits_its_cap() {
-        use crate::message::{ShardSampleLeaf, ShardSampleResponseMessage};
-        use ghost_common::types::ShareProof;
-
-        // A share padded to the single-share cap via its widest variable field. What matters is
-        // total serialised size, not field realism: the cap argument is byte arithmetic.
-        let cap_sized_share = |i: u32| {
-            let mut s = ShareProof {
-                round_id: u64::MAX,
-                miner_id: [0xAA; 32],
-                difficulty: f64::MAX,
-                work: f64::MAX,
-                share_hash: [i as u8; 32],
-                timestamp: u64::MAX,
-                received_by: [0xBB; 32],
-                template_id: Some([0xCC; 32]),
-                payout_address: Some(format!("bc1q{:058}", i)),
-                header: Some(vec![0xDD; 80]),
-                tier_log2: Some(u32::MAX),
-                signature: Some(vec![0xEE; 64]),
-            };
-            // Grow the header until the serialised share reaches MAX_SHARE_PROOF_SIZE.
-            let base = serde_json::to_vec(&s).expect("serialises").len();
-            let room = MAX_SHARE_PROOF_SIZE.saturating_sub(base);
-            // `Vec<u8>` serialises as decimal integers, ≤ 4 bytes per element ("255,").
-            s.header = Some(vec![0xDD; 80 + room / 4]);
-            let got = serde_json::to_vec(&s).expect("serialises").len();
-            assert!(
-                got <= MAX_SHARE_PROOF_SIZE && got > MAX_SHARE_PROOF_SIZE - 200,
-                "padding missed the single-share cap: {got}"
-            );
-            s
-        };
-
-        let worst = ShardSampleResponseMessage {
-            epoch: u64::MAX,
-            responding_node: [0xAB; 32],
-            share_root: [0xCD; 32],
-            leaves: (0..17u32)
-                .map(|i| ShardSampleLeaf {
-                    leaf_index: u32::MAX,
-                    share: cap_sized_share(i),
-                    merkle_proof: vec![[0xEF; 32]; 64],
-                })
-                .collect(),
-            signature: vec![0xFF; 64],
-        };
-        let payload = serde_json::to_vec(&worst).expect("serialises");
-        assert!(
-            payload.len() <= MAX_SHARD_SAMPLE_RESPONSE_SIZE,
-            "17 absolute-worst-case leaves are {} bytes against the \
-             {MAX_SHARD_SAMPLE_RESPONSE_SIZE} cap — the guaranteed floor is broken",
-            payload.len()
-        );
-
-        // The realistic default: λ = 20 live-sized shares (~1.2 KB proof blob measured on the
-        // fleet, 2026-08-12) with 20-hash paths (a million-leaf epoch).
-        let realistic = ShardSampleResponseMessage {
-            epoch: u64::MAX,
-            responding_node: [0xAB; 32],
-            share_root: [0xCD; 32],
-            leaves: (0..20u32)
-                .map(|i| {
-                    let mut share = cap_sized_share(i);
-                    share.header = Some(vec![0xDD; 80]);
-                    ShardSampleLeaf {
-                        leaf_index: i,
-                        share,
-                        merkle_proof: vec![[0xEF; 32]; 20],
-                    }
-                })
-                .collect(),
-            signature: vec![0xFF; 64],
-        };
-        let payload = serde_json::to_vec(&realistic).expect("serialises");
-        assert!(
-            payload.len() * 2 <= MAX_SHARD_SAMPLE_RESPONSE_SIZE,
-            "a realistic λ=20 response is {} bytes — over half the \
-             {MAX_SHARD_SAMPLE_RESPONSE_SIZE} cap, the default exchange has no headroom",
-            payload.len()
         );
     }
 
@@ -1475,12 +1156,6 @@ mod tests {
             validate_envelope_header(&data),
             Err(MessageValidationError::InvalidType(99))
         ));
-    }
-
-    #[test]
-    fn test_payload_size_limits() {
-        assert!(validate_payload_size(MessageType::Vote, 500).is_ok());
-        assert!(validate_payload_size(MessageType::Vote, MAX_VOTE_SIZE + 1).is_err());
     }
 
     #[test]
@@ -1611,7 +1286,7 @@ mod tests {
         // H-P2P-2: Test that zero signatures are rejected by validate_envelope
         let envelope = MessageEnvelope {
             version: ENVELOPE_VERSION_V1,
-            msg_type: MessageType::Vote,
+            msg_type: MessageType::Discovery,
             sender: [1u8; 32],
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             sequence: 1,
@@ -1629,7 +1304,7 @@ mod tests {
         // Non-zero signature should pass the zero check (actual sig verification is separate)
         let envelope = MessageEnvelope {
             version: ENVELOPE_VERSION_V1,
-            msg_type: MessageType::Vote,
+            msg_type: MessageType::Discovery,
             sender: [1u8; 32],
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             sequence: 1,
@@ -1658,26 +1333,6 @@ mod tests {
         let result = extract_message_type_fast(&padded);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(MessageType::HealthPing));
-    }
-
-    #[test]
-    fn test_extract_message_type_vote() {
-        let json = r#"{"msg_type":"Vote","sender":"abc123"}"#;
-        let mut padded = json.as_bytes().to_vec();
-        padded.resize(MIN_ENVELOPE_SIZE + 100, b' ');
-
-        let result = extract_message_type_fast(&padded);
-        assert_eq!(result.unwrap(), Some(MessageType::Vote));
-    }
-
-    #[test]
-    fn test_extract_message_type_share_proof() {
-        let json = r#"{"msg_type":"ShareProof","data":"..."}"#;
-        let mut padded = json.as_bytes().to_vec();
-        padded.resize(MIN_ENVELOPE_SIZE + 100, b' ');
-
-        let result = extract_message_type_fast(&padded);
-        assert_eq!(result.unwrap(), Some(MessageType::ShareProof));
     }
 
     #[test]
@@ -1713,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_validate_topic_wrong_type() {
-        let json = r#"{"msg_type":"Vote","sender":"abc123"}"#;
+        let json = r#"{"msg_type":"Discovery","sender":"abc123"}"#;
         let mut padded = json.as_bytes().to_vec();
         padded.resize(MIN_ENVELOPE_SIZE + 100, b' ');
 
@@ -1881,7 +1536,7 @@ mod envelope_version_tolerance_tests {
         let identity = NodeIdentity::generate();
 
         for version in [ENVELOPE_VERSION_V1, ENVELOPE_VERSION_V2] {
-            let env = signed(&identity, version, MessageType::ShareProof);
+            let env = signed(&identity, version, MessageType::HealthPing);
             assert!(
                 verify_envelope_signature(&env).is_ok(),
                 "v{version} envelope must verify — a receiver that refuses one of the two \
@@ -1899,14 +1554,14 @@ mod envelope_version_tolerance_tests {
     fn restamping_a_captured_envelope_defeats_v1_and_is_caught_by_v2() {
         let identity = NodeIdentity::generate();
 
-        let mut v1 = signed(&identity, ENVELOPE_VERSION_V1, MessageType::ShareProof);
+        let mut v1 = signed(&identity, ENVELOPE_VERSION_V1, MessageType::HealthPing);
         v1.timestamp += 3_600_000;
         assert!(
             verify_envelope_signature(&v1).is_ok(),
             "v1 is expected to accept a re-stamped envelope — that IS finding H-11"
         );
 
-        let mut v2 = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        let mut v2 = signed(&identity, ENVELOPE_VERSION_V2, MessageType::HealthPing);
         v2.timestamp += 3_600_000;
         assert!(
             matches!(
@@ -1914,31 +1569,6 @@ mod envelope_version_tolerance_tests {
                 Err(MessageValidationError::InvalidSignature(_))
             ),
             "v2 must refuse a re-stamped envelope"
-        );
-    }
-
-    /// Re-typing between two message types that share a ZMQ topic delivers a signed payload to a
-    /// handler its signer never addressed. `topic()` cannot distinguish them, so only the
-    /// signature can.
-    #[test]
-    fn retyping_across_a_shared_topic_is_caught_by_v2() {
-        let identity = NodeIdentity::generate();
-
-        let mut v1 = signed(&identity, ENVELOPE_VERSION_V1, MessageType::ShareProof);
-        v1.msg_type = MessageType::ShareConvergence;
-        assert!(
-            verify_envelope_signature(&v1).is_ok(),
-            "v1 is expected to accept a re-typed envelope — that IS finding H-11"
-        );
-
-        let mut v2 = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
-        v2.msg_type = MessageType::ShareConvergence;
-        assert!(
-            matches!(
-                verify_envelope_signature(&v2),
-                Err(MessageValidationError::InvalidSignature(_))
-            ),
-            "v2 must refuse a re-typed envelope"
         );
     }
 
@@ -1972,7 +1602,7 @@ mod envelope_version_tolerance_tests {
     #[test]
     fn an_unknown_claimed_version_is_rejected_not_trusted() {
         let identity = NodeIdentity::generate();
-        let mut env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        let mut env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::HealthPing);
         env.version = 3;
         env.signature = identity.sign(&[]);
 
@@ -1993,14 +1623,14 @@ mod envelope_version_tolerance_tests {
     fn flipping_the_version_field_invalidates_the_signature_in_both_directions() {
         let identity = NodeIdentity::generate();
 
-        let mut down = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        let mut down = signed(&identity, ENVELOPE_VERSION_V2, MessageType::HealthPing);
         down.version = ENVELOPE_VERSION_V1;
         assert!(matches!(
             verify_envelope_signature(&down),
             Err(MessageValidationError::InvalidSignature(_))
         ));
 
-        let mut up = signed(&identity, ENVELOPE_VERSION_V1, MessageType::ShareProof);
+        let mut up = signed(&identity, ENVELOPE_VERSION_V1, MessageType::HealthPing);
         up.version = ENVELOPE_VERSION_V2;
         assert!(matches!(
             verify_envelope_signature(&up),
@@ -2015,7 +1645,7 @@ mod envelope_version_tolerance_tests {
     #[test]
     fn a_v2_envelope_survives_the_whole_inbound_pipeline() {
         let identity = NodeIdentity::generate();
-        let env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::ShareProof);
+        let env = signed(&identity, ENVELOPE_VERSION_V2, MessageType::HealthPing);
         let bytes = env.serialize().expect("serialise");
 
         assert_eq!(
