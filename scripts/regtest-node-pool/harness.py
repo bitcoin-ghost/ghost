@@ -613,8 +613,11 @@ class Harness:
         if i == 0 and n.rpc("getblockcount") == 0:
             # Leave initial block download (regtest's genesis is from 2011); see BOOTSTRAP_HEIGHT.
             n.rpc("generatetoaddress", BOOTSTRAP_HEIGHT, payee("bootstrap")[0])
-        tip = self.nodes[0].rpc("getbestblockhash")
-        wait_for(lambda: n.rpc("getbestblockhash") == tip, 120, what=f"node{i} Bitcoin sync")
+        # Synced to node0's tip as it was, or past it: earlier nodes' miners keep mining.
+        h0 = self.nodes[0].rpc("getblockcount")
+        tip = self.nodes[0].rpc("getblockhash", h0)
+        wait_for(lambda: n.rpc("getblockcount") >= h0 and n.rpc("getblockhash", h0) == tip, 120,
+                 what=f"node{i} Bitcoin sync")
         n.start_ghost_mining()
         n.start_pool([m.relay for m in others])
         n.start_translator()
