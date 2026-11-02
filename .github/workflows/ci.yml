@@ -176,9 +176,14 @@ jobs:
       - name: Installer nightly-backup option self-test
         run: ./scripts/test-installer-backups.sh
       # The node pool's coinbase runs to 22 KB and ghostd's default 8,000 WU block reserve lost a
-      # block at 2.25 KB. --node-pool writes blockreservedweight=90000; off unless asked.
+      # block at 2.25 KB. The installer always writes blockreservedweight=90000 (node pool only).
       - name: Installer node pool reserve self-test
         run: ./scripts/test-installer-node-pool-reserve.sh
+      # The fee address check, per-network defaults, rendered pool_sv2 config, preflight lines,
+      # flags and wizard (W2.12). pool_sv2 itself loads the rendered config in
+      # bins/pool-sv2/tests/installer_config.rs.
+      - name: Installer node pool self-test
+        run: ./scripts/test-installer-node-pool.sh
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.

@@ -15,14 +15,15 @@ Four services on one machine, all installed by `scripts/install-node.sh`:
                             │ RPC + ZMQ (localhost)
                    ┌────────▼────────┐
                    │  ghost-mining   │   decentralised pool node
-                   │  mesh 8555-8563 │   BFT mesh, payouts, capability
-                   │  HTTP 8080      │   challenges, Template
-                   │  TDP 8442       │   Distribution (TDP)
+                   │  mesh 8555-8563 │   mesh, HTTP API, Template
+                   │  HTTP 8080      │   Distribution (TDP)
+                   │  TDP 8442       │
                    └────────┬────────┘
                             │ TDP
                    ┌────────▼────────┐
-                   │    sri-pool     │   pool_sv2 — Stratum V2
-                   │   (SV2 34255)   │
+                   │    sri-pool     │   pool_sv2 — Stratum V2, the node
+                   │   (SV2 34255,   │   pool's canonical coinbase and
+                   │  relay 8566)    │   the share-chain relay
                    └────────┬────────┘
                             │ SV2 (localhost)
                    ┌────────▼────────┐
@@ -51,16 +52,13 @@ Every binary comes from the signed release tarball. For each release that tarbal
 | Storage | 500 GB SSD | 1 TB NVMe |
 | Network | 100 Mbps symmetric | 1 Gbps |
 
-The installer does not check any of these — they are guidance, not gates. Disk depends on the sync mode you choose: the default (`ibd`) prunes old blocks, `haze` sits around 195 GB, and a full archive (`--archive`) is ~720 GB and growing.
+The installer's preflight (below) checks RAM and free disk against floors lower than this table: on mainnet it fails under 7 GB of RAM and warns under 15 GB, and it fails with less free space on `/var/lib` than 60 GB (`ibd`, which prunes), 250 GB (`haze`, which sits around 195 GB) or 800 GB (`--archive`, ~720 GB and growing). Signet and regtest have smaller floors.
 
-**Two bech32 mainnet addresses** (`bc1…`) that you control:
-
-- a **payout address**, where this node's reward share is paid; and
-- a **treasury address**, where this node's pool fee accumulates. There is deliberately no default — the installer refuses to run without one.
-
-They can be the same address or different ones.
+**A fee address** that you control (`--fee-address`). Every transaction fee of a block this node's miners find is paid to it. It must be P2SH, P2WPKH, P2WSH or P2TR, on the network you install (`bc1…`/`3…` on mainnet, `tb1…`/`2…` on signet, `bcrt1…`/`2…` on regtest); P2PKH is refused. The installer verifies the checksum, so a typo is refused rather than paid. Miners are not paid through this address: they are paid from the block subsidy, by the share-chain ledger, at the address they mine with. There is no treasury address to give; the treasury is a protocol constant.
 
 **An alert endpoint** (for example `https://ntfy.sh`). It is optional in the sense that the install completes without it, but then alerts are disabled and every detector — low disk, node offline, behind tip, restart loop — fires into nothing.
+
+**Relay peers**, optionally (`--relay-peer host:port`, repeatable): other node pool nodes for the share-chain relay to dial first. Without any, the node waits for peers to dial it on the relay port (8566).
 
 ⚠ **SSH on a non-standard port.** The installer enables `ufw` with `--force` and only allows SSH on `22/tcp`. If your SSH daemon listens anywhere else, add that rule (`sudo ufw allow <port>/tcp`) *before* you run the installer, or you will lock yourself out.
 
@@ -68,17 +66,16 @@ They can be the same address or different ones.
 
 ```bash
 curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \
-  --payout-address bc1q... \
-  --treasury-address bc1q... \
+  --fee-address bc1q... \
   --alert-webhook https://ntfy.sh
 ```
 
-That gives you the defaults: full trustless sync with pruning, Public Pool mining, the mempool Reaper on, no archive, no Tor, no automatic updates.
+That gives you the defaults: mainnet, full trustless sync with pruning, the node pool (the only mode), the mempool Reaper on, no archive, no Tor, no automatic updates.
 
 The installer always installs the latest published GitHub release. To pin one, set `GHOST_VERSION` — after `sudo`, so it survives into the root shell:
 
 ```bash
-curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=v1.11.46 bash -s -- --payout-address ...
+curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=v1.11.46 bash -s -- --fee-address ...
 ```
 
 If the GitHub API can't be reached and no version is pinned, the installer stops rather than guessing.
@@ -88,24 +85,43 @@ If the GitHub API can't be reached and no version is pinned, the installer stops
 ```bash
 curl -sSLo install-node.sh https://get.bitcoinghost.org
 less install-node.sh
-sudo bash install-node.sh --payout-address bc1q... --treasury-address bc1q... --alert-webhook https://ntfy.sh
+sudo bash install-node.sh --fee-address bc1q... --alert-webhook https://ntfy.sh
 ```
 
-Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the same choices as the flags below (payout and treasury addresses, sync mode, mining mode, pool name, Reaper, archive, Tor, auto-update, nightly backups, nickname), shows a summary and asks before it changes anything. The wizard does not ask for an alert endpoint, so a wizard install has alerts disabled until you add one. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
+Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the network, the fee address (re-asking until it is valid for that network), relay peers, an alert webhook and topic (optional), sync mode, pool name, Reaper, archive, Tor, auto-update, nightly backups and nickname, shows a summary and asks before it changes anything. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
+
+### Preflight
+
+Every install starts with a preflight, before anything on the machine is changed. Each check prints one line, `[PASS]`, `[WARN]` (installs anyway) or `[FAIL]`; any FAIL stops the install with `Nothing has been changed`. `--preflight-only` runs the checks and exits.
+
+| Check | FAIL when | WARN when |
+|---|---|---|
+| Fee address | not P2SH/P2WPKH/P2WSH/P2TR, wrong network, bad checksum | |
+| RAM | below the network's floor (mainnet 7 GB) | below the recommended size (mainnet 15 GB) |
+| Disk | free space on `/var/lib` below the floor for the network and sync mode | |
+| Ports | ghostd P2P, 8332, 8080, 8442, 3333, 4444, 34255, 9090 or the relay port is held by a process that is not this node's own (a re-run is fine) | |
+| Bitcoin node | a node already answering on 127.0.0.1:8332 runs another chain, or the RPC port listens but refuses `bitcoin.conf`'s credentials | |
+| Relay | a `--relay-peer` is not `host:port` | no peers given; a peer does not resolve |
+| Genesis | `--genesis-anchor` is not 64 hex characters, or all zeros | no share-chain genesis is published for the network (see below) |
+| Alert webhook | not an `http(s)://` URL | none given |
+
+On a fresh install there is no Bitcoin node yet; ghostd is installed, and the installer checks again once it runs and prints the result (`[PASS] Bitcoin node answers on 127.0.0.1:8332 (chain main)`) at the end. The relay port is opened on `ufw`; whether it is reachable from outside cannot be tested before anything listens on it, so open it on any firewall in front of the machine yourself.
 
 ### Flags
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--payout-address <bech32>` | — (required) | Where this node's reward share is paid. |
-| `--treasury-address <bech32>` | — (required) | Where this node's pool fee accumulates. |
+| `--fee-address <address>` | — (required) | Where every transaction fee of a block this node's miners find is paid. `[node_pool] fee_address`. |
+| `--network <mainnet\|signet\|regtest>` | `mainnet` | The Bitcoin network, for ghostd, ghost-mining and the node pool. |
+| `--relay-port <port>` | `8566` | The share-chain relay port peers dial. Opened on `ufw`. |
+| `--relay-peer <host:port>` | none | A relay peer to dial; repeat for more. More are learned from them. |
+| `--genesis-anchor <hex>`, `--genesis-height <n>` | the network's | The share chain's genesis anchor and its Bitcoin height. See *Share-chain genesis*, below. |
+| `--preflight-only` | | Run the preflight and exit. |
 | `--alert-webhook <url>` | none | Push endpoint for node alerts. Without it, `[alerts]` is written with `enabled = false`. |
 | `--alert-topic <name>` | `ghost-node` | Push topic. |
 | `--nickname <name>` | `ghost-node` | Display name in the mesh. |
-| `--pool-name <name>` | mode default | Custom coinbase tag, shown on explorers as `- G H O S T - <name>`. Printable ASCII, at most 30 characters. |
+| `--pool-name <name>` | `GHOST PublicPool` | Custom coinbase tag, shown on explorers as `- G H O S T - <name>`. Printable ASCII, at most 30 characters. |
 | `--sync <ibd\|haze>` | `ibd` | How ghostd stores the chain. See *Sync mode*, below. |
-| `--mining-mode <public\|pool\|solo>` | `public` | Who can mine on this node. See *Mining mode*, below. |
-| `--no-public-mining` | | Older alias for `--mining-mode solo`. If both are given, the last one wins. |
 | `--no-reaper` | Reaper on | Don't run the mempool Reaper. |
 | `--archive` | off | Full archive node (~720 GB). |
 | `--tor` | off | Hybrid Tor: ghostd peers via Tor and publishes an onion, still reachable on clearnet 8333. |
@@ -117,6 +133,8 @@ Run from a file like this, with **no** flags at all, on a terminal, the installe
 | `--no-backups` | | No nightly backups. The job is still installed; switch it on later with `sudo systemctl enable --now ghost-backup.timer`. |
 | `--non-interactive` | | Never start the wizard. |
 | `-h`, `--help` | | Print the help. |
+
+Old flags: `--payout-address` is the old name of `--fee-address` and still works. `--node-pool` is accepted and does nothing: the node pool's block reserve (`blockreservedweight=90000`) is always written. `--treasury-address`, `--mining-mode` and `--no-public-mining` are gone; there are no mining modes, treasury prompts or capability flags.
 
 ## Choices
 
@@ -131,32 +149,45 @@ Run from a file like this, with **no** flags at all, on a terminal, the installe
 
 `--sync haze` stops and asks you to type `yes` at the terminal. With `--non-interactive` there is no prompt: passing it is taken as confirmation that you have read the warning above. Without a terminal and without `--non-interactive`, the installer refuses.
 
-### Mining mode
+### The node pool
 
-| `--mining-mode` | Written as | Who can mine | Rewards | Stratum ports |
-|---|---|---|---|---|
-| `public` (default) | `public_pool` | Anyone. The node is DNS-registered. | Pool-aggregated (shared). | 3333, 34255 and 4444 open |
-| `pool` | `private_pool` | Your miners plus invited external miners, with a password. Not in DNS. | Pool-aggregated (shared). | 3333 and 34255 open |
-| `solo` | `private_solo` | Only miners you run locally, with a password. Not in DNS. | 99% of the subsidy plus all fees to your payout address. | all closed |
+Every node is a node pool node; there is no other mode. Miners connect to `stratum+tcp://<your-ip>:3333` (hobby tier), `:4444` (farm tier, ~232,827 starting difficulty) or SV2 on `:34255`, and authorise as `<their payout address>.<worker>`. Their payout address must be P2SH, P2WPKH, P2WSH or P2TR. Each block the pool finds pays miners' ledger balances from the subsidy; this node's fee address takes the block's transaction fees when one of its miners finds it.
 
-For the two private modes the installer generates a miner password, writes it to `/etc/ghost/pool.toml` as `[network] private_mining_password`, and prints it at the end of the install. Anyone with it can mine on the node.
+The installer writes the node pool into pool_sv2's config, `/etc/ghost/pool-config.toml`. pool_sv2 refuses to start without either section:
 
-Port 4444 is a second SV1 listener (the "farm tier") with a higher starting difficulty, for large and rented miners; 3333 is sized for hobby hardware such as a BitAxe. It exists only in Public Pool mode.
+```toml
+[node_pool]
+fee_address = "bc1q..."
 
-SV1 miners connect to `stratum+tcp://<your-ip>:3333` and may authorise as `<address>.<worker>` to attribute their own shares.
+[node_pool.relay]
+listen = "0.0.0.0:8566"
+peers = ["peer.example:8566"]
+db_path = "/var/lib/ghost/node-pool.db"
+genesis_anchor = "..."
+genesis_btc_height = ...
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+rpc_user = "..."
+rpc_password = "..."
+```
 
-### Capabilities and reward shares
+On regtest it also writes `tier_base` (regtest's proof-of-work limit), so CPU-mined shares reach the network tier.
 
-Nodes split the network's node rewards by capability shares, 5-4-3-2-1:
+### Share-chain genesis
 
-| Shares | Capability | How a node gets there |
-|---|---|---|
-| +5 | Archive | `--archive`, so the node holds the full chain. |
-| +3 | Public Mining | `--mining-mode public` (the default). The private modes do not earn it. |
-| +2 | Reaper | On by default; `--no-reaper` gives it up. See [Reaper](#reaper). |
-| +1 | Elder | The first 101 nodes. |
+The relay needs the share chain's genesis: the anchor every node's chain starts from, and its Bitcoin height. Nodes on different geneses never join each other.
 
-A flag does not award a share. Shares are earned by passing challenges that peers send to the node; a flag only puts the node in a position to pass them. A public-mining node whose Stratum port peers can't reach doesn't qualify.
+| Network | Genesis written |
+|---|---|
+| mainnet | **`UNSET`** — none is published yet |
+| signet | **`UNSET`** — none is published yet |
+| regtest | `sha256("GhostNodePool/genesis/regtest")` = `8d8cd561…9c69f1229c`, height 0 |
+
+With `UNSET` the install completes, the preflight warns, the config carries a marked placeholder, and **pool_sv2 refuses to start** with `node_pool.relay.genesis_anchor is UNSET: the share-chain genesis for this network has not been published, and this node will not guess one`. Set `genesis_anchor` and `genesis_btc_height` in `/etc/ghost/pool-config.toml` and restart `sri-pool`, or re-run the installer with `--genesis-anchor` and `--genesis-height`.
+
+### Networks
+
+`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"` and no seed nodes (the seeds are mainnet nodes), and `assumevalid` is written only on mainnet.
 
 ### Tor
 
@@ -168,11 +199,13 @@ Tor applies to ghostd's Bitcoin P2P only. ghost-mining's mesh, its HTTP API and 
 
 In order:
 
+Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the install there, before anything is installed.
+
 1. **Packages.** `apt-get install` of the libevent and ZeroMQ runtime libraries, `ufw`, `openssl`, `curl`, `gnupg`, `tar` (and `tor` with `--tor`).
 2. **User and directories.** Creates the system user `ghost` with home `/home/ghost`, and `/opt/ghost/bin`, `/etc/ghost`, `/etc/bitcoin`, `/var/lib/bitcoin`, `/var/lib/ghost`, `/home/ghost/.ghost/data`. If you ran it via `sudo`, your own user is added to `systemd-journal` so `journalctl` works without sudo after your next login.
 3. **Persistent journal.** Writes `/etc/systemd/journald.conf.d/10-ghost.conf`: `Storage=persistent`, 2 GB cap, 1 GB kept free, two weeks' retention. Without it the journal lives in RAM and a reboot erases the evidence you need.
 4. **Download and verify.** Fetches `bitcoin-ghost-<version>-x86_64-unknown-linux-gnu.tar.gz`, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc` from the GitHub release, imports the release key from `https://get.bitcoinghost.org/ghost-release-key.asc`, and requires a valid signature from exactly `777FE81F8CC077FD3D08055E852C2B3190F5B928` before checking the tarball's SHA256. Any failure stops the install before a binary is written.
-5. **Secrets.** Generates a fresh RPC password, `internal_api_secret`, `signing_key`, and — for private modes — the miner password, all on this machine. Nothing is shared with any other node.
+5. **Secrets.** Generates a fresh RPC password, `internal_api_secret` and `signing_key`, all on this machine. Nothing is shared with any other node.
 6. **Configs.** Writes `/etc/bitcoin/bitcoin.conf` and `/etc/ghost/pool.toml` (both `ghost`-owned, mode 600), `/etc/ghost/translator-config.toml` (644) and `/etc/ghost/pool-config.toml` (root-only 600; it holds the SV2 authority secret).
 7. **Node identity.** Generates `/home/ghost/.ghost/node.key` with `ghost-mining --generate-identity` — unless one already exists, in which case it is kept.
 8. **SV2 keys.** Generates a fresh SV2 pool authority keypair for this node, and derives ghost-mining's template-server key from `node.key` so pool_sv2 can pin it.
@@ -189,7 +222,8 @@ In order:
 | `/etc/ghost/pool.toml` | ghost-mining config |
 | `/home/ghost/.ghost/node.key` | Node identity |
 | `/home/ghost/.ghost/data` | ghost-mining database |
-| `/etc/ghost/pool-config.toml` | pool_sv2 (sri-pool) config |
+| `/etc/ghost/pool-config.toml` | pool_sv2 (sri-pool) config, with `[node_pool]` and `[node_pool.relay]` |
+| `/var/lib/ghost/node-pool.db` | The share-chain relay's store (anchors, batches, shares, ledger) |
 | `/etc/ghost/translator-config.toml` | translator_sv2 (sri-translator) config |
 | `/etc/ghost/auto-update.conf` | Auto-update opt-in |
 | `/etc/ghost/backup.conf` | Optional off-node backup destination. Not present unless you configure one |
@@ -222,19 +256,15 @@ The installer enables `ufw` and allows:
 | Port | Service | Notes |
 |---|---|---|
 | 22/tcp | SSH | The only SSH rule — see the warning above |
-| 8333/tcp | ghostd P2P | Removed with `--tor-only` |
+| 8333/tcp | ghostd P2P | 38333 on signet, 18444 on regtest. Removed with `--tor-only` |
+| 8566/tcp | Node pool share-chain relay | `--relay-port` |
 | 8080/tcp | ghost-mining HTTP API | |
 | 8442/tcp | ghost-mining TDP | |
 | 8443/tcp | Verification HTTPS | Peers fetch MPC params and votes |
-| 8555–8562/tcp | Mesh consensus | Share propagation, blocks, voting, health, discovery, Elder management, payouts |
+| 8555–8562/tcp | Mesh | Share propagation, blocks, health, discovery |
 | 8563/tcp | Noise mesh | Verifications and MPC exchange |
 
-Three more ports follow `pool.toml`. `ghost-mining-firewall.path` watches the file and re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever it changes, so changing the mining mode later updates the firewall without a manual `ufw` step:
-
-| Port | Open when |
-|---|---|
-| 3333/tcp (SV1), 34255/tcp (SV2) | `mining_mode` is `public_pool` or `private_pool` |
-| 4444/tcp (farm tier) | `mining_mode` is `public_pool` |
+Three more ports are always open: 3333/tcp (SV1), 34255/tcp (SV2) and 4444/tcp (farm tier). `ghost-mining-firewall.path` re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever `pool.toml` changes, so a rule removed by hand, or closed by an older private or solo install, is put back.
 
 RPC (8332), ZMQ (28332–28334) and pool_sv2's monitoring endpoint (9090) are bound to `127.0.0.1`.
 
@@ -243,7 +273,13 @@ RPC (8332), ZMQ (28332–28334) and pool_sv2's monitoring endpoint (9090) are bo
 The installer ends by printing the Node ID and each service's state:
 
 ```
-  ✅ Bitcoin Ghost node installed.
+  ✅ Bitcoin Ghost node installed (mainnet).
+     Node ID: ...
+     [PASS] Bitcoin node answers on 127.0.0.1:8332 (chain main)
+     Fee address:     bc1q...
+     Relay:           port 8566, peers: none yet
+     Genesis:         UNSET — pool_sv2 will refuse to start until it is set in /etc/ghost/pool-config.toml
+     Alerts:          https://ntfy.sh
      ghostd:          active
      ghost-mining-gate: active  (waiting for sync, then auto-starts ghost-mining)
      ghost-mining:    inactive  (started by the gate)
@@ -251,7 +287,7 @@ The installer ends by printing the Node ID and each service's state:
      sri-translator:  inactive  ...
 ```
 
-`inactive` is expected for the last three until ghostd finishes syncing. For the private modes it also prints the miner password.
+`inactive` is expected for the last three until ghostd finishes syncing.
 
 Follow the sync, then the gate:
 
@@ -260,7 +296,7 @@ sudo journalctl -u ghostd -f
 sudo journalctl -u ghost-mining-gate -f
 ```
 
-When the gate logs `ghostd synced — starting ghost-mining`, the node joins the mesh and registers as an Elder if slots remain. Then:
+When the gate logs `ghostd synced — starting ghost-mining`, the node joins the mesh. Then:
 
 ```bash
 sudo journalctl -u ghost-mining -f
@@ -271,7 +307,7 @@ sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockc
 
 `ghost-cli` lives in `/opt/ghost/bin`, not on the default `PATH`, and needs `sudo -u ghost` because `bitcoin.conf` (which holds the RPC password) is readable only by `ghost`.
 
-**Back up `node.key`.** `/home/ghost/.ghost/node.key` is the node's identity. The node ID derives from it and the Elder slot is bound to it. Lose it and you lose the peer slot, the verification history and any Elder position; nothing on the machine backs it up for you. See [Key management](#key-management).
+**Back up `node.key`.** `/home/ghost/.ghost/node.key` is the node's identity. The node ID derives from it, and the node pool's share tags commit to it. Lose it and the node becomes a different node; nothing on the machine backs it up for you. See [Key management](#key-management).
 
 ### pool.toml
 
@@ -279,22 +315,22 @@ The installer writes `/etc/ghost/pool.toml` in full. The flags land here:
 
 | Flag | Key |
 |---|---|
-| `--payout-address` | `[pool] node_payout_address` (and `[network] solo_payout_address` for `solo`) |
-| `--treasury-address` | `[pool] treasury_address` |
+| `--network` | `[bitcoin] network` |
 | `--nickname` | `[identity] display_name` |
 | `--pool-name` | `[pool] pool_name` |
-| `--mining-mode` | `[network] mining_mode` |
 | `--archive` | `[storage] archive_mode` |
 | `--no-reaper` | `[reaper] enabled` |
 | `--alert-webhook`, `--alert-topic` | `[alerts]`, `[alerts.channels.push] webhook_url`, `topic` |
 
-The `[ghost_pay]` section is historical: Ghost Pay is retired and `enabled` is always `false`. Older installs may still carry `[ghost_pay] wraith_enabled` and a `[coordinator]` block with Wraith election and role keys; those keys are read and ignored, and the installer no longer writes them.
+The node pool flags (`--fee-address`, `--relay-port`, `--relay-peer`, `--genesis-anchor`, `--genesis-height`) land in pool_sv2's `/etc/ghost/pool-config.toml`, under `[node_pool]` and `[node_pool.relay]` (see *The node pool*, above).
+
+Older installs may carry keys for removed features (`[network] mining_mode`, `private_mining_password`, `solo_payout_address`, `[pool] treasury_address`, `node_payout_address`, `[coordinator]`, `[ghost_pay]`); they are read and ignored, and the installer no longer writes them.
 
 The installer does not install the node dashboard. It writes `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf` so that a dashboard installed later signs its requests with the same `internal_api_secret`. See [Node dashboard](#node-dashboard).
 
 ### Re-running the installer
 
-Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
+Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
 
 ## Automatic updates
 
@@ -374,7 +410,7 @@ The [Recovery runbook](#recovery) covers what to do when a running node breaks (
 ## What this guide isn't
 
 - **It isn't a tuning guide.** The installer's defaults are what the reference fleet runs.
-- **It isn't multi-node coordination.** A second node runs the same installer on a different host; it bootstraps from the seed Elders built into the installer and discovers the rest through gossip. There's no centralised registry or membership flow.
+- **It isn't multi-node coordination.** A second node runs the same installer on a different host; it bootstraps from the seed nodes built into the installer and discovers the rest through gossip. There's no centralised registry or membership flow.
 - **It isn't a config reference.** It covers the keys the installer's flags set; other fields keep their defaults.
 - **It isn't a security review.** [Security](/security.html) covers the disclosure flow. Keep `pool.toml`, `bitcoin.conf`, `pool-config.toml` and `node.key` off public repos and backups you don't control.
 

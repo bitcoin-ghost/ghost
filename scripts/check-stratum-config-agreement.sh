@@ -107,8 +107,18 @@ def values(path):
     """Return (hobby_keys, farm_keys). Farm-tier keys are kept out of the hobby set."""
     out, farm = {}, {}
     in_farm = False
+    in_pool_render = False
     with open(path) as fh:
         for line in fh:
+            # The installer's pool_sv2 config is rendered by `np_render_pool_config`, above the
+            # translator heredoc; its keys are the POOL side's (installer_pool_section, below), and
+            # a flat parse keeping first occurrences would read them as the translator's.
+            if re.match(r"^np_render_pool_config\(\) \{", line):
+                in_pool_render = True
+            if in_pool_render:
+                if re.match(r"^\}\s*$", line):
+                    in_pool_render = False
+                continue
             if FARM_OPENS_RE.search(line):
                 in_farm = True
                 continue
@@ -207,14 +217,21 @@ pool_vals, _ = values(POOL_REFERENCE)
 # The installer writes THREE TOML files, and a flat parse of it keeps whichever occurrence of a key
 # comes first, so the pool heredoc is extracted on its own. Comparing the whole installer against
 # the pool reference would pair `shares_per_minute` from pool.toml against the pool-config one.
-POOL_HEREDOC_OPEN = re.compile(r"^cat > /etc/ghost/pool-config\.toml <<")
+#
+# The heredoc lives in the installer's `np_render_pool_config` function (W2.12), so the tests can
+# render the file without running the installer; its first `cat <<EOF` is the pool config.
+POOL_RENDER_OPEN = re.compile(r"^np_render_pool_config\(\) \{")
+POOL_HEREDOC_OPEN = re.compile(r"^\s*cat <<EOF\s*$")
 
 def installer_pool_section(path):
-    """Keys from the installer's `cat > /etc/ghost/pool-config.toml` heredoc only."""
-    out, inside = {}, False
+    """Keys from the heredoc in the installer's `np_render_pool_config` only."""
+    out, armed, inside = {}, False, False
     with open(path) as fh:
         for line in fh:
-            if POOL_HEREDOC_OPEN.match(line):
+            if POOL_RENDER_OPEN.match(line):
+                armed = True
+                continue
+            if armed and not inside and POOL_HEREDOC_OPEN.match(line):
                 inside = True
                 continue
             if inside and re.match(r"^EOF\s*$", line):
@@ -230,7 +247,7 @@ pool_compared = 0
 pool_installer, pool_found = installer_pool_section(INSTALLER)
 if not pool_found:
     problems.append(
-        f"could not find `cat > /etc/ghost/pool-config.toml` in {INSTALLER} — the pool side of "
+        f"could not find the heredoc of `np_render_pool_config` in {INSTALLER} — the pool side of "
         f"this check examined NOTHING. It was renamed or removed."
     )
 elif len(pool_installer) < 8:
@@ -245,8 +262,15 @@ else:
     POOL_NOT_COMPARED = {
         "authority_public_key": "per-node, installer substitutes ${SV2_AUTH_PUB}",
         "authority_secret_key": "per-node, installer substitutes ${SV2_AUTH_SEC}",
-        "coinbase_reward_script": "per-node, installer substitutes ${PAYOUT_ADDRESS}; the "
+        "coinbase_reward_script": "per-node, installer substitutes ${FEE_ADDRESS}; the "
                                   "reference keeps an invalid placeholder on purpose",
+        "fee_address": "per-node, installer substitutes ${FEE_ADDRESS}",
+        "listen": "the relay port is --relay-port (default 8566, as in the reference)",
+        "peers": "per-node, from --relay-peer",
+        "genesis_anchor": "per-network, from np_network_defaults or --genesis-anchor",
+        "genesis_btc_height": "per-network, from np_network_defaults or --genesis-height",
+        "rpc_user": "per-node RPC credentials",
+        "rpc_password": "per-node RPC credentials",
         "secret": "per-node, installer substitutes ${INTERNAL_API_SECRET}",
         "public_key": "per-node TDP authority key",
         "url": "the webhook URL carries a per-node port in the installer",
