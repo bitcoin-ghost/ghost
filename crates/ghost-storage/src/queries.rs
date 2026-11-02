@@ -3547,6 +3547,30 @@ impl Database {
         })
     }
 
+    /// Register this node (or refresh it): insert if absent, else bump `last_seen` and keep the
+    /// stored public address unless a new one is given.
+    pub fn register_node(
+        &self,
+        node_id: &str,
+        public_address: Option<&str>,
+        display_name: Option<&str>,
+    ) -> GhostResult<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO nodes (node_id, public_address, display_name, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                     last_seen = excluded.last_seen,
+                     public_address = COALESCE(excluded.public_address, nodes.public_address),
+                     display_name = COALESCE(excluded.display_name, nodes.display_name)",
+                params![node_id, public_address, display_name, now],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Register a node with PoW proof for Sybil-resistant elder eligibility
     ///
     /// **IMPORTANT**: Nodes without valid PoW proofs will NOT be eligible for elder status.

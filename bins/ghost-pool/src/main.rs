@@ -22,14 +22,13 @@
 
 //! Ghost Pool - Bitcoin Ghost Mining Pool Node
 //!
-//! Main entry point for the Ghost Pool node. This is a complete mining pool
-//! implementation featuring:
+//! Main entry point for the Ghost Pool node:
 //!
-//! - Stratum V2 server for miner connections
-//! - BUDS-based transaction filtering
-//! - Pre-consensus coinbase construction
-//! - P2P mesh network for share propagation
-//! - 67% BFT consensus for payouts
+//! - BUDS-filtered block templates served to the co-located pool_sv2 over TDP
+//! - the P2P mesh (health pings and peer discovery)
+//! - round statistics and the operator API
+//!
+//! Miners' balances and every coinbase are the node pool's, in pool_sv2.
 //!
 //! Run with: ghost-mining --config ghost.toml
 
@@ -37,7 +36,6 @@
 
 use anyhow::Result;
 use clap::Parser;
-use ghost_storage::queries::VerificationProofInsert;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -51,28 +49,19 @@ use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::signer::SignerConfig;
-use ghost_common::types::{ConsensusResult, NodeCapabilities};
+use ghost_common::types::NodeCapabilities;
 use ghost_common::zmq::{ZmqConfig, ZmqSubscriber};
 use ghost_consensus::ban_manager::BanManager;
 use ghost_consensus::health_handler::HealthPingHandler;
 use ghost_consensus::mesh::{MeshConfig, MeshNetwork};
-use ghost_consensus::message::MessageType;
-use ghost_consensus::verification_handler::VerificationResultHandler;
-use ghost_consensus::vote_handler::{BroadcastFn, ExecuteFn, VoteHandler, VoteHandlerConfig};
-use ghost_consensus::voting::VotingManager;
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
 use ghost_storage::Database;
-use ghost_verification::{
-    start_server, GspHandler, PeerProvider, QualifiedCapabilityProvider, RpcArchiveHandler,
-    VerifiablePeer, VerificationState, VerificationTask,
-};
+use ghost_verification::{start_server, GspHandler, RpcArchiveHandler, VerificationState};
 
 use ghost_pool::capacity;
 use ghost_pool::reorg::{ReorgConfig, ReorgHandler};
 use ghost_pool::round::{RoundConfig, RoundManager};
-use ghost_pool::self_check::SelfCheck;
-use ghost_pool::share_handler::ShareProofHandler;
 use ghost_pool::template::{TemplateConfig, TemplateEvent, TemplateProcessor};
 use ghost_pool::template_provider::{TdpConfig, TemplateDistributionServer};
 
@@ -94,25 +83,6 @@ const RECORD_WINDOWS: [(&str, i64); 4] = [
     ("week", 604_800),
     ("month", 2_592_000),
 ];
-
-/// Decide whether to advertise the Archive capability (+5 shares).
-///
-/// The claim must reflect Ghost Core's REAL archive state, not merely the
-/// operator's `storage.archive_mode` config flag. Archive is only advertised when
-/// the operator asked for it AND ghostd is genuinely serving a full block store:
-/// - `hazed` nodes strip witness/scriptSig/OP_RETURN data, so they cannot return
-///   whole historical blocks, and
-/// - `pruned` nodes have discarded old blocks entirely, so they cannot serve the
-///   arbitrary historical block the Archive challenge asks for.
-///
-/// Claiming Archive in either state always fails qualification and wastes every
-/// peer's verification challenges, so we drop the claim up front. The `hazed` and
-/// `pruned` inputs come straight from `getblockchaininfo`; the caller only reaches
-/// this with a real response (the pool hard-exits if ghostd's RPC is unreachable),
-/// so an unknown ghostd state never newly-claims Archive — fail-safe by design.
-fn should_claim_archive(config_archive_mode: bool, hazed: bool, pruned: bool) -> bool {
-    config_archive_mode && !hazed && !pruned
-}
 
 /// Build this node's best (rarest) valid share per records window from the
 /// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
@@ -248,74 +218,6 @@ impl GspHandler for CachedGspHandler {
     }
 }
 
-/// Adapter to provide peers for verification from PeerManager
-struct PeerProviderAdapter {
-    peers: Arc<ghost_consensus::peer::PeerManager>,
-    http_port: u16,
-}
-
-impl PeerProviderAdapter {
-    fn new(peers: Arc<ghost_consensus::peer::PeerManager>, http_port: u16) -> Self {
-        Self { peers, http_port }
-    }
-}
-
-impl PeerProvider for PeerProviderAdapter {
-    fn get_random_peers(
-        &self,
-        exclude: &ghost_common::types::NodeId,
-        count: usize,
-    ) -> Vec<VerifiablePeer> {
-        use rand::seq::SliceRandom;
-
-        // Get connected peers (seen in last 60 seconds)
-        let connected = self.peers.get_connected_peers(60);
-
-        // Filter out the excluded node (ourselves) and peers without valid addresses.
-        //
-        // #618: also skip bootstrap placeholders. `connect_peer` registers a seed under an
-        // address-derived stub id until its real identity arrives on the first health ping,
-        // and such an entry satisfied both filters above. Selecting one produced a verdict
-        // attributed to a node_id that exists nowhere: only the port is rewritten when a
-        // challenge is sent, so the host is a real node, it answered with a genuine proof,
-        // and the result was filed against the stub. Measured on vm1: 11,754 ledger rows,
-        // 11,510 passing, across ghostpay, policy and stratum. An unidentified peer must not
-        // be verifiable at all, so this is filtered at selection rather than at record time.
-        let mut candidates: Vec<_> = connected
-            .into_iter()
-            .filter(|p| {
-                &p.node_id != exclude
-                    && !p.public_address.is_empty()
-                    && !p.is_bootstrap_placeholder()
-            })
-            .map(|p| {
-                // Derive HTTP address from public_address + http_port
-                let host = extract_peer_host(&p.public_address);
-
-                // CRIT-VER-1: Extract IP address for Sybil resistance
-                let ip_address = Some(host.to_string());
-
-                // CRIT-VER-1: Uptime info for reputation weighting
-                // Default to None, will be filled by verification task from DB
-                let uptime = None;
-
-                VerifiablePeer {
-                    node_id: p.node_id,
-                    http_address: format!("{}:{}", host, self.http_port),
-                    uptime,
-                    ip_address,
-                }
-            })
-            .collect();
-
-        // Shuffle and take up to count
-        let mut rng = rand::thread_rng();
-        candidates.shuffle(&mut rng);
-        candidates.truncate(count);
-        candidates
-    }
-}
-
 /// What a node should report as its own hashrate, given a query outcome.
 ///
 /// Pure so the failure path can actually be tested — the failure path is the whole point. Both the
@@ -415,27 +317,6 @@ struct Args {
     /// Disable native stratum server (use when running with SRI pool via TDP)
     #[arg(long)]
     no_stratum: bool,
-
-    /// ONE-TIME LEDGER RECONCILIATION: export this node's unpaid shares to a JSON file.
-    ///
-    /// Shares predating schema v41 carry no signed proof, so no node can serve or verify them
-    /// and GHOST-03 convergence cannot repair the divergence they cause. The fleet can only be
-    /// made to agree on that backlog by taking the UNION across the operator's own nodes.
-    #[arg(long, value_name = "FILE")]
-    ledger_export: Option<PathBuf>,
-
-    /// ONE-TIME LEDGER RECONCILIATION: import unpaid shares this node is missing.
-    ///
-    /// Never deletes and never overwrites — dedup is UNIQUE(share_hash) and a miner row is only
-    /// created if absent, so it is safe to re-run. Each miner's payout address is re-encrypted
-    /// with THIS node's key (the DB key is per-node), without which the payout query's
-    /// INNER JOIN would drop the share and the miner would silently lose the work.
-    #[arg(long, value_name = "FILE")]
-    ledger_import: Option<PathBuf>,
-
-    /// With --ledger-import: report what WOULD change and write nothing.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 /// Handle `--status`: report what THIS node can establish about itself (B4).
@@ -825,16 +706,8 @@ async fn main() -> Result<()> {
     rpc.set_network(config.bitcoin.network);
     let rpc = Arc::new(rpc);
 
-    // A-2b: start the cached L1 block-hash oracle that seeds the consensus
-    // challenger draw. Its background task keeps a trailing window warm so the
-    // (synchronous) qualification path can look up round seeds without blocking.
-    // Attached to every qualification provider below; inert until the assignment
-    // gate is armed.
-    let block_hash_oracle =
-        ghost_pool::block_hash_oracle::CachedBlockHashOracle::spawn(Arc::clone(&rpc));
-
     // Test RPC connection
-    let blockchain_info = match rpc.get_blockchain_info().await {
+    match rpc.get_blockchain_info().await {
         Ok(info) => {
             info!(
                 chain = %info.chain,
@@ -842,7 +715,6 @@ async fn main() -> Result<()> {
                 difficulty = info.difficulty,
                 "Connected to Ghost Core"
             );
-            info
         }
         Err(e) => {
             error!(error = %e, "Failed to connect to Ghost Core");
@@ -886,12 +758,6 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // Resolve the activation gates for this run BEFORE anything reads them. On mainnet these are
-    // the compiled-in constants and nothing can move them; elsewhere they may be pulled down from
-    // the environment so a regtest cluster exercises the POST-gate paths using the real shipping
-    // binary, rather than a specially-patched one that is not what gets deployed.
-    ghost_pool::init_activation_heights(&config.bitcoin.network);
-
     let db = Arc::new(Database::open(&db_path)?);
     info!("Database opened: {}", db_path.display());
 
@@ -912,153 +778,6 @@ async fn main() -> Result<()> {
         db.set_encryption_key(key);
         // Zeroize local copies
         key.fill(0);
-    }
-
-    // ONE-TIME LEDGER RECONCILIATION (runs after DB encryption is configured, and exits).
-    //
-    // Shares predating schema v41 carry no signed proof — their GHOST-09 signatures exist
-    // nowhere — so no node can serve or verify them, and GHOST-03 convergence cannot repair the
-    // divergence they cause. Every node sums a different unpaid ledger, so every node computes a
-    // different miner split, so GHOST-02's exact-equality check rejects every payout.
-    //
-    // The only way to make the fleet agree on that backlog is to take the UNION across the
-    // operator's own nodes. That is sound because the divergence is nodes MISSING shares, never
-    // nodes holding fabricated ones — each node's set is a subset of the truth. It is trusted
-    // rather than verified, and it is only defensible because every node in the mesh belongs to
-    // the same operator. New shares (v41 onward) carry their proof and converge verifiably.
-    // SHARE-BATCH-CHAIN QUARANTINE (runs after DB encryption is configured, and exits).
-    //
-
-    if let Some(path) = &args.ledger_export {
-        // STREAMING export. The previous version called `export_unpaid_shares()` (which
-        // materialises the ledger twice) and then `serde_json::to_vec` (a third copy, as one
-        // contiguous buffer). On ghost-vm5 with 2.77M unpaid rows that was OOM-killed at 1.57 GB
-        // RSS against 1.4 GB available — so the one-time reconciliation could not be run at the
-        // scale that needs it (#584).
-        //
-        // Both formats stream, so neither can OOM:
-        //   *.jsonl -> one record per line (what `--ledger-import` already streams back in)
-        //   other   -> a JSON array written incrementally, for compatibility with the legacy
-        //              whole-file import path
-        //
-        // Peak memory is one record either way.
-        use std::io::Write as _;
-        let as_jsonl = path.extension().map(|e| e == "jsonl").unwrap_or(false);
-        let file = std::fs::File::create(path)?;
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
-        let mut total_work = 0f64;
-        let mut no_address = 0usize;
-        let mut first = true;
-        if !as_jsonl {
-            w.write_all(b"[")?;
-        }
-        let shares_len = db.for_each_unpaid_share(|rec| {
-            total_work += rec.work;
-            if rec.payout_address.is_none() {
-                no_address += 1;
-            }
-            let line = serde_json::to_vec(rec)
-                .map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))?;
-            let emit = |w: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
-                if as_jsonl {
-                    w.write_all(&line)?;
-                    w.write_all(b"\n")
-                } else {
-                    if !first {
-                        w.write_all(b",")?;
-                    }
-                    w.write_all(&line)
-                }
-            };
-            emit(&mut w).map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))?;
-            first = false;
-            Ok(())
-        })?;
-        if !as_jsonl {
-            w.write_all(b"]")?;
-        }
-        w.flush()?;
-        info!(
-            shares = shares_len,
-            total_work,
-            no_address,
-            format = if as_jsonl { "jsonl" } else { "json-array" },
-            file = %path.display(),
-            "Ledger export complete"
-        );
-        if no_address > 0 {
-            warn!(
-                no_address,
-                "Shares with no resolvable payout address will be dropped by the payout query's \
-                 INNER JOIN on `miners` — they cannot be credited to anyone"
-            );
-        }
-        return Ok(());
-    }
-
-    if let Some(path) = &args.ledger_import {
-        // Batched + (for .jsonl) STREAMING import. The unbatched load-everything path OOM-killed
-        // memory-constrained nodes on a 600MB+ union; a `.jsonl` file (one record per line) is
-        // streamed a chunk at a time so peak RAM stays tiny, and each chunk commits in one
-        // transaction. A legacy JSON array still works (loaded whole, then batched in chunks).
-        const CHUNK: usize = 100_000;
-        type Rec = ghost_storage::queries::UnpaidShareExport;
-        let is_jsonl = path.extension().map(|e| e == "jsonl").unwrap_or(false);
-        let (mut offered, mut inserted, mut miners) = (0usize, 0usize, 0usize);
-
-        if is_jsonl {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-            let mut chunk: Vec<Rec> = Vec::with_capacity(CHUNK);
-            let flush = |chunk: &mut Vec<Rec>,
-                         offered: &mut usize,
-                         inserted: &mut usize,
-                         miners: &mut usize|
-             -> anyhow::Result<()> {
-                if chunk.is_empty() {
-                    return Ok(());
-                }
-                let (ins, m) = db.import_unpaid_shares_batch(chunk, args.dry_run)?;
-                *offered += chunk.len();
-                *inserted += ins;
-                *miners += m;
-                info!(
-                    offered = *offered,
-                    inserted = *inserted,
-                    "Ledger import progress"
-                );
-                chunk.clear();
-                Ok(())
-            };
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                chunk.push(serde_json::from_str(&line)?);
-                if chunk.len() >= CHUNK {
-                    flush(&mut chunk, &mut offered, &mut inserted, &mut miners)?;
-                }
-            }
-            flush(&mut chunk, &mut offered, &mut inserted, &mut miners)?;
-        } else {
-            let raw = std::fs::read(path)?;
-            let shares: Vec<Rec> = serde_json::from_slice(&raw)?;
-            offered = shares.len();
-            for chunk in shares.chunks(CHUNK) {
-                let (ins, m) = db.import_unpaid_shares_batch(chunk, args.dry_run)?;
-                inserted += ins;
-                miners += m;
-            }
-        }
-        info!(
-            offered,
-            inserted,
-            miners_created = miners,
-            dry_run = args.dry_run,
-            "Ledger import complete"
-        );
-        return Ok(());
     }
 
     // Setup policy profile
@@ -1109,110 +828,23 @@ async fn main() -> Result<()> {
         mining_mode, is_public_mining
     );
 
-    // Setup capabilities - initially with elder_status = false
-    // We'll update after registering with the database
-    let mut capabilities = NodeCapabilities {
-        archive_mode: config.storage.archive_mode,
-        // Ghost Pay is removed, so this node never claims it. The capability bit stays in
-        // the wire type until the capability ladder goes at the cutover; a node without a
-        // ghost-pay daemon always failed the challenge, so no award changes.
-        ghost_pay: false,
-        public_mining: is_public_mining, // Derived from mining_mode
-        reaper: config.reaper.enabled,
-        elder_status: false,
-        coordinator: config.coordinator.coordinator_enabled, // opt-in Wraith coordinator role
+    // What this node advertises in its health pings. The capability ladder, its challenges and
+    // node rewards are gone; only whether this node takes outside hashpower is still read (by the
+    // translator's load balancer).
+    let capabilities = NodeCapabilities {
+        public_mining: is_public_mining,
+        ..Default::default()
     };
 
-    // Register node with database
+    // Register this node in the database (peer tracking and discovery).
     let node_id_hex = identity.node_id_hex();
-    let public_address = config.network.public_address.as_deref();
-    let display_name = config.identity.display_name.as_deref();
-    let capabilities_str = format!(
-        "archive:{},ghost_pay:{},public_mining:{},reaper:{}",
-        capabilities.archive_mode,
-        capabilities.ghost_pay,
-        capabilities.public_mining,
-        capabilities.reaper
-    );
-
-    // Register node in database (for tracking/discovery purposes).
-    // The PoW proof is mandatory for elder-slot eligibility — the
-    // promotion SQL filters `WHERE pow_proof IS NOT NULL`, so a nil
-    // proof leaves the node permanently ineligible. Always pass our
-    // locally-computed proof (generated by NodeIdentity::generate).
-    let pow_proof_hex = identity.pow_proof_hex();
-    if let Err(e) = db.register_node_with_elder_check_and_pow(
+    if let Err(e) = db.register_node(
         &node_id_hex,
-        public_address,
-        display_name,
-        &capabilities_str,
-        pow_proof_hex.as_deref(),
+        config.network.public_address.as_deref(),
+        config.identity.display_name.as_deref(),
     ) {
         warn!("Failed to register node: {} - continuing anyway", e);
     }
-
-    // Set local node's payout address for node reward distribution
-    if let Some(ref addr) = config.pool.node_payout_address {
-        if let Err(e) = db.update_node_payout_address(&node_id_hex, addr) {
-            warn!(
-                "Failed to set node payout address: {} - continuing anyway",
-                e
-            );
-        } else {
-            let redacted = if addr.len() > 10 {
-                format!("{}...{}", &addr[..6], &addr[addr.len() - 4..])
-            } else {
-                "***".to_string()
-            };
-            debug!(address = %redacted, "Node payout address configured");
-        }
-    }
-
-    // Check MPC-based elder status
-    // Elder = MPC contributor (position 1-101 in the ceremony)
-    match db.get_mpc_elder_position(&node_id_hex) {
-        Ok(Some(position)) => {
-            capabilities.elder_status = true;
-            info!("Node is MPC Elder #{}", position);
-        }
-        Ok(None) => {
-            info!(
-                "Node is not an MPC elder ({} MPC contributors exist)",
-                db.get_mpc_elder_count().unwrap_or(0)
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Failed to check MPC elder status: {} - defaulting to non-elder",
-                e
-            );
-        }
-    }
-
-    // Only advertise Archive when Ghost Core is genuinely keeping a full archive.
-    // `storage.archive_mode = true` alone is not enough: a hazed ghostd strips
-    // block data and a pruned ghostd has discarded old blocks, so neither can
-    // serve the arbitrary historical block the Archive challenge asks for, and
-    // claiming it just burns every peer's verification challenges on a guaranteed
-    // failure. `blockchain_info` came from `getblockchaininfo` above (the pool
-    // hard-exits if that RPC is unreachable), so we never newly-claim Archive on an
-    // unknown state — fail-safe: prefer not claiming over falsely claiming.
-    if capabilities.archive_mode
-        && !should_claim_archive(
-            capabilities.archive_mode,
-            blockchain_info.hazed,
-            blockchain_info.pruned,
-        )
-    {
-        if blockchain_info.hazed {
-            warn!("Ghost Core is running in haze mode — disabling archive_mode capability (+5 shares)");
-        } else {
-            warn!("storage.archive_mode is set but Ghost Core is pruned (not keeping a full archive) — disabling archive_mode capability (+5 shares)");
-        }
-        capabilities.archive_mode = false;
-    }
-
-    info!("Capability shares: {}/15", capabilities.total_shares());
 
     // Create identity Arc
     let identity = Arc::new(identity);
@@ -1260,104 +892,24 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Initialize round manager with mining mode
+    // Rounds, for statistics: one per template.
     let is_mainnet_round = config.bitcoin.network == ghost_common::config::BitcoinNetwork::Mainnet;
-    let round_config = RoundConfig {
-        mining_mode,
-        ..Default::default()
-    };
-    let mut round_manager_inner = RoundManager::new(identity.node_id(), round_config);
-    round_manager_inner.set_metrics(Arc::clone(&metrics));
-    let round_manager = Arc::new(round_manager_inner);
+    let round_manager = Arc::new(RoundManager::new(RoundConfig::default()));
 
-    // Seed the chain height before anything reads a gate. Until the first template arrives
-    // `current_height` is 0, which sorts below every activation height — so a restarted node
-    // disagrees with the fleet about which rules are in force. That was #597 for the PoW check;
-    // for a signature-format gate it would mean signing with the wrong encoding and having peers
-    // reject the shares. A failure here is not fatal: the first template still sets the height,
-    // and the gates behave exactly as they did before this call existed.
+    // Seed the chain height so `/health` and the health pings report a real height before the
+    // first template arrives. A failure here is not fatal: the first template still sets it.
     match rpc.get_block_count().await {
         Ok(h) => {
             round_manager.seed_height(h);
-            info!(
-                height = h,
-                "Seeded chain height from Core before gate evaluation"
-            );
+            info!(height = h, "Seeded chain height from Core");
         }
         Err(e) => warn!(
             error = %e,
-            "Could not seed chain height from Core — gates read 0 until the first template"
+            "Could not seed chain height from Core — it reads 0 until the first template"
         ),
     }
 
-    // Restore the address-bind era boundary. It must survive a restart: re-deriving it from the
-    // next template would place it later than the true boundary.
-    match db.kv_get(ghost_pool::ADDR_BIND_ACTIVATION_KEY) {
-        Ok(Some(v)) => match v.parse::<u64>() {
-            Ok(r) => {
-                round_manager.note_addr_bind_activation(r);
-                info!(activation_round = r, "Restored address-bind era boundary");
-            }
-            Err(e) => warn!(value = %v, error = %e, "unparseable address-bind activation round"),
-        },
-        Ok(None) => {}
-        Err(e) => warn!(error = %e, "could not read address-bind activation round"),
-    }
-
-    // Restore the tier-commitment era boundary, for the same reason.
-    match db.kv_get(ghost_pool::TIER_BIND_ACTIVATION_KEY) {
-        Ok(Some(v)) => match v.parse::<u64>() {
-            Ok(r) => {
-                round_manager.note_tier_bind_activation(r);
-                info!(
-                    activation_round = r,
-                    "Restored tier-commitment era boundary"
-                );
-            }
-            Err(e) => warn!(value = %v, error = %e, "unparseable tier-bind activation round"),
-        },
-        Ok(None) => {}
-        Err(e) => warn!(error = %e, "could not read tier-bind activation round"),
-    }
-
-    // Restore the PoW-header era boundary. Unlike the two gates above, this one fired BEFORE
-    // boundaries were being recorded, so alongside the persisted key the boundary is DERIVED from
-    // the rounds table — rounds are persisted with their block height at round start, so the
-    // lowest round at/above the gate height IS the boundary (see `POW_VERIFY_ACTIVATION_KEY`).
-    // Both are noted; `note_pow_verify_activation` keeps the earliest. The derivation runs on
-    // every start (it is one index seek) so a value that was persisted too late self-corrects
-    // for as long as the sub-gate rounds survive in storage.
-    match db.kv_get(ghost_pool::POW_VERIFY_ACTIVATION_KEY) {
-        Ok(Some(v)) => match v.parse::<u64>() {
-            Ok(r) => {
-                round_manager.note_pow_verify_activation(r);
-                info!(activation_round = r, "Restored PoW-header era boundary");
-            }
-            Err(e) => warn!(value = %v, error = %e, "unparseable pow-verify activation round"),
-        },
-        Ok(None) => {}
-        Err(e) => warn!(error = %e, "could not read pow-verify activation round"),
-    }
-    match db.first_round_at_or_above_height(ghost_pool::share_pow_verify_height()) {
-        Ok(Some(r)) => {
-            round_manager.note_pow_verify_activation(r);
-            info!(
-                activation_round = r,
-                gate_height = ghost_pool::share_pow_verify_height(),
-                "Derived PoW-header era boundary from persisted rounds"
-            );
-        }
-        // No round at/above the gate on record: either a fresh database or the gate has not
-        // fired here. `requires_pow_header` falls back to the current height (fail-closed).
-        Ok(None) => {}
-        Err(e) => warn!(error = %e, "could not derive pow-verify activation round from rounds"),
-    }
-
-    // Register our own node's capabilities so we're included in node reward calculations
-    // This is critical - without this, our shares won't be counted for node rewards
-    round_manager.register_node(identity.node_id(), capabilities);
-
-    // Reload pre-restart share data from database so miners don't lose credit
+    // Reload the latest round's statistics from the database
     round_manager.reload_from_db(&db);
 
     // Resolve coinbase tag: coinbase_extra > pool_name formatted > mode default
@@ -1465,10 +1017,6 @@ async fn main() -> Result<()> {
         advertised_farm_port: is_public_mining
             .then_some(config.network.farm_port)
             .flatten(),
-        // Advertise our node-reward payout address so every peer's node registry
-        // converges (payout-finalisation: without it get_all_node_ids_with_payout
-        // returns {self} everywhere and the payout checkpoint can't finalise).
-        advertised_payout_address: config.pool.node_payout_address.clone(),
         // C-1: Noise Protocol configuration for encrypted P2P
         // Read from config (mainnet validation ensures this is true on mainnet)
         noise_enabled: config.network.noise_enabled,
@@ -1625,1446 +1173,19 @@ async fn main() -> Result<()> {
     mesh.set_max_capacity(cap_breakdown.effective_max);
     let effective_max_capacity = cap_breakdown.effective_max;
 
-    // Initialize consensus voting
-    let voting_manager = Arc::new(VotingManager::new(100)); // 100 max sessions
-
-    // Create broadcast callback for vote propagation via Noise relay
-    let (vote_tx, mut vote_rx) =
-        tokio::sync::mpsc::channel::<(ghost_consensus::message::MessageType, Vec<u8>)>(64);
-    let mesh_for_vote_relay = Arc::clone(&mesh);
-    tokio::spawn(async move {
-        while let Some((msg_type, payload)) = vote_rx.recv().await {
-            match mesh_for_vote_relay.create_envelope_raw(msg_type, payload) {
-                Ok(envelope) => {
-                    if let Err(e) = mesh_for_vote_relay.broadcast(envelope).await {
-                        tracing::warn!(error = %e, "Vote Noise broadcast failed");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Vote envelope creation failed");
-                }
-            }
-        }
-    });
-    let broadcast_fn: BroadcastFn = Arc::new(move |msg_type, payload| {
-        vote_tx.try_send((msg_type, payload)).map_err(|e| {
-            ghost_common::error::GhostError::Internal(format!(
-                "Vote broadcast channel error: {}",
-                e
-            ))
-        })
-    });
-
-    // Create execute callback for consensus decisions
-    let execute_fn: ExecuteFn = Arc::new(move |result: ConsensusResult| {
-        match result {
-            ConsensusResult::Approved {
-                proposal_hash,
-                approval_count,
-                total_nodes,
-            } => {
-                info!(
-                    hash = %hex::encode(&proposal_hash[..8]),
-                    approvals = approval_count,
-                    total = total_nodes,
-                    "Payout consensus approved - executing"
-                );
-                // Nothing to arm: the coinbase is the node pool's canonical one, built per
-                // job by pool_sv2. A payout proposal approved here pays nobody.
-            }
-            ConsensusResult::Rejected {
-                proposal_hash,
-                rejection_count,
-                reason,
-                ..
-            } => {
-                warn!(
-                    hash = %hex::encode(&proposal_hash[..8]),
-                    rejections = rejection_count,
-                    reason = ?reason,
-                    "Payout consensus rejected"
-                );
-            }
-            ConsensusResult::Timeout {
-                proposal_hash,
-                approvals,
-                rejections,
-                ..
-            } => {
-                warn!(
-                    hash = %hex::encode(&proposal_hash[..8]),
-                    approvals = approvals,
-                    rejections = rejections,
-                    "Payout consensus timed out"
-                );
-            }
-            ConsensusResult::Error(msg) => {
-                error!(error = %msg, "Consensus error");
-            }
-        }
-        Ok(())
-    });
-
     // Create shared ban manager for cross-handler enforcement (C1 security fix)
     let ban_manager = Arc::new(BanManager::new());
     info!("Shared BanManager created for cross-handler ban enforcement");
 
-    // GHOST-11: re-apply equivocation bans persisted before this restart, so a
-    // restart doesn't silently un-ban an equivocator that is still inside its
-    // ban window. (Bans are otherwise in-memory only.)
-    {
-        const EQUIVOCATION_BAN_WINDOW_SECS: i64 = 600;
-        let now = chrono::Utc::now().timestamp();
-        match db.get_recent_equivocators(now - EQUIVOCATION_BAN_WINDOW_SECS) {
-            Ok(equivocators) => {
-                let mut restored = 0usize;
-                for (node_id, detected_at) in equivocators {
-                    let remaining = (detected_at + EQUIVOCATION_BAN_WINDOW_SECS) - now;
-                    if remaining > 0 {
-                        ban_manager.ban_for_duration(
-                            node_id,
-                            ghost_consensus::ban_manager::BanReason::Equivocation,
-                            std::time::Duration::from_secs(remaining as u64),
-                        );
-                        restored += 1;
-                    }
-                }
-                if restored > 0 {
-                    info!(
-                        restored,
-                        "GHOST-11: re-applied persisted equivocation bans on startup"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "GHOST-11: failed to load persisted equivocation bans")
-            }
-        }
-    }
-
-    // Create vote handler with callbacks and shared ban manager
-    // 4.5 SECURITY: Rate limiter persistence is now enabled by default to prevent
-    // attackers from bypassing rate limits by triggering node restarts.
-    // GHOST-04: adapt the BFT voter floor to the registered elder set, clamped
-    // to [4, 7]. At the bootstrap 4-elder set this is 4 (f=1, 3-of-4 quorum) so
-    // payout consensus can actually FORM — a hard floor of 7 made mainnet payout
-    // voting impossible below 7 elders. It rises to 7 (f=2) as the set grows,
-    // capped at the long-term target; requiring the full registered set (up to
-    // 7) keeps a small-N quorum from being unsafe. NOTE: computed once at start;
-    // restart after the elder set changes materially.
-    let rate_limiter_path = data_dir.join("rate_limiter.json");
-    let vote_config = VoteHandlerConfig {
-        min_voters_for_bft: if is_mainnet_round {
-            (db.get_mpc_elder_count().unwrap_or(0) as usize).clamp(4, 7)
-        } else {
-            3
-        },
-        ..VoteHandlerConfig::default()
-    };
-    let vote_handler = Arc::new(
-        VoteHandler::with_config(
-            Arc::clone(&identity),
-            Arc::clone(&voting_manager),
-            vote_config,
-        )
-        .with_broadcaster(broadcast_fn)
-        .with_executor(execute_fn)
-        .with_ban_manager(Arc::clone(&ban_manager))
-        .with_database(Arc::clone(&db))
-        .with_rate_limiter_persistence(rate_limiter_path)
-        .with_revocation_executor({
-            let db_for_revoke = Arc::clone(&db);
-            Arc::new(move |node_id_hex: &str, _position: u32, reason: &str| {
-                // 1. Remove from mpc_contributions and get position
-                let pos = db_for_revoke.revoke_mpc_elder(node_id_hex)?;
-                if let Some(position) = pos {
-                    // 2. Burn the elder position
-                    db_for_revoke.burn_elder_position(position, node_id_hex, reason)?;
-                    tracing::warn!(
-                        node_id = %&node_id_hex[..8.min(node_id_hex.len())],
-                        position,
-                        reason,
-                        "Elder revoked and position burned"
-                    );
-                } else {
-                    tracing::warn!(
-                        node_id = %&node_id_hex[..8.min(node_id_hex.len())],
-                        "Elder revocation: node not found in MPC contributions"
-                    );
-                }
-                Ok(())
-            })
-        }),
-    );
-    // Start the background persistence task (persists every 60 seconds)
-    vote_handler.start_persistence_task();
-
-    // Populate elders from database for BFT voting
-    match db.get_elders() {
-        Ok(elders) => {
-            for elder in &elders {
-                // Parse node_id hex to bytes
-                if let Ok(node_id_bytes) = hex::decode(&elder.node_id) {
-                    if node_id_bytes.len() == 32 {
-                        let mut node_id = [0u8; 32];
-                        node_id.copy_from_slice(&node_id_bytes);
-                        vote_handler.add_elder(node_id);
-                    }
-                }
-            }
-            info!(
-                "Registered {} elders from database for BFT voting",
-                elders.len()
-            );
-        }
-        Err(e) => {
-            warn!("Failed to load elders for voting: {}", e);
-        }
-    }
-
-    // Register ourselves as a voter - ALL active nodes participate in BFT consensus
-    // (elder_status is just a capability flag indicating uptime/reliability, not a voting requirement)
-    vote_handler.add_elder(identity.node_id());
-    info!("Registered self as BFT voter");
-    info!(
-        "Initial voters for BFT: {} (peer discovery will add more from HealthPing)",
-        vote_handler.elder_count()
-    );
-
-    // Register vote handler with mesh for incoming vote messages
-    mesh.register_handler(
-        Arc::clone(&vote_handler) as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>
-    );
-
-    // Periodic timeout checker for payout proposals
-    // Without this, voting sessions that don't get enough votes never expire,
-    // which can cause stale proposals to accumulate and block new ones.
-    {
-        let vh_for_timeouts = Arc::clone(&vote_handler);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let timeouts = vh_for_timeouts.check_timeouts();
-                for result in &timeouts {
-                    if let ghost_common::types::ConsensusResult::Timeout {
-                        proposal_hash,
-                        approvals,
-                        total_nodes,
-                        ..
-                    } = result
-                    {
-                        tracing::warn!(
-                            hash = %hex::encode(&proposal_hash[..8]),
-                            approvals,
-                            total_nodes,
-                            "Payout proposal timed out"
-                        );
-                    }
-                }
-                vh_for_timeouts.cleanup_rate_limiter();
-            }
-        });
-    }
-
-    // Create and register health ping handler for peer tracking and voter discovery
-    // ALL active nodes participate in BFT consensus - the callback registers discovered nodes as voters
-    let vh_for_callback = Arc::clone(&vote_handler);
-    let voter_callback: ghost_consensus::health_handler::ElderCallback = Arc::new(move |node_id| {
-        vh_for_callback.add_elder(node_id);
-    });
-
-    // Callback to register node capabilities for payout calculations
-    let rm_for_callback = Arc::clone(&round_manager);
-    let node_caps_callback: ghost_consensus::health_handler::NodeCapabilitiesCallback =
-        Arc::new(move |node_id, capabilities| {
-            rm_for_callback.register_node(node_id, capabilities);
-        });
-
-    // P2P4-M2: Create capability verifier to replace claimed capabilities with VERIFIED ones
-    // This ensures health pings register nodes with their actual verified capabilities,
-    // not just what they claim. The QualifiedCapabilityProvider checks challenge results.
-    let qualification_provider_for_health = Arc::new(
-        QualifiedCapabilityProvider::new(Arc::clone(&db))
-            .with_block_hash_oracle(Arc::new(block_hash_oracle.clone()))
-            // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT. EVERY construction site
-            // must wire this — one that missed it would compute a different qualified set from
-            // its peers once the gate fires, and the node-reward split would diverge. Guarded
-            // by scripts/check-address-enforcement-wiring.sh.
-            .with_address_enforcement(ghost_pool::address_proof_enforcement_height()),
-    );
-    let qp_for_verifier = Arc::clone(&qualification_provider_for_health);
-    let capability_verifier: ghost_consensus::health_handler::CapabilityVerifierCallback =
-        Arc::new(move |node_id| qp_for_verifier.get_qualified(node_id));
-
-    let health_handler = Arc::new(
-        HealthPingHandler::new(
-            Arc::clone(mesh.peers()),
-            Some(Arc::clone(&db)),
-            Arc::clone(&ban_manager),
-        )
-        .with_elder_callback(voter_callback)
-        .with_node_capabilities_callback(node_caps_callback)
-        .with_capability_verifier(capability_verifier),
-    );
+    // Health ping handler: peer tracking for the mesh (hashrate, miner counts, routing).
+    let health_handler = Arc::new(HealthPingHandler::new(
+        Arc::clone(mesh.peers()),
+        Some(Arc::clone(&db)),
+        Arc::clone(&ban_manager),
+    ));
     mesh.register_handler(
         Arc::clone(&health_handler) as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>
     );
-
-    // Node-reward challenge convergence (Component A): reconcile the v42
-    // verification_ledger across nodes so deterministic node-reward qualification
-    // reads the same signed challenge history everywhere — the analogue of the
-    // GHOST-03 share ledger sweep below. The handler's send is sync, so outbound
-    // frames go through an mpsc channel drained by a task that wraps each in a
-    // ChallengeConvergence envelope and broadcasts it.
-    //
-    // A response is addressed to its requester rather than fanned out: it serves exactly one
-    // peer's advertised key set, so a fan-out spends a Noise send per peer to serve one (#647).
-    let (verify_conv_tx, verify_conv_rx) = ghost_pool::convergence_channel::convergence_channel(
-        ghost_pool::convergence_channel::CONVERGENCE_CHANNEL_CAPACITY,
-        "challenge",
-    );
-    {
-        let counters = Arc::clone(verify_conv_tx.counters());
-        let transport = Arc::new(
-            ghost_pool::convergence_channel::MeshConvergenceTransport::new(
-                Arc::clone(&mesh),
-                ghost_consensus::MessageType::ChallengeConvergence,
-            ),
-        );
-        tokio::spawn(ghost_pool::convergence_channel::drain(
-            verify_conv_rx,
-            transport,
-            counters,
-            "challenge",
-        ));
-    }
-    let verify_conv_send: ghost_consensus::verification_handler::ChallengeSendFn = {
-        let verify_conv_tx = verify_conv_tx.clone();
-        Arc::new(move |bytes, to| verify_conv_tx.try_enqueue(bytes, to))
-    };
-
-    // Create and register verification result handler for P2P verification results
-    // HIGH-VER-4: Use with_peers to validate challengers are known nodes before recording
-    // CONSENSUS SECURITY: re-derive peer-broadcast Archive verdicts against our
-    // own Bitcoin Core + the target's signed response, so a colluding minority of
-    // challengers cannot fabricate a FAIL (to grief an honest node under the 95%
-    // gate) or a PASS. `rpc` is the node's Bitcoin Core RPC client (see above).
-    let verification_result_handler = Arc::new(
-        VerificationResultHandler::with_peers(Arc::clone(&db), Arc::clone(mesh.peers()))
-            .with_rederivation(Arc::new(
-                ghost_pool::verification_reverify::ChainReVerifier::new(
-                    Arc::clone(&rpc),
-                    policy.clone(),
-                ),
-            ))
-            .with_challenge_send(verify_conv_send),
-    );
-    mesh.register_handler(Arc::clone(&verification_result_handler)
-        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-    // ── Payout-ledger checkpoint finalisation (payout-finalisation P1) ──
-    // The fleet BFT-finalises a {height, cutoff_ts, ledger_root} snapshot at a
-    // lagging height; the coinbase becomes a pure function of it (see
-    // tasks/design_payout_finalization.md). Runs DARK here — nothing consumes the
-    // finalised checkpoint yet; the coinbase wiring lands behind an activation gate.
-    let (plchk_tx, mut plchk_rx) =
-        tokio::sync::mpsc::channel::<(ghost_consensus::MessageType, Vec<u8>)>(256);
-    {
-        let mesh_c = Arc::clone(&mesh);
-        tokio::spawn(async move {
-            while let Some((ty, bytes)) = plchk_rx.recv().await {
-                match mesh_c.create_envelope_raw(ty, bytes) {
-                    Ok(env) => {
-                        if let Err(e) = mesh_c.broadcast(env).await {
-                            tracing::debug!(error = %e, "payout-checkpoint broadcast failed");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "payout-checkpoint envelope failed"),
-                }
-            }
-        });
-    }
-    let plchk_send: ghost_pool::payout_checkpoint::BroadcastFn = {
-        let tx = plchk_tx.clone();
-        Arc::new(move |ty, bytes| {
-            tx.try_send((ty, bytes)).map_err(|e| {
-                ghost_common::error::GhostError::P2PMessage(format!(
-                    "payout-checkpoint channel: {e}"
-                ))
-            })
-        })
-    };
-    // compute_root: the canonical ledger root from THIS node's converged view at a
-    // fixed cutoff — miner set (unpaid ledger) + qualified-node set. Deterministic
-    // subsidy via calculate_block_subsidy(height, None) so every node matches.
-    // The shard, once it exists. It is constructed BELOW this point, while the checkpoint manager
-    // that owns the closure is built above it — so the handle is filled in rather than captured.
-    // Safe because the closure is only ever CALLED to propose or vote a checkpoint, long after
-    // startup has finished; it is never called during init.
-    let shard_for_checkpoint: Arc<OnceLock<Arc<ghost_pool::shard::ShardRuntime>>> =
-        Arc::new(OnceLock::new());
-    let compute_ledger_root_fn: ghost_pool::payout_checkpoint::ComputeRootFn = {
-        let db_c = Arc::clone(&db);
-        let oracle_c = block_hash_oracle.clone();
-        let shard_c = Arc::clone(&shard_for_checkpoint);
-        Arc::new(move |cutoff_ts, height| {
-            // (the block subsidy was only needed by the legacy ledger source, removed in Stage 6)
-            // #722: at and above the gate the miner half comes from the SHARD, not the legacy
-            // unpaid ledger. v56 disabled the GHOST-03 sweep that repaired `shares` while this
-            // computation kept reading it, so its holes became permanent and no two nodes could
-            // agree a per-address total — 25% apart against a 2% tolerance, every proposal
-            // rejected by everyone since 2026-08-18. The shard converges where that table cannot.
-            //
-            // Refuse rather than fall back when the shard is absent or unarmed. A silent fall
-            // back to the legacy ledger is precisely the mixed-source divergence this gate exists
-            // to end: the node would compute a root nobody else can reproduce and reject every
-            // proposal, which is the failure we are already living with and the hardest kind to
-            // attribute. Returning `None` makes this node abstain, loudly.
-            let miner_payouts = if height >= ghost_pool::checkpoint_from_shard_height() {
-                let Some(rt) = shard_c.get() else {
-                    error!(
-                        height,
-                        "checkpoint: at/above CHECKPOINT_FROM_SHARD_HEIGHT but no shard is \
-                         running — abstaining. Set `pool.share_shard`; this node cannot take \
-                         part in payout checkpoints until it does"
-                    );
-                    return None;
-                };
-                if !rt.genesis_installed() {
-                    error!(
-                        height,
-                        "checkpoint: at/above CHECKPOINT_FROM_SHARD_HEIGHT but shard genesis is \
-                         NOT installed — abstaining. Its balances would omit everything the pool \
-                         owed before the shard was armed"
-                    );
-                    return None;
-                }
-                ghost_pool::payout::select_shard_miner_work(&rt.owed_snapshot())
-            } else {
-                // Stage 6: the legacy ledger source is gone. Below the gate there is nothing to
-                // fall back TO, so abstain loudly rather than compute a root from a source that
-                // no longer exists.
-                //
-                // ⚠ Unreachable in practice — `CHECKPOINT_FROM_SHARD_HEIGHT` (963,388) passed on
-                // 2026-08-21, so no live height takes this arm. The branch survives only until
-                // the tip-keyed gate collapse removes the gate itself, which is a later release.
-                error!(
-                    height,
-                    "checkpoint: below CHECKPOINT_FROM_SHARD_HEIGHT, whose legacy source was \
-                     removed in the Stage 6 deletion — abstaining"
-                );
-                return None;
-            };
-            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()))
-                // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
-                // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
-                // address enforcement: every paid or ratified derivation wires it identically.
-                .with_coordinator_shares(height >= ghost_pool::coordinator_shares_height());
-            // A-2/A-2b: the checkpoint root must scope challengers to the voter set +
-            // subnets AND to the consensus assignment at/above the gates, identically to
-            // the coinbase node split, or the root and the paid split would disagree.
-            let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
-            let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
-            let node_shares = qp.get_all_qualified_nodes_at_cutoff_from_db(
-                cutoff_ts,
-                voter_set_scoped,
-                assignment_scoped,
-            );
-            let root = ghost_pool::payout::compute_ledger_root(
-                &miner_payouts,
-                &node_shares,
-                cutoff_ts,
-                height,
-            );
-            Some(ghost_pool::payout_checkpoint::CanonicalPayout {
-                miner_payouts,
-                node_shares,
-                root,
-            })
-        })
-    };
-    // DIAGNOSTIC (v1.10.34): breakdown of the root inputs (miner-set + node-set
-    // hashed separately, with counts + node list), so a live root divergence can be
-    // isolated to the miner half or the node half and compared across nodes.
-    // Formats the breakdown from the lists the caller ALREADY computed — it does not touch the
-    // database. This closure previously re-ran `select_ledger_miner_work` and the qualified-node
-    // query, i.e. a second full scan of the unpaid ledger on every propose and every reject,
-    // solely to hash values the caller was holding. On the live fleet that is 1.46M rows per
-    // call and roughly half of all checkpoint scan load (measured ghost-vm7, 2026-08-08).
-    let compute_ledger_root_diag_fn: ghost_pool::payout_checkpoint::ComputeRootDiagFn =
-        Arc::new(|miners, nodes, cutoff_ts, height| {
-            ghost_pool::payout::ledger_root_diag(miners, nodes, cutoff_ts, height)
-        });
-    // ACTIVE_VOTER_SET resolver: the qualified active node set at a cutoff, from the SAME
-    // scoped query `compute_ledger_root_fn` uses for `node_shares` — so the voter set and
-    // the ratified ledger's node set are identical by construction. Once ACTIVE_VOTER_SET
-    // activates, the payout consensus votes/proposes over ALL qualified nodes, not just the
-    // MPC ceremony elders (with an elder floor; see `voter_set_for`).
-    let active_voter_set_fn: ghost_pool::payout_checkpoint::ActiveVoterSetFn = {
-        let db_c = Arc::clone(&db);
-        let oracle_c = block_hash_oracle.clone();
-        Arc::new(move |cutoff_ts, height| {
-            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()))
-                // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
-                // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
-                // address enforcement: every paid or ratified derivation wires it identically.
-                .with_coordinator_shares(height >= ghost_pool::coordinator_shares_height());
-            let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
-            let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
-            let mut ids: Vec<ghost_common::types::NodeId> = qp
-                .get_all_qualified_nodes_at_cutoff_from_db(
-                    cutoff_ts,
-                    voter_set_scoped,
-                    assignment_scoped,
-                )
-                .into_iter()
-                .map(|(id, _shares)| id)
-                .collect();
-            ids.sort_unstable();
-            ids
-        })
-    };
-    let payout_checkpoint_mgr = Arc::new(
-        ghost_pool::payout_checkpoint::PayoutCheckpointManager::new(
-            Arc::clone(&identity),
-            Arc::clone(&db),
-            plchk_send,
-            compute_ledger_root_fn,
-        )
-        .with_diag(compute_ledger_root_diag_fn)
-        .with_active_voter_set_fn(active_voter_set_fn.clone()),
-    );
-    // The network shard (docs/SHARE_SHARD.md). Dark unless `pool.share_shard` is set.
-    //
-    // A load failure is deliberately NOT fatal: the shard folds and
-    // persists its own state and pays nobody yet, so taking the pool down because an observation
-    // could not start would make the safer configuration the riskier one to deploy.
-    //
-    // `owns_evidence` is passed TRUE explicitly rather than defaulted, and it is true only
-    // because migration v56 shipped in this same binary. Retention deletes from `shares`; until
-    // v56 that was also the table the legacy payout path computed unpaid balances from, so a
-    // delete took money out of a ledger that was still paying. v56 renamed that ledger to the
-    // frozen `shares_archive` and left `shares` holding this node's own post-cutover evidence
-    // and nothing else, which is what makes the delete safe. Spelled at the call site because a
-    // defaulted money-safety gate is one nobody reads.
-    //
-    // ⚠ Do not set this true in a binary that does not carry v56 — see `ShardRuntime`'s
-    // `owns_evidence` doc for what that costs and how long it stays invisible.
-    let shard: Option<Arc<ghost_pool::shard::ShardRuntime>> = if config.pool.share_shard {
-        let solo = matches!(
-            config.network.mining_mode,
-            ghost_common::config::MiningMode::PrivateSolo
-        );
-        match ghost_pool::shard::ShardRuntime::load(
-            Arc::clone(&identity),
-            Arc::clone(&db),
-            solo,
-            true,
-        ) {
-            Ok(rt) => {
-                info!(
-                    epoch_blocks = ghost_common::share_shard::EPOCH_BLOCKS.get(),
-                    retention_epochs = ghost_common::share_shard::RETENTION_EPOCHS,
-                    solo,
-                    "shard: enabled"
-                );
-                Some(Arc::new(rt))
-            }
-            Err(e) => {
-                error!(error = %e, "shard: could not load — continuing without it");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // ── Stage 5: the genesis ceremony ────────────────────────────────────────────────────────
-    //
-    // Runs ONCE, on startup, when the operator sets `pool.shard_arm_genesis`. Converts THIS node's
-    // own copy of the pinned anchor checkpoint into the opening balances and asserts the result
-    // against the compile-time pin. A loud LOCAL self-check: no node asks another node anything.
-    //
-    // Idempotent — arming refuses once the genesis column exists — so leaving the flag set across
-    // restarts is the intended steady state, and "already armed" is reported as SUCCESS rather
-    // than as a failure, or every restart of a correctly armed node would log an error saying it
-    // is unarmed.
-    //
-    // ⚠ On a genuine refusal the shard is DROPPED, not merely left unarmed. An earlier version of
-    // this block claimed "the shard simply does not start" and did not implement it: `shard` was
-    // already `Some`, and the mesh handler and fold task below guard on `shard` rather than on
-    // arming state — so a refused ceremony left the shard fully live, folding into an unarmed
-    // column and gossiping summaries with `genesis_marker: None`. The safety argument the whole
-    // block rests on has to be real, so the binding is reassigned.
-    let shard = match (&shard, config.pool.shard_arm_genesis) {
-        (Some(rt), true) => {
-            let anchor = ghost_accounting::shard_genesis::pinned_anchor();
-            match db.get_payout_ledger_canonical_blob(anchor.height) {
-                Ok(Some(blob)) => match rt.arm_from_genesis(&anchor, &blob) {
-                    Ok(report) => {
-                        info!(
-                            anchor_height = report.anchor_height,
-                            epoch_floor = report.epoch_floor,
-                            opening_addresses = report.opening_addresses,
-                            replaced_columns = report.replaced_columns,
-                            cleared_epochs = report.cleared_epochs,
-                            table_root = %hex::encode(&report.table_root[..8]),
-                            "shard: GENESIS CEREMONY COMPLETE"
-                        );
-                        shard
-                    }
-                    Err(e) if e.to_string().contains("already armed") => {
-                        // The steady state, not a fault.
-                        info!(
-                            anchor_height = anchor.height,
-                            "shard: already armed — ceremony skipped"
-                        );
-                        shard
-                    }
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            anchor_height = anchor.height,
-                            "shard: genesis ceremony REFUSED — DISABLING the shard. A shard that \
-                             failed to open is visible and recoverable; one folding and gossiping \
-                             from balances the ceremony rejected is neither"
-                        );
-                        None
-                    }
-                },
-                // Absent is NOT "convert something near it". A node missing the anchor must not
-                // fall back to an older checkpoint: it would pass its own checks and open on
-                // balances no other node agreed to.
-                Ok(None) => {
-                    error!(
-                        anchor_height = anchor.height,
-                        "shard: no checkpoint at the anchor height — DISABLING the shard; sync it \
-                         before arming"
-                    );
-                    None
-                }
-                Err(e) => {
-                    error!(error = %e, "shard: could not read the anchor checkpoint — DISABLING the shard");
-                    None
-                }
-            }
-        }
-        (None, true) => {
-            // The exact failure `shard_arm_genesis`'s own doc warns about: arming a runtime that
-            // was never constructed. Silence here is how an operator ends up believing a node is
-            // armed when nothing ran at all.
-            warn!(
-                "shard: `shard_arm_genesis` is set but `share_shard` is NOT — nothing to arm, and \
-                 no ceremony ran. Set both, or neither."
-            );
-            shard
-        }
-        _ => shard,
-    };
-
-    // Hand the (possibly armed) shard to the checkpoint closure built above. Done here rather
-    // than at construction because the checkpoint manager is built before the shard exists, and
-    // done AFTER the arming match so the closure sees the armed runtime — an unarmed one has no
-    // genesis balances and its `owed()` would omit everything the pool owed before the cutover.
-    if let Some(rt) = shard.as_ref() {
-        let _ = shard_for_checkpoint.set(Arc::clone(rt));
-    }
-
-    // The share checks in force right now: §6 sampling and the §12.4 evidence audits.
-    //
-    // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
-    // captured it once would keep applying the rules in force when the process started. ONE
-    // definition, used by both consumers — a second spelling is how a signer and a verifier
-    // drift apart, and here one of them decides who gets publicly accused.
-    let share_checks: ghost_pool::share_checks::ChecksFn = {
-        let rm_c = Arc::clone(&round_manager);
-        Arc::new(move || {
-            ghost_pool::share_checks::NodeShareChecks::at_height(
-                rm_c.current_height(),
-                rm_c.addr_bind_activation_round(),
-                rm_c.pow_verify_activation_round(),
-                ghost_pool::share_pow_verify_height(),
-                rm_c.tier_bind_activation_round(),
-            )
-        })
-    };
-
-    // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
-    // no handler on the mesh at all — matching the flag's promise that deploying the binary
-    // starts nothing.
-    if let Some(ref rt) = shard {
-        // Responder channel for whole-table syncs. The handler cannot send: it has no mesh
-        // reference, so it hands the built response here and this task puts it on the wire.
-        // §12.4 evidence produced by our own audits, broadcast to every peer.
-        let (evidence_tx, mut evidence_rx) =
-            tokio::sync::mpsc::channel::<ghost_consensus::message::ShardEvidenceMessage>(16);
-
-        // Served §6 sampling responses, same hand-off shape as the sync responder.
-        let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<(
-            ghost_common::types::NodeId,
-            ghost_consensus::message::ShardSampleResponseMessage,
-        )>(16);
-
-        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel::<(
-            ghost_common::types::NodeId,
-            ghost_consensus::message::ShardTableSyncMessage,
-        )>(16);
-
-        let h = Arc::new(
-            ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(rt))
-                .with_sync_responder(sync_tx)
-                .with_sample_responder(sample_tx)
-                .with_evidence_publisher(evidence_tx)
-                .with_share_checks(Arc::clone(&share_checks)),
-        );
-        mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-        // §12.4 publish half: broadcast evidence our own audits produced.
-        //
-        // BROADCAST, not unicast: the verdict is re-derivable by every peer from the bytes alone,
-        // and a verdict one node keeps to itself protects only that node while the accused keeps
-        // being merged everywhere else.
-        {
-            let mesh_c = Arc::clone(&mesh);
-            tokio::spawn(async move {
-                while let Some(ev) = evidence_rx.recv().await {
-                    if !mesh_c.noise_available() {
-                        warn!("shard: Noise unavailable — §12.4 evidence NOT published");
-                        continue;
-                    }
-                    let bytes = match serde_json::to_vec(&ev) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "shard: evidence would not serialise");
-                            continue;
-                        }
-                    };
-                    let cap = ghost_consensus::message_validator::max_payload_size(
-                        ghost_consensus::MessageType::ShardEvidence,
-                    );
-                    if bytes.len() > cap {
-                        warn!(
-                            bytes = bytes.len(),
-                            cap, "shard: evidence exceeds the per-type cap — NOT published"
-                        );
-                        continue;
-                    }
-                    match mesh_c
-                        .create_envelope_raw(ghost_consensus::MessageType::ShardEvidence, bytes)
-                    {
-                        Ok(env) => match mesh_c.broadcast(env).await {
-                            Ok(0) => warn!(
-                                "shard: §12.4 evidence reached NO peers — the accused is \
-                                 quarantined here only"
-                            ),
-                            Ok(peers) => warn!(
-                                peers,
-                                accused = %hex::encode(&ev.summary.node_id[..4]),
-                                epoch = ev.summary.epoch,
-                                "shard: published §12.4 evidence"
-                            ),
-                            Err(e) => warn!(error = %e, "shard: evidence broadcast failed"),
-                        },
-                        Err(e) => warn!(error = %e, "shard: evidence envelope failed"),
-                    }
-                }
-            });
-        }
-
-        // §6 serve half: unicast a served audit answer back to the node that asked.
-        {
-            let mesh_c = Arc::clone(&mesh);
-            tokio::spawn(async move {
-                while let Some((requester, response)) = sample_rx.recv().await {
-                    // Same rule as every other shard transmit: the leaves carry whole
-                    // ShareProofs, including payout addresses, so this must not go out in clear.
-                    if !mesh_c.noise_available() {
-                        warn!("shard: Noise unavailable — §6 sampling response NOT served");
-                        continue;
-                    }
-                    let bytes = match serde_json::to_vec(&response) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "shard: sampling response would not serialise");
-                            continue;
-                        }
-                    };
-                    let cap = ghost_consensus::message_validator::max_payload_size(
-                        ghost_consensus::MessageType::ShardSampleResponse,
-                    );
-                    if bytes.len() > cap {
-                        // §6 allows an honest SUBSET, so an oversized answer is a bug in how many
-                        // leaves were packed, not a reason to go silent without saying so.
-                        warn!(
-                            bytes = bytes.len(),
-                            cap,
-                            leaves = response.leaves.len(),
-                            "shard: sampling response exceeds the per-type cap — not sent; the \
-                             receiver would drop it silently"
-                        );
-                        continue;
-                    }
-                    let env = match mesh_c.create_envelope_raw(
-                        ghost_consensus::MessageType::ShardSampleResponse,
-                        bytes,
-                    ) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            warn!(error = %e, "shard: sampling response envelope failed");
-                            continue;
-                        }
-                    };
-                    match mesh_c.peers().get_peer(&requester) {
-                        Some(peer) => {
-                            if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
-                                debug!(error = %e, "shard: could not send sampling response");
-                            }
-                        }
-                        None => debug!("shard: sampling requester is not a known peer"),
-                    }
-                }
-            });
-        }
-
-        // §6 ask half: audit one ratified peer per interval.
-        //
-        // The verdict path judges a sampled share by BLOCK HEIGHT, not by our local rounds — see
-        // `NodeBatchChecks::at_shared_height`. Round numbers are node-local, so judging a peer's
-        // shares by ours accused honest operators; height is the axis every node agrees on, and
-        // the gates were always defined in height terms before being translated into rounds.
-        {
-            // §6 ask half: audit one ratified peer per interval.
-            //
-            // ⚠ The entropy is drawn HERE, fresh per audit, from the OS RNG, and never leaves this
-            // node until the request is sent. The ~10^-6 detection bound rests entirely on the sampled
-            // node being unable to predict which leaves will be pulled before it signs its summary: a
-            // node that can predict them fabricates work in the never-sampled leaves and the bound
-            // collapses to zero. Deriving it from the summary, chain data, a schedule or a per-node
-            // seed all break it.
-            {
-                let mesh_c = Arc::clone(&mesh);
-                let rt_c = Arc::clone(rt);
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        interval.tick().await;
-                        // An unanswered audit is not a verdict (§6 leaves that to policy), but it
-                        // must not accumulate.
-                        let expired =
-                            rt_c.expire_pending_samples(std::time::Duration::from_secs(3600));
-                        if expired > 0 {
-                            debug!(expired, "shard: expired unanswered §6 audits");
-                        }
-                        if !mesh_c.noise_available() {
-                            continue;
-                        }
-                        // Pick a live ratified peer at random; `sample_request_for` refuses anything
-                        // outside the ratified set, ourselves, and epochs with nothing to sample.
-                        let self_id = rt_c.node_id();
-                        let candidates: Vec<_> = mesh_c
-                            .peers()
-                            .get_connected_peers(300)
-                            .into_iter()
-                            .filter(|p| p.node_id != self_id)
-                            .collect();
-                        let Some(target) = ({
-                            use rand::seq::SliceRandom;
-                            let mut rng = rand::thread_rng();
-                            candidates.choose(&mut rng).map(|p| p.node_id)
-                        }) else {
-                            continue;
-                        };
-                        // OsRng, not thread_rng(): this is the §6 sampling challenge a peer
-                        // must answer, so its unpredictability is the whole point (#705, E-1).
-                        let entropy: [u8; 32] = {
-                            use rand::Rng;
-                            rand::rngs::OsRng.gen()
-                        };
-                        let req = match rt_c.sample_request_for(
-                            &target,
-                            &entropy,
-                            ghost_consensus::shard_handler::DEFAULT_SAMPLE_LAMBDA,
-                        ) {
-                            Ok(Some(r)) => r,
-                            Ok(None) => continue,
-                            Err(e) => {
-                                warn!(error = %e, "shard: could not build a §6 sampling request");
-                                continue;
-                            }
-                        };
-                        let bytes = match serde_json::to_vec(&req) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!(error = %e, "shard: sampling request would not serialise");
-                                continue;
-                            }
-                        };
-                        match mesh_c.create_envelope_raw(
-                            ghost_consensus::MessageType::ShardSampleRequest,
-                            bytes,
-                        ) {
-                            Ok(env) => match mesh_c.peers().get_peer(&target) {
-                                Some(peer) => {
-                                    if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
-                                        debug!(error = %e, "shard: could not send sampling request");
-                                    } else {
-                                        info!(
-                                            epoch = req.epoch,
-                                            peer = %hex::encode(&target[..4]),
-                                            leaves = req.leaf_indices.len(),
-                                            "shard: sent a §6 sampling request"
-                                        );
-                                    }
-                                }
-                                None => debug!("shard: sampling target is not a known peer"),
-                            },
-                            Err(e) => warn!(error = %e, "shard: sampling request envelope failed"),
-                        }
-                    }
-                });
-            }
-        }
-
-        // Serve half: answer a peer's sync request, unicast back to whoever asked.
-        {
-            let mesh_c = Arc::clone(&mesh);
-            tokio::spawn(async move {
-                while let Some((requester, response)) = sync_rx.recv().await {
-                    // Same rule as the summary path: the table is keyed by PAYOUT ADDRESS, so it
-                    // must never go out in clear. A requester that got no answer simply retries.
-                    if !mesh_c.noise_available() {
-                        warn!("shard: Noise unavailable — table sync NOT served (payout addresses must not go out in clear)");
-                        continue;
-                    }
-                    let bytes = match serde_json::to_vec(&response) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "shard: table sync response would not serialise");
-                            continue;
-                        }
-                    };
-                    // ⚠ Check the cap HERE, on the way out.
-                    //
-                    // `validate_payload_size` runs only on the inbound side, so an oversized table
-                    // is dropped by the receiver at `debug!` while this node logs a successful
-                    // send. §12.6 would then stop working with nothing in either log naming the
-                    // reason — and it would fail precisely when the table is largest, which is
-                    // when the repair matters most. Saying so loudly is the difference between a
-                    // known limit and a silent one.
-                    let cap = ghost_consensus::message_validator::max_payload_size(
-                        ghost_consensus::MessageType::ShardTableSync,
-                    );
-                    if bytes.len() > cap {
-                        warn!(
-                            bytes = bytes.len(),
-                            cap,
-                            "shard: table sync response EXCEEDS the per-type payload cap — not \
-                             sent; the receiver would drop it silently. §12.6 repair is degraded \
-                             until the table is split or the cap is raised."
-                        );
-                        continue;
-                    }
-                    let env = match mesh_c
-                        .create_envelope_raw(ghost_consensus::MessageType::ShardTableSync, bytes)
-                    {
-                        Ok(e) => e,
-                        Err(e) => {
-                            warn!(error = %e, "shard: table sync envelope failed");
-                            continue;
-                        }
-                    };
-                    // Unicast: a whole table is large and only the asker needs it.
-                    match mesh_c.peers().get_peer(&requester) {
-                        Some(peer) => {
-                            if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
-                                debug!(error = %e, "shard: could not send table sync response");
-                            }
-                        }
-                        None => debug!("shard: table sync requester is not a known peer"),
-                    }
-                }
-            });
-        }
-
-        // Ask half: periodically request a whole-table sync from the fleet.
-        //
-        // ⚠ This is NOT redundant with epoch-summary gossip, which is why it has to exist.
-        // `EpochSummary::build` emits only the addresses that had shares in that epoch, so a node
-        // which has gone quiet broadcasts a summary containing nothing, and a peer that was absent
-        // while it was working can never learn its totals from gossip. Measured on the fleet
-        // 2026-08-15: vm1–4 held 5 columns and vm5–8 held 6, byte-identical within each group,
-        // with zero refusals — a gap no amount of listening would have closed.
-        //
-        // Hourly, jittered by node id: the payload is the whole accrued table, and eight nodes
-        // asking in lockstep would serve eight copies of it at the same instant every hour.
-        {
-            let mesh_c = Arc::clone(&mesh);
-            let rt_c = Arc::clone(rt);
-            let self_id = identity.node_id();
-            tokio::spawn(async move {
-                // Spread the first ask across ten minutes so a fleet restarted together does not
-                // synchronise. Derived from the node id, so it is stable across restarts.
-                let jitter = (self_id[0] as u64 * 600) / 256;
-                tokio::time::sleep(std::time::Duration::from_secs(120 + jitter)).await;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    interval.tick().await;
-                    if !mesh_c.noise_available() {
-                        continue;
-                    }
-                    // The request carries only our node id and our table root — no addresses —
-                    // but it rides Noise anyway so the root is not a public fingerprint.
-                    // `None` in solo mode: a solo node must not make the fleet build tables for
-                    // an answer it would discard.
-                    let req = match rt_c.table_sync_request() {
-                        Some(r) => r,
-                        None => continue,
-                    };
-                    let bytes = match serde_json::to_vec(&req) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "shard: table sync request would not serialise");
-                            continue;
-                        }
-                    };
-                    match mesh_c
-                        .create_envelope_raw(ghost_consensus::MessageType::ShardTableSync, bytes)
-                    {
-                        Ok(env) => match mesh_c.broadcast(env).await {
-                            Ok(0) => debug!("shard: table sync request reached no peers"),
-                            Ok(peers) => info!(peers, "shard: requested a whole-table sync"),
-                            Err(e) => debug!(error = %e, "shard: table sync request failed"),
-                        },
-                        Err(e) => warn!(error = %e, "shard: table sync request envelope failed"),
-                    }
-                }
-            });
-        }
-
-        info!("shard: mesh handler registered (summaries + whole-table sync)");
-    }
-
-    mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
-        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-    if let Some(ref rt) = shard {
-        // Two handles: one for the relay task, one for the tick task that owns the fold.
-        let rt_publish = Arc::clone(rt);
-        let rt = Arc::clone(rt);
-        let rpc_c = Arc::clone(&rpc);
-        // Broadcast relay for this node's own summaries. Channel-plus-relay, the same shape the
-        // checkpoint path uses: the fold holds the storage lock and must never await a
-        // network send while holding it.
-        let (shard_tx, mut shard_rx) =
-            tokio::sync::mpsc::channel::<ghost_common::share_shard::EpochSummary>(64);
-        {
-            let mesh_c = Arc::clone(&mesh);
-            let rt_c = rt_publish;
-            tokio::spawn(async move {
-                while let Some(summary) = shard_rx.recv().await {
-                    let epoch = summary.epoch;
-                    // ⚠ Refuse to send at all if the Noise plane is absent.
-                    //
-                    // `broadcast` falls back to plaintext ZMQ for ANY message type when there is
-                    // no Noise pool, and returns Ok(1) — so the "zero peers is not success" guard
-                    // below could never fire, `mark_broadcast` would retire the pending flag, and
-                    // a summary whose delta map is KEYED BY PAYOUT ADDRESS would have gone out in
-                    // clear. Leaving it pending is strictly better: nothing leaks, and it sends
-                    // the moment Noise is up.
-                    if !mesh_c.noise_available() {
-                        warn!(
-                            epoch,
-                            "shard: Noise unavailable — summary NOT broadcast (payout addresses \
-                             must not go out in clear); staying pending"
-                        );
-                        continue;
-                    }
-                    let bytes = match serde_json::to_vec(
-                        &ghost_consensus::message::ShardEpochSummaryMessage { summary },
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, epoch, "shard: summary would not serialise");
-                            continue;
-                        }
-                    };
-                    match mesh_c
-                        .create_envelope_raw(ghost_consensus::MessageType::ShardEpochSummary, bytes)
-                    {
-                        Ok(env) => match mesh_c.broadcast(env).await {
-                            // `broadcast` returns how many peers it reached. ZERO is not success:
-                            // the summary went nowhere, and marking it published would retire the
-                            // only record that it still needs sending. Left pending, it is picked
-                            // up again on a later tick once a peer is reachable.
-                            Ok(0) => {
-                                info!(epoch, "shard: summary reached no peers — left pending")
-                            }
-                            Ok(peers) => {
-                                // Marked ONLY after the send reached someone — the flag is the sole
-                                // record that an epoch still needs putting on the wire, so marking
-                                // optimistically would lose it silently.
-                                let _ = peers;
-                                match rt_c.mark_broadcast(epoch) {
-                                    Ok(true) => info!(epoch, peers, "shard: summary broadcast"),
-                                    Ok(false) => warn!(
-                                        epoch,
-                                        "shard: broadcast an epoch with no stored summary row"
-                                    ),
-                                    Err(e) => {
-                                        warn!(error = %e, epoch, "shard: could not mark published")
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, epoch, "shard: broadcast failed — will retry")
-                            }
-                        },
-                        Err(e) => warn!(error = %e, epoch, "shard: envelope failed"),
-                    }
-                }
-            });
-        }
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                // The tip comes from this node's own RPC, never from a peer: an epoch boundary
-                // must be a function of the chain this node has actually validated.
-                let tip = match rpc_c.get_block_count().await {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                // Drain pending summaries EVERY tick, not only on a tick that folded.
-                //
-                // This used to sit inside the `folded` arm, which contradicted its own comment: a
-                // node that folded while partitioned and regained peers a minute later waited up
-                // to a full epoch (~1h) to retry, and a restart carrying a backlog published
-                // nothing until the next epoch closed. The flag is the durable record of "still
-                // needs sending", so it should be consulted on the cadence that can act on it.
-                match rt.pending_broadcasts(8) {
-                    Ok(pending) => {
-                        for summary in pending {
-                            if shard_tx.try_send(summary).is_err() {
-                                // Relay saturated. Nothing is lost: the rows stay unpublished and
-                                // the next tick retries them.
-                                debug!("shard: broadcast relay busy — summaries stay pending");
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "shard: could not read pending summaries"),
-                }
-
-                match rt.tick(tip) {
-                    Ok(report) if !report.folded.is_empty() => {
-                        info!(
-                            tip,
-                            folded = report.folded.len(),
-                            remaining = report.remaining,
-                            "shard: folded closed epochs"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(error = %e, tip, "shard: epoch tick failed — retrying next tick")
-                    }
-                }
-
-                // Maturity settlement (§4.6) rides the same task, deliberately: a block 100 deep
-                // is past reorg range, so this is a lookback with no reversal to handle, and it
-                // must NEVER move to the block-connected or template-refresh paths — those must
-                // stay sub-second at a tip change. Bounded per call; a backlog resumes next tick.
-                match rt.settle_matured(&rpc_c, tip).await {
-                    // A STALL must be louder than a success, and must not depend on whether
-                    // anything happened to settle. Logging only the non-empty case meant a node
-                    // whose cursor had stopped moving looked exactly like one with nothing to do —
-                    // and the difference between those two is unpaid work piling up unnoticed.
-                    Ok(r) if r.stalled_at.is_some() || !r.skipped_unreadable.is_empty() => warn!(
-                        tip,
-                        stalled_at = ?r.stalled_at,
-                        skipped = ?r.skipped_unreadable,
-                        settled = r.settled.len(),
-                        deferred = r.deferred,
-                        "shard: settlement did NOT complete its window"
-                    ),
-                    // ⛔ An unresolvable payout tag outranks "we settled something", because it
-                    // means a block we may have WON cannot be settled and its balances will never
-                    // discharge. It was previously counted into the report and never logged at
-                    // all, so the one symptom was a weight ledger that quietly stopped decaying.
-                    Ok(r) if r.ours_but_unresolvable > 0 => warn!(
-                        tip,
-                        unresolvable = r.ours_but_unresolvable,
-                        settled = r.settled.len(),
-                        deferred = r.deferred,
-                        "shard: coinbase payout tag(s) matched NO proposal we hold — if any of \
-                         those blocks were ours, their balances will never discharge"
-                    ),
-                    Ok(r) if !r.settled.is_empty() => info!(
-                        tip,
-                        blocks = r.settled.len(),
-                        deferred = r.deferred,
-                        "shard: settled matured pool blocks"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(error = %e, tip, "shard: maturity settlement failed — retrying next tick")
-                    }
-                }
-            }
-        });
-    }
-
-    // Propose cadence: every ~30s the deterministic proposer for (tip - LAG)
-    // proposes that checkpoint. LAG keeps the anchor far enough behind the tip that
-    // the share/qualification ledgers have converged there (else validators reject).
-    {
-        let mgr = Arc::clone(&payout_checkpoint_mgr);
-        let rpc_c = Arc::clone(&rpc);
-        tokio::spawn(async move {
-            const LAG: u64 = 6;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let tip = match rpc_c.get_block_count().await {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                if tip <= LAG {
-                    continue;
-                }
-                let height = tip - LAG;
-                let cutoff_ts = match rpc_c.get_block_hash(height).await {
-                    Ok(hash) => match rpc_c.get_block_header(&hash).await {
-                        Ok(hdr) => hdr.time as i64,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-                mgr.maybe_propose(height, cutoff_ts).await;
-                // On-demand backfill: if we lag the anchor (a missed proposal left a
-                // hole the once-only broadcast can't recover), pull it from peers.
-                mgr.maybe_request_backfill(height);
-                // Alarm if that backfill isn't keeping up — a sustained gap means the
-                // fleet is not converging and miners are not being paid (#548).
-                mgr.check_convergence_stall(height);
-            }
-        });
-    }
-
-    // ── Mesh node-list checkpoint (decentralised mining discovery) ────────────────
-    // The same BFT lifecycle as the payout checkpoint, over the PUBLIC-MINING node set:
-    // a signed snapshot a miner-side shim verifies offline to discover pool nodes without
-    // trusting DNS. DORMANT — gated on MESH_NODE_LIST_CHECKPOINT_HEIGHT (u64::MAX today), so
-    // the propose cadence below no-ops until armed. See tasks/design_mesh_node_list_checkpoint.md.
-    let (mnlchk_tx, mut mnlchk_rx) =
-        tokio::sync::mpsc::channel::<(ghost_consensus::MessageType, Vec<u8>)>(256);
-    {
-        let mesh_c = Arc::clone(&mesh);
-        tokio::spawn(async move {
-            while let Some((ty, bytes)) = mnlchk_rx.recv().await {
-                match mesh_c.create_envelope_raw(ty, bytes) {
-                    Ok(env) => {
-                        if let Err(e) = mesh_c.broadcast(env).await {
-                            tracing::debug!(error = %e, "mesh node-list checkpoint broadcast failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "mesh node-list checkpoint envelope failed")
-                    }
-                }
-            }
-        });
-    }
-    let mnlchk_send: ghost_pool::payout_checkpoint::BroadcastFn = {
-        let tx = mnlchk_tx.clone();
-        Arc::new(move |ty, bytes| {
-            tx.try_send((ty, bytes)).map_err(|e| {
-                ghost_common::error::GhostError::P2PMessage(format!(
-                    "mesh-node-checkpoint channel: {e}"
-                ))
-            })
-        })
-    };
-    // ONE store, shared by the inbound handler (which writes) and the propose path (which
-    // reads). See `with_advert_store` for why a second copy would fail silently.
-    let advert_store = Arc::new(ghost_pool::mesh_node_checkpoint::AdvertStore::new());
-
-    // The adverts covering a given qualified set, or None if we are missing any of them.
-    //
-    // This REPLACES a derivation that read `get_connected_peers(120)` and each peer's
-    // locally-observed address. That was the whole of #625: three node-local inputs feeding an
-    // exact-set agreement, which measured six distinct sets across seven reporters. Nothing
-    // here consults connectivity — an advert is held because its subject signed and broadcast
-    // it, not because we happen to have a socket open to them.
-    let compute_adverts_fn: ghost_pool::mesh_node_checkpoint::ComputeAdvertsFn = {
-        let store = Arc::clone(&advert_store);
-        Arc::new(move |qualified: &[ghost_common::types::NodeId]| store.covering(qualified))
-    };
-    let mesh_node_checkpoint_mgr = Arc::new(
-        ghost_pool::mesh_node_checkpoint::MeshNodeListCheckpointManager::new(
-            Arc::clone(&identity),
-            Arc::clone(&db),
-            mnlchk_send,
-            compute_adverts_fn,
-        )
-        .with_active_voter_set_fn(active_voter_set_fn.clone())
-        .with_advert_store(Arc::clone(&advert_store)),
-    );
-    mesh.register_handler(Arc::clone(&mesh_node_checkpoint_mgr)
-        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-    // Publish THIS node's endpoint advert, and re-publish it on a cadence.
-    //
-    // Nothing else can say where this node lives: the advert is signed by our own key, so a
-    // peer that has never met us can still carry it into a proposal and every voter can check
-    // it. Without this task a node is simply absent from the qualified set's coverage, and
-    // `derive_mesh_node_list` refuses the whole list rather than quietly omitting it.
-    //
-    // ⚠ The advert is built ONCE, not per tick. `seq` is inside the signed bytes, so a fresh
-    // timestamp each cycle would make every re-broadcast look like news: peers would accept it,
-    // the advert root would move, and the checkpoint's "has the set changed?" test would be
-    // comparing against a value that never settles. Process start time is monotonic enough —
-    // a restart supersedes, an idle process does not.
-    //
-    // The immediate first tick IS wanted here, unlike the elder-revocation checker: publishing
-    // at once means a restarting node re-enters coverage in seconds rather than after a full
-    // period of everyone else being unable to propose.
-    {
-        let tx = mnlchk_tx.clone();
-        let store = Arc::clone(&advert_store);
-        let id = Arc::clone(&identity);
-        let addr = config.network.public_address.clone();
-        let public = is_public_mining;
-        // Advertise a coordinator endpoint ONLY when opted in, matching the health-ping
-        // capability beside it — otherwise a stray config value would enrol this node in the
-        // coordinator roster, and a wallet would be sent to something that does not answer.
-        let coordinator_endpoint = if config.coordinator.coordinator_enabled {
-            config
-                .coordinator
-                .advertised_endpoint
-                .clone()
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        tokio::spawn(async move {
-            let Some(raw) = addr.as_deref().filter(|a| !a.is_empty()) else {
-                warn!(
-                    "no network.public_address — this node cannot advertise a mining endpoint, \
-                     so the node-list checkpoint cannot cover it"
-                );
-                return;
-            };
-            let advert = ghost_pool::mesh_node_checkpoint::build_self_advert(
-                &id,
-                extract_peer_host(raw),
-                ghost_pool::MESH_ADVERT_SV1_PORT,
-                ghost_pool::MESH_ADVERT_SV2_PORT,
-                public,
-                !coordinator_endpoint.is_empty(),
-                &coordinator_endpoint,
-                chrono::Utc::now().timestamp().max(0) as u64,
-            );
-            // Seed our own before anything is sent: a single-node fleet must still be able to
-            // derive a list covering itself.
-            store.accept(advert.clone());
-            let Ok(bytes) = serde_json::to_vec(&advert) else {
-                error!("endpoint advert would not serialise — not advertising");
-                return;
-            };
-            info!(
-                host = %advert.host,
-                public_mining = advert.public_mining,
-                "mesh endpoint advert: publishing"
-            );
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                ghost_pool::MESH_ADVERT_REPUBLISH_SECS,
-            ));
-            // No shutdown branch, matching the checkpoint relay beside it: the task holds no
-            // resource that needs releasing and ends with the runtime. `shutdown_tx` is not
-            // even in scope this early in `main`.
-            loop {
-                interval.tick().await;
-                if tx
-                    .try_send((
-                        ghost_consensus::MessageType::MeshEndpointAdvertisement,
-                        bytes.clone(),
-                    ))
-                    .is_err()
-                {
-                    tracing::debug!("endpoint advert: relay channel full — will retry next cycle");
-                }
-            }
-        });
-    }
-    {
-        let mgr = Arc::clone(&mesh_node_checkpoint_mgr);
-        let rpc_c = Arc::clone(&rpc);
-        tokio::spawn(async move {
-            const LAG: u64 = ghost_pool::MESH_CHECKPOINT_LAG_BLOCKS;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let tip = match rpc_c.get_block_count().await {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                if tip <= LAG {
-                    continue;
-                }
-                let height = tip - LAG;
-                let cutoff_ts = match rpc_c.get_block_hash(height).await {
-                    Ok(hash) => match rpc_c.get_block_header(&hash).await {
-                        Ok(hdr) => hdr.time as i64,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-                mgr.maybe_propose(height, cutoff_ts).await;
-                mgr.maybe_request_backfill(height);
-            }
-        });
-    }
-
-    // Component A sweep: rotate through bounded windows of the verification
-    // ledger, advertising the keys we hold so peers backfill what we lack. This is a
-    // SEPARATE subsystem from the GHOST-03 unpaid-ledger sweep deleted in Stage 6 —
-    // it reconciles capability-challenge verdicts. One 1-hour bucket per tick keeps a request a
-    // sane size; the rotation covers the trailing 7 days that qualification reads.
-    {
-        let vconv_handler = Arc::clone(&verification_result_handler);
-        tokio::spawn(async move {
-            const VCONV_INTERVAL_SECS: u64 = 60;
-            const VLEDGER_BUCKET_SECS: i64 = 3_600; // 1h per advertisement
-            const VLEDGER_SWEEP_SPAN_SECS: i64 = 7 * 86_400; // trailing 7 days
-            const VLEDGER_BUCKETS: i64 = VLEDGER_SWEEP_SPAN_SECS / VLEDGER_BUCKET_SECS;
-
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(VCONV_INTERVAL_SECS));
-            let mut bucket: i64 = 0;
-            loop {
-                ticker.tick().await;
-                let now = chrono::Utc::now().timestamp();
-                let until = now - bucket * VLEDGER_BUCKET_SECS;
-                let since = until - VLEDGER_BUCKET_SECS;
-                bucket = (bucket + 1) % VLEDGER_BUCKETS;
-                if let Err(e) = vconv_handler.request_convergence(since, until) {
-                    tracing::debug!(error = %e, "challenge-convergence request failed");
-                }
-            }
-        });
-    }
 
     // Create and register discovery handler for peer gossip
     // This enables nodes to discover peers beyond just seed nodes
@@ -3098,173 +1219,8 @@ async fn main() -> Result<()> {
     mesh.register_handler(Arc::clone(&discovery_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
-    // Register share proof handler for cross-node share propagation
-    let share_proof_handler = Arc::new(ShareProofHandler::new(
-        Arc::clone(&round_manager),
-        Arc::clone(&db),
-        identity.node_id(),
-    ));
-    mesh.register_handler(Arc::clone(&share_proof_handler)
-        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-
-    // GHOST-03: ledger convergence. Periodically advertise the shares we hold for
-    // the current round; peers reply with the signed proofs we were missing
-    // (drop/partition) and we apply them (re-verifying the GHOST-09 signature).
-    // `broadcast()` is async but the handler's send is sync, so outbound
-    // convergence frames go through an mpsc channel drained by a spawned task.
-    //
-    // Each frame carries the peer it is addressed to. A REPLY is addressed to its requester —
-    // its contents are the complement of that peer's advertisement — so the drain pays one Noise
-    // send instead of one per peer, and six uninterested nodes no longer receive a response they
-    // then re-request on `more_available`. That amplification is what filled this queue (#647).
-    // An advertisement carries no address and still fans out.
-    let (conv_tx, conv_rx) = ghost_pool::convergence_channel::convergence_channel(
-        ghost_pool::convergence_channel::CONVERGENCE_CHANNEL_CAPACITY,
-        "share",
-    );
-    {
-        let counters = Arc::clone(conv_tx.counters());
-        let transport = Arc::new(
-            ghost_pool::convergence_channel::MeshConvergenceTransport::new(
-                Arc::clone(&mesh),
-                ghost_consensus::MessageType::ShareConvergence,
-            ),
-        );
-        tokio::spawn(ghost_pool::convergence_channel::drain(
-            conv_rx, transport, counters, "share",
-        ));
-    }
-    let conv_send: ghost_pool::convergence::ConvergenceSendFn = {
-        let conv_tx = conv_tx.clone();
-        Arc::new(move |bytes, to| conv_tx.try_enqueue(bytes, to))
-    };
-    // The shared era axis for GHOST-03 backfill (#677).
-    //
-    // A peer's `proof.round_id` is in ITS numbering, so judging it against our activation round
-    // asks a question about us rather than about the share — and the fleet's boundaries genuinely
-    // differ (vm1 111,556 vs vm8 111,553), so every share in the gap was discarded as `bad_sig`
-    // for ever, the share sets never converged, and no payout checkpoint could ever be ratified.
-    // The gate's block timestamp is the one instant every node derives identically.
-    let addr_bind_activation_time: Option<i64> = {
-        let gate_height = ghost_pool::share_addr_bind_height();
-        match rpc.get_block_hash(gate_height).await {
-            Ok(hash) => match rpc.get_block_header(&hash).await {
-                Ok(hdr) => {
-                    info!(
-                        gate_height,
-                        activation_time = hdr.time,
-                        "GHOST-03: resolved the address-bind era axis from the chain"
-                    );
-                    Some(hdr.time as i64)
-                }
-                Err(e) => {
-                    warn!(gate_height, error = %e,
-                        "GHOST-03: could not read the gate block header — backfill falls back to \
-                         node-local rounds, which cannot agree across nodes (#677)");
-                    None
-                }
-            },
-            // Expected while the chain is still below the gate; there is no era to share yet.
-            Err(e) => {
-                warn!(gate_height, error = %e,
-                    "GHOST-03: gate height not on this chain yet — backfill falls back to \
-                     node-local rounds (#677)");
-                None
-            }
-        }
-    };
-    let convergence_handler = Arc::new({
-        let h = ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
-            .with_send(conv_send)
-            .with_db(Arc::clone(&db));
-        match addr_bind_activation_time {
-            Some(t) => h.with_addr_bind_activation_time(t),
-            None => h,
-        }
-    });
-    mesh.register_handler(Arc::clone(&convergence_handler)
-        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-    {
-        let conv_handler = Arc::clone(&convergence_handler);
-        let rm_for_conv = Arc::clone(&round_manager);
-        let conv_tx = conv_tx.clone();
-        tokio::spawn(async move {
-            const CONVERGENCE_INTERVAL_SECS: u64 = 30;
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
-            loop {
-                ticker.tick().await;
-
-                // Repair the round in flight (fast path for a share dropped seconds ago).
-                let round_id = rm_for_conv.current_round_id();
-                if let Ok(bytes) = conv_handler.request_bytes(round_id) {
-                    // An advertisement: every peer is a legitimate recipient, so it fans out.
-                    conv_tx.enqueue(bytes, None).await;
-                }
-            }
-        });
-    }
-
     // Create shutdown channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-    // Stage 6: the GHOST-02 ledger-recompute validator is gone with the payout vote.
-    //
-    // It only ever judged PAYOUT proposals — recomputing a peer's split from this node's own
-    // ledger and demanding an exact match. Above `PAYOUT_FROM_SHARD_HEIGHT` no payout proposal
-    // is broadcast at all, so there is nothing for it to judge.
-    //
-    // ⚠ The vote handler itself STAYS. Elder revocation still proposes BFT revocation votes,
-    // and those are a different proposal type that this validator never inspected.
-
-    // Phase 4: install the active-voter-set resolver. Below ACTIVE_VOTER_SET_HEIGHT it returns
-    // None and the vote handler keeps using the static MPC elder set. At and above it, the
-    // eligible-voter set becomes the qualified active nodes at the cutoff of the latest finalised
-    // payout checkpoint at/below the block — resolved identically fleet-wide via the same
-    // converged resolver + height scoping the payout root uses (so voters and the node split
-    // agree). The gate lives inside the closure, so the wiring itself is inert below the height.
-    //
-    // This gate is ARMED and has fired; see ACTIVE_VOTER_SET_HEIGHT for the value and the arming
-    // record. Do not describe it as dormant or restate the height here — that is how this comment
-    // came to claim `u64::MAX` long after the gate went live.
-    {
-        let db_c = Arc::clone(&db);
-        let oracle_c = block_hash_oracle.clone();
-        let resolver: ghost_consensus::ActiveVoterSetFn = Arc::new(move |block_height: u64| {
-            if block_height < ghost_pool::active_voter_set_height() {
-                return None; // dormant → fall back to the MPC elder set
-            }
-            let cutoff = db_c
-                .get_payout_ledger_checkpoint_at_or_before(block_height)
-                .ok()
-                .flatten()?
-                .cutoff_ts;
-            let voter_set_scoped = block_height >= ghost_pool::voter_set_qualification_height();
-            let assignment_scoped = block_height >= ghost_pool::challenger_assignment_height();
-            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                .with_block_hash_oracle(Arc::new(oracle_c.clone()))
-                // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
-                // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
-                // address enforcement: every paid or ratified derivation wires it identically.
-                .with_coordinator_shares(block_height >= ghost_pool::coordinator_shares_height());
-            let voters: Vec<ghost_common::types::NodeId> = qp
-                .get_all_qualified_nodes_at_cutoff_from_db(
-                    cutoff,
-                    voter_set_scoped,
-                    assignment_scoped,
-                )
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            if voters.is_empty() {
-                None
-            } else {
-                Some(voters)
-            }
-        });
-        vote_handler.set_active_voter_set_fn(resolver);
-    }
 
     // Start verification HTTP server
     let rpc_for_verification = Arc::clone(&rpc);
@@ -3292,115 +1248,11 @@ async fn main() -> Result<()> {
     // Report the node's real configured chain on the status/info endpoints
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);
-    // SHARE_TIER_BIND: hand the webhook ingest the resolved tier gate so its H-13 check can
-    // switch to tier-credit judging at the same block as everything else. The authority stays
-    // `share_tier_bind_height()` here in ghost-mining; verification only receives the value
-    // (its default is the dormant u64::MAX, so an unwired embedder cannot arm early).
-    verification_state =
-        verification_state.with_share_tier_bind_height(ghost_pool::share_tier_bind_height());
-    // H-13: the same hand-off for SHARE_POW_VERIFY. At and above this height ingest REQUIRES the
-    // 80-byte header, rather than treating its absence as "no evidence, so admit". Without that,
-    // the PoW check the webhook gained was bypassable by simply omitting the header — which is
-    // exactly what an attacker minting work would do. Requiring it here matches the rule already
-    // in force below: since this gate armed, `with_share_recorder` attaches the header to every
-    // `ShareProof`, so a header-less share is already unverifiable at every peer.
-    verification_state =
-        verification_state.with_share_pow_verify_height(ghost_pool::share_pow_verify_height());
-    // A-2b: hand the verification server the same warm block-hash oracle the payout
-    // checkpoint uses, so /api/v1/qualification/scoped-set can compute the
-    // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
-    verification_state =
-        verification_state.with_block_hash_oracle(Arc::new(block_hash_oracle.clone()));
-    // ACTIVE_VOTER_SET convergence proof: hash the checkpoint-path voter set consensus WOULD
-    // use once the gate is armed — the widened set (active-qualified set floored to a superset
-    // of the elders), from the SAME scoped query the consensus resolver uses. Ignores the gate
-    // height so the go-live value is provable identical fleet-wide BEFORE arming.
-    // MESH_NODE_LIST convergence proof — the gate is IGNORED on purpose.
-    //
-    // #625's first problem was that this could not be checked at all: nothing is proposed
-    // below `MESH_NODE_LIST_CHECKPOINT_HEIGHT`, so proving the blob byte-identical fleet-wide
-    // required arming first. Deriving it here, gate or no gate, makes #402's acceptance
-    // criterion something an operator can run against all eight nodes and compare.
-    verification_state = verification_state.with_mesh_node_list_fn({
-        let store = Arc::clone(&advert_store);
-        let resolve = active_voter_set_fn.clone();
-        Arc::new(move |cutoff_ts: i64, height: u64| {
-            let mut qualified = resolve(cutoff_ts, height);
-            qualified.sort_unstable();
-            qualified.dedup();
-            if qualified.is_empty() {
-                return None;
-            }
-            // Report the gap rather than a bare failure: without full coverage the derivation
-            // refuses, and "which node has not advertised" is the only actionable part of that.
-            let missing: Vec<String> = store
-                .missing(&qualified)
-                .iter()
-                .map(|id| hex::encode(&id[..8]))
-                .collect();
-            let adverts = store.covering(&qualified)?;
-            let nodes = ghost_consensus::derive_mesh_node_list(&qualified, &adverts).ok()?;
-            // Derived the same way the proposer and the vote path derive them, from the same
-            // adverts — so a disagreement here is a real disagreement and not two spellings.
-            let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
-            // The voter set is this node's OWN view, and the vote path rejects on it
-            // (`mesh_signer_set_root(&voters) != msg.signer_set_root`). So it can diverge between
-            // honest nodes and belongs in the comparison, not in an assumption.
-            let mut voters = qualified.clone();
-            voters.sort_unstable();
-            voters.dedup();
-            Some(ghost_verification::server::MeshNodeListConvergence {
-                listed: nodes.len(),
-                list_root: hex::encode(ghost_consensus::mesh_node_list_root(&nodes)),
-                advert_root: hex::encode(ghost_consensus::mesh_advert_set_root(&adverts)),
-                coordinator_roster_root: hex::encode(
-                    ghost_consensus::mesh_coordinator_roster_root(&roster),
-                ),
-                signer_set_root: hex::encode(ghost_consensus::mesh_signer_set_root(&voters)),
-                missing_adverts: missing,
-            })
-        })
-    });
-
-    verification_state = verification_state.with_checkpoint_voter_set_fn({
-        let db_c = Arc::clone(&db);
-        let oracle_c = block_hash_oracle.clone();
-        Arc::new(
-            move |cutoff_ts: i64, height: u64| -> Option<(usize, String, bool)> {
-                use sha2::{Digest, Sha256};
-                let mut elders: Vec<ghost_common::types::NodeId> =
-                    db_c.get_mpc_elder_node_ids().ok()?.into_iter().collect();
-                elders.sort_unstable();
-                let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
-                    .with_block_hash_oracle(Arc::new(oracle_c.clone()))
-                    // #605: dormant until ADDRESS_PROOF_ENFORCEMENT_HEIGHT.
-                    .with_address_enforcement(ghost_pool::address_proof_enforcement_height())
-                    // #736: the +4 slot moves to a proven coordinator at this gate. Same rule as
-                    // address enforcement: every paid or ratified derivation wires it identically.
-                    .with_coordinator_shares(height >= ghost_pool::coordinator_shares_height());
-                let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
-                let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
-                let mut active: Vec<ghost_common::types::NodeId> = qp
-                    .get_all_qualified_nodes_at_cutoff_from_db(
-                        cutoff_ts,
-                        voter_set_scoped,
-                        assignment_scoped,
-                    )
-                    .into_iter()
-                    .map(|(id, _shares)| id)
-                    .collect();
-                active.sort_unstable();
-                let floored =
-                    !ghost_pool::payout_checkpoint::active_is_superset_of_elders(&elders, &active);
-                let voters = ghost_pool::payout_checkpoint::widen_voter_set(elders, active);
-                let mut h = Sha256::new();
-                for id in &voters {
-                    h.update(id);
-                }
-                Some((voters.len(), hex::encode(h.finalize()), floored))
-            },
-        )
-    });
+    // H-13: the webhook ingest judges every share by its committed tier and requires its 80-byte
+    // header; pool_sv2 sends both on every share.
+    verification_state = verification_state
+        .with_share_tier_bind_height(0)
+        .with_share_pow_verify_height(0);
     // VER-6: When a peer challenges this node's stratum capability, our
     // handler probes the stratum endpoint to confirm reachability. Without
     // this, the handler falls back to 127.0.0.1, which only proves loopback
@@ -3460,74 +1312,6 @@ async fn main() -> Result<()> {
                 farm_port: p.farm_port,
             })
             .collect()
-    });
-
-    // Signed mesh node-list checkpoint for the public /api/v1/pool/mesh-node-list-checkpoint
-    // endpoint. Serializes the latest finalised record into the verifiable blob a miner-side
-    // shim consumes (node list + signer-set forward-chain delta/root + proposer and ≥67%
-    // approver signatures, all hex). None until a checkpoint is finalised → the handler 404s
-    // (the gate is dormant on mainnet, so this returns 404 today).
-    let db_for_mnl_ckpt = Arc::clone(&db);
-    verification_state = verification_state.with_mesh_node_list_checkpoint(move || {
-        let rec = db_for_mnl_ckpt
-            .get_latest_mesh_node_list_checkpoint()
-            .ok()
-            .flatten()?;
-        let nodes: Vec<serde_json::Value> = rec
-            .nodes
-            .iter()
-            .map(|(id, host, s1, s2)| {
-                serde_json::json!({
-                    "node_id": hex::encode(id),
-                    "host": host,
-                    "sv1_port": s1,
-                    "sv2_port": s2,
-                })
-            })
-            .collect();
-        let approvals: Vec<serde_json::Value> = rec
-            .approvals
-            .iter()
-            .map(|(v, sig)| {
-                serde_json::json!({
-                    "voter": hex::encode(v),
-                    "signature": hex::encode(sig),
-                })
-            })
-            .collect();
-        // ⚠ EVERYTHING inside `checkpoint_hash` must be here, or a shim cannot reconstruct
-        // the hash and therefore cannot check a single signature. `advert_root` and
-        // `coordinator_roster_root` are committed but not stored — both are pure functions of
-        // the adopted adverts — so they are recomputed here from `adverts_json`, the same way
-        // the sync path recomputes them.
-        //
-        // This served a blob without `adverts` or `advert_root` until now, which no shim could
-        // have verified. Nothing noticed because the endpoint 404s below the gate, so the
-        // first exercise of it would have been the day it was armed.
-        let adverts = ghost_pool::mesh_node_checkpoint::adverts_from_json_public(&rec.adverts_json);
-        let advert_root = ghost_consensus::mesh_advert_set_root(&adverts);
-        let roster = ghost_consensus::coordinator_roster_from_adverts(&adverts);
-        let roster_root = ghost_consensus::mesh_coordinator_roster_root(&roster);
-        Some(serde_json::json!({
-            "version": "MeshNodeListCheckpoint/v3",
-            "height": rec.height,
-            "cutoff_ts": rec.cutoff_ts,
-            "nodes": nodes,
-            "adverts": adverts,
-            "advert_root": hex::encode(advert_root),
-            "list_root": hex::encode(rec.list_root),
-            "coordinator_roster": roster,
-            "coordinator_roster_root": hex::encode(roster_root),
-            "signer_set_root": hex::encode(rec.signer_set_root),
-            "signer_set_delta": {
-                "added": rec.signer_set_delta.0.iter().map(hex::encode).collect::<Vec<_>>(),
-                "removed": rec.signer_set_delta.1.iter().map(hex::encode).collect::<Vec<_>>(),
-            },
-            "active_node_count": rec.active_node_count,
-            "proposer": rec.proposer_id,
-            "proposer_signature": hex::encode(&rec.proposer_signature),
-            "approvals": approvals,
-        }))
     });
 
     // Live mesh node list for the public /api/v1/pool/mesh-nodes endpoint.
@@ -3628,9 +1412,8 @@ async fn main() -> Result<()> {
     let tp_for_snapshot = Arc::clone(&template_processor);
     verification_state = verification_state
         .with_template_snapshot(move || tp_for_snapshot.current_template_summary());
-    // Coinbase-payments breakdown provider: how the current block's coinbase
-    // splits across miners / node rewards / treasury / finder fees, from the
-    // approved payout proposal. `None` result until a payout is agreed.
+    // Coinbase breakdown provider: the current template's subsidy split between the treasury
+    // base and the miners' pool, and the fees that go to the finder.
     let tp_for_coinbase = Arc::clone(&template_processor);
     verification_state = verification_state
         .with_coinbase_snapshot(move || tp_for_coinbase.current_coinbase_breakdown());
@@ -3662,20 +1445,6 @@ async fn main() -> Result<()> {
     verification_state = verification_state.with_reaper_stats(move || {
         serde_json::to_value(reaper_stats_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
     });
-
-    // Capability self-check (Phase 3). Construct the coordinator here so its
-    // last snapshot can be surfaced over HTTP at /api/v1/system/self-check;
-    // the background probe loop is spawned later (after the HTTP listener is
-    // up). The dashboard reads this to warn when a claimed capability's
-    // prerequisite is missing (e.g. public_mining announced but no stratum
-    // serving). Read-only: the handler reads the snapshot, it does not probe.
-    let self_check = SelfCheck::new();
-    {
-        let self_check_for_api = self_check.clone();
-        verification_state = verification_state.with_self_check(move || {
-            serde_json::to_value(self_check_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
-        });
-    }
 
     // Configure archive handler if archive mode enabled
     if capabilities.archive_mode {
@@ -3755,100 +1524,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Configure test proposal callback for BFT consensus testing
-    let vh_for_test = Arc::clone(&vote_handler);
-    let identity_for_test = Arc::clone(&identity);
-    let rm_for_test = Arc::clone(&round_manager);
-    let test_proposal_fn: ghost_verification::TestProposalFn = Arc::new(move || {
-        use ghost_common::types::{PayoutEntry, PayoutProposal, PayoutType};
-
-        // Create a test payout proposal
-        let round_id = rm_for_test.current_round_id() as u64;
-        let height = rm_for_test.current_height();
-        let timestamp = chrono::Utc::now().timestamp() as u64;
-
-        // Create minimal valid test proposal
-        let proposal = PayoutProposal {
-            proposal_hash: [0u8; 32], // Will be computed by handler
-            round_id,
-            block_hash: [0u8; 32],
-            block_height: height.max(800_000), // Ensure valid height
-            proposer: identity_for_test.node_id(),
-            miner_payouts: vec![PayoutEntry {
-                address: b"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_vec(), // Signet address
-                amount: 100_000_000,                                             // 1 BTC test
-                recipient_id: [1u8; 32],
-                payout_type: PayoutType::Mining,
-            }],
-            node_payouts: vec![],
-            treasury_amount: 1_000_000,                 // 0.01 BTC
-            treasury_address: b"tb1qtreasury".to_vec(), // H-MINE-3: snapshot address (test)
-            tx_fees: 500_000,
-            subsidy: 312_500_000, // 3.125 BTC (signet subsidy)
-            timestamp,
-            tx_fees_unallocated: 0,
-        };
-
-        // Submit to vote handler (broadcasts to peers)
-        vh_for_test.handle_proposal(proposal)
-    });
-    verification_state = verification_state.with_test_proposal_fn(test_proposal_fn);
-
-    // Share broadcast relay: sync callback → async Noise broadcast
-    // Follows the MPC relay pattern (main.rs:1107-1134)
-    // Buffer cushion for share-relay bursts. The real throughput fix is the
-    // concurrent per-peer fan-out in MeshNetwork::broadcast; this just absorbs
-    // short bursts so try_send doesn't drop proofs under load.
-    let (share_broadcast_tx, mut share_broadcast_rx) =
-        tokio::sync::mpsc::channel::<ghost_common::types::ShareProof>(1024);
-    let mesh_for_shares_relay = Arc::clone(&mesh);
-    tokio::spawn(async move {
-        while let Some(proof) = share_broadcast_rx.recv().await {
-            let msg = ghost_consensus::message::ShareProofMessage { proof };
-            match serde_json::to_vec(&msg) {
-                Ok(payload) => {
-                    match mesh_for_shares_relay
-                        .create_envelope_raw(MessageType::ShareProof, payload)
-                    {
-                        Ok(envelope) => {
-                            if let Err(e) = mesh_for_shares_relay.smart_broadcast(envelope).await {
-                                tracing::warn!(error = %e, "Share proof broadcast failed");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Share proof envelope creation failed");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Share proof serialization failed");
-                }
-            }
-        }
-    });
-
     // Configure share recorder callback for SRI Pool share notifications
-    // Store coinbase skeletons as they are announced, so a share naming one can be judged.
-    //
-    // Verified by rehashing, never trusted: the id a share carries must be the id the skeleton
-    // itself hashes to, or a peer could name any bytes it liked and have them stored under an
-    // identity that shares already point at.
-    {
-        let db_for_skeletons = Arc::clone(&db);
-        let rm_for_skeletons = Arc::clone(&round_manager);
-        verification_state = verification_state.with_skeleton_recorder(move |skeleton| {
-            ghost_pool::binding_recheck::accept_skeleton(
-                &db_for_skeletons,
-                &skeleton.skeleton_id,
-                &skeleton.coinbase_prefix,
-                &skeleton.coinbase_suffix,
-                &skeleton.merkle_path,
-                rm_for_skeletons.current_height(),
-            )
-            .map(|_| ())
-        });
-    }
-
     let rm_for_shares = Arc::clone(&round_manager);
     let identity_for_shares = Arc::clone(&identity);
     let db_for_shares = Arc::clone(&db);
@@ -3859,20 +1535,12 @@ async fn main() -> Result<()> {
 
         // Record the share in the current round (in-memory tracking)
         rm_for_shares
-            .record_share(&share.miner_id, share.work, identity_for_shares.node_id())
+            .record_share(&share.miner_id, share.work)
             .map_err(|e| ghost_common::GhostError::Internal(e.to_string()))?;
 
         // The SV2/SRI layer reports share_hash in big-endian DISPLAY order (PoW leading zeros
-        // at the front). The pool's difficulty machinery and the ShareProof both use INTERNAL
-        // (little-endian) order, zeros at the high-index end.
-        //
-        // CANONICAL STORAGE IS INTERNAL ORDER. This row used to be written in display order
-        // while every gossiped copy of the SAME share was written internal, so one share had
-        // two different `share_hash` strings depending on which node stored it. Nothing
-        // double-counted only because a node skips gossip of its own shares — but it makes
-        // share_hash useless as a cross-node identity, and any ledger reconciliation keyed on
-        // it would serve a node its own shares back under the other spelling, where the UNIQUE
-        // constraint would not recognise them and the work would be counted TWICE.
+        // at the front). CANONICAL STORAGE IS INTERNAL (little-endian) ORDER, zeros at the
+        // high-index end, which is what the records and difficulty readers expect.
         let mut share_hash_bytes = [0u8; 32];
         if let Ok(decoded) = hex::decode(&share.share_hash) {
             if decoded.len() == 32 {
@@ -3885,86 +1553,6 @@ async fn main() -> Result<()> {
             }
         }
         let canonical_share_hash = hex::encode(share_hash_bytes);
-
-        // Uses SHA256(miner_id) as the 32-byte miner identifier for the proof.
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(share.miner_id.as_bytes());
-        let miner_hash: [u8; 32] = hasher.finalize().into();
-
-        // Multi-operator PoW verification: at/above SHARE_POW_VERIFY_HEIGHT bind the raw
-        // 80-byte header the SRI layer validated against, so any peer can independently
-        // recompute sha256d(header) == share_hash instead of trusting our numeric claim.
-        // Below the gate this stays None → signing_bytes byte-identical to today.
-        let header = if rm_for_shares.current_height() >= ghost_pool::share_pow_verify_height() {
-            match share.header.as_ref().and_then(|h| hex::decode(h).ok()) {
-                Some(bytes) if bytes.len() == 80 => Some(bytes),
-                _ => {
-                    tracing::warn!(
-                        miner_id = %share.miner_id,
-                        share_hash = %share.share_hash,
-                        "SHARE_POW_VERIFY active but SRI submission carried no valid 80-byte header; \
-                         proof will not verify at peers (upgrade the translator/pool)"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // SHARE_TIER_BIND: at/above the gate the proof carries the tier its job's coinbase
-        // committed to, so peers judge and credit exactly that tier. Below the gate it stays
-        // None → signing_bytes byte-identical to today, mirroring `header` above. The tier
-        // comes from the SRI layer (which stamped the coinbase); a missing tier at/above the
-        // gate means the emitting side is behind, and the proof will be rejected by peers —
-        // warned here so the deploy-order fault is visible at its source.
-        let tier_log2 = if ghost_pool::binds_difficulty_tier(rm_for_shares.current_height()) {
-            let t = share.tier_log2;
-            if t.is_none() {
-                tracing::warn!(
-                    miner_id = %share.miner_id,
-                    share_hash = %share.share_hash,
-                    "SHARE_TIER_BIND active but SRI submission carried no committed tier; \
-                     proof will not verify at peers (upgrade pool_sv2/translator)"
-                );
-            }
-            t
-        } else {
-            None
-        };
-
-        let mut proof = ghost_common::types::ShareProof {
-            round_id,
-            miner_id: miner_hash,
-            difficulty: share.work,
-            work: share.work,
-            share_hash: share_hash_bytes,
-            timestamp: share.timestamp,
-            received_by: identity_for_shares.node_id(),
-            template_id: rm_for_shares.current_template_id(),
-            payout_address: share.payout_address.clone(),
-            header,
-            tier_log2,
-            signature: None,
-        };
-        // GHOST-09: sign as the receiving node so peers can authenticate the
-        // node-reward credit and reject relayed/forged `received_by`.
-        //
-        // At and above the bind gate the signature also covers `payout_address`, so a relay cannot
-        // redirect this miner's earnings while keeping the signature valid. Signer and verifier use
-        // the same predicate, so both switch encoding at the same block.
-        // Signing happens in the current round, so era and "now" coincide here — but go through
-        // the same predicate the verifiers use, so signer and verifier cannot drift apart.
-        if rm_for_shares.requires_bound_signature(round_id) {
-            proof.sign_bound(identity_for_shares.as_ref());
-        } else {
-            proof.sign(identity_for_shares.as_ref());
-        }
-
-        // GHOST-03 (schema v41): store the signed proof with the share so this node can serve a
-        // backfill of it to any peer that dropped the broadcast, at any age.
-        let proof_blob = serde_json::to_vec(&proof).unwrap_or_default();
 
         // Persist share to database for historical tracking and auditing
         let share_record = ghost_storage::models::ShareRecord {
@@ -3984,90 +1572,7 @@ async fn main() -> Result<()> {
             valid: true,
         };
 
-        // Establish which node this share was really mined for, from the share itself.
-        //
-        // `received_by` is only a claim until the coinbase says so: the header commits to a merkle
-        // root that commits to the coinbase that carries the node tag. Judging that needs the
-        // skeleton, which travels once per job — so a share can legitimately arrive first, and a
-        // share we cannot judge yet must be recorded rather than given a verdict it did not earn.
-        //
-        // Advisory here: a failed binding is logged, and an unjudgeable one deferred — this path
-        // rejects nothing either way. Note `SHARE_ADDR_BIND_HEIGHT` is ARMED (961_100); an earlier
-        // note here called it unarmed, which stopped being true when the gate was set.
-        if let (Some(sid_hex), Some(extranonce_hex), Some(header_hex)) = (
-            share.skeleton_id.as_deref(),
-            share.extranonce.as_deref(),
-            share.header.as_deref(),
-        ) {
-            match (
-                ghost_pool::binding_recheck::hex32(sid_hex),
-                hex::decode(extranonce_hex),
-                hex::decode(header_hex),
-            ) {
-                (Some(skeleton_id), Ok(extranonce), Ok(header)) => {
-                    // The commitment this node's coinbase stamped for this share's job: plain
-                    // below SHARE_TIER_BIND_HEIGHT, tier-bound at/above it (the tier folds into
-                    // the same 20 bytes — see `node_commitment_for_tier`). Computed HERE and
-                    // stored with the deferral, so the recheck pass judges the share against
-                    // the rule in force when it was mined, not whenever its skeleton arrives.
-                    let expected = match (
-                        ghost_pool::binds_difficulty_tier(rm_for_shares.current_height()),
-                        tier_log2,
-                    ) {
-                        (true, Some(t)) => ghost_common::coinbase_tags::node_commitment_for_tier(
-                            &identity_for_shares.node_id(),
-                            t,
-                        ),
-                        _ => ghost_common::coinbase_tags::node_commitment_plain(
-                            &identity_for_shares.node_id(),
-                        ),
-                    };
-
-                    match db_for_shares.get_skeleton(&skeleton_id) {
-                        Ok(Some((prefix, suffix, merkle_path))) => {
-                            let skeleton = ghost_common::share_binding::CoinbaseSkeleton {
-                                coinbase_prefix: prefix,
-                                coinbase_suffix: suffix,
-                                merkle_path,
-                            };
-                            if let Err(e) = ghost_common::share_binding::verify_share_node_binding(
-                                &skeleton,
-                                &extranonce,
-                                &header,
-                                &expected,
-                            ) {
-                                warn!(
-                                    share_hash = %share.share_hash,
-                                    error = ?e,
-                                    "share does NOT prove it was mined for this node"
-                                );
-                            }
-                        }
-                        Ok(None) => {
-                            // Not a fault — the skeleton is simply not here yet. Recorded so the
-                            // recheck pass judges it when the skeleton lands, instead of the share
-                            // keeping a verdict that only reflects when it happened to arrive.
-                            if let Err(e) = db_for_shares.defer_binding(
-                                &share.share_hash,
-                                &skeleton_id,
-                                &extranonce,
-                                &header,
-                                &expected,
-                            ) {
-                                warn!(error = %e, "could not record a share awaiting its skeleton");
-                            }
-                        }
-                        Err(e) => warn!(error = %e, "skeleton lookup failed for a share"),
-                    }
-                }
-                _ => debug!(
-                    share_hash = %share.share_hash,
-                    "share carries malformed binding fields; no binding claimed"
-                ),
-            }
-        }
-
-        match db_for_shares.insert_share_with_proof(&share_record, &proof_blob) {
+        match db_for_shares.insert_share(&share_record) {
             Ok(_) => {
                 // Share inserted successfully — update miner cumulative stats
                 if let Err(e) = db_for_shares.increment_miner_stats(&share.miner_id, 1, share.work)
@@ -4128,36 +1633,6 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-        }
-
-        // Broadcast the signed share proof to other nodes via P2P.
-        //
-        // #592: never in solo mode. A solo node pays only its own operator and takes its own
-        // payout decision locally, so a share it broadcast would credit node rewards and enter
-        // peers' unpaid ledgers on the strength of work that no public round accounted for.
-        //
-        // This was previously safe only by accident — a solo node normally has no peers, so the
-        // broadcast went nowhere. That is a property of how solo happens to be deployed, not an
-        // invariant: `config/mainnet-solo.toml` says no seed nodes are *needed*, not that peers
-        // are forbidden. Suppress at the source so reachability cannot change the answer.
-        if rm_for_shares.is_solo_mode() {
-            tracing::trace!(
-                miner_id = %share.miner_id,
-                "Solo mode: share proof not broadcast (solo cannot touch the public ledger)"
-            );
-        } else if !ghost_pool::crosses_network_tier(proof.tier_log2) {
-            // Stage 2, network tier. At R = 1 this arm is unreachable — the floor equals the
-            // vardiff floor, so every share that exists today crosses — and that is the point:
-            // the mechanism ships inert, and raising R later is a roll of one constant rather
-            // than a change to this path. The share is still recorded locally for vardiff, stats
-            // and the miner's own credit; only the mesh hop is withheld.
-            tracing::trace!(
-                miner_id = %share.miner_id,
-                tier_log2 = ?proof.tier_log2,
-                "Below network tier: recorded locally, not gossiped"
-            );
-        } else if let Err(e) = share_broadcast_tx.try_send(proof) {
-            tracing::warn!(error = %e, "Share broadcast channel full or closed");
         }
 
         tracing::debug!(
@@ -4243,22 +1718,6 @@ async fn main() -> Result<()> {
                 bad_timestamp: s.bad_timestamp,
                 other_errors: s.other_errors,
                 memory_limit_exceeded: s.memory_limit_exceeded,
-            }
-        });
-    }
-
-    // #647: surface the outbound convergence-queue counters on `/health`. The queues shed frames
-    // when full and the only evidence was an ERROR line per shed frame, so establishing that the
-    // fleet was losing 3,770 frames a day on one node took a hand-run journald grep across eight
-    // hosts. `shed` is now a number an operator (or a monitor) can read, and `unaddressable`
-    // says whether the reply-addressing that removes the fan-out cost is actually landing.
-    {
-        let share = conv_tx.clone();
-        let challenge = verify_conv_tx.clone();
-        verification_state = verification_state.with_convergence_channels(move || {
-            ghost_verification::challenge::ConvergenceChannelStats {
-                share: share.snapshot().into(),
-                challenge: challenge.snapshot().into(),
             }
         });
     }
@@ -4534,11 +1993,8 @@ async fn main() -> Result<()> {
         info!("Pool time-series sampler started (30s interval, 24h retention)");
     }
 
-    // Start self-uptime recording task
-    // Records our own uptime so we can be qualified for payouts
-    // This is necessary because verification results are stored by OTHER nodes about us,
-    // but we need our own uptime record for the gatekeeper calculation (95% over 7 days).
-    // Without self-recording, this node would have no uptime data ABOUT itself.
+    // Self-uptime recording: the uptime % this node gossips and shows on the swarm page.
+    // Peers' rows are refreshed by their pings; ours by this.
     let db_for_uptime = Arc::clone(&db);
     let node_id_for_uptime = identity.node_id_hex();
     let mut uptime_shutdown = shutdown_tx.subscribe();
@@ -4611,134 +2067,6 @@ async fn main() -> Result<()> {
     });
     info!("Ban manager cleanup task started (60s interval)");
 
-    // Elder offline revocation checker — detects elders offline >7 days and proposes BFT
-    // revocation votes. A revoked position is BURNED and never reassigned: that permanence is
-    // the point, and it is what makes an elder position scarce rather than a rotating seat.
-    {
-        let db_for_revoke = Arc::clone(&db);
-        let vh_for_revoke = Arc::clone(&vote_handler);
-        let hh_for_revoke = Arc::clone(&health_handler);
-        let mesh_for_revoke = Arc::clone(&mesh);
-        let alert_dispatcher_for_revoke = Arc::clone(&alert_dispatcher);
-        let mut revoke_shutdown = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            // Daily, with the first check shortly after start.
-            //
-            // DAILY rather than hourly: the threshold is 7 days, so hourly polling buys one hour
-            // of precision on a 604,800-second boundary — 0.6% — which nothing needs. For an
-            // action this irreversible, a day of extra grace before a slot is burned for good is
-            // a property worth having. The work is not the reason: the whole check is one 1 ms
-            // query over 8 rows plus an in-memory scan of the peer table.
-            //
-            // ⚠ The initial delay is a `sleep`, NOT the previous tick-and-discard. With a 24-hour
-            // period that older pattern would mean a node restarting more often than daily NEVER
-            // runs the check — and ghost-mining restarts well inside a day during a deploy or a
-            // config roll, so the feature would have gone silently dead. The delay lets the peer
-            // table populate: `detect_offline_elders` skips an elder absent from the peer table
-            // entirely ("no evidence of how long offline"), so a cold start cannot manufacture an
-            // accusation.
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {}
-                _ = revoke_shutdown.recv() => return,
-            }
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(86_400));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // 1. Get all current MPC elders from DB
-                        let elders = match db_for_revoke.get_all_mpc_elders() {
-                            Ok(e) => e,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to get elders for revocation check");
-                                continue;
-                            }
-                        };
-
-                        // Convert to NodeId array
-                        let elder_ids: Vec<[u8; 32]> = elders.iter().filter_map(|(hex, _)| {
-                            hex::decode(hex).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                        }).collect();
-
-                        // 2. Detect which are offline > 7 days
-                        let offline = hh_for_revoke.detect_offline_elders(&elder_ids);
-
-                        // NodeOffline alerts: this is the node's only periodic
-                        // peer-liveness signal (self can't alert while it's the
-                        // one that's down). Edge-trigger per elder so an elder
-                        // that stays offline doesn't re-alert every day, and
-                        // re-arm elders that are no longer offline so a later
-                        // outage alerts again. Keyed by the offline peer's id.
-                        {
-                            use std::collections::HashSet;
-                            let offline_ids: HashSet<[u8; 32]> =
-                                offline.iter().map(|(id, _)| *id).collect();
-                            for (elder_hex, _) in &elders {
-                                let is_offline = hex::decode(elder_hex)
-                                    .ok()
-                                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                                    .map(|id| offline_ids.contains(&id))
-                                    .unwrap_or(false);
-                                let days = offline
-                                    .iter()
-                                    .find(|(id, _)| hex::encode(id) == *elder_hex)
-                                    .map(|(_, d)| *d)
-                                    .unwrap_or(0);
-                                let detail = format!(
-                                    "Elder node {} has been offline for {} day(s).",
-                                    &elder_hex[..8.min(elder_hex.len())],
-                                    days
-                                );
-                                alert_dispatcher_for_revoke
-                                    .fire_edge(
-                                        ghost_verification::alerts::AlertEvent::NodeOffline,
-                                        elder_hex,
-                                        is_offline,
-                                        &detail,
-                                    )
-                                    .await;
-                            }
-                        }
-
-                        // 3. For each offline elder, propose revocation vote
-                        for (node_id, offline_days) in offline {
-                            let node_id_hex = hex::encode(node_id);
-                            tracing::info!(
-                                target = %&node_id_hex[..8],
-                                offline_days,
-                                "Detected offline elder, proposing revocation"
-                            );
-
-                            match vh_for_revoke.propose_revocation(&node_id_hex, offline_days) {
-                                Ok(Some(payload)) => {
-                                    // Broadcast the vote
-                                    if let Ok(envelope) = mesh_for_revoke.create_envelope_raw(
-                                        ghost_consensus::message::MessageType::Vote,
-                                        payload,
-                                    ) {
-                                        if let Err(e) = mesh_for_revoke.broadcast(envelope).await {
-                                            tracing::warn!(error = %e, "Failed to broadcast revocation vote");
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    tracing::debug!("Revocation proposal skipped (session exists or not enough elders)");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "Failed to propose elder revocation");
-                                }
-                            }
-                        }
-                    }
-                    _ = revoke_shutdown.recv() => {
-                        tracing::info!("Elder revocation checker shutting down");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("Elder revocation checker started (daily, first check in 10 min)");
-    }
-
     // M-MINE-2: Start rate limit cleanup task for RoundManager
     // Periodically cleans up old rate limit entries to prevent memory growth
     let rm_for_cleanup = Arc::clone(&round_manager);
@@ -4805,13 +2133,6 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         const PRUNE_INTERVAL_SECS: u64 = 3600;
         const SHARE_RETENTION_SECS: i64 = 24 * 3600;
-        /// How far back settlement may need to look up a proposal.
-        ///
-        /// A won block pays whatever was armed when ITS template was built, which can be older than
-        /// the currently-approved proposal — miners work a template while consensus approves new
-        /// ones. 24h covers that plus any reorg comfortably; at the observed ~160 proposals/day it
-        /// is well under a megabyte.
-        const PROPOSAL_RETENTION_SECS: i64 = 24 * 3600;
 
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(PRUNE_INTERVAL_SECS));
@@ -4825,24 +2146,6 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to prune old shares");
-                        }
-                    }
-
-                    // Payout proposals: the table only ever gets read for the approved row, plus a
-                    // recent window so settlement can match a block won on a slightly stale
-                    // template. Everything older that no payout references is a proposal which
-                    // armed a coinbase that never won — 1,234 such rows had accumulated on vm1 with
-                    // not one referenced by anything. The prune keeps the approved row and any
-                    // provenance a settled block or paid share depends on, at any age.
-                    let proposal_cutoff =
-                        chrono::Utc::now().timestamp() - PROPOSAL_RETENTION_SECS;
-                    match db_for_pruning.prune_payout_proposals(proposal_cutoff) {
-                        Ok(0) => {}
-                        Ok(count) => {
-                            tracing::info!(deleted = count, "Pruned superseded payout proposals");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to prune payout proposals");
                         }
                     }
                 }
@@ -5172,7 +2475,6 @@ async fn main() -> Result<()> {
     // verification mesh — only the verification client uses this port. Cert
     // is identity-derived (pubkey == node_id), peers pin against the
     // registered node_id, no CA / DNS / Let's Encrypt required.
-    let https_verification_listening = tls_server_config.is_some();
     if let Some(tls) = tls_server_config {
         let state_for_https = Arc::clone(&verification_state);
         tokio::spawn(async move {
@@ -5191,21 +2493,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Phase 3: capability self-check loop. Probes prerequisites for each
-    // claimed capability (stratum ports, disk space, ghost-pay daemon,
-    // reaper config) every 30s. Diagnostic only — surfaced via the dashboard
-    // (`/api/v1/system/self-check`) and `/health/self_check`. Does not
-    // auto-demote claims; the verification mesh catches false claims at the
-    // consensus layer. `self_check` was constructed earlier so the HTTP
-    // handler shares this exact snapshot; here we start its probe loop.
-    // Pass the alert dispatcher so the self-check loop fires CapabilityDrift
-    // (a claimed capability's prerequisite regressing pass→fail) and LowDisk
-    // (data partition crossing the low-free threshold) as edge-triggered alerts.
-    self_check.clone().spawn_loop(
-        Arc::new(config.clone()),
-        Some(Arc::clone(&alert_dispatcher)),
+    // Low-disk monitor on the data partition (edge-triggered LowDisk alerts).
+    ghost_pool::alert_monitors::spawn_low_disk_monitor(
+        config.storage.db_path.clone(),
+        Arc::clone(&alert_dispatcher),
     );
-    info!("Capability self-check loop started (30s interval)");
 
     // Subscribe to template events BEFORE starting the processor to avoid race condition
     // (the processor fires NewWork immediately on first refresh)
@@ -5439,218 +2731,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start periodic verification task (verifies peer capabilities every 5 minutes)
-    // This implements the spec: nodes verify each other, results stored in DB for payout calculation.
-    //
-    // The peer_provider's `http_port` becomes the port the verification client
-    // connects to on each peer. When the local HTTPS listener bound, peers also
-    // expose the same HTTPS listener (per protocol), so we target their
-    // `verification_https_port`. Otherwise fall back to plain HTTP on
-    // `http_port`.
-    let peer_challenge_port = if https_verification_listening {
-        config.network.verification_https_port
-    } else {
-        config.network.http_port
-    };
-    let peer_provider = Arc::new(PeerProviderAdapter::new(
-        Arc::clone(mesh.peers()),
-        peer_challenge_port,
-    ));
-
-    // Create broadcast channel for verification results
-    let (verification_tx, mut verification_rx) =
-        ghost_verification::task::verification_broadcast_channel(100);
-
-    // C-3: Handle Result from VerificationTask::new() instead of panicking
-    // Mainnet uses identity-pinned TLS (cert pubkey == node_id, no CA chain).
-    // Signet/testnet falls back to plain HTTP for ease of dev iteration.
-    let is_mainnet = config.bitcoin.network == ghost_common::config::BitcoinNetwork::Mainnet;
-    let verification_result = if is_mainnet {
-        // Build the pubkey allow list backed by the live peer registry. The
-        // closure clones the Arc<PeerManager> so it can be consulted at every
-        // TLS handshake without holding any lock outside the call.
-        let peer_mgr_for_pinning = Arc::clone(mesh.peers());
-        let pubkey_allow: ghost_common::tls::PubkeyAllowList =
-            Arc::new(move |pubkey: &[u8; 32]| peer_mgr_for_pinning.get_peer(pubkey).is_some());
-        VerificationTask::new_with_identity_pinned(
-            Arc::clone(&db),
-            &identity,
-            peer_provider as Arc<dyn PeerProvider>,
-            pubkey_allow,
-        )
-    } else {
-        // Signet/testnet: Use HTTP since TLS is typically not configured
-        VerificationTask::new_for_signet(
-            Arc::clone(&db),
-            &identity,
-            peer_provider as Arc<dyn PeerProvider>,
-        )
-    };
-    match verification_result {
-        Ok(verification_task) => {
-            let verification_task = verification_task
-                .with_rpc(Arc::clone(&rpc))
-                .with_assignment_gate(ghost_pool::challenger_assignment_height())
-                // #605: prove Public Mining with a real mining.subscribe at/above the gate.
-                .with_stratum_proof_gate(
-                    ghost_pool::stratum_handshake_proof_height(),
-                    ghost_common::constants::SV1_STRATUM_PORT,
-                )
-                // #605: demand transaction-level detail for Archive at/above the gate.
-                .with_archive_tx_gate(ghost_pool::archive_tx_proof_height())
-                // #605 H-7: broadcast the address proof at/above the gate, so a claimed
-                // `/24` becomes a majority-attested fact instead of a self-report.
-                .with_address_proof_gate(ghost_pool::address_proof_height())
-                .with_policy(policy.clone())
-                .with_broadcast(verification_tx);
-
-            let mut verification_shutdown = shutdown_tx.subscribe();
-            tokio::spawn(async move {
-                // Wait for mesh to establish connections before starting verification
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                tokio::select! {
-                    _ = verification_task.run() => {}
-                    _ = verification_shutdown.recv() => {
-                        tracing::info!("Verification task shutting down");
-                    }
-                }
-            });
-            info!("Verification task started (5 minute interval)");
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to create verification task - verification disabled");
-        }
-    }
-
-    // Start verification result broadcaster (sends results to other nodes via P2P)
-    let mesh_for_verification = Arc::clone(&mesh);
-    let identity_for_verification = Arc::clone(&identity);
-    let db_for_verification = Arc::clone(&db);
-    let rm_for_verification = Arc::clone(&round_manager);
-    tokio::spawn(async move {
-        use ghost_consensus::message::{CapabilityType, MessageType, VerificationResultMessage};
-
-        while let Some(broadcast) = verification_rx.recv().await {
-            let target_short = hex::encode(&broadcast.target_node_id[..4]);
-            let challenger_short = hex::encode(&broadcast.challenger_id[..4]);
-
-            info!(
-                target = %target_short,
-                challenger = %challenger_short,
-                capability = %broadcast.capability,
-                passed = broadcast.passed,
-                "DIAG: Broadcasting verification result to P2P mesh"
-            );
-
-            // Convert the capability to the message enum
-            let capability = match broadcast.capability.as_str() {
-                "archive" => CapabilityType::Archive,
-                "policy" => CapabilityType::Policy,
-                "stratum" => CapabilityType::Stratum,
-                "ghostpay" => CapabilityType::GhostPay,
-                // H-7. Emitted only at/above `address_proof_height()`; the task will not
-                // hand one over below the gate, so reaching here means the gate is live.
-                "address" => CapabilityType::Address,
-                // #736. Emitted only at/above `coordinator_proof_height()`.
-                "coordinator" => CapabilityType::Coordinator,
-                other => {
-                    warn!(capability = %other, "Unknown capability type, skipping broadcast");
-                    continue;
-                }
-            };
-
-            // A-2b: stamp the round this challenge was issued in (our current L1 tip)
-            // so qualification can recompute the challenger draw for it. Populated
-            // ONLY at/above the assignment gate: below the gate it stays None, so the
-            // signed bytes are byte-identical to the pre-A-2b format and a
-            // mixed-version fleet verifies each other's verdicts across the roll. The
-            // gate is armed only once the fleet is uniform, so the None→Some flip is
-            // simultaneous everywhere.
-            let round_height = {
-                let tip = rm_for_verification.current_height();
-                if tip >= ghost_pool::challenger_assignment_height() {
-                    Some(tip)
-                } else {
-                    None
-                }
-            };
-
-            let mut msg = VerificationResultMessage {
-                target_node_id: broadcast.target_node_id,
-                challenger_id: broadcast.challenger_id,
-                capability,
-                passed: broadcast.passed,
-                timestamp: broadcast.timestamp,
-                challenge_data: broadcast.challenge_data,
-                response_data: broadcast.response_data,
-                target_signed_response: broadcast.target_signed_response,
-                round_height,
-                signature: [0u8; 64],
-            };
-            // Sign the CANONICAL bytes (never a hand-rolled copy that could drift
-            // from signing_data) — this binds round_height when present.
-            msg.signature = identity_for_verification.sign(&msg.signing_data());
-
-            // Retain OUR OWN signed verdict in the convergence ledger, so a node's own challenges
-            // enter its ledger immediately rather than only via a convergence round-trip from a
-            // peer that happened to receive this broadcast. Same authoritative source the receive
-            // path stores (the signed message blob); the distinct-challenger majority at
-            // qualification still governs the verdict.
-            match serde_json::to_vec(&msg) {
-                Ok(blob) => {
-                    if let Err(e) =
-                        db_for_verification.insert_verification_proof(VerificationProofInsert {
-                            challenger_id: &hex::encode(msg.challenger_id),
-                            target_node_id: &hex::encode(msg.target_node_id),
-                            capability: broadcast.capability.as_str(),
-                            passed: msg.passed,
-                            timestamp: msg.timestamp,
-                            proof: &blob,
-                            round_height: msg.round_height.map(|h| h as i64),
-                        })
-                    {
-                        warn!(error = %e, "Failed to persist own verification proof to ledger");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to serialize own verification result for ledger")
-                }
-            }
-
-            // Get peer count before broadcast for logging
-            let peer_count = mesh_for_verification.peers().peer_count();
-            let connected_count = mesh_for_verification.peers().connected_count();
-
-            match mesh_for_verification
-                .broadcast_message(MessageType::VerificationResult, &msg)
-                .await
-            {
-                Ok(sent) => {
-                    info!(
-                        target = %target_short,
-                        capability = %broadcast.capability,
-                        passed = broadcast.passed,
-                        sent_to = sent,
-                        peer_entries = peer_count,
-                        zmq_connections = connected_count,
-                        "DIAG: Verification result broadcast complete"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        target = %target_short,
-                        capability = %broadcast.capability,
-                        peer_count = peer_count,
-                        connected_count = connected_count,
-                        "DIAG: Failed to broadcast verification result"
-                    );
-                }
-            }
-        }
-    });
-    info!("Verification result broadcaster started");
-
     // Start ZMQ block watcher with reorg detection (if configured)
     if let Some(ref zmq_endpoint) = config.bitcoin.zmq_hashblock {
         let rm = Arc::clone(&round_manager);
@@ -5731,7 +2811,6 @@ async fn main() -> Result<()> {
         let block_events = zmq_subscriber.subscribe_block_events();
         let rm_for_reorg = Arc::clone(&round_manager);
         let reorg_handler = ReorgHandler::new(Arc::clone(&db), ReorgConfig::default())
-            .with_vote_handler(Arc::clone(&vote_handler))
             .with_alert_dispatcher(Arc::clone(&alert_dispatcher))
             // Record each detected reorg into the shared chain-health ring so the
             // Sync page's Chain Health view can display it (not just alert).
@@ -5754,18 +2833,12 @@ async fn main() -> Result<()> {
     // (subscription was created earlier before template processor started)
     // Note: Job notifications to miners now handled by SRI via TDP
     let rm_notify = Arc::clone(&round_manager);
-    let tp_for_template_events = Arc::clone(&template_processor);
     // Persist each round at start so the `rounds` table carries its block
     // height. The best-hash per-window queries LEFT JOIN rounds to resolve a
     // share's block height; previously rounds were only ever written by the
     // payout path (block-found), which almost never fires, so every per-window
     // best share reported a null block height.
     let db_for_rounds = Arc::clone(&db);
-    // The vote handler validates a payout proposal's block height against the current tip
-    // (a +/-1000 block window). It needs to be told the tip advances, or that check runs
-    // against height 0 and falls back to a permissive default — see below.
-    let vote_handler_for_tips = Arc::clone(&vote_handler);
-    let shard_for_rounds = shard.clone();
     tokio::spawn(async move {
         // `Lagged` is recoverable; only `Closed` is terminal (#984).
         loop {
@@ -5788,105 +2861,6 @@ async fn main() -> Result<()> {
                     // Start new round (SRI gets jobs via TDP automatically)
                     let round_id = rm_notify.start_round(height);
 
-                    // Observation only: an integer compare and a log. The fold runs in the epoch
-                    // task, never here — `NewWork` fires per template refresh (~30s, not per
-                    // block) and shares this path with the ZMQ handler that publishes the empty
-                    // template sub-second so miners get work instantly at a tip change. Nothing
-                    // heavy may live on either. This exists so a boundary crossing is visible when
-                    // it happens rather than up to 30s later, which is the difference between
-                    // diagnosing a stuck fold and guessing at one.
-                    if let Some(ref rt) = shard_for_rounds {
-                        if rt.note_height(height) {
-                            info!(
-                                epoch = ghost_common::share_shard::epoch_for_height(
-                                    height,
-                                    ghost_common::share_shard::EPOCH_BLOCKS
-                                ),
-                                height, round_id, "shard: epoch boundary — fold due next tick"
-                            );
-                        }
-                    }
-
-                    // Persist the address-bind era boundary the first time it is established.
-                    // Without this a restart loses it and re-derives a LATER round from the next
-                    // template, which would treat genuinely post-gate shares as historical and
-                    // accept the weaker signature for them.
-                    if let Some(activation) = rm_notify.addr_bind_activation_round() {
-                        let stored = db_for_rounds
-                            .kv_get(ghost_pool::ADDR_BIND_ACTIVATION_KEY)
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse::<u64>().ok());
-                        if stored != Some(activation) {
-                            if let Err(e) = db_for_rounds.kv_set(
-                                ghost_pool::ADDR_BIND_ACTIVATION_KEY,
-                                &activation.to_string(),
-                            ) {
-                                warn!(error = %e, "could not persist address-bind activation round");
-                            } else {
-                                info!(
-                                    activation_round = activation,
-                                    "Recorded the address-bind signature era boundary"
-                                );
-                            }
-                        }
-                    }
-
-                    // Same for the tier-commitment boundary. A pre-gate share carries no
-                    // `tier_log2`, so losing this round on restart would re-derive a later one and
-                    // make genuinely pre-gate shares unrecordable — refused before they can be
-                    // written, hence replayed for ever by the sweep (#639).
-                    if let Some(activation) = rm_notify.tier_bind_activation_round() {
-                        let stored = db_for_rounds
-                            .kv_get(ghost_pool::TIER_BIND_ACTIVATION_KEY)
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse::<u64>().ok());
-                        if stored != Some(activation) {
-                            if let Err(e) = db_for_rounds.kv_set(
-                                ghost_pool::TIER_BIND_ACTIVATION_KEY,
-                                &activation.to_string(),
-                            ) {
-                                warn!(error = %e, "could not persist tier-bind activation round");
-                            } else {
-                                info!(
-                                    activation_round = activation,
-                                    "Recorded the tier-commitment era boundary"
-                                );
-                            }
-                        }
-                    }
-
-                    // And the PoW-header boundary. For this gate the value is usually the one
-                    // DERIVED from the rounds table at startup (the gate fired before boundaries
-                    // were recorded, #650); persisting it means the boundary outlives the
-                    // eventual pruning of the sub-gate rounds it was derived from.
-                    if let Some(activation) = rm_notify.pow_verify_activation_round() {
-                        let stored = db_for_rounds
-                            .kv_get(ghost_pool::POW_VERIFY_ACTIVATION_KEY)
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse::<u64>().ok());
-                        if stored != Some(activation) {
-                            if let Err(e) = db_for_rounds.kv_set(
-                                ghost_pool::POW_VERIFY_ACTIVATION_KEY,
-                                &activation.to_string(),
-                            ) {
-                                warn!(error = %e, "could not persist pow-verify activation round");
-                            } else {
-                                info!(
-                                    activation_round = activation,
-                                    "Recorded the PoW-header era boundary"
-                                );
-                            }
-                        }
-                    }
-
-                    // Tell the vote handler the chain has advanced — feeds the payout-proposal
-                    // height window (`known_best_height +/- 1000`); it was never called, so the
-                    // handler's height sat at 0 and the window check never constrained anything.
-                    vote_handler_for_tips.update_block_height(height);
-
                     // Persist the round (round_id → block_height) so the
                     // best-hash per-window join can resolve a share's block
                     // height. INSERT OR IGNORE: the payout path later upserts
@@ -5908,19 +2882,6 @@ async fn main() -> Result<()> {
                     };
                     if let Err(e) = db_for_rounds.create_round_if_not_exists(&round_record) {
                         warn!(round_id = round_id, error = %e, "Failed to persist round at start");
-                    }
-
-                    // M-MINE-1: Update template ID for share validation
-                    // The template ID is the prev_block_hash which uniquely identifies the template
-                    if let Some(work_state) = tp_for_template_events.current_work() {
-                        // Parse prev_hash hex string to [u8; 32]
-                        if let Ok(prev_hash_bytes) = hex::decode(&work_state.prev_hash) {
-                            if prev_hash_bytes.len() == 32 {
-                                let mut template_id = [0u8; 32];
-                                template_id.copy_from_slice(&prev_hash_bytes);
-                                rm_notify.set_template_id(template_id);
-                            }
-                        }
                     }
                 }
                 TemplateEvent::TransactionsFiltered {
@@ -5954,7 +2915,6 @@ async fn main() -> Result<()> {
     }
     info!("  HTTP API:   0.0.0.0:{}", http_port);
     info!("  Policy:     {}", policy.name);
-    info!("  Shares:     {}/15", capabilities.total_shares());
     if let Some(ref ts) = tor_status {
         if ts.enabled {
             info!(
@@ -6239,15 +3199,6 @@ fn is_loopback_url(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
 }
 
-/// Extract the host portion from a peer address (strips port if present)
-fn extract_peer_host(address: &str) -> &str {
-    if address.contains(':') {
-        address.split(':').next().unwrap_or(address)
-    } else {
-        address
-    }
-}
-
 /// Resolve the effective signer configuration from config and defaults
 fn resolve_signer_path(
     config_signer: &Option<SignerConfig>,
@@ -6374,39 +3325,6 @@ mod tests {
         assert_eq!(cfg.min_drop_data_size, 64);
         // valid for the analyzer
         assert!(cfg.validate().is_ok());
-    }
-
-    // ── should_claim_archive ─────────────────────────────────────────
-
-    #[test]
-    fn archive_claimed_only_when_config_on_and_ghostd_full() {
-        // Operator asked for archive AND ghostd is a full (non-pruned, non-hazed)
-        // node — this is the only combination that may advertise Archive (+5).
-        assert!(should_claim_archive(true, false, false));
-    }
-
-    #[test]
-    fn archive_not_claimed_when_ghostd_pruned() {
-        // storage.archive_mode = true but ghostd is pruned: a pruned node cannot
-        // serve arbitrary historical blocks, so the claim must be dropped even
-        // though the config asks for it. This is the operator-reported bug.
-        assert!(!should_claim_archive(true, false, true));
-    }
-
-    #[test]
-    fn archive_not_claimed_when_ghostd_hazed() {
-        // Hazed ghostd strips block data, so it also cannot satisfy the Archive
-        // challenge regardless of the config flag.
-        assert!(!should_claim_archive(true, true, false));
-    }
-
-    #[test]
-    fn archive_not_claimed_when_config_off() {
-        // Operator did not enable archive mode — never claim, whatever ghostd's
-        // real state is.
-        assert!(!should_claim_archive(false, false, false));
-        assert!(!should_claim_archive(false, false, true));
-        assert!(!should_claim_archive(false, true, false));
     }
 
     // ── expand_path ──────────────────────────────────────────────────
@@ -6568,64 +3486,6 @@ mod tests {
     #[test]
     fn is_loopback_url_external_domain() {
         assert!(!is_loopback_url("http://example.com:8800"));
-    }
-
-    // ── extract_peer_host ────────────────────────────────────────────
-
-    #[test]
-    fn extract_peer_host_ip_with_port() {
-        assert_eq!(extract_peer_host("192.168.1.1:8080"), "192.168.1.1");
-    }
-
-    #[test]
-    fn get_random_peers_skips_bootstrap_placeholders() {
-        // #618: a stub must never be offered as a verification target, while a real
-        // peer on the same host still must be. Before the fix both were selectable,
-        // and the stub's verdict was filed against a node_id that exists nowhere.
-        use ghost_consensus::peer::{placeholder_node_id, Peer, PeerManager, PeerState};
-
-        let us = [1u8; 32];
-        let mgr = std::sync::Arc::new(PeerManager::new(us, 100));
-
-        // Exactly what connect_peer mints for a not-yet-identified seed.
-        let stub_addr = "95.111.221.169:8559".to_string();
-        let mut stub = Peer::new(placeholder_node_id(&stub_addr), stub_addr.clone());
-        stub.state = PeerState::Connected;
-        let stub_id = stub.node_id;
-        mgr.upsert_peer(stub);
-
-        // A real, identified peer on a different host.
-        let real_id = [42u8; 32];
-        let mut real = Peer::new(real_id, "203.0.113.7:8555".to_string());
-        real.state = PeerState::Connected;
-        mgr.upsert_peer(real);
-
-        let adapter = PeerProviderAdapter::new(mgr, 8080);
-        let selected = adapter.get_random_peers(&us, 10);
-
-        assert!(
-            selected.iter().any(|p| p.node_id == real_id),
-            "a real identified peer must still be selectable"
-        );
-        assert!(
-            !selected.iter().any(|p| p.node_id == stub_id),
-            "a bootstrap placeholder must never be selected as a verification target"
-        );
-    }
-
-    #[test]
-    fn extract_peer_host_ip_without_port() {
-        assert_eq!(extract_peer_host("192.168.1.1"), "192.168.1.1");
-    }
-
-    #[test]
-    fn extract_peer_host_hostname_with_port() {
-        assert_eq!(extract_peer_host("host.com:8080"), "host.com");
-    }
-
-    #[test]
-    fn extract_peer_host_empty() {
-        assert_eq!(extract_peer_host(""), "");
     }
 
     // ── resolve_signer_path ──────────────────────────────────────────

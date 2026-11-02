@@ -32,7 +32,6 @@ pub mod fund_safety;
 pub mod helpers;
 pub mod historical_bugs;
 pub mod hypothetical_bugs;
-pub mod mesh_cluster;
 pub mod policy_enforcement;
 pub mod pool_cycle;
 pub mod round_management;
