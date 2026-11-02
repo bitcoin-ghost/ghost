@@ -71,13 +71,32 @@ curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \
 
 That gives you the defaults: mainnet, full trustless sync with pruning, the node pool (the only mode), the mempool Reaper on, no archive, no Tor, no automatic updates.
 
-**The release must be pinned.** Every release published on GitHub so far is the old network's, which keeps running beside the node pool, so the installer does not track the latest release: it refuses to install without `GHOST_VERSION` naming a node pool release. Set it after `sudo`, so it survives into the root shell:
+**Name the release channel.** The old network keeps running beside the node pool and publishes its own releases in the same GitHub repository, so the installer never takes "the latest release": `GHOST_VERSION` is required, and it must be a node pool release. Set it after `sudo`, so it survives into the root shell:
 
 ```bash
-curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=<node pool release tag> bash -s -- --fee-address ...
+curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=np-latest bash -s -- --fee-address ...
 ```
 
-**No contact with the old network.** A node pool node runs no part of the old mesh: ghost-mining has no mesh, and the installer keeps the old mesh ports (8555–8563) and 8443 closed, so the node neither dials nor accepts the old fleet's mesh. Its peers are share-chain relay peers only (`--relay-peer`). Automatic updates are off and `--auto-update` is ignored with a warning: the updater tracks the latest GitHub release, which is the old network's.
+| `GHOST_VERSION` | Installs |
+|---|---|
+| `np-latest` | The newest published node pool release (`np-vX.Y.Z`; candidates such as `np-vX.Y.Z-rc1` are never picked). |
+| `np-v1.11.46` | Exactly that node pool release. |
+| `v1.11.46`, `1.11.46`, `latest` | Nothing: refused. Those are the old network's releases and carry no node pool. |
+
+No node pool release is published yet, so for now every install stops here.
+
+### Release channels
+
+| | Old network | Node pool |
+|---|---|---|
+| Tags | `v1.11.46` | `np-v1.11.46` (`np-v1.11.46-rc1` for a candidate) |
+| GitHub release | The repository's **latest** release | A **pre-release**, never latest. Titled "Node pool np-v…" |
+| Archive | `bitcoin-ghost-v1.11.46-<target>.tar.gz` | `bitcoin-ghost-np-v1.11.46-<target>.tar.gz` |
+| Its nodes update from | `releases/latest` | The newest published `np-vX.Y.Z`, picked from the release list |
+
+GitHub cannot make a pre-release the latest release, so the old network's nodes, which update from `releases/latest`, are never offered a node pool build, and a node pool node never asks for `latest`. Both channels ship the same set of binaries (`ghostd` and `ghost-cli`, `ghost-mining`, `pool_sv2`, `translator_sv2`, `ghost-admin`, `ghost-audit`), built the same way and signed with the same key (verify with [`SHA256SUMS.txt.asc`](/downloads.html#verify)); the tag is what tells them apart.
+
+**No contact with the old network.** A node pool node runs no part of the old mesh: ghost-mining has no mesh, and the installer keeps the old mesh ports (8555–8563) and 8443 closed, so the node neither dials nor accepts the old fleet's mesh. Its peers are share-chain relay peers only (`--relay-peer`). Automatic updates, when switched on, follow the node pool channel only (see Automatic updates below).
 
 **Reading it first.** The installer is one self-contained shell script. To read it before it runs as root, download it and run the file:
 
@@ -126,7 +145,7 @@ On a fresh install there is no Bitcoin node yet; ghostd is installed, and the in
 | `--tor` | off | Hybrid Tor: ghostd peers via Tor and publishes an onion, still reachable on clearnet 8333. |
 | `--tor-only` | off | ghostd uses Tor only (`onlynet=onion`) and 8333 is closed. Implies `--tor`. |
 | `--no-tor` | | Never use Tor (the default). |
-| `--auto-update` | off | Ignored on node pool nodes for now, with a warning: the updater tracks the latest GitHub release, which is the old network's. |
+| `--auto-update` | off | Apply newer signed node pool releases automatically (np- channel only). See Automatic updates below. |
 | `--no-auto-update` | | Never auto-update (the default). |
 | `--backups` | on | Back up the node database every night at 03:00 UTC, kept 7 days. See *Database backups*, below. |
 | `--no-backups` | | No nightly backups. The job is still installed; switch it on later with `sudo systemctl enable --now ghost-backup.timer`. |
@@ -225,6 +244,7 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 | `/var/lib/ghost/node-pool.db` | The share-chain relay's store (anchors, batches, shares, ledger) |
 | `/etc/ghost/translator-config.toml` | translator_sv2 (sri-translator) config |
 | `/etc/ghost/auto-update.conf` | Auto-update opt-in |
+| `/etc/ghost/release-channel` | Release channel marker: `node-pool`. The updater follows np- releases only while it says so |
 | `/etc/ghost/backup.conf` | Optional off-node backup destination. Not present unless you configure one |
 | `/etc/ghost/version` | Installed release version |
 
@@ -332,19 +352,25 @@ Re-running keeps the things that identify the node: an existing `node.key` is ke
 
 ## Automatic updates
 
-⚠ **Not on node pool nodes yet.** The updater resolves the latest GitHub release, which is the old network's, so the installer leaves it off and ignores `--auto-update`. Do not switch it on from the dashboard either: it would replace the node pool binaries. The rest of this section describes the updater as it works on the old network.
-
 Off by default. A node never upgrades itself unless you opt in, with `--auto-update` at install time or later:
 
 ```bash
 sudo /opt/ghost/bin/ghost-autoupdate-toggle on     # or off
 ```
 
-The toggle writes `AUTO_UPDATE=true|false` to `/etc/ghost/auto-update.conf` and enables or disables `ghost-auto-update.timer`. The updater is a no-op unless that file says exactly `AUTO_UPDATE=true`.
+The toggle writes `AUTO_UPDATE=true|false` to `/etc/ghost/auto-update.conf` and enables or disables `ghost-auto-update.timer`. The updater is a no-op unless that file says exactly `AUTO_UPDATE=true`. The dashboard's switch runs the same toggle.
+
+**Which releases it follows** is decided by `/etc/ghost/release-channel`, which the installer writes and nothing else changes (not the toggle, not the dashboard):
+
+| Marker | The updater |
+|---|---|
+| `node-pool` (every node this installer sets up) | Takes the newest published `np-vX.Y.Z` release. Never asks for `releases/latest`. |
+| absent (a node installed before the channel existed) | Follows the old network's `releases/latest`, exactly as before. Refuses if that is ever a node pool release, or if the node already runs an `np-` build. |
+| anything else | Refuses, and the toggle refuses to switch updates on. |
 
 When it is on, `ghost-auto-update.timer` runs `/opt/ghost/bin/ghost-auto-update.sh` 15 minutes after boot and then every 6 hours, with up to an hour of random delay. Each run:
 
-1. compares the latest GitHub release with `/etc/ghost/version`, and stops if it is not newer;
+1. compares the newest release on its channel with `/etc/ghost/version`, and stops if it is not newer;
 2. downloads the tarball, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc`, and verifies the signature against the same pinned key and the tarball's checksum — on any failure no binary is touched;
 3. backs up the current binaries next to themselves as `*.bak.<timestamp>`;
 4. stops `sri-translator`, `sri-pool`, `ghost-mining` and `ghostd` in that order, swaps in the new `ghostd`, `ghost-mining`, `pool_sv2` and `translator_sv2` (and `ghost-cli` and `ghost-admin` where installed), and starts them again in the opposite order;
@@ -394,7 +420,9 @@ systemd restarts a crashing service for ever and reports it `active` between cra
 | Symptom | First check |
 |---|---|
 | Installer stops with `Release signature verification FAILED` or `Checksum verification FAILED` | The download did not match the signed release. Don't work around it; re-run, and if it persists report it. |
-| Installer stops with `could not determine the latest release` | The GitHub API was unreachable. Re-run, or pin `GHOST_VERSION`. |
+| Installer stops with `GHOST_VERSION=… refused` | It is empty, or an old-network tag. Use `GHOST_VERSION=np-latest` or an exact `np-v…` tag. |
+| Installer stops with `GHOST_VERSION=np-latest: could not fetch the release list` or `no node pool release` | The GitHub API was unreachable, or no node pool release is published yet. Re-run, or name an exact `np-v…` tag. |
+| Auto-update status says `release channel marker invalid` or `node pool install without its channel marker` | `/etc/ghost/release-channel` is wrong or missing on a node pool node. Re-run the installer, or write `node-pool` into it. |
 | Lost SSH after the install | `ufw` only allows 22/tcp. Use the provider's console and `ufw allow <port>/tcp`. |
 | ghost-mining, sri-pool, sri-translator all `inactive` | Expected until ghostd is synced. `sudo journalctl -u ghost-mining-gate -f` — it logs `waiting for ghostd to finish initial sync...` until then. |
 | ghostd not syncing | `sudo journalctl -u ghostd -n 100`; `sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo` |
