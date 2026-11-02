@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-common"
-version = "1.11.46"
+version = "2.0.0"
 dependencies = [
  "base64",
  "bitcoin",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-np-relay"
-version = "1.11.46"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-storage"
-version = "1.11.46"
+version = "2.0.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
