@@ -2,7 +2,10 @@
 """SV1 CPU miner for the node pool regtest harness.
 
 One process runs several miners (threads), each its own stratum connection with its own
-username (payout address + worker) and user agent, so one process per node is enough.
+username (payout address + worker) and user agent, so one process per node is enough. A miner
+spec ending `@serial` behaves like cgminer: it sends mining.authorize only once its
+mining.subscribe has been answered (the translator answers it from a channel opened on
+subscribe); every other miner pipelines subscribe and authorize, as AxeOS does.
 
 On regtest every hash below the proof-of-work limit's half is a Bitcoin block, and the node
 pool's network tier T_net (tier base = regtest's limit, floor tier 10) sits 2^10 below it, so
@@ -30,7 +33,7 @@ import time
 ap = argparse.ArgumentParser()
 ap.add_argument("host")
 ap.add_argument("port", type=int)
-ap.add_argument("--miner", action="append", required=True, help="USER@AGENT")
+ap.add_argument("--miner", action="append", required=True, help="USER@AGENT[@serial]")
 ap.add_argument("--events", required=True)
 ap.add_argument("--pace", type=float, default=6.0, help="mean seconds between submits, per miner")
 ap.add_argument("--anchor-odds", type=float, default=0.3)
@@ -93,6 +96,10 @@ class Miner(threading.Thread):
     def __init__(self, spec):
         super().__init__(daemon=True)
         self.user, _, self.agent = spec.partition("@")
+        self.serial = self.agent.endswith("@serial")
+        if self.serial:
+            self.agent = self.agent[: -len("@serial")]
+        self.subscribed = threading.Event()
         self.name_ = self.user.split(".", 1)[-1]
         self.rid = 1
         self.en1, self.en2sz, self.diff = "", 4, 1.0
@@ -131,6 +138,7 @@ class Miner(threading.Thread):
         if msg.get("id") == 1 and msg.get("result"):
             self.en1, self.en2sz = msg["result"][1], msg["result"][2]
             emit(self.user, "subscribed", en1=self.en1, en2sz=self.en2sz)
+            self.subscribed.set()
         elif method == "mining.set_extranonce":
             self.en1, self.en2sz = msg["params"][0], msg["params"][1]
         elif method == "mining.set_difficulty":
@@ -194,8 +202,13 @@ class Miner(threading.Thread):
                 time.sleep(1)
         threading.Thread(target=self.reader, daemon=True).start()
         self.send("mining.subscribe", [self.agent])
+        if self.serial:
+            # cgminer's order: nothing more until the subscribe is answered.
+            if not self.subscribed.wait(120):
+                emit(self.user, "subscribe_unanswered")
+                return
         self.send("mining.authorize", [self.user, "x"])
-        emit(self.user, "connected", agent=self.agent)
+        emit(self.user, "connected", agent=self.agent, serial=self.serial)
         while True:
             job = self.jobs.get()
             while not self.jobs.empty():

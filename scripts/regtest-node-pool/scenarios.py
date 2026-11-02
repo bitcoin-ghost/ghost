@@ -6,8 +6,10 @@ import re
 import subprocess
 import time
 
-from harness import (logged, RPC_PASS, RPC_USER, SLOT_CLASSES, TREASURY_SCRIPT as TREASURY, check_coinbase,
-                     payee, regtest_subsidy, result, say, subsidy, wait_for)
+from harness import (FIRST_EARNING_HEIGHT, logged, RPC_PASS, RPC_USER, SERIAL_AGENT, SLOT_CLASSES, TREASURY_SCRIPT as TREASURY,
+                     check_coinbase, p2pkh_address, payee, result, say, subsidy, wait_for, Proc, HERE,
+                     REGTEST_TIER_BASE)
+import sys
 
 def genesis_args(h):
     """ghost-audit starts from the same genesis table the nodes imported, and refuses any other."""
@@ -132,6 +134,113 @@ def balances_agree(h):
            "PASS" if ok else "FAIL", ev)
 
 
+def early_blocks(h):
+    """Findings F and E. Pool blocks at heights 2..16 carry OP_2..OP_16 BIP34 heights, which
+    Bitcoin accepts only as those opcodes; and work below the first earning height (genesis 0 +
+    21) is served, said to earn nothing, and never made into an anchor peers would refuse."""
+    blocks = STATE.get("pool_blocks") or h.pool_blocks(h.nodes[0])
+    early = [b[0] for b in blocks if b[0] < FIRST_EARNING_HEIGHT]
+    op_n = [x for x in early if x <= 16]
+    ev, ok = [f"pool blocks below height {FIRST_EARNING_HEIGHT} on the best chain: {early}",
+              f"of them at BIP34 heights 2-16 (OP_2..OP_16): {op_n}"], bool(op_n)
+    for n in h.honest():
+        log = n.read_log("pool_sv2")
+        warned = sorted({int(m) for m in re.findall(r"NODE_POOL_VOID_WORK.*?height=(\d+)", log)})
+        invalid = len(re.findall(r"invalid anchor: its own share: rule 6", log))
+        st = n.status().get("earning") or {}
+        good = (warned and max(warned) == FIRST_EARNING_HEIGHT - 1 and invalid == 0
+                and st.get("first_earning_height") == FIRST_EARNING_HEIGHT and st.get("earns") is True)
+        ok &= bool(good) if n.i < h.args.nodes else invalid == 0
+        ev.append(f"node{n.i}: NODE_POOL_VOID_WORK for heights {warned[:3]}..{warned[-1:] or ''}; "
+                  f"anchors refused for rule 6: {invalid}; status earning={st}")
+    result("early blocks: OP_N BIP34 heights accepted; void work before genesis + 21 served, "
+           "flagged, never anchored", "PASS" if ok else "FAIL", ev)
+
+
+def miner_events(n, since=0.0):
+    try:
+        with open(os.path.join(n.dir, "miner-events.jsonl")) as f:
+            return [e for e in (json.loads(l) for l in f if l.strip()) if e["t"] >= since]
+    except OSError:
+        return []
+
+
+def serial_miner(h):
+    """Finding C (and G): a cgminer-style miner, which authorises only once its subscribe is
+    answered, gets a channel opened on subscribe and bound to its bare payout address on
+    authorize; it mines and is credited like a pipelining miner."""
+    n0 = h.nodes[0]
+    serial = [m for m in n0.miners if m[3] == SERIAL_AGENT]
+    if not serial:
+        return result("serialising (cgminer-style) miner is served", "UNMEASURED", "run without --no-serial-miner")
+    user, addr, script, agent, cls = serial[0]
+    ev = miner_events(n0)
+    mine = [e for e in ev if e["miner"] == addr]
+    kinds = [e["ev"] for e in mine]
+    first_sub = kinds.index("subscribed") if "subscribed" in kinds else None
+    auth = next((e for e in mine if e["ev"] == "authorized"), None)
+    ok_shares = sum(1 for e in mine if e["ev"] == "submit_result" and e.get("ok"))
+    drops = kinds.count("disconnect")
+    tr = n0.read_log("translator")
+    bound_tr = re.search(r"binding downstream \d+'s provisional channel \d+ to " + re.escape(user), tr)
+    bound_pool = "provisional channel bound to its payee" in n0.read_log("pool_sv2")
+    led = n0.ledger(addr)
+    units = int(led.get("balance", {}).get("units", 0) or 0)
+    good = (first_sub is not None and auth and auth.get("ok") and kinds.index("authorized") > first_sub
+            and ok_shares > 0 and drops == 0 and bool(bound_tr) and bound_pool and units > 0)
+    result("serialising (cgminer-style) miner: channel opened on subscribe, bound to its bare "
+           "address on authorize, mines and is credited", "PASS" if good else "FAIL",
+           [f"{addr[:16]}.. ({agent}, bare address): subscribe answered then authorize "
+            f"{'accepted' if auth and auth.get('ok') else auth}; {ok_shares} shares accepted; "
+            f"{drops} disconnects",
+            f"translator: {'bound: ' + bound_tr.group(0)[:120] if bound_tr else 'NO binding line'}",
+            f"pool_sv2: 'provisional channel bound to its payee' logged={bound_pool}",
+            f"ledger balance units on node0: {units}"])
+
+
+def one_refused_miner(h):
+    """Finding C: the pool refusing one SV1 miner's channel drops that miner only."""
+    n0 = h.nodes[0]
+    bad = f"{p2pkh_address('refused')}.bad"
+    mark_tr = len(n0.read_log("translator"))
+    events = os.path.join(h.work, "refused-miner.jsonl")
+    for n in h.nodes:
+        n.pause_miners(False)
+    t = time.time()
+    proc = Proc("refused-miner", [sys.executable, os.path.join(HERE, "cpu_miner.py"), "127.0.0.1",
+                                  str(n0.sv1), "--events", events, "--miner", f"{bad}@bitaxe/v2.10.0",
+                                  "--tier-base", REGTEST_TIER_BASE], os.path.join(n0.dir, "refused-miner.log"))
+    try:
+        def dropped():
+            with open(events) as f:
+                return any('"disconnect"' in l for l in f)
+        try:
+            wait_for(dropped, 60, what="the refused miner to be disconnected")
+            gone = True
+        except TimeoutError:
+            gone = False
+        time.sleep(5)
+    finally:
+        proc.stop()
+        for n in h.nodes:
+            n.pause_miners(True)
+    others = [e for e in miner_events(n0, t) if e["ev"] == "disconnect"]
+    tr = n0.read_log("translator")[mark_tr:]
+    refused = re.search(r"the pool refused downstream \d+'s channel \(([^)]*)\)", tr)
+    fallback = tr.count("fallback triggered")
+    ok = gone and refused and not others and fallback == 0
+    result("one refused SV1 miner is dropped alone; the translator's other miners keep mining",
+           "PASS" if ok else "FAIL",
+           [f"{bad[:20]}.. (P2PKH, refused by the pool) disconnected: {gone}",
+            f"translator: {refused.group(0) if refused else 'NO per-miner refusal line'}; "
+            f"'fallback triggered' {fallback} times",
+            f"node0's own miners' disconnects meanwhile: {len(others)}"])
+    try:
+        STATE["quiet"] = h.quiesce(240)
+    except TimeoutError:
+        STATE["quiet"] = None
+
+
 def blocks_settle(h):
     if not STATE.get("quiet"):
         return result("pool blocks: settled on every node, exact coinbase sums", "UNMEASURED",
@@ -152,9 +261,6 @@ def blocks_settle(h):
             ev.append(f"h{height} {bh[:16]}: " + "; ".join(errs))
         if len(vouts) > 4 or (len(vouts) == 4 and vouts[1][1] in payees):
             paying += 1
-        if subsidy(height) != regtest_subsidy(height):
-            ok = False
-            ev.append(f"h{height}: Ghost's subsidy {subsidy(height)} != regtest's {regtest_subsidy(height)}")
     if h.genesis:
         paid = {}
         for _, _, vouts in blocks:
@@ -371,7 +477,7 @@ def audit(h):
     argv = [exe, "audit", "--network", "regtest", "--relay-peer", f"127.0.0.1:{peer.relay}",
             "--data-dir", data, "--rpc-port", str(target.rpc_port), "--rpc-user", RPC_USER,
             "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{target.sv1}",
-            "--node-relay", f"127.0.0.1:{target.relay}", "--address", addr, "--username", f"{addr}.audit", "--jobs",
+            "--node-relay", f"127.0.0.1:{target.relay}", "--address", addr, "--jobs",
             str(h.args.audit_jobs), "--json", "--wait", "180", "--timeout", "120"] + genesis_args(h)
     # New jobs come with new blocks: let the miners go slowly while the auditor listens.
     tr_mark = len(target.read_log("translator"))
@@ -447,34 +553,51 @@ def genesis_import(h):
 def past_halving(h):
     if not h.args.past_halving:
         return result("regtest halving (height 150)", "UNMEASURED",
-                      "not run (pass --past-halving). Regtest halves every 150 blocks; Ghost's subsidy "
-                      "follows mainnet's 210,000, so above 149 the template is worth less than the "
-                      "canonical coinbase")
-    n0 = h.nodes[0]
+                      "not run (pass --past-halving). Regtest halves every 150 blocks; pool_sv2 "
+                      "follows the relay's network (Halving::REGTEST)")
+    n0 = h.honest()[0]
     tip = n0.rpc("getblockcount")
-    if tip < 148:
-        n0.rpc("generatetoaddress", 148 - tip, payee("bootstrap")[0])
-    log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
+    if tip < 146:
+        n0.rpc("generatetoaddress", 146 - tip, payee("bootstrap")[0])
+    log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.honest()}
     for n in h.nodes:
         n.pause_miners(False)
     try:
-        wait_for(lambda: n0.rpc("getblockcount") >= 151, 120, what="height 151")
+        wait_for(lambda: n0.rpc("getblockcount") >= 155, 300, what="height 155")
     except TimeoutError:
         pass
     for n in h.nodes:
         n.pause_miners(True)
     height = n0.rpc("getblockcount")
-    ev = [f"height {height}"]
-    stuck = False
+    ev, ok = [f"height {height}"], True
+    try:
+        ev.append(f"agreed (height, share-chain tip): {h.quiesce(240)}")
+    except TimeoutError as e:
+        ok = False
+        ev.append(str(e))
     for n in h.nodes:
-        new = n.read_log("pool_sv2")[log_len[n.i]:]
+        if n.fault:
+            continue
+        new = n.read_log("pool_sv2")[log_len.get(n.i, 0):]
         m = re.search(r"[^\n]*below the subsidy[^\n]*", new)
         alive = n.procs["pool_sv2"].alive()
-        stuck |= bool(m) or not alive
+        ok &= alive and not m
         ev.append(f"node{n.i}: pool_sv2 alive={alive}; " + (m.group(0)[-200:] if m else "no subsidy error"))
     blocks = [b for b in h.pool_blocks(n0) if b[0] >= 150]
-    ev.append(f"pool blocks at 150 or above: {len(blocks)}")
-    result("regtest halving (height 150): pool blocks continue", "FAIL" if stuck or not blocks else "PASS", ev)
+    payees = ({m[2] for n in h.nodes for m in n.miners} | {payee("node0/sv2-device", True)[1]}
+              | set(h.genesis))
+    fees = {n.fee_script for n in h.nodes}
+    ev.append(f"pool blocks at 150 or above: {len(blocks)} (heights {[b[0] for b in blocks]})")
+    ok &= bool(blocks)
+    for height_, bh, vouts in blocks:
+        errs = check_coinbase(height_, vouts, payees, fees)
+        settled = [n.i for n in h.honest() if settled_in(n.read_log("pool_sv2"), bh)]
+        ok &= not errs and len(settled) == len(h.honest())
+        ev.append(f"h{height_}: treasury {vouts[0][0]} + miners = {subsidy(height_)} (regtest era "
+                  f"{height_ // 150}): {'exact' if not errs else '; '.join(errs)}; settled on nodes "
+                  f"{settled}")
+    result("regtest halving (height 150): pool blocks continue, pay the halved subsidy exactly "
+           "and settle on every node", "PASS" if ok else "FAIL", ev)
 
 
 FAULT_REASON = {"wrong-treasury": "wrong treasury", "fee-skim": "fee skim"}
@@ -543,7 +666,7 @@ def hostile(h):
         argv = [exe, "audit", "--network", "regtest", "--relay-peer", f"127.0.0.1:{honest[0].relay}",
                 "--data-dir", os.path.join(h.work, f"audit-{fault}"), "--rpc-port", str(honest[0].rpc_port),
                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{bad.sv1}",
-                "--node-relay", f"127.0.0.1:{bad.relay}", "--address", addr, "--username", f"{addr}.audit", "--jobs", "1", "--json",
+                "--node-relay", f"127.0.0.1:{bad.relay}", "--address", addr, "--jobs", "1", "--json",
                 "--wait", "120", "--timeout", "120"] + genesis_args(h)
         out = subprocess.run(argv, capture_output=True, text=True, timeout=400)
         with open(os.path.join(h.work, f"audit-{fault}.log"), "w") as f:
@@ -560,5 +683,6 @@ def hostile(h):
                "PASS" if ok else "FAIL", ev)
 
 
-ALL = [bringup, genesis_import, mine, balances_agree, blocks_settle, slot_classes, bitcoin_reorg, fresh_node, audit,
-       hostile, past_halving]
+ALL = [bringup, genesis_import, mine, balances_agree, serial_miner, one_refused_miner, blocks_settle, early_blocks,
+       slot_classes,
+       bitcoin_reorg, fresh_node, audit, hostile, past_halving]

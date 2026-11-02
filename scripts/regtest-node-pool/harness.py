@@ -3,11 +3,12 @@
 
 Native processes on loopback, one temp directory, no Docker. Per node:
 
-  bitcoind (regtest, peered) -> ghost-mining (TDP template provider) -> pool_sv2
+  ghostd (regtest, peered) -> ghost-mining (TDP template provider) -> pool_sv2
   ([node_pool] + [node_pool.relay], relays peered) -> translator_sv2 (SV1) -> cpu_miner.py
 
-The Bitcoin node is any binary that speaks Core's RPC and ZMQ on regtest (--bitcoind; stock
-Bitcoin Core by default). Every scenario prints PASS, FAIL or UNMEASURED with its evidence;
+The Bitcoin node is ghostd, as on every node pool node, run as the installer runs it (Reaper on;
+--no-reaper turns it off). --bitcoind (or BITCOIND=) runs any other binary that speaks Core's RPC
+and ZMQ on regtest instead. Every scenario prints PASS, FAIL or UNMEASURED with its evidence;
 only a positive reading passes. Run: scripts/regtest-node-pool/run.sh --help
 """
 import argparse
@@ -42,8 +43,8 @@ TREASURY_SCRIPT = "51209925167815d1202e985dc607bceab162cb70c98d292da3592c087b44a
 LEDGER_MAGIC = b"GHNP".hex()
 WITNESS_PREFIX = "6a24aa21a9ed"
 COIN = 100_000_000
-# Ghost's subsidy schedule (canonical_payout::subsidy): mainnet halvings, whatever the network.
-HALVING = 210_000
+# Regtest's subsidy schedule (Halving::REGTEST): it halves every 150 blocks.
+HALVING = 150
 # Agents chosen to land in each class of the ceiling table (slot_class_sensing.rs).
 AGENTS = [
     ("cpuminer/2.5", 3),              # unknown -> smallest class
@@ -54,12 +55,22 @@ AGENTS = [
     ("bitaxe/v2.10.0", 500),          # ESP-Miner <= 2.15, 22 KB
 ]
 SLOT_CLASSES = [3, 9, 44, 143, 364, 500]
-# Plain blocks mined before any pool job. Two reasons, both findings (see the report):
-# - ghost-mining writes BIP34 heights 1-16 as a one-byte push where consensus wants OP_1..OP_16,
-#   so a pool block there is refused (bad-cb-height);
-# - rule 6 has no snapshot anchor for a job height within 20 of the genesis anchor (cut(H) <=
-#   genesis), so every share and anchor there is void, while pool_sv2 still issues the jobs.
-BOOTSTRAP_HEIGHT = 20
+# The serialising miner's agent: cgminer with no model, so an unknown agent (smallest class).
+SERIAL_AGENT = "cgminer/4.10"
+# Plain blocks mined before any pool job: one, so the Bitcoin node leaves initial block download
+# (regtest's genesis is from 2011). Pool blocks then start at height 2, through the OP_1..OP_16
+# BIP34 heights, and through the first 20 blocks after the genesis anchor, whose shares are void
+# (cut(H) is at or below genesis, so rule 6 has no snapshot anchor): jobs are still served there,
+# and pool_sv2 says they earn nothing (NODE_POOL_VOID_WORK).
+BOOTSTRAP_HEIGHT = 1
+# The first job height whose shares earn: genesis btc_height (0) + SNAPSHOT_CUT_LAG + 1.
+FIRST_EARNING_HEIGHT = 21
+# The installer's Reaper flags for ghostd (scripts/install-node.sh, REAPER_FLAGS).
+REAPER_FLAGS = ["-ghostreaper=enabled", "-ghostreaper-rejectinscription=1",
+                "-ghostreaper-rejectdropstuffing=1", "-ghostreaper-rejectfakepubkey=1",
+                "-ghostreaper-rejectannex=1", "-ghostreaper-rejectopreturn=1",
+                "-ghostreaper-rejectrunestone=1", "-ghostreaper-maxopreturn=82",
+                "-ghostreaper-mindropsize=76"]
 
 RESULTS = []
 
@@ -111,6 +122,23 @@ def segwit_address(hrp, version, program):
     pm = _polymod(hrpx + data + [0] * 6) ^ const
     chk = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
     return hrp + "1" + "".join(CHARSET[d] for d in data + chk)
+
+
+def b58check(version, payload):
+    raw = bytes([version]) + payload
+    raw += hashlib.sha256(hashlib.sha256(raw).digest()).digest()[:4]
+    n = int.from_bytes(raw, "big")
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = alphabet[r] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
+
+
+def p2pkh_address(tag):
+    """A regtest P2PKH address: a valid address the node pool refuses as a payee."""
+    return b58check(0x6F, hashlib.sha256(tag.encode()).digest()[:20])
 
 
 def payee(tag, taproot=False):
@@ -262,8 +290,10 @@ class Node:
         ] + [f"addnode=127.0.0.1:{p}" for p in peers]
         with open(os.path.join(d, "bitcoin.conf"), "w") as f:
             f.write("\n".join(conf) + "\n")
-        self.procs["bitcoind"] = Proc("bitcoind", [self.h.args.bitcoind, f"-datadir={d}"],
-                                      self.log("bitcoind"))
+        argv = [self.h.args.bitcoind, f"-datadir={d}"]
+        if self.h.is_ghostd and self.h.args.reaper:
+            argv += REAPER_FLAGS
+        self.procs["bitcoind"] = Proc("bitcoind", argv, self.log("bitcoind"))
         wait_for(lambda: self.rpc("getblockcount") is not None, 60, what=f"node{self.i} bitcoind RPC")
 
     # -- ghost-mining ----------------------------------------------------------------------
@@ -306,7 +336,7 @@ prune_height = 0
 [pool]
 
 [reaper]
-enabled = false
+enabled = {"true" if self.h.is_ghostd and self.h.args.reaper else "false"}
 """
         with open(os.path.join(d, "pool.toml"), "w") as f:
             f.write(cfg)
@@ -533,6 +563,9 @@ class Harness:
         self.t0 = time.time()
         self.peak_rss = 0
         self.export_dir = self.export_digest = None
+        out = subprocess.run([args.bitcoind, "-version"], capture_output=True, text=True).stdout
+        self.node_version = (out.splitlines() or ["unknown version"])[0]
+        self.is_ghostd = "Ghost Core" in out
         self.genesis = {}  # script hex -> sats owed at genesis
         self.genesis_addr = {}  # script hex -> address
         if args.genesis_rows:
@@ -631,6 +664,13 @@ class Harness:
                 user = f"{addr}.w{k}"
                 n.miners.append((user, addr, script, agent, cls))
                 specs.append((user, agent))
+            if i == 0 and not agents and self.args.serial_miner:
+                # A cgminer-style miner: authorize only after its subscribe is answered, so the
+                # translator opens its channel on subscribe and binds the payee on authorize.
+                # It authorises as its bare payout address (finding G).
+                addr, script = payee("node0/serial", False)
+                n.miners.append((f"{addr}.default", addr, script, SERIAL_AGENT, 3))
+                specs.append((addr, SERIAL_AGENT + "@serial"))
             n.start_miners(specs, self.args.pace,
                            self.args.anchor_odds if anchor_odds is None else anchor_odds)
         say(f"  node{i}: bitcoind :{n.rpc_port}  ghost-mining tdp :{n.tdp}  pool_sv2 :{n.pool} "
@@ -705,11 +745,8 @@ class Harness:
 
 # ---------------------------------------------------------------------------------------------
 def subsidy(h):
+    """Regtest's block subsidy at height h."""
     return 0 if h // HALVING >= 64 else (50 * COIN) >> (h // HALVING)
-
-
-def regtest_subsidy(h):
-    return 0 if h // 150 >= 64 else (50 * COIN) >> (h // 150)
 
 
 def check_coinbase(h, vouts, payee_scripts, fee_scripts):
@@ -752,7 +789,8 @@ def run(args):
         raise SystemExit(f"ports already in use (another run?): {busy[:8]}; pass --base-port")
     h = Harness(args)
     say(f"work dir: {h.work}")
-    say(f"bitcoin node: {args.bitcoind} ({subprocess.run([args.bitcoind, '-version'], capture_output=True, text=True).stdout.splitlines()[0]})")
+    say(f"bitcoin node: {args.bitcoind} ({h.node_version}); Reaper "
+        f"{'on' if h.is_ghostd and args.reaper else 'off'}")
     interrupted = False
 
     def on_signal(signum, _frame):
@@ -797,11 +835,32 @@ def scenarios(h):
         sc(h)
 
 
+def find_ghostd(cache):
+    """The newest released ghostd run.sh --fetch-ghostd verified and cached, else ghostd on PATH,
+    else the installer's /opt/ghost/bin/ghostd."""
+    if cache and os.path.isdir(cache):
+        def version(d):
+            return tuple(int(x) for x in re.findall(r"\d+", d))
+        for d in sorted((d for d in os.listdir(cache) if d.startswith("ghostd-v")), key=version,
+                        reverse=True):
+            p = os.path.join(cache, d, "ghostd")
+            if os.access(p, os.X_OK):
+                return p
+    for p in (shutil.which("ghostd"), "/opt/ghost/bin/ghostd"):
+        if p and os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--nodes", type=int, default=3)
     ap.add_argument("--miners-per-node", type=int, default=2)
-    ap.add_argument("--bitcoind", default=os.environ.get("BITCOIND") or shutil.which("bitcoind"))
+    ap.add_argument("--bitcoind", default=os.environ.get("BITCOIND") or os.environ.get("GHOSTD"),
+                    help="the Bitcoin node binary (default: ghostd; see run.sh)")
+    ap.add_argument("--ghostd-cache", help="where run.sh --fetch-ghostd keeps released ghostds")
+    ap.add_argument("--no-reaper", dest="reaper", action="store_false",
+                    help="run ghostd and ghost-mining without the Reaper (the installer's default is on)")
     ap.add_argument("--bin-dir", default=os.path.join(REPO, "target", "debug"))
     ap.add_argument("--pool-binary", default="pool_sv2")
     ap.add_argument("--mining-device", default=os.environ.get("MINING_DEVICE"),
@@ -814,6 +873,8 @@ def main():
     ap.add_argument("--anchor-odds", type=float, default=0.35)
     ap.add_argument("--sensing-min-shares", type=int, default=2)
     ap.add_argument("--mine-to", type=int, default=110, help="Bitcoin height to mine to first")
+    ap.add_argument("--no-serial-miner", dest="serial_miner", action="store_false",
+                    help="leave out node0's cgminer-style (serialising) miner")
     ap.add_argument("--translator-required", default="[0x0002, 0x4748]")
     ap.add_argument("--translator-supported", default="[]")
     ap.add_argument("--open-channel-on-subscribe", choices=["true", "false"], default="true",
@@ -831,8 +892,10 @@ def main():
                     help="finally mine past regtest's first halving (150) and report what happens")
     ap.add_argument("--only", nargs="*", help="scenario function names to run")
     args = ap.parse_args()
+    args.bitcoind = args.bitcoind or find_ghostd(args.ghostd_cache)
     if not args.bitcoind:
-        raise SystemExit("no bitcoind: pass --bitcoind or set BITCOIND")
+        raise SystemExit("no ghostd: run `run.sh --fetch-ghostd`, put ghostd on PATH, or pass "
+                         "--bitcoind (BITCOIND=/GHOSTD=)")
     sys.path.insert(0, HERE)
     # scenarios.py imports this file as `harness`: make that this very module, so its results
     # land in the same RESULTS list.
