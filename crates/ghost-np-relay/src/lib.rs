@@ -51,3 +51,6 @@ mod testkit;
 
 #[cfg(test)]
 mod multi_node;
+
+#[cfg(test)]
+mod net_tests;

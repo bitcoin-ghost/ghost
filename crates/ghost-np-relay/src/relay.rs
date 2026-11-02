@@ -265,6 +265,8 @@ pub struct RelayStatus {
     pub loose: usize,
     /// Anchors held but not yet seen.
     pub unseen: usize,
+    /// Connected peers.
+    pub peers: usize,
     /// Counters.
     pub stats: RelayStats,
 }
@@ -636,6 +638,7 @@ impl Relay {
                 .unwrap_or(info.t_net),
             loose: self.loose.len(),
             unseen: self.anchors.len() - self.credits.len(),
+            peers: self.peers.len(),
             stats: self.stats,
         }
     }
@@ -881,10 +884,11 @@ impl Relay {
 
     fn on_net_share(&mut self, src: Option<PeerId>, s: NetShare, hdr: &dyn HeaderLookup) {
         let id = s.id();
+        let known = self.shares.contains_key(&id);
         if self.wanted.contains_key(&id) {
             self.store_body(s.clone(), hdr);
         }
-        if self.loose.contains_key(&id) || self.credits.contains_key(&id) {
+        if known || self.loose.contains_key(&id) {
             return;
         }
         if s.header.time as u64 > self.now + self.p.future_time_secs {

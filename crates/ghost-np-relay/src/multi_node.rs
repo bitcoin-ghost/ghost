@@ -367,3 +367,41 @@ fn a_restarted_node_reloads_its_chain_and_ledger() {
     assert!(r.has_batch(&best));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_reorg_parks_block_retirements_above_the_credits_and_re_applies_them() {
+    use ghost_common::node_pool_constants::FACE_PER_SAT;
+    let mut s = Sim::mesh(2);
+    s.unlink(0, 1);
+    s.mine(0, false);
+    s.mine(1, false);
+    s.tick(31);
+    s.mine(0, true);
+    s.mine(1, true);
+    s.mine(1, true);
+    // Settlement (W2.7) applied a block's retirements on node 0 after its anchor's credits.
+    let r = vec![(s.nodes[0].miner.payee.clone(), 5 * FACE_PER_SAT)];
+    let block = [0xB0; 32];
+    s.nodes[0]
+        .relay
+        .db()
+        .np_apply_block(&block, START_TIP + 1, &r, 0)
+        .unwrap();
+
+    s.link(0, 1);
+    s.run();
+    let best = s.nodes[1].relay.best();
+    assert_eq!(s.nodes[0].relay.best(), best);
+    assert_eq!(s.nodes[0].relay.status().stats.reorgs, 1);
+    assert_eq!(
+        s.nodes[0].relay.db().np_block_retirements(&block).unwrap(),
+        Some(r.clone()),
+        "the block is applied again after the move"
+    );
+    s.nodes[1]
+        .relay
+        .db()
+        .np_apply_block(&block, START_TIP + 1, &r, 0)
+        .unwrap();
+    assert_eq!(ledger(&s, 0), ledger(&s, 1));
+}

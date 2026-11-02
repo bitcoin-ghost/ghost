@@ -132,16 +132,23 @@ pub struct Btc {
     pub headers: MemHeaders,
     /// Current tip height.
     pub tip: u32,
+    /// Median time past of block `h` is `t0 - 100_000 + h`.
+    pub t0: u64,
 }
 
 impl Btc {
     /// Headers from below genesis up to `tip`.
     pub fn new(tip: u32) -> Btc {
-        let b = Btc {
+        Btc::with_time(tip, T0)
+    }
+
+    /// Headers whose times sit just below `t0`.
+    pub fn with_time(tip: u32, t0: u64) -> Btc {
+        let mut b = Btc {
             headers: MemHeaders::default(),
             tip: 0,
+            t0,
         };
-        let mut b = b;
         b.extend_to(tip);
         b
     }
@@ -154,7 +161,7 @@ impl Btc {
                 HeaderFacts {
                     height: h,
                     next_bits: CompactTarget::from_consensus(BITS),
-                    median_time_past: (T0 - 100_000) as u32 + h,
+                    median_time_past: (self.t0 - 100_000) as u32 + h,
                 },
             );
         }
@@ -169,6 +176,8 @@ pub struct Miner {
     pub payee: Script,
     /// The node its jobs come from.
     pub node_id: [u8; 32],
+    /// Header time of its shares.
+    pub time: u32,
     extranonce: u64,
 }
 
@@ -178,6 +187,7 @@ impl Miner {
         Miner {
             payee: p2tr(label),
             node_id: [node; 32],
+            time: T0 as u32,
             extranonce: 0,
         }
     }
@@ -226,7 +236,7 @@ impl Miner {
             version: Version::from_consensus(0x2000_0000),
             prev_blockhash: BlockHash::from_byte_array(btc_hash(prev_height)),
             merkle_root: TxMerkleNode::from_byte_array(tx.compute_txid().to_byte_array()),
-            time: T0 as u32,
+            time: self.time,
             bits: CompactTarget::from_consensus(BITS),
             nonce: 0,
         };
