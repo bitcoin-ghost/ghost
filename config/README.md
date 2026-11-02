@@ -68,7 +68,11 @@ What a block pays is the node pool's canonical coinbase (see `docs/NODE_POOL_SPE
 | 4444 | TCP | Stratum V1 — farm/rental tier (public mining nodes only) |
 | 34255 | TCP | Stratum V2 (miners) |
 | 8080 | TCP | HTTP API |
-| 8555-8562 | TCP | P2P consensus mesh |
+| 8566 | TCP | Node pool share-chain relay (pool_sv2, `[node_pool.relay]`) |
+
+The old mesh ports (8555-8563) and 8443 are not used: ghost-mining no longer runs the old mesh,
+and `noise_enabled`, `seed_nodes` and `[network.p2p]` in an older `pool.toml` are read and
+ignored.
 
 ## Configuration Mutability
 
@@ -84,7 +88,6 @@ These settings cannot be changed via the dashboard API. They require direct conf
 | `key_path` | `[identity]` | Identity - changing would change node_id |
 | `signing_key` | `[network]` | Identity |
 | `network` | `[bitcoin]` | Network - changing networks is catastrophic |
-| `seed_nodes` | `[network]` | Security - prevents peer poisoning |
 
 ### Mutable Settings (Dashboard API)
 
@@ -104,22 +107,18 @@ When configuration changes via the dashboard API:
 
 2. **Temporarily interrupted:**
    - Active miner connections (~5-10 seconds reconnect)
-   - P2P mesh connections (auto-reconnect)
+   - Share-chain relay connections (auto-reconnect)
    - In-flight share submissions (miners retry)
 
 ## Security Requirements (Mainnet)
 
 These settings are **mandatory** for mainnet and cannot be disabled:
 
-1. **Noise Protocol Encryption** (`noise_enabled = true`)
-   - Encrypts all P2P traffic
-   - Prevents eavesdropping and MITM attacks
-
-2. **Internal API Authentication** (`internal_api_secret` configured)
+1. **Internal API Authentication** (`internal_api_secret` configured)
    - Protects admin endpoints with HMAC-SHA256
    - Prevents unauthorized share injection
 
-The node will refuse to start on mainnet without these configured.
+The node will refuse to start on mainnet without it.
 
 ## Dashboard Configuration API
 

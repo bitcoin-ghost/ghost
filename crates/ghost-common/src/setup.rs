@@ -119,7 +119,6 @@ pub fn apply_initial_setup(
     if !nickname.is_empty() {
         config.identity.display_name = Some(nickname);
     }
-    config.network.noise_enabled = true;
     config.network.internal_api_secret = Some(api_secret);
     config.storage.archive_mode = archive_mode;
     config.policy.profile = profile;

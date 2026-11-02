@@ -160,71 +160,9 @@ signing_key = "${SIGNING_KEY}"
 # IMMUTABLE: Cannot be changed via dashboard API (would compromise own auth)
 internal_api_secret = "${INTERNAL_API_SECRET}"
 
-# Enable Noise Protocol encryption for P2P (REQUIRED FOR MAINNET)
-# Encrypts sensitive P2P messages (shares, blocks, votes, payouts)
-# SECURITY: Node will refuse to start on mainnet with false!
-# Options: true | false
-# Default: true
-noise_enabled = true
-
-# Bootstrap seed nodes for P2P mesh discovery
-# Format: "host:port" using discovery port (8559)
-# Options: Array of peer addresses
-# Default: [] (empty)
-# IMMUTABLE: Cannot be changed via dashboard API (prevents peer poisoning)
-seed_nodes = [
-    # Add mainnet seed nodes here:
-    # "seed1.bitcoinghost.org:8559",
-    # "seed2.bitcoinghost.org:8559",
-    # "seed3.bitcoinghost.org:8559",
-]
-
-# -----------------------------------------------------------------------------
-# [network.p2p] - P2P Consensus Mesh Ports
-# -----------------------------------------------------------------------------
-# Each port serves a specific function in the consensus mesh.
-# All ports should be open in firewall for P2P communication.
-[network.p2p]
-
-# Share propagation - miners submit shares, nodes propagate
-# Options: 1-65535
-# Default: 8555
-share_propagation = 8555
-
-# Block announcements - new blocks found notification
-# Options: 1-65535
-# Default: 8556
-block_announcement = 8556
-
-# Consensus voting - BFT voting messages
-# Options: 1-65535
-# Default: 8557
-consensus_voting = 8557
-
-# Health monitoring - health pings between nodes
-# Options: 1-65535
-# Default: 8558
-health_monitoring = 8558
-
-# Discovery - peer discovery and mesh bootstrap
-# Options: 1-65535
-# Default: 8559
-discovery = 8559
-
-# Elder management - elder list updates and MPC ceremony
-# Options: 1-65535
-# Default: 8560
-elder_management = 8560
-
-# Payout proposal - payout distribution proposals
-# Options: 1-65535
-# Default: 8561
-payout_proposal = 8561
-
-# Payout transaction - signed payout transactions
-# Options: 1-65535
-# Default: 8562
-payout_transaction = 8562
+# The old mesh is gone: miners' ledger agreement is the share-chain relay in pool_sv2
+# (`[node_pool.relay]`). `noise_enabled`, `seed_nodes` and the `[network.p2p]` ports in an older
+# pool.toml are read and ignored.
 
 # =============================================================================
 # [policy] - Transaction Policy (BUDS Classification)

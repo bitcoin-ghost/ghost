@@ -58,27 +58,8 @@ max_miners = 1000
 # Allow external miners to connect
 public_mining = true
 
-# Seed nodes for P2P discovery
-# Add known Ghost Pool nodes for mesh network bootstrap
-# Format: ["host:port", ...] - uses port 8559 (discovery port)
-seed_nodes = [
-    # Signet test nodes (uncomment for signet testing)
-    # "83.136.251.162:8559",   # VM1 London
-    # "85.9.198.212:8559",     # VM2 Frankfurt
-    # "213.163.207.46:8559",   # VM3 Amsterdam
-    # "95.111.221.169:8559",   # VM4 NYC
-]
-
-# P2P consensus mesh ports
-[network.p2p]
-share_propagation = 8555
-block_announcement = 8556
-consensus_voting = 8557
-health_monitoring = 8558
-discovery = 8559
-elder_management = 8560
-payout_proposal = 8561
-payout_transaction = 8562
+# The old mesh (seed_nodes, [network.p2p]) was removed; share-chain peers are configured in
+# pool_sv2's [node_pool.relay].
 
 # =============================================================================
 # Mining Policy

@@ -72,6 +72,36 @@ const REMOVED_KEYS: &[(&str, &str)] = &[
     ("shard_arm_genesis", "removed with the share shard"),
     ("shard_coinbase", "removed with the share shard"),
     ("node_payout_address", "removed with node rewards"),
+    ("noise_enabled", "removed with the old mesh"),
+    ("seed_nodes", "removed with the old mesh"),
+    (
+        "share_propagation",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "block_announcement",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "consensus_voting",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "health_monitoring",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "elder_management",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "payout_proposal",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "payout_transaction",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
 ];
 
 /// Sections that were removed whole. Installed configs may still carry them and load (they are
@@ -293,7 +323,8 @@ fn the_installers_alerts_block_parses_in_both_shapes() {
 /// genesis_password` on nodes that guarded the MPC genesis, a `[coordinator]` section on nodes that
 /// opted into the coordinator capability, and the old ledger's keys: `[network] mining_mode`, the
 /// private and solo settings, `[pool] treasury_address`, `min_payout_sats`,
-/// `payout_interval_blocks`, `node_payout_address` and the share-shard flags. The structs reject
+/// `payout_interval_blocks`, `node_payout_address` and the share-shard flags, and the old mesh's
+/// `[network] noise_enabled`, `seed_nodes` and `[network.p2p]` ports. The structs reject
 /// unknown keys, so each retired key and section is accepted explicitly and ignored. If this test
 /// fails, upgrading a node would leave it unable to start.
 ///
@@ -331,7 +362,9 @@ fn a_config_with_retired_keys_still_loads() {
         "[network]\n\
          mining_mode = \"private_solo\"\n\
          private_mining_password = \"retired-password\"\n\
-         solo_payout_address = \"bc1qexample\"\n",
+         solo_payout_address = \"bc1qexample\"\n\
+         noise_enabled = true\n\
+         seed_nodes = [\"203.0.113.7:8559\"]\n",
         1,
     );
     assert!(
@@ -352,7 +385,16 @@ fn a_config_with_retired_keys_still_loads() {
          advertised_endpoint = \"203.0.113.7:9100\"\n\
          coordinator_port = 9100\n\
          coordinator_role_enabled = true\n\
-         coordinator_fee_address = \"bc1qexample\"\n",
+         coordinator_fee_address = \"bc1qexample\"\n\
+         \n[network.p2p]\n\
+         share_propagation = 8555\n\
+         block_announcement = 8556\n\
+         consensus_voting = 8557\n\
+         health_monitoring = 8558\n\
+         discovery = 8559\n\
+         elder_management = 8560\n\
+         payout_proposal = 8561\n\
+         payout_transaction = 8562\n",
     );
 
     let cfg: ghost_common::config::NodeConfig = toml::from_str(&raw)
@@ -378,6 +420,11 @@ fn a_config_with_retired_keys_still_loads() {
         "share_shard",
         "shard_arm_genesis",
         "shard_coinbase",
+        "noise_enabled",
+        "seed_nodes",
+        "[network.p2p]",
+        "share_propagation",
+        "payout_transaction",
     ] {
         assert!(
             !written.contains(key),
@@ -395,6 +442,7 @@ fn a_config_with_retired_keys_still_loads() {
             "mining_mdoe = \"private_solo\"",
         ),
         ("max_miners = 10000", "max_minres = 10000"),
+        ("noise_enabled = true", "noise_enabeld = true"),
     ] {
         assert!(raw.contains(from), "fixture lost `{from}`");
         let typo = raw.replacen(from, to, 1);

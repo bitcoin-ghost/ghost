@@ -80,31 +80,6 @@ pub const HTTP_API_PORT: u16 = 8080;
 /// with identity-pinned TLS. SRI / nginx / dashboard never see TLS.
 pub const VERIFICATION_HTTPS_PORT: u16 = 8443;
 
-// P2P Consensus ports
-/// Share propagation port
-pub const SHARE_PROPAGATION_PORT: u16 = 8555;
-
-/// Block announcement port
-pub const BLOCK_ANNOUNCEMENT_PORT: u16 = 8556;
-
-/// Consensus voting port
-pub const CONSENSUS_VOTING_PORT: u16 = 8557;
-
-/// Health monitoring port
-pub const HEALTH_MONITORING_PORT: u16 = 8558;
-
-/// Discovery port
-pub const DISCOVERY_PORT: u16 = 8559;
-
-/// Elder management port
-pub const ELDER_MANAGEMENT_PORT: u16 = 8560;
-
-/// Payout proposal port
-pub const PAYOUT_PROPOSAL_PORT: u16 = 8561;
-
-/// Payout transaction port
-pub const PAYOUT_TRANSACTION_PORT: u16 = 8562;
-
 // =============================================================================
 // BITCOIN CORE
 // =============================================================================

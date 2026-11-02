@@ -382,15 +382,10 @@ impl NodeConfig {
     ///
     /// # Requirements (Mainnet Only)
     ///
-    /// 1. **Noise Protocol Encryption** (`noise_enabled = true`)
-    ///    - P2P traffic must be encrypted to prevent eavesdropping and MITM attacks
-    ///
-    /// 2. **Internal API Authentication** (`internal_api_secret` configured)
+    /// 1. **Internal API Authentication** (`internal_api_secret` configured)
     ///    - Admin endpoints must be protected to prevent unauthorized access
     ///
-    /// 3. **Seed Nodes Configured** (`seed_nodes` non-empty) [M-15]
-    ///    - At least one seed node required for P2P network discovery
-    ///    - Without seed nodes, the node will be isolated and unable to participate
+    /// 2. **TLS key with a TLS certificate** (`tls.key_path` when `tls.cert_path` is set)
     ///
     /// These checks only apply when `bitcoin.network = "mainnet"`. Testnets allow
     /// relaxed security for development and testing purposes.
@@ -400,17 +395,7 @@ impl NodeConfig {
             return;
         }
 
-        // MAINNET REQUIREMENT 1: Noise Protocol encryption
-        if !self.network.noise_enabled {
-            result.add_error(
-                "network.noise_enabled",
-                "MAINNET SECURITY: Noise Protocol encryption is REQUIRED for mainnet. \
-                 Set noise_enabled = true in [network] section. \
-                 P2P traffic without encryption is vulnerable to eavesdropping and MITM attacks.",
-            );
-        }
-
-        // MAINNET REQUIREMENT 2: Internal API authentication
+        // MAINNET REQUIREMENT 1: Internal API authentication
         match &self.network.internal_api_secret {
             None => {
                 result.add_error(
@@ -439,19 +424,7 @@ impl NodeConfig {
             }
         }
 
-        // Seed nodes are the old mesh's (M-15). The node pool agrees on its ledger through the
-        // share-chain relay (`[node_pool.relay]` in pool_sv2), not this mesh, so a node pool node
-        // runs with none: an empty list keeps it off the old fleet's mesh, which must never hear
-        // from it. Said, not refused.
-        if self.network.seed_nodes.is_empty() {
-            result.add_warning(
-                "network.seed_nodes",
-                "no mesh seed nodes: this node dials no mesh peers. The node pool's share chain \
-                 runs over [node_pool.relay] in pool_sv2, not this mesh.",
-            );
-        }
-
-        // MAINNET REQUIREMENT 4: TLS certificates must be operator-provided
+        // MAINNET REQUIREMENT 2: TLS certificates must be operator-provided
         // Self-signed certificates are not acceptable for mainnet because they provide
         // no chain of trust. Clients have no way to verify they are connecting to the
         // legitimate node rather than a MITM attacker.
@@ -527,20 +500,6 @@ impl NodeConfig {
             ("sv2_port", self.network.sv2_port),
             ("sv1_port", self.network.sv1_port),
             ("http_port", self.network.http_port),
-            ("p2p.share_propagation", self.network.p2p.share_propagation),
-            (
-                "p2p.block_announcement",
-                self.network.p2p.block_announcement,
-            ),
-            ("p2p.consensus_voting", self.network.p2p.consensus_voting),
-            ("p2p.health_monitoring", self.network.p2p.health_monitoring),
-            ("p2p.discovery", self.network.p2p.discovery),
-            ("p2p.elder_management", self.network.p2p.elder_management),
-            ("p2p.payout_proposal", self.network.p2p.payout_proposal),
-            (
-                "p2p.payout_transaction",
-                self.network.p2p.payout_transaction,
-            ),
         ];
 
         // Check for zero ports
@@ -567,11 +526,11 @@ impl NodeConfig {
             result.add_warning("network.max_miners", "Set to 0 - no miners can connect");
         }
 
-        // A pool node with no public address cannot be reached by miners or routed to by peers.
+        // A pool node with no public address cannot tell miners where to connect.
         if self.network.public_address.is_none() {
             result.add_warning(
                 "network.public_address",
-                "No public address configured - peers cannot route miners to this node",
+                "No public address configured - the API cannot tell miners where to connect",
             );
         }
 
@@ -591,87 +550,6 @@ impl NodeConfig {
                     "signing_key must contain only hexadecimal characters (0-9, a-f, A-F)",
                 );
             }
-        }
-
-        // Validate seed nodes use secure protocols and have valid format
-        for (i, seed) in self.network.seed_nodes.iter().enumerate() {
-            let field = format!("network.seed_nodes[{}]", i);
-
-            // Allow localhost without TLS for development
-            let is_localhost = seed.starts_with("127.0.0.1")
-                || seed.starts_with("localhost")
-                || seed.starts_with("::1")
-                || seed.contains("://127.0.0.1")
-                || seed.contains("://localhost")
-                || seed.contains("://[::1]");
-
-            // If it's a URL, check for HTTP vs HTTPS
-            if seed.starts_with("http://") && !is_localhost {
-                result.add_error(
-                    &field,
-                    &format!(
-                        "Insecure HTTP URL for remote seed node: {}. Use HTTPS or TCP for P2P.",
-                        seed
-                    ),
-                );
-            }
-
-            // Warn about insecure localhost (defense in depth)
-            if seed.starts_with("http://") && is_localhost {
-                result.add_warning(
-                    &field,
-                    "Using HTTP for localhost seed node. Consider HTTPS for defense in depth.",
-                );
-            }
-
-            // Validate host:port format for non-URL seeds
-            if !seed.starts_with("http://") && !seed.starts_with("https://") {
-                // IPv6 format: [::1]:8559 or plain host:port
-                let has_port = if seed.starts_with('[') {
-                    // IPv6: expect [addr]:port
-                    seed.contains("]:")
-                } else {
-                    seed.contains(':') && seed.matches(':').count() == 1
-                };
-
-                if !has_port {
-                    result.add_error(
-                        &field,
-                        &format!(
-                            "Seed node '{}' must be in host:port format (e.g. 'seed1.example.com:8559')",
-                            seed
-                        ),
-                    );
-                } else {
-                    // Validate port is numeric
-                    let port_str = if seed.starts_with('[') {
-                        seed.rsplit("]:").next().unwrap_or("")
-                    } else {
-                        seed.rsplit(':').next().unwrap_or("")
-                    };
-                    if port_str.parse::<u16>().is_err() {
-                        result.add_error(
-                            &field,
-                            &format!("Seed node '{}' has invalid port: '{}'", seed, port_str),
-                        );
-                    }
-                }
-            }
-        }
-
-        // M1: fewer than 3 seeds is a single point of failure for mesh discovery. A warning since
-        // the node pool (see validate_mainnet_security): none at all is the node pool default.
-        if self.bitcoin.network == BitcoinNetwork::Mainnet
-            && (1..3).contains(&self.network.seed_nodes.len())
-        {
-            result.add_warning(
-                "network.seed_nodes",
-                &format!(
-                    "only {} mesh seed node(s): a single seed is a single point of failure for \
-                     mesh discovery",
-                    self.network.seed_nodes.len()
-                ),
-            );
         }
     }
 
@@ -928,7 +806,6 @@ impl BitcoinNetwork {
 /// TLS configuration for HTTP servers
 ///
 /// Controls HTTPS for the verification (8080), Ghost Pay (8800), and GSP (8900) servers.
-/// P2P mesh (ports 8555-8562) uses Noise protocol and does NOT need TLS.
 ///
 /// If neither `cert_path` nor `key_path` is set, a self-signed certificate is
 /// automatically generated at startup. For mainnet, operator-provided certificates
@@ -976,10 +853,15 @@ pub struct NetworkConfig {
     /// SRI / nginx / dashboard keep talking plain HTTP on `http_port`.
     #[serde(default = "default_verification_https_port")]
     pub verification_https_port: u16,
-    /// P2P consensus ports
-    pub p2p: P2PPortConfig,
-    /// Seed nodes for P2P discovery
-    pub seed_nodes: Vec<String>,
+    /// Retired `[network.p2p]` table: the old mesh's ports. The old mesh was removed (the node
+    /// pool agrees on its ledger over the share-chain relay in pool_sv2), so the table is
+    /// accepted with whatever keys it carries so older installed configs still load. Never
+    /// written back.
+    #[serde(default, skip_serializing, rename = "p2p")]
+    pub retired_p2p: Option<IgnoredAny>,
+    /// Retired key, see `retired_p2p`: the old mesh's seed nodes.
+    #[serde(default, skip_serializing, rename = "seed_nodes")]
+    pub retired_seed_nodes: Option<IgnoredAny>,
     /// Maximum connected miners
     pub max_miners: u32,
     /// Signing key for message authentication (optional)
@@ -1012,22 +894,9 @@ pub struct NetworkConfig {
     /// refuse to start on mainnet without this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_api_secret: Option<String>,
-    /// Enable Noise Protocol encryption for P2P communication (REQUIRED for mainnet)
-    ///
-    /// When enabled, sensitive P2P messages (shares, blocks, votes, payouts)
-    /// are sent over encrypted Noise TCP channels instead of plaintext ZMQ.
-    ///
-    /// # Security (C-1)
-    ///
-    /// Without this, P2P traffic is unencrypted and vulnerable to:
-    /// - Eavesdropping on share submissions
-    /// - Man-in-the-middle attacks on consensus messages
-    /// - Traffic analysis of payout information
-    ///
-    /// **MAINNET REQUIREMENT**: This MUST be true for mainnet. The node will
-    /// refuse to start on mainnet with noise_enabled = false.
-    #[serde(default = "default_noise_enabled")]
-    pub noise_enabled: bool,
+    /// Retired key, see `retired_p2p`: the old mesh's Noise encryption switch.
+    #[serde(default, skip_serializing, rename = "noise_enabled")]
+    pub retired_noise_enabled: Option<IgnoredAny>,
     /// TLS configuration for HTTP servers (verification, Ghost Pay, GSP)
     ///
     /// When configured with cert/key paths, HTTPS is enabled for all HTTP servers.
@@ -1082,10 +951,6 @@ pub struct NetworkConfig {
     pub rate_limit_trusted_ips: Vec<String>,
 }
 
-fn default_noise_enabled() -> bool {
-    true
-}
-
 fn default_verification_https_port() -> u16 {
     crate::constants::VERIFICATION_HTTPS_PORT
 }
@@ -1099,58 +964,21 @@ impl Default for NetworkConfig {
             farm_port: None,
             http_port: HTTP_API_PORT,
             verification_https_port: crate::constants::VERIFICATION_HTTPS_PORT,
-            p2p: P2PPortConfig::default(),
-            seed_nodes: Vec::new(),
+            retired_p2p: None,
+            retired_seed_nodes: None,
             max_miners: 1000,
             signing_key: None,
             retired_mining_mode: None,
             retired_private_mining_password: None,
             retired_solo_payout_address: None,
             internal_api_secret: None,
-            noise_enabled: true,
+            retired_noise_enabled: None,
             tls: TlsConfig::default(),
             ghost_mode: false,
             ghost_mode_local_egress: false,
             shroud_enabled: false,
             sv2_authority_public_key: None,
             rate_limit_trusted_ips: Vec::new(),
-        }
-    }
-}
-
-/// P2P consensus port configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct P2PPortConfig {
-    /// Share propagation port
-    pub share_propagation: u16,
-    /// Block announcement port
-    pub block_announcement: u16,
-    /// Consensus voting port
-    pub consensus_voting: u16,
-    /// Health monitoring port
-    pub health_monitoring: u16,
-    /// Discovery port
-    pub discovery: u16,
-    /// Elder management port
-    pub elder_management: u16,
-    /// Payout proposal port
-    pub payout_proposal: u16,
-    /// Payout transaction port
-    pub payout_transaction: u16,
-}
-
-impl Default for P2PPortConfig {
-    fn default() -> Self {
-        Self {
-            share_propagation: SHARE_PROPAGATION_PORT,
-            block_announcement: BLOCK_ANNOUNCEMENT_PORT,
-            consensus_voting: CONSENSUS_VOTING_PORT,
-            health_monitoring: HEALTH_MONITORING_PORT,
-            discovery: DISCOVERY_PORT,
-            elder_management: ELDER_MANAGEMENT_PORT,
-            payout_proposal: PAYOUT_PROPOSAL_PORT,
-            payout_transaction: PAYOUT_TRANSACTION_PORT,
         }
     }
 }
@@ -1993,8 +1821,8 @@ impl BackupSchedule {
 /// ⚠ Two things would break that, and neither is true today:
 /// - an unconditional `#[serde(skip_serializing)]`, or a `skip_serializing_if` predicate that can
 ///   fire on a value the operator SET (e.g. "skip if default")
-/// - the degenerate case of writing an explicitly empty value — `seed_nodes = []` serializes away
-///   under `Vec::is_empty` and would be reported. Writing an empty list is equivalent to omitting
+/// - the degenerate case of writing an explicitly empty value — a `Vec` field skipped under
+///   `Vec::is_empty` serializes away when written as `[]` and would be reported. Writing an empty list is equivalent to omitting
 ///   it, so this is harmless, but it is the one shape that can produce a spurious name.
 ///
 /// ⛔ I nearly documented a false-positive class that does not exist, from a grep that matched a
@@ -2784,76 +2612,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mainnet_allows_empty_seed_nodes_with_a_warning() {
-        // A node pool node runs with no mesh seeds, so it never dials the old fleet's mesh.
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
-        config.network.internal_api_secret =
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![]; // Empty seed nodes
-
-        let result = config.validate();
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes"));
-        assert!(result
-            .warnings
-            .iter()
-            .any(|w| w.field == "network.seed_nodes" && w.message.contains("no mesh seed")));
-
-        config.network.seed_nodes = vec!["a.example:8559".to_string()];
-        let result = config.validate();
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes"));
-        assert!(result
-            .warnings
-            .iter()
-            .any(|w| w.field == "network.seed_nodes" && w.message.contains("only 1")));
-    }
-
-    #[test]
-    fn test_mainnet_with_seed_nodes_valid() {
-        // M-15: Mainnet nodes with seed_nodes configured should not error
-        // M1: Mainnet requires at least 3 seed nodes
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
-        config.network.internal_api_secret =
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
-
-        let result = config.validate();
-        // Should not have seed_nodes error
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes"));
-    }
-
-    #[test]
-    fn test_signet_allows_empty_seed_nodes() {
-        // M-15: Signet (non-mainnet) nodes do not require seed nodes
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Signet;
-        config.network.seed_nodes = vec![]; // Empty is OK for signet
-
-        let result = config.validate();
-        // Should not have seed_nodes error on non-mainnet
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes"));
-    }
-
-    #[test]
     fn test_hsm_signer_rejected_at_config_validation() {
         let mut config = NodeConfig::default();
         config.identity.signer = Some(SignerConfig::Hsm {
@@ -2904,14 +2662,8 @@ mod tests {
         // operators are aware of the cert source) but NOT a hard error.
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
         config.network.internal_api_secret =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
         config.network.tls = TlsConfig::default();
 
         let result = config.validate();
@@ -2935,14 +2687,8 @@ mod tests {
     fn test_mainnet_tls_cert_without_key_errors() {
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
         config.network.internal_api_secret =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
         config.network.tls = TlsConfig {
             cert_path: Some(PathBuf::from("/etc/ghost/cert.pem")),
             key_path: None, // Missing key
@@ -2961,14 +2707,8 @@ mod tests {
     fn test_mainnet_with_tls_cert_and_key_passes() {
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
         config.network.internal_api_secret =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
         config.network.tls = TlsConfig {
             cert_path: Some(PathBuf::from("/etc/ghost/cert.pem")),
             key_path: Some(PathBuf::from("/etc/ghost/key.pem")),
