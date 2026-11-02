@@ -31,6 +31,12 @@
 //! The payout values must agree with `docs/node-pool-reference/refimpl_v3.py`, the normative
 //! reference; the vector test in `canonical_payout` pins them against `test_vectors_v3.json`.
 
+/// Bitcoin height at which the node pool's job layer switches on: share tags in the
+/// `GhostShare/v2` format, per-channel slot classes and the sensing loop. `u64::MAX` keeps it
+/// dark: no template can reach it, so nothing changes for a running node. Set to a real height
+/// only in a release that arms the whole pool (plan, Phase 4).
+pub const NODE_POOL_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
 /// One face unit is `2^-32` sat; a balance of `x` sats is `x << 32` face units.
 pub const FACE_UNIT_SHIFT: u32 = 32;
 
@@ -122,3 +128,20 @@ pub const RETARGET_MAX_COUNT_PER_BLOCK: u32 = 1 << 20;
 /// Re-inclusion depth from the spec's constants table. Recorded here, NOT used by any rule yet:
 /// see `docs/node-pool-reference/PORTING_NOTES.md`.
 pub const REINCLUSION_DEPTH_K: u32 = 120;
+
+/// Hard ceiling on a node pool coinbase, non-witness bytes, extranonce and any outputs the SV2
+/// pool adds included. The largest slot class (500 P2TR miner outputs) builds about 21.9 KB.
+/// Measured on regtest (W0.2): a 22,034 B coinbase mined on a full template under a 90,000 WU
+/// reserve, and the SV2 wire carried up to 65,436 B before `SubmitSolution` overflowed, so this
+/// leaves the wire a wide margin. A job above it is refused, never sent.
+pub const MAX_COINBASE_BYTES: usize = 22_000;
+
+/// `blockreservedweight` a node pool node gives ghostd: the weight `getblocktemplate` leaves
+/// free for the block header, the transaction count and the coinbase. ghostd's default, 8,000
+/// WU, lost a block at a 2.25 KB coinbase on a full template (W0.2).
+pub const NODE_POOL_BLOCK_RESERVED_WEIGHT: u64 = 90_000;
+
+// The reserve must hold the largest coinbase the ceiling allows, plus the 80-byte header, a
+// 5-byte transaction count and the 36 witness bytes of a segwit coinbase.
+const _: () =
+    assert!((MAX_COINBASE_BYTES as u64) * 4 + 36 + (80 + 5) * 4 <= NODE_POOL_BLOCK_RESERVED_WEIGHT);
