@@ -28,9 +28,10 @@
 //! `ghost-audit list` runs rounds on a schedule and writes the generated files after each.
 //!
 //! The live prober ([`crate::lister::LiveProber`]) reads the node's mining advert from its relay
-//! port (`GetAdvert`: the stratum ports, on the IP the relay was reached at) and then runs the
-//! public probe ([`crate::probe::probe`]) on the advertised SV1 port. A relay that advertises no
-//! SV1 port cannot be probed, since the probe speaks SV1, and is `unmeasured`: never listed.
+//! port (`GetAdvert`: the stratum ports and the SV2 authority key, on the IP the relay was
+//! reached at) and then runs the public probe ([`crate::probe::probe`]) on every port advertised:
+//! SV1, SV2, or both, each of which must pass. A relay that advertises neither cannot be probed
+//! and is `unmeasured`: never listed. An SV2-only node is probed over SV2 and listable.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,7 +44,8 @@ use ghost_np_relay::client::{ClientError, Session};
 use crate::check::ShareChainData;
 use crate::discover::{crawl, Candidates, Limits, Reply};
 use crate::listing::{AdvertInfo, ListState, Outcome, Policy, ProbeRecord, Transition};
-use crate::probe::{probe, ProbeConfig, ProbeVerdict};
+use crate::probe::{probe, ProbeConfig, ProbeVerdict, Sv2Endpoint};
+use crate::sv2::Sv2Device;
 
 /// One node's probe, as listing records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +85,11 @@ pub struct LiveProber {
     pub payee: Vec<u8>,
     /// User agent for `mining.subscribe`.
     pub user_agent: String,
-    /// Jobs judged per probe.
+    /// The device fields of the SV2 `SetupConnection`.
+    pub sv2_device: Sv2Device,
+    /// The hash rate the SV2 channels declare, H/s.
+    pub sv2_hash_rate: f32,
+    /// Jobs judged per probe, on each protocol.
     pub jobs: usize,
     /// How long to retry a job the prober cannot judge yet.
     pub wait: Duration,
@@ -136,16 +142,23 @@ impl NodeProber for LiveProber {
             Err(_) => return verdict(Outcome::Unmeasured, "advert_unanswered", Some(info)),
         }
         drop(s);
-        if info.sv1_port == 0 {
-            return verdict(Outcome::Unmeasured, "advert_no_sv1", Some(info));
+        if info.sv1_port == 0 && info.sv2_port == 0 {
+            return verdict(Outcome::Unmeasured, "advert_no_stratum", Some(info));
         }
+        let at = |port: u16| SocketAddr::new(relay.ip(), port).to_string();
         let cfg = ProbeConfig {
-            stratum: SocketAddr::new(relay.ip(), info.sv1_port).to_string(),
+            stratum: (info.sv1_port != 0).then(|| at(info.sv1_port)),
+            sv2: (info.sv2_port != 0).then(|| Sv2Endpoint {
+                addr: at(info.sv2_port),
+                authority_key: info.sv2_authority_key.clone(),
+            }),
             relay,
             genesis: self.genesis,
             address: self.address.clone(),
             payee: self.payee.clone(),
             user_agent: self.user_agent.clone(),
+            sv2_device: self.sv2_device.clone(),
+            sv2_hash_rate: self.sv2_hash_rate,
             jobs: self.jobs,
             wait: self.wait,
             timeout: self.timeout,

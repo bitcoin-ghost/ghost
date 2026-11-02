@@ -23,7 +23,7 @@
 //! `ghost-audit`: check that a node pool node's jobs pay the canonical coinbase and credit you.
 //!
 //! `ghost-audit audit` connects to a node's stratum port like a miner, with your payout address,
-//! and judges every job it is sent. `ghost-audit probe` is the public prober: it checks a node's
+//! and judges every job it is sent, over Stratum V1, Stratum V2 or both. `ghost-audit probe` is the public prober: it checks a node's
 //! relay advert and jobs and prints a JSON verdict. `ghost-audit list` is open listing (W2.10):
 //! it finds nodes from relay gossip, probes them on a schedule, and writes the website's
 //! `node-list.json` and a DNS fragment. None of them submits a share.
@@ -41,10 +41,11 @@ use ghost_audit::check::{JobReport, ShareChainData, Verdict};
 use ghost_audit::discover::Limits;
 use ghost_audit::lister::{now_secs, run_round, write_atomic, LiveProber, RoundConfig};
 use ghost_audit::listing::{render_dns, render_node_list, DnsConfig, ListMeta, ListState, Policy};
-use ghost_audit::probe::{probe, ProbeConfig, ProbeVerdict};
+use ghost_audit::probe::{probe, read_advert, ProbeConfig, ProbeVerdict, Sv2Endpoint};
 use ghost_audit::source::{start_share_chain, ChainConfig, ExportSource, GenesisSource};
 use ghost_audit::sv1::Sv1Config;
-use ghost_audit::{audit_jobs, AuditTarget, RelayStamps};
+use ghost_audit::sv2::{Sv2Config, Sv2Device, DEFAULT_HASH_RATE};
+use ghost_audit::{audit_jobs, audit_sv2_jobs, AuditTarget, RelayStamps, Sv2Target};
 use ghost_common::node_pool_constants::T_NET_FLOOR;
 use ghost_common::node_pool_genesis_export::hex32;
 use ghost_common::node_pool_network::{NodePoolNetwork, MAINNET_START};
@@ -184,20 +185,54 @@ struct ChainArgs {
 struct NodeArgs {
     /// The node's SV1 stratum port, `host:port`.
     #[arg(long)]
-    stratum: String,
-    /// The node's relay port, `host:port`: asked only for its job stamps.
+    stratum: Option<String>,
+    /// The node's SV2 port, `host:port`.
+    #[arg(long)]
+    sv2: Option<String>,
+    /// The SV2 authority public key the node's Noise certificate must be signed by
+    /// (base58check). Default: the key the node's relay advertises.
+    #[arg(long)]
+    sv2_authority_key: Option<String>,
+    /// The node's relay port, `host:port`: asked for its job stamps (and its advert).
     #[arg(long)]
     node_relay: String,
     /// User agent sent in mining.subscribe. The node picks the slot class from it: pass your
     /// miner's own (for example `bmminer/2.0.0`) to audit the class your hardware is served.
     #[arg(long)]
     user_agent: Option<String>,
+    #[command(flatten)]
+    sv2_id: Sv2IdArgs,
     /// Seconds to keep retrying a job the auditor cannot judge yet (its share chain is syncing).
     #[arg(long, default_value_t = 300)]
     wait: u64,
     /// Seconds to wait for each job and each connection.
     #[arg(long, default_value_t = 120)]
     timeout: u64,
+}
+
+/// What the SV2 channels say about the miner.
+#[derive(Args)]
+struct Sv2IdArgs {
+    /// `vendor/hardware_version/firmware` sent in the SV2 SetupConnection. The node may pick an
+    /// extended channel's slot class from it: pass your miner's own to audit its class.
+    #[arg(long)]
+    sv2_device: Option<String>,
+    /// The hash rate the SV2 channels declare, H/s; the node sets their difficulty from it.
+    #[arg(long, default_value_t = DEFAULT_HASH_RATE)]
+    sv2_hash_rate: f32,
+}
+
+impl Sv2IdArgs {
+    fn device(&self) -> Sv2Device {
+        match &self.sv2_device {
+            Some(d) => Sv2Device::parse(d),
+            None => Sv2Device {
+                vendor: "ghost-audit".into(),
+                hardware_version: String::new(),
+                firmware: env!("CARGO_PKG_VERSION").into(),
+            },
+        }
+    }
 }
 
 #[derive(Args)]
@@ -212,7 +247,8 @@ struct AuditArgs {
     /// Stratum username, if not the bare address (for example `address.worker`).
     #[arg(long)]
     username: Option<String>,
-    /// Jobs to judge; 0 keeps going until the node disconnects.
+    /// Jobs to judge on each protocol (on SV2, on each channel); 0 keeps going until the node
+    /// disconnects.
     #[arg(long, default_value_t = 3)]
     jobs: usize,
     /// One JSON object per job instead of text.
@@ -229,7 +265,7 @@ struct ProbeArgs {
     /// The payout address the probe logs in with; its jobs must credit it.
     #[arg(long)]
     address: String,
-    /// Jobs to judge.
+    /// Jobs to judge on each protocol.
     #[arg(long, default_value_t = 2)]
     jobs: usize,
 }
@@ -248,6 +284,8 @@ struct ListArgs {
     /// User agent sent in mining.subscribe.
     #[arg(long)]
     user_agent: Option<String>,
+    #[command(flatten)]
+    sv2_id: Sv2IdArgs,
     /// The lister's state (candidates and probe history). Default: <data dir>/list-state.json.
     #[arg(long)]
     state: Option<PathBuf>,
@@ -290,7 +328,7 @@ struct ListArgs {
     /// Nodes probed at once.
     #[arg(long, default_value_t = 4)]
     probe_concurrency: usize,
-    /// Jobs judged per probe.
+    /// Jobs judged per probe, on each protocol.
     #[arg(long, default_value_t = 2)]
     jobs: usize,
     /// Seconds to keep retrying a job the prober cannot judge yet.
@@ -308,7 +346,8 @@ struct ListArgs {
     /// DNS TTL, seconds.
     #[arg(long, default_value_t = 300)]
     dns_ttl: u32,
-    /// Only listed nodes serving SV1 on this port go in the DNS fragment.
+    /// Only listed nodes serving SV1 on this port go in the DNS fragment (a DNS name carries no
+    /// port, so an SV2-only node is listed in node-list.json but not here).
     #[arg(long, default_value_t = 3333)]
     dns_sv1_port: u16,
     /// Most records in the DNS fragment.
@@ -448,7 +487,37 @@ fn print_text(r: &JobReport) {
     );
 }
 
+fn tally(reports: &[JobReport]) -> (usize, usize) {
+    let fails = reports
+        .iter()
+        .filter(|r| r.verdict == Verdict::Fail)
+        .count();
+    let unchecked = reports
+        .iter()
+        .filter(|r| r.verdict == Verdict::Unchecked)
+        .count();
+    (fails, unchecked)
+}
+
+/// The SV2 authority key: `--sv2-authority-key`, else the one the node's relay advertises.
+async fn sv2_key(n: &NodeArgs, relay: SocketAddr, genesis: [u8; 32]) -> Result<String, String> {
+    if let Some(k) = &n.sv2_authority_key {
+        return Ok(k.clone());
+    }
+    let t = Duration::from_secs(n.timeout.min(30));
+    let a = read_advert(relay, genesis, t)
+        .await
+        .map_err(|e| format!("no --sv2-authority-key, and the node's advert: {e}"))?;
+    if a.sv2_authority_key.is_empty() {
+        return Err("no --sv2-authority-key, and the node advertises none".into());
+    }
+    Ok(a.sv2_authority_key)
+}
+
 async fn run_audit(a: AuditArgs) -> Result<ExitCode, String> {
+    if a.node.stratum.is_none() && a.node.sv2.is_none() {
+        return Err("pass --stratum (SV1), --sv2 (SV2), or both".into());
+    }
     let payee = payee_script(&a.address, a.chain.network)?;
     let chain_cfg = a.chain.config().await?;
     let node_relay = resolve(&a.node.node_relay).await?;
@@ -458,53 +527,97 @@ async fn run_audit(a: AuditArgs) -> Result<ExitCode, String> {
              checked like any peer's, but add other peers so the audit does not depend on it."
         );
     }
-    eprintln!(
-        "ghost-audit submits no shares: it only reads the jobs {} sends.",
-        a.node.stratum
-    );
-    let data = start_share_chain(&chain_cfg).await?;
-    let target = AuditTarget {
-        stratum: Sv1Config {
-            addr: a.node.stratum.clone(),
-            username: a.username.clone().unwrap_or_else(|| a.address.clone()),
-            password: "x".into(),
-            user_agent: agent(&a.node),
-            timeout: Duration::from_secs(a.node.timeout),
-        },
-        payee,
-        jobs: a.jobs,
-        wait: Duration::from_secs(a.node.wait),
-        job_timeout: Duration::from_secs(a.node.timeout),
+    let sv2_key = match &a.node.sv2 {
+        Some(_) => Some(sv2_key(&a.node, node_relay, chain_cfg.genesis_anchor).await?),
+        None => None,
     };
+    eprintln!("ghost-audit submits no shares: it only reads the jobs the node sends.");
+    let data = start_share_chain(&chain_cfg).await?;
+    let username = a.username.clone().unwrap_or_else(|| a.address.clone());
+    let timeout = Duration::from_secs(a.node.timeout);
     let stamps = RelayStamps {
         addr: node_relay,
         genesis: chain_cfg.genesis_anchor,
         timeout: Duration::from_secs(a.node.timeout.min(30)),
     };
     let json = a.json;
-    let reports = audit_jobs(&target, &stamps, &data, |r| {
+    let print = |proto: &str, r: &JobReport| {
         if json {
             println!("{}", serde_json::to_string(r).unwrap_or_default());
         } else {
+            print!("{proto} ");
             print_text(r);
         }
-    })
-    .await
-    .map_err(|e| format!("stratum {}: {e}", a.node.stratum))?;
-    let fails = reports
-        .iter()
-        .filter(|r| r.verdict == Verdict::Fail)
-        .count();
-    let unchecked = reports
-        .iter()
-        .filter(|r| r.verdict == Verdict::Unchecked)
-        .count();
+    };
+    let v1 = async {
+        let Some(addr) = &a.node.stratum else {
+            return None;
+        };
+        let target = AuditTarget {
+            stratum: Sv1Config {
+                addr: addr.clone(),
+                username: username.clone(),
+                password: "x".into(),
+                user_agent: agent(&a.node),
+                timeout,
+            },
+            payee: payee.clone(),
+            jobs: a.jobs,
+            wait: Duration::from_secs(a.node.wait),
+            job_timeout: timeout,
+        };
+        Some(
+            audit_jobs(&target, &stamps, &data, |r| print("SV1", r))
+                .await
+                .map_err(|e| format!("SV1 {addr}: {e}")),
+        )
+    };
+    let v2 = async {
+        let (Some(addr), Some(key)) = (&a.node.sv2, &sv2_key) else {
+            return None;
+        };
+        let target = Sv2Target {
+            node: Sv2Config {
+                addr: addr.clone(),
+                authority_key: key.clone(),
+                username: username.clone(),
+                device: a.node.sv2_id.device(),
+                nominal_hash_rate: a.node.sv2_id.sv2_hash_rate,
+                timeout,
+            },
+            payee: payee.clone(),
+            jobs: a.jobs,
+            wait: Duration::from_secs(a.node.wait),
+            job_timeout: timeout,
+        };
+        Some(
+            audit_sv2_jobs(&target, &stamps, &data, |r| print("SV2", r))
+                .await
+                .map_err(|e| format!("SV2 {addr}: {e}")),
+        )
+    };
+    let (r1, r2) = tokio::join!(v1, v2);
+    let mut reports = Vec::new();
+    let mut errors = Vec::new();
+    for r in [r1, r2].into_iter().flatten() {
+        match r {
+            Ok(v) => reports.extend(v),
+            Err(e) => errors.push(e),
+        }
+    }
+    let (fails, unchecked) = tally(&reports);
     if !json {
         println!(
             "{} jobs: {} PASS, {fails} FAIL, {unchecked} UNCHECKED",
             reports.len(),
             reports.len() - fails - unchecked
         );
+    }
+    if fails == 0 && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    for e in &errors {
+        eprintln!("ghost-audit: {e}");
     }
     Ok(if fails > 0 {
         ExitCode::from(1)
@@ -519,14 +632,54 @@ async fn run_probe(p: ProbeArgs) -> Result<ExitCode, String> {
     let payee = payee_script(&p.address, p.chain.network)?;
     let chain_cfg = p.chain.config().await?;
     let relay = resolve(&p.node.node_relay).await?;
+    // Ports not given are the ones the node advertises, on its relay's IP: every protocol it
+    // serves is probed.
+    let need_advert =
+        p.node.stratum.is_none() || p.node.sv2.is_none() || p.node.sv2_authority_key.is_none();
+    let advert = if need_advert {
+        read_advert(
+            relay,
+            chain_cfg.genesis_anchor,
+            Duration::from_secs(p.node.timeout.min(30)),
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+    let at = |port: u16| SocketAddr::new(relay.ip(), port).to_string();
+    let stratum = p.node.stratum.clone().or_else(|| {
+        advert
+            .as_ref()
+            .filter(|a| a.sv1_port != 0)
+            .map(|a| at(a.sv1_port))
+    });
+    let sv2_addr = p.node.sv2.clone().or_else(|| {
+        advert
+            .as_ref()
+            .filter(|a| a.sv2_port != 0)
+            .map(|a| at(a.sv2_port))
+    });
+    let sv2 = sv2_addr.map(|addr| Sv2Endpoint {
+        addr,
+        authority_key: p.node.sv2_authority_key.clone().unwrap_or_else(|| {
+            advert
+                .as_ref()
+                .map(|a| a.sv2_authority_key.clone())
+                .unwrap_or_default()
+        }),
+    });
     let data = start_share_chain(&chain_cfg).await?;
     let cfg = ProbeConfig {
-        stratum: p.node.stratum.clone(),
+        stratum,
+        sv2,
         relay,
         genesis: chain_cfg.genesis_anchor,
         address: p.address.clone(),
         payee,
         user_agent: agent(&p.node),
+        sv2_device: p.node.sv2_id.device(),
+        sv2_hash_rate: p.node.sv2_id.sv2_hash_rate,
         jobs: p.jobs,
         wait: Duration::from_secs(p.node.wait),
         timeout: Duration::from_secs(p.node.timeout),
@@ -586,6 +739,8 @@ async fn run_list(a: ListArgs) -> Result<ExitCode, String> {
             .user_agent
             .clone()
             .unwrap_or_else(|| format!("ghost-audit-list/{}", env!("CARGO_PKG_VERSION"))),
+        sv2_device: a.sv2_id.device(),
+        sv2_hash_rate: a.sv2_id.sv2_hash_rate,
         jobs: a.jobs.max(1),
         wait: Duration::from_secs(a.wait),
         timeout: Duration::from_secs(a.timeout),
