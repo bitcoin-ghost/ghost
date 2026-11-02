@@ -95,7 +95,7 @@ Do not forget: 26 `deny_unknown_fields` structs versus `[ghost_pay]`, `[coordina
 ### Phase 6: public launch
 Website and docs rewrite, remove the "NOT READY" banner only after Phases 3 and 4 pass. Required wording: no block has ever been found, no payout ever made, your balance may stay unpaid for a long time, an unaudited node can cheat you, use an established pool if you need steady income.
 
-Launch blockers: W2.1-W2.9, W2.11, W2.13, Phases 3 and 4, ninth node.
+Launch blockers: W2.1-W2.9, W2.11, W2.13-W2.16, Phases 3 and 4, ninth node.
 
 ## 4. Total size
 About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to end for one engineer. Soak, signet and hardware are elapsed-time bound whoever does the work.
