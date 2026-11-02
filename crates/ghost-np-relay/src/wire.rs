@@ -41,6 +41,16 @@
 //! | 9 | `Tip` | anchor 32, cumulative work 32 BE, anchor height u32 |
 //! | 10 | `GetAddr` | empty |
 //! | 11 | `Addr` | count u8, addresses (u8 len, UTF-8 `host:port`) |
+//! | 12 | `GetHeaders` | count u8, locator anchor hashes (newest first) |
+//! | 13 | `Headers` | count u16, anchors in chain order: btc_height u32, the anchor's [`NetShare`] |
+//! | 14 | `GetBtcBlocks` | count u8, Bitcoin block hashes |
+//! | 15 | `BtcBlocks` | count u16, [`BtcBlockMsg`]s |
+//!
+//! `NotFound` kind 3 is a Bitcoin block. Messages 12 to 15 are share-chain sync (W2.13): a node
+//! behind its peers asks for anchor headers after the last locator hash on the peer's best chain,
+//! then fetches their batches with `GetBatch` / `GetShares`, and fetches from the archive any
+//! Bitcoin block its own Bitcoin node does not have (stale blocks, which Bitcoin peers never
+//! serve).
 //!
 //! A [`NetShare`] is `header 80 || coinbase (u32 len) || merkle branch (u8 count, 32 each) ||
 //! node_id 32 || tier u8 || slot_class u16 || payee_script (u8 len) || parent_anchor 32 ||
@@ -82,6 +92,12 @@ pub const MAX_ADDR_LEN: usize = 128;
 pub const MAX_USER_AGENT: usize = 64;
 /// Bytes of a frame header.
 pub const FRAME_HEADER_LEN: usize = 5;
+/// Most hashes in a `GetHeaders` locator.
+pub const MAX_LOCATOR: usize = 64;
+/// Most anchors in one `Headers` message.
+pub const MAX_HEADERS_PER_MESSAGE: usize = 32;
+/// Most Bitcoin blocks asked for, or sent, in one message.
+pub const MAX_BTC_BLOCKS_PER_MESSAGE: usize = 16;
 
 /// Largest encoded [`NetShare`].
 pub const MAX_SHARE_BYTES: usize = 80
@@ -95,6 +111,10 @@ pub const MAX_SHARE_BYTES: usize = 80
     + 1
     + MAX_PAYEE_WIRE_BYTES
     + 64;
+
+/// Largest encoded [`BtcBlockMsg`].
+pub const MAX_BTC_BLOCK_BYTES: usize =
+    80 + 4 + 4 + MAX_COINBASE_WIRE_BYTES + 1 + 32 * MAX_BRANCH_LEN;
 
 /// Message type codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,6 +144,14 @@ pub enum MsgType {
     GetAddr = 10,
     /// Peer addresses.
     Addr = 11,
+    /// Ask for anchor headers after a locator.
+    GetHeaders = 12,
+    /// Anchor headers in chain order.
+    Headers = 13,
+    /// Ask for archived Bitcoin blocks.
+    GetBtcBlocks = 14,
+    /// Archived Bitcoin blocks.
+    BtcBlocks = 15,
 }
 
 impl MsgType {
@@ -143,6 +171,10 @@ impl MsgType {
             9 => Tip,
             10 => GetAddr,
             11 => Addr,
+            12 => GetHeaders,
+            13 => Headers,
+            14 => GetBtcBlocks,
+            15 => BtcBlocks,
             _ => return None,
         })
     }
@@ -162,6 +194,10 @@ impl MsgType {
             Tip => 32 + 32 + 4,
             GetAddr => 0,
             Addr => 1 + MAX_ADDRS * (1 + MAX_ADDR_LEN),
+            GetHeaders => 1 + 32 * MAX_LOCATOR,
+            Headers => 2 + MAX_HEADERS_PER_MESSAGE * (4 + MAX_SHARE_BYTES),
+            GetBtcBlocks => 1 + 32 * MAX_BTC_BLOCKS_PER_MESSAGE,
+            BtcBlocks => 2 + MAX_BTC_BLOCKS_PER_MESSAGE * MAX_BTC_BLOCK_BYTES,
         }
     }
 }
@@ -314,6 +350,20 @@ pub struct Hello {
     pub user_agent: String,
 }
 
+/// A Bitcoin block from the archive: its header, height, and coinbase (non-witness) with the
+/// merkle branch from the coinbase txid to the header's merkle root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtcBlockMsg {
+    /// The header.
+    pub header: Header,
+    /// Its height.
+    pub height: u32,
+    /// The coinbase, non-witness serialization.
+    pub coinbase: Vec<u8>,
+    /// The merkle branch.
+    pub branch: Vec<[u8; 32]>,
+}
+
 /// What a `NotFound` refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotFoundKind {
@@ -323,6 +373,8 @@ pub enum NotFoundKind {
     Batch = 1,
     /// A share.
     Share = 2,
+    /// An archived Bitcoin block.
+    BtcBlock = 3,
 }
 
 /// One relay message.
@@ -364,6 +416,14 @@ pub enum Message {
     GetAddr,
     /// Peer addresses, `host:port`.
     Addr(Vec<String>),
+    /// Ask for the anchors after the first locator hash on the receiver's best chain.
+    GetHeaders(Vec<AnchorHash>),
+    /// Anchor headers, parents first.
+    Headers(Vec<AnchorMsg>),
+    /// Ask for archived Bitcoin blocks by hash.
+    GetBtcBlocks(Vec<[u8; 32]>),
+    /// Archived Bitcoin blocks.
+    BtcBlocks(Vec<BtcBlockMsg>),
 }
 
 impl Message {
@@ -382,6 +442,10 @@ impl Message {
             Message::Tip { .. } => MsgType::Tip,
             Message::GetAddr => MsgType::GetAddr,
             Message::Addr(_) => MsgType::Addr,
+            Message::GetHeaders(_) => MsgType::GetHeaders,
+            Message::Headers(_) => MsgType::Headers,
+            Message::GetBtcBlocks(_) => MsgType::GetBtcBlocks,
+            Message::BtcBlocks(_) => MsgType::BtcBlocks,
         }
     }
 
@@ -443,6 +507,28 @@ impl Message {
             Message::Addr(v) => {
                 p.push(v.len() as u8);
                 v.iter().for_each(|a| put_str(p, a, MAX_ADDR_LEN));
+            }
+            Message::GetHeaders(v) | Message::GetBtcBlocks(v) => {
+                p.push(v.len() as u8);
+                v.iter().for_each(|h| p.extend_from_slice(h));
+            }
+            Message::Headers(v) => {
+                p.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                for a in v {
+                    p.extend_from_slice(&a.btc_height.to_le_bytes());
+                    put_share(p, &a.share);
+                }
+            }
+            Message::BtcBlocks(v) => {
+                p.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                for b in v {
+                    p.extend_from_slice(&serialize(&b.header));
+                    p.extend_from_slice(&b.height.to_le_bytes());
+                    p.extend_from_slice(&(b.coinbase.len() as u32).to_le_bytes());
+                    p.extend_from_slice(&b.coinbase);
+                    p.push(b.branch.len() as u8);
+                    b.branch.iter().for_each(|x| p.extend_from_slice(x));
+                }
             }
         }
     }
@@ -509,6 +595,7 @@ impl Message {
                     0 => NotFoundKind::Anchor,
                     1 => NotFoundKind::Batch,
                     2 => NotFoundKind::Share,
+                    3 => NotFoundKind::BtcBlock,
                     _ => return Err(WireError::Truncated),
                 };
                 Message::NotFound(k, r.arr32()?)
@@ -529,6 +616,31 @@ impl Message {
                         .map(|_| r.string(MAX_ADDR_LEN))
                         .collect::<Result<_, _>>()?,
                 )
+            }
+            MsgType::GetHeaders => Message::GetHeaders(r.hashes(MAX_LOCATOR)?),
+            MsgType::GetBtcBlocks => Message::GetBtcBlocks(r.hashes(MAX_BTC_BLOCKS_PER_MESSAGE)?),
+            MsgType::Headers => {
+                let n = r.u16()? as usize;
+                if n > MAX_HEADERS_PER_MESSAGE {
+                    return Err(WireError::TooMany(n));
+                }
+                Message::Headers(
+                    (0..n)
+                        .map(|_| {
+                            Ok(AnchorMsg {
+                                btc_height: r.u32()?,
+                                share: r.share()?,
+                            })
+                        })
+                        .collect::<Result<_, WireError>>()?,
+                )
+            }
+            MsgType::BtcBlocks => {
+                let n = r.u16()? as usize;
+                if n > MAX_BTC_BLOCKS_PER_MESSAGE {
+                    return Err(WireError::TooMany(n));
+                }
+                Message::BtcBlocks((0..n).map(|_| r.btc_block()).collect::<Result<_, _>>()?)
             }
         };
         if !r.0.is_empty() {
@@ -624,6 +736,35 @@ impl<'a> Reader<'a> {
             return Err(WireError::TooMany(n));
         }
         (0..n).map(|_| self.arr32()).collect()
+    }
+
+    fn hashes(&mut self, max: usize) -> Result<Vec<[u8; 32]>, WireError> {
+        let n = self.u8()? as usize;
+        if n > max {
+            return Err(WireError::TooMany(n));
+        }
+        (0..n).map(|_| self.arr32()).collect()
+    }
+
+    fn btc_block(&mut self) -> Result<BtcBlockMsg, WireError> {
+        let header: Header = deserialize(self.take(80)?).map_err(|_| WireError::BadHeader)?;
+        let height = self.u32()?;
+        let n = self.u32()? as usize;
+        if n > MAX_COINBASE_WIRE_BYTES {
+            return Err(WireError::TooMany(n));
+        }
+        let coinbase = self.take(n)?.to_vec();
+        let b = self.u8()? as usize;
+        if b > MAX_BRANCH_LEN {
+            return Err(WireError::TooMany(b));
+        }
+        let branch = (0..b).map(|_| self.arr32()).collect::<Result<_, _>>()?;
+        Ok(BtcBlockMsg {
+            header,
+            height,
+            coinbase,
+            branch,
+        })
     }
 
     fn string(&mut self, max: usize) -> Result<String, WireError> {
@@ -738,6 +879,26 @@ mod tests {
             },
             Message::GetAddr,
             Message::Addr(vec!["10.0.0.1:8566".into(), "[::1]:8566".into()]),
+            Message::GetHeaders(vec![[11; 32], [12; 32]]),
+            Message::GetHeaders(vec![]),
+            Message::Headers(vec![
+                AnchorMsg {
+                    btc_height: 974_501,
+                    share: sample_share(5),
+                },
+                AnchorMsg {
+                    btc_height: 974_502,
+                    share: sample_share(6),
+                },
+            ]),
+            Message::GetBtcBlocks(vec![[13; 32]]),
+            Message::BtcBlocks(vec![BtcBlockMsg {
+                header: sample_share(7).header,
+                height: 974_503,
+                coinbase: vec![7; 90],
+                branch: vec![[8; 32]],
+            }]),
+            Message::NotFound(NotFoundKind::BtcBlock, [14; 32]),
         ]
     }
 
@@ -817,6 +978,27 @@ mod tests {
             Message::decode_payload(MsgType::Hello, &h),
             Err(WireError::BadMagic)
         );
+        // Sync lists over their caps are refused.
+        let mut g = vec![(MAX_LOCATOR + 1) as u8];
+        g.extend(vec![0u8; 32 * (MAX_LOCATOR + 1)]);
+        assert!(Message::decode_payload(MsgType::GetHeaders, &g).is_err());
+        let over = ((MAX_HEADERS_PER_MESSAGE + 1) as u16).to_le_bytes();
+        assert_eq!(
+            Message::decode_payload(MsgType::Headers, &over),
+            Err(WireError::TooMany(MAX_HEADERS_PER_MESSAGE + 1))
+        );
+        let over = ((MAX_BTC_BLOCKS_PER_MESSAGE + 1) as u16).to_le_bytes();
+        assert!(Message::decode_payload(MsgType::BtcBlocks, &over).is_err());
+        // The largest legal sync messages fit their caps.
+        let headers = Message::Headers(
+            (0..MAX_HEADERS_PER_MESSAGE)
+                .map(|i| AnchorMsg {
+                    btc_height: i as u32,
+                    share: sample_share(i as u8),
+                })
+                .collect(),
+        );
+        assert!(Message::decode(&headers.encode()).is_ok());
         // The largest legal batch fits its cap.
         let big = Message::Batch {
             anchor: [0; 32],

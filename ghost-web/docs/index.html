@@ -5,23 +5,23 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Docs · Bitcoin Ghost</title>
-  <meta name="description" content="Architecture, protocol, operator guides, and RPC reference for Bitcoin Ghost.">
+  <meta name="description" content="How the Bitcoin Ghost node pool works, how to mine on it and how to run a node.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Docs · Bitcoin Ghost">
-  <meta property="og:description" content="Architecture, protocol, operator guides, and RPC reference for Bitcoin Ghost.">
+  <meta property="og:description" content="How the Bitcoin Ghost node pool works, how to mine on it and how to run a node.">
   <meta property="og:url" content="https://bitcoinghost.org/docs/">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
   <meta name="twitter:title" content="Docs · Bitcoin Ghost">
-  <meta name="twitter:description" content="Architecture, protocol, operator guides, and RPC reference for Bitcoin Ghost.">
+  <meta name="twitter:description" content="How the Bitcoin Ghost node pool works, how to mine on it and how to run a node.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260424">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
       var saved = localStorage.getItem('ghost-theme');
@@ -232,8 +232,8 @@
     <nav class="primary">
       <a href="/">overview</a>
       <a href="/pool.html">pool</a>
-      <a href="/pay.html">pay</a>
       <a href="/nodes.html">nodes</a>
+      <a href="/hazync.html">hazync</a>
       <a href="/miners.html">miners</a>
       <a href="/downloads.html">downloads</a>
       <a href="/docs/" class="current">docs</a>
@@ -250,13 +250,20 @@
   </div>
 </header>
 
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
+  <div class="container">
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
+  </div>
+</div>
+
 <section class="hero">
   <div class="container">
     <span class="eyebrow">Docs</span>
     <h1>Documentation.</h1>
     <p class="lead">
-      Architecture, protocol, operator guides, and RPC reference.
-      Pick a topic on the left — loads in place, no round trips to other pages.
+      How the node pool works, how to mine on it, how to run a node, and what
+      has not been proven yet. Pick a topic on the left.
     </p>
   </div>
 </section>
@@ -267,48 +274,32 @@
       <aside class="docs-nav" id="docs-nav">
         <input type="text" class="dn-search" id="dn-search" placeholder="Filter docs…" autocomplete="off">
 
-        <div class="dn-group-title">Foundations</div>
+        <div class="dn-group-title">Node pool</div>
         <ul>
-          <li><a href="#ghost-core" data-doc="ghost-core">Ghost Core</a></li>
-          <li><a href="#ghost-pool" data-doc="ghost-pool">Ghost Pool</a></li>
-        </ul>
-
-        <div class="dn-group-title">Protocol</div>
-        <ul>
-        </ul>
-
-        <div class="dn-group-title">Privacy</div>
-        <ul>
-          <li><a href="#shroud" data-doc="shroud">Shroud</a></li>
-          <li><a href="#ghost-mode" data-doc="ghost-mode">Ghost Mode</a></li>
-          <li><a href="#keys" data-doc="keys">Keys</a></li>
-        </ul>
-
-        <div class="dn-group-title">Mining policy</div>
-        <ul>
-          <li><a href="#reaper" data-doc="reaper">Reaper</a></li>
-          <li><a href="#buds" data-doc="buds">BUDS</a></li>
-        </ul>
-
-        <div class="dn-group-title">Custody &amp; archive</div>
-        <ul>
-          <li><a href="#exorcism" data-doc="exorcism">Exorcism</a></li>
-          <li><a href="#haze" data-doc="haze">Haze</a></li>
-          <li><a href="#hazync" data-doc="hazync">Hazync sync</a></li>
-          <li><a href="#pruning" data-doc="pruning">Pruning</a></li>
-        </ul>
-
-        <div class="dn-group-title">Apps</div>
-        <ul>
-          <li><a href="#node-dashboard" data-doc="node-dashboard">Node dashboard</a></li>
+          <li><a href="#node-pool" data-doc="node-pool">The node pool</a></li>
+          <li><a href="#honest-reading" data-doc="honest-reading">Before you mine</a></li>
+          <li><a href="#payouts" data-doc="payouts">The payout rule</a></li>
+          <li><a href="#mining" data-doc="mining">Mining &amp; firmware</a></li>
+          <li><a href="#ghost-audit" data-doc="ghost-audit">Auditing your node</a></li>
         </ul>
 
         <div class="dn-group-title">Operations</div>
         <ul>
           <li><a href="#deployment" data-doc="deployment">Deployment</a></li>
-          <li><a href="#recovery" data-doc="recovery">Recovery</a></li>
           <li><a href="#key-management" data-doc="key-management">Key management</a></li>
-          <li><a href="#load-balancer" data-doc="load-balancer">Load balancer</a></li>
+          <li><a href="#node-dashboard" data-doc="node-dashboard">Node dashboard</a></li>
+        </ul>
+
+        <div class="dn-group-title">The Bitcoin node</div>
+        <ul>
+          <li><a href="#ghost-core" data-doc="ghost-core">Ghost Core</a></li>
+          <li><a href="#reaper" data-doc="reaper">Reaper</a></li>
+          <li><a href="#buds" data-doc="buds">BUDS</a></li>
+          <li><a href="#shroud" data-doc="shroud">Shroud</a></li>
+          <li><a href="#ghost-mode" data-doc="ghost-mode">Ghost Mode</a></li>
+          <li><a href="#exorcism" data-doc="exorcism">Exorcism</a></li>
+          <li><a href="#haze" data-doc="haze">Haze</a></li>
+          <li><a href="#hazync" data-doc="hazync">Hazync sync</a></li>
         </ul>
 
         <div class="dn-group-title">External</div>
@@ -322,19 +313,19 @@
         <div class="dv-welcome">
           <h2>Welcome.</h2>
           <p>
-            Bitcoin Ghost is built on a modified Bitcoin Core fork — the consensus
-            rules are unchanged, the mining stack and L2 are added on top. We
-            inherit Bitcoin's security model, then layer a decentralised
-            mining pool and a shielded L2 payment network around it. The docs on
-            the left cover everything from first principles to the RPC interface.
+            Bitcoin Ghost is a mining pool with no operator: the node pool. Anyone can run
+            a node or point a miner at someone else's. A light share chain decides who is
+            owed what, and every block the pool finds pays miners straight from its coinbase.
           </p>
           <p>
-            New to Ghost? Start with <a href="#ghost-core" data-doc="ghost-core">Ghost Core</a>
-            for the node-level view, then <a href="#ghost-pool" data-doc="ghost-pool">Ghost Pool</a>
-            for the full reward-split picture.
+            <strong>It is not ready.</strong> The node pool has never found a block and never
+            made a payout. Read <a href="#honest-reading" data-doc="honest-reading">Before you mine</a> first.
           </p>
           <p>
-            Running a node? Jump to <a href="#node-dashboard" data-doc="node-dashboard">Node dashboard</a>
+            New here? Start with <a href="#node-pool" data-doc="node-pool">The node pool</a>.
+            Mining? Read <a href="#mining" data-doc="mining">Mining &amp; firmware</a> and
+            <a href="#payouts" data-doc="payouts">The payout rule</a>.
+            Running a node? Go to <a href="#deployment" data-doc="deployment">Deployment</a>.
           </p>
         </div>
       </main>
@@ -347,18 +338,47 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
+    </div>
     <div>
       <h4>Project</h4>
       <ul>
@@ -397,13 +417,10 @@
   // AJAX docs browser
   (function () {
     var VALID = {
-      'ghost-core': 1, 'ghost-pool': 1,
-      'node-dashboard': 1,
-      'shroud': 1, 'ghost-mode': 1, 'reaper': 1,
-      'buds': 1, 'exorcism': 1, 'haze': 1, 'hazync': 1, 'keys': 1,
-      'pruning': 1,
-      'deployment': 1, 'recovery': 1, 'key-management': 1,
-      'load-balancer': 1
+      'node-pool': 1, 'honest-reading': 1, 'payouts': 1, 'mining': 1, 'ghost-audit': 1,
+      'deployment': 1, 'key-management': 1, 'node-dashboard': 1,
+      'ghost-core': 1, 'reaper': 1, 'buds': 1, 'shroud': 1, 'ghost-mode': 1,
+      'exorcism': 1, 'haze': 1, 'hazync': 1
     };
 
     var viewer = document.getElementById('docs-viewer');

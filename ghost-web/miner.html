@@ -21,10 +21,11 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260423b">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
       var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', saved || system);
     })();
@@ -42,6 +43,7 @@
       </svg>
       <span class="wordmark">bitcoinghost</span>
     </a>
+
     <nav class="primary">
       <a href="/">overview</a>
       <a href="/pool.html" class="current">pool</a>
@@ -51,6 +53,7 @@
       <a href="/downloads.html">downloads</a>
       <a href="/docs/">docs</a>
     </nav>
+
     <div class="utils">
       <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -61,6 +64,13 @@
     </div>
   </div>
 </header>
+
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
+  <div class="container">
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
+  </div>
+</div>
 
 <div class="rl-notice-wrap">
   <div class="container">
@@ -188,18 +198,47 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
+    </div>
     <div>
       <h4>Project</h4>
       <ul>

@@ -54,6 +54,20 @@
 //! one event per job height in ascending order; on a reorg the disconnected anchors are undone
 //! newest first, then the new branch applied. Block retirements applied by settlement (W2.7) that
 //! sit above them are undone and re-applied around the move.
+//!
+//! ## Retirements (deterministic settlement, W2.13)
+//!
+//! A snapshot table subtracts the retirements of the node pool blocks on the Bitcoin ancestry of
+//! the share's own `prev_hash`, read from the [`crate::archive::BtcArchive`], never this node's
+//! best chain. A pool block retires what it paid unless an anchor with its `GHPP` prefix sits on
+//! the includer's ancestry and none of them matches it (`block_table` root and canonical outputs),
+//! in which case it retires nothing. Every input is committed by the share, its includer, or an
+//! archived block, so two nodes with the same archive reach the same table whatever their Bitcoin
+//! tips.
+//!
+//! ## Sync, checkpoints and pruning (W2.13)
+//!
+//! See [`crate::relay::sync`].
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -64,7 +78,9 @@ use tracing::{debug, error, info, warn};
 use ghost_common::anchor_chain::{
     AncestryError, AnchorChain, AnchorError, AnchorHash, AnchorHeader, ShareId,
 };
-use ghost_common::canonical_payout::{cut, table_for_from, Retirement, Script, Table};
+use ghost_common::canonical_payout::{
+    cut, provisional_retirements, table_for_from, table_root, Retirement, Script, Table,
+};
 use ghost_common::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::node_pool_constants::{
@@ -72,17 +88,21 @@ use ghost_common::node_pool_constants::{
 };
 use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::{
-    batch_root, fold_coinbase_branch, hash_meets_tier, verify_share, ShareContext, ShareError,
-    ShareSubmission,
+    batch_root, fold_coinbase_branch, hash_meets_tier, settle_outputs, verify_share, ShareContext,
+    ShareError, ShareSubmission,
 };
 use ghost_storage::node_pool_store::{NpAnchorRecord, NpBatchShare, NpLedgerEventKind};
 use ghost_storage::Database;
 
+use crate::archive::{ArchivedBlock, BtcArchive};
+use crate::checkpoint::{Checkpoint, CreditMap};
 use crate::headers::{HeaderFacts, HeaderLookup};
 use crate::peers::penalty;
 use crate::wire::{
     AnchorMsg, Message, NetShare, NotFoundKind, MAX_BATCH_SHARES, MAX_SHARES_PER_MESSAGE,
 };
+
+pub mod sync;
 
 /// A connected peer, as the network layer numbers it.
 pub type PeerId = u64;
@@ -156,6 +176,17 @@ pub struct RelayParams {
     pub future_time_secs: u64,
     /// Announce the best tip to every peer this often, seconds.
     pub tip_announce_secs: u64,
+    /// Fold a checkpoint at the last best-chain anchor this many Bitcoin blocks below the best
+    /// anchor's `btc_height`. 0: never (every batch stays in memory and is replayed on start).
+    /// At least [`sync::MIN_CHECKPOINT_DEPTH`] otherwise.
+    pub checkpoint_depth: u32,
+    /// Fold a new checkpoint once the target anchor is this many Bitcoin blocks past the last.
+    pub checkpoint_interval: u32,
+    /// Delete stored batches below the older of the two kept checkpoints. Off: an archive node,
+    /// which can serve a fresh node's sync from genesis.
+    pub prune: bool,
+    /// Batches requested at once while syncing.
+    pub sync_inflight: usize,
 }
 
 impl RelayParams {
@@ -171,41 +202,11 @@ impl RelayParams {
             recency_blocks: 6,
             future_time_secs: 7_200,
             tip_announce_secs: 30,
+            checkpoint_depth: sync::DEFAULT_CHECKPOINT_DEPTH,
+            checkpoint_interval: sync::DEFAULT_CHECKPOINT_INTERVAL,
+            prune: false,
+            sync_inflight: 32,
         }
-    }
-}
-
-/// Bitcoin block retirements a snapshot table subtracts: settlement's hook (W2.7). The relay
-/// folds them into every table it checks shares against, so they must be a pure function of the
-/// including anchor's ancestry and the Bitcoin chain.
-pub trait Retirements: Send {
-    /// Retirements of blocks below `h`, by Bitcoin height, as seen from `including`.
-    fn blocks_below(
-        &self,
-        chain: &AnchorChain,
-        including: &AnchorHash,
-        h: u32,
-    ) -> BTreeMap<u32, Vec<Retirement>>;
-
-    /// A digest of what [`Retirements::blocks_below`] depends on for `including`, so cached
-    /// tables are not reused across differing views. Constant if it depends on nothing.
-    fn view_tag(&self, _chain: &AnchorChain, _including: &AnchorHash) -> [u8; 32] {
-        [0; 32]
-    }
-}
-
-/// No retirements: tests without blocks. A running node uses settlement's
-/// [`crate::settlement::SettledView`].
-pub struct NoRetirements;
-
-impl Retirements for NoRetirements {
-    fn blocks_below(
-        &self,
-        _: &AnchorChain,
-        _: &AnchorHash,
-        _: u32,
-    ) -> BTreeMap<u32, Vec<Retirement>> {
-        BTreeMap::new()
     }
 }
 
@@ -263,7 +264,8 @@ pub struct RelayStatus {
     pub t_net: u8,
     /// Shares in the loose pool.
     pub loose: usize,
-    /// Anchors held but not yet seen.
+    /// Anchors held but not yet seen: waiting for their batch, its bodies, or what its checks
+    /// need.
     pub unseen: usize,
     /// Connected peers.
     pub peers: usize,
@@ -287,6 +289,8 @@ enum Reject {
 enum WaitOn {
     Header([u8; 32]),
     Anchor(AnchorHash),
+    /// Not judgeable here: it reaches below this node's checkpoint.
+    Checkpoint,
 }
 
 /// Who would include a share.
@@ -312,8 +316,9 @@ struct Awaiting {
 
 struct Loose {
     job_height: u32,
-    /// The snapshot anchor and retirement view it was last fully checked against.
-    checked: Option<(AnchorHash, [u8; 32])>,
+    /// The snapshot anchor and the includer (the best tip then) it was last fully checked
+    /// against. Tables are pure functions of those, the job height and the share's own prev.
+    checked: Option<(AnchorHash, AnchorHash)>,
 }
 
 struct Published {
@@ -322,7 +327,19 @@ struct Published {
     ids: Arc<Vec<ShareId>>,
 }
 
-type CreditMap = BTreeMap<u32, BTreeMap<Script, i128>>;
+/// Retirements by Bitcoin height, and a digest of them for cache keys.
+type RetireView = Arc<(BTreeMap<u32, Vec<Retirement>>, [u8; 32])>;
+
+/// Why a table could not be had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TableErr {
+    /// A Bitcoin block on the way is not archived: fetch it.
+    Wait([u8; 32]),
+    /// It reaches below this node's checkpoint.
+    Unavailable,
+    /// The arithmetic refused.
+    Arith(String),
+}
 
 /// One ledger credit event: `(key, job height, deltas per payee)`.
 pub type CreditEvent = ([u8; 32], u32, BTreeMap<Script, i128>);
@@ -335,6 +352,8 @@ const CUM_CACHE: usize = 64;
 const TABLE_CACHE: usize = 32;
 /// Batches buffered for anchors not held yet.
 const EARLY_BATCHES: usize = 256;
+/// Cached retirement views.
+const RETIRE_CACHE: usize = 256;
 /// Most share bodies served for one `GetShares`.
 const MAX_SERVED_SHARES: usize = 4 * MAX_SHARES_PER_MESSAGE;
 /// Re-batched shares must still be includable this many Bitcoin blocks ahead.
@@ -369,6 +388,31 @@ pub fn credit_events(anchor: &AnchorHash, credits: &[Credit]) -> GhostResult<Vec
         .collect())
 }
 
+/// The parts of a share its id does not commit are bound to it: the coinbase is a coinbase and
+/// folds to the header's merkle root, and its scriptSig carries the preimage's tag and parent
+/// anchor prefix. A body that fails this was substituted in transit and says nothing about the
+/// share or any anchor that includes it.
+pub fn share_integrity(s: &NetShare) -> Result<(), String> {
+    let tx = s.coinbase_tx().map_err(|e| e.to_string())?;
+    if !tx.is_coinbase() || tx.input.len() != 1 {
+        return Err("not a coinbase".into());
+    }
+    let txid = bitcoin::hashes::Hash::to_byte_array(tx.compute_txid());
+    if fold_coinbase_branch(txid, &s.merkle_branch)
+        != bitcoin::hashes::Hash::to_byte_array(s.header.merkle_root)
+    {
+        return Err("coinbase does not fold to the header".into());
+    }
+    let sig = tx.input[0].script_sig.as_bytes();
+    if extract_node_tag(sig) != Some(s.tag.tag()) {
+        return Err("tag does not match its preimage".into());
+    }
+    if extract_payout_tag(sig) != Some(s.tag.parent_anchor_tag()) {
+        return Err("payout-tag slot does not carry the parent anchor".into());
+    }
+    Ok(())
+}
+
 /// The relay core.
 pub struct Relay {
     p: RelayParams,
@@ -393,8 +437,9 @@ pub struct Relay {
     last_publish: Option<JobAnchor>,
     last_snapshot_at: u64,
     last_tip_announce: u64,
-    applied: Vec<AnchorHash>,
-    applied_index: HashMap<AnchorHash, usize>,
+    /// The best chain whose credits the stored ledger holds: `path[i]` is the anchor at height
+    /// `i + 1`.
+    path: Vec<AnchorHash>,
     applied_tip: AnchorHash,
     btc_tip: u32,
     peers: Vec<PeerId>,
@@ -403,7 +448,13 @@ pub struct Relay {
     cum_order: VecDeque<AnchorHash>,
     table_cache: HashMap<(AnchorHash, u32, [u8; 32]), Arc<Table>>,
     table_order: VecDeque<(AnchorHash, u32, [u8; 32])>,
-    retirements: Box<dyn Retirements>,
+    archive: Arc<BtcArchive>,
+    base: Arc<Checkpoint>,
+    retire_cache: HashMap<(AnchorHash, [u8; 32], u32), RetireView>,
+    retire_order: VecDeque<(AnchorHash, [u8; 32], u32)>,
+    block_checks: HashMap<([u8; 32], AnchorHash), Option<Vec<Retirement>>>,
+    prefix_index: HashMap<[u8; PARENT_ANCHOR_TAG_LEN], Vec<AnchorHash>>,
+    sync: sync::SyncState,
     needed_headers: HashSet<[u8; 32]>,
     out: Vec<Out>,
     now: u64,
@@ -415,12 +466,14 @@ fn db_ctx(what: &str) -> impl Fn(GhostError) -> GhostError + '_ {
 }
 
 impl Relay {
-    /// Open the relay over `db`: store the genesis anchor if new, replay every stored anchor and
-    /// batch into the chain, and bring the stored ledger to the best tip's credits.
+    /// Open the relay over `db`: store the genesis anchor if new, load the newest checkpoint that
+    /// verifies, replay every stored anchor and the batches above the checkpoint into the chain,
+    /// and bring the stored ledger to the best tip's credits. Share checks read Bitcoin blocks
+    /// from `archive`.
     pub fn open(
         params: RelayParams,
         db: Arc<Database>,
-        retirements: Box<dyn Retirements>,
+        archive: Arc<BtcArchive>,
     ) -> GhostResult<Relay> {
         let g = params.genesis.clone();
         let chain = AnchorChain::new(g.hash, g.btc_height, g.tier, params.tier_base);
@@ -436,6 +489,12 @@ impl Relay {
             received_at: 0,
         })
         .map_err(db_ctx("genesis anchor"))?;
+        let base = Arc::new(Checkpoint::genesis(
+            g.hash,
+            g.btc_height,
+            gi.work,
+            g.table.clone(),
+        ));
         let mut r = Relay {
             p: params,
             db,
@@ -459,8 +518,7 @@ impl Relay {
             last_publish: None,
             last_snapshot_at: 0,
             last_tip_announce: 0,
-            applied: Vec::new(),
-            applied_index: HashMap::new(),
+            path: Vec::new(),
             applied_tip: g.hash,
             btc_tip: g.btc_height,
             peers: Vec::new(),
@@ -469,20 +527,50 @@ impl Relay {
             cum_order: VecDeque::new(),
             table_cache: HashMap::new(),
             table_order: VecDeque::new(),
-            retirements,
+            archive,
+            base,
+            retire_cache: HashMap::new(),
+            retire_order: VecDeque::new(),
+            block_checks: HashMap::new(),
+            prefix_index: HashMap::new(),
+            sync: sync::SyncState::default(),
             needed_headers: HashSet::new(),
             out: Vec::new(),
             now: 0,
             stats: RelayStats::default(),
         };
+        r.index_prefix(g.hash);
+        let (base, stale) = r.load_checkpoints()?;
+        if let Some(cp) = base {
+            r.adopt_base(cp);
+        }
         r.replay()?;
         r.reconcile_ledger()?;
+        r.verify_newer_checkpoints(stale)?;
         r.publish_snapshot(&HashMap::<[u8; 32], HeaderFacts>::new(), true);
         Ok(r)
     }
 
     fn replay(&mut self) -> GhostResult<()> {
-        for rec in self.db.np_load_anchors()? {
+        let records = self.db.np_load_anchors()?;
+        // The checkpoint anchor's ancestry: held without its batch (folded into the base).
+        let parents: HashMap<AnchorHash, AnchorHash> = records
+            .iter()
+            .filter_map(|r| r.parent.map(|p| (r.hash, p)))
+            .collect();
+        let mut folded = HashSet::new();
+        let mut cur = self.base.anchor;
+        while let Some(p) = parents.get(&cur) {
+            folded.insert(cur);
+            cur = *p;
+        }
+        if cur != self.p.genesis.hash {
+            return Err(GhostError::Database(format!(
+                "the checkpoint anchor {} does not descend from the stored genesis",
+                hex::encode(self.base.anchor)
+            )));
+        }
+        for rec in records {
             let Some(parent) = rec.parent else {
                 if rec.hash != self.p.genesis.hash {
                     return Err(GhostError::Database(format!(
@@ -508,21 +596,45 @@ impl Relay {
                 continue;
             }
             self.kids.entry(parent).or_default().push(rec.hash);
+            let share = Arc::new(share);
+            self.shares.insert(rec.hash, share.clone());
             self.anchors.insert(
                 rec.hash,
                 AnchorEntry {
-                    share: Arc::new(share.clone()),
+                    share,
                     btc_height: rec.btc_height,
                     source: None,
                     received_at: rec.received_at,
                 },
             );
-            self.shares.insert(rec.hash, Arc::new(share));
+            if folded.contains(&rec.hash) {
+                // Folded into the checkpoint: seen, its credits in the base.
+                self.chain
+                    .attach_batch(&rec.hash, &[])
+                    .map_err(|e| GhostError::Database(format!("checkpoint ancestry: {e}")))?;
+                self.index_prefix(rec.hash);
+                self.stats.anchors_valid += 1;
+                continue;
+            }
+            if !self.chain.is_ancestor(&self.base.anchor, &rec.hash) {
+                // A fork below the checkpoint: kept as a header, never judged again.
+                continue;
+            }
             let Some(batch) = self.db.np_get_batch(&rec.hash)? else {
+                // Pruned under a checkpoint that no longer verifies, or stored without it: fetch
+                // it from peers like any unseen anchor's.
+                self.awaiting.insert(
+                    rec.hash,
+                    Awaiting {
+                        since: 0,
+                        asked: Vec::new(),
+                    },
+                );
                 continue;
             };
             let mut ids = Vec::with_capacity(batch.shares.len());
             let mut cs = Vec::with_capacity(batch.shares.len());
+            let mut bodies = Vec::with_capacity(batch.shares.len());
             for m in &batch.shares {
                 let s = NetShare::from_record(&m.share)
                     .map_err(|e| GhostError::Database(format!("stored share: {e}")))?;
@@ -534,14 +646,18 @@ impl Relay {
                         .map_err(|_| GhostError::Database("stored face above i128".into()))?,
                     credited_tier: m.credited_tier,
                 });
-                self.shares.insert(m.share.share_id, Arc::new(s));
+                bodies.push((m.share.share_id, s));
             }
             if let Err(e) = self.chain.attach_batch(&rec.hash, &ids) {
                 warn!(anchor = %hex::encode(rec.hash), "NP_RELAY: stored batch refused on replay: {e}");
                 continue;
             }
+            for (id, s) in bodies {
+                self.shares.entry(id).or_insert_with(|| Arc::new(s));
+            }
             self.batch_ids.insert(rec.hash, Arc::new(ids));
             self.credits.insert(rec.hash, Arc::new(cs));
+            self.index_prefix(rec.hash);
             self.stats.anchors_valid += 1;
         }
         Ok(())
@@ -549,37 +665,55 @@ impl Relay {
 
     /// Bring the stored ledger to the best tip after a restart: undo credit events of anchors
     /// that are no longer on the best chain (they sit on top, since events are applied in chain
-    /// order and undone last-in first-out), then apply what is missing.
+    /// order and undone last-in first-out), then apply what is missing. Events of anchors folded
+    /// into the checkpoint are below every event this can need to undo.
     fn reconcile_ledger(&mut self) -> GhostResult<()> {
-        let path = self.path_from_genesis(self.chain.best());
+        let path = self.path_from_base(self.chain.best());
+        let on_path: HashSet<AnchorHash> = path.iter().copied().collect();
         let mut expected = HashSet::new();
-        for a in &path {
-            for (k, _, _) in credit_events(a, &self.credits[a])? {
-                expected.insert(k);
+        let mut other = HashSet::new();
+        for (a, cs) in &self.credits {
+            for (k, _, _) in credit_events(a, cs)? {
+                if on_path.contains(a) {
+                    expected.insert(k);
+                } else {
+                    other.insert(k);
+                }
             }
         }
         let mut parked = Vec::new();
         while let Some(ev) = self.db.np_last_ledger_event()? {
             match ev.kind {
-                NpLedgerEventKind::Credit if expected.contains(&ev.key) => break,
-                NpLedgerEventKind::Credit => self.db.np_undo_credits(&ev.key)?,
+                NpLedgerEventKind::Credit if other.contains(&ev.key) => {
+                    self.db.np_undo_credits(&ev.key)?
+                }
+                NpLedgerEventKind::Credit => break,
                 NpLedgerEventKind::Block => self.park_block(&ev.key, ev.height, &mut parked)?,
             }
         }
         for a in &path {
             self.apply_credits_of(a)?;
-            self.applied_index.insert(*a, self.applied.len());
-            self.applied.push(*a);
         }
         self.unpark(parked)?;
+        self.path = self.path_from_genesis(self.chain.best());
         self.applied_tip = self.chain.best();
         Ok(())
     }
 
+    /// The best-chain anchors from genesis (excluded) to `tip`.
     fn path_from_genesis(&self, tip: AnchorHash) -> Vec<AnchorHash> {
+        self.path_down_to(tip, self.p.genesis.hash)
+    }
+
+    /// The anchors from the checkpoint anchor (excluded) to `tip`, which descends from it.
+    fn path_from_base(&self, tip: AnchorHash) -> Vec<AnchorHash> {
+        self.path_down_to(tip, self.base.anchor)
+    }
+
+    fn path_down_to(&self, tip: AnchorHash, stop: AnchorHash) -> Vec<AnchorHash> {
         let mut v = Vec::new();
         let mut cur = tip;
-        while cur != self.p.genesis.hash {
+        while cur != stop && cur != self.p.genesis.hash {
             v.push(cur);
             cur = self
                 .chain
@@ -589,6 +723,16 @@ impl Relay {
         }
         v.reverse();
         v
+    }
+
+    fn index_prefix(&mut self, a: AnchorHash) {
+        let mut k = [0u8; PARENT_ANCHOR_TAG_LEN];
+        k.copy_from_slice(&a[..PARENT_ANCHOR_TAG_LEN]);
+        let v = self.prefix_index.entry(k).or_default();
+        if !v.contains(&a) {
+            v.push(a);
+            v.sort_unstable();
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -639,7 +783,7 @@ impl Relay {
                 .required_tier(&best, self.btc_tip.max(info.btc_height))
                 .unwrap_or(info.t_net),
             loose: self.loose.len(),
-            unseen: self.anchors.len() - self.credits.len(),
+            unseen: self.awaiting.len(),
             peers: self.peers.len(),
             stats: self.stats,
         }
@@ -653,42 +797,84 @@ impl Relay {
             .ok()
     }
 
-    /// The table a job on `parent` at job height `h` must pay (rule 4): the snapshot `S(h)` from
-    /// `parent`'s ancestry with retirements folded. For the coinbase builder (W2.6).
-    pub fn job_table(&mut self, parent: &AnchorHash, h: u32) -> Option<Arc<Table>> {
-        let s = self.chain.last_below(parent, cut(h)?)?;
-        self.table_at(s, h, parent).ok()
+    /// The archive share checks read Bitcoin blocks from.
+    pub fn archive(&self) -> &Arc<BtcArchive> {
+        &self.archive
     }
 
-    /// The table a block (or a job) at height `h` built on `parent` must pay: [`Relay::job_table`],
-    /// or, in the first 20 Bitcoin blocks after genesis where no anchor sits below the cut, the
-    /// genesis table with the settled retirements folded. `None` if `parent` is not a held anchor
-    /// with its batch, or the arithmetic refuses.
+    /// The checkpoint the in-memory state is folded at (genesis when none).
+    pub fn checkpoint(&self) -> &Checkpoint {
+        &self.base
+    }
+
+    /// The table a job on `parent` at job height `h` must pay (rule 4), on this node's best
+    /// Bitcoin chain (the job's `prev_hash` is the local tip). For the coinbase builder (W2.6).
+    pub fn job_table(&mut self, parent: &AnchorHash, h: u32) -> Option<Arc<Table>> {
+        self.block_table(parent, h)
+    }
+
+    /// The table a block (or a job) at height `h` built on `parent` must pay, with `prev_hash`
+    /// this node's best-chain block at `h - 1`. See [`Relay::block_table_on`].
     pub fn block_table(&mut self, parent: &AnchorHash, h: u32) -> Option<Arc<Table>> {
-        if *parent != self.p.genesis.hash && !self.credits.contains_key(parent) {
-            return None;
+        let prev = self.archive.main_at(h.checked_sub(1)?)?;
+        self.block_table_on(parent, h, &prev)
+    }
+
+    /// The table a block (or a job) at height `h` on Bitcoin block `prev`, built on `parent`, must
+    /// pay: the snapshot `S(h)` from `parent`'s ancestry with the retirements of `prev`'s Bitcoin
+    /// ancestry folded; in the first 20 Bitcoin blocks after genesis, where no anchor sits below
+    /// the cut, the genesis table with those retirements. `None` if `parent` is not a held anchor
+    /// with its batch, a Bitcoin block on the way is not archived (it is wanted), it reaches
+    /// below the checkpoint, or the arithmetic refuses.
+    pub fn block_table_on(
+        &mut self,
+        parent: &AnchorHash,
+        h: u32,
+        prev: &[u8; 32],
+    ) -> Option<Arc<Table>> {
+        match self.table_for_job(parent, h, prev) {
+            Ok(t) => Some(t),
+            Err(TableErr::Wait(x)) => {
+                self.needed_headers.insert(x);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn table_for_job(
+        &mut self,
+        parent: &AnchorHash,
+        h: u32,
+        prev: &[u8; 32],
+    ) -> Result<Arc<Table>, TableErr> {
+        if !self.is_complete(parent) {
+            return Err(TableErr::Unavailable);
         }
         if let Some(s) = cut(h).and_then(|c| self.chain.last_below(parent, c)) {
-            return self.table_at(s, h, parent).ok();
+            return self.table_at(s, h, parent, prev);
         }
-        let blocks = self.retirements.blocks_below(&self.chain, parent, h);
-        table_for_from(self.p.genesis.table.clone(), h, &BTreeMap::new(), &blocks)
-            .ok()
+        if self.base.anchor != self.p.genesis.hash {
+            return Err(TableErr::Unavailable);
+        }
+        let view = self.retirements_for(parent, prev, h)?;
+        table_for_from(self.p.genesis.table.clone(), h, &BTreeMap::new(), &view.0)
             .map(Arc::new)
+            .map_err(|e| TableErr::Arith(e.to_string()))
+    }
+
+    /// Whether `a` is genesis, or held with its batch checked (folded into the checkpoint counts).
+    fn is_complete(&self, a: &AnchorHash) -> bool {
+        *a == self.p.genesis.hash
+            || self.credits.contains_key(a)
+            || (self.chain.get(a).is_some_and(|i| i.seen)
+                && self.chain.is_ancestor(a, &self.base.anchor))
     }
 
     /// Held anchors (batch attached, or genesis) whose hash starts with `prefix`: the anchors a
     /// block's `GHPP` slot can name.
     pub fn anchors_with_prefix(&self, prefix: &[u8; PARENT_ANCHOR_TAG_LEN]) -> Vec<AnchorHash> {
-        let mut v: Vec<AnchorHash> = self
-            .credits
-            .keys()
-            .chain(std::iter::once(&self.p.genesis.hash))
-            .filter(|a| a[..PARENT_ANCHOR_TAG_LEN] == prefix[..])
-            .copied()
-            .collect();
-        v.sort_unstable();
-        v
+        self.prefix_index.get(prefix).cloned().unwrap_or_default()
     }
 
     /// Bitcoin headers the core needed and did not have since the last call.
@@ -696,8 +882,7 @@ impl Relay {
         self.needed_headers.drain().collect()
     }
 
-    /// Hook for initial sync (W2.13): whether a peer announced a heavier tip this node cannot
-    /// place yet.
+    /// Whether a peer announced a heavier tip this node cannot place yet: it is syncing.
     pub fn behind_peers(&self) -> bool {
         let work = self.chain.get(&self.chain.best()).expect("best").work;
         self.tip_peers
@@ -733,6 +918,8 @@ impl Relay {
     pub fn peer_disconnected(&mut self, peer: PeerId) {
         self.peers.retain(|p| *p != peer);
         self.tip_peers.remove(&peer);
+        self.sync.headers_asked.remove(&peer);
+        self.sync.forget(peer);
     }
 
     fn tip_message(&self) -> Message {
@@ -756,6 +943,10 @@ impl Relay {
         self.now = now;
         match msg {
             Message::Hello(_) | Message::GetAddr | Message::Addr(_) => {}
+            Message::GetHeaders(loc) => self.serve_headers(peer, &loc),
+            Message::Headers(v) => self.on_headers(peer, v, hdr),
+            Message::GetBtcBlocks(v) => self.serve_btc_blocks(peer, &v),
+            Message::BtcBlocks(v) => self.on_btc_blocks(peer, v, hdr),
             Message::Share(s) => self.on_net_share(Some(peer), s, hdr),
             Message::Anchor(a) => self.on_anchor(Some(peer), a, hdr),
             Message::Batch { anchor, ids } => self.on_batch(Some(peer), anchor, ids, hdr),
@@ -764,7 +955,7 @@ impl Relay {
             Message::Shares(v) => {
                 for s in v {
                     if self.wanted.contains_key(&s.id()) {
-                        self.store_body(s, hdr);
+                        self.store_body(Some(peer), s, hdr);
                     }
                 }
             }
@@ -778,6 +969,7 @@ impl Relay {
                         a.since = 0;
                     }
                 }
+                NotFoundKind::BtcBlock => self.btc_not_found(peer, h),
             },
             Message::Tip { hash, work, .. } => self.on_tip(peer, hash, work),
         }
@@ -797,7 +989,7 @@ impl Relay {
             return Err("already held".into());
         }
         let prev = share.prev_hash();
-        let f = hdr.facts(&prev).ok_or_else(|| {
+        let f = self.facts(hdr, &prev).ok_or_else(|| {
             self.needed_headers.insert(prev);
             "unknown Bitcoin header".to_string()
         })?;
@@ -898,6 +1090,11 @@ impl Relay {
             self.ask_anchor(p, from);
         }
         self.evict_loose();
+        self.drive_sync();
+        self.retry_btc_requests();
+        if let Err(e) = self.maybe_checkpoint(hdr) {
+            error!("NP_RELAY: checkpoint failed: {e}");
+        }
         if now.saturating_sub(self.last_snapshot_at) >= self.p.backstop_secs {
             self.publish_snapshot(hdr, false);
         }
@@ -929,7 +1126,7 @@ impl Relay {
         let id = s.id();
         let known = self.shares.contains_key(&id);
         if self.wanted.contains_key(&id) {
-            self.store_body(s.clone(), hdr);
+            self.store_body(src, s.clone(), hdr);
         }
         if known || self.loose.contains_key(&id) {
             return;
@@ -967,13 +1164,13 @@ impl Relay {
         src: Option<PeerId>,
     ) {
         let id = s.id();
-        let tag = self.retirements.view_tag(&self.chain, &self.chain.best());
+        let best = self.chain.best();
         self.shares.entry(id).or_insert_with(|| Arc::new(s.clone()));
         self.loose.insert(
             id,
             Loose {
                 job_height,
-                checked: checked.map(|a| (a, tag)),
+                checked: checked.map(|a| (a, best)),
             },
         );
         self.stats.shares_accepted += 1;
@@ -1010,7 +1207,9 @@ impl Relay {
     ) -> Result<(Credit, AnchorHash), Reject> {
         let id = s.id();
         let prev = s.prev_hash();
-        let f = hdr.facts(&prev).ok_or(Reject::Wait(WaitOn::Header(prev)))?;
+        let f = self
+            .facts(hdr, &prev)
+            .ok_or(Reject::Wait(WaitOn::Header(prev)))?;
         let h = f
             .height
             .checked_add(1)
@@ -1061,9 +1260,14 @@ impl Relay {
                 (b, sa, p)
             }
         };
-        let table = self
-            .table_at(sa, h, &view)
-            .map_err(|e| Reject::Invalid(format!("table: {e}")))?;
+        if !self.chain.is_ancestor(&self.base.anchor, &sa) {
+            return Err(Reject::Wait(WaitOn::Checkpoint));
+        }
+        let table = self.table_at(sa, h, &view, &prev).map_err(|e| match e {
+            TableErr::Wait(x) => Reject::Wait(WaitOn::Header(x)),
+            TableErr::Unavailable => Reject::Wait(WaitOn::Checkpoint),
+            TableErr::Arith(e) => Reject::Invalid(format!("table: {e}")),
+        })?;
         let tx = s
             .coinbase_tx()
             .map_err(|e| Reject::Invalid(format!("coinbase: {e}")))?;
@@ -1107,20 +1311,35 @@ impl Relay {
         ))
     }
 
-    /// The snapshot table at `sa` for job height `h`: the genesis table, the credits of every
-    /// batch on `sa`'s ancestry folded by job height (`canonical_payout::table_for`), and the
-    /// retirements of blocks below `h` as seen from `view`.
-    fn table_at(&mut self, sa: AnchorHash, h: u32, view: &AnchorHash) -> GhostResult<Arc<Table>> {
-        let tag = self.retirements.view_tag(&self.chain, view);
-        let key = (sa, h, tag);
+    /// Header facts: the caller's lookup (the local Bitcoin node), then the archive.
+    fn facts(&self, hdr: &dyn HeaderLookup, h: &[u8; 32]) -> Option<HeaderFacts> {
+        hdr.facts(h).or_else(|| self.archive.facts(h))
+    }
+
+    /// The snapshot table at `sa` for job height `h`: the checkpoint's base table (the genesis
+    /// table when none), the credits of every batch on `sa`'s ancestry above it folded by job
+    /// height (`canonical_payout::table_for_from`), and the retirements of the pool blocks on
+    /// `prev`'s Bitcoin ancestry below `h` as `inc` judges them. `sa` descends from the
+    /// checkpoint anchor.
+    fn table_at(
+        &mut self,
+        sa: AnchorHash,
+        h: u32,
+        inc: &AnchorHash,
+        prev: &[u8; 32],
+    ) -> Result<Arc<Table>, TableErr> {
+        if h < self.base.fold_height || !self.chain.is_ancestor(&self.base.anchor, &sa) {
+            return Err(TableErr::Unavailable);
+        }
+        let view = self.retirements_for(inc, prev, h)?;
+        let key = (sa, h, view.1);
         if let Some(t) = self.table_cache.get(&key) {
             return Ok(t.clone());
         }
         let cum = self.cum_credits(sa);
-        let blocks = self.retirements.blocks_below(&self.chain, view, h);
         let t = Arc::new(
-            table_for_from(self.p.genesis.table.clone(), h, &cum, &blocks)
-                .map_err(|e| GhostError::PayoutCalculation(e.to_string()))?,
+            table_for_from(self.base.base.clone(), h, &cum, &view.0)
+                .map_err(|e| TableErr::Arith(e.to_string()))?,
         );
         if self.table_order.len() >= TABLE_CACHE {
             if let Some(old) = self.table_order.pop_front() {
@@ -1132,17 +1351,149 @@ impl Relay {
         Ok(t)
     }
 
-    /// Credits of every batch from genesis to `a` inclusive, by job height and payee.
+    /// The retirements a table at job height `h` subtracts for a share on Bitcoin block `prev`
+    /// included by `inc` (or, for a job, the next anchor on `inc`): every node pool block on
+    /// `prev`'s Bitcoin ancestry at or above the checkpoint's fold height and below `h`, each
+    /// judged by [`Relay::block_retirement`].
+    fn retirements_for(
+        &mut self,
+        inc: &AnchorHash,
+        prev: &[u8; 32],
+        h: u32,
+    ) -> Result<RetireView, TableErr> {
+        let key = (*inc, *prev, h);
+        if let Some(v) = self.retire_cache.get(&key) {
+            return Ok(v.clone());
+        }
+        let from = self.base.fold_height.max(self.p.genesis.btc_height + 1);
+        let blocks = if h <= from {
+            Vec::new()
+        } else {
+            self.archive
+                .pool_blocks_on(prev, from, h)
+                .map_err(TableErr::Wait)?
+        };
+        let mut map = BTreeMap::new();
+        let mut tag = Sha256::new();
+        tag.update(b"GhostNP/retire/v2");
+        for b in blocks {
+            let r = self.block_retirement(&b, inc)?;
+            tag.update(b.height.to_le_bytes());
+            tag.update(b.hash());
+            match &r {
+                Some(r) => {
+                    tag.update([1]);
+                    tag.update((r.len() as u32).to_le_bytes());
+                    for (sc, v) in r {
+                        tag.update((sc.len() as u16).to_le_bytes());
+                        tag.update(sc);
+                        tag.update(v.to_le_bytes());
+                    }
+                    map.insert(b.height, r.clone());
+                }
+                None => tag.update([0]),
+            }
+        }
+        let v: RetireView = Arc::new((map, tag.finalize().into()));
+        if self.retire_order.len() >= RETIRE_CACHE {
+            if let Some(old) = self.retire_order.pop_front() {
+                self.retire_cache.remove(&old);
+            }
+        }
+        self.retire_order.push_back(key);
+        self.retire_cache.insert(key, v.clone());
+        Ok(v)
+    }
+
+    /// What pool block `b` retires as seen from includer `inc`, a pure function of the two:
+    ///
+    /// - no anchor with its `GHPP` prefix on `inc`'s ancestry: what it paid (its miner outputs,
+    ///   `canonical_payout::provisional_retirements`);
+    /// - one that it matches (the `block_table` root it commits, outputs canonical for some slot
+    ///   class): what it paid, which is the same;
+    /// - such anchors, none matching: nothing.
+    ///
+    /// `None` is nothing.
+    fn block_retirement(
+        &mut self,
+        b: &ArchivedBlock,
+        inc: &AnchorHash,
+    ) -> Result<Option<Vec<Retirement>>, TableErr> {
+        let Some((prefix, _)) = b.pool_tag() else {
+            return Ok(None);
+        };
+        let cands: Vec<AnchorHash> = self
+            .anchors_with_prefix(&prefix)
+            .into_iter()
+            .filter(|a| self.chain.is_ancestor(a, inc))
+            .collect();
+        let paid = || {
+            let (cb, _) = b.coinbase.as_ref().expect("a pool block has its coinbase");
+            let outs: Vec<(u64, Script)> = cb
+                .output
+                .iter()
+                .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
+                .collect();
+            provisional_retirements(b.height, &outs)
+        };
+        if cands.is_empty() {
+            return Ok(paid());
+        }
+        for a in cands {
+            match self.check_block(b, &a) {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(TableErr::Unavailable) => {
+                    // Decided before a checkpoint folded what it needs, and not carried: it
+                    // arrived too late to judge here. Count what it paid.
+                    warn!(
+                        block = %hex::encode(b.hash()),
+                        "NP_RELAY: a pool block below the checkpoint cannot be matched; \
+                         counting what it paid"
+                    );
+                    return Ok(paid());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether pool block `b` pays `a`'s table: `Some(retirements)` on a match. Cached: it is a
+    /// pure function of the block and the anchor.
+    fn check_block(
+        &mut self,
+        b: &ArchivedBlock,
+        a: &AnchorHash,
+    ) -> Result<Option<Vec<Retirement>>, TableErr> {
+        let key = (b.hash(), *a);
+        if let Some(r) = self.block_checks.get(&key) {
+            return Ok(r.clone());
+        }
+        let (Some((_, root)), Some((cb, _))) = (b.pool_tag(), b.coinbase.as_ref()) else {
+            return Ok(None);
+        };
+        let r = match self.table_for_job(a, b.height, &b.prev()) {
+            Ok(t) if table_root(&t) == root => settle_outputs(cb, &t, b.height).map(|(_, r)| r),
+            Ok(_) | Err(TableErr::Arith(_)) => None,
+            Err(e) => return Err(e),
+        };
+        self.block_checks.insert(key, r.clone());
+        Ok(r)
+    }
+
+    /// Credits of every batch from the checkpoint anchor (exclusive; its ancestry's credits above
+    /// the fold are the checkpoint's residual) to `a` inclusive, by job height and payee.
     fn cum_credits(&mut self, a: AnchorHash) -> Arc<CreditMap> {
         let mut stack = Vec::new();
         let mut cur = a;
-        let mut base = Arc::new(CreditMap::new());
+        let mut base = Arc::new(self.base.residual.clone());
         loop {
             if let Some(m) = self.cum_cache.get(&cur) {
                 base = m.clone();
                 break;
             }
-            if cur == self.p.genesis.hash {
+            if cur == self.base.anchor || cur == self.p.genesis.hash {
                 break;
             }
             stack.push(cur);
@@ -1187,23 +1538,9 @@ impl Relay {
     /// anchor's hash.
     fn anchor_self_checks(&self, m: &AnchorMsg) -> Result<(), String> {
         let s = &m.share;
+        share_integrity(s)?;
         let tx = s.coinbase_tx().map_err(|e| e.to_string())?;
-        if !tx.is_coinbase() || tx.input.len() != 1 {
-            return Err("not a coinbase".into());
-        }
-        let txid = bitcoin::hashes::Hash::to_byte_array(tx.compute_txid());
-        if fold_coinbase_branch(txid, &s.merkle_branch)
-            != bitcoin::hashes::Hash::to_byte_array(s.header.merkle_root)
-        {
-            return Err("coinbase does not fold to the header".into());
-        }
         let sig = tx.input[0].script_sig.as_bytes();
-        if extract_node_tag(sig) != Some(s.tag.tag()) {
-            return Err("tag does not match its preimage".into());
-        }
-        if extract_payout_tag(sig) != Some(s.tag.parent_anchor_tag()) {
-            return Err("payout-tag slot does not carry the parent anchor".into());
-        }
         let bip34 = bitcoin::script::Builder::new()
             .push_int(m.btc_height as i64 + 1)
             .into_bytes();
@@ -1332,7 +1669,9 @@ impl Relay {
             return;
         }
         let ours = self.chain.get(&self.chain.best()).expect("best").work;
-        if work >= ours {
+        if work > ours {
+            self.request_headers(peer);
+        } else if work == ours {
             self.ask_anchor(hash, Some(peer));
         }
     }
@@ -1399,8 +1738,17 @@ impl Relay {
         self.complete_from(a, hdr);
     }
 
-    fn store_body(&mut self, s: NetShare, hdr: &dyn HeaderLookup) {
+    fn store_body(&mut self, src: Option<PeerId>, s: NetShare, hdr: &dyn HeaderLookup) {
         let id = s.id();
+        if !self.wanted.contains_key(&id) {
+            return;
+        }
+        // The id commits only the header: a body whose coinbase or tag was substituted would
+        // condemn an honest anchor. Refuse it here, from its sender, and keep waiting.
+        if let Err(e) = share_integrity(&s) {
+            self.penalize(src, penalty::BAD_BODY, format!("share body: {e}"));
+            return;
+        }
         let Some(waiters) = self.wanted.remove(&id) else {
             return;
         };
@@ -1434,6 +1782,11 @@ impl Relay {
         let info = self.chain.get(&a).expect("held").clone();
         let parent = info.parent.expect("not genesis");
         if !self.chain.get(&parent).is_some_and(|p| p.seen) {
+            return false;
+        }
+        if !self.chain.is_ancestor(&self.base.anchor, &parent) {
+            // A fork from below the checkpoint: its shares reach state folded away here.
+            debug!(anchor = %hex::encode(a), "NP_RELAY: anchor forks below the checkpoint; not judged");
             return false;
         }
         if ids.iter().any(|i| !self.shares.contains_key(i)) {
@@ -1484,6 +1837,8 @@ impl Relay {
         let job_height = own_credit.job_height;
         self.credits.insert(a, Arc::new(cs));
         self.awaiting.remove(&a);
+        self.sync.inflight.remove(&a);
+        self.index_prefix(a);
         self.shares.entry(a).or_insert_with(|| own.clone());
         self.loose.insert(
             a,
@@ -1559,6 +1914,7 @@ impl Relay {
                 }
                 self.ask_anchor(p, from);
             }
+            WaitOn::Checkpoint => {}
         }
     }
 
@@ -1573,6 +1929,7 @@ impl Relay {
             }
             self.stats.anchors_invalid += 1;
             self.awaiting.remove(&x);
+            self.sync.inflight.remove(&x);
             if let Some(ids) = self.batch_ids.remove(&x) {
                 for i in ids.iter() {
                     if let Some(w) = self.wanted.get_mut(i) {
@@ -1656,11 +2013,12 @@ impl Relay {
     }
 
     /// Move the stored ledger from the applied chain to `tip`'s. Returns the anchors undone
-    /// (newest first) and applied (oldest first).
+    /// (newest first) and applied (oldest first). The fork point is at or above the checkpoint
+    /// anchor: anchors forking below it never complete.
     fn move_ledger(&mut self, tip: AnchorHash) -> GhostResult<(Vec<AnchorHash>, Vec<AnchorHash>)> {
         let mut fresh = Vec::new();
         let mut cur = tip;
-        while cur != self.p.genesis.hash && !self.applied_index.contains_key(&cur) {
+        while cur != self.p.genesis.hash && !self.on_path(&cur) {
             fresh.push(cur);
             cur = self
                 .chain
@@ -1668,16 +2026,18 @@ impl Relay {
                 .and_then(|i| i.parent)
                 .expect("seen ancestry");
         }
-        let keep = if cur == self.p.genesis.hash {
-            0
-        } else {
-            self.applied_index[&cur] + 1
-        };
+        let keep = self.chain.get(&cur).expect("held").height as usize;
+        if keep < self.base.height as usize {
+            return Err(GhostError::Database(format!(
+                "a reorg to {} forks below the checkpoint at height {}",
+                hex::encode(tip),
+                self.base.height
+            )));
+        }
         let mut parked = Vec::new();
         let mut undone = Vec::new();
-        while self.applied.len() > keep {
-            let a = self.applied.pop().expect("len > keep");
-            self.applied_index.remove(&a);
+        while self.path.len() > keep {
+            let a = self.path.pop().expect("len > keep");
             for (key, _, _) in credit_events(&a, &self.credits[&a])?.into_iter().rev() {
                 self.undo_credit_event(&key, &mut parked)?;
             }
@@ -1686,11 +2046,19 @@ impl Relay {
         fresh.reverse();
         for a in &fresh {
             self.apply_credits_of(a)?;
-            self.applied_index.insert(*a, self.applied.len());
-            self.applied.push(*a);
+            self.path.push(*a);
         }
         self.unpark(parked)?;
         Ok((undone, fresh))
+    }
+
+    /// Whether `a` is on the applied best chain.
+    fn on_path(&self, a: &AnchorHash) -> bool {
+        self.chain
+            .get(a)
+            .and_then(|i| i.height.checked_sub(1))
+            .and_then(|i| self.path.get(i as usize))
+            == Some(a)
     }
 
     fn apply_credits_of(&self, a: &AnchorHash) -> GhostResult<()> {
@@ -1764,7 +2132,6 @@ impl Relay {
             .map(|(i, l)| (l.job_height, *i))
             .collect();
         cands.sort_unstable();
-        let tag = self.retirements.view_tag(&self.chain, &best);
         let mut out = Vec::new();
         let mut drop = Vec::new();
         for (h, id) in cands {
@@ -1773,7 +2140,7 @@ impl Relay {
             }
             let sa = cut(h).and_then(|c| self.chain.last_below(&best, c));
             let quick = sa.is_some()
-                && self.loose[&id].checked == sa.map(|a| (a, tag))
+                && self.loose[&id].checked == sa.map(|a| (a, best))
                 && !self.chain.included_on_ancestry(&best, &id);
             if quick {
                 out.push(id);
@@ -1790,7 +2157,7 @@ impl Relay {
             match self.check_share(&s, inc, hdr) {
                 Ok((_, sa)) => {
                     if let Some(l) = self.loose.get_mut(&id) {
-                        l.checked = Some((sa, tag));
+                        l.checked = Some((sa, best));
                     }
                     out.push(id);
                 }
@@ -1834,16 +2201,18 @@ impl Relay {
     // ---------------------------------------------------------------------------------------
 
     fn serve_anchor(&mut self, peer: PeerId, h: &AnchorHash) {
-        match (self.anchors.get(h), self.batch_ids.get(h)) {
-            (Some(e), Some(ids)) if self.credits.contains_key(h) => {
+        let ids = match self.batch_ids.get(h) {
+            Some(ids) if self.credits.contains_key(h) => Some(ids.to_vec()),
+            _ if *h != self.p.genesis.hash && self.is_complete(h) => self.stored_batch_ids(h),
+            _ => None,
+        };
+        match (self.anchors.get(h), ids) {
+            (Some(e), Some(ids)) => {
                 let m = Message::Anchor(AnchorMsg {
                     btc_height: e.btc_height,
                     share: (*e.share).clone(),
                 });
-                let b = Message::Batch {
-                    anchor: *h,
-                    ids: ids.to_vec(),
-                };
+                let b = Message::Batch { anchor: *h, ids };
                 self.out.push(Out::Send(peer, m));
                 self.out.push(Out::Send(peer, b));
             }
@@ -1854,17 +2223,29 @@ impl Relay {
     }
 
     fn serve_batch(&mut self, peer: PeerId, a: &AnchorHash) {
-        match self.batch_ids.get(a) {
-            Some(ids) if self.credits.contains_key(a) => {
-                let m = Message::Batch {
-                    anchor: *a,
-                    ids: ids.to_vec(),
-                };
-                self.out.push(Out::Send(peer, m));
-            }
-            _ => self
+        let ids = match self.batch_ids.get(a) {
+            Some(ids) if self.credits.contains_key(a) => Some(ids.to_vec()),
+            // Folded into the checkpoint, or below it: served from the store while it holds it.
+            _ if self.is_complete(a) => self.stored_batch_ids(a),
+            _ => None,
+        };
+        match ids {
+            Some(ids) => self
+                .out
+                .push(Out::Send(peer, Message::Batch { anchor: *a, ids })),
+            None => self
                 .out
                 .push(Out::Send(peer, Message::NotFound(NotFoundKind::Batch, *a))),
+        }
+    }
+
+    fn stored_batch_ids(&self, a: &AnchorHash) -> Option<Vec<ShareId>> {
+        match self.db.np_get_batch(a) {
+            Ok(b) => b.map(|b| b.shares.iter().map(|m| m.share.share_id).collect()),
+            Err(e) => {
+                error!(anchor = %hex::encode(a), "NP_RELAY: reading a stored batch failed: {e}");
+                None
+            }
         }
     }
 
@@ -1872,7 +2253,15 @@ impl Relay {
         // Bounded per request: a peer that needs more asks again (`retry_request` does).
         let held: Vec<NetShare> = ids
             .iter()
-            .filter_map(|i| self.shares.get(i).map(|s| (**s).clone()))
+            .filter_map(|i| match self.shares.get(i) {
+                Some(s) => Some((**s).clone()),
+                None => self
+                    .db
+                    .np_get_share(i)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| NetShare::from_record(&r).ok()),
+            })
             .take(MAX_SERVED_SHARES)
             .collect();
         for chunk in held.chunks(MAX_SHARES_PER_MESSAGE) {

@@ -1,6 +1,6 @@
 # Deployment
 
-*How to stand up a Ghost node on Linux with the one-line installer. Covers what the installer asks for, what it puts where, how the node comes up, and where to look when it doesn't. Targets operators who want their node visibly participating in the mesh, not someone trying out the software in dev mode.*
+*How to stand up a Ghost node on Linux with the one-line installer. Covers what the installer asks for, what it puts where, how the node comes up, and where to look when it doesn't. Targets operators who want to run a node pool node. For what the node pool is, see [The node pool](#node-pool).*
 
 ## What you're deploying
 
@@ -401,12 +401,12 @@ systemd restarts a crashing service for ever and reports it `active` between cra
 | ghostd not syncing | `sudo journalctl -u ghostd -n 100`; `sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo` |
 | ghost-mining exits at startup | `sudo journalctl -u ghost-mining -n 100` — most config errors are explicit |
 | `peer_count` stays at 0 | Inbound 8555–8563 or 8443 blocked upstream of `ufw` (a provider firewall or security group) |
-| Miners can't connect | `sudo journalctl -u sri-pool -u sri-translator -n 100`; `sudo ufw status` should show 3333 (and 34255) for the pool modes. In `solo` mode they are closed on purpose. |
+| Miners can't connect | `sudo journalctl -u sri-pool -u sri-translator -n 100`; `sudo ufw status` should show 3333, 4444 and 34255. |
 | A service keeps restarting, or is up but serving nothing | `sudo /opt/ghost/bin/ghost-restart-watch.sh --check` |
 | An automatic update rolled back | `cat /var/lib/ghost/auto-update.status`; `sudo journalctl -u ghost-auto-update -n 100` |
 | The off-node backup copy failed | `sudo /opt/ghost/bin/ghost-backup-offsite show` (see `last_result`); `sudo /opt/ghost/bin/ghost-backup-offsite test`; `sudo journalctl -u ghost-backup -n 100` |
 
-The [Recovery runbook](#recovery) covers what to do when a running node breaks (DB corruption, mesh split, payout proposal divergence, etc).
+There is no recovery runbook for the node pool yet; the old network's runbook (elders, quorum, payout proposals) no longer applies and has been removed.
 
 ## What this guide isn't
 
@@ -423,5 +423,4 @@ The [Recovery runbook](#recovery) covers what to do when a running node breaks (
 | `scripts/ghost-auto-update.sh` | Canonical copy of the auto-updater |
 | `scripts/backup-databases.sh` | The nightly database backup |
 | `scripts/ghost-backup-offsite.sh` | Canonical copy of the optional off-node backup helper |
-| `crates/ghost-common/src/constants.rs` | Capability share weights, `MAX_ELDERS` |
 | `crates/ghost-common/src/config.rs` | `pool.toml` structures |

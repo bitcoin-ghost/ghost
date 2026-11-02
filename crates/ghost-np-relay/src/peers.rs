@@ -55,6 +55,12 @@ pub mod penalty {
     pub const BAD_BATCH_ROOT: u32 = 50;
     /// An anchor built on an invalid anchor.
     pub const INVALID_DESCENDANT: u32 = 20;
+    /// A share body that does not match its header (coinbase or tag substituted).
+    pub const BAD_BODY: u32 = 50;
+    /// A `Headers` reply whose anchors do not connect to each other or to the chain.
+    pub const UNCONNECTED_HEADERS: u32 = 20;
+    /// An archived Bitcoin block that is not a valid block of the chain.
+    pub const INVALID_BTC_BLOCK: u32 = 50;
 }
 
 /// A token bucket: `rate` tokens a second up to `burst`.
@@ -93,6 +99,11 @@ impl TokenBucket {
 
 /// `(per second, burst)` for a message type. Sized well above honest traffic: about 256 network
 /// shares and one anchor and batch per 54 s at target, and one `Shares` message per 64 bodies.
+///
+/// Sync (W2.13) is request-driven: a node keeps one `GetHeaders` outstanding per peer and a
+/// bounded number of batch requests, so `Headers` arrive no faster than they were asked for. A
+/// peer asking for more than these rates is served no faster than them: a request over its
+/// bucket is dropped, unanswered, without penalty.
 pub fn limits_for(t: MsgType) -> (f64, f64) {
     use MsgType::*;
     match t {
@@ -103,6 +114,8 @@ pub fn limits_for(t: MsgType) -> (f64, f64) {
         Shares | GetBatch | GetAnchor | NotFound => (20.0, 200.0),
         Tip => (2.0, 20.0),
         GetAddr | Addr => (0.1, 4.0),
+        GetHeaders | Headers => (4.0, 40.0),
+        GetBtcBlocks | BtcBlocks => (10.0, 100.0),
     }
 }
 

@@ -20,7 +20,7 @@ Four tiers, ordered:
 |---|---|---|---|
 | **T0** | Core financial (single-sig) | P2PKH, P2WPKH, P2SH-P2WPKH, P2TR key-path payments — no OP_RETURN, standard-sized witnesses | Always allow |
 | **T1** | Extended financial | Multisig (any m-of-n), CLTV / CSV timelocks, HTLCs, complex scripts, extended witness sizes (≤400 bytes per input) | Allow by default |
-| **T2** | Data-anchoring | Small OP_RETURN (≤80 bytes — Lightning channel commitments, timestamping anchors, Ghost Pay settlement roots) | Operator decides |
+| **T2** | Data-anchoring | Small OP_RETURN (≤80 bytes — Lightning channel commitments, timestamping anchors) | Operator decides |
 | **T3** | Heavy data | Inscriptions (Ordinals envelopes), BRC-20, Runes, large OP_RETURN (>80 bytes), oversized witnesses (>1 KB per input or >4 KB total) | Reject by default |
 
 The verdict is the highest tier any element of the transaction triggers. A transaction with a regular P2WPKH input (T0-shaped) and a 200-byte OP_RETURN (heavy data) ends up at T3 — heavy-data wins.
@@ -77,7 +77,7 @@ Brc20Pattern                T3 trigger
 
 The accompanying `ClassificationReason` enum records *why* a transaction landed in its tier — `StandardPayment`, `Multisig { m, n }`, `Timelock`, `Htlc`, `ComplexScript`, `SmallOpReturn { size }`, `LargeOpReturn { size }`, `Inscription`, `LargeWitness { total_bytes }`, `Runes`, `Brc20`, or `Unknown`. This is what surfaces in logs and operator tooling, so a rejected transaction always carries a human-readable reason.
 
-The 80-byte OP_RETURN cut-off is deliberate. Bitcoin's standardness rule (and Ghost's) keeps anchor-sized OP_RETURNs at T2 because they're load-bearing for legitimate L2 protocols (Lightning channel IDs, Ghost Pay settlement roots). Larger payloads jump to T3.
+The 80-byte OP_RETURN cut-off is deliberate. Bitcoin's standardness rule (and Ghost's) keeps anchor-sized OP_RETURNs at T2 because they're load-bearing for legitimate L2 protocols (for example Lightning channel IDs). Larger payloads jump to T3.
 
 ## Policy presets
 
@@ -130,7 +130,6 @@ When a node is connected to its own miners, the BUDS-filtered template is what t
 - **Not a network rule.** BUDS is purely a per-node policy tool. Other nodes apply other policies; the chain accepts whatever a miner manages to include.
 - **Not a censorship layer.** Operators choose. The classifier's job is to *describe* transactions accurately enough that the operator's choice can be applied programmatically. The default `permissive` preset actually accepts most things — only T3 (heavy data) is rejected.
 - **Not stable forever.** New protocols arrive. The detector needs maintenance. A transaction format that doesn't yet match any known pattern lands in whatever tier its script shapes and sizes imply (often T0 if it looks ordinary, T3 if it doesn't) — operators can adjust the allowed tiers list as classifier coverage evolves.
-- **Not a capability tier.** BUDS is foundational tech that *enables* the Reaper capability (+2 shares). Running BUDS itself doesn't earn shares directly.
 
 ## Performance
 

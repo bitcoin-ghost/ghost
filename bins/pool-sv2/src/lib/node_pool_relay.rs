@@ -8,9 +8,13 @@
 //! tip, and the 30 s re-batch, is published back to the driver at once.
 //!
 //! Settlement runs in the same task over the same store: it follows the local Bitcoin node's
-//! best chain over RPC, retires what pool blocks paid, and is the relay's retirement hook, so
-//! every table a share is checked against and every job pays subtracts what was paid. The job
-//! builder asks the task for its tables ([`crate::node_pool::NodePool::fetch_table`]).
+//! best chain over RPC, retires what pool blocks paid into the stored ledger, and archives every
+//! block it reads in the relay's Bitcoin archive. Every table a share is checked against and every
+//! job pays subtracts the pool blocks on its own Bitcoin ancestry, read from that archive (W2.13).
+//! The job builder asks the task for its tables ([`crate::node_pool::NodePool::fetch_table`]).
+//!
+//! Share-chain sync (W2.13) needs nothing configured: a node behind its peers fetches headers,
+//! batches and stale Bitcoin blocks from them. `checkpoint_depth` and `prune` set retention.
 //!
 //! **Where the share chain starts (W2.8)** is per network ([`ghost_common::node_pool_network`]):
 //! `network` names it, and [`NodePoolRelayConfig::network_start`] resolves the genesis anchor, its
@@ -30,6 +34,7 @@ use ghost_common::{
     share_commit::diff1_target,
 };
 use ghost_np_relay::{
+    archive::BtcArchive,
     headers::{HeaderOracle, RpcHeaderOracle},
     net::{spawn_with_settlement, NetConfig, RelayHandle},
     relay::{Genesis, Relay, RelayParams, RelayStatus},
@@ -85,6 +90,14 @@ pub struct NodePoolRelayConfig {
     pub rpc_user: String,
     /// RPC password.
     pub rpc_password: String,
+    /// Fold a ledger checkpoint this many Bitcoin blocks below the share-chain tip (0: never;
+    /// otherwise at least 40). Defaults to 288.
+    #[serde(default)]
+    pub checkpoint_depth: Option<u32>,
+    /// Delete stored batches below the older of the two kept checkpoints. Off by default: an
+    /// archive node, which can serve a fresh node's sync from genesis.
+    #[serde(default)]
+    pub prune: bool,
 }
 
 /// The `genesis_anchor` an installer writes for a network whose share-chain genesis has not been
@@ -334,12 +347,13 @@ pub async fn start_with_parts(
     let genesis_btc_height = genesis.btc_height;
     let db = Arc::new(Database::open(&cfg.db_path).map_err(|e| format!("relay store: {e}"))?);
     let view = SettledView::load(&db).map_err(|e| format!("settlement view: {e}"))?;
-    let relay = Relay::open(
-        RelayParams::new(genesis, tier_base),
-        db.clone(),
-        Box::new(view.clone()),
-    )
-    .map_err(|e| format!("relay: {e}"))?;
+    let archive = BtcArchive::open(db.clone()).map_err(|e| format!("bitcoin archive: {e}"))?;
+    let mut params = RelayParams::new(genesis, tier_base);
+    if let Some(d) = cfg.checkpoint_depth {
+        params.checkpoint_depth = d;
+    }
+    params.prune = cfg.prune;
+    let relay = Relay::open(params, db.clone(), archive).map_err(|e| format!("relay: {e}"))?;
     let rpc = || {
         BitcoinRpc::new(
             &cfg.rpc_host,
@@ -431,6 +445,15 @@ mod tests {
         assert_eq!(r.genesis_btc_height, 974_400);
         assert_eq!(r.peers, vec!["127.0.0.1:1".to_string()]);
         assert!(r.tier_base.is_none() && r.genesis_tier.is_none());
+        assert!(
+            r.checkpoint_depth.is_none() && !r.prune,
+            "archive node by default"
+        );
+        let r = parse(&relay_toml(db, "checkpoint_depth = 500\nprune = true\n"))
+            .unwrap()
+            .relay
+            .unwrap();
+        assert_eq!((r.checkpoint_depth, r.prune), (Some(500), true));
         assert!(parse(&relay_toml(db, "nonsense = 1\n")).is_err());
         assert!(parse("").is_err(), "fee_address is required");
         let bare = parse("fee_address = \"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"").unwrap();

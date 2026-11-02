@@ -85,10 +85,10 @@ Specific config keys for window sizes and per-tier pruning have not been defined
 - **Size:** Infinite
 - **Configurable:** Enable/disable
 - **Pruning:** None — full chain history
-- **Purpose:** Historical audit, Ghost Pay recovery
+- **Purpose:** Historical audit
 
 :::warning Archive Mode Storage
-Archive mode requires 2+ TB of storage and growing. Enable only if you have the capacity. Archive nodes earn +5 shares in the reward system.
+Archive mode requires 2+ TB of storage and growing. Enable only if you have the capacity.
 :::
 
 ## Mempool Profiles

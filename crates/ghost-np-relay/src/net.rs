@@ -138,6 +138,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_QUEUE: usize = 4_096;
 /// Table requests queued from pool_sv2.
 const TABLE_QUEUE: usize = 256;
+/// Most blocks read back from the local Bitcoin node for one wanted hash.
+const MAX_LOCAL_WALK: usize = 2_016;
 
 enum Event {
     Inbound(TcpStream, SocketAddr),
@@ -312,6 +314,7 @@ impl Node {
                     let need = self.relay.take_needed_headers();
                     if !need.is_empty() {
                         self.oracle.prefetch(&need).await;
+                        self.fetch_blocks(need).await;
                     }
                     let outs = self.relay.tick(self.oracle.lookup(), now_secs());
                     self.dispatch(outs);
@@ -343,6 +346,38 @@ impl Node {
                 warn!("NP_SETTLE: sync failed: {e}");
             }
             self.settlement_tx.send_replace(s.status());
+        }
+    }
+
+    /// Bitcoin blocks share checks wanted: from the local Bitcoin node first (walking back to an
+    /// archived ancestor), then from peers' archives.
+    async fn fetch_blocks(&mut self, need: Vec<[u8; 32]>) {
+        let mut missing = Vec::new();
+        for h in need {
+            let mut cur = h;
+            for _ in 0..MAX_LOCAL_WALK {
+                if self.relay.archive().has_full(&cur) {
+                    break;
+                }
+                let local = match self.settlement.as_ref() {
+                    Some((_, src)) => src.block(&cur).await,
+                    None => None,
+                };
+                let Some(b) = local else {
+                    missing.push(cur);
+                    break;
+                };
+                let prev = b.prev();
+                if let Err(e) = self.relay.archive().insert_local(b, now_secs() as i64) {
+                    warn!("NP_RELAY: archiving a local block failed: {e}");
+                    break;
+                }
+                cur = prev;
+            }
+        }
+        if !missing.is_empty() {
+            self.relay.request_btc_blocks(&missing);
+            self.flush_out();
         }
     }
 
@@ -515,6 +550,7 @@ impl Node {
                     Message::Share(s) => vec![s.prev_hash()],
                     Message::Anchor(a) => vec![a.share.prev_hash()],
                     Message::Shares(v) => v.iter().map(|s| s.prev_hash()).collect(),
+                    Message::Headers(v) => v.iter().map(|a| a.share.prev_hash()).collect(),
                     _ => vec![],
                 };
                 if !prevs.is_empty() {

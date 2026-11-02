@@ -33,13 +33,15 @@
 //! block that does not match retires nothing. On a Bitcoin reorg the disconnected blocks are
 //! undone.
 //!
-//! Every retirement also lands in the [`SettledView`], the relay's [`Retirements`] hook, so every
-//! later snapshot table subtracts it.
+//! Settlement also feeds the [`crate::archive::BtcArchive`]: every best-chain block it reads (and
+//! the 11 at genesis, for median time past) is archived with its coinbase and recorded as this
+//! node's best chain. Blocks it leaves on a reorg stay archived.
 //!
-//! The view is this node's Bitcoin best chain: the retirements a table subtracts for job height
-//! `H` are those of the settled pool blocks below `H` on the best chain, whatever the including
-//! anchor. Two nodes on different Bitcoin tips can disagree for the time it takes a block to
-//! propagate; a pool block on a stale branch is never in the view.
+//! What it retires here is this node's stored ledger (`np_ledger`), which follows this node's
+//! Bitcoin best chain and the anchors it holds. Share checks and snapshot tables do not read it:
+//! they apply the deterministic rule in [`crate::relay`] (W2.13) to the share's own Bitcoin
+//! ancestry, so two nodes on different Bitcoin tips judge every share alike once their archives
+//! hold the same blocks.
 //!
 //! [`share_commit::settle_outputs`]: ghost_common::share_commit::settle_outputs
 //! [`canonical_payout::provisional_retirements`]: ghost_common::canonical_payout::provisional_retirements
@@ -52,7 +54,7 @@ use bitcoin::Transaction;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use ghost_common::anchor_chain::{AnchorChain, AnchorHash};
+use ghost_common::anchor_chain::AnchorHash;
 use ghost_common::canonical_payout::{
     ledger_root_of, provisional_retirements, table_root, CoinbaseOutput, Retirement,
 };
@@ -62,7 +64,8 @@ use ghost_common::rpc::BitcoinRpc;
 use ghost_common::share_commit::settle_outputs;
 use ghost_storage::Database;
 
-use crate::relay::{Relay, Retirements};
+use crate::archive::{coinbase_branch, ArchivedBlock, MTP_SPAN};
+use crate::relay::Relay;
 
 /// Best-chain heights remembered for reorg detection.
 const RECENT_KEPT: usize = 1_024;
@@ -91,8 +94,8 @@ impl ViewInner {
     }
 }
 
-/// The settled pool blocks on the best chain and what each retired: the relay's [`Retirements`]
-/// hook. Cheap to clone; every clone sees the same blocks.
+/// The settled pool blocks on the best chain and what each retired: settlement's own record of
+/// the stored ledger. Cheap to clone; every clone sees the same blocks.
 #[derive(Clone, Default)]
 pub struct SettledView {
     inner: Arc<Mutex<ViewInner>>,
@@ -144,25 +147,6 @@ impl SettledView {
     }
 }
 
-impl Retirements for SettledView {
-    fn blocks_below(
-        &self,
-        _chain: &AnchorChain,
-        _including: &AnchorHash,
-        h: u32,
-    ) -> BTreeMap<u32, Vec<Retirement>> {
-        self.lock()
-            .blocks
-            .range(..h)
-            .map(|(k, (_, r))| (*k, r.clone()))
-            .collect()
-    }
-
-    fn view_tag(&self, _chain: &AnchorChain, _including: &AnchorHash) -> [u8; 32] {
-        self.lock().tag
-    }
-}
-
 // -------------------------------------------------------------------------------------------
 // Where blocks come from
 // -------------------------------------------------------------------------------------------
@@ -174,8 +158,9 @@ pub trait BlockSource: Send + Sync {
     async fn tip(&self) -> Option<u32>;
     /// The best-chain block at height `h`, internal byte order.
     async fn hash_at(&self, h: u32) -> Option<[u8; 32]>;
-    /// A block's coinbase transaction.
-    async fn coinbase(&self, hash: &[u8; 32]) -> Option<Transaction>;
+    /// A block's header, height, and coinbase with its merkle branch, on any branch the Bitcoin
+    /// node holds.
+    async fn block(&self, hash: &[u8; 32]) -> Option<ArchivedBlock>;
 }
 
 /// The local Bitcoin node over RPC. Works without `txindex`: the coinbase is fetched with its
@@ -210,10 +195,28 @@ impl BlockSource for RpcBlockSource {
         Some(v)
     }
 
-    async fn coinbase(&self, hash: &[u8; 32]) -> Option<Transaction> {
+    async fn block(&self, hash: &[u8; 32]) -> Option<ArchivedBlock> {
         let block = display_hex(hash);
+        let info = self.rpc.get_block_header(&block).await.ok()?;
+        let raw = self
+            .rpc
+            .call_raw("getblockheader", vec![block.clone().into(), false.into()])
+            .await
+            .ok()?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::deserialize(&hex::decode(raw.as_str()?).ok()?).ok()?;
         let b = self.rpc.get_block(&block, 1).await.ok()?;
-        let txid = b.get("tx")?.get(0)?.as_str()?.to_string();
+        let txids: Vec<[u8; 32]> = b
+            .get("tx")?
+            .as_array()?
+            .iter()
+            .map(|t| {
+                let mut v: [u8; 32] = hex::decode(t.as_str()?).ok()?.try_into().ok()?;
+                v.reverse();
+                Some(v)
+            })
+            .collect::<Option<_>>()?;
+        let txid = display_hex(txids.first()?);
         let raw = self
             .rpc
             .call_raw(
@@ -222,32 +225,66 @@ impl BlockSource for RpcBlockSource {
             )
             .await
             .ok()?;
-        let bytes = hex::decode(raw.as_str()?).ok()?;
-        bitcoin::consensus::deserialize(&bytes).ok()
+        let tx: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(raw.as_str()?).ok()?).ok()?;
+        let mut tx = tx;
+        for i in &mut tx.input {
+            i.witness.clear();
+        }
+        Some(ArchivedBlock {
+            header,
+            height: u32::try_from(info.height).ok()?,
+            coinbase: Some((tx, coinbase_branch(&txids))),
+        })
     }
 }
 
-/// Blocks by height: hash and coinbase.
-type BlocksByHeight = BTreeMap<u32, ([u8; 32], Transaction)>;
+#[derive(Default)]
+struct MemInner {
+    best: BTreeMap<u32, ArchivedBlock>,
+    known: HashMap<[u8; 32], ArchivedBlock>,
+}
 
-/// An in-memory best chain: tests, and a node handed its blocks.
+/// An in-memory Bitcoin node: tests, and a node handed its blocks.
 #[derive(Clone, Default)]
 pub struct MemBlocks {
-    inner: Arc<Mutex<BlocksByHeight>>,
+    inner: Arc<Mutex<MemInner>>,
 }
 
 impl MemBlocks {
-    /// Put block `hash` with `coinbase` at height `h`, replacing whatever was there.
-    pub fn set(&self, h: u32, hash: [u8; 32], coinbase: Transaction) {
-        self.lock().insert(h, (hash, coinbase));
+    /// Put `b` on the best chain at its height, replacing whatever was there. It stays known.
+    pub fn set(&self, b: ArchivedBlock) {
+        let mut g = self.lock();
+        g.known.insert(b.hash(), b.clone());
+        g.best.insert(b.height, b);
     }
 
-    /// Drop every block above `h`.
+    /// Make `b` known without putting it on the best chain (a stale block this node saw).
+    pub fn know(&self, b: ArchivedBlock) {
+        self.lock().known.insert(b.hash(), b);
+    }
+
+    /// Drop every best-chain block above `h` from the best chain. They stay known.
     pub fn truncate(&self, h: u32) {
-        let _dropped = self.lock().split_off(&(h + 1));
+        let _dropped = self.lock().best.split_off(&(h + 1));
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BlocksByHeight> {
+    /// The best-chain block at `h`.
+    pub fn at(&self, h: u32) -> Option<ArchivedBlock> {
+        self.lock().best.get(&h).cloned()
+    }
+
+    /// Any known block by hash.
+    pub fn get(&self, hash: &[u8; 32]) -> Option<ArchivedBlock> {
+        self.lock().known.get(hash).cloned()
+    }
+
+    /// The best chain's height.
+    pub fn best_height(&self) -> Option<u32> {
+        self.lock().best.keys().next_back().copied()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemInner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -255,24 +292,30 @@ impl MemBlocks {
 #[async_trait]
 impl BlockSource for MemBlocks {
     async fn tip(&self) -> Option<u32> {
-        self.lock().keys().next_back().copied()
+        self.lock().best.keys().next_back().copied()
     }
 
     async fn hash_at(&self, h: u32) -> Option<[u8; 32]> {
-        self.lock().get(&h).map(|(hash, _)| *hash)
+        self.lock().best.get(&h).map(|b| b.hash())
     }
 
-    async fn coinbase(&self, hash: &[u8; 32]) -> Option<Transaction> {
-        self.lock()
-            .values()
-            .find(|(x, _)| x == hash)
-            .map(|(_, tx)| tx.clone())
+    async fn block(&self, hash: &[u8; 32]) -> Option<ArchivedBlock> {
+        self.lock().known.get(hash).cloned()
     }
 }
 
 // -------------------------------------------------------------------------------------------
 // Settlement
 // -------------------------------------------------------------------------------------------
+
+/// Archive a block from the local Bitcoin node.
+fn archive_local(relay: &Relay, b: ArchivedBlock) -> GhostResult<()> {
+    relay
+        .archive()
+        .insert_local(b, now_secs())
+        .map(|_| ())
+        .map_err(|e| ghost_common::error::GhostError::Database(format!("archive: {e}")))
+}
 
 /// What settlement made of one block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +374,7 @@ impl SettlementStatus {
 
 struct Pending {
     height: u32,
+    prev: [u8; 32],
     tag: [u8; PAYOUT_ID_LEN],
     coinbase: Transaction,
     retired: Vec<Retirement>,
@@ -364,7 +408,7 @@ fn now_secs() -> i64 {
 }
 
 impl Settlement {
-    /// Settlement over the relay's store, publishing to `view` (the relay's [`Retirements`]).
+    /// Settlement over the relay's store, recording what it applied in `view`.
     pub fn new(db: Arc<Database>, view: SettledView, genesis_btc_height: u32) -> Settlement {
         Settlement {
             db,
@@ -402,22 +446,40 @@ impl Settlement {
         self.pending.len()
     }
 
-    /// Bring settlement to `src`'s best chain: undo blocks a reorg disconnected, settle new ones.
+    /// Bring settlement to `src`'s best chain: undo blocks a reorg disconnected, settle new ones,
+    /// and archive every block read.
     ///
-    /// The first call also re-checks every block the store holds as applied: it must still be on
-    /// the best chain, and one whose anchor is not held goes back to provisional.
+    /// The first call also archives the headers at genesis that median time past needs, and
+    /// re-checks every block the store holds as applied: it must still be on the best chain, and
+    /// one whose anchor is not held goes back to provisional.
     pub async fn sync(&mut self, relay: &mut Relay, src: &dyn BlockSource) -> GhostResult<()> {
         let Some(tip) = src.tip().await else {
             return Ok(());
         };
         self.last_tip = Some(tip);
         if !self.started {
+            let floor = self.genesis_btc_height.saturating_sub(MTP_SPAN - 1);
+            for h in floor..=self.genesis_btc_height.min(tip) {
+                let Some(hash) = src.hash_at(h).await else {
+                    return Ok(());
+                };
+                if !relay.archive().has_full(&hash) {
+                    let Some(b) = src.block(&hash).await else {
+                        return Ok(());
+                    };
+                    archive_local(relay, b)?;
+                }
+                relay.archive().set_main(h, hash);
+            }
             for (h, hash) in self.view.blocks() {
                 if src.hash_at(h).await != Some(hash) {
                     self.disconnect(h, hash)?;
                     continue;
                 }
-                let Some(cb) = src.coinbase(&hash).await else {
+                let Some(b) = src.block(&hash).await else {
+                    continue;
+                };
+                let Some((cb, _)) = b.coinbase.clone() else {
                     continue;
                 };
                 // A block whose anchor is still not held goes back to provisional, to be checked
@@ -436,6 +498,7 @@ impl Settlement {
                         hash,
                         Pending {
                             height: h,
+                            prev: b.prev(),
                             tag,
                             coinbase: cb,
                             retired,
@@ -451,6 +514,7 @@ impl Settlement {
                 break;
             }
             self.recent.remove(&h);
+            relay.archive().truncate_main(h.saturating_sub(1));
             if let Some(applied) = self.view.at(h) {
                 self.disconnect(h, applied)?;
             }
@@ -464,21 +528,42 @@ impl Settlement {
                 .map_or(self.genesis_btc_height + 1, |(h, _)| h + 1)
                 .max(self.genesis_btc_height + 1),
         };
+        // Below the first settled height, the best chain is only archived (once): share checks
+        // walk it.
+        if self.recent.is_empty() {
+            let mut h = self.genesis_btc_height + 1;
+            while h < start {
+                let Some(hash) = src.hash_at(h).await else {
+                    break;
+                };
+                if !relay.archive().has_full(&hash) {
+                    let Some(b) = src.block(&hash).await else {
+                        break;
+                    };
+                    archive_local(relay, b)?;
+                }
+                relay.archive().set_main(h, hash);
+                self.recent.insert(h, hash);
+                h += 1;
+            }
+        }
         let end = tip.min(start.saturating_add(MAX_SCAN_PER_SYNC - 1));
         for h in start..=end {
             let Some(hash) = src.hash_at(h).await else {
                 break;
             };
+            let Some(b) = src.block(&hash).await else {
+                break;
+            };
+            archive_local(relay, b.clone())?;
+            relay.archive().set_main(h, hash);
             match self.view.at(h) {
                 Some(x) if x == hash => {}
                 other => {
                     if let Some(stale) = other {
                         self.disconnect(h, stale)?;
                     }
-                    let Some(cb) = src.coinbase(&hash).await else {
-                        break;
-                    };
-                    self.settle(relay, h, hash, &cb)?;
+                    self.settle(relay, &b)?;
                 }
             }
             self.recent.insert(h, hash);
@@ -499,16 +584,14 @@ impl Settlement {
 
     /// Settle one best-chain block. Public for tests and for callers that follow the chain
     /// themselves; [`Settlement::sync`] is the usual entry.
-    pub fn settle(
-        &mut self,
-        relay: &mut Relay,
-        h: u32,
-        hash: [u8; 32],
-        cb: &Transaction,
-    ) -> GhostResult<Outcome> {
+    pub fn settle(&mut self, relay: &mut Relay, b: &ArchivedBlock) -> GhostResult<Outcome> {
+        let (h, hash, prev) = (b.height, b.hash(), b.prev());
         if h <= self.genesis_btc_height {
             return Ok(Outcome::BelowGenesis);
         }
+        let Some((cb, _)) = b.coinbase.as_ref() else {
+            return Ok(Outcome::NotPool);
+        };
         let outs = outputs_of(cb);
         let sig = cb
             .input
@@ -533,6 +616,7 @@ impl Settlement {
                 hash,
                 Pending {
                     height: h,
+                    prev,
                     tag,
                     coinbase: cb.clone(),
                     retired,
@@ -547,7 +631,7 @@ impl Settlement {
             return Ok(Outcome::Provisional);
         }
         for a in candidates {
-            if let Some((slot_class, retired)) = Self::check(relay, &a, h, &root, cb) {
+            if let Some((slot_class, retired)) = Self::check(relay, &a, h, &prev, &root, cb) {
                 self.apply(h, hash, &retired)?;
                 self.stats.matched += 1;
                 info!(
@@ -577,10 +661,11 @@ impl Settlement {
         relay: &mut Relay,
         a: &AnchorHash,
         h: u32,
+        prev: &[u8; 32],
         root: &[u8; 32],
         cb: &Transaction,
     ) -> Option<(u16, Vec<Retirement>)> {
-        let table = relay.block_table(a, h)?;
+        let table = relay.block_table_on(a, h, prev)?;
         if table_root(&table) != *root {
             return None;
         }
@@ -602,7 +687,7 @@ impl Settlement {
                 relay
                     .anchors_with_prefix(&p.tag)
                     .into_iter()
-                    .find_map(|a| Self::check(relay, &a, p.height, &root, &p.coinbase))
+                    .find_map(|a| Self::check(relay, &a, p.height, &p.prev, &root, &p.coinbase))
             });
             match matched {
                 Some((_, retired)) if retired == p.retired => {
@@ -667,16 +752,18 @@ impl Settlement {
 mod tests {
     use super::*;
     use crate::relay::JobAnchor;
-    use crate::testkit::{p2tr, params, Miner, Sim, GENESIS_BTC};
+    use crate::testkit::{
+        btc_hash, fed_archive, main_block, main_node, make_block, params, plain_coinbase, Miner,
+        Sim, GENESIS_BTC, START_TIP,
+    };
     use bitcoin::consensus::deserialize;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
     use ghost_common::canonical_payout::Table;
 
-    /// A relay whose snapshot hook is settlement's view, and the settlement over its store.
+    /// A relay with its archive, and the settlement over its store.
     fn settled() -> (Relay, Settlement) {
         let db = Arc::new(Database::in_memory().unwrap());
         let view = SettledView::load(&db).unwrap();
-        let r = Relay::open(params(), db.clone(), Box::new(view.clone())).unwrap();
+        let r = Relay::open(params(), db.clone(), fed_archive(START_TIP)).unwrap();
         (r, Settlement::new(db, view, GENESIS_BTC))
     }
 
@@ -696,30 +783,9 @@ mod tests {
         deserialize(&s.coinbase).unwrap()
     }
 
-    /// A coinbase with no node pool layout.
-    fn plain_coinbase(h: u32) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: bitcoin::script::Builder::new()
-                    .push_int(h as i64)
-                    .into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(312_500_000),
-                script_pubkey: ScriptBuf::from_bytes(p2tr("solo")),
-            }],
-        }
-    }
-
-    fn hash(h: u32, tag: u8) -> [u8; 32] {
-        let mut x = [tag; 32];
-        x[..4].copy_from_slice(&h.to_le_bytes());
-        x
+    /// A block at `h` on the main chain's block `h - 1`.
+    fn on_main(h: u32, cb: Transaction) -> ArchivedBlock {
+        make_block(btc_hash(h - 1), h, cb)
     }
 
     /// Node 0 of `sim` produces an anchor; returns the job built on it.
@@ -728,16 +794,21 @@ mod tests {
         sim.nodes[0].relay.job_anchor().unwrap()
     }
 
-    fn owed(r: &mut Relay, job: &JobAnchor, h: u32) -> i128 {
-        r.block_table(&job.parent_anchor, h)
+    /// What a job at `h` on `job`'s anchor owes in all, on Bitcoin block `prev`.
+    fn owed(r: &mut Relay, job: &JobAnchor, h: u32, prev: &[u8; 32]) -> i128 {
+        r.block_table_on(&job.parent_anchor, h, prev)
             .unwrap()
             .values()
             .map(|b| b.owed)
             .sum()
     }
 
+    fn archive(r: &Relay, b: &ArchivedBlock) {
+        r.archive().insert_local(b.clone(), 0).unwrap();
+    }
+
     #[test]
-    fn a_canonical_block_retires_and_later_tables_subtract_it() {
+    fn a_canonical_block_retires_and_tables_on_top_of_it_subtract_it() {
         let (mut sim, mut st) = sim(1);
         let job = anchored(&mut sim);
         let tip = sim.btc.tip;
@@ -745,10 +816,11 @@ mod tests {
         let r = &mut sim.nodes[0].relay;
         let table = r.block_table(&job.parent_anchor, h).unwrap();
         assert_eq!(table.len(), 4, "the genesis table, still above the cut");
-        let cb = pool_coinbase(job, &table, tip);
-        let before = owed(r, &job, h + 1);
+        let b = on_main(h, pool_coinbase(job, &table, tip));
+        archive(r, &b);
+        archive(r, &main_block(h));
 
-        let out = st[0].settle(r, h, hash(h, 1), &cb).unwrap();
+        let out = st[0].settle(r, &b).unwrap();
         assert_eq!(
             out,
             Outcome::Matched {
@@ -756,19 +828,24 @@ mod tests {
                 slot_class: 9
             }
         );
-        let retired = r.db().np_block_retirements(&hash(h, 1)).unwrap().unwrap();
+        let retired = r.db().np_block_retirements(&b.hash()).unwrap().unwrap();
         assert_eq!(retired.len(), 4, "every genesis balance was paid");
         let paid: i128 = retired.iter().map(|x| x.1).sum();
+        let on_block = owed(r, &job, h + 1, &b.hash());
+        let on_sibling = owed(r, &job, h + 1, &btc_hash(h));
         assert_eq!(
-            owed(r, &job, h + 1),
-            before - paid,
-            "the next table subtracts it"
+            on_sibling - on_block,
+            paid,
+            "a table on top of it subtracts it"
         );
-        assert_eq!(owed(r, &job, h), before, "the block's own table does not");
+        assert_eq!(
+            owed(r, &job, h, &btc_hash(tip)),
+            on_sibling,
+            "its own table does not"
+        );
         assert_eq!(st[0].stats().matched, 1);
-        // A share for the next height now pays nobody from the genesis table.
         assert!(r
-            .block_table(&job.parent_anchor, h + 1)
+            .block_table_on(&job.parent_anchor, h + 1, &b.hash())
             .unwrap()
             .values()
             .all(|b| b.owed == 0));
@@ -786,26 +863,37 @@ mod tests {
         // The right root, the payees in the wrong order.
         let mut swapped = pool_coinbase(job, &table, tip);
         swapped.output.swap(1, 2);
-        assert_eq!(
-            st[0].settle(r, h, hash(h, 1), &swapped).unwrap(),
-            Outcome::Mismatch
-        );
+        let swapped = on_main(h, swapped);
+        archive(r, &swapped);
+        assert_eq!(st[0].settle(r, &swapped).unwrap(), Outcome::Mismatch);
         // Another table altogether (a balance inflated).
         table.values_mut().next().unwrap().owed *= 2;
-        let inflated = pool_coinbase(job, &table, tip);
-        assert_eq!(
-            st[0].settle(r, h, hash(h, 2), &inflated).unwrap(),
-            Outcome::Mismatch
-        );
+        let inflated = on_main(h, pool_coinbase(job, &table, tip));
+        archive(r, &inflated);
+        assert_eq!(st[0].settle(r, &inflated).unwrap(), Outcome::Mismatch);
         assert_eq!(r.db().np_applied_blocks().unwrap(), vec![]);
         assert_eq!(st[0].stats().mismatched, 2);
+        // The deterministic rule agrees: a table on top of either subtracts nothing.
+        archive(r, &main_block(h));
+        let plain = owed(r, &job, h + 1, &btc_hash(h));
+        assert_eq!(owed(r, &job, h + 1, &swapped.hash()), plain);
+        assert_eq!(owed(r, &job, h + 1, &inflated.hash()), plain);
         // Not a pool block, and below genesis: ignored.
         assert_eq!(
-            st[0].settle(r, h, hash(h, 3), &plain_coinbase(h)).unwrap(),
+            st[0].settle(r, &on_main(h, plain_coinbase(h, 3))).unwrap(),
             Outcome::NotPool
         );
         assert_eq!(
-            st[0].settle(r, GENESIS_BTC, hash(h, 4), &inflated).unwrap(),
+            st[0]
+                .settle(
+                    r,
+                    &make_block(
+                        btc_hash(GENESIS_BTC - 1),
+                        GENESIS_BTC,
+                        plain_coinbase(GENESIS_BTC, 4)
+                    )
+                )
+                .unwrap(),
             Outcome::BelowGenesis
         );
     }
@@ -820,30 +908,26 @@ mod tests {
             .relay
             .block_table(&job.parent_anchor, h)
             .unwrap();
-        let good = pool_coinbase(job, &table, tip);
+        let good = on_main(h, pool_coinbase(job, &table, tip));
         let mut wrong_table = (*table).clone();
         wrong_table.pop_first();
-        let wrong = pool_coinbase(job, &wrong_table, tip);
+        let wrong = make_block(good.hash(), h + 1, pool_coinbase(job, &wrong_table, h));
 
         // Node 1 has never heard of the anchor.
         let r1 = &mut sim.nodes[1].relay;
         assert!(r1.block_table(&job.parent_anchor, h).is_none());
-        assert_eq!(
-            st[1].settle(r1, h, hash(h, 1), &good).unwrap(),
-            Outcome::Provisional
-        );
-        assert_eq!(
-            st[1].settle(r1, h + 1, hash(h + 1, 1), &wrong).unwrap(),
-            Outcome::Provisional
-        );
+        archive(r1, &good);
+        archive(r1, &wrong);
+        assert_eq!(st[1].settle(r1, &good).unwrap(), Outcome::Provisional);
+        assert_eq!(st[1].settle(r1, &wrong).unwrap(), Outcome::Provisional);
         assert_eq!(st[1].pending(), 2);
         assert_eq!(
             st[1].status().provisional,
-            vec![(h, hash(h, 1)), (h + 1, hash(h + 1, 1))]
+            vec![(h, good.hash()), (h + 1, wrong.hash())]
         );
         let applied = r1.db().np_applied_blocks().unwrap();
         assert_eq!(applied.len(), 2, "both retire from their coinbase alone");
-        let provisional = r1.db().np_block_retirements(&hash(h, 1)).unwrap().unwrap();
+        let provisional = r1.db().np_block_retirements(&good.hash()).unwrap().unwrap();
         st[1].reconcile(r1).unwrap();
         assert_eq!(
             st[1].pending(),
@@ -863,45 +947,54 @@ mod tests {
         assert_eq!(st[1].stats().mismatched, 1);
         assert_eq!(
             r1.db().np_applied_blocks().unwrap(),
-            vec![(h, hash(h, 1))],
+            vec![(h, good.hash())],
             "the block that did not match is undone"
         );
         assert_eq!(
-            r1.db().np_block_retirements(&hash(h, 1)).unwrap().unwrap(),
+            r1.db().np_block_retirements(&good.hash()).unwrap().unwrap(),
             provisional,
             "a confirmed block keeps exactly what it retired"
         );
-        // Node 1 now agrees with node 0 on what the next block must pay.
-        let mut st0 = st.remove(0);
-        st0.settle(&mut sim.nodes[0].relay, h, hash(h, 1), &good)
-            .unwrap();
-        let t0 = sim.nodes[0].relay.block_table(&job.parent_anchor, h + 2);
-        let t1 = sim.nodes[1].relay.block_table(&job.parent_anchor, h + 2);
-        assert_eq!(t0, t1);
+        // Both nodes agree on what a block on top of either must pay.
+        archive(&sim.nodes[0].relay, &good);
+        archive(&sim.nodes[0].relay, &wrong);
+        for prev in [good.hash(), wrong.hash()] {
+            let t0 = sim.nodes[0]
+                .relay
+                .block_table_on(&job.parent_anchor, h + 2, &prev);
+            let t1 = sim.nodes[1]
+                .relay
+                .block_table_on(&job.parent_anchor, h + 2, &prev);
+            assert!(t0.is_some());
+            assert_eq!(t0, t1);
+        }
     }
 
     #[tokio::test]
-    async fn sync_follows_the_best_chain_and_undoes_a_reorg() {
+    async fn sync_follows_the_best_chain_archives_it_and_undoes_a_reorg() {
         let (mut sim, mut st) = sim(1);
         let job = anchored(&mut sim);
         let tip = sim.btc.tip;
         let h = tip + 1;
         let r = &mut sim.nodes[0].relay;
         let table = r.block_table(&job.parent_anchor, h).unwrap();
-        let chain = MemBlocks::default();
-        for x in GENESIS_BTC - 3..h {
-            chain.set(x, hash(x, 0), plain_coinbase(x));
-        }
-        chain.set(h, hash(h, 1), pool_coinbase(job, &table, tip));
-        chain.set(h + 1, hash(h + 1, 0), plain_coinbase(h + 1));
+        let chain = main_node(h - 1);
+        let pool = on_main(h, pool_coinbase(job, &table, tip));
+        let after = make_block(pool.hash(), h + 1, plain_coinbase(h + 1, 0));
+        chain.set(pool.clone());
+        chain.set(after.clone());
 
         assert!(!st[0].status().caught_up(), "nothing synced yet");
         st[0].sync(r, &chain).await.unwrap();
-        assert_eq!(r.db().np_applied_blocks().unwrap(), vec![(h, hash(h, 1))]);
+        assert_eq!(r.db().np_applied_blocks().unwrap(), vec![(h, pool.hash())]);
+        assert_eq!(r.archive().main_at(h + 1), Some(after.hash()));
+        assert!(
+            r.archive().has_full(&pool.hash()),
+            "archived with its coinbase"
+        );
         let s = st[0].status();
         assert_eq!((s.synced_height, s.bitcoin_tip), (Some(h + 1), Some(h + 1)));
         assert!(s.caught_up() && s.provisional.is_empty());
-        let settled_owed = owed(r, &job, h + 2);
         st[0].sync(r, &chain).await.unwrap();
         assert_eq!(
             st[0].stats().matched,
@@ -911,24 +1004,27 @@ mod tests {
 
         // A two-block reorg replaces the pool block.
         chain.truncate(h - 1);
-        chain.set(h, hash(h, 7), plain_coinbase(h));
-        chain.set(h + 1, hash(h + 1, 7), plain_coinbase(h + 1));
-        chain.set(h + 2, hash(h + 2, 7), plain_coinbase(h + 2));
+        let mut prev = btc_hash(h - 1);
+        for x in h..h + 3 {
+            let b = make_block(prev, x, plain_coinbase(x, 7));
+            prev = b.hash();
+            chain.set(b);
+        }
         st[0].sync(r, &chain).await.unwrap();
         assert_eq!(st[0].stats().disconnected, 1);
         assert_eq!(r.db().np_applied_blocks().unwrap(), vec![]);
-        assert!(r.db().np_block_retirements(&hash(h, 1)).unwrap().is_none());
+        assert!(r.db().np_block_retirements(&pool.hash()).unwrap().is_none());
+        assert_eq!(r.archive().main_at(h + 2), Some(prev));
         assert!(
-            owed(r, &job, h + 2) > settled_owed,
-            "the balances are owed again"
+            r.archive().has_full(&pool.hash()),
+            "the stale pool block stays archived for shares built on it"
         );
 
         // The pool block comes back on a third branch.
         chain.truncate(h - 1);
-        chain.set(h, hash(h, 1), pool_coinbase(job, &table, tip));
+        chain.set(pool.clone());
         st[0].sync(r, &chain).await.unwrap();
-        assert_eq!(r.db().np_applied_blocks().unwrap(), vec![(h, hash(h, 1))]);
-        assert_eq!(owed(r, &job, h + 2), settled_owed);
+        assert_eq!(r.db().np_applied_blocks().unwrap(), vec![(h, pool.hash())]);
     }
 
     #[tokio::test]
@@ -939,19 +1035,17 @@ mod tests {
         let h = tip + 1;
         let r = &mut sim.nodes[0].relay;
         let table = r.block_table(&job.parent_anchor, h).unwrap();
-        let chain = MemBlocks::default();
-        for x in GENESIS_BTC + 1..h {
-            chain.set(x, hash(x, 0), plain_coinbase(x));
-        }
-        chain.set(h, hash(h, 1), pool_coinbase(job, &table, tip));
+        let chain = main_node(h - 1);
+        let pool = on_main(h, pool_coinbase(job, &table, tip));
+        chain.set(pool.clone());
         st[0].sync(r, &chain).await.unwrap();
 
         // Restart: the view comes back from the store; the block left the chain meanwhile.
         let db = r.db().clone();
         let view = SettledView::load(&db).unwrap();
-        assert_eq!(view.blocks(), vec![(h, hash(h, 1))]);
+        assert_eq!(view.blocks(), vec![(h, pool.hash())]);
         let mut again = Settlement::new(db.clone(), view.clone(), GENESIS_BTC);
-        chain.set(h, hash(h, 2), plain_coinbase(h));
+        chain.set(on_main(h, plain_coinbase(h, 2)));
         again.sync(r, &chain).await.unwrap();
         assert_eq!(db.np_applied_blocks().unwrap(), vec![]);
         assert_eq!(view.blocks(), vec![]);
@@ -982,7 +1076,7 @@ mod tests {
                     queue_since: None,
                 },
             );
-            let r = Relay::open(p, db.clone(), Box::new(view.clone())).unwrap();
+            let r = Relay::open(p, db.clone(), fed_archive(START_TIP)).unwrap();
             made.borrow_mut()
                 .push(Settlement::new(db, view, GENESIS_BTC));
             r
@@ -1034,10 +1128,7 @@ mod tests {
         let below_cut = r.block_table(&job.parent_anchor, h - 1).unwrap();
         assert_eq!(below_cut[&miner].owed, start, "not before the cut");
 
-        let chain = MemBlocks::default();
-        for x in GENESIS_BTC + 1..h {
-            chain.set(x, hash(x, 0), plain_coinbase(x));
-        }
+        let chain = main_node(h - 1);
         let cb = pool_coinbase(job, &table, h - 1);
         let paid: u64 = cb
             .output
@@ -1050,10 +1141,11 @@ mod tests {
             owed / FACE_PER_SAT,
             "paid its whole sats, nothing more"
         );
-        chain.set(h, hash(h, 1), cb);
+        let block = on_main(h, cb.clone());
+        chain.set(block.clone());
         st.sync(r, &chain).await.unwrap();
         assert_eq!(st.stats().matched, 1);
-        let retired = r.db().np_block_retirements(&hash(h, 1)).unwrap().unwrap();
+        let retired = r.db().np_block_retirements(&block.hash()).unwrap().unwrap();
         assert!(retired.contains(&(miner.clone(), paid as i128 * FACE_PER_SAT)));
 
         // The balances fall by exactly what was paid, in the store and in every later table.
@@ -1066,16 +1158,12 @@ mod tests {
             "the stored ledger (credits and retirements; the genesis table is the snapshot's)"
         );
         // Every genesis balance was paid too, and the treasury took S/200 plus the change.
-        let treasury = cb_value(&chain, h, 0);
+        let treasury = cb.output[0].value.to_sat();
         let miners: u64 = retired.iter().map(|x| (x.1 / FACE_PER_SAT) as u64).sum();
         assert_eq!(
             treasury + miners,
             ghost_common::canonical_payout::subsidy(h),
             "treasury plus miners is the subsidy exactly"
         );
-    }
-
-    fn cb_value(chain: &MemBlocks, h: u32, i: usize) -> u64 {
-        chain.lock()[&h].1.output[i].value.to_sat()
     }
 }

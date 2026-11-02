@@ -1,0 +1,9 @@
+{
+  "placeholder": true,
+  "note": "PLACEHOLDER: the open-listing generator (W2.10) that writes this file is not built yet, and no node pool node is listed.",
+  "generated_at": null,
+  "format": {
+    "nodes": "array of { name, host, sv1_port, sv2_port, relay_port, region }; endpoints.html renders it once placeholder is false"
+  },
+  "nodes": []
+}

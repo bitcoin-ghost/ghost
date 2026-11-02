@@ -32,7 +32,7 @@ use ghost_storage::Database;
 
 use crate::headers::HeaderOracle;
 use crate::net::{spawn, NetConfig, RelayHandle};
-use crate::relay::{JobAnchor, NoRetirements, Relay};
+use crate::relay::{JobAnchor, Relay};
 use crate::testkit::*;
 
 struct TestNode {
@@ -53,7 +53,7 @@ async fn node(i: u8, btc: &Btc, peers: Vec<std::net::SocketAddr>) -> TestNode {
     let db = Arc::new(Database::in_memory().unwrap());
     let mut p = params();
     p.backstop_secs = 1;
-    let mut relay = Relay::open(p, db.clone(), Box::new(NoRetirements)).unwrap();
+    let mut relay = Relay::open(p, db.clone(), fed_archive(START_TIP)).unwrap();
     relay.set_btc_tip(btc.tip);
     let job = Arc::new(Mutex::new(relay.job_anchor()));
     let sink = job.clone();
