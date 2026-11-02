@@ -70,6 +70,13 @@
 //! listing reads the advert, probes those ports with `ghost-audit probe`, and lists the node only
 //! on a pass; the advert itself is a claim, worth nothing until the probe measures it.
 //!
+//! **Forward compatibility.** A frame of a type this build does not know is skipped, unread, with
+//! no penalty, as long as its length is within [`MAX_FRAME_PAYLOAD`], the largest cap of any known
+//! type. So a later build can add message types without a version bump, and an older node simply
+//! never answers them. A known type that breaks its own caps or does not decode is still
+//! malformed and scored. `PROTOCOL_VERSION` changes only for a change an older node would
+//! misread: a new meaning for an existing type or field. See [`Message::read_header`].
+//!
 //! A [`NetShare`] is `header 80 || coinbase (u32 len) || merkle branch (u8 count, 32 each) ||
 //! node_id 32 || tier u8 || slot_class u16 || payee_script (u8 len) || parent_anchor 32 ||
 //! batch_root 32`: the share's header, its non-witness coinbase, the branch from the coinbase
@@ -189,7 +196,7 @@ pub enum MsgType {
 
 impl MsgType {
     /// The type for a code, if known.
-    pub fn from_code(c: u8) -> Option<MsgType> {
+    pub const fn from_code(c: u8) -> Option<MsgType> {
         use MsgType::*;
         Some(match c {
             0 => Hello,
@@ -217,7 +224,7 @@ impl MsgType {
     }
 
     /// The largest payload a message of this type may carry.
-    pub fn max_payload(self) -> usize {
+    pub const fn max_payload(self) -> usize {
         use MsgType::*;
         match self {
             Hello => 4 + 2 + 32 + 8 + 2 + 32 + 32 + 1 + MAX_USER_AGENT,
@@ -241,6 +248,39 @@ impl MsgType {
             Advert => 2 + 2 + 1 + MAX_AUTHORITY_KEY_LEN,
         }
     }
+}
+
+/// The largest payload of any known message type. A frame of an unknown type up to this length
+/// is skipped without penalty (forward compatibility); a longer one is malformed.
+pub const MAX_FRAME_PAYLOAD: usize = {
+    let mut max = 0;
+    let mut c = 0u8;
+    loop {
+        if let Some(t) = MsgType::from_code(c) {
+            if t.max_payload() > max {
+                max = t.max_payload();
+            }
+        }
+        if c == u8::MAX {
+            break;
+        }
+        c += 1;
+    }
+    max
+};
+
+/// A frame header as read off the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameHead {
+    /// A type this build knows, with its payload length (within the type's cap).
+    Known(MsgType, usize),
+    /// A type this build does not know: its payload is skipped, unread, without penalty.
+    Unknown {
+        /// The type code.
+        code: u8,
+        /// Payload length (at most [`MAX_FRAME_PAYLOAD`]).
+        len: usize,
+    },
 }
 
 /// Why bytes did not decode. Every variant is the sender's fault.
@@ -625,18 +665,37 @@ impl Message {
         }
     }
 
-    /// Read a frame header: the type and payload length, refusing an unknown type or a length
-    /// over the type's cap before any payload is read.
-    pub fn decode_header(h: &[u8; FRAME_HEADER_LEN]) -> Result<(MsgType, usize), WireError> {
+    /// Read a frame header off a stream, before any payload. A known type over its cap is
+    /// refused. An unknown type is [`FrameHead::Unknown`], for the reader to skip without penalty
+    /// (a newer peer's message), unless its length is over [`MAX_FRAME_PAYLOAD`].
+    pub fn read_header(h: &[u8; FRAME_HEADER_LEN]) -> Result<FrameHead, WireError> {
         let len = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as usize;
-        let t = MsgType::from_code(h[4]).ok_or(WireError::UnknownType(h[4]))?;
+        let Some(t) = MsgType::from_code(h[4]) else {
+            if len > MAX_FRAME_PAYLOAD {
+                return Err(WireError::TooLarge {
+                    len,
+                    max: MAX_FRAME_PAYLOAD,
+                });
+            }
+            return Ok(FrameHead::Unknown { code: h[4], len });
+        };
         if len > t.max_payload() {
             return Err(WireError::TooLarge {
                 len,
                 max: t.max_payload(),
             });
         }
-        Ok((t, len))
+        Ok(FrameHead::Known(t, len))
+    }
+
+    /// Read a frame header that must be of a known type: the type and payload length, refusing
+    /// an unknown type or a length over the type's cap. For decoding a whole frame as a
+    /// [`Message`]; a stream reader uses [`Message::read_header`] and skips unknown types.
+    pub fn decode_header(h: &[u8; FRAME_HEADER_LEN]) -> Result<(MsgType, usize), WireError> {
+        match Self::read_header(h)? {
+            FrameHead::Known(t, len) => Ok((t, len)),
+            FrameHead::Unknown { code, .. } => Err(WireError::UnknownType(code)),
+        }
     }
 
     /// Decode a payload of type `t`.
@@ -1120,6 +1179,24 @@ mod tests {
             Err(WireError::TooLarge { .. })
         ));
         assert!(Message::decode_header(&[0xFF, 0xFF, 0xFF, 0xFF, 6]).is_err());
+        // A stream reader is told an unknown type's length, to skip it, up to the frame cap.
+        let at_cap = (MAX_FRAME_PAYLOAD as u32).to_le_bytes();
+        assert_eq!(
+            Message::read_header(&[at_cap[0], at_cap[1], at_cap[2], at_cap[3], 200]),
+            Ok(FrameHead::Unknown {
+                code: 200,
+                len: MAX_FRAME_PAYLOAD
+            })
+        );
+        let over = (MAX_FRAME_PAYLOAD as u32 + 1).to_le_bytes();
+        assert!(matches!(
+            Message::read_header(&[over[0], over[1], over[2], over[3], 200]),
+            Err(WireError::TooLarge { .. })
+        ));
+        // The cap is the largest known type's, so no known message is ever longer.
+        assert!((0..=u8::MAX)
+            .filter_map(MsgType::from_code)
+            .all(|t| t.max_payload() <= MAX_FRAME_PAYLOAD));
         // A list count above its cap is refused even when the frame is within the type's cap.
         let mut p = vec![0u8; 32];
         p.extend_from_slice(&((MAX_BATCH_SHARES + 1) as u32).to_le_bytes());

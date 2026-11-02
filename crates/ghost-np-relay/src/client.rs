@@ -39,7 +39,7 @@ use ghost_common::anchor_chain::AnchorHash;
 use ghost_common::node_pool_u256::U256;
 
 use crate::wire::{
-    Hello, JobStamps, Message, NodeAdvert, NotFoundKind, WireError, FRAME_HEADER_LEN,
+    FrameHead, Hello, JobStamps, Message, NodeAdvert, NotFoundKind, WireError, FRAME_HEADER_LEN,
     PROTOCOL_VERSION,
 };
 
@@ -90,17 +90,33 @@ pub struct Session {
     pub hello: Hello,
 }
 
+/// Read the next frame of a known type, skipping any of a type this build does not know (a
+/// newer node's), as the relay itself does.
 async fn read_frame(s: &mut TcpStream) -> Result<Message, ClientError> {
-    let mut h = [0u8; FRAME_HEADER_LEN];
-    s.read_exact(&mut h)
-        .await
-        .map_err(|e| ClientError::Io(e.to_string()))?;
-    let (t, len) = Message::decode_header(&h)?;
-    let mut p = vec![0u8; len];
-    s.read_exact(&mut p)
-        .await
-        .map_err(|e| ClientError::Io(e.to_string()))?;
-    Ok(Message::decode_payload(t, &p)?)
+    loop {
+        let mut h = [0u8; FRAME_HEADER_LEN];
+        s.read_exact(&mut h)
+            .await
+            .map_err(|e| ClientError::Io(e.to_string()))?;
+        match Message::read_header(&h)? {
+            FrameHead::Known(t, len) => {
+                let mut p = vec![0u8; len];
+                s.read_exact(&mut p)
+                    .await
+                    .map_err(|e| ClientError::Io(e.to_string()))?;
+                return Ok(Message::decode_payload(t, &p)?);
+            }
+            FrameHead::Unknown { len, .. } => {
+                let skipped =
+                    tokio::io::copy(&mut (&mut *s).take(len as u64), &mut tokio::io::sink())
+                        .await
+                        .map_err(|e| ClientError::Io(e.to_string()))?;
+                if skipped != len as u64 {
+                    return Err(ClientError::Io("connection closed mid-frame".into()));
+                }
+            }
+        }
+    }
 }
 
 impl Session {

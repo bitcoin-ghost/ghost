@@ -57,8 +57,8 @@ use crate::peers::{penalty, AddrBook, AddrSource, PeerState};
 use crate::relay::{JobAnchor, Out, PeerId, Relay, RelayStatus};
 use crate::settlement::{BlockSource, Settlement, SettlementStatus};
 use crate::wire::{
-    Hello, JobStamps, Message, NetShare, NodeAdvert, NotFoundKind, WireError, FRAME_HEADER_LEN,
-    MAX_ADDRS, MAX_STAMPS, PROTOCOL_VERSION,
+    FrameHead, Hello, JobStamps, Message, NetShare, NodeAdvert, NotFoundKind, WireError,
+    FRAME_HEADER_LEN, MAX_ADDRS, MAX_STAMPS, PROTOCOL_VERSION,
 };
 
 /// Transport settings.
@@ -727,19 +727,36 @@ enum ReadErr {
     Wire(WireError),
 }
 
+/// Read the next frame of a known type. A frame of a type this build does not know (a newer
+/// peer's) is skipped unread, logged at debug and never scored; see [`Message::read_header`].
 async fn read_frame(r: &mut OwnedReadHalf) -> Result<Message, ReadErr> {
-    let mut h = [0u8; FRAME_HEADER_LEN];
-    if let Err(e) = r.read_exact(&mut h).await {
-        return Err(if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            ReadErr::Eof
-        } else {
-            ReadErr::Io
-        });
+    loop {
+        let mut h = [0u8; FRAME_HEADER_LEN];
+        if let Err(e) = r.read_exact(&mut h).await {
+            return Err(if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                ReadErr::Eof
+            } else {
+                ReadErr::Io
+            });
+        }
+        match Message::read_header(&h).map_err(ReadErr::Wire)? {
+            FrameHead::Known(t, len) => {
+                let mut p = vec![0u8; len];
+                r.read_exact(&mut p).await.map_err(|_| ReadErr::Io)?;
+                return Message::decode_payload(t, &p).map_err(ReadErr::Wire);
+            }
+            FrameHead::Unknown { code, len } => {
+                let skipped =
+                    tokio::io::copy(&mut (&mut *r).take(len as u64), &mut tokio::io::sink())
+                        .await
+                        .map_err(|_| ReadErr::Io)?;
+                if skipped != len as u64 {
+                    return Err(ReadErr::Eof);
+                }
+                debug!("NP_RELAY: skipped a frame of unknown type {code} ({len} bytes)");
+            }
+        }
     }
-    let (t, len) = Message::decode_header(&h).map_err(ReadErr::Wire)?;
-    let mut p = vec![0u8; len];
-    r.read_exact(&mut p).await.map_err(|_| ReadErr::Io)?;
-    Message::decode_payload(t, &p).map_err(ReadErr::Wire)
 }
 
 async fn conn_task(conn: u64, s: TcpStream, hello: Hello, ev: mpsc::Sender<Event>) {

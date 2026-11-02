@@ -163,8 +163,8 @@ async fn a_peer_sending_garbage_is_banned() {
     let mut buf = [0u8; 4096];
     let n = s.read(&mut buf).await.unwrap();
     assert!(n > 5 && buf[4] == 0, "the node speaks first with Hello");
-    // A frame of an unknown type: refused from its header.
-    s.write_all(&[0, 0, 0, 0, 99]).await.unwrap();
+    // A known type over its payload cap (a 33-byte `GetBatch`): refused from its header.
+    s.write_all(&[33, 0, 0, 0, 4]).await.unwrap();
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match s.read(&mut buf).await {
@@ -180,6 +180,76 @@ async fn a_peer_sending_garbage_is_banned() {
     let mut s = TcpStream::connect(addr).await.unwrap();
     let r = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await;
     assert!(matches!(r, Ok(Ok(0)) | Ok(Err(_))), "{r:?}");
+}
+
+/// Read one frame of a known type off a raw stream.
+async fn raw_frame(s: &mut TcpStream) -> crate::wire::Message {
+    use crate::wire::{FrameHead, Message, FRAME_HEADER_LEN};
+    let mut h = [0u8; FRAME_HEADER_LEN];
+    s.read_exact(&mut h).await.unwrap();
+    let FrameHead::Known(t, len) = Message::read_header(&h).unwrap() else {
+        panic!("the node sent a type it does not know")
+    };
+    let mut p = vec![0u8; len];
+    s.read_exact(&mut p).await.unwrap();
+    Message::decode_payload(t, &p).unwrap()
+}
+
+/// Forward compatibility: a newer peer's message types are skipped without penalty, so the
+/// connection carries on, and only a malformed frame of a known type is scored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_message_types_are_ignored_without_penalty() {
+    use crate::wire::{Hello, Message, PROTOCOL_VERSION};
+    let btc = Btc::with_time(START_TIP, wall());
+    let a = node(1, &btc, vec![]).await;
+    let addr = a.handle.listen_addr.unwrap();
+
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let Message::Hello(theirs) = raw_frame(&mut s).await else {
+        panic!("the node speaks first with Hello")
+    };
+    let ours = Hello {
+        version: PROTOCOL_VERSION,
+        genesis: genesis_hash(),
+        nonce: 0x5EED,
+        listen_port: 0,
+        tip: theirs.tip,
+        tip_work: theirs.tip_work,
+        user_agent: "newer-build/test".into(),
+    };
+    s.write_all(&Message::Hello(ours).encode()).await.unwrap();
+    // Types this build does not know, empty and with a payload, before and after the handshake
+    // settles: each is skipped.
+    for (code, payload) in [
+        (200u8, vec![]),
+        (77, vec![7u8; 1_000]),
+        (255, vec![1, 2, 3]),
+    ] {
+        let mut f = (payload.len() as u32).to_le_bytes().to_vec();
+        f.push(code);
+        f.extend_from_slice(&payload);
+        s.write_all(&f).await.unwrap();
+    }
+    // The connection still works: a known request after them is answered.
+    s.write_all(&Message::GetAddr.encode()).await.unwrap();
+    let answered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Addr(_) = raw_frame(&mut s).await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        answered.is_ok(),
+        "a request after unknown frames is answered"
+    );
+    wait_for("the peer counted", || a.status().peers == 1).await;
+
+    // Not banned: a fresh connection gets a Hello.
+    let mut s2 = TcpStream::connect(addr).await.unwrap();
+    let hello = tokio::time::timeout(Duration::from_secs(5), raw_frame(&mut s2)).await;
+    assert!(matches!(hello, Ok(Message::Hello(_))), "{hello:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
