@@ -2402,14 +2402,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-glyph"
-version = "1.11.46"
-dependencies = [
- "sha2 0.10.9",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "ghost-miner-proxy"
 version = "1.11.46"
 dependencies = [
@@ -2447,7 +2439,6 @@ dependencies = [
  "ghost-build-info",
  "ghost-common",
  "ghost-consensus",
- "ghost-glyph",
  "ghost-mpc",
  "ghost-policy",
  "ghost-reaper",

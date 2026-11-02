@@ -41,8 +41,6 @@ members = [
     "crates/ghost-mpc",
     # Cross-process MPC ceremony contribution harness (test-only, feature-gated)
     "crates/mpc-xproc-harness",
-    # Visual Identity
-    "crates/ghost-glyph",
     # GSP
     # Node Binaries
     "bins/ghost-pool",
@@ -97,7 +95,6 @@ ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # ZK-BFT Infrastructure
 ghost-zkp = { path = "crates/ghost-zkp" }
 ghost-mpc = { path = "crates/ghost-mpc" }
-ghost-glyph = { path = "crates/ghost-glyph" }
 # GSP crates
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }

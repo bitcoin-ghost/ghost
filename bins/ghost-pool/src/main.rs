@@ -4958,51 +4958,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Register GhostGlyph handler for visual identity P2P messages
-    let glyph_handler = Arc::new(ghost_pool::glyph_handler::GlyphRegistrationHandler::new(
-        Arc::clone(&db),
-    ));
-    mesh.register_handler(
-        Arc::clone(&glyph_handler) as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>
-    );
-
-    // Create broadcast relay for GhostGlyph messages (Noise-encrypted)
-    let (glyph_tx, mut glyph_rx) =
-        tokio::sync::mpsc::channel::<(ghost_consensus::message::MessageType, Vec<u8>)>(64);
-    let mesh_for_glyph_relay = Arc::clone(&mesh);
-    tokio::spawn(async move {
-        while let Some((msg_type, payload)) = glyph_rx.recv().await {
-            match mesh_for_glyph_relay.create_envelope_raw(msg_type, payload) {
-                Ok(envelope) => {
-                    if let Err(e) = mesh_for_glyph_relay.broadcast(envelope).await {
-                        tracing::warn!(error = %e, "Glyph Noise broadcast failed");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Glyph envelope creation failed");
-                }
-            }
-        }
-    });
-    let glyph_broadcast: ghost_consensus::vote_handler::BroadcastFn =
-        Arc::new(move |msg_type, payload| {
-            glyph_tx.try_send((msg_type, payload)).map_err(|e| {
-                ghost_common::error::GhostError::Internal(format!(
-                    "Glyph broadcast channel error: {}",
-                    e
-                ))
-            })
-        });
-    glyph_handler.set_broadcast_fn(glyph_broadcast);
-
-    // Wire glyph relay callbacks for ghost-pay → ghost-mining localhost relay
-    let gh_for_claim = Arc::clone(&glyph_handler);
-    let glyph_claim_relay_fn: ghost_verification::GlyphClaimRelayFn =
-        Arc::new(move |data: Vec<u8>| gh_for_claim.relay_claim(data));
-    let gh_for_registered = Arc::clone(&glyph_handler);
-    let glyph_registered_relay_fn: ghost_verification::GlyphRegisteredRelayFn =
-        Arc::new(move |data: Vec<u8>| gh_for_registered.relay_registered(data));
-
     // ZK consensus handlers (optional feature)
     // DEFERRED INITIALIZATION: ZK parameter generation is memory-intensive and can take minutes.
     // We spawn it in a background task so the node can start serving immediately.
@@ -8028,11 +7983,6 @@ async fn main() -> Result<()> {
         verification_state = verification_state.with_l2_tree_state(l2_tree_state_fn);
     }
 
-    // Wire GhostGlyph relay callbacks (always enabled — no feature gate)
-    verification_state = verification_state
-        .with_glyph_claim_relay(glyph_claim_relay_fn)
-        .with_glyph_registered_relay(glyph_registered_relay_fn);
-
     // Configure internal API authentication (AUTH4-1 security fix)
     let is_mainnet_auth = config.bitcoin.network == ghost_common::config::BitcoinNetwork::Mainnet;
     if let Some(ref secret_hex) = config.network.internal_api_secret {
@@ -9448,40 +9398,6 @@ async fn main() -> Result<()> {
             }
         });
         info!("Elder revocation checker started (daily, first check in 10 min)");
-    }
-
-    // Stale glyph claim cleanup — runs hourly, deletes unfunded claims past their expires_at
-    {
-        let db_for_glyph_cleanup = Arc::clone(&db);
-        let mut glyph_cleanup_shutdown = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            // Skip immediate first tick
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        match db_for_glyph_cleanup.cleanup_expired_glyph_claims(now) {
-                            Ok(0) => {}
-                            Ok(n) => {
-                                info!(deleted = n, "Cleaned up expired glyph claims");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to cleanup expired glyph claims");
-                            }
-                        }
-                    }
-                    _ = glyph_cleanup_shutdown.recv() => {
-                        break;
-                    }
-                }
-            }
-        });
-        info!("Glyph claim cleanup task started (hourly)");
     }
 
     // M-MINE-2: Start rate limit cleanup task for RoundManager

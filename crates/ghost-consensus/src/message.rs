@@ -94,8 +94,6 @@ pub mod topics {
     pub const MESH_ENDPOINT_ADVERT: &[u8] = b"mnladv";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
-    /// GhostGlyph visual identity
-    pub const GLYPH: &[u8] = b"glyph";
     /// Share shard: a node's signed per-epoch summary (delta + running total per address).
     ///
     /// `shd` prefix, not `sh`: ZMQ subscriptions match by PREFIX, so a topic that extends an
@@ -548,10 +546,6 @@ pub enum MessageType {
     L2TreeSync,
     /// L2: Shield commitment broadcast (node → all)
     L2ShieldBroadcast,
-    /// GhostGlyph: Claim broadcast (user submits glyph design)
-    GhostGlyphClaim,
-    /// GhostGlyph: Registration confirmed (lock funded)
-    GhostGlyphRegistered,
     /// Payout-ledger checkpoint proposal (proposer → all): the BFT-finalised
     /// snapshot the coinbase is a pure function of.
     PayoutLedgerCheckpoint,
@@ -695,7 +689,6 @@ impl MessageType {
             Self::ShardSampleResponse => topics::SHARD_SAMPLE_RESPONSE,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
-            Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
         }
     }
 
@@ -741,7 +734,6 @@ impl MessageType {
             Self::ShardSampleResponse => "shdsrsp",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
-            Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
         }
     }
 }
@@ -2732,38 +2724,6 @@ pub struct L2NoteGapResponse {
 }
 
 // =============================================================================
-// GhostGlyph Messages
-// =============================================================================
-
-/// Broadcast when a user submits a glyph claim (design chosen, pending funding)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GhostGlyphClaimMessage {
-    /// bech32m ghost1... address
-    pub ghost_id: String,
-    /// 256 bytes, each 0..25
-    pub pixels: Vec<u8>,
-    /// SHA256("GhostGlyphBitmap/v1" || pixels)
-    pub bitmap_hash: Vec<u8>,
-    /// SHA256("GhostGlyph/v1" || pixels || ghost_id_bytes)
-    pub commitment: Vec<u8>,
-    /// Claim timestamp
-    pub timestamp: u64,
-}
-
-/// Broadcast when a glyph claim is confirmed (Ghost Lock funded via Wraith)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GhostGlyphRegisteredMessage {
-    /// bech32m ghost1... address
-    pub ghost_id: String,
-    /// SHA256("GhostGlyphBitmap/v1" || pixels)
-    pub bitmap_hash: Vec<u8>,
-    /// Wraith deposit txid that funded the lock
-    pub funding_txid: String,
-    /// Unix timestamp of registration
-    pub registered_at: u64,
-}
-
-// =============================================================================
 // SHARE SHARD Messages (docs/SHARE_SHARD.md — §4.4 merge rule, §6 verification,
 // §12.4 publishable rejection, §12.6 ship-the-whole-table)
 // =============================================================================
@@ -3940,7 +3900,7 @@ mod tests {
         // ZMQ subscriptions match by PREFIX: a topic that extends another (or is extended by
         // one) delivers cross-traffic to the wrong subscriber. Check the new topics against
         // every registered topic, both directions.
-        let all: [&[u8]; 35] = [
+        let all: &[&[u8]] = &[
             topics::SHARE,
             topics::BLOCK,
             topics::PAYOUT_PROPOSAL,
@@ -3970,7 +3930,6 @@ mod tests {
             topics::MESH_NODE_LIST_VOTE,
             topics::MESH_NODE_LIST_SYNC,
             topics::L2_SHIELD,
-            topics::GLYPH,
             topics::SHARD_EPOCH_SUMMARY,
             topics::SHARD_TABLE_SYNC,
             topics::SHARD_EVIDENCE,
@@ -3984,7 +3943,7 @@ mod tests {
             topics::SHARD_SAMPLE_REQUEST,
             topics::SHARD_SAMPLE_RESPONSE,
         ] {
-            for existing in all {
+            for &existing in all {
                 if existing == new {
                     continue;
                 }
@@ -4176,7 +4135,6 @@ mod tests {
             ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
             ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
             ("L2_SHIELD", topics::L2_SHIELD),
-            ("GLYPH", topics::GLYPH),
             ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
             ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
             ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),
@@ -4211,7 +4169,7 @@ mod tests {
         }
     }
 
-    /// Two message types sharing one topic is legitimate (the glyph pair does it), but two
+    /// Two message types sharing one topic is legitimate (`ShareProof` and `ShareConvergence` do it), but two
     /// DIFFERENT topics with identical bytes would make `validate_topic` ambiguous.
     #[test]
     fn no_two_distinct_topics_share_bytes() {
@@ -4249,7 +4207,6 @@ mod tests {
             ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
             ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
             ("L2_SHIELD", topics::L2_SHIELD),
-            ("GLYPH", topics::GLYPH),
             ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
             ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
             ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),

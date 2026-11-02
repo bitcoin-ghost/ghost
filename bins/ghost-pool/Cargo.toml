@@ -54,7 +54,6 @@ ghost-consensus = { workspace = true }
 ghost-accounting = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-verification = { workspace = true }
-ghost-glyph = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

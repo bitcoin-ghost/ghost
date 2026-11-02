@@ -68,8 +68,4 @@ fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_slice::<L2CheckpointVoteMessage>(data);
     let _ = serde_json::from_slice::<L2TreeSyncRequest>(data);
     let _ = serde_json::from_slice::<L2TreeSyncResponse>(data);
-
-    // GhostGlyph
-    let _ = serde_json::from_slice::<GhostGlyphClaimMessage>(data);
-    let _ = serde_json::from_slice::<GhostGlyphRegisteredMessage>(data);
 });
