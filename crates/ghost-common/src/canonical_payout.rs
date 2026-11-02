@@ -176,13 +176,12 @@ pub fn share_face(tier_log2: u32, nbits: u32, h: u32) -> Result<u128, PayoutErro
 /// A selected payee: script and owed face units.
 pub type Pick<'a> = (&'a Script, i128);
 
-/// `(oldest, largest)`: `largest[0]` is top, the remainder absorber.
-pub fn select(table: &Table, slots: usize) -> Result<(Vec<Pick<'_>>, Vec<Pick<'_>>), PayoutError> {
-    if slots < 2 {
-        return Err(PayoutError::InvalidSlots(slots));
-    }
-    let (o, l) = split_slots(slots);
-    let mut el: Vec<(&Script, i128, u32)> = Vec::new();
+/// An eligible row: script, owed, `queue_since`.
+type Eligible<'a> = (&'a Script, i128, u32);
+
+/// Every balance at or above the payout floor, in script order.
+fn eligible(table: &Table) -> Result<Vec<Eligible<'_>>, PayoutError> {
+    let mut el = Vec::new();
     for (a, b) in table {
         if b.owed >= PAYOUT_FLOOR_FACE {
             let q = b
@@ -191,30 +190,122 @@ pub fn select(table: &Table, slots: usize) -> Result<(Vec<Pick<'_>>, Vec<Pick<'_
             el.push((a, b.owed, q));
         }
     }
+    Ok(el)
+}
+
+/// The largest order: owed descending, then script ascending. Its first row is top.
+fn by_size(x: &Eligible<'_>, y: &Eligible<'_>) -> std::cmp::Ordering {
+    y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0))
+}
+
+/// The oldest order: `queue_since` ascending, then owed descending, then script ascending.
+fn by_age(x: &Eligible<'_>, y: &Eligible<'_>) -> std::cmp::Ordering {
+    x.2.cmp(&y.2)
+        .then_with(|| y.1.cmp(&x.1))
+        .then_with(|| x.0.cmp(y.0))
+}
+
+/// `(oldest, largest)`: `largest[0]` is top, the remainder absorber.
+pub fn select(table: &Table, slots: usize) -> Result<(Vec<Pick<'_>>, Vec<Pick<'_>>), PayoutError> {
+    if slots < 2 {
+        return Err(PayoutError::InvalidSlots(slots));
+    }
+    let (o, l) = split_slots(slots);
+    let el = eligible(table)?;
     if el.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let mut by_size = el.clone();
-    by_size.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
-    let top = by_size[0];
-    let mut by_age: Vec<_> = el.into_iter().filter(|x| x.0 != top.0).collect();
-    by_age.sort_by(|x, y| {
-        x.2.cmp(&y.2)
-            .then_with(|| y.1.cmp(&x.1))
-            .then_with(|| x.0.cmp(y.0))
-    });
-    by_age.truncate(o);
-    let oldest: Vec<Pick<'_>> = by_age.iter().map(|x| (x.0, x.1)).collect();
+    let mut size_order = el.clone();
+    size_order.sort_by(by_size);
+    let top = size_order[0];
+    let mut age_order: Vec<_> = el.into_iter().filter(|x| x.0 != top.0).collect();
+    age_order.sort_by(by_age);
+    age_order.truncate(o);
+    let oldest: Vec<Pick<'_>> = age_order.iter().map(|x| (x.0, x.1)).collect();
     let in_oldest: BTreeSet<&Script> = oldest.iter().map(|p| p.0).collect();
     let mut largest: Vec<Pick<'_>> = vec![(top.0, top.1)];
     largest.extend(
-        by_size[1..]
+        size_order[1..]
             .iter()
             .filter(|x| !in_oldest.contains(x.0))
             .take(l - 1)
             .map(|x| (x.0, x.1)),
     );
     Ok((oldest, largest))
+}
+
+/// Where one payee stands in the rule's two queues on a table (for the ledger API).
+///
+/// Ranks are 1-based and use exactly the orders [`select`] uses, so a payee whose `age_rank` is
+/// at most `O = ceil(N/2)` is in a block's oldest list at `N` miner outputs, and `size_rank` 1 is
+/// top. Whether a block actually pays it, and how much, is [`build_outputs`]' answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuePosition {
+    /// Owed on this table, face units.
+    pub owed: i128,
+    /// At or above the 1,000-sat payout floor.
+    pub eligible: bool,
+    /// Eligible balances on the table, this one included if eligible.
+    pub eligible_count: usize,
+    /// The largest eligible balance: paid last in any block, with whatever is left.
+    pub is_top: bool,
+    /// Rank in the oldest queue (eligible balances except top, by `queue_since`). `None` for top
+    /// and for a balance below the floor.
+    pub age_rank: Option<usize>,
+    /// Rank by size among eligible balances (1 = top). `None` below the floor.
+    pub size_rank: Option<usize>,
+}
+
+/// Balances at or above the payout floor on `table`.
+pub fn eligible_count(table: &Table) -> Result<usize, PayoutError> {
+    eligible(table).map(|e| e.len())
+}
+
+/// `script`'s place in the payout queues of `table`, or `None` if it has no row.
+pub fn queue_position(table: &Table, script: &[u8]) -> Result<Option<QueuePosition>, PayoutError> {
+    let Some(b) = table.get(script) else {
+        return Ok(None);
+    };
+    let el = eligible(table)?;
+    let eligible_count = el.len();
+    let mut pos = QueuePosition {
+        owed: b.owed,
+        eligible: b.owed >= PAYOUT_FLOOR_FACE,
+        eligible_count,
+        is_top: false,
+        age_rank: None,
+        size_rank: None,
+    };
+    if !pos.eligible {
+        return Ok(Some(pos));
+    }
+    let mut size_order = el.clone();
+    size_order.sort_by(by_size);
+    pos.size_rank = size_order
+        .iter()
+        .position(|x| x.0.as_slice() == script)
+        .map(|i| i + 1);
+    pos.is_top = pos.size_rank == Some(1);
+    if !pos.is_top {
+        let top = size_order[0].0;
+        let mut age_order: Vec<_> = el.into_iter().filter(|x| x.0 != top).collect();
+        age_order.sort_by(by_age);
+        pos.age_rank = age_order
+            .iter()
+            .position(|x| x.0.as_slice() == script)
+            .map(|i| i + 1);
+    }
+    Ok(Some(pos))
+}
+
+/// What block `h` built on `table` with `slots` miner outputs pays `script`, in sats (0 if it is
+/// not paid). [`build_outputs`]' own answer.
+pub fn paid_to(h: u32, table: &Table, slots: usize, script: &[u8]) -> Result<u64, PayoutError> {
+    Ok(build_outputs(h, table, slots)?
+        .outputs
+        .iter()
+        .find(|(a, _)| a.as_slice() == script)
+        .map_or(0, |(_, p)| *p))
 }
 
 /// What block `h` pays from `table` with `slots` miner outputs. Reads nothing but its arguments.
@@ -570,6 +661,53 @@ mod tests {
             t.insert(p2tr(&format!("{seed}/{i}")), row);
         }
         t
+    }
+
+    /// `queue_position` agrees with `select` and `build_outputs` on the same table: with
+    /// `2n` slots the oldest list is the whole age order, so its index is the age rank; top is
+    /// `largest[0]` and size rank 1; a payee is in the oldest list at `N` outputs exactly when
+    /// its age rank is at most `ceil(N/2)`; and `paid_to` is what the block's outputs pay it.
+    #[test]
+    fn queue_position_matches_select_and_build_outputs() {
+        for seed in [1u32, 7, 42] {
+            let t = gen(seed, 60);
+            let n = t.len();
+            let (oldest, largest) = select(&t, 2 * n).unwrap();
+            let el = t.values().filter(|b| b.owed >= FLOOR).count();
+            for (script, b) in &t {
+                let p = queue_position(&t, script).unwrap().unwrap();
+                assert_eq!(p.owed, b.owed);
+                assert_eq!(p.eligible_count, el);
+                assert_eq!(p.eligible, b.owed >= FLOOR);
+                if !p.eligible {
+                    assert_eq!((p.age_rank, p.size_rank, p.is_top), (None, None, false));
+                    continue;
+                }
+                if p.is_top {
+                    assert_eq!(largest[0].0, script);
+                    assert_eq!(p.size_rank, Some(1));
+                    assert_eq!(p.age_rank, None);
+                } else {
+                    let i = oldest.iter().position(|x| x.0 == script).unwrap();
+                    assert_eq!(p.age_rank, Some(i + 1));
+                }
+                for &class in &SLOT_CLASSES {
+                    let slots = class as usize;
+                    let (o, _) = split_slots(slots);
+                    let (old_n, _) = select(&t, slots).unwrap();
+                    let in_old = old_n.iter().any(|x| x.0 == script);
+                    assert_eq!(in_old, p.age_rank.is_some_and(|r| r <= o), "{seed} {class}");
+                    let out = build_outputs(H, &t, slots).unwrap();
+                    let want = out
+                        .outputs
+                        .iter()
+                        .find(|(a, _)| a == script)
+                        .map_or(0, |x| x.1);
+                    assert_eq!(paid_to(H, &t, slots, script).unwrap(), want);
+                }
+            }
+            assert_eq!(queue_position(&t, &p2tr("absent")).unwrap(), None);
+        }
     }
 
     /// The reference's `flat(n, sats)` generator.

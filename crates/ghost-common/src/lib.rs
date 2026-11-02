@@ -52,6 +52,9 @@ pub mod metrics;
 /// Node pool protocol constants (new names only; nothing live reads them).
 pub mod node_pool_constants;
 
+/// Where each network's node pool share chain starts (W2.8).
+pub mod node_pool_network;
+
 /// Node pool 256-bit arithmetic.
 pub mod node_pool_u256;
 pub mod rpc;
