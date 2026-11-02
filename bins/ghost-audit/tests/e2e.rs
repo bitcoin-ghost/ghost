@@ -22,8 +22,9 @@
 
 //! ghost-audit end to end, in process: real `ghost-np-relay` nodes over loopback TCP (the audited
 //! node's, which serves job stamps, and the auditor's own, which settles from a Bitcoin chain and
-//! answers its table requests), and a stratum server speaking SV1 that serves honest and hostile
-//! jobs built the way pool_sv2 builds them.
+//! answers its table requests), a stratum server speaking SV1 that serves honest and hostile
+//! jobs built the way pool_sv2 builds them, and an SV2 server (real Noise handshake, real SV2
+//! framing) whose jobs are built by the vendored channel and job-factory code pool_sv2 runs.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,12 +44,13 @@ use tokio::net::TcpListener;
 
 use ghost_audit::check::{FailReason, JobReport, Verdict};
 use ghost_audit::job::to_sv1_prev_hash;
-use ghost_audit::probe::{probe, ProbeConfig, ProbeVerdict};
+use ghost_audit::probe::{probe, ProbeConfig, ProbeVerdict, Sv2Endpoint};
 use ghost_audit::source::{
     start_share_chain_on, ChainConfig, ExportSource, GenesisSource, RelayChain,
 };
 use ghost_audit::sv1::Sv1Config;
-use ghost_audit::{audit_jobs, AuditTarget, RelayStamps};
+use ghost_audit::sv2::{Sv2Config, Sv2Device, Sv2Error, DEFAULT_HASH_RATE};
+use ghost_audit::{audit_jobs, audit_sv2_jobs, AuditTarget, RelayStamps, Sv2Target};
 use ghost_common::canonical_payout::{
     coinbase_outputs, table_root, Balance, CoinbaseOutput, Table,
 };
@@ -65,6 +67,25 @@ use ghost_np_relay::relay::{Genesis, JobAnchor, Relay, RelayParams};
 use ghost_np_relay::settlement::{BlockSource, MemBlocks, SettledView, Settlement};
 use ghost_np_relay::wire::NodeAdvert;
 use ghost_storage::Database;
+use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
+use stratum_apps::network_helpers::accept_noise_connection;
+use stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf;
+use stratum_apps::stratum_core::bitcoin::Target;
+use stratum_apps::stratum_core::channels_sv2::server::extended::ExtendedChannel;
+use stratum_apps::stratum_core::channels_sv2::server::jobs::job_store::DefaultJobStore;
+use stratum_apps::stratum_core::channels_sv2::server::standard::StandardChannel;
+use stratum_apps::stratum_core::channels_sv2::target::tier_target;
+use stratum_apps::stratum_core::codec_sv2::StandardSv2Frame;
+use stratum_apps::stratum_core::common_messages_sv2::SetupConnectionSuccess;
+use stratum_apps::stratum_core::mining_sv2::{
+    OpenExtendedMiningChannelSuccess, OpenStandardMiningChannelSuccess,
+    SetNewPrevHash as MiningPrevHash,
+};
+use stratum_apps::stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
+use stratum_apps::stratum_core::template_distribution_sv2::{
+    NewTemplate, SetNewPrevHash as TemplatePrevHash,
+};
+use stratum_apps::utils::protocol_message_type::{protocol_message_type, MessageType};
 
 const GENESIS: [u8; 32] = [0xEE; 32];
 const G: u32 = 1_000;
@@ -293,20 +314,27 @@ enum Hostile {
     WrongSlotClass,
 }
 
-/// `mining.notify` params for a job pool_sv2 would build on `stamp` for `payee`, then bent.
-fn notify(id: usize, prev: [u8; 32], stamp: JobAnchor, payee: &[u8], how: Hostile) -> Vec<Value> {
+/// The stamp push (`GHPP` slot and `GHNT` tag) and outputs (witness commitment last) of a job
+/// pool_sv2 would build on `stamp` for `payee` with `class` and `tier`, then bent.
+fn job_parts(
+    stamp: JobAnchor,
+    payee: &[u8],
+    how: Hostile,
+    class: u16,
+    tier: u8,
+    fees: u64,
+) -> (Vec<u8>, Vec<CoinbaseOutput>) {
     let table = genesis_table();
-    let class: u16 = 9;
     let mut tag = ShareTagPreimage {
         node_id: NODE_ID,
-        tier: 10,
+        tier,
         slot_class: class,
         payee_script: payee.to_vec(),
         parent_anchor: stamp.parent_anchor,
         batch_root: stamp.batch_root,
     };
     let outs = |t: &Table, c: u16| {
-        coinbase_outputs(H, t, c as usize, &p2tr("finder"), 25_000, &[7; 32])
+        coinbase_outputs(H, t, c as usize, &p2tr("finder"), fees, &[7; 32])
             .unwrap()
             .0
     };
@@ -334,11 +362,18 @@ fn notify(id: usize, prev: [u8; 32], stamp: JobAnchor, payee: &[u8], how: Hostil
         }
         Hostile::WrongSlotClass => o = outs(&table, 3),
     }
+    let mut push = encode_payout_tag(&tag.parent_anchor_tag());
+    push.extend(encode_node_tag(&tag.tag()));
+    (push, o)
+}
+
+/// `mining.notify` params for a job pool_sv2 would build on `stamp` for `payee`, then bent.
+fn notify(id: usize, prev: [u8; 32], stamp: JobAnchor, payee: &[u8], how: Hostile) -> Vec<Value> {
+    let (push, o) = job_parts(stamp, payee, how, 9, 10, 25_000);
     let mut sig = bitcoin::script::Builder::new()
         .push_int(H as i64)
         .into_bytes();
-    sig.extend(encode_payout_tag(&tag.parent_anchor_tag()));
-    sig.extend(encode_node_tag(&tag.tag()));
+    sig.extend(push);
     sig.extend([0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
     let sig_len = sig.len();
     let raw = bitcoin::consensus::serialize(&tx(sig, o));
@@ -556,12 +591,15 @@ async fn the_prober_verdict_has_its_shape() {
     let w = world().await;
     let me = p2tr("the prober");
     let cfg = |stratum: String| ProbeConfig {
-        stratum,
+        stratum: Some(stratum),
+        sv2: None,
         relay: w.node.listen_addr.unwrap(),
         genesis: GENESIS,
         address: "bcrt1p-the-prober".into(),
         payee: me.clone(),
         user_agent: "ghost-audit-probe/test".into(),
+        sv2_device: Sv2Device::default(),
+        sv2_hash_rate: DEFAULT_HASH_RATE,
         jobs: 2,
         wait: Duration::from_secs(20),
         timeout: Duration::from_secs(10),
@@ -584,16 +622,20 @@ async fn the_prober_verdict_has_its_shape() {
             "advert",
             "checked_at",
             "jobs",
+            "jobs_sv2",
             "listable",
             "node",
             "reasons",
             "schema",
             "stratum",
             "summary",
+            "sv2",
             "verdict"
         ]
     );
-    assert_eq!(v["schema"], "ghost-audit/probe/v1");
+    assert_eq!(v["schema"], "ghost-audit/probe/v2");
+    assert_eq!(v["sv2"], Value::Null);
+    assert_eq!(v["node"]["sv2"], Value::Null);
     assert_eq!(v["verdict"], "pass");
     assert_eq!(v["advert"]["reachable"], true);
     assert_eq!(v["advert"]["genesis_match"], true);
@@ -646,12 +688,19 @@ async fn the_prober_verdict_has_its_shape() {
     drop(closed);
     let mut gone = cfg(honest);
     gone.relay = dead;
-    gone.stratum = dead.to_string();
+    gone.stratum = Some(dead.to_string());
     gone.timeout = Duration::from_secs(2);
     let r = probe(&gone, &w.chain).await;
     assert_eq!(r.verdict, ProbeVerdict::Unmeasured, "{:?}", r.reasons);
     assert!(!r.listable);
     assert!(r.reasons.contains(&"relay_unreachable".to_string()));
+
+    // No stratum port at all: unmeasured.
+    let mut none = cfg(String::new());
+    none.stratum = None;
+    let r = probe(&none, &w.chain).await;
+    assert_eq!(r.verdict, ProbeVerdict::Unmeasured);
+    assert_eq!(r.reasons, ["no_stratum"]);
 }
 
 /// Wait for a relay's job stamp.
@@ -665,11 +714,12 @@ async fn stamp_of(stamp: &Arc<Mutex<Option<JobAnchor>>>) -> JobAnchor {
     panic!("no job stamp published");
 }
 
-/// Open listing end to end: two nodes found from relay gossip alone (the lister is told only
-/// the first), each read for its advert and probed on the advertised SV1 port over several
-/// rounds. The honest one is listed with its advertised endpoints; the one serving a coinbase
-/// with the wrong treasury is probed every round and never listed; a relay that advertises no
-/// stratum port is a candidate that is never listed.
+/// Open listing end to end: nodes found from relay gossip alone (the lister is told only the
+/// first), each read for its advert and probed on every advertised stratum port over several
+/// rounds. The honest node (SV1 and SV2) is listed with its advertised endpoints, and so is an
+/// SV2-only node, probed on SV2 alone; the one serving a coinbase with the wrong treasury is
+/// probed every round and never listed; a relay that advertises no stratum port is a candidate
+/// that is never listed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
     use ghost_audit::discover::{ask, Limits};
@@ -719,9 +769,41 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
     )
     .await;
 
-    // The honest node, which dials the other two, so its gossip names them.
+    // A node that serves SV2 only, honestly.
+    let only2_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let only2_sv2 = only2_l.local_addr().unwrap().port();
+    let only2_stamp = Arc::new(Mutex::new(None));
+    let only2 = relay_with(
+        &blocks,
+        true,
+        Some(NODE_ID),
+        only2_stamp.clone(),
+        Some(NodeAdvert {
+            sv1_port: 0,
+            sv2_port: only2_sv2,
+            sv2_authority_key: SV2_PUB.into(),
+        }),
+        vec![],
+    )
+    .await;
+    let os = stamp_of(&only2_stamp).await;
+    sv2_pool_on(
+        only2_l,
+        Sv2Pool {
+            prev,
+            stamp: os,
+            bend: HONEST,
+            templates: 2,
+        },
+        me.clone(),
+    );
+
+    // The honest node, serving SV1 and SV2, which dials the other three, so its gossip names
+    // them.
     let honest_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let honest_sv1 = honest_l.local_addr().unwrap().port();
+    let honest_l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let honest_sv2 = honest_l2.local_addr().unwrap().port();
     let honest_stamp = Arc::new(Mutex::new(None));
     let honest = relay_with(
         &blocks,
@@ -730,10 +812,14 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
         honest_stamp.clone(),
         Some(NodeAdvert {
             sv1_port: honest_sv1,
-            sv2_port: 34255,
-            sv2_authority_key: "the-authority-key".into(),
+            sv2_port: honest_sv2,
+            sv2_authority_key: SV2_PUB.into(),
         }),
-        vec![cheat.listen_addr.unwrap(), bare.listen_addr.unwrap()],
+        vec![
+            cheat.listen_addr.unwrap(),
+            bare.listen_addr.unwrap(),
+            only2.listen_addr.unwrap(),
+        ],
     )
     .await;
     let hs = stamp_of(&honest_stamp).await;
@@ -744,15 +830,25 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
             notify(2, prev, hs, &me, Hostile::Honest),
         ],
     );
-    // Let the honest node connect to both.
+    sv2_pool_on(
+        honest_l2,
+        Sv2Pool {
+            prev,
+            stamp: hs,
+            bend: HONEST,
+            templates: 2,
+        },
+        me.clone(),
+    );
+    // Let the honest node connect to all three.
     for _ in 0..100 {
-        if honest.status.borrow().peers >= 2 {
+        if honest.status.borrow().peers >= 3 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        honest.status.borrow().peers >= 2,
+        honest.status.borrow().peers >= 3,
         "the honest node reached its peers"
     );
 
@@ -765,6 +861,8 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
         address: "bcrt1p-the-lister".into(),
         payee: me.clone(),
         user_agent: "ghost-audit-list/test".into(),
+        sv2_device: Sv2Device::default(),
+        sv2_hash_rate: DEFAULT_HASH_RATE,
         jobs: 2,
         wait: Duration::from_secs(20),
         timeout: Duration::from_secs(10),
@@ -779,7 +877,7 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
             ..Limits::default()
         },
         policy: Policy::default(),
-        probe_concurrency: 3,
+        probe_concurrency: 4,
         forget_after_secs: 3_600,
     };
     let mut state = ListState::default();
@@ -792,18 +890,21 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
             round,
         )
         .await;
-        assert_eq!(r.candidates, 3, "round {round}: {r:?}");
-        assert_eq!(r.probed, 3);
+        assert_eq!(r.candidates, 4, "round {round}: {r:?}");
+        assert_eq!(r.probed, 4);
         assert_eq!(
             r.outcomes,
-            (1, 1, 1),
+            (2, 1, 1),
             "round {round}: {:?}",
             state.candidates
         );
     }
     let h = honest.listen_addr.unwrap();
+    let o = only2.listen_addr.unwrap();
     let listed: Vec<_> = state.listed().map(|c| c.relay).collect();
-    assert_eq!(listed, vec![h]);
+    let mut want = vec![h, o];
+    want.sort();
+    assert_eq!(listed, want);
     let cheat_c = &state.candidates[&cheat.listen_addr.unwrap()];
     assert_eq!(cheat_c.counts(), (0, 4, 0));
     assert_eq!(
@@ -821,15 +922,27 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
         policy: Policy::default(),
     };
     let v: Value = serde_json::from_str(&render_node_list(&state, &meta)).unwrap();
-    assert_eq!(v["listed"], 1);
-    assert_eq!(v["candidates"], 3);
-    let n = &v["nodes"][0];
-    assert_eq!(n["relay"], h.to_string());
+    assert_eq!(v["listed"], 2);
+    assert_eq!(v["candidates"], 4);
+    let node = |relay: std::net::SocketAddr| {
+        v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["relay"] == relay.to_string())
+            .unwrap()
+            .clone()
+    };
+    let n = node(h);
     assert_eq!(n["sv1"], format!("stratum+tcp://127.0.0.1:{honest_sv1}"));
-    assert_eq!(n["sv2"], "127.0.0.1:34255");
-    assert_eq!(n["sv2_authority_key"], "the-authority-key");
+    assert_eq!(n["sv2"], format!("127.0.0.1:{honest_sv2}"));
+    assert_eq!(n["sv2_authority_key"], SV2_PUB);
     assert_eq!(n["node_id"], hex::encode(NODE_ID));
     assert_eq!(n["protocol_version"], 1);
+    assert_eq!(n["recent"]["pass"], 4);
+    let n = node(o);
+    assert_eq!(n["sv1"], Value::Null);
+    assert_eq!(n["sv2"], format!("127.0.0.1:{only2_sv2}"));
     assert_eq!(n["recent"]["pass"], 4);
     let dns = render_dns(
         &state,
@@ -841,4 +954,588 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
     );
     let records: Vec<&str> = dns.lines().filter(|l| !l.starts_with(';')).collect();
     assert_eq!(records, ["pool 300 IN A 127.0.0.1"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stratum V2
+// ---------------------------------------------------------------------------------------------
+
+/// The test pool's authority key pair: pool_sv2's example config.
+const SV2_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
+const SV2_SEC: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
+/// A valid authority key that is not the pool's (the generator point's x coordinate).
+const WRONG_KEY: &str = "9bZBweHhn6px2Quf1hADVUTrWxX65vtRBweWHP66kfkKGFTQRHs";
+/// The class pool_sv2 serves a standard channel, and the one this test pool's extended channels
+/// are sensed at.
+const STD_CLASS: u16 = 500;
+const EXT_CLASS: u16 = 9;
+const NTIME: u32 = 1_700_003_600;
+
+type Msg = AnyMessage<'static>;
+
+/// How each channel kind's jobs depart from the canonical ones.
+#[derive(Clone, Copy, Debug)]
+struct Sv2Bend {
+    ext: Hostile,
+    std: Hostile,
+}
+
+const HONEST: Sv2Bend = Sv2Bend {
+    ext: Hostile::Honest,
+    std: Hostile::Honest,
+};
+
+/// What the test pool builds its jobs on.
+#[derive(Clone)]
+struct Sv2Pool {
+    prev: [u8; 32],
+    stamp: JobAnchor,
+    bend: Sv2Bend,
+    /// Templates per connection: the first future and activated, the rest live.
+    templates: u64,
+}
+
+/// Template `k`: a BIP34 push and nothing else in the prefix (pool_sv2 strips the template's
+/// own Ghost tags before stamping each channel's back in), a two-entry merkle path, the witness
+/// commitment as the template's output, and fees that differ per template.
+fn template(k: u64) -> NewTemplate<'static> {
+    let prefix = bitcoin::script::Builder::new()
+        .push_int(H as i64)
+        .into_bytes();
+    let witness = TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(ghost_common::canonical_payout::witness_script(
+            &[7; 32],
+        )),
+    };
+    let path: Vec<stratum_apps::stratum_core::binary_sv2::U256<'static>> =
+        vec![[0x11; 32].into(), [0x22; 32].into()];
+    NewTemplate {
+        template_id: k,
+        future_template: k == 1,
+        version: 0x2000_0000,
+        coinbase_tx_version: 2,
+        coinbase_prefix: prefix.try_into().unwrap(),
+        coinbase_tx_input_sequence: u32::MAX,
+        coinbase_tx_value_remaining: ghost_common::canonical_payout::subsidy(H) + fees_of(k),
+        coinbase_tx_outputs_count: 1,
+        coinbase_tx_outputs: bitcoin::consensus::serialize(&witness).try_into().unwrap(),
+        coinbase_tx_locktime: 0,
+        merkle_path: path.into(),
+    }
+}
+
+fn fees_of(k: u64) -> u64 {
+    25_000 + 1_000 * k
+}
+
+/// The reward outputs a channel factory takes: the canonical outputs without the witness
+/// commitment, which the template supplies.
+fn reward(o: Vec<CoinbaseOutput>) -> Vec<TxOut> {
+    o[..o.len() - 1]
+        .iter()
+        .map(|(v, s)| TxOut {
+            value: Amount::from_sat(*v),
+            script_pubkey: ScriptBuf::from_bytes(s.clone()),
+        })
+        .collect()
+}
+
+async fn send(w: &mut NoiseTcpWriteHalf<Msg>, m: Msg) -> bool {
+    let f: StandardSv2Frame<Msg> = m.try_into().unwrap();
+    w.write_frame(f.into()).await.is_ok()
+}
+
+/// The tier pool_sv2 commits for a channel target, and the target quantised to it.
+fn tier_of(target: &Target) -> (u8, Target) {
+    let t = ghost_common::coinbase_tags::difficulty_to_tier_log2(target.difficulty_float());
+    (t as u8, tier_target(t))
+}
+
+fn prev_hash_msg(channel_id: u32, job_id: u32, prev: [u8; 32]) -> Msg {
+    AnyMessage::Mining(Mining::SetNewPrevHash(MiningPrevHash {
+        channel_id,
+        job_id,
+        prev_hash: prev.into(),
+        min_ntime: NTIME,
+        nbits: BITS,
+    }))
+}
+
+fn template_prev_hash(prev: [u8; 32]) -> TemplatePrevHash<'static> {
+    TemplatePrevHash {
+        template_id: 1,
+        prev_hash: prev.into(),
+        header_timestamp: NTIME,
+        n_bits: BITS,
+        target: [0xFF; 32].into(),
+    }
+}
+
+/// The messages that open a channel and carry its jobs: the success, the first (future) job and
+/// its `SetNewPrevHash`, then one live job per further template.
+fn open_standard(pool: &Sv2Pool, request_id: u32, identity: String, payee: &[u8]) -> Vec<Msg> {
+    let mut ch = StandardChannel::new_for_pool(
+        1,
+        identity,
+        (0..16u8).map(|i| 0xC0 ^ i).collect(),
+        Target::from_le_bytes([0xFF; 32]),
+        DEFAULT_HASH_RATE,
+        100,
+        6.0,
+        DefaultJobStore::new(),
+        "GHOST".into(),
+    )
+    .unwrap();
+    let (tier, q) = tier_of(ch.get_target());
+    ch.set_target(q);
+    let mut out = vec![AnyMessage::Mining(
+        Mining::OpenStandardMiningChannelSuccess(OpenStandardMiningChannelSuccess {
+            request_id: request_id.into(),
+            channel_id: 1,
+            target: ch.get_target().to_le_bytes().into(),
+            extranonce_prefix: ch.get_extranonce_prefix().clone().try_into().unwrap(),
+            group_channel_id: 0,
+        }),
+    )];
+    for k in 1..=pool.templates {
+        let (push, o) = job_parts(
+            pool.stamp,
+            payee,
+            pool.bend.std,
+            STD_CLASS,
+            tier,
+            fees_of(k),
+        );
+        ch.set_tier_commitment(Some((tier as u32, push)));
+        ch.on_new_template(template(k), reward(o)).unwrap();
+        if k == 1 {
+            let id = ch.get_future_job_id_from_template_id(1).unwrap();
+            let job = ch.get_future_job(id).unwrap().get_job_message().clone();
+            out.push(AnyMessage::Mining(Mining::NewMiningJob(job)));
+            ch.on_set_new_prev_hash(template_prev_hash(pool.prev))
+                .unwrap();
+            out.push(prev_hash_msg(1, id, pool.prev));
+        } else {
+            let job = ch.get_active_job().unwrap().get_job_message().clone();
+            out.push(AnyMessage::Mining(Mining::NewMiningJob(job)));
+        }
+    }
+    out
+}
+
+/// [`open_standard`] for an extended channel.
+fn open_extended(pool: &Sv2Pool, request_id: u32, identity: String, payee: &[u8]) -> Vec<Msg> {
+    let mut ch = ExtendedChannel::new_for_pool(
+        1,
+        identity,
+        vec![0xE0, 0, 0, 1],
+        Target::from_le_bytes([0xFF; 32]),
+        DEFAULT_HASH_RATE,
+        true,
+        8,
+        100,
+        6.0,
+        DefaultJobStore::new(),
+        "GHOST".into(),
+    )
+    .unwrap();
+    let (tier, q) = tier_of(ch.get_target());
+    ch.set_target(q);
+    let mut out = vec![AnyMessage::Mining(
+        Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+            request_id,
+            channel_id: 1,
+            target: ch.get_target().to_le_bytes().into(),
+            extranonce_size: ch.get_rollable_extranonce_size(),
+            extranonce_prefix: ch.get_extranonce_prefix().clone().try_into().unwrap(),
+            group_channel_id: 0,
+        }),
+    )];
+    for k in 1..=pool.templates {
+        let (push, o) = job_parts(
+            pool.stamp,
+            payee,
+            pool.bend.ext,
+            EXT_CLASS,
+            tier,
+            fees_of(k),
+        );
+        ch.set_tier_commitment(Some((tier as u32, push)));
+        ch.on_new_template(template(k), reward(o)).unwrap();
+        if k == 1 {
+            let id = ch.get_future_job_id_from_template_id(1).unwrap();
+            let job = ch.get_future_job(id).unwrap().get_job_message().clone();
+            out.push(AnyMessage::Mining(Mining::NewExtendedMiningJob(job)));
+            ch.on_set_new_prev_hash(template_prev_hash(pool.prev))
+                .unwrap();
+            out.push(prev_hash_msg(1, id, pool.prev));
+        } else {
+            let job = ch.get_active_job().unwrap().get_job_message().clone();
+            out.push(AnyMessage::Mining(Mining::NewExtendedMiningJob(job)));
+        }
+    }
+    out
+}
+
+/// An SV2 pool on `l`: the Noise responder for [`SV2_PUB`], `SetupConnection`, and channels of
+/// either kind whose jobs pay `payee` (the test's miner; the pool does not parse the identity).
+/// Panics if a share is ever submitted.
+fn sv2_pool_on(l: TcpListener, pool: Sv2Pool, payee: Vec<u8>) -> String {
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = l.accept().await else { return };
+            let (pool, payee) = (pool.clone(), payee.clone());
+            tokio::spawn(async move {
+                let Ok(noise) = accept_noise_connection::<Msg>(
+                    s,
+                    Secp256k1PublicKey::try_from(SV2_PUB.to_string()).unwrap(),
+                    SV2_SEC.parse::<Secp256k1SecretKey>().unwrap(),
+                    3_600,
+                )
+                .await
+                else {
+                    return;
+                };
+                let (mut r, mut w) = noise.into_split();
+                while let Ok(f) = r.read_frame().await {
+                    let mut f: StandardSv2Frame<Msg> = f.try_into().unwrap();
+                    let h = f.get_header().unwrap();
+                    let (ext, mt) = (h.ext_type(), h.msg_type());
+                    let payload = f.payload();
+                    let out = match protocol_message_type(ext, mt) {
+                        MessageType::Common => {
+                            let m: CommonMessages<'_> = (mt, payload).try_into().unwrap();
+                            match m {
+                                CommonMessages::SetupConnection(_) => {
+                                    vec![AnyMessage::Common(
+                                        SetupConnectionSuccess {
+                                            used_version: 2,
+                                            flags: 0,
+                                        }
+                                        .into(),
+                                    )]
+                                }
+                                _ => vec![],
+                            }
+                        }
+                        MessageType::Mining => {
+                            let m: Mining<'_> = (mt, payload).try_into().unwrap();
+                            match m {
+                                Mining::OpenStandardMiningChannel(o) => open_standard(
+                                    &pool,
+                                    o.request_id.as_u32(),
+                                    o.user_identity.as_utf8_or_hex(),
+                                    &payee,
+                                ),
+                                Mining::OpenExtendedMiningChannel(o) => open_extended(
+                                    &pool,
+                                    o.request_id,
+                                    o.user_identity.as_utf8_or_hex(),
+                                    &payee,
+                                ),
+                                Mining::SubmitSharesStandard(_)
+                                | Mining::SubmitSharesExtended(_) => {
+                                    panic!("the auditor submitted a share")
+                                }
+                                _ => vec![],
+                            }
+                        }
+                        _ => vec![],
+                    };
+                    for m in out {
+                        if !send(&mut w, m).await {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn sv2_pool(pool: Sv2Pool, payee: &[u8]) -> String {
+    sv2_pool_on(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        pool,
+        payee.to_vec(),
+    )
+}
+
+fn sv2_target(addr: String, key: &str, payee: &[u8], jobs: usize, wait: u64) -> Sv2Target {
+    Sv2Target {
+        node: Sv2Config {
+            addr,
+            authority_key: key.into(),
+            username: "bcrt1p-the-miner".into(),
+            device: Sv2Device::parse("ghost-audit//test"),
+            nominal_hash_rate: DEFAULT_HASH_RATE,
+            timeout: Duration::from_secs(10),
+        },
+        payee: payee.to_vec(),
+        jobs,
+        wait: Duration::from_secs(wait),
+        job_timeout: Duration::from_secs(10),
+    }
+}
+
+fn verdicts(r: &[JobReport]) -> Vec<(String, Verdict, Option<FailReason>)> {
+    let mut v: Vec<_> = r
+        .iter()
+        .map(|j| (j.job_id.clone(), j.verdict, j.reason))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Honest SV2 jobs pass on both channels: the extended job's coinbase is judged directly, and
+/// each standard job, which shows only a merkle root, is rebuilt from the extended job on the
+/// same template and passes for the full slot class. Nothing is submitted (the pool panics).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn honest_sv2_jobs_pass_on_extended_and_standard_channels() {
+    let w = world().await;
+    let me = p2tr("the miner");
+    let pool = Sv2Pool {
+        prev: w.prev,
+        stamp: w.stamp,
+        bend: HONEST,
+        templates: 2,
+    };
+    let addr = sv2_pool(pool, &me).await;
+    let stamps = RelayStamps {
+        addr: w.node.listen_addr.unwrap(),
+        genesis: GENESIS,
+        timeout: Duration::from_secs(5),
+    };
+    let r = audit_sv2_jobs(
+        &sv2_target(addr, SV2_PUB, &me, 2, 20),
+        &stamps,
+        &w.chain,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.len(), 4, "{r:#?}");
+    for j in &r {
+        assert_eq!(j.verdict, Verdict::Pass, "{}: {}", j.job_id, j.detail);
+        assert_eq!(j.height, Some(H));
+        assert_eq!(j.parent_anchor, Some(hex::encode(GENESIS)));
+        let class = if j.job_id.starts_with("std-") {
+            STD_CLASS
+        } else {
+            EXT_CLASS
+        };
+        assert_eq!(j.slot_class, Some(class), "{}", j.job_id);
+        assert!(j.tier.unwrap() >= 10);
+    }
+    let ids: Vec<String> = verdicts(&r).into_iter().map(|v| v.0).collect();
+    assert_eq!(ids, ["ext-1", "ext-2", "std-1", "std-2"]);
+}
+
+/// Each channel kind is judged on its own: a node that bends only its standard jobs, or only
+/// its extended jobs, is caught on that channel while the other passes. A standard job's
+/// failure is named `standard_job_not_canonical`: a merkle root shows only that no canonical
+/// coinbase crediting the miner is behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_sv2_jobs_fail_on_the_channel_that_serves_them() {
+    let w = world().await;
+    let me = p2tr("the miner");
+    let stamps = RelayStamps {
+        addr: w.node.listen_addr.unwrap(),
+        genesis: GENESIS,
+        timeout: Duration::from_secs(5),
+    };
+    let not_canonical = Some(FailReason::StandardJobNotCanonical);
+    let cases = [
+        (
+            Hostile::Honest,
+            Hostile::RelabelledPayee,
+            None,
+            not_canonical,
+        ),
+        (Hostile::Honest, Hostile::TagToTheNode, None, not_canonical),
+        (Hostile::Honest, Hostile::FeeSkim, None, not_canonical),
+        (
+            Hostile::Honest,
+            Hostile::WrongSlotClass,
+            None,
+            not_canonical,
+        ),
+        (
+            Hostile::WrongTreasury,
+            Hostile::Honest,
+            Some(FailReason::WrongTreasury),
+            None,
+        ),
+        (
+            Hostile::InflatedBalance,
+            Hostile::Honest,
+            Some(FailReason::InflatedBalance),
+            None,
+        ),
+    ];
+    for (ext, std, want_ext, want_std) in cases {
+        let pool = Sv2Pool {
+            prev: w.prev,
+            stamp: w.stamp,
+            bend: Sv2Bend { ext, std },
+            templates: 1,
+        };
+        let addr = sv2_pool(pool, &me).await;
+        let r = audit_sv2_jobs(
+            &sv2_target(addr, SV2_PUB, &me, 1, 6),
+            &stamps,
+            &w.chain,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let v = verdicts(&r);
+        let verdict = |w: Option<FailReason>| {
+            if w.is_some() {
+                Verdict::Fail
+            } else {
+                Verdict::Pass
+            }
+        };
+        assert_eq!(
+            v,
+            [
+                ("ext-1".to_string(), verdict(want_ext), want_ext),
+                ("std-1".to_string(), verdict(want_std), want_std)
+            ],
+            "ext {ext:?} std {std:?}: {r:#?}"
+        );
+    }
+}
+
+/// The authority key is checked in the Noise handshake: a node that cannot prove the key it is
+/// audited against is refused before anything else is read, and a key that is not a key is
+/// refused before connecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_authority_key_is_refused() {
+    let w = world().await;
+    let me = p2tr("the miner");
+    let pool = Sv2Pool {
+        prev: w.prev,
+        stamp: w.stamp,
+        bend: HONEST,
+        templates: 1,
+    };
+    let addr = sv2_pool(pool, &me).await;
+    let stamps = RelayStamps {
+        addr: w.node.listen_addr.unwrap(),
+        genesis: GENESIS,
+        timeout: Duration::from_secs(5),
+    };
+    let e = audit_sv2_jobs(
+        &sv2_target(addr.clone(), WRONG_KEY, &me, 1, 5),
+        &stamps,
+        &w.chain,
+        |_| panic!("no job may be judged"),
+    )
+    .await
+    .expect_err("refused");
+    assert!(matches!(e, Sv2Error::WrongKey(_)), "{e}");
+    let e = audit_sv2_jobs(
+        &sv2_target(addr, "not-a-key", &me, 1, 5),
+        &stamps,
+        &w.chain,
+        |_| {},
+    )
+    .await
+    .expect_err("refused");
+    assert!(matches!(e, Sv2Error::BadKey(_)), "{e}");
+}
+
+/// The case SV1 alone cannot see: a node serving honest SV1 jobs and a bent coinbase to SV2
+/// standard channels. The prober checks both protocols the node serves and fails it; with the
+/// wrong authority key it fails it too, and an SV2-only node passes on SV2 alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_serving_sv2_differently_fails_the_probe() {
+    let w = world().await;
+    let me = p2tr("the prober");
+    let sv1 = stratum(vec![
+        notify(1, w.prev, w.stamp, &me, Hostile::Honest),
+        notify(2, w.prev, w.stamp, &me, Hostile::Honest),
+    ])
+    .await;
+    let pool = |std: Hostile| Sv2Pool {
+        prev: w.prev,
+        stamp: w.stamp,
+        bend: Sv2Bend {
+            ext: Hostile::Honest,
+            std,
+        },
+        templates: 2,
+    };
+    let honest_sv2 = sv2_pool(pool(Hostile::Honest), &me).await;
+    let bent_sv2 = sv2_pool(pool(Hostile::RelabelledPayee), &me).await;
+    let cfg = |stratum: Option<String>, sv2: Option<(String, &str)>| ProbeConfig {
+        stratum,
+        sv2: sv2.map(|(addr, key)| Sv2Endpoint {
+            addr,
+            authority_key: key.into(),
+        }),
+        relay: w.node.listen_addr.unwrap(),
+        genesis: GENESIS,
+        address: "bcrt1p-the-prober".into(),
+        payee: me.clone(),
+        user_agent: "ghost-audit-probe/test".into(),
+        sv2_device: Sv2Device::default(),
+        sv2_hash_rate: DEFAULT_HASH_RATE,
+        jobs: 2,
+        wait: Duration::from_secs(6),
+        timeout: Duration::from_secs(10),
+    };
+
+    // Both protocols honest: pass, with every job from both.
+    let r = probe(
+        &cfg(Some(sv1.clone()), Some((honest_sv2.clone(), SV2_PUB))),
+        &w.chain,
+    )
+    .await;
+    assert_eq!(r.verdict, ProbeVerdict::Pass, "{:?}", r.reasons);
+    assert_eq!((r.jobs.len(), r.jobs_sv2.len()), (2, 4));
+    assert_eq!(r.summary.pass, 6);
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["sv2"]["reachable"], true);
+    assert_eq!(v["sv2"]["jobs_seen"], 4);
+    assert_eq!(v["node"]["sv2"], honest_sv2);
+    assert_eq!(v["node"]["sv2_authority_key"], SV2_PUB);
+
+    // SV1 honest, SV2 standard jobs bent: SV1 alone would pass it; the probe fails it.
+    let only_sv1 = probe(&cfg(Some(sv1.clone()), None), &w.chain).await;
+    assert_eq!(only_sv1.verdict, ProbeVerdict::Pass);
+    let r = probe(
+        &cfg(Some(sv1.clone()), Some((bent_sv2.clone(), SV2_PUB))),
+        &w.chain,
+    )
+    .await;
+    assert_eq!(r.verdict, ProbeVerdict::Fail);
+    assert!(!r.listable);
+    assert_eq!(r.reasons, ["sv2_job_standard_job_not_canonical"]);
+    assert!(r.jobs.iter().all(|j| j.verdict == Verdict::Pass));
+    assert!(r
+        .jobs_sv2
+        .iter()
+        .filter(|j| j.job_id.starts_with("ext-"))
+        .all(|j| j.verdict == Verdict::Pass));
+
+    // The wrong authority key fails the probe, whatever SV1 does.
+    let r = probe(
+        &cfg(Some(sv1), Some((honest_sv2.clone(), WRONG_KEY))),
+        &w.chain,
+    )
+    .await;
+    assert_eq!(r.verdict, ProbeVerdict::Fail);
+    assert_eq!(r.reasons, ["sv2_authority_key"]);
+
+    // An SV2-only node is probed on SV2 alone and passes.
+    let r = probe(&cfg(None, Some((honest_sv2, SV2_PUB))), &w.chain).await;
+    assert_eq!(r.verdict, ProbeVerdict::Pass, "{:?}", r.reasons);
+    assert!(r.listable && r.stratum.is_none() && r.jobs.is_empty());
+    assert_eq!(r.jobs_sv2.len(), 4);
 }

@@ -265,13 +265,49 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
 - **Verdicts**: PASS, FAIL, UNCHECKED. UNCHECKED (prev_hash or parent anchor not held yet, or the
   relay port unreachable) is retried for `--wait` seconds and is never a pass. A tag that does
   not open is retried once with fresh stamps (the node may have re-stamped in between).
-- **Prober verdict** (`ghost-audit/probe/v1`): `fail` if the relay is on another genesis or
-  version, is not a relay, refuses stamps, the stratum port refuses the payee or speaks garbage,
-  or any job fails (`job_<reason>`); else `unmeasured` if anything could not be measured (relay
-  or stratum unreachable, fewer jobs than asked, a job UNCHECKED); else `pass`. `listable` is
-  `verdict == pass`. A failed advert skips the job check.
-- **Submits nothing.** The SV1 client never sends `mining.submit`; the e2e test server panics if
-  it does.
+- **Prober verdict** (`ghost-audit/probe/v2`): `fail` if the relay is on another genesis or
+  version, is not a relay, refuses stamps, a stratum port refuses the payee or speaks garbage,
+  the SV2 port cannot prove its authority key (`sv2_authority_key`, `sv2_bad_authority_key`), or
+  any job on either protocol fails (`job_<reason>`, `sv2_job_<reason>`); else `unmeasured` if
+  anything could not be measured (relay or a stratum port unreachable, fewer jobs than asked, a
+  job UNCHECKED, no stratum port at all: `no_stratum`); else `pass`. `listable` is
+  `verdict == pass`. A failed advert skips the job checks. v2 (from v1): `node.stratum` may be
+  null, and `node.sv2`, `node.sv2_authority_key`, `sv2`, `jobs_sv2` and the advert's ports and
+  key were added. SV1 and SV2 are probed at once; `--jobs` counts per protocol (on SV2, per
+  channel).
+- **SV2** (`src/sv2.rs`, `audit_sv2_jobs` in `src/lib.rs`). Noise and framing are
+  `stratum-apps`' (`connect_with_noise` with the key, so the responder's certificate must be
+  signed by it: `InvalidCertificate` is `Sv2Error::WrongKey`). The key is `--sv2-authority-key`,
+  else the relay `Advert`'s. Two connections, each with its own `SetupConnection` (device fields
+  from `--sv2-device vendor/hardware/firmware`, since pool_sv2 senses an extended channel's class
+  from them): an extended channel first, then a standard channel with `REQUIRES_STANDARD_JOBS`,
+  as a header-only miner opens it, so neither connection shows the node it is an auditor
+  holding both. Future jobs wait for their `SetNewPrevHash`.
+  - **Extended jobs** carry the coinbase (prefix, extranonce, suffix, BIP141-stripped): the
+    extranonce is filled with the channel prefix and zeros and the job judged exactly as SV1.
+  - **Standard jobs carry only the merkle root**, so their coinbase cannot be read, only
+    guessed and checked. pool_sv2 builds every channel's job for a template in one pass with the
+    same job factory: the scriptSig is the template prefix, the `/pool//` push, the channel's
+    `GHPP` and `GHNT` pushes, then the extranonce (the standard channel's prefix); the outputs
+    are the canonical outputs of the channel's class plus the template's witness commitment.
+    So from an extended job on the same template the auditor takes version, the rest of the
+    scriptSig, sequence, lock time, witness commitment, fees (outputs minus subsidy), the finder's
+    script and the merkle path, and for every disclosed stamp whose table it holds, every class
+    (500 first) and every tier 10..=63 (the channel target's tier first) builds the canonical
+    candidate and folds its txid up the path (`rebuild_standard`). A match is the coinbase the
+    miner hashes, judged as any job (so its class and tier are reported). No match against the
+    4 newest extended jobs on the job's `prev_hash`, once an extended job has arrived after it
+    and 2 s have passed (or `--wait` ran out), is FAIL `standard_job_not_canonical`: which part is
+    wrong cannot be told from a hash. No extended job on its `prev_hash`, or no stamped table
+    held, until `--wait` is UNCHECKED. Worst case 16 stamps x 6 classes x 54 tiers x 4 jobs
+    full-coinbase hashes for a failing job.
+  - Not checked on SV2: anything a standard job's merkle root hides beyond "it is or is not a
+    canonical coinbase crediting you" (the reason is not named); a node that recognises the
+    auditor (by IP, say) can serve it alone honestly, on SV2 as on SV1; group-channel jobs
+    (pool_sv2 never sends them); `SetCustomMiningJob` (work selection is refused by pool_sv2).
+- **Submits nothing.** Neither client sends `mining.submit` or `SubmitShares*`; the e2e test
+  servers (SV1, and SV2 built on the vendored `StandardChannel`/`ExtendedChannel`) panic if one
+  does.
 
 ## Open listing (W2.10, `bins/ghost-audit/src/{discover,listing,lister}.rs`)
 - **The advert** is a relay message, `GetAdvert` (18) / `Advert` (19): SV1 port, SV2 port, SV2
@@ -288,8 +324,11 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   gossiped) and one IP may hold at most 4 learned addresses (`MAX_LEARNED_PER_IP`).
 - **Probing** reads the advert first: unreachable relay `unmeasured` (`relay_unreachable`); other
   genesis, version or not a relay `fail`; no advert (`advert_none`), no answer
-  (`advert_unanswered`) or no SV1 port (`advert_no_sv1`) `unmeasured`, so a relay with no pool is
-  a candidate that is never listed. Otherwise `probe::probe` on `relay IP:sv1_port`.
+  (`advert_unanswered`) or neither an SV1 nor an SV2 port (`advert_no_stratum`, was
+  `advert_no_sv1`) `unmeasured`, so a relay with no pool is a candidate that is never listed.
+  Otherwise `probe::probe` on `relay IP:sv1_port` and `relay IP:sv2_port` with the advertised key,
+  whichever are advertised; both must pass. An SV2-only node is listable (in `node-list.json`,
+  not the DNS fragment, which is SV1 on one port).
 - **Policy** (flags, defaults): listed after `list_after` 3 passes in the last `window` 6 probes,
   the latest a pass, no `fail` in the window, and after a delisting only passes since it;
   delisted after `delist_after` 3 non-passes in a row or `delist_after_fail` 1 fails in a row.

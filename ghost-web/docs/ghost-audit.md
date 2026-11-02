@@ -16,7 +16,7 @@ The only party who can catch that is you, by checking the jobs your node sends y
 
 ## What it checks
 
-`ghost-audit` connects to your node's stratum port like a miner, logs in with your payout address, and checks each job it is sent:
+`ghost-audit` connects to your node's stratum port like a miner, over Stratum V1, Stratum V2 or both, logs in with your payout address, and checks each job it is sent:
 
 - **The job credits you.** Every job carries a tag that commits to who its shares credit. `ghost-audit` asks the node's relay port for the job stamps its tags commit to, and checks that the tag opens to *your* payout address. A stamp that does not open the tag proves nothing, so this trusts the node for nothing.
 - **The job pays the canonical coinbase.** It recomputes what the coinbase must pay for the job's height, parent anchor and slot class (treasury, the owed miners in the fixed order, the finder, the commitments) and compares it with the job, output by output.
@@ -25,6 +25,15 @@ The only party who can catch that is you, by checking the jobs your node sends y
 It recomputes the coinbase from a share chain it syncs **itself**, from relay peers you name, and settles it from **your own Bitcoin node**, exactly as a node does. It never asks the node you are auditing what the coinbase should be: that is the party being checked.
 
 **It submits nothing.** It never sends a share, so nothing it does is credited to anyone. It only reads jobs.
+
+## Stratum V2
+
+Over Stratum V2, `ghost-audit` first checks it is talking to the node you meant: the node must prove its **authority key** in the encrypted handshake, the key it advertises on its relay port (or the one you pass with `--sv2-authority-key`). A node that cannot is refused before anything else is read.
+
+It then opens two channels, on two connections, as two miners would:
+
+- an **extended channel**, whose jobs carry the coinbase itself. Each is checked exactly like a Stratum V1 job.
+- a **standard channel**, the kind header-only SV2 firmware uses. Its jobs carry only the merkle root, a hash of the coinbase, not the coinbase. `ghost-audit` cannot read a hash, so it rebuilds the coinbase the job should have: the node builds every miner's job from the same block template, so the extended job supplies the template's parts, and `ghost-audit` fills in the rest itself, canonically (the outputs your job must pay, a tag crediting you). If that coinbase hashes to the job's merkle root, the job is the canonical one and is checked like any other. If nothing canonical crediting you does, the job fails as **standard job not canonical**: the job pays or credits someone else, but a hash cannot say which part is wrong.
 
 ## Results
 
@@ -50,6 +59,7 @@ The reasons a job fails:
 | tier above your difficulty | The job commits a difficulty tier your shares will not meet, so they would earn nothing. |
 | wrong height | The coinbase's block height does not follow the job's previous block. |
 | outputs not canonical | Any other difference: wrong order, a dropped payee, the treasury overpaid. |
+| standard job not canonical | (SV2 standard channel) No canonical coinbase crediting you hashes to the job's merkle root. |
 
 The exit code is 0 when every job passed, 1 if any failed, 2 if any could not be checked.
 
@@ -72,6 +82,8 @@ ghost-audit audit \
   --jobs 5
 ```
 
+For Stratum V2, add or use instead `--sv2 node.example.org:34255`; the authority key is the one the node's relay advertises unless you pass `--sv2-authority-key`. Pass `--sv2-device "vendor/hardware/firmware"` with your miner's SetupConnection fields to audit the jobs your hardware gets. With both `--stratum` and `--sv2`, both are audited at once and `--jobs` counts per protocol (on SV2, per channel). Job ids start `ext-` or `std-` for the SV2 channel they came from.
+
 - `--user-agent`: the node chooses how many outputs your jobs carry from your miner's user agent. Pass the one your hardware sends to audit the jobs your hardware actually gets.
 - `--genesis-anchor` and `--genesis-height`: the share chain's start. Regtest has a fixed one; none is published for mainnet or signet yet.
 - `--genesis-export` and `--export-digest`: the published ledger export (`ledger-export.bin` and `ledger-export.json`), which holds the balances carried over at the cutover. Every payout table starts from them, so the auditor must start from the same ones the network does. It checks the export exactly as a node's import does and keeps the table in its data directory, so later runs need not pass it again.
@@ -82,12 +94,13 @@ The first run syncs the share chain from your relay peers, which takes a while; 
 
 ## The public prober
 
-`ghost-audit probe` runs the same checks from outside, plus the node's advert (its relay port answers on this share chain and discloses its job stamps), and prints a JSON verdict: `pass`, `fail` or `unmeasured`, with reason codes. Open listing uses it to decide whether a node is listed: only `pass` is listed. Being listed means a node passed this probe when it ran; it does not mean the node is honest with every miner, which is why you audit your own.
+`ghost-audit probe` runs the same checks from outside, plus the node's advert (its relay port answers on this share chain and discloses its job stamps), and prints a JSON verdict: `pass`, `fail` or `unmeasured`, with reason codes. It probes every protocol the node advertises (SV1, SV2 or both), and each must pass, so a node that serves SV2 miners worse than SV1 miners fails. Open listing uses it to decide whether a node is listed: only `pass` is listed. A node that serves only SV2 can be listed; it appears in the node list but not the DNS name, which carries the SV1 port. Being listed means a node passed this probe when it ran; it does not mean the node is honest with every miner, which is why you audit your own.
 
 ## What it does not check
 
 - **Whether your shares were included.** Each anchor commits to its batch of shares in a merkle tree, so a miner can get a short proof that an anchor included a share. `ghost-audit` submits no shares, so it has none to look for.
-- **Stratum V2 jobs.** It speaks Stratum V1. A node serves both from the same pool, but a hostile node could treat them differently.
+- **Which part of a bad standard job is wrong.** A standard-channel job is only a hash, so a failing one is reported as not canonical, not as, say, a relabelled payee.
+- **A node that recognises the auditor.** A node that can tell `ghost-audit`'s connection from your miner's (by IP address, for instance) could serve it alone honestly. Running it from your miner's own network and with your miner's user agent or device fields narrows that.
 - **Withheld blocks.** A node can hide a block your miner found. That shows only as bad luck over time.
 
 ## Until you run it
