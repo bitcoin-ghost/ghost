@@ -3,7 +3,7 @@
 #
 # 30-minute iterations covering all layers:
 #   - L1 Mining: block height, shares, payout rounds
-#   - L2 Operations: shield, L2 payment, wraith session, tree root check
+#   - L2 Operations: shield, L2 payment, tree root check
 #   - Bridge: test-withdrawal, simulate-unshield, lock creation + funding
 #   - Health: services, DB integrity, checkpoint pipeline
 #   - Fault Injection: SIGKILL random VM (configurable)
@@ -50,16 +50,12 @@ L2_SHIELD_ATTEMPTS=0
 L2_SHIELD_SUCCESSES=0
 L2_SIM_ATTEMPTS=0
 L2_SIM_SUCCESSES=0
-WRAITH_ATTEMPTS=0
-WRAITH_SUCCESSES=0
 BRIDGE_WITHDRAWAL_ATTEMPTS=0
 BRIDGE_WITHDRAWAL_SUCCESSES=0
 BRIDGE_UNSHIELD_ATTEMPTS=0
 BRIDGE_UNSHIELD_SUCCESSES=0
 BRIDGE_LOCK_ATTEMPTS=0
 BRIDGE_LOCK_SUCCESSES=0
-BRIDGE_WRAITH_ATTEMPTS=0
-BRIDGE_WRAITH_SUCCESSES=0
 BRIDGE_SETTLEMENT_CHECKS=0
 BRIDGE_SETTLEMENT_CONFIRMED=0
 HEALTH_CHECKS=0
@@ -415,79 +411,6 @@ simulate_l2_on_vm() {
     fi
 }
 
-wraith_session_on_vm() {
-    local vm_idx="$1" iteration="$2"
-    ((WRAITH_ATTEMPTS++))
-
-    local result
-    result=$(ssh_cmd "$vm_idx" \
-        "curl -s --max-time 10 -X POST http://localhost:${PAY_PORT}/api/v1/admin/simulate-wraith-session" 2>/dev/null)
-
-    if [[ -z "$result" ]]; then
-        log "    Wraith on ${VM_NAMES[$vm_idx]}: ${YELLOW}no response${RESET}"
-        log_event "wraith-session" "vm=${VM_NAMES[$vm_idx]}" "fail:timeout"
-        return 1
-    fi
-
-    local session_id error_msg
-    session_id=$(echo "$result" | jq -r '.session_id // empty' 2>/dev/null)
-    error_msg=$(echo "$result" | jq -r '.error // empty' 2>/dev/null)
-
-    if [[ -n "$error_msg" ]]; then
-        log "    Wraith on ${VM_NAMES[$vm_idx]}: ${YELLOW}$error_msg${RESET}"
-        log_event "wraith-session" "vm=${VM_NAMES[$vm_idx]},error=$error_msg" "fail"
-        return 1
-    fi
-
-    if [[ -z "$session_id" ]]; then
-        log "    Wraith on ${VM_NAMES[$vm_idx]}: ${YELLOW}no session_id${RESET}"
-        log_event "wraith-session" "vm=${VM_NAMES[$vm_idx]}" "fail:no-session-id"
-        return 1
-    fi
-
-    log "    Wraith on ${VM_NAMES[$vm_idx]}: ${GREEN}started $session_id${RESET}"
-
-    # Poll for completion (35 min timeout)
-    local poll_timeout=2100 poll_interval=15 elapsed=0 final_state="unknown"
-
-    while (( elapsed < poll_timeout )); do
-        sleep "$poll_interval"
-        elapsed=$((elapsed + poll_interval))
-
-        local status_result
-        status_result=$(ssh_cmd "$vm_idx" \
-            "curl -s --max-time 5 http://localhost:${PAY_PORT}/api/v1/wraith/sessions" 2>/dev/null)
-
-        [[ -z "$status_result" ]] && continue
-
-        local state
-        state=$(echo "$status_result" | jq -r --arg id "$session_id" \
-            '.[] | select(.id == $id or .session_id == $id) | .state // "unknown"' 2>/dev/null)
-
-        case "$state" in
-            complete|completed)
-                final_state="complete"
-                break
-                ;;
-            failed|error)
-                final_state="failed"
-                break
-                ;;
-        esac
-    done
-
-    if [[ "$final_state" == "complete" ]]; then
-        log "    Wraith $session_id: ${GREEN}COMPLETE${RESET} (${elapsed}s)"
-        log_event "wraith-session" "vm=${VM_NAMES[$vm_idx]},session=$session_id,elapsed=${elapsed}s" "ok"
-        ((WRAITH_SUCCESSES++))
-        return 0
-    else
-        log "    Wraith $session_id: ${RED}$final_state${RESET} (${elapsed}s)"
-        log_event "wraith-session" "vm=${VM_NAMES[$vm_idx]},session=$session_id,state=$final_state" "fail"
-        return 1
-    fi
-}
-
 check_l2() {
     local iteration="$1"
 
@@ -500,10 +423,6 @@ check_l2() {
     # L2 simulation on a round-robin VM (different from shield)
     local sim_vm=$(( (iteration + 1) % VM_COUNT ))
     simulate_l2_on_vm "$sim_vm" "$iteration" || true
-
-    # Wraith session: every iteration (long-running, polls in background)
-    local wraith_vm=$(( (iteration + 2) % VM_COUNT ))
-    wraith_session_on_vm "$wraith_vm" "$iteration" || true
 
     # Triple-snapshot tree root check (from f5f1d22)
     check_tree_convergence "$iteration"
@@ -568,108 +487,6 @@ check_tree_convergence() {
 # ═══════════════════════════════════════════════════════════════════════════════
 # BRIDGE LAYER — every 3rd iteration (test-withdrawal/unshield), every 6th (lock)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-bridge_wraith_to_withdrawal() {
-    local iteration="$1"
-    local vm_idx=$((iteration % VM_COUNT))
-    ((BRIDGE_WRAITH_ATTEMPTS++))
-
-    log "    Path A: wraith→lock→settle on ${VM_NAMES[$vm_idx]}..."
-
-    # Step 1: Trigger wraith session
-    local wraith_result
-    wraith_result=$(ssh_cmd "$vm_idx" \
-        "curl -s --max-time 120 -X POST http://localhost:${PAY_PORT}/api/v1/admin/simulate-wraith-session" 2>/dev/null)
-
-    if [[ -z "$wraith_result" ]]; then
-        log "    wraith session: ${YELLOW}timeout${RESET}"
-        log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]}" "fail:timeout"
-        return 1
-    fi
-
-    local session_id
-    session_id=$(echo "$wraith_result" | jq -r '.session_id // empty' 2>/dev/null)
-    if [[ -z "$session_id" ]]; then
-        log "    wraith session: ${YELLOW}no session_id${RESET}"
-        log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]}" "fail:wraith"
-        return 1
-    fi
-    log "    wraith session: ${GREEN}started $session_id${RESET}"
-
-    # Wait for wraith session to complete (poll up to 5 min)
-    local poll_timeout=300 poll_interval=15 elapsed=0
-    while (( elapsed < poll_timeout )); do
-        sleep "$poll_interval"
-        elapsed=$((elapsed + poll_interval))
-        local state
-        state=$(ssh_cmd "$vm_idx" \
-            "curl -s --max-time 5 http://localhost:${PAY_PORT}/api/v1/wraith/sessions" 2>/dev/null \
-            | jq -r --arg id "$session_id" '.[] | select(.id == $id or .session_id == $id) | .state // "unknown"' 2>/dev/null)
-        [[ "$state" == "complete" || "$state" == "completed" ]] && break
-        [[ "$state" == "failed" || "$state" == "error" ]] && {
-            log "    wraith session: ${YELLOW}$state${RESET}"
-            log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]}" "fail:wraith-$state"
-            return 1
-        }
-    done
-
-    # Step 2: Create a fresh lock, fund it, then reconcile
-    local body='{"amount_sats":10000,"timelock_tier":"short"}'
-    local create_result
-    create_result=$(pay_api_auth "$vm_idx" "/api/v1/locks/create" "$body")
-
-    local lock_id address
-    lock_id=$(echo "$create_result" | jq -r '.lock.id // .lock_id // .id // empty' 2>/dev/null)
-    address=$(echo "$create_result" | jq -r '.lock.address // .address // .funding_address // empty' 2>/dev/null)
-
-    if [[ -z "$lock_id" || -z "$address" ]]; then
-        local err
-        err=$(echo "$create_result" | jq -r '.error // empty' 2>/dev/null)
-        log "    Lock create: ${YELLOW}${err:-missing fields}${RESET}"
-        log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]},error=${err:-missing}" "fail:no_lock"
-        return 1
-    fi
-    log "    Lock created: ${GREEN}$lock_id${RESET} → $address"
-
-    # Step 3: Fund the lock
-    local btc_amount="0.0001"
-    local txid
-    txid=$(ssh_cmd "$vm_idx" "bitcoin-cli -signet -datadir=/var/lib/bitcoin -rpcport=38332 -rpcuser=ghostrpc -rpcpassword=ghost_signet_rpc_2024 sendtoaddress '$address' $btc_amount" 2>/dev/null)
-    if [[ -z "$txid" ]]; then
-        log "    Funding: ${YELLOW}sendtoaddress failed${RESET}"
-        log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]},lock=$lock_id" "fail:fund"
-        return 1
-    fi
-    log "    Funded: ${GREEN}$txid${RESET}"
-
-    # Notify ghost-pay to scan
-    local scan_body
-    scan_body=$(printf '{"txid":"%s","vout":0}' "$txid")
-    pay_api_auth "$vm_idx" "/api/v1/payments/scan" "$scan_body" >/dev/null 2>&1
-    sleep 2
-
-    # Step 4: Request withdrawal with express settlement class
-    local reconcile_body
-    reconcile_body=$(printf '{"destination_address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","settlement_class":"express"}')
-    local reconcile_result
-    reconcile_result=$(pay_api_auth "$vm_idx" "/api/v1/locks/${lock_id}/reconcile" "$reconcile_body")
-
-    local reconcile_ok
-    reconcile_ok=$(echo "$reconcile_result" | jq -r '.success // false' 2>/dev/null)
-
-    if [[ "$reconcile_ok" == "true" ]]; then
-        local wid
-        wid=$(echo "$reconcile_result" | jq -r '.withdrawal_id // "?"' 2>/dev/null)
-        log "    Reconcile: ${GREEN}OK${RESET} withdrawal_id=$wid class=express"
-        log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]},lock=$lock_id,wid=$wid,class=express" "ok"
-        ((BRIDGE_WRAITH_SUCCESSES++))
-    else
-        local err
-        err=$(echo "$reconcile_result" | jq -r '.error // empty' 2>/dev/null)
-        log "    Reconcile: ${YELLOW}${err:-failed}${RESET}"
-        log_event "bridge-wraith" "vm=${VM_NAMES[$vm_idx]},lock=$lock_id,error=${err:-unknown}" "fail"
-    fi
-}
 
 bridge_create_lock() {
     local iteration="$1"
@@ -771,13 +588,9 @@ check_bridge() {
 
     log "  ${BLUE}── Bridge ──${RESET}"
 
-    # Every 6th iteration (alternating paths): wraith-sourced or manual lock
+    # Every 6th iteration: manual lock
     if (( iteration % 6 == 0 )); then
-        if (( (iteration / 6) % 2 == 0 )); then
-            bridge_wraith_to_withdrawal "$iteration" || true
-        else
-            bridge_create_lock "$iteration" || true
-        fi
+        bridge_create_lock "$iteration" || true
     fi
 
     # Every iteration: check settlement status and progression
@@ -954,10 +767,8 @@ final_report() {
     log "  ${BOLD}── L2 Operations ──${RESET}"
     log "    Shields:      $L2_SHIELD_SUCCESSES / $L2_SHIELD_ATTEMPTS ($( (( L2_SHIELD_ATTEMPTS > 0 )) && echo "$((L2_SHIELD_SUCCESSES * 100 / L2_SHIELD_ATTEMPTS))%" || echo "N/A"))"
     log "    Simulations:  $L2_SIM_SUCCESSES / $L2_SIM_ATTEMPTS ($( (( L2_SIM_ATTEMPTS > 0 )) && echo "$((L2_SIM_SUCCESSES * 100 / L2_SIM_ATTEMPTS))%" || echo "N/A"))"
-    log "    Wraith:       $WRAITH_SUCCESSES / $WRAITH_ATTEMPTS ($( (( WRAITH_ATTEMPTS > 0 )) && echo "$((WRAITH_SUCCESSES * 100 / WRAITH_ATTEMPTS))%" || echo "N/A"))"
     log ""
     log "  ${BOLD}── Bridge ──${RESET}"
-    log "    Wraith→Settle: $BRIDGE_WRAITH_SUCCESSES / $BRIDGE_WRAITH_ATTEMPTS"
     log "    Lock→Settle:   $BRIDGE_LOCK_SUCCESSES / $BRIDGE_LOCK_ATTEMPTS"
     log "    Settlements:   $BRIDGE_SETTLEMENT_CONFIRMED confirmed ($BRIDGE_SETTLEMENT_CHECKS checks)"
     log ""
@@ -993,8 +804,8 @@ final_report() {
     fi
 
     # Bridge >95% success
-    local total_bridge_attempts=$((BRIDGE_WRAITH_ATTEMPTS + BRIDGE_LOCK_ATTEMPTS))
-    local total_bridge_successes=$((BRIDGE_WRAITH_SUCCESSES + BRIDGE_LOCK_SUCCESSES))
+    local total_bridge_attempts=$BRIDGE_LOCK_ATTEMPTS
+    local total_bridge_successes=$BRIDGE_LOCK_SUCCESSES
     if (( total_bridge_attempts > 0 )); then
         local bridge_pct=$((total_bridge_successes * 100 / total_bridge_attempts))
         if (( bridge_pct < 95 )); then
@@ -1073,7 +884,7 @@ main() {
         # L2 Operations — every iteration
         check_l2 "$iter"
 
-        # Bridge — settlement checks every iteration, wraith/lock every 6th
+        # Bridge — settlement checks every iteration, lock every 6th
         check_bridge "$iter"
 
         # Health — every iteration

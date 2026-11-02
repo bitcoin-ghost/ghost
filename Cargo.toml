@@ -38,7 +38,6 @@ members = [
     "crates/ghost-lock",
     "bins/ghost-lock-signer",
     "crates/ghost-entropy",
-    "crates/wraith-protocol",
     "crates/ghost-reconciliation",
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
@@ -52,8 +51,6 @@ members = [
     "bins/ghost-pool",
     "bins/ghost-stats",
     "bins/ghost-cli",
-    # Wraith coordinator (Wraith Lite v1, single-round atomic CoinJoin)
-    "bins/wraith-coordinator",
     # Decentralised mining-discovery shim (miner-side; verifies the signed node-list checkpoint)
     "bins/ghost-miner-proxy",
     # Headless setup CLI
@@ -101,8 +98,6 @@ ghost-verification = { path = "crates/ghost-verification" }
 ghost-keys = { path = "crates/ghost-keys" }
 ghost-entropy = { path = "crates/ghost-entropy" }
 ghost-lock = { path = "crates/ghost-lock" }
-wraith-protocol = { path = "crates/wraith-protocol" }
-wraith-coordinator = { path = "bins/wraith-coordinator" }
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # ZK-BFT Infrastructure
 ghost-zkp = { path = "crates/ghost-zkp" }
@@ -119,9 +114,6 @@ toml = "0.8"
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde"] }
-# BIP-322 generic message signing/verification, from the rust-bitcoin org.
-# Pinned: 0.0.x, and it tracks `bitcoin` closely.
-bip322 = "0.0.11"
 
 # Cryptography
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
@@ -175,7 +167,6 @@ base64 = "0.22"
 # Cryptography
 snow = "0.9"
 getrandom = "0.2"
-scrypt = "0.11"
 
 # BIP standards
 bip39 = "2.0"
@@ -200,7 +191,6 @@ crossterm = "0.29"
 # Additional crypto
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
-subtle = "2.5"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 secrecy = "0.8"
 

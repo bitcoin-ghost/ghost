@@ -834,7 +834,10 @@ pub const MESH_ADVERT_REPUBLISH_SECS: u64 = 600;
 /// Qualification reconciles over days, so six blocks would have been cosmetic here: the
 /// feature would have looked correct, passed its tests, and produced nothing forever once
 /// armed. One epoch is the distance at which the inputs have stopped moving.
-pub const MESH_CHECKPOINT_LAG_BLOCKS: u64 = wraith_protocol::roster_snapshot::SNAPSHOT_LAG_BLOCKS;
+pub const MESH_CHECKPOINT_LAG_BLOCKS: u64 = MESH_CHECKPOINT_EPOCH_BLOCKS;
+
+/// One epoch: 144 blocks, about a day.
+pub const MESH_CHECKPOINT_EPOCH_BLOCKS: u64 = 144;
 
 /// Lowering the lag below what qualification needs must not compile.
 ///
@@ -843,7 +846,7 @@ pub const MESH_CHECKPOINT_LAG_BLOCKS: u64 = wraith_protocol::roster_snapshot::SN
 /// Refusing to build is the only signal proportionate to a feature that would otherwise look
 /// correct and produce nothing forever.
 const _: () = assert!(
-    MESH_CHECKPOINT_LAG_BLOCKS >= wraith_protocol::EPOCH_BLOCKS,
+    MESH_CHECKPOINT_LAG_BLOCKS >= MESH_CHECKPOINT_EPOCH_BLOCKS,
     "the mesh checkpoint anchor must lag at least one epoch — qualification reconciles over \
      days, and this checkpoint needs exact-set agreement on a list derived from it"
 );
@@ -1423,13 +1426,6 @@ pub mod capacity;
 /// Cumulative Reaper stats — txs evaluated, reaped, accepted, dead-bytes
 /// total, plus per-DeadCodeType counters. Read by `/api/v1/reaper/status`.
 pub mod reaper_stats;
-
-/// Decentralised Wraith coordinator election — live wiring (read-only, gated
-/// off by default). Computes and publishes the per-epoch coordinator draw via
-/// `wraith-protocol`; activates no role and changes no consensus message.
-pub mod coordinator_election;
-
-pub mod coordinator_supervisor;
 
 /// CONSENSUS SECURITY: re-derives peer-broadcast capability verdicts against
 /// this node's own Bitcoin Core, so a colluding minority of challengers cannot

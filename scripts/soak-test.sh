@@ -48,7 +48,7 @@ SOAK_HOURS="${SOAK_HOURS:-18}"
 SOAK_INTERVAL_SEC=1800   # 30 minutes
 BIANNUAL_SEC=7200         # 2 hours
 SOAK_NO_INJECT="${SOAK_NO_INJECT:-false}"  # Set to true to disable fault injection
-SOAK_HIGH_TRAFFIC="${SOAK_HIGH_TRAFFIC:-false}"  # Set to true to run wraith+L2 sims every iteration
+SOAK_HIGH_TRAFFIC="${SOAK_HIGH_TRAFFIC:-false}"  # Set to true to run L2 sims every iteration
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -787,7 +787,7 @@ pay_api_auth() {
 # Real L2 operations via ghost-pay authenticated endpoints:
 # 1. Shield balance — creates confidential note (no ZK proof needed)
 # 2. L2 payment — instant off-chain transfer
-# 3. Admin simulation — triggers full confidential transfer + wraith cycles
+# 3. Admin simulation — triggers full confidential transfer cycles
 #
 # Note: Confidential transfer/consolidate/unshield require valid Groth16
 # proofs that can't be generated from bash. We use admin simulation
@@ -853,7 +853,7 @@ l2_send_payment() {
 
 l2_simulate_full_cycle() {
     # Trigger admin simulation endpoints via SSH (localhost-only).
-    # These exercise the full confidential transfer + wraith pipelines
+    # These exercise the full confidential transfer pipelines
     # including ZK proof verification.
     local iteration="$1" vm_idx="$2"
 
@@ -1233,13 +1233,12 @@ phase2_soak() {
     local inject_hour_7=$((7 * 3600))
     local inject_hour_8=$((8 * 3600))
     local inject_hour_10=$((10 * 3600))
-    local inject_hour_11=$((11 * 3600))
     local inject_hour_13=$((13 * 3600))
     local inject_hour_14=$((14 * 3600))
     local inject_hour_16=$((16 * 3600))
     local inject_hour_17=$((17 * 3600))
     local injected_1=false injected_2=false injected_4=false injected_5=false
-    local injected_7=false injected_8=false injected_10=false injected_11=false
+    local injected_7=false injected_8=false injected_10=false
     local injected_13=false injected_14=false injected_16=false injected_17=false
 
     for iter in $(seq 1 "$total_iterations"); do
@@ -1272,7 +1271,7 @@ phase2_soak() {
         # h. Commitment tree consistency
         check_tree_consistency "$iter"
 
-        # Wraith + L2 simulations: every 2 hours normally, every iteration in high-traffic mode
+        # L2 simulations: every 2 hours normally, every iteration in high-traffic mode
         local run_sims=false
         if [[ "$SOAK_HIGH_TRAFFIC" == "true" ]]; then
             run_sims=true
@@ -1284,18 +1283,6 @@ phase2_soak() {
 
             # Round-robin VM selection for simulations (prevents VM1 accumulation)
             local sim_vm=$(( (iter / 4) % VM_COUNT ))
-
-            # Wraith simulation (ghost-pay endpoint, not ghost-mining)
-            log "  Triggering wraith simulation on ${VM_NAMES[$sim_vm]}..."
-            local wraith_resp
-            wraith_resp=$(pay_api "$sim_vm" "/api/v1/admin/simulate-wraith-session" "POST")
-            if [[ -n "$wraith_resp" ]]; then
-                log "    Wraith simulation: ${GREEN}triggered${RESET}"
-                log_event "wraith-sim" "iteration=$iter,vm=${VM_NAMES[$sim_vm]}" "triggered"
-            else
-                log "    Wraith simulation: ${YELLOW}no response${RESET}"
-                log_event "wraith-sim" "iteration=$iter,vm=${VM_NAMES[$sim_vm]}" "no-response"
-            fi
 
             # L2 activity simulation on ALL VMs (balanced note creation)
             log "  Triggering L2 activity simulation on ALL VMs..."
@@ -1384,15 +1371,6 @@ phase2_soak() {
             l2_shield_balance "$iter" 2 &
             sleep 1
             inject_kill9_ghost_pay 2 "Hour-10: VM3 ghost-pay SIGKILL mid-shield"
-        fi
-
-        # Hour 11: Kill VM3 mid-wraith session
-        if ! $injected_11 && (( elapsed >= inject_hour_11 )); then
-            injected_11=true
-            log "${YELLOW}  INJECT: Hour-11 — triggering wraith then killing VM3 mid-session${RESET}"
-            pool_api 0 "/api/v1/admin/simulate-wraith-session" &
-            sleep 2
-            inject_kill_service 2 "ghost-mining" 60 "Hour-11: VM3 kill mid-wraith"
         fi
 
         # Hour 13: SIGKILL ghost-mining mid-finalization on VM3 (second mid-finalization test)

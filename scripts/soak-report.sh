@@ -139,11 +139,6 @@ generate_report() {
         l2_partial=$(count_events "l2-test" "partial")
         echo "  L2 tests: $l2_pass passed, $l2_partial partial"
 
-        local wraith_triggered wraith_noresp
-        wraith_triggered=$(count_events "wraith-sim" "triggered")
-        wraith_noresp=$(count_events "wraith-sim" "no-response")
-        echo "  Wraith simulations: $wraith_triggered triggered, $wraith_noresp no-response"
-
         local l2_cons_ok l2_cons_mm
         l2_cons_ok=$(count_events "l2-consistency" "consistent")
         l2_cons_mm=$(count_events "l2-consistency" "mismatch")

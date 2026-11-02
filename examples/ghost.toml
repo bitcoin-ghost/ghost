@@ -131,7 +131,7 @@ min_payout_sats = 10000
 # =============================================================================
 # Ghost Pay L2 (Enabled by default)
 # =============================================================================
-# L2 instant payments with Wraith Protocol mixing
+# L2 instant payments
 
 [ghost_pay]
 enabled = true
@@ -142,5 +142,3 @@ virtual_block_secs = 10
 # Epoch length in virtual blocks before L1 settlement
 epoch_blocks = 100
 
-# Enable Wraith Protocol mixing
-wraith_enabled = true

@@ -25,8 +25,7 @@ COPY bins ./bins
 RUN cargo build --release \
     --bin ghost-mining \
     --bin translator \
-    --bin ghost-pay \
-    --bin ghost-coordinator
+    --bin ghost-pay
 
 # ============================================================================
 # Runtime Stage - ghost-pool
@@ -115,33 +114,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8081/api/v1/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/ghost-pay"]
-CMD ["--config", "/etc/ghost/config.toml"]
-
-# ============================================================================
-# Runtime Stage - ghost-coordinator
-# ============================================================================
-FROM debian:bookworm-slim AS ghost-coordinator
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -r -s /bin/false ghost
-RUN mkdir -p /etc/ghost /var/lib/ghost \
-    && chown -R ghost:ghost /etc/ghost /var/lib/ghost
-
-COPY --from=builder /build/target/release/ghost-coordinator /usr/local/bin/ghost-coordinator
-COPY docker/config/ghost-coordinator.toml /etc/ghost/config.toml
-RUN chown ghost:ghost /etc/ghost/config.toml
-
-USER ghost
-WORKDIR /var/lib/ghost
-
-EXPOSE 8333
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8333/api/v1/health || exit 1
-
-ENTRYPOINT ["/usr/local/bin/ghost-coordinator"]
 CMD ["--config", "/etc/ghost/config.toml"]

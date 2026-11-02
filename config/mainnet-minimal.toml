@@ -67,4 +67,3 @@ payout_interval_blocks = 100
 enabled = true
 virtual_block_secs = 10
 epoch_blocks = 2160
-wraith_enabled = true

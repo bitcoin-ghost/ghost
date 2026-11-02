@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reconcile the Stratum and Wraith coordinator firewall ports to the node's config.
+# Reconcile the Stratum firewall ports to the node's config.
 #
 # Run by `ghost-mining-firewall.service`, triggered at boot and by
 # `ghost-mining-firewall.path` whenever pool.toml changes. Idempotent.
@@ -48,17 +48,6 @@ else
   logger -t ghost-mining-firewall "farm tier OFF -> Stratum 4444 CLOSED"
 fi
 
-# Wraith coordinator listen port (9100) follows [coordinator]
-# coordinator_role_enabled, exactly as the Stratum ports follow public mining.
-coord="no"
-if [[ -r "$CONF" ]] \
- && grep -qE '^[[:space:]]*coordinator_role_enabled[[:space:]]*=[[:space:]]*true([[:space:]]|$)' "$CONF" 2>/dev/null; then
-  coord="yes"
-fi
-if [[ "$coord" == "yes" ]]; then
-  ufw allow 9100/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "coordinator role ON -> Wraith 9100 OPEN"
-else
-  ufw delete allow 9100/tcp >/dev/null 2>&1 || true
-  logger -t ghost-mining-firewall "coordinator role OFF -> Wraith 9100 CLOSED"
-fi
+# 9100 was the Wraith coordinator port. Nothing listens on it any more, so a rule
+# left open by an older install is closed.
+ufw delete allow 9100/tcp >/dev/null 2>&1 || true

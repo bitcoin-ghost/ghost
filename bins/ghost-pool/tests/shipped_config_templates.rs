@@ -35,10 +35,26 @@ fn templates() -> Vec<PathBuf> {
 ///
 /// Unknown keys are silently ignored, so a stale one produces no error anywhere — it just quietly
 /// tells the reader something untrue. Add to this list whenever a config field is deleted.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
-    "public_mining",
-    "removed — `mining_mode` is the single source of truth for discoverability",
-)];
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "public_mining",
+        "removed — `mining_mode` is the single source of truth for discoverability",
+    ),
+    ("wraith_enabled", "removed with Wraith"),
+    ("wraith_election_enabled", "removed with Wraith"),
+    (
+        "coordinator_port",
+        "removed with the in-process Wraith coordinator",
+    ),
+    (
+        "coordinator_role_enabled",
+        "removed with the in-process Wraith coordinator",
+    ),
+    (
+        "coordinator_fee_address",
+        "removed with the in-process Wraith coordinator",
+    ),
+];
 
 #[test]
 fn every_shipped_template_parses_as_toml() {
@@ -303,5 +319,62 @@ fn the_installers_alerts_block_parses_in_both_shapes() {
         saw_enabled_true,
         "no `[alerts]` shape in install-node.sh ever sets `enabled = true` — the --alert-webhook \
          path must produce a genuinely enabled block, or #985 is not fixed"
+    );
+}
+
+/// A config installed before Wraith was removed must still load.
+///
+/// Installed `pool.toml` files carry `[ghost_pay] wraith_enabled` (it used to be required) and,
+/// on nodes that opted in, the `[coordinator]` election and role keys. The structs reject unknown
+/// keys, so the retired keys are accepted explicitly and ignored. If this test fails, upgrading a
+/// node would leave it unable to start.
+#[test]
+fn a_config_with_retired_wraith_keys_still_loads() {
+    let mut raw = std::fs::read_to_string(config_dir().join("mainnet.toml")).expect("read");
+    raw = raw.replacen("[ghost_pay]\n", "[ghost_pay]\nwraith_enabled = true\n", 1);
+    assert!(
+        raw.contains("wraith_enabled = true"),
+        "the template has no [ghost_pay] section"
+    );
+    raw.push_str(
+        "\n[coordinator]\n\
+         wraith_election_enabled = true\n\
+         coordinator_enabled = true\n\
+         advertised_endpoint = \"203.0.113.7:9100\"\n\
+         coordinator_port = 9100\n\
+         coordinator_role_enabled = true\n\
+         coordinator_fee_address = \"bc1qexample\"\n",
+    );
+
+    let cfg: ghost_common::config::NodeConfig = toml::from_str(&raw)
+        .unwrap_or_else(|e| panic!("a config with the retired Wraith keys must load: {e}"));
+    assert!(cfg.coordinator.coordinator_enabled);
+    assert_eq!(
+        cfg.coordinator.advertised_endpoint.as_deref(),
+        Some("203.0.113.7:9100")
+    );
+    assert!(cfg.ghost_pay.is_some());
+
+    // Written back, the retired keys are gone and the rest survives.
+    let written = toml::to_string(&cfg).expect("serialize");
+    for key in [
+        "wraith_enabled",
+        "wraith_election_enabled",
+        "coordinator_port",
+        "coordinator_role_enabled",
+        "coordinator_fee_address",
+    ] {
+        assert!(
+            !written.contains(key),
+            "retired key `{key}` was written back"
+        );
+    }
+    assert!(written.contains("advertised_endpoint"));
+
+    // A real typo in the same section is still refused.
+    let typo = raw.replace("coordinator_enabled = true", "coordinator_enabeld = true");
+    assert!(
+        toml::from_str::<ghost_common::config::NodeConfig>(&typo).is_err(),
+        "an unknown key that was never a config field must still be rejected"
     );
 }
