@@ -28,10 +28,58 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 64;
+const SCHEMA_VERSION: u32 = 65;
+
+/// [`SCHEMA_VERSION`], for code outside this module (tests, tools).
+pub const LATEST_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+
+/// The first schema version stored negated in `PRAGMA user_version` (v65, the node pool cutover).
+///
+/// Every binary from before v65 reads `user_version` as a `u32` when it opens the database, and a
+/// negative value fails that read, so an old binary refuses a v65 database at open instead of
+/// running against the tables v65 dropped ([`crate::migration_v65`]). Versions below this one
+/// are stored as they always were.
+pub const FIRST_NEGATED_SCHEMA_VERSION: u32 = 65;
+
+/// Decode a raw `PRAGMA user_version`: `0..=64` as stored, `-65` and below as their negation.
+/// Anything else (a positive value at or above 65, or a negative one above -65) was not written
+/// by this code and is refused rather than guessed at.
+pub fn decode_schema_version(raw: i64) -> GhostResult<u32> {
+    let first = FIRST_NEGATED_SCHEMA_VERSION as i64;
+    if (0..first).contains(&raw) {
+        return Ok(raw as u32);
+    }
+    if raw <= -first && raw >= -(u32::MAX as i64) {
+        return Ok((-raw) as u32);
+    }
+    Err(GhostError::Migration(format!(
+        "PRAGMA user_version is {raw}, which no Ghost build writes: versions below \
+         {FIRST_NEGATED_SCHEMA_VERSION} are stored as they are and later ones negated"
+    )))
+}
+
+/// The raw `PRAGMA user_version` value for schema version `v` (see [`decode_schema_version`]).
+pub fn encode_schema_version(v: u32) -> i64 {
+    if v >= FIRST_NEGATED_SCHEMA_VERSION {
+        -(v as i64)
+    } else {
+        v as i64
+    }
+}
+
+/// The decoded schema version of an open database.
+pub fn schema_version(conn: &Connection) -> GhostResult<u32> {
+    get_schema_version(conn)
+}
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
+    run_migrations_to(conn, SCHEMA_VERSION)
+}
+
+/// Run the pending migrations up to and including `target` (tests build a database at an earlier
+/// version with it; production always passes [`SCHEMA_VERSION`]).
+pub(crate) fn run_migrations_to(conn: &Connection, target: u32) -> GhostResult<()> {
     let current_version = get_schema_version(conn)?;
 
     // A database AHEAD of the binary is always a mistake, and it used to be completely silent.
@@ -55,14 +103,14 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         return Ok(());
     }
 
-    if current_version == SCHEMA_VERSION {
+    if current_version >= target {
         debug!(version = current_version, "Database schema up to date");
         return Ok(());
     }
 
     info!(
         from = current_version,
-        to = SCHEMA_VERSION,
+        to = target,
         "Running database migrations"
     );
 
@@ -144,21 +192,27 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
     ];
 
     for &(version, migrate_fn) in pre_v10 {
-        if current_version < version {
+        if current_version < version && version <= target {
             run_migration_tx(conn, version, migrate_fn)?;
         }
     }
 
     // v10 manages its own PRAGMA foreign_keys ON/OFF and cannot be wrapped
-    if current_version < 10 {
+    if current_version < 10 && 10 <= target {
         migrate_v10(conn)?;
         set_schema_version(conn, 10)?;
     }
 
     for &(version, migrate_fn) in post_v10 {
-        if current_version < version {
+        if current_version < version && version <= target {
             run_migration_tx(conn, version, migrate_fn)?;
         }
+    }
+
+    // v65 manages its own transaction: its backup (`VACUUM INTO`) cannot run inside one, and its
+    // space reclamation runs after the commit.
+    if current_version < crate::migration_v65::V65 && crate::migration_v65::V65 <= target {
+        crate::migration_v65::run(conn, set_schema_version)?;
     }
 
     // A migration that rewrites a large table leaves the whole rewrite sitting in the WAL, and
@@ -175,7 +229,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
     // and refusing to start over a housekeeping step would turn a disk-space nuisance into an
     // outage on every node at once. It must also run OUTSIDE a transaction, which is why it sits
     // here rather than inside `run_migration_tx`.
-    if current_version < SCHEMA_VERSION {
+    if current_version < target {
         if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
             warn!(
                 "post-migration WAL checkpoint failed; the WAL will shrink at the next \
@@ -190,10 +244,10 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
 
 /// Get current schema version
 fn get_schema_version(conn: &Connection) -> GhostResult<u32> {
-    let version: u32 = conn
+    let raw: i64 = conn
         .query_row("PRAGMA user_version;", [], |row| row.get(0))
         .map_err(|e| GhostError::Database(e.to_string()))?;
-    Ok(version)
+    decode_schema_version(raw)
 }
 
 /// Set schema version
@@ -206,11 +260,11 @@ fn get_schema_version(conn: &Connection) -> GhostResult<u32> {
 ///
 /// SECURITY: While format! is used, u32 cannot produce SQL injection.
 /// The version number is bounded by u32::MAX and only contains digits.
-fn set_schema_version(conn: &Connection, version: u32) -> GhostResult<()> {
+pub(crate) fn set_schema_version(conn: &Connection, version: u32) -> GhostResult<()> {
     // PRAGMA does not support ? parameters
     // SECURITY: Use Display formatting for u32 which produces only ASCII digits 0-9
     // This is SQL injection safe because u32.to_string() cannot contain ', ", ;, or --
-    let sql = format!("PRAGMA user_version = {}", version);
+    let sql = format!("PRAGMA user_version = {}", encode_schema_version(version));
     conn.execute(&sql, [])
         .map_err(|e| GhostError::Database(e.to_string()))?;
     Ok(())
@@ -3743,6 +3797,14 @@ fn migrate_v50(conn: &Connection) -> GhostResult<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The last version before the node pool cutover. The tests of historical migrations read
+    /// tables v65 drops, so they stop here.
+    const PRE_CUTOVER: u32 = 64;
+
+    fn run_to_v64(conn: &Connection) -> GhostResult<()> {
+        run_migrations_to(conn, PRE_CUTOVER)
+    }
+
     use super::*;
     use rusqlite::Connection;
 
@@ -3797,11 +3859,11 @@ mod tests {
     #[test]
     fn v47_creates_the_checkpoint_table_and_tolerates_an_existing_one() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
+        run_to_v64(&conn).expect("migrate");
         // Bind to the constant, not a literal: this test is about v47's table being
         // idempotent, so pinning the version number here just breaks it on every
         // subsequent migration (it did, on v48).
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
 
         let sql: String = conn
             .query_row(
@@ -3892,7 +3954,7 @@ mod tests {
     #[test]
     fn v49_settlement_tables_have_the_reversal_columns() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
+        run_to_v64(&conn).expect("migrate");
 
         for (table, required) in [
             (
@@ -3937,7 +3999,7 @@ mod tests {
     #[test]
     fn v49_outputs_hash_lookup_uses_the_index() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
+        run_to_v64(&conn).expect("migrate");
 
         let plan: String = conn
             .query_row(
@@ -4124,7 +4186,7 @@ mod tests {
     #[test]
     fn v63_migrates_a_v62_database_additively() {
         let fresh = Connection::open_in_memory().unwrap();
-        run_migrations(&fresh).unwrap();
+        run_to_v64(&fresh).unwrap();
         let fresh_np = np_schema(&fresh);
         assert_eq!(
             fresh_np.iter().filter(|o| o.0 == "table").count(),
@@ -4133,7 +4195,7 @@ mod tests {
         );
 
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         for (kind, name, _) in np_schema(&conn) {
             if kind == "table" {
                 conn.execute_batch(&format!("DROP TABLE IF EXISTS {name};"))
@@ -4147,8 +4209,8 @@ mod tests {
         );
         let before = other_schema(&conn);
 
-        run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
         assert_eq!(
             other_schema(&conn),
             before,
@@ -4268,7 +4330,7 @@ mod tests {
     #[test]
     fn test_v39_adds_ceremony_id_column() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         let cols = get_column_names(&conn, "mpc_ceremony");
         assert!(
             cols.contains(&"ceremony_id".to_string()),
@@ -4282,7 +4344,7 @@ mod tests {
         setup_pre_v39_mpc(&conn);
         insert_synthetic_contributions(&conn, 5);
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let (count, cph, ossified, cid) =
             read_singleton(&conn).expect("singleton must be backfilled");
@@ -4306,9 +4368,9 @@ mod tests {
         setup_pre_v39_mpc(&conn);
         insert_synthetic_contributions(&conn, 5);
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         // Re-running is version-gated and must not change the singleton.
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let (count, cph, _ossified, cid) = read_singleton(&conn).unwrap();
         assert_eq!(count, 5);
@@ -4330,7 +4392,7 @@ mod tests {
         )
         .unwrap();
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let (count, cph, _ossified, cid) = read_singleton(&conn).unwrap();
         assert_eq!(count, 2, "existing singleton count must NOT be overwritten");
@@ -4347,7 +4409,7 @@ mod tests {
         setup_pre_v39_mpc(&conn);
         // No contributions at all (fresh genesis DB).
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         assert!(
             read_singleton(&conn).is_none(),
@@ -4362,7 +4424,7 @@ mod tests {
     #[test]
     fn test_v40_adds_ossified_file_hash_column() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         let cols = get_column_names(&conn, "mpc_ceremony");
         assert!(
             cols.contains(&"ossified_file_hash".to_string()),
@@ -4386,9 +4448,9 @@ mod tests {
         )
         .unwrap();
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
         let cols = get_column_names(&conn, "mpc_ceremony");
         assert!(cols.contains(&"ossified_file_hash".to_string()));
         // Existing data preserved; new column defaults to NULL.
@@ -4447,7 +4509,7 @@ mod tests {
     #[test]
     fn test_v2_challenge_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         for expected in &[
@@ -4468,7 +4530,7 @@ mod tests {
     #[test]
     fn test_v10_foreign_key_cascades() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         // Check that tables recreated in v10 have ON DELETE CASCADE.
         // PRAGMA foreign_key_list returns rows with columns:
@@ -4514,7 +4576,7 @@ mod tests {
     #[test]
     fn test_v13_mpc_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         for expected in &["mpc_contributions", "mpc_verification_votes"] {
@@ -4530,7 +4592,7 @@ mod tests {
     #[test]
     fn test_v21_l2_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         // v21 creates l2_notes and l2_nullifiers (the nullifier set)
@@ -4547,7 +4609,7 @@ mod tests {
     #[test]
     fn test_v23_triggers_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name")
@@ -4588,11 +4650,11 @@ mod tests {
             version, SCHEMA_VERSION
         );
 
-        // Also verify directly via PRAGMA user_version
-        let pragma_version: u32 = conn
+        // Also verify directly via PRAGMA user_version: stored negated from v65 on.
+        let pragma_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(pragma_version, SCHEMA_VERSION);
+        assert_eq!(pragma_version, encode_schema_version(SCHEMA_VERSION));
     }
 
     /// v38 created `wraith_bonds`; v57 drops it. A database that runs the
@@ -4765,7 +4827,7 @@ mod tests {
     #[test]
     fn v60_keeps_the_newest_arming_a_settled_row_and_both_recipient_types() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        run_migrations(&conn).expect("migrate to head");
+        run_to_v64(&conn).expect("migrate to head");
 
         // Head already carries the unique index, so the duplicate fixture cannot be inserted
         // through it. Drop it to recreate the pre-v60 shape, which is also what a real upgrade
@@ -4946,7 +5008,7 @@ mod tests {
     #[test]
     fn test_v24_burned_elder_positions() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         assert!(
@@ -5071,7 +5133,7 @@ mod tests {
     #[test]
     fn v50s_sbc_schema_is_retired_at_head() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         for t in [
@@ -5100,7 +5162,7 @@ mod tests {
     #[test]
     fn test_kv_store_table_exists() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         assert!(
@@ -5129,8 +5191,8 @@ mod tests {
     #[test]
     fn v53_applies_on_v52_and_is_idempotent() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).expect("migrate");
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
 
         let expected: &[(&str, &[&str])] = &[
             (
@@ -5215,8 +5277,8 @@ mod tests {
         // must not error and must land back on the current version.
         conn.execute("PRAGMA user_version = 52", [])
             .expect("rewind");
-        run_migrations(&conn).expect("v53 must tolerate existing tables");
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).expect("v53 must tolerate existing tables");
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
 
         // Clean v52 case: no shard tables at all, exactly what the fleet's databases hold today.
         conn.execute_batch(
@@ -5226,8 +5288,8 @@ mod tests {
         .expect("drop");
         conn.execute("PRAGMA user_version = 52", [])
             .expect("rewind");
-        run_migrations(&conn).expect("v53 must apply on a v52 database");
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).expect("v53 must apply on a v52 database");
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
         check_shape(&conn, "after migrating a v52 database");
     }
 

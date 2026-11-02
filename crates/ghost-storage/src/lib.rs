@@ -39,6 +39,7 @@ pub mod address_key;
 pub mod audit_log;
 pub mod database;
 pub mod encryption;
+mod migration_v65;
 pub mod migrations;
 pub mod models;
 pub mod node_pool_store;
