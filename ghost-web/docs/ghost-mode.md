@@ -124,14 +124,11 @@ The two layers can be set independently. Most operators who want the privacy pos
 | Network identity | Tor mode | Your IP address from peers |
 | **Transaction relay** | **Ghost Mode** | **Whether you relay/announce transactions at all** |
 | Relay timing | [Shroud](#shroud) | When you relay (if you do) |
-| Address linkability | [Keys](#keys) | Recipient address publication |
 
 A typical privacy-maximising operator stack:
 
 - Tor mode → IP layer
 - Ghost Mode → suppress outbound relay
-- Wraith for entry into Ghost Pay
-- Ghost Keys for receive-side addresses
 - L1 broadcast happens through a separate path (Tor-routed RPC to a remote broadcasting node, or a broadcast service over .onion)
 
 You can mix and match. Most users only need Shroud for the basic timing protection. Ghost Mode is for operators who want zero P2P-layer transaction footprint.

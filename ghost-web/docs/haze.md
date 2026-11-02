@@ -191,4 +191,4 @@ That produces three behaviours worth knowing about:
 | `ghost-core/src/node/blockstorage.cpp` | `gsb*.dat` FlatFileSeq integration |
 | `crates/ghost-common/src/config.rs` | `storage.haze_mode` config field |
 
-Companion docs: [Exorcism](#exorcism) for the runtime process, [Pruning](#pruning) for related disk-management concepts.
+Companion docs: [Exorcism](#exorcism) for the runtime process. Pruning of block files is set at install (`--sync ibd` writes `prune=550`); see [Deployment](#deployment).

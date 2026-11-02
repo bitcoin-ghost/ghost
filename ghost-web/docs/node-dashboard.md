@@ -1,6 +1,6 @@
 # Node Dashboard
 
-*Monitor your node, track rewards, and manage settings through a web-based dashboard.*
+*Monitor your node and manage its settings through a web-based dashboard.*
 
 ## Overview
 
@@ -10,12 +10,6 @@ Every Ghost node includes a local web dashboard for monitoring and configuration
 - **Real-time** — Live updates via WebSocket
 - **Responsive** — Works on desktop and mobile
 - **Secure** — JWT authentication, no external dependencies
-
-- **Status**: ● Online (99.8% uptime)
-- **Sync**: 870,234 / 870,234 (100%)
-- **Mining**: 1.2 PH/s (12 miners)
-- **Shares**: ⭐⭐⭐⭐ (14/15)
-- **This Round**: ~0.0234 BTC
 
 :::warning Security First
 The dashboard binds only to localhost (127.0.0.1). It's never exposed to the public internet. You access it through SSH tunnel or VPN.
@@ -125,53 +119,16 @@ Tailscale uses WireGuard under the hood for encrypted connections. It handles NA
 
 ## Dashboard Features
 
-### Overview Page
+:::warning Being rebuilt
+The dashboard is being rebuilt for the node pool (W2.14 in the build plan). Pages for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2 are removed. The list below is what the rebuilt dashboard is planned to show; check the dashboard itself for what your release has.
+:::
 
-- Node status and uptime percentage
-- Blockchain sync progress
-- Mining hashrate and connected miners
-- Current share count (0-15)
-- Estimated rewards this round
-- Network statistics
-
-### Mining Page
-
-- List of connected miners with hashrate
-- Share statistics per worker
-- Template profile selector
-- Stratum endpoint display
-- Historical hashrate graph
-
-### Rewards Page
-
-- Share breakdown (which shares you're earning)
-- Payout history with transaction links
-- Earnings chart over time
-- Payout address configuration
-
-### Network Page
-
-- Pool-wide statistics
-- Connected peers list
-- Elder registry and your status
-- Treasury progress and decay status
-
-### Settings Page
-
-- Ghost Mode toggle
-- Archive Mode toggle
-- Public Mining toggle
-- Mempool and template profiles
-- Pruning configuration
-- Security settings (rotate `DASHBOARD_PASSWORD` via systemd override)
-
-### Logs Page
-
-- Live log streaming
-- Filter by level (info, warn, error)
-- Filter by source (core, pool, node)
-- Search functionality
-- Download logs
+- Node status and share-chain relay peers
+- Share-chain tip and recent anchors
+- Connected miners, each with its sensed slot class and any firmware warning (see [Mining on the node pool](#mining))
+- Per-miner shares and ledger balance, queue position and expected wait
+- Recent pool blocks with their payouts and the change sent to the treasury
+- Settlement status
 
 ## API Access
 
@@ -254,8 +211,6 @@ the change rides the next restart — batch it with a binary roll rather than
 spending a restart on it. The edit keeps every comment and every other line,
 is checked against the node's real config loader before it is written, and
 replaces the file atomically with its original owner and mode.
-
-Full API documentation: [docs.ghostpool.io/api](https://docs.ghostpool.io/api)
 
 ## Security
 

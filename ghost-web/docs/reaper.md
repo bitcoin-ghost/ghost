@@ -139,12 +139,10 @@ Reaper runs **before** BUDS so dead-code transactions get filtered cheaply, befo
 
 Honestly: some fees. Inscriptions and BRC-20 transactions pay above-market fee rates because they need to fit into restricted block space. By rejecting them, a Reaper-enabled node forgoes that fee revenue.
 
-Two reasons it's still defaultable-on:
+Why it's still on by default:
 
-1. **The economics are aligning.** As inscriptions volume falls and Bitcoin's fee market normalises, the fee premium shrinks. The network-effect benefit of nodes refusing data dumps grows over the same window.
-2. **Capability share.** Running Reaper qualifies a node for the +2 Reaper capability share in Ghost's reward system. Long-run reward economics make this break-even or better for most operators, depending on inscription volume in any given week.
-
-The honest answer: most weeks Reaper is mildly fee-negative and reward-positive. If a network-wide consensus to run it forms, it becomes both fee-positive (clean blocks attract clean transactions) and reward-positive. We can't promise that consensus, only describe the choice.
+- **The economics are aligning.** As inscriptions volume falls and Bitcoin's fee market normalises, the fee premium shrinks. The network-effect benefit of nodes refusing data dumps grows over the same window.
+The honest answer: most weeks Reaper is mildly fee-negative. Node rewards no longer exist, so nothing offsets that; on the node pool the fees of a block go to the node whose miner found it, so the cost falls on that node's operator. We can't promise a network-wide move to clean blocks, only describe the choice.
 
 ## Source
 
