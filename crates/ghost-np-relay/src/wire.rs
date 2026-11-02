@@ -217,6 +217,35 @@ pub struct NetShare {
 }
 
 impl NetShare {
+    /// A share from its parts as a pool holds them: the 80-byte header, the serialized coinbase
+    /// (with or without witness data) and the merkle branch.
+    pub fn from_parts(
+        header80: &[u8],
+        coinbase: Vec<u8>,
+        merkle_branch: Vec<[u8; 32]>,
+        tag: ShareTagPreimage,
+    ) -> Result<NetShare, WireError> {
+        if header80.len() != 80 {
+            return Err(WireError::BadHeader);
+        }
+        let header = deserialize(header80).map_err(|_| WireError::BadHeader)?;
+        let tx: Transaction = deserialize(&coinbase).map_err(|_| WireError::BadCoinbase)?;
+        if merkle_branch.len() > MAX_BRANCH_LEN {
+            return Err(WireError::TooMany(merkle_branch.len()));
+        }
+        // Carried without witness data: the txid, which is what folds to the root, ignores it.
+        let coinbase = bitcoin::consensus::encode::serialize(&strip_witness(tx));
+        if coinbase.len() > MAX_COINBASE_WIRE_BYTES {
+            return Err(WireError::TooMany(coinbase.len()));
+        }
+        Ok(NetShare {
+            header,
+            coinbase,
+            merkle_branch,
+            tag,
+        })
+    }
+
     /// The share's id: its header hash, internal byte order.
     pub fn id(&self) -> ShareId {
         self.header.block_hash().to_byte_array()
@@ -524,6 +553,13 @@ impl Message {
     }
 }
 
+fn strip_witness(mut tx: Transaction) -> Transaction {
+    for i in &mut tx.input {
+        i.witness.clear();
+    }
+    tx
+}
+
 fn put_str(p: &mut Vec<u8>, s: &str, max: usize) {
     let b = &s.as_bytes()[..s.len().min(max)];
     p.push(b.len() as u8);
@@ -787,6 +823,30 @@ mod tests {
             ids: vec![[1; 32]; MAX_BATCH_SHARES],
         };
         assert!(Message::decode(&big.encode()).is_ok());
+    }
+
+    #[test]
+    fn a_pool_share_drops_its_witness_and_keeps_its_id() {
+        use bitcoin::{OutPoint, ScriptBuf, Sequence, TxIn, Witness};
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![1, 2]),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[[0u8; 32]]),
+            }],
+            output: vec![],
+        };
+        let s = sample_share(3);
+        let h = serialize(&s.header);
+        let p = NetShare::from_parts(&h, serialize(&tx), vec![], s.tag.clone()).unwrap();
+        assert_eq!(p.id(), s.id());
+        assert_eq!(p.coinbase_tx().unwrap().compute_txid(), tx.compute_txid());
+        assert!(p.coinbase.len() < serialize(&tx).len());
+        assert!(NetShare::from_parts(&h[..79], serialize(&tx), vec![], s.tag.clone()).is_err());
+        assert!(NetShare::from_parts(&h, vec![1, 2, 3], vec![], s.tag).is_err());
     }
 
     #[test]
