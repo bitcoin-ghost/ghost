@@ -3435,7 +3435,7 @@ impl MeshNetwork {
                     }
 
                     // M-P2P-1: Validate topic matches envelope's msg_type (post-deser fallback)
-                    // Covers multi-type topics (elder, mpc) that can't use the fast check
+                    // Covers multi-type topics (elder) that can't use the fast check
                     if let Ok(envelope) = MessageEnvelope::deserialize(&data) {
                         let expected_topic = envelope.msg_type.topic_str();
                         if topic_name != expected_topic {
@@ -3667,7 +3667,7 @@ impl MeshNetwork {
     }
 
     /// M-9: Map topic name to primary MessageType for pre-deserialization validation.
-    /// Returns None for multi-type topics (elder, mpc) which need post-deser checking.
+    /// Returns None for multi-type topics (elder) which need post-deser checking.
     fn primary_message_type_for_topic(topic: &str) -> Option<MessageType> {
         match topic {
             "health" => Some(MessageType::HealthPing),

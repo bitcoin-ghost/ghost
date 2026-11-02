@@ -6661,17 +6661,14 @@ pub struct MpcContributionRecord {
 }
 
 impl Database {
-    /// Save an MPC contribution.
+    /// Save an MPC contribution row (the elder registry).
     ///
-    /// Stage C: this is a SAFE proof-fill upsert. A first INSERT records the row.
-    /// On conflict (the position already exists) it ONLY fills in a previously
-    /// EMPTY `contribution_proof`, and ONLY when the incoming row has the SAME
-    /// identity (contributor + prev/new hashes). It NEVER rewrites the hashes or
-    /// replaces an already-present proof. This lets a node that first synced a
-    /// proof-less row (the old `/contributors` path) later upgrade it with the
-    /// real proof fetched from `/api/v1/mpc/votes/{position}` — needed for
-    /// catch-up re-verification — while a peer can never overwrite the lineage
-    /// hashes or substitute a different proof for an applied position.
+    /// A SAFE proof-fill upsert. A first INSERT records the row. On conflict (the
+    /// position already exists) it ONLY fills in a previously EMPTY
+    /// `contribution_proof`, and ONLY when the incoming row has the SAME identity
+    /// (contributor + prev/new hashes). It NEVER rewrites the hashes or replaces
+    /// an already-present proof. The ceremony is removed, so nothing syncs these
+    /// rows any more; the elder set is read from what is already recorded.
     pub fn save_mpc_contribution(&self, contribution: &MpcContributionRecord) -> GhostResult<()> {
         self.with_connection(|conn| {
             conn.execute(
