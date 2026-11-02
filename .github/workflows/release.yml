@@ -16,8 +16,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The old network's channel releases only what main carries. A `v*` tag pushed by hand on any
+  # other history (the node pool branch, above all) would otherwise build and publish an
+  # old-channel release that GitHub makes latest, and every old-network node would update to
+  # it. The tagged commit must be on main's history.
+  guard:
+    name: Tag on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main's history
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "not a tag ($GITHUB_REF_NAME): dry run, nothing to check"
+            exit 0
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME is on $GITHUB_SHA, which is not on main's history: the old channel releases only from main (node pool releases are np-v* tags, release-node-pool.yml)"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on main's history"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: guard
     runs-on: ${{ matrix.os }}
     # There was no timeout here at all, so the v1.11.23 apt hang was heading for the
     # 6-hour default. Generous enough for a cold cross-target release build, bounded

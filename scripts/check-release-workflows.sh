@@ -11,7 +11,10 @@
 #   2. each release job publishes only for its own prefix;
 #   3. the node pool release is created as a pre-release with make_latest "false";
 #   4. the two `build` jobs are the same apart from `needs`, so both channels ship the same
-#      artefact set built the same way.
+#      artefact set built the same way;
+#   5. release.yml refuses a `v*` tag whose commit is not on main's history (its guard job, which
+#      the build waits for), so a v-tag pushed by hand on node pool code cannot publish an
+#      old-channel latest release.
 # Usage: scripts/check-release-workflows.sh
 set -euo pipefail
 
@@ -119,11 +122,24 @@ if build(old) != build(np):
 if np["jobs"]["build"].get("needs") != "guard":
     bad.append("release-node-pool.yml's build must wait for the tag guard (needs: guard)")
 
+if old["jobs"]["build"].get("needs") != "guard":
+    bad.append("release.yml's build must wait for the main-history guard (needs: guard)")
+guard = old["jobs"].get("guard") or {}
+checkout = [s for s in guard.get("steps", []) if str(s.get("uses", "")).startswith("actions/checkout")]
+script = "\n".join(str(s.get("run", "")) for s in guard.get("steps", []))
+if not checkout or (checkout[0].get("with") or {}).get("fetch-depth") != 0:
+    bad.append("release.yml's guard must check out full history (fetch-depth: 0) to test ancestry")
+if not re.search(r"merge-base --is-ancestor \"\$GITHUB_SHA\" origin/main", script):
+    bad.append("release.yml's guard must refuse a tag whose commit is not an ancestor of origin/main")
+if "fetch --no-tags origin main" not in script or "exit 1" not in script:
+    bad.append("release.yml's guard must fetch main and fail the run on a tag off main")
+
 if bad:
     print("Release channels are not kept apart:\n", file=sys.stderr)
     for b in bad:
         print(f"  {b}", file=sys.stderr)
     sys.exit(1)
 print(f"check-release-workflows: {len(cases)} tag pushes route to their own workflow; the node pool "
-      "release is a pre-release that cannot be latest; both channels build the same set")
+      "release is a pre-release that cannot be latest; both channels build the same set; a v-tag "
+      "off main's history is refused")
 PY
