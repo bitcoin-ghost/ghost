@@ -241,7 +241,7 @@ impl MemBlocks {
 
     /// Drop every block above `h`.
     pub fn truncate(&self, h: u32) {
-        self.lock().split_off(&(h + 1));
+        let _dropped = self.lock().split_off(&(h + 1));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, ([u8; 32], Transaction)>> {
@@ -897,5 +897,127 @@ mod tests {
         again.sync(r, &chain).await.unwrap();
         assert_eq!(db.np_applied_blocks().unwrap(), vec![]);
         assert_eq!(view.blocks(), vec![]);
+    }
+
+    /// End to end on the relay core: a miner's shares are batched by an anchor and credited; the
+    /// credit lifts its balance over the floor once it passes the cut; a pool block built on the
+    /// anchor pays it the canonical outputs; settlement retires exactly what was paid; and the
+    /// stored ledger and every later table show the balance fall by that amount.
+    #[tokio::test]
+    async fn shares_to_anchor_to_block_to_settlement_to_balances() {
+        use crate::testkit::{p2tr, BITS};
+        use ghost_common::canonical_payout::{share_face, Balance};
+        use ghost_common::node_pool_constants::{FACE_PER_SAT, PAYOUT_FLOOR_FACE};
+
+        // The miner starts just under the floor, so its credited shares make it eligible.
+        let miner = p2tr("miner-0");
+        let start = PAYOUT_FLOOR_FACE - 1;
+        let made = std::cell::RefCell::new(Vec::new());
+        let mut sim = Sim::with_relays(1, |_| {
+            let db = Arc::new(Database::in_memory().unwrap());
+            let view = SettledView::load(&db).unwrap();
+            let mut p = params();
+            p.genesis.table.insert(
+                miner.clone(),
+                Balance {
+                    owed: start,
+                    queue_since: None,
+                },
+            );
+            let r = Relay::open(p, db.clone(), Box::new(view.clone())).unwrap();
+            made.borrow_mut()
+                .push(Settlement::new(db, view, GENESIS_BTC));
+            r
+        });
+        let mut st = made.into_inner().remove(0);
+
+        // Two network shares and an anchor that batches them, all at job height tip + 1.
+        let job_height = sim.btc.tip + 1;
+        sim.mine(0, false);
+        sim.mine(0, false);
+        // The 30 s re-batch publishes a job whose batch holds them.
+        sim.tick(31);
+        sim.mine(0, true);
+        let r = &mut sim.nodes[0].relay;
+        let anchor = r.best();
+        let credits: i128 = r
+            .batch_credits(&anchor)
+            .unwrap()
+            .iter()
+            .filter(|c| c.script == miner)
+            .map(|c| c.face)
+            .sum();
+        assert_eq!(
+            r.batch_credits(&anchor).unwrap().len(),
+            2,
+            "both shares batched"
+        );
+        let t_net = r
+            .required_tier(&crate::testkit::genesis_hash(), job_height - 1)
+            .unwrap();
+        let face = share_face(t_net as u32, BITS, job_height).unwrap() as i128;
+        assert_eq!(credits, 2 * face, "each share credits its face at T_net");
+        assert_eq!(
+            r.db().np_balance(&miner).unwrap().map(|b| b.owed),
+            Some(credits),
+            "the stored ledger holds the credits (the genesis table is the snapshot's base)"
+        );
+
+        // Twenty Bitcoin blocks later the credit is below the cut: a block pays it.
+        let h = job_height + 20;
+        sim.btc.extend_to(h - 1);
+        sim.tick(1);
+        let r = &mut sim.nodes[0].relay;
+        let job = r.job_anchor().unwrap();
+        let table = r.block_table(&job.parent_anchor, h).unwrap();
+        let owed = table[&miner].owed;
+        assert_eq!(owed, start + credits);
+        assert!(owed >= PAYOUT_FLOOR_FACE, "eligible once credited");
+        let below_cut = r.block_table(&job.parent_anchor, h - 1).unwrap();
+        assert_eq!(below_cut[&miner].owed, start, "not before the cut");
+
+        let chain = MemBlocks::default();
+        for x in GENESIS_BTC + 1..h {
+            chain.set(x, hash(x, 0), plain_coinbase(x));
+        }
+        let cb = pool_coinbase(job, &table, h - 1);
+        let paid: u64 = cb
+            .output
+            .iter()
+            .filter(|o| o.script_pubkey.as_bytes() == &miner[..])
+            .map(|o| o.value.to_sat())
+            .sum();
+        assert_eq!(
+            paid as i128,
+            owed / FACE_PER_SAT,
+            "paid its whole sats, nothing more"
+        );
+        chain.set(h, hash(h, 1), cb);
+        st.sync(r, &chain).await.unwrap();
+        assert_eq!(st.stats().matched, 1);
+        let retired = r.db().np_block_retirements(&hash(h, 1)).unwrap().unwrap();
+        assert!(retired.contains(&(miner.clone(), paid as i128 * FACE_PER_SAT)));
+
+        // The balances fall by exactly what was paid, in the store and in every later table.
+        let after = r.block_table(&job.parent_anchor, h + 1).unwrap();
+        assert_eq!(after[&miner].owed, owed - paid as i128 * FACE_PER_SAT);
+        assert_eq!(after[&miner].queue_since, None, "below the floor again");
+        assert_eq!(
+            r.db().np_balance(&miner).unwrap().unwrap().owed,
+            credits - paid as i128 * FACE_PER_SAT,
+            "the stored ledger (credits and retirements; the genesis table is the snapshot's)"
+        );
+        // Every genesis balance was paid too, and the treasury took S/200 plus the change.
+        let treasury = cb_value(&chain, h, 0);
+        let miners: u64 = retired.iter().map(|x| (x.1 / FACE_PER_SAT) as u64).sum();
+        assert_eq!(
+            treasury + miners,
+            ghost_common::canonical_payout::subsidy(h),
+            "treasury plus miners is the subsidy exactly"
+        );
+    }
+
+    fn cb_value(chain: &MemBlocks, h: u32, i: usize) -> u64 {
+        chain.lock()[&h].1.output[i].value.to_sat()
     }
 }
