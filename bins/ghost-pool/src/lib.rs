@@ -93,6 +93,10 @@ pub const SBC_GENESIS_ANCHOR_HEIGHT: u64 = 961_642;
 
 pub mod share_checks;
 
+/// Node-pool flag-day export: the miners' ledger at a finalised checkpoint and the MPC lineage,
+/// read-only (`docs/LEDGER_EXPORT.md`).
+pub mod node_pool_export;
+
 /// The network shard's runtime: epoch folds, evidence retention, boundary detection
 /// (`SHARE_SHARD.md` §4.3/§4.4). Dark unless `pool.share_shard` is set.
 pub mod shard;

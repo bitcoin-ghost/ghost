@@ -87,6 +87,8 @@ hex = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 bitcoin = { workspace = true }
+# Read-only access to ghost.db for the node-pool ledger export.
+rusqlite = { workspace = true }
 getrandom = { workspace = true }
 
 # HTTP client for registry

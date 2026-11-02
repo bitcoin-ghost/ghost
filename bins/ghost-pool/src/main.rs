@@ -758,6 +758,107 @@ struct Args {
     /// With --ledger-import: report what WOULD change and write nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// NODE-POOL CUTOVER: export the miners' ledger at a finalised payout checkpoint, and the MPC
+    /// ceremony lineage, into DIR, then exit. Read-only: the database is opened read-only and
+    /// never migrated, so it is safe on a running or stopped node. See docs/LEDGER_EXPORT.md.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires_all = ["np_export_height", "np_export_sats_per_work"]
+    )]
+    np_export: Option<PathBuf>,
+
+    /// With --np-export: the EXACT checkpoint height. Never falls back to an older one.
+    #[arg(long, value_name = "HEIGHT", requires = "np_export")]
+    np_export_height: Option<u64>,
+
+    /// With --np-export: sats per whole unit of work, exact: `N`, `N/D` or `I.F`. Required;
+    /// the export never picks a rate.
+    #[arg(long, value_name = "RATE", requires = "np_export")]
+    np_export_sats_per_work: Option<String>,
+
+    /// With --np-export: network the payout addresses belong to.
+    #[arg(long, value_name = "NETWORK", default_value = "bitcoin")]
+    np_export_network: String,
+
+    /// With --np-export: database file (default: ghost.db in the data directory).
+    #[arg(long, value_name = "FILE", requires = "np_export")]
+    np_export_db: Option<PathBuf>,
+
+    /// With --np-export: export even when the stored ledger_root does not recompute from the
+    /// adopted lists (the export records a warning).
+    #[arg(long, requires = "np_export")]
+    np_export_allow_root_mismatch: bool,
+}
+
+/// Handle `--np-export`: run the read-only node-pool export and print what a stranger needs.
+fn handle_np_export(args: &Args, out_dir: &std::path::Path) -> Result<()> {
+    use ghost_pool::node_pool_export as npx;
+    use std::str::FromStr as _;
+
+    let db_path = match &args.np_export_db {
+        Some(p) => expand_path(p)?,
+        None => expand_path(&args.data_dir)?.join("ghost.db"),
+    };
+    let network = bitcoin::Network::from_str(&args.np_export_network)
+        .map_err(|e| anyhow::anyhow!("--np-export-network {:?}: {e}", args.np_export_network))?;
+    let opts = npx::ExportOptions {
+        db_path,
+        out_dir: expand_path(out_dir)?,
+        height: args
+            .np_export_height
+            .ok_or_else(|| anyhow::anyhow!("--np-export needs --np-export-height"))?,
+        sats_per_work: args.np_export_sats_per_work.clone(),
+        network,
+        allow_root_mismatch: args.np_export_allow_root_mismatch,
+    };
+    let s = npx::run(&opts)?;
+    let l = &s.ledger;
+    println!("ledger export  {}", l.format);
+    println!(
+        "  checkpoint     height {}  cutoff_ts {}",
+        l.checkpoint.height, l.checkpoint.cutoff_ts
+    );
+    println!("  ledger_root    {}", l.checkpoint.ledger_root);
+    println!(
+        "  adopted_root   {}  ({})",
+        l.checkpoint.adopted_root,
+        if l.checkpoint.ledger_root_recomputes {
+            "recomputes"
+        } else {
+            "DOES NOT recompute"
+        }
+    );
+    println!(
+        "  canonical_payout sha256 {}",
+        l.checkpoint.canonical_payout_sha256
+    );
+    println!(
+        "  rate           {}/{} sats per work ({} checkpoint units per work)",
+        l.rate.sats_per_work_num, l.rate.sats_per_work_den, l.rate.work_units_per_work
+    );
+    println!(
+        "  miners         {}  table rows {}",
+        l.miners.len(),
+        l.genesis_table.len()
+    );
+    println!("  total work     {}", l.totals.work);
+    println!("  total face     {} (2^-32 sat)", l.totals.face_units);
+    println!(
+        "  remainder      {} + {}/{} face units lost to per-miner flooring",
+        l.totals.remainder_face_units, l.totals.remainder_frac_num, l.totals.remainder_frac_den
+    );
+    println!("  LEDGER DIGEST  {}", l.digest_sha256);
+    println!("mpc lineage    {}", npx::MPC_FORMAT);
+    println!("  MPC DIGEST     {}", s.mpc_digest_sha256);
+    for w in &l.warnings {
+        println!("WARNING: {w}");
+    }
+    for f in &s.files {
+        println!("wrote {}", f.display());
+    }
+    Ok(())
 }
 
 /// Handle `--status`: report what THIS node can establish about itself (B4).
@@ -2352,6 +2453,11 @@ async fn main() -> Result<()> {
         .is_err()
     {
         // Already installed (test harness / re-init); nothing to do.
+    }
+
+    // Node-pool export: read-only, needs no config, and must not create or migrate anything.
+    if let Some(out_dir) = &args.np_export {
+        return handle_np_export(&args, out_dir);
     }
 
     // Expand data directory

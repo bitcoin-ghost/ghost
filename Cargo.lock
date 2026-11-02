@@ -3507,6 +3507,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "rusqlite",
  "rustls",
  "secp256k1 0.28.2",
  "serde",
