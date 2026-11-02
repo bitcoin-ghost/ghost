@@ -300,8 +300,14 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   store) and creates `np_genesis` and `np_genesis_meta`. Kept, because code still reads them:
   `miners`, `shares`, `shares_archive` (and the `shares_all` view), `rounds`, `nodes`, `peers`,
   `uptime_samples`, `won_blocks`, and every `np_*` table.
-- **It refuses, changing nothing,** on any row in `withdrawal_requests`, `ghost_locks`, `l2_*` or
-  `wraith_*`, and when a table it drops holds rows but no verified copy exists: it takes one
+- **It refuses, changing nothing,** on any row in a table that can hold user funds or an unspent
+  claim: `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`, Ghost Pay's
+  `confidential_notes`, `nullifiers`, `pending_nullifiers`, `confidential_transfers`,
+  `pending_l2_shields`, `accepted_instant_payments` and `instant_payment_reservations`,
+  `confirmed_pool_staging` and `reconciliation_entries`, and on a `node_rewards` row whose
+  `balance_sats` is not 0 (every health report creates one at 0). The old payout ledger is not
+  halted on: the ledger export carries it. It also refuses when a table it drops holds rows but
+  no verified copy exists: it takes one
   itself (`<db>.pre-v65`, `VACUUM INTO`, twice the database free required), reuses a verifying
   one, and never overwrites one that does not verify.
 - **Space**: with `auto_vacuum = INCREMENTAL` the free list is drained step by step after the
