@@ -1075,13 +1075,20 @@ impl Database {
         })
     }
 
+    /// Store one share outside any batch: an anchor's own share, which no batch of its own can
+    /// carry (its job committed the batch before it was hashed). Idempotent; a different share
+    /// under the same id is an error. Pruning keeps any share that is an anchor's own.
+    pub fn np_insert_share(&self, s: &NpShareRecord) -> GhostResult<()> {
+        self.transaction(|tx| insert_share_conn(tx, s))
+    }
+
     /// One share, if held.
     pub fn np_get_share(&self, share_id: &ShareId) -> GhostResult<Option<NpShareRecord>> {
         self.with_connection(|conn| get_share_conn(conn, share_id))
     }
 
     /// Remove every batch whose anchor's `btc_height` is below `retention_height`, and every
-    /// share no remaining batch carries. Anchor headers, the ledger and its journals are kept.
+    /// share no remaining batch carries and no anchor owns. Anchor headers, the ledger and its journals are kept.
     /// One transaction. Frees pages to SQLite's free list only: no VACUUM.
     pub fn np_prune_batches_below(&self, retention_height: u32) -> GhostResult<NpPruneReport> {
         self.transaction(|tx| {
@@ -1116,7 +1123,8 @@ impl Database {
                 shares += tx
                     .execute(
                         "DELETE FROM np_shares WHERE share_id = ?1 AND NOT EXISTS \
-                         (SELECT 1 FROM np_batch_shares WHERE share_id = ?1)",
+                         (SELECT 1 FROM np_batch_shares WHERE share_id = ?1) AND NOT EXISTS \
+                         (SELECT 1 FROM np_anchors WHERE hash = ?1)",
                         params![id],
                     )
                     .map_err(db_err)?;
@@ -1768,6 +1776,28 @@ mod tests {
             db.np_prune_batches_below(150).unwrap(),
             NpPruneReport::default()
         );
+    }
+
+    #[test]
+    fn an_anchors_own_share_is_stored_alone_and_survives_pruning() {
+        let db = db();
+        db.np_insert_anchor(&anchor(1, None, 0, 100)).unwrap();
+        // Share 30 is an anchor's own share, later included in anchor 1's (old) batch.
+        let own = share(30);
+        db.np_insert_share(&own).unwrap();
+        db.np_insert_share(&own).unwrap();
+        let mut altered = own.clone();
+        altered.coinbase.push(0);
+        assert!(db.np_insert_share(&altered).is_err());
+        let mut rec = anchor(2, Some(1), 1, 100);
+        rec.hash = own.share_id;
+        db.np_insert_anchor(&rec).unwrap();
+        db.np_insert_batch(&h(1), &[member(30, 1), member(31, 1)], 0)
+            .unwrap();
+        let r = db.np_prune_batches_below(150).unwrap();
+        assert_eq!((r.batches, r.shares), (1, 1));
+        assert_eq!(db.np_get_share(&own.share_id).unwrap(), Some(own));
+        assert_eq!(db.np_get_share(&share(31).share_id).unwrap(), None);
     }
 
     // -- ledger --------------------------------------------------------------------------------
