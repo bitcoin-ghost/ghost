@@ -7,7 +7,7 @@
 - **No block has ever been found** by the node pool.
 - **No payout has ever been made.**
 - **Your balance may stay unpaid for a long time.** Even if every miner could carry large coinbases, a 100 TH/s miner on a pool at 1% of the network would wait about 4.5 months for a first payment. On hardware with low coinbase limits, about half of small miners were not paid within 2 simulated years.
-- **An unaudited node can cheat you.** The node you mine on builds your jobs. Until `ghost-audit` exists, you are trusting it. See [Auditing your node](#ghost-audit).
+- **An unaudited node can cheat you.** The node you mine on builds your jobs. Unless you audit it with `ghost-audit`, you are trusting it. See [Auditing your node](#ghost-audit).
 - **If you need steady income, use an established pool.**
 
 ## What has been tested

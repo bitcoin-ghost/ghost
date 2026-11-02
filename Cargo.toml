@@ -39,6 +39,8 @@ members = [
     "bins/ghost-pool",
     "bins/ghost-stats",
     "bins/ghost-cli",
+    # Miner-side audit of a node pool node's jobs, and the public prober (W2.9)
+    "bins/ghost-audit",
     # Headless setup CLI
     "bins/ghost-setup",
     # SV2 apps (amalgamated from the former sv2-apps submodule)

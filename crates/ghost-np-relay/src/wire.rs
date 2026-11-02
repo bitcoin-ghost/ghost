@@ -45,12 +45,21 @@
 //! | 13 | `Headers` | count u16, anchors in chain order: btc_height u32, the anchor's [`NetShare`] |
 //! | 14 | `GetBtcBlocks` | count u8, Bitcoin block hashes |
 //! | 15 | `BtcBlocks` | count u16, [`BtcBlockMsg`]s |
+//! | 16 | `GetStamps` | empty |
+//! | 17 | `Stamps` | node_id 32, count u8, (parent_anchor 32, batch_root 32) newest first |
 //!
-//! `NotFound` kind 3 is a Bitcoin block. Messages 12 to 15 are share-chain sync (W2.13): a node
+//! `NotFound` kind 3 is a Bitcoin block; kind 4 (hash all zeros) answers `GetStamps` from a node
+//! that does not stamp jobs. Messages 12 to 15 are share-chain sync (W2.13): a node
 //! behind its peers asks for anchor headers after the last locator hash on the peer's best chain,
 //! then fetches their batches with `GetBatch` / `GetShares`, and fetches from the archive any
 //! Bitcoin block its own Bitcoin node does not have (stale blocks, which Bitcoin peers never
 //! serve).
+//!
+//! Messages 16 and 17 are the job stamp (W2.9): what this node's mining jobs commit to in their
+//! share tag besides the miner's own payee and the job's tier and slot class. A miner's
+//! `ghost-audit` opens its job's tag with them; without them the tag is a hash the miner cannot
+//! check. They are self-authenticating: a stamp that does not hash to the tag in the coinbase
+//! proves nothing, so the auditor trusts the audited node for nothing by asking it.
 //!
 //! A [`NetShare`] is `header 80 || coinbase (u32 len) || merkle branch (u8 count, 32 each) ||
 //! node_id 32 || tier u8 || slot_class u16 || payee_script (u8 len) || parent_anchor 32 ||
@@ -66,6 +75,8 @@ use ghost_common::anchor_chain::{AnchorHash, ShareId};
 use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::ShareTagPreimage;
 use ghost_storage::node_pool_store::NpShareRecord;
+
+use crate::relay::JobAnchor;
 
 /// Protocol version spoken by this build.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -98,6 +109,9 @@ pub const MAX_LOCATOR: usize = 64;
 pub const MAX_HEADERS_PER_MESSAGE: usize = 32;
 /// Most Bitcoin blocks asked for, or sent, in one message.
 pub const MAX_BTC_BLOCKS_PER_MESSAGE: usize = 16;
+
+/// Most job stamps in one `Stamps`: about 8 minutes of re-batches at the 30 s backstop.
+pub const MAX_STAMPS: usize = 16;
 
 /// Largest encoded [`NetShare`].
 pub const MAX_SHARE_BYTES: usize = 80
@@ -152,6 +166,10 @@ pub enum MsgType {
     GetBtcBlocks = 14,
     /// Archived Bitcoin blocks.
     BtcBlocks = 15,
+    /// Ask for the node's recent job stamps.
+    GetStamps = 16,
+    /// The node's recent job stamps.
+    Stamps = 17,
 }
 
 impl MsgType {
@@ -175,6 +193,8 @@ impl MsgType {
             13 => Headers,
             14 => GetBtcBlocks,
             15 => BtcBlocks,
+            16 => GetStamps,
+            17 => Stamps,
             _ => return None,
         })
     }
@@ -198,6 +218,8 @@ impl MsgType {
             Headers => 2 + MAX_HEADERS_PER_MESSAGE * (4 + MAX_SHARE_BYTES),
             GetBtcBlocks => 1 + 32 * MAX_BTC_BLOCKS_PER_MESSAGE,
             BtcBlocks => 2 + MAX_BTC_BLOCKS_PER_MESSAGE * MAX_BTC_BLOCK_BYTES,
+            GetStamps => 0,
+            Stamps => 32 + 1 + 64 * MAX_STAMPS,
         }
     }
 }
@@ -375,6 +397,18 @@ pub enum NotFoundKind {
     Share = 2,
     /// An archived Bitcoin block.
     BtcBlock = 3,
+    /// Job stamps: this node does not stamp jobs (no pool attached).
+    Stamps = 4,
+}
+
+/// What a node's mining jobs commit to in their share tag, besides each miner's own payee, tier
+/// and slot class: its `node_id`, and the anchor and batch root of its recent job stamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStamps {
+    /// The node id every tag of this node commits.
+    pub node_id: [u8; 32],
+    /// The last stamps published to its jobs, newest first, at most [`MAX_STAMPS`].
+    pub recent: Vec<JobAnchor>,
 }
 
 /// One relay message.
@@ -424,6 +458,10 @@ pub enum Message {
     GetBtcBlocks(Vec<[u8; 32]>),
     /// Archived Bitcoin blocks.
     BtcBlocks(Vec<BtcBlockMsg>),
+    /// Ask for the node's job stamps.
+    GetStamps,
+    /// The node's job stamps.
+    Stamps(JobStamps),
 }
 
 impl Message {
@@ -446,6 +484,8 @@ impl Message {
             Message::Headers(_) => MsgType::Headers,
             Message::GetBtcBlocks(_) => MsgType::GetBtcBlocks,
             Message::BtcBlocks(_) => MsgType::BtcBlocks,
+            Message::GetStamps => MsgType::GetStamps,
+            Message::Stamps(_) => MsgType::Stamps,
         }
     }
 
@@ -503,7 +543,15 @@ impl Message {
                 p.extend_from_slice(&work.to_be_bytes());
                 p.extend_from_slice(&height.to_le_bytes());
             }
-            Message::GetAddr => {}
+            Message::GetAddr | Message::GetStamps => {}
+            Message::Stamps(s) => {
+                p.extend_from_slice(&s.node_id);
+                p.push(s.recent.len() as u8);
+                for j in &s.recent {
+                    p.extend_from_slice(&j.parent_anchor);
+                    p.extend_from_slice(&j.batch_root);
+                }
+            }
             Message::Addr(v) => {
                 p.push(v.len() as u8);
                 v.iter().for_each(|a| put_str(p, a, MAX_ADDR_LEN));
@@ -596,6 +644,7 @@ impl Message {
                     1 => NotFoundKind::Batch,
                     2 => NotFoundKind::Share,
                     3 => NotFoundKind::BtcBlock,
+                    4 => NotFoundKind::Stamps,
                     _ => return Err(WireError::Truncated),
                 };
                 Message::NotFound(k, r.arr32()?)
@@ -606,6 +655,23 @@ impl Message {
                 height: r.u32()?,
             },
             MsgType::GetAddr => Message::GetAddr,
+            MsgType::GetStamps => Message::GetStamps,
+            MsgType::Stamps => {
+                let node_id = r.arr32()?;
+                let n = r.u8()? as usize;
+                if n > MAX_STAMPS {
+                    return Err(WireError::TooMany(n));
+                }
+                let recent = (0..n)
+                    .map(|_| {
+                        Ok(JobAnchor {
+                            parent_anchor: r.arr32()?,
+                            batch_root: r.arr32()?,
+                        })
+                    })
+                    .collect::<Result<_, WireError>>()?;
+                Message::Stamps(JobStamps { node_id, recent })
+            }
             MsgType::Addr => {
                 let n = r.u8()? as usize;
                 if n > MAX_ADDRS {
@@ -899,6 +965,25 @@ mod tests {
                 branch: vec![[8; 32]],
             }]),
             Message::NotFound(NotFoundKind::BtcBlock, [14; 32]),
+            Message::GetStamps,
+            Message::Stamps(JobStamps {
+                node_id: [15; 32],
+                recent: vec![
+                    JobAnchor {
+                        parent_anchor: [16; 32],
+                        batch_root: [17; 32],
+                    },
+                    JobAnchor {
+                        parent_anchor: [18; 32],
+                        batch_root: [19; 32],
+                    },
+                ],
+            }),
+            Message::Stamps(JobStamps {
+                node_id: [20; 32],
+                recent: vec![],
+            }),
+            Message::NotFound(NotFoundKind::Stamps, [0; 32]),
         ]
     }
 
@@ -989,6 +1074,21 @@ mod tests {
         );
         let over = ((MAX_BTC_BLOCKS_PER_MESSAGE + 1) as u16).to_le_bytes();
         assert!(Message::decode_payload(MsgType::BtcBlocks, &over).is_err());
+        let mut st = vec![0u8; 32];
+        st.push((MAX_STAMPS + 1) as u8);
+        st.extend(vec![0u8; 64 * (MAX_STAMPS + 1)]);
+        assert!(Message::decode_payload(MsgType::Stamps, &st).is_err());
+        let full = Message::Stamps(JobStamps {
+            node_id: [1; 32],
+            recent: vec![
+                JobAnchor {
+                    parent_anchor: [2; 32],
+                    batch_root: [3; 32],
+                };
+                MAX_STAMPS
+            ],
+        });
+        assert!(Message::decode(&full.encode()).is_ok());
         // The largest legal sync messages fit their caps.
         let headers = Message::Headers(
             (0..MAX_HEADERS_PER_MESSAGE)

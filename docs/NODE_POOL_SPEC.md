@@ -107,7 +107,7 @@ Mandatory corrections from simulation:
 **Batches and relay (W2.5, `crates/ghost-np-relay`).**
 - `batch_root = sha256("GhostBatch/v1" || n as u32 LE || M)`, where `M` is the RFC 6962 merkle tree over the batch's share ids in batch order (`leaf = sha256(0x00 || id)`, `node = sha256(0x01 || left || right)`, split at the largest power of two below `n`, odd nodes carried up, empty tree 32 zero bytes). A share id is its header hash. The count is committed, and the tree gives a miner a log-size proof that an anchor included its share.
 - A job's batch is the set of loose network shares its node held when it last re-batched: on every new best anchor, and every 30 s. A share mined since then waits for the next batch.
-- Messages, all length-prefixed and capped per type: `Hello` (protocol version, genesis anchor, tip), `Share` (header, coinbase, merkle branch, tag preimage), `Anchor` (`btc_height` and the anchor's own share), `Batch` (anchor and share ids), `GetBatch`, `GetShares`, `Shares`, `GetAnchor`, `NotFound`, `Tip`, `GetAddr`, `Addr`. A node relays an anchor and its batch only after checking them, so it never passes on an anchor it cannot serve.
+- Messages, all length-prefixed and capped per type: `Hello` (protocol version, genesis anchor, tip), `Share` (header, coinbase, merkle branch, tag preimage), `Anchor` (`btc_height` and the anchor's own share), `Batch` (anchor and share ids), `GetBatch`, `GetShares`, `Shares`, `GetAnchor`, `NotFound`, `Tip`, `GetAddr`, `Addr`, and (W2.9) `GetStamps`/`Stamps`: a node's id and its last 16 job stamps (parent anchor, batch root), so a miner can open its job's tag. A node relays an anchor and its batch only after checking them, so it never passes on an anchor it cannot serve.
 - An anchor's own share is checked as included by the anchor itself; if it fails, the anchor is invalid. It earns credit only when a later anchor includes it, like any network share.
 - Peers are any nodes on the same genesis. Invalid data scores toward a 24-hour ban; late, stale or fork data never does.
 
@@ -163,7 +163,7 @@ Settlement is applied at tip, not at maturity, using Bitcoin ancestry plus the s
 Pinned test cases: the 15 in `test_vectors.json`, plus 503/504-output golden vectors, two blocks on one snapshot, reorg restores balances, halving block.
 
 ### 2.4 What this does not fix
-- **Your own node can harvest you.** A hostile node can put its own payee on jobs before you hash. `ghost-audit` and the proxy check detect it; without them, a miner trusts their node.
+- **Your own node can harvest you.** A hostile node can put its own payee on jobs before you hash. `ghost-audit` detects it (W2.9; the proxy check went with ghost-miner-proxy); without it, a miner trusts their node.
 - **Block withholding** cannot be prevented, only seen as pool-level luck.
 - **A pool-work majority** can censor and rewrite recent anchors. It cannot forge or relabel. A 45% attacker is not contained: 23% per cycle at lag 12-23, 10% at lag 24-47.
 - **Small pools have no real security.** One 200 TH/s ASIC is about 65% of today's 110 TH/s. Nothing is worth stealing until blocks are found, but the ledger can be rewritten until hashrate grows.
