@@ -99,7 +99,8 @@ pub fn limits_for(t: MsgType) -> (f64, f64) {
         Hello => (0.0, 1.0),
         Share => (100.0, 500.0),
         Anchor | Batch => (5.0, 100.0),
-        Shares | GetShares | GetBatch | GetAnchor | NotFound => (20.0, 200.0),
+        GetShares => (5.0, 50.0),
+        Shares | GetBatch | GetAnchor | NotFound => (20.0, 200.0),
         Tip => (2.0, 20.0),
         GetAddr | Addr => (0.1, 4.0),
     }

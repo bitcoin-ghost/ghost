@@ -81,8 +81,7 @@ use ghost_storage::Database;
 use crate::headers::{HeaderFacts, HeaderLookup};
 use crate::peers::penalty;
 use crate::wire::{
-    AnchorMsg, Message, NetShare, NotFoundKind, MAX_BATCH_SHARES, MAX_IDS_PER_REQUEST,
-    MAX_SHARES_PER_MESSAGE,
+    AnchorMsg, Message, NetShare, NotFoundKind, MAX_BATCH_SHARES, MAX_SHARES_PER_MESSAGE,
 };
 
 /// A connected peer, as the network layer numbers it.
@@ -312,8 +311,8 @@ struct Awaiting {
 
 struct Loose {
     job_height: u32,
-    /// The snapshot anchor it was last fully checked against.
-    checked: Option<AnchorHash>,
+    /// The snapshot anchor and retirement view it was last fully checked against.
+    checked: Option<(AnchorHash, [u8; 32])>,
 }
 
 struct Published {
@@ -335,6 +334,8 @@ const CUM_CACHE: usize = 64;
 const TABLE_CACHE: usize = 32;
 /// Batches buffered for anchors not held yet.
 const EARLY_BATCHES: usize = 256;
+/// Most share bodies served for one `GetShares`.
+const MAX_SERVED_SHARES: usize = 4 * MAX_SHARES_PER_MESSAGE;
 /// Re-batched shares must still be includable this many Bitcoin blocks ahead.
 const BATCH_MARGIN: u32 = 2;
 
@@ -854,6 +855,16 @@ impl Relay {
         }
         self.orphans.retain(|_, v| !v.is_empty());
         self.orphan_count -= dropped;
+        // Parents of orphans not on request any more: ask again, from whoever sent the orphan.
+        let lost: Vec<(AnchorHash, Option<PeerId>)> = self
+            .orphans
+            .iter()
+            .filter(|(p, _)| !self.asked_anchor.contains_key(*p))
+            .map(|(p, v)| (*p, v.first().and_then(|(s, _, _)| *s)))
+            .collect();
+        for (p, from) in lost {
+            self.ask_anchor(p, from);
+        }
         self.evict_loose();
         if now.saturating_sub(self.last_snapshot_at) >= self.p.backstop_secs {
             self.publish_snapshot(hdr, false);
@@ -924,12 +935,13 @@ impl Relay {
         src: Option<PeerId>,
     ) {
         let id = s.id();
+        let tag = self.retirements.view_tag(&self.chain, &self.chain.best());
         self.shares.entry(id).or_insert_with(|| Arc::new(s.clone()));
         self.loose.insert(
             id,
             Loose {
                 job_height,
-                checked,
+                checked: checked.map(|a| (a, tag)),
             },
         );
         self.stats.shares_accepted += 1;
@@ -1342,7 +1354,7 @@ impl Relay {
         self.batch_source.insert(a, src);
         if !missing.is_empty() {
             if let Some(p) = src {
-                for chunk in missing.chunks(MAX_IDS_PER_REQUEST) {
+                for chunk in missing.chunks(MAX_SERVED_SHARES) {
                     self.out
                         .push(Out::Send(p, Message::GetShares(chunk.to_vec())));
                 }
@@ -1720,6 +1732,7 @@ impl Relay {
             .map(|(i, l)| (l.job_height, *i))
             .collect();
         cands.sort_unstable();
+        let tag = self.retirements.view_tag(&self.chain, &best);
         let mut out = Vec::new();
         let mut drop = Vec::new();
         for (h, id) in cands {
@@ -1728,7 +1741,7 @@ impl Relay {
             }
             let sa = cut(h).and_then(|c| self.chain.last_below(&best, c));
             let quick = sa.is_some()
-                && self.loose[&id].checked == sa
+                && self.loose[&id].checked == sa.map(|a| (a, tag))
                 && !self.chain.included_on_ancestry(&best, &id);
             if quick {
                 out.push(id);
@@ -1745,7 +1758,7 @@ impl Relay {
             match self.check_share(&s, inc, hdr) {
                 Ok((_, sa)) => {
                     if let Some(l) = self.loose.get_mut(&id) {
-                        l.checked = Some(sa);
+                        l.checked = Some((sa, tag));
                     }
                     out.push(id);
                 }
@@ -1824,9 +1837,11 @@ impl Relay {
     }
 
     fn serve_shares(&mut self, peer: PeerId, ids: &[ShareId]) {
+        // Bounded per request: a peer that needs more asks again (`retry_request` does).
         let held: Vec<NetShare> = ids
             .iter()
             .filter_map(|i| self.shares.get(i).map(|s| (**s).clone()))
+            .take(MAX_SERVED_SHARES)
             .collect();
         for chunk in held.chunks(MAX_SHARES_PER_MESSAGE) {
             self.out
@@ -1850,26 +1865,28 @@ impl Relay {
         let Some(p) = peer else {
             return;
         };
-        let msg = match self.batch_ids.get(&a) {
-            None => Message::GetBatch(a),
+        let msgs = match self.batch_ids.get(&a) {
+            None => vec![Message::GetBatch(a)],
             Some(ids) => {
                 let missing: Vec<ShareId> = ids
                     .iter()
                     .filter(|i| !self.shares.contains_key(*i))
-                    .take(MAX_IDS_PER_REQUEST)
                     .copied()
                     .collect();
                 if missing.is_empty() {
                     return;
                 }
-                Message::GetShares(missing)
+                missing
+                    .chunks(MAX_SERVED_SHARES)
+                    .map(|c| Message::GetShares(c.to_vec()))
+                    .collect()
             }
         };
         if let Some(aw) = self.awaiting.get_mut(&a) {
             aw.asked.push(p);
             aw.since = self.now;
         }
-        self.out.push(Out::Send(p, msg));
+        self.out.extend(msgs.into_iter().map(|m| Out::Send(p, m)));
     }
 
     fn penalize(&mut self, peer: Option<PeerId>, score: u32, reason: String) {

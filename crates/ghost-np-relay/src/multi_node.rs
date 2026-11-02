@@ -405,3 +405,23 @@ fn a_reorg_parks_block_retirements_above_the_credits_and_re_applies_them() {
         .unwrap();
     assert_eq!(ledger(&s, 0), ledger(&s, 1));
 }
+
+#[test]
+fn a_peer_that_missed_the_shares_fetches_a_large_batch_in_chunks() {
+    let mut s = Sim::mesh(2);
+    s.unlink(0, 1);
+    for _ in 0..300 {
+        s.mine(0, false);
+    }
+    s.tick(31);
+    s.mine(0, true);
+    let a = s.nodes[0].relay.best();
+    assert_eq!(s.nodes[0].relay.batch_credits(&a).unwrap().len(), 300);
+    assert_eq!(s.nodes[1].relay.status().loose, 0);
+    // Node 1 learns of the tip on connect, fetches the anchor, then the bodies, 256 at a time.
+    s.link(0, 1);
+    s.run();
+    assert_eq!(assert_converged(&s), a);
+    assert_no_penalties(&s);
+    assert_eq!(ledger(&s, 1)[&s.nodes[0].miner.payee].owed, 300 * face());
+}
