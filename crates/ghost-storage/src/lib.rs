@@ -50,11 +50,8 @@ pub use audit_log::*;
 pub use database::*;
 pub use encryption::*;
 pub use models::*;
-pub use queries::L2StateInfo;
 pub use queries::MeshNodeListCheckpointRecord;
 pub use queries::MpcContributionRecord;
 pub use queries::PayoutLedgerCheckpointRecord;
-pub use queries::{ConfidentialNoteRecord, ConfidentialTransferRecord};
-pub use queries::{L2CheckpointRecord, L2EpochRecord, L2NoteRecord, L2ValidRootRecord};
 pub use snapshot::*;
 // Note: queries module adds methods to Database via impl blocks

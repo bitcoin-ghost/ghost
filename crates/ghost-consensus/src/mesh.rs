@@ -2330,15 +2330,7 @@ impl MeshNetwork {
             | MessageType::ShardSampleResponse
             | MessageType::VerificationResult
             | MessageType::ChallengeConvergence
-            | MessageType::EquivocationProof
-            // L2 messages use Noise encryption (contain proofs and encrypted note data)
-            | MessageType::L2ConfidentialTransfer
-            | MessageType::L2TransferConfirmation
-            | MessageType::L2TransferBroadcast
-            | MessageType::L2CheckpointBlock
-            | MessageType::L2CheckpointVote
-            | MessageType::L2TreeSync
-            | MessageType::L2ShieldBroadcast => true,
+            | MessageType::EquivocationProof => true,
         }
     }
 
@@ -2675,13 +2667,7 @@ impl MeshNetwork {
             }
             // P2P-H3: Equivocation proofs use consensus voting port
             MessageType::EquivocationProof => self.config.ports.consensus_voting,
-            // L2 messages use consensus voting port
-            MessageType::L2ConfidentialTransfer
-            | MessageType::L2TransferConfirmation
-            | MessageType::L2TransferBroadcast
-            | MessageType::L2CheckpointBlock
-            | MessageType::L2CheckpointVote
-            | MessageType::PayoutLedgerCheckpoint
+            MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
             | MessageType::PayoutProposalSync
@@ -2700,9 +2686,7 @@ impl MeshNetwork {
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
             | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse
-            | MessageType::L2TreeSync
-            | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
+            | MessageType::ShardSampleResponse => self.config.ports.consensus_voting,
         };
         format!("tcp://{}:{}", host_only, base_port)
     }
@@ -3707,7 +3691,7 @@ impl MeshNetwork {
             "verify" => Some(MessageType::VerificationResult),
             "payout" => Some(MessageType::PayoutProposal),
             // Multi-type topics — skip fast check, rely on post-deser validation
-            "elder" | "l2tx" | "l2chk" | "l2vote" | "l2sync" | "unknown" => None,
+            "elder" | "unknown" => None,
             _ => None,
         }
     }
@@ -3841,11 +3825,6 @@ impl MeshNetwork {
             MessageType::Discovery => self.config.ports.discovery,
             MessageType::PayoutProposal => self.config.ports.payout_proposal,
             MessageType::EquivocationProof
-            | MessageType::L2ConfidentialTransfer
-            | MessageType::L2TransferConfirmation
-            | MessageType::L2TransferBroadcast
-            | MessageType::L2CheckpointBlock
-            | MessageType::L2CheckpointVote
             | MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
@@ -3864,9 +3843,7 @@ impl MeshNetwork {
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
             | MessageType::ShardSampleRequest
-            | MessageType::ShardSampleResponse
-            | MessageType::L2TreeSync
-            | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
+            | MessageType::ShardSampleResponse => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
                 self.config.ports.health_monitoring
             }
@@ -4795,14 +4772,7 @@ mod tests {
                 | MessageType::ShardSampleResponse
                 | MessageType::VerificationResult
                 | MessageType::ChallengeConvergence
-                | MessageType::EquivocationProof
-                | MessageType::L2ConfidentialTransfer
-                | MessageType::L2TransferConfirmation
-                | MessageType::L2TransferBroadcast
-                | MessageType::L2CheckpointBlock
-                | MessageType::L2CheckpointVote
-                | MessageType::L2TreeSync
-                | MessageType::L2ShieldBroadcast => true,
+                | MessageType::EquivocationProof => true,
             }
         }
 
@@ -4839,32 +4809,6 @@ mod tests {
         // Block/mining messages (MUST use Noise)
 
         // Elder management (MUST use Noise)
-
-        // L2 messages (MUST use Noise — contain proofs and encrypted note data)
-        assert!(
-            message_type_requires_noise(MessageType::L2ConfidentialTransfer),
-            "L2ConfidentialTransfer must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2TransferConfirmation),
-            "L2TransferConfirmation must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2TransferBroadcast),
-            "L2TransferBroadcast must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2CheckpointBlock),
-            "L2CheckpointBlock must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2CheckpointVote),
-            "L2CheckpointVote must use Noise"
-        );
-        assert!(
-            message_type_requires_noise(MessageType::L2TreeSync),
-            "L2TreeSync must use Noise"
-        );
 
         // ZK messages (MUST use Noise)
         // Verification and security (MUST use Noise)

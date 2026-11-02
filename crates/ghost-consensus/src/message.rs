@@ -53,14 +53,6 @@ pub mod topics {
     pub const VERIFICATION: &[u8] = b"verify";
     /// P2P-H3: Equivocation proof topic for Byzantine behavior evidence
     pub const EQUIVOCATION: &[u8] = b"equivoc";
-    /// L2 confidential transfer submission
-    pub const L2_TRANSFER: &[u8] = b"l2tx";
-    /// L2 checkpoint block
-    pub const L2_CHECKPOINT: &[u8] = b"l2chk";
-    /// L2 checkpoint vote
-    pub const L2_VOTE: &[u8] = b"l2vote";
-    /// L2 tree sync
-    pub const L2_SYNC: &[u8] = b"l2sync";
     /// Payout-ledger checkpoint proposal (BFT-finalised payout snapshot root)
     pub const PAYOUT_LEDGER_CHECKPOINT: &[u8] = b"plchk";
     /// Payout-ledger checkpoint vote
@@ -90,8 +82,6 @@ pub mod topics {
     /// the fourth byte — which matters because ZMQ subscriptions match by PREFIX, so a topic
     /// that extended an existing one would be silently delivered to its subscribers too.
     pub const MESH_ENDPOINT_ADVERT: &[u8] = b"mnladv";
-    /// L2 shield commitment broadcast
-    pub const L2_SHIELD: &[u8] = b"l2shld";
     /// Share shard: a node's signed per-epoch summary (delta + running total per address).
     ///
     /// `shd` prefix, not `sh`: ZMQ subscriptions match by PREFIX, so a topic that extends an
@@ -522,20 +512,6 @@ pub enum MessageType {
     ChallengeConvergence,
     /// P2P-H3: Equivocation proof broadcast for Byzantine behavior evidence
     EquivocationProof,
-    /// L2: Confidential transfer submission (sender → validator)
-    L2ConfidentialTransfer,
-    /// L2: Transfer confirmation receipt (validator → sender)
-    L2TransferConfirmation,
-    /// L2: Broadcast confirmed tx to all nodes (validator → all)
-    L2TransferBroadcast,
-    /// L2: Checkpoint block proposal (proposer → all)
-    L2CheckpointBlock,
-    /// L2: Checkpoint vote (validator → all)
-    L2CheckpointVote,
-    /// L2: Tree sync request/response (node → peer)
-    L2TreeSync,
-    /// L2: Shield commitment broadcast (node → all)
-    L2ShieldBroadcast,
     /// Payout-ledger checkpoint proposal (proposer → all): the BFT-finalised
     /// snapshot the coinbase is a pure function of.
     PayoutLedgerCheckpoint,
@@ -650,11 +626,6 @@ impl MessageType {
             Self::VerificationResult => topics::VERIFICATION,
             Self::ChallengeConvergence => topics::VERIFICATION,
             Self::EquivocationProof => topics::EQUIVOCATION,
-            Self::L2ConfidentialTransfer => topics::L2_TRANSFER,
-            Self::L2TransferConfirmation => topics::L2_TRANSFER,
-            Self::L2TransferBroadcast => topics::L2_TRANSFER,
-            Self::L2CheckpointBlock => topics::L2_CHECKPOINT,
-            Self::L2CheckpointVote => topics::L2_VOTE,
             Self::PayoutLedgerCheckpoint => topics::PAYOUT_LEDGER_CHECKPOINT,
             Self::PayoutLedgerCheckpointVote => topics::PAYOUT_LEDGER_VOTE,
             Self::PayoutLedgerCheckpointSync => topics::PAYOUT_LEDGER_SYNC,
@@ -673,8 +644,6 @@ impl MessageType {
             Self::ShardEvidence => topics::SHARD_EVIDENCE,
             Self::ShardSampleRequest => topics::SHARD_SAMPLE_REQUEST,
             Self::ShardSampleResponse => topics::SHARD_SAMPLE_RESPONSE,
-            Self::L2TreeSync => topics::L2_SYNC,
-            Self::L2ShieldBroadcast => topics::L2_SHIELD,
         }
     }
 
@@ -691,11 +660,6 @@ impl MessageType {
             Self::Discovery => "discovery",
             Self::VerificationResult | Self::ChallengeConvergence => "verify",
             Self::EquivocationProof => "equivoc",
-            Self::L2ConfidentialTransfer => "l2tx",
-            Self::L2TransferConfirmation => "l2tx",
-            Self::L2TransferBroadcast => "l2tx",
-            Self::L2CheckpointBlock => "l2chk",
-            Self::L2CheckpointVote => "l2vote",
             Self::PayoutLedgerCheckpoint => "plchk",
             Self::PayoutLedgerCheckpointVote => "plvote",
             Self::PayoutLedgerCheckpointSync => "plsync",
@@ -714,8 +678,6 @@ impl MessageType {
             Self::ShardEvidence => "shdevid",
             Self::ShardSampleRequest => "shdsreq",
             Self::ShardSampleResponse => "shdsrsp",
-            Self::L2TreeSync => "l2sync",
-            Self::L2ShieldBroadcast => "l2shield",
         }
     }
 }
@@ -1113,49 +1075,6 @@ impl EquivocationProofMessage {
 // P2P-C1/C2/C3: CANONICAL ELDER LIST Messages
 // =============================================================================
 
-// =============================================================================
-// L2 NOTE/UTXO MODEL MESSAGES
-// =============================================================================
-
-/// L2 transaction (sender creates, ~490 bytes)
-///
-/// Contains a ZK proof that a note spend is valid, plus encrypted
-/// note data for sender and recipient.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2Transaction {
-    /// Which epoch's tree this references
-    pub epoch: u64,
-    /// Nullifier (prevents double-spend, routes to validator)
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub nullifier: [u8; 32],
-    /// Change commitment (sender's new note)
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub change_commitment: [u8; 32],
-    /// Recipient commitment (recipient's new note)
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub recipient_commitment: [u8; 32],
-    /// Commitment root at proof time (Merkle inclusion)
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub commitment_root: [u8; 32],
-    /// Groth16 proof (192 bytes)
-    pub proof: Vec<u8>,
-    /// Encrypted note data for sender (change note)
-    pub encrypted_change: Vec<u8>,
-    /// Encrypted note data for recipient
-    pub encrypted_recipient: Vec<u8>,
-    /// Timestamp (Unix milliseconds)
-    pub timestamp: u64,
-}
-
-/// L2: Shield commitment (for checkpoint batching and transfer prerequisites)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShieldCommitment {
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub commitment: [u8; 32],
-    pub note_index: u64,
-    pub block_height: u64,
-}
-
 /// Epoch transition data (present at epoch boundary checkpoints)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochTransition {
@@ -1164,174 +1083,6 @@ pub struct EpochTransition {
     /// Compacted tree root
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub new_initial_root: [u8; 32],
-}
-
-/// L2: Confidential transfer submission (sender → assigned validator)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2ConfidentialTransferMessage {
-    /// The transaction with proof
-    pub transaction: L2Transaction,
-    /// Sender's node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub sender: NodeId,
-}
-
-/// L2: Transfer confirmation receipt (validator → sender)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2TransferConfirmationMessage {
-    /// Nullifier of the confirmed transaction
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub nullifier: [u8; 32],
-    /// Validator that confirmed it
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub validator: NodeId,
-    /// Confirmation timestamp
-    pub timestamp: u64,
-    /// Validator's signature over the nullifier
-    #[serde(with = "ghost_common::serde_hex::bytes64")]
-    pub signature: [u8; 64],
-}
-
-impl L2TransferConfirmationMessage {
-    /// Get the message to be signed
-    pub fn signing_message(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"L2TransferConfirmation/v1");
-        hasher.update(self.nullifier);
-        hasher.update(self.timestamp.to_le_bytes());
-        hasher.finalize().into()
-    }
-}
-
-/// L2: Broadcast confirmed tx to all nodes (validator → all)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2TransferBroadcastMessage {
-    /// The confirmed transaction
-    pub transaction: L2Transaction,
-    /// Validator that confirmed it
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub validator: NodeId,
-    /// Validator's signature
-    #[serde(with = "ghost_common::serde_hex::bytes64")]
-    pub signature: [u8; 64],
-    /// Shield commitments that must be applied before validating this transfer's root.
-    /// Piggybacked on the broadcast for instant (~100-200ms) network confirmation
-    /// instead of waiting for the next checkpoint (~10s).
-    #[serde(default)]
-    pub prerequisites: Vec<ShieldCommitment>,
-}
-
-impl L2TransferBroadcastMessage {
-    /// Get the message to be signed
-    pub fn signing_message(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"L2TransferBroadcast/v1");
-        hasher.update(self.transaction.nullifier);
-        hasher.update(self.transaction.change_commitment);
-        hasher.update(self.transaction.recipient_commitment);
-        for p in &self.prerequisites {
-            hasher.update(p.commitment);
-            hasher.update(p.note_index.to_le_bytes());
-        }
-        hasher.finalize().into()
-    }
-}
-
-/// L2: Checkpoint block proposal (proposer → all)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2CheckpointBlockMessage {
-    /// Checkpoint height
-    pub height: u64,
-    /// Epoch number
-    pub epoch: u64,
-    /// Previous commitment root
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub prev_commitment_root: [u8; 32],
-    /// New commitment root (after appending all new commitments)
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub new_commitment_root: [u8; 32],
-    /// Transactions included in this checkpoint
-    pub transactions: Vec<L2Transaction>,
-    /// Shield commitments included in this checkpoint (fallback distribution path).
-    /// Nodes that missed piggybacked prerequisites get shields here.
-    #[serde(default)]
-    pub shield_commitments: Vec<ShieldCommitment>,
-    /// Number of active nodes at this checkpoint
-    pub active_node_count: u32,
-    /// Proposer's node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub proposer: NodeId,
-    /// Proposer's signature
-    #[serde(with = "ghost_common::serde_hex::bytes64")]
-    pub proposer_signature: [u8; 64],
-    /// Timestamp (Unix milliseconds)
-    pub timestamp: u64,
-    /// Epoch transition data (present at epoch boundary)
-    pub epoch_transition: Option<EpochTransition>,
-}
-
-impl L2CheckpointBlockMessage {
-    /// Compute the hash of this checkpoint for voting
-    pub fn checkpoint_hash(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"L2CheckpointBlock/v1");
-        hasher.update(self.height.to_le_bytes());
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.prev_commitment_root);
-        hasher.update(self.new_commitment_root);
-        hasher.update((self.transactions.len() as u64).to_le_bytes());
-        for tx in &self.transactions {
-            hasher.update(tx.nullifier);
-        }
-        hasher.update((self.shield_commitments.len() as u64).to_le_bytes());
-        for sc in &self.shield_commitments {
-            hasher.update(sc.commitment);
-            hasher.update(sc.note_index.to_le_bytes());
-        }
-        hasher.finalize().into()
-    }
-
-    /// Get the deterministic signable bytes for the proposer signature.
-    /// Covers all fields except the signature itself.
-    pub fn to_signable_bytes(&self) -> [u8; 32] {
-        self.checkpoint_hash()
-    }
-}
-
-/// L2: Checkpoint vote (validator → all, all-node BFT)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2CheckpointVoteMessage {
-    /// Checkpoint height being voted on
-    pub height: u64,
-    /// Hash of the checkpoint block
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub checkpoint_hash: [u8; 32],
-    /// Voter's node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub voter: NodeId,
-    /// Vote (true = approve)
-    pub approve: bool,
-    /// Voter's signature
-    #[serde(with = "ghost_common::serde_hex::bytes64")]
-    pub signature: [u8; 64],
-    /// Timestamp (Unix milliseconds)
-    pub timestamp: u64,
-}
-
-impl L2CheckpointVoteMessage {
-    /// Get the message to be signed
-    pub fn signing_message(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"L2CheckpointVote/v1");
-        hasher.update(self.height.to_le_bytes());
-        hasher.update(self.checkpoint_hash);
-        hasher.update([self.approve as u8]);
-        hasher.finalize().into()
-    }
 }
 
 /// Payout-ledger checkpoint proposal (proposer → all).
@@ -2373,168 +2124,6 @@ pub struct MeshNodeListCheckpointSyncResponse {
     /// True if the responder hit its page cap — the requester should re-request.
     pub has_more: bool,
     /// Timestamp (Unix milliseconds).
-    pub timestamp: u64,
-}
-
-/// L2: Tree sync request (new node → peer)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2TreeSyncRequest {
-    /// Requesting node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub requesting_node: NodeId,
-    /// Start syncing from this checkpoint height
-    pub from_height: u64,
-    /// Timestamp
-    pub timestamp: u64,
-}
-
-/// L2: Tree sync response (peer → requesting node)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2TreeSyncResponse {
-    /// Responding node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub responding_node: NodeId,
-    /// Who asked. Responses go out over the broadcast transport, so without an addressee every
-    /// node processes every response in the mesh — with N nodes that is N(N-1) handler runs for
-    /// (N-1) real answers, and each run recomputes a Merkle root. On the 8-node fleet each node
-    /// was processing ~175 responses per 10 minutes of which ~150 were answers to somebody
-    /// else's question (#517).
-    ///
-    /// `Option` + `#[serde(default)]` for wire-compat: a peer that predates this field sends
-    /// `None`, which the handler treats as "cannot tell, process it" — the old behaviour. The
-    /// amplification only disappears once both ends are upgraded, which is the honest ordering
-    /// for a mixed-version fleet.
-    #[serde(default, with = "ghost_common::serde_hex::opt_bytes32")]
-    pub requesting_node: Option<NodeId>,
-    /// Checkpoint blocks (batched, max 100 per response)
-    pub checkpoints: Vec<L2CheckpointBlockMessage>,
-    /// Current epoch number
-    pub current_epoch: u64,
-    /// Current commitment root for verification
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub commitment_root: [u8; 32],
-    /// Epoch records for every epoch referenced by the checkpoints above.
-    ///
-    /// Sent so a joining node can materialise the parent `l2_epochs` rows
-    /// BEFORE persisting checkpoints that reference them, satisfying the
-    /// `l2_checkpoints.epoch -> l2_epochs.epoch` foreign-key trigger even when
-    /// the batch begins past an epoch boundary (e.g. early checkpoints were
-    /// pruned, or a prior boundary batch was dropped). Without this, a fresh
-    /// node relied on locally re-deriving epoch rows by replaying every
-    /// boundary in sequence — any gap left the epoch row missing and every
-    /// sync round re-failed the FK. `#[serde(default)]` keeps wire-compat with
-    /// peers that predate this field.
-    #[serde(default)]
-    pub epochs: Vec<L2EpochSync>,
-    /// Whether there are more checkpoints to sync
-    pub has_more: bool,
-    /// The `from_height` of the request this answers.
-    ///
-    /// Responses are broadcast and several peers answer the same question, so without the echo
-    /// the requester cannot tell WHICH gap an answer is about — and therefore cannot tell that
-    /// the gap it asked for came back unserved. `#[serde(default)]` keeps wire-compat; a peer
-    /// predating this field reports 0.
-    #[serde(default)]
-    pub served_from_height: u64,
-    /// Why the responder sent what it sent.
-    ///
-    /// Only the SERVER knows why a batch came back empty, and until this field it threw that
-    /// away: "no rows at all" (peer is behind — ask someone else), "rows present but their
-    /// payload was pruned" (permanently unfillable) and "payload failed to deserialize"
-    /// (corruption) all collapsed into `checkpoints_sent=0`. A node missing one pruned
-    /// checkpoint re-derived the same gap and re-asked for it forever (#621).
-    ///
-    /// `None` means the peer predates the field and MUST NOT be read as "nothing wrong" —
-    /// only an explicit report may retire a gap.
-    #[serde(default)]
-    pub serve_report: Option<TreeSyncServeReport>,
-    /// Timestamp
-    pub timestamp: u64,
-}
-
-/// What the responder found at and above the requested height, and what it did with it.
-///
-/// Counts, not a verdict: the requester decides what an empty answer means. Serving is
-/// bounded by `MAX_SYNC_CHECKPOINTS`, so every count describes the batch that was examined,
-/// not the responder's whole ledger.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeSyncServeReport {
-    /// Rows at or above the requested height that were examined, before any filtering.
-    pub rows_found: u64,
-    /// Rows whose `block_data` was empty. Checkpoint payloads are blanked by the 90-day
-    /// retention sweep (`prune_old_l2_checkpoints`), so these heights can never be served
-    /// by this peer again — the row survives, the block to replay it does not.
-    pub rows_pruned: u64,
-    /// Rows whose `block_data` was present but failed to deserialize. Distinct from pruned:
-    /// this is corruption, and it used to be skipped in silence.
-    pub rows_corrupt: u64,
-    /// Lowest height whose payload was pruned in this batch, if any. The requester compares
-    /// this against what it asked for: only a pruned row AT the requested height proves that
-    /// height unfillable.
-    pub pruned_from: Option<u64>,
-    /// Highest height whose payload was pruned in this batch, if any.
-    pub pruned_through: Option<u64>,
-}
-
-/// L2: Epoch metadata carried inside a tree-sync response.
-///
-/// Mirrors `ghost_storage::L2EpochRecord` on the wire (hex-encoded roots) so a
-/// joining node can upsert the parent epoch row for each synced checkpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2EpochSync {
-    /// Epoch number
-    pub epoch: u64,
-    /// First checkpoint height of this epoch
-    pub start_height: u64,
-    /// Last checkpoint height of this epoch (None while active)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_height: Option<u64>,
-    /// Commitment root at epoch start
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub initial_root: [u8; 32],
-    /// Commitment root at epoch end (None while active)
-    #[serde(default, with = "ghost_common::serde_hex::option_bytes32")]
-    pub final_root: Option<[u8; 32]>,
-    /// Number of notes migrated into this epoch at compaction
-    pub notes_migrated: u64,
-    /// Lifecycle status ("active" | "archived")
-    pub status: String,
-}
-
-/// L2: Note gap request — sent when tree sync replay didn't fix root mismatch.
-/// Asks peer for specific notes we're missing (SIGKILL recovery / fresh node bootstrap).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2NoteGapRequest {
-    /// Requesting node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub requesting_node: NodeId,
-    /// Our note count (peer compares to theirs)
-    pub our_note_count: u64,
-    /// Our note indices (peer diffs against theirs to find missing)
-    pub our_note_indices: Vec<u64>,
-    /// Only send missing notes with index >= from_index (pagination cursor)
-    #[serde(default)]
-    pub from_index: u64,
-    /// Timestamp
-    pub timestamp: u64,
-}
-
-/// L2: Note gap response — peer responds with a batch of notes we're missing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2NoteGapResponse {
-    /// Responding node ID
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub responding_node: NodeId,
-    /// Batch of notes the requester is missing (max 100 per response)
-    pub missing_notes: Vec<ShieldCommitment>,
-    /// Peer's total note count
-    pub their_note_count: u64,
-    /// Peer's current commitment root for verification
-    #[serde(with = "ghost_common::serde_hex::bytes32")]
-    pub commitment_root: [u8; 32],
-    /// Whether there are more missing notes beyond this batch
-    pub has_more: bool,
-    /// Timestamp
     pub timestamp: u64,
 }
 
@@ -3727,10 +3316,6 @@ mod tests {
             topics::ZK_VOTE,
             topics::VERIFICATION,
             topics::EQUIVOCATION,
-            topics::L2_TRANSFER,
-            topics::L2_CHECKPOINT,
-            topics::L2_VOTE,
-            topics::L2_SYNC,
             topics::PAYOUT_LEDGER_CHECKPOINT,
             topics::PAYOUT_LEDGER_VOTE,
             topics::PAYOUT_LEDGER_SYNC,
@@ -3743,7 +3328,6 @@ mod tests {
             topics::MESH_NODE_LIST_CHECKPOINT,
             topics::MESH_NODE_LIST_VOTE,
             topics::MESH_NODE_LIST_SYNC,
-            topics::L2_SHIELD,
             topics::SHARD_EPOCH_SUMMARY,
             topics::SHARD_TABLE_SYNC,
             topics::SHARD_EVIDENCE,
@@ -3927,10 +3511,6 @@ mod tests {
             ("ZK_VOTE", topics::ZK_VOTE),
             ("VERIFICATION", topics::VERIFICATION),
             ("EQUIVOCATION", topics::EQUIVOCATION),
-            ("L2_TRANSFER", topics::L2_TRANSFER),
-            ("L2_CHECKPOINT", topics::L2_CHECKPOINT),
-            ("L2_VOTE", topics::L2_VOTE),
-            ("L2_SYNC", topics::L2_SYNC),
             ("PAYOUT_LEDGER_CHECKPOINT", topics::PAYOUT_LEDGER_CHECKPOINT),
             ("PAYOUT_LEDGER_VOTE", topics::PAYOUT_LEDGER_VOTE),
             ("PAYOUT_LEDGER_SYNC", topics::PAYOUT_LEDGER_SYNC),
@@ -3947,7 +3527,6 @@ mod tests {
             ("MESH_NODE_LIST_VOTE", topics::MESH_NODE_LIST_VOTE),
             ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
             ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
-            ("L2_SHIELD", topics::L2_SHIELD),
             ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
             ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
             ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),
@@ -3998,10 +3577,6 @@ mod tests {
             ("ZK_VOTE", topics::ZK_VOTE),
             ("VERIFICATION", topics::VERIFICATION),
             ("EQUIVOCATION", topics::EQUIVOCATION),
-            ("L2_TRANSFER", topics::L2_TRANSFER),
-            ("L2_CHECKPOINT", topics::L2_CHECKPOINT),
-            ("L2_VOTE", topics::L2_VOTE),
-            ("L2_SYNC", topics::L2_SYNC),
             ("PAYOUT_LEDGER_CHECKPOINT", topics::PAYOUT_LEDGER_CHECKPOINT),
             ("PAYOUT_LEDGER_VOTE", topics::PAYOUT_LEDGER_VOTE),
             ("PAYOUT_LEDGER_SYNC", topics::PAYOUT_LEDGER_SYNC),
@@ -4018,7 +3593,6 @@ mod tests {
             ("MESH_NODE_LIST_VOTE", topics::MESH_NODE_LIST_VOTE),
             ("MESH_NODE_LIST_SYNC", topics::MESH_NODE_LIST_SYNC),
             ("MESH_ENDPOINT_ADVERT", topics::MESH_ENDPOINT_ADVERT),
-            ("L2_SHIELD", topics::L2_SHIELD),
             ("SHARD_EPOCH_SUMMARY", topics::SHARD_EPOCH_SUMMARY),
             ("SHARD_TABLE_SYNC", topics::SHARD_TABLE_SYNC),
             ("SHARD_EVIDENCE", topics::SHARD_EVIDENCE),

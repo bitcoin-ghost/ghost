@@ -3364,18 +3364,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ZK consensus handlers (optional feature)
-    // DEFERRED INITIALIZATION: ZK parameter generation is memory-intensive and can take minutes.
-    // We spawn it in a background task so the node can start serving immediately.
-    #[allow(unused_assignments, unused_mut)]
-    let mut l2_submit_fn_opt: Option<ghost_verification::L2SubmitFn> = None;
-    #[allow(unused_assignments, unused_mut)]
-    let mut l2_sync_commitment_fn_opt: Option<ghost_verification::L2SyncCommitmentFn> = None;
-    #[allow(unused_assignments, unused_mut)]
-    let mut l2_tree_state_fn_opt: Option<ghost_verification::L2TreeStateFn> = None;
-
-    // MPC ceremony integration (optional feature)
-
     // Create shutdown channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -4000,21 +3988,6 @@ async fn main() -> Result<()> {
     // #403: the operator-signed config endpoint edits THIS file. Passed explicitly rather than
     // guessed, so a node started with a non-default config cannot have a different one rewritten.
     verification_state = verification_state.with_pool_config_path(args.config.clone());
-
-    // Wire L2 submit callback if ZK consensus is enabled
-    if let Some(l2_submit_fn) = l2_submit_fn_opt {
-        verification_state = verification_state.with_l2_submit(l2_submit_fn);
-    }
-
-    // Wire L2 commitment sync callback if ZK consensus is enabled
-    if let Some(l2_sync_fn) = l2_sync_commitment_fn_opt {
-        verification_state = verification_state.with_l2_sync_commitment(l2_sync_fn);
-    }
-
-    // Wire L2 tree state callback if ZK consensus is enabled
-    if let Some(l2_tree_state_fn) = l2_tree_state_fn_opt {
-        verification_state = verification_state.with_l2_tree_state(l2_tree_state_fn);
-    }
 
     // Configure internal API authentication (AUTH4-1 security fix)
     let is_mainnet_auth = config.bitcoin.network == ghost_common::config::BitcoinNetwork::Mainnet;
@@ -5583,7 +5556,6 @@ async fn main() -> Result<()> {
                                 // it worked.
                                 verification_ledger = result.verification_ledger_deleted,
                                 verifications = result.verifications_deleted,
-                                checkpoints = result.checkpoints_pruned,
                                 // Without this the two numbers that matter cannot be paired.
                                 // MEASURED on vm1, 2026-10-04: two consecutive passes each
                                 // deleted ~5,280 rows and `db_size_mb` read 2433 both times —

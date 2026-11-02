@@ -300,11 +300,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // Additional dashboard endpoints
         .route("/api/v1/swarm", get(api_swarm_handler))
         .route("/api/v1/network/treasury", get(api_treasury_handler))
-        .route(
-            "/api/v1/l2/fee-distribution-context",
-            get(api_l2_fee_distribution_context_handler),
-        )
-        .route("/api/v1/l2/tree-state", get(api_l2_tree_state_handler))
         .route("/api/v1/rewards/current", get(api_rewards_current_handler))
         .route("/api/v1/rewards/history", get(api_rewards_history_handler))
         // HIGH-4: /api/v1/logs endpoint REMOVED - exposed journalctl output (security risk)
@@ -410,7 +405,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/settings/ghostpay_payout_address",
             get(api_settings_ghostpay_payout_address_handler),
         )
-        // L2 read endpoints (public)
         // Ghost Haze & Shroud endpoints
         .route("/api/v1/haze/status", get(api_haze_status_handler))
         .route("/api/v1/haze/legal-pack", get(api_haze_legal_pack_handler))
@@ -456,12 +450,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             ),
         )
         .route("/api/internal/pool-nodes", get(pool_nodes_handler))
-        // L2 mutation endpoints — localhost only (ghost-pay is colocated)
-        .route("/api/v1/l2/submit", post(api_l2_submit_handler))
-        .route(
-            "/api/v1/l2/sync-commitment",
-            post(api_l2_sync_commitment_handler),
-        )
         .layer(middleware::from_fn(localhost_only_middleware));
 
     // H-13: the share ingest lane. Separated from `localhost_router` because loopback is not an
@@ -709,12 +697,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_shroud_configure_handler),
         )
         // Dashboard: Node restart
-        .route("/api/v1/node/restart", post(api_node_restart_handler))
-        // L2 commitment sync (authenticated alternative to localhost-only sync-commitment)
-        .route(
-            "/api/internal/l2/sync-commitment",
-            post(api_l2_sync_commitment_handler),
-        );
+        .route("/api/v1/node/restart", post(api_node_restart_handler));
 
     // H-3: Apply authentication middleware - ALWAYS required for internal endpoints
     let internal_router = if let Some(ref auth) = state.internal_auth {
@@ -4493,8 +4476,7 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
 
 /// API v1 Treasury handler
 async fn api_treasury_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // ⛔ The treasury balance is read from the AUTHORITATIVE source, the same one
-    // `api_l2_fee_distribution_context_handler` uses one function below (#989).
+    // ⛔ The treasury balance is read from the AUTHORITATIVE source (#989).
     //
     // This handler used to sum `payouts` rows of type Treasury instead, which is not a balance:
     // `record_payout_entries` writes those at ARM TIME on every round, whether or not a block is
@@ -4564,151 +4546,6 @@ async fn api_treasury_handler(State(state): State<Arc<VerificationState>>) -> im
         "progress_percent": progress,
         "treasury_percent": 50.0,
         "node_pool_percent": 50.0
-    }))
-}
-
-/// L2 fee distribution context for ghost-pay settlement loop.
-/// Returns treasury state and qualified Ghost Pay nodes for fee distribution.
-async fn api_l2_fee_distribution_context_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let db = match state.database.as_ref() {
-        Some(db) => db,
-        None => {
-            return Json(serde_json::json!({
-                "error": "Database not available"
-            }));
-        }
-    };
-
-    // Get treasury balance
-    let treasury_balance_sats = db.get_treasury_balance().unwrap_or(0);
-
-    // Get treasury threshold timestamp
-    let threshold_reached_at: Option<i64> = db.get_treasury_threshold_reached().unwrap_or(None);
-
-    // Get nodes with Ghost Pay capability and their shares.
-    // Uses the nodes table which is updated by health pings. Filter for recently-seen
-    // nodes (last_seen within 5 min) that have ghost_pay in their capabilities JSON.
-    let now = chrono::Utc::now().timestamp();
-    let recent_cutoff = now - 300; // 5 minutes
-    let ghost_pay_nodes: Vec<serde_json::Value> = match db.get_top_nodes_by_shares(200) {
-        Ok(nodes) => nodes
-            .into_iter()
-            .filter(|node| node.last_seen >= recent_cutoff)
-            .filter_map(|node| {
-                // Parse "key:value,key:value" format stored by health_handler
-                let cap_map: std::collections::HashMap<&str, bool> = node
-                    .capabilities
-                    .split(',')
-                    .filter_map(|pair| {
-                        let (k, v) = pair.split_once(':')?;
-                        Some((k.trim(), v.trim() == "true"))
-                    })
-                    .collect();
-
-                if !cap_map.get("ghost_pay").copied().unwrap_or(false) {
-                    return None;
-                }
-                // Compute total shares from capabilities
-                let archive = if cap_map.get("archive").copied().unwrap_or(false) {
-                    5i32
-                } else {
-                    0
-                };
-                let ghost_pay_shares = 4i32;
-                let public_mining = if cap_map.get("public_mining").copied().unwrap_or(false) {
-                    3
-                } else {
-                    0
-                };
-                let reaper = if cap_map.get("reaper").copied().unwrap_or(false) {
-                    2
-                } else {
-                    0
-                };
-                let elder = if node.is_elder { 1 } else { 0 };
-                let total_shares = archive + ghost_pay_shares + public_mining + reaper + elder;
-
-                // Get payout address from node record or fall back to public_address
-                let address = db
-                    .get_node_payout_address(&node.node_id)
-                    .ok()
-                    .flatten()
-                    .or_else(|| node.public_address.clone())
-                    .unwrap_or_default();
-
-                Some(serde_json::json!({
-                    "node_id": node.node_id,
-                    "address": address,
-                    "shares": total_shares,
-                }))
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
-    Json(serde_json::json!({
-        "treasury_balance_sats": treasury_balance_sats,
-        "threshold_reached_at": threshold_reached_at,
-        "ghost_pay_nodes": ghost_pay_nodes,
-    }))
-}
-
-/// L2 commitment tree state for health monitoring.
-/// Exposes live in-memory tree root, checkpoint root, and finalization status.
-async fn api_l2_tree_state_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let tree_state_fn = match &state.l2_tree_state_fn {
-        Some(f) => f.clone(),
-        None => {
-            return Json(serde_json::json!({
-                "error": "L2 tree state not configured"
-            }));
-        }
-    };
-
-    let info = match tree_state_fn() {
-        Ok(info) => info,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("Failed to get tree state: {}", e)
-            }));
-        }
-    };
-
-    let db = match state.database.as_ref() {
-        Some(db) => db,
-        None => {
-            return Json(serde_json::json!({
-                "error": "Database not available"
-            }));
-        }
-    };
-
-    let checkpoint = db.get_latest_l2_checkpoint().unwrap_or(None);
-    let (checkpoint_root, checkpoint_tx_count, checkpoint_height) = match &checkpoint {
-        Some(cp) => (hex::encode(cp.commitment_root), cp.tx_count, cp.height),
-        None => ("0".repeat(64), 0, 0),
-    };
-
-    let recent_finalizations = db.count_recent_l2_finalizations(100).unwrap_or(0);
-    let active_finalizations = db.count_recent_active_l2_finalizations(100).unwrap_or(0);
-
-    let tree_root_hex = hex::encode(info.tree_root);
-    let roots_match = tree_root_hex == checkpoint_root;
-
-    Json(serde_json::json!({
-        "epoch": info.epoch,
-        "tree_root": tree_root_hex,
-        "checkpoint_height": checkpoint_height,
-        "checkpoint_root": checkpoint_root,
-        "checkpoint_tx_count": checkpoint_tx_count,
-        "note_count": info.note_count,
-        "recent_finalizations": recent_finalizations,
-        "active_finalizations": active_finalizations,
-        "roots_match": roots_match
     }))
 }
 
@@ -10262,84 +10099,6 @@ async fn metrics_handler(State(state): State<Arc<VerificationState>>) -> impl In
             )],
             "# No metrics available\n".to_string(),
         )
-    }
-}
-
-/// POST /api/v1/l2/submit — Accept L2 NoteSpend transaction for mesh broadcast
-///
-/// Called by ghost-pay after verifying a NoteSpend proof. Forwards the transaction
-/// to the consensus mesh via the l2_submit_fn callback.
-async fn api_l2_submit_handler(
-    State(state): State<Arc<VerificationState>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let submit_fn = match &state.l2_submit_fn {
-        Some(f) => f.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "L2 submission not configured"})),
-            );
-        }
-    };
-
-    match submit_fn(body.to_vec()) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "submitted"})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{}", e)})),
-        ),
-    }
-}
-
-/// POST /api/v1/l2/sync-commitment — Sync a commitment to the L2 tree
-///
-/// Called by ghost-pay after shielding a note or applying a transfer.
-/// Inserts the commitment into the ghost-mining epoch tree and broadcasts to mesh.
-async fn api_l2_sync_commitment_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let sync_fn = match &state.l2_sync_commitment_fn {
-        Some(f) => f.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "L2 commitment sync not configured"})),
-            );
-        }
-    };
-
-    let commitment_hex = body["commitment"].as_str().unwrap_or_default();
-    let note_index = body["note_index"].as_u64().unwrap_or(0);
-    let block_height = body["block_height"].as_u64().unwrap_or(0);
-
-    let commitment = match hex::decode(commitment_hex) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            arr
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid commitment hex (need 32 bytes)"})),
-            );
-        }
-    };
-
-    match sync_fn(commitment, note_index, block_height) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "synced"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("{}", e)})),
-        ),
     }
 }
 

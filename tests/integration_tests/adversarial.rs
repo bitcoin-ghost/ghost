@@ -287,17 +287,17 @@ async fn test_935_stale_verification_result_rejected() {
 }
 
 // =============================================================================
-// TEST 936: L2 CHECKPOINT VOTE — ZERO SIGNATURE REJECTED
+// TEST 936: VOTE — ZERO SIGNATURE REJECTED
 // =============================================================================
 
 #[test]
-fn test_936_l2_checkpoint_vote_zero_signature() {
+fn test_936_vote_zero_signature() {
     let identity = NodeIdentity::generate();
 
     // Create an envelope with an all-zeros signature.
     let payload = b"{}";
     let envelope = MessageEnvelope::new(
-        MessageType::L2CheckpointVote,
+        MessageType::Vote,
         identity.node_id(),
         payload.to_vec(),
         1,
