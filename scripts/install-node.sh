@@ -13,17 +13,16 @@
 set -euo pipefail
 
 # ─────────────────────────── network constants ───────────────────────────────
-# ⛔ GHOST_VERSION must be PINNED. This installer used to track the latest GitHub release, but
-# every release published so far is the old network's (`main`), which keeps running beside the node
-# pool: tracking `latest` would install old-network binaries, without the node pool, onto a node
-# pool node. There is no node pool release channel yet, so the operator names the release and the
-# installer refuses without one (checked after the preflight, so --help and --preflight-only work).
-# The tarball is GPG-verified below regardless.
+# ⛔ GHOST_VERSION names a NODE POOL release: `np-latest` (the newest published np-vX.Y.Z) or an
+# exact `np-v…` tag. Node pool releases have their own channel in the same GitHub repository: tags
+# `np-v*`, published as pre-releases, so they are never the repository's `latest`. `latest` is the
+# old network's (`main`, still running beside the node pool), and its tags (v1.11.x) are refused
+# here: they carry no node pool. There is no default; the installer refuses without one (checked
+# after the preflight, so --help and --preflight-only work). The tarball is GPG-verified below
+# regardless. RELEASE_BASE and POOL_TARBALL are set once the tag is resolved.
 GHOST_VERSION="${GHOST_VERSION:-}"
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
-RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
-POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # ghostd now ships INSIDE the signed release tarball (same SHA256SUMS + GPG chain
 # as ghost-mining), so it can never drift from the release version and
 # needs no separate checksum pin — its integrity rides the tarball signature we
@@ -127,8 +126,9 @@ Options:
   --tor-only                  Route over Tor ONLY: no clearnet (onlynet=onion),
                                 close 8333 (implies --tor)
   --no-tor                    Never use Tor                   (default)
-  --auto-update               Automatically apply newer SIGNED releases (off by
-                                default). Verifies the GPG signature and the
+  --auto-update               Automatically apply newer SIGNED node pool releases (off by
+                                default). Follows the np- channel only, never the old
+                                network's releases. Verifies the GPG signature and the
                                 tarball checksum before swapping any binary; health-checks
                                 and rolls back on failure. Checked every 6h.
   --no-auto-update            Never auto-update                (default)
@@ -140,6 +140,10 @@ Options:
   --node-pool                 Accepted and ignored: the node pool is the only mode.
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
+
+Environment:
+  GHOST_VERSION=<release>     Required. np-latest (the newest node pool release) or an exact
+                                np-v<x.y.z> tag. Old-network tags (v1.11.x) are refused.
 
 With no config flags on an interactive terminal, a guided setup wizard runs.
 Every install runs a preflight first (fee address, RAM, disk, ports, Bitcoin node,
@@ -585,6 +589,85 @@ np_preflight() {
   fi
   echo "Preflight: passed."
 }
+
+# >>> NP_RELEASE_CHANNEL
+# The node pool release channel. Node pool releases are tagged `np-vMAJOR.MINOR.PATCH` and are
+# published as GitHub PRE-releases, so GitHub can never make one the repository's `latest`: the
+# old network's nodes resolve `releases/latest` and must never be handed a node pool build. A node
+# pool node therefore never asks for `latest`; it lists the releases and picks the newest
+# `np-v` tag itself. The same block is in scripts/install-node.sh, which resolves
+# GHOST_VERSION=np-latest with it; scripts/test-release-channel.sh keeps the copies identical.
+NP_RELEASES_API_URL="${GHOST_NP_RELEASES_API_URL:-https://api.github.com/repos/bitcoin-ghost/ghost/releases?per_page=100}"
+# The marker the node pool installer writes. Present and saying `node-pool`: this node follows the
+# np- channel. Absent: an install from before the channel existed, which keeps the old channel.
+# Anything else is refused, never guessed.
+NP_CHANNEL_FILE="${GHOST_RELEASE_CHANNEL_FILE:-/etc/ghost/release-channel}"
+
+# np_tag_ok TAG — an exact node pool release tag, final or with a suffix (np-v1.2.3-rc1).
+np_tag_ok() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; }
+# np_tag_final TAG — a final node pool release: the only kind np-latest ever picks.
+np_tag_final() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+# np_latest_tag — reads a GitHub "list releases" JSON array on stdin and prints the highest final
+# np- tag of a PUBLISHED release. Drafts, tags of any other shape (the old network's v1.11.x,
+# np-v…-rc1) and anything else are skipped. Exit 1 when there is none, 2 when the JSON does not
+# have the shape this expects (each release carries one tag_name and one draft), so a changed API
+# fails closed instead of picking something. The prerelease flag is not used: every node pool
+# release carries it, which is what keeps them out of `latest`.
+np_latest_tag() {
+  local tok key val tag="" draft="" cands=""
+  while IFS= read -r tok; do
+    key="${tok#\"}"; key="${key%%\"*}"
+    val="${tok#*:}"; val="${val#"${val%%[![:space:]]*}"}"; val="${val//\"/}"
+    case "$key" in
+      tag_name) [[ -z "$tag" ]] || return 2; tag="$val" ;;
+      draft)    [[ -z "$draft" ]] || return 2; draft="$val" ;;
+    esac
+    if [[ -n "$tag" && -n "$draft" ]]; then
+      if [[ "$draft" == false ]] && np_tag_final "$tag"; then cands+="${tag#np-v}"$'\n'; fi
+      tag=""; draft=""
+    fi
+  done < <(grep -oE '"(tag_name|draft)"[[:space:]]*:[[:space:]]*("[^"]*"|true|false)' || true)
+  [[ -z "$tag" && -z "$draft" ]] || return 2
+  [[ -n "$cands" ]] || return 1
+  echo "np-v$(printf '%s' "$cands" | sort -V | tail -1)"
+}
+
+# np_channel — prints this node's release channel: `node-pool` or `old-network`. Fails, printing
+# why on stderr, when the marker exists but says anything else.
+np_channel() {
+  [[ -e "$NP_CHANNEL_FILE" ]] || { echo old-network; return 0; }
+  local v
+  v="$(grep -vE '^[[:space:]]*(#|$)' "$NP_CHANNEL_FILE" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  [[ "$v" == node-pool ]] || { echo "release channel marker $NP_CHANNEL_FILE says '${v}', expected 'node-pool'" >&2; return 1; }
+  echo node-pool
+}
+# <<< NP_RELEASE_CHANNEL
+
+# np_resolve_release SPEC — prints the node pool release tag to install for GHOST_VERSION=SPEC:
+# `np-latest` resolves to the newest published np-vX.Y.Z (never `releases/latest`, which is the
+# old network's), an exact np- tag is taken as given. Anything else fails, saying why.
+np_resolve_release() {
+  local spec="$1" json tag rc=0
+  case "$spec" in
+    "")
+      echo "Name the node pool release to install: GHOST_VERSION=np-latest (or an exact np-v<x.y.z> tag). The latest GitHub release is the old network's and is never installed." >&2
+      return 1 ;;
+    np-latest)
+      json="$(curl -fsSL --max-time 30 "$NP_RELEASES_API_URL" 2>/dev/null)" \
+        || { echo "GHOST_VERSION=np-latest: could not fetch the release list from $NP_RELEASES_API_URL" >&2; return 1; }
+      tag="$(np_latest_tag <<<"$json")" || rc=$?
+      case "$rc" in
+        0) echo "$tag" ;;
+        1) echo "GHOST_VERSION=np-latest: no node pool release (np-v<x.y.z>) is published yet" >&2; return 1 ;;
+        *) echo "GHOST_VERSION=np-latest: the release list is not in the expected shape — refusing to pick one" >&2; return 1 ;;
+      esac ;;
+    *)
+      if np_tag_ok "$spec"; then echo "$spec"; return 0; fi
+      echo "GHOST_VERSION=$spec is not a node pool release. Node pool releases are tagged np-v<x.y.z>; v-tags are the old network's and carry no node pool. Use GHOST_VERSION=np-latest or an exact np- tag." >&2
+      return 1 ;;
+  esac
+}
 # <<< NODE_POOL_FUNCTIONS
 
 # is_core_rpc_client PATH — true only if PATH is the Ghost Core RPC client (#1028).
@@ -839,14 +922,14 @@ fi
 # ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
 np_preflight || err "Preflight failed — fix the FAIL lines above and re-run."
 [[ "$PREFLIGHT_ONLY" == "true" ]] && exit 0
-[[ -n "$GHOST_VERSION" ]] || err "Pin the node pool release to install: GHOST_VERSION=<tag> $0 ... The latest GitHub release is the old network's and is not installed by default."
-# Automatic updates track the latest GitHub release too, which is the old network's: on a node
-# pool node they would replace its binaries with ones that have no node pool. Off until a node
-# pool release channel exists.
-if [[ "$AUTO_UPDATE" == "true" ]]; then
-  log "WARNING: --auto-update is not available for node pool nodes yet (it tracks the old network's releases) — leaving it off."
-  AUTO_UPDATE="false"
-fi
+# The node pool release channel: np-latest or an exact np- tag, never an old-network tag.
+GHOST_VERSION_SPEC="$GHOST_VERSION"
+GHOST_VERSION="$(np_resolve_release "$GHOST_VERSION_SPEC")" || err "GHOST_VERSION='${GHOST_VERSION_SPEC}' refused (see above)."
+[[ "$GHOST_VERSION_SPEC" == "$GHOST_VERSION" ]] || log "GHOST_VERSION=${GHOST_VERSION_SPEC} resolved to ${GHOST_VERSION}"
+RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
+POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+# Automatic updates follow the same channel: the updater reads /etc/ghost/release-channel
+# (written below) and picks the newest np- release, never the old network's `releases/latest`.
 
 # The [alerts] block. ⛔ Written with `enabled` reflecting whether a channel was actually given:
 # a section that says `enabled = true` with nowhere to deliver is worse than an honest false,
@@ -1843,6 +1926,14 @@ cat > /opt/ghost/bin/ghost-auto-update.sh <<'GHOST_AUTOUPDATE_SH_EOF'
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
 # failure.
 #
+# ⛔ Two release channels share one GitHub repository. Which one a node follows is decided by
+# /etc/ghost/release-channel, written by the node pool installer:
+#   * `node-pool`  — the newest published `np-vX.Y.Z` release, picked from the release LIST.
+#                    Node pool releases are pre-releases and never `latest`.
+#   * no marker    — the old network: `releases/latest`, exactly as before the channel existed.
+#                    An install running an `np-` build without the marker is refused.
+#   * anything else — refused.
+#
 # ⛔ The SV2 stratum stack (`pool_sv2` under sri-pool, `translator_sv2` under
 # sri-translator) is swapped in the SAME set as ghost-mining (#1044). Share-batch
 # signing lives in the pool_sv2 binary (#742), so a new ghost-mining against an old
@@ -1930,7 +2021,8 @@ write_status() {
   "result": "${result}",
   "message": "${message//\"/\'}",
   "installed_version": "${installed}",
-  "latest_version": "${latest}"
+  "latest_version": "${latest}",
+  "channel": "${CHANNEL:-}"
 }
 EOF
   chmod 644 "$STATUS_FILE" 2>/dev/null || true
@@ -1938,8 +2030,63 @@ EOF
 
 # ─────────────────────────────── helpers ─────────────────────────────────────
 
-# Normalise a version string for comparison: strip a leading 'v'.
-normver() { local v="$1"; echo "${v#v}"; }
+# >>> NP_RELEASE_CHANNEL
+# The node pool release channel. Node pool releases are tagged `np-vMAJOR.MINOR.PATCH` and are
+# published as GitHub PRE-releases, so GitHub can never make one the repository's `latest`: the
+# old network's nodes resolve `releases/latest` and must never be handed a node pool build. A node
+# pool node therefore never asks for `latest`; it lists the releases and picks the newest
+# `np-v` tag itself. The same block is in scripts/install-node.sh, which resolves
+# GHOST_VERSION=np-latest with it; scripts/test-release-channel.sh keeps the copies identical.
+NP_RELEASES_API_URL="${GHOST_NP_RELEASES_API_URL:-https://api.github.com/repos/bitcoin-ghost/ghost/releases?per_page=100}"
+# The marker the node pool installer writes. Present and saying `node-pool`: this node follows the
+# np- channel. Absent: an install from before the channel existed, which keeps the old channel.
+# Anything else is refused, never guessed.
+NP_CHANNEL_FILE="${GHOST_RELEASE_CHANNEL_FILE:-/etc/ghost/release-channel}"
+
+# np_tag_ok TAG — an exact node pool release tag, final or with a suffix (np-v1.2.3-rc1).
+np_tag_ok() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; }
+# np_tag_final TAG — a final node pool release: the only kind np-latest ever picks.
+np_tag_final() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+# np_latest_tag — reads a GitHub "list releases" JSON array on stdin and prints the highest final
+# np- tag of a PUBLISHED release. Drafts, tags of any other shape (the old network's v1.11.x,
+# np-v…-rc1) and anything else are skipped. Exit 1 when there is none, 2 when the JSON does not
+# have the shape this expects (each release carries one tag_name and one draft), so a changed API
+# fails closed instead of picking something. The prerelease flag is not used: every node pool
+# release carries it, which is what keeps them out of `latest`.
+np_latest_tag() {
+  local tok key val tag="" draft="" cands=""
+  while IFS= read -r tok; do
+    key="${tok#\"}"; key="${key%%\"*}"
+    val="${tok#*:}"; val="${val#"${val%%[![:space:]]*}"}"; val="${val//\"/}"
+    case "$key" in
+      tag_name) [[ -z "$tag" ]] || return 2; tag="$val" ;;
+      draft)    [[ -z "$draft" ]] || return 2; draft="$val" ;;
+    esac
+    if [[ -n "$tag" && -n "$draft" ]]; then
+      if [[ "$draft" == false ]] && np_tag_final "$tag"; then cands+="${tag#np-v}"$'\n'; fi
+      tag=""; draft=""
+    fi
+  done < <(grep -oE '"(tag_name|draft)"[[:space:]]*:[[:space:]]*("[^"]*"|true|false)' || true)
+  [[ -z "$tag" && -z "$draft" ]] || return 2
+  [[ -n "$cands" ]] || return 1
+  echo "np-v$(printf '%s' "$cands" | sort -V | tail -1)"
+}
+
+# np_channel — prints this node's release channel: `node-pool` or `old-network`. Fails, printing
+# why on stderr, when the marker exists but says anything else.
+np_channel() {
+  [[ -e "$NP_CHANNEL_FILE" ]] || { echo old-network; return 0; }
+  local v
+  v="$(grep -vE '^[[:space:]]*(#|$)' "$NP_CHANNEL_FILE" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  [[ "$v" == node-pool ]] || { echo "release channel marker $NP_CHANNEL_FILE says '${v}', expected 'node-pool'" >&2; return 1; }
+  echo node-pool
+}
+# <<< NP_RELEASE_CHANNEL
+
+# Normalise a version string for comparison: strip a leading 'np-' (the node pool channel's tag
+# prefix) and then a leading 'v'.
+normver() { local v="${1#np-}"; echo "${v#v}"; }
 
 # Installed version: prefer the file we write on update, fall back to parsing
 # `ghost-mining --version` (clap prints "ghost-mining <semver>").
@@ -2144,11 +2291,45 @@ main() {
   installed="$(read_installed_version || true)"
   [[ -n "$installed" ]] || { err "could not determine installed version"; write_status "error" "installed version unknown"; exit 1; }
 
-  # Resolve the latest published release directly from the GitHub releases API
-  # (the same source install.sh auto-tracks). Robust to install.sh's format.
-  latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
-  [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
-  [[ "$latest" == v* ]] || latest="v${latest}"
+  # 2a. Which release channel this node follows. The node pool installer writes the marker; an
+  #     install without it is an old-network node and keeps tracking `releases/latest` exactly as
+  #     before. A node running a node pool build with no marker is refused rather than "updated"
+  #     to the old network's latest, which has no node pool in it.
+  CHANNEL="$(np_channel)" || { err "unreadable release channel marker — refusing to pick a channel"; CHANNEL=""; write_status "error" "release channel marker invalid"; exit 1; }
+  if [[ "$CHANNEL" == old-network && "$installed" == np-* ]]; then
+    err "installed $installed is a node pool release but $NP_CHANNEL_FILE is missing — refusing to track the old network's releases"
+    write_status "error" "node pool install without its channel marker"
+    exit 1
+  fi
+  log "release channel: $CHANNEL"
+
+  if [[ "$CHANNEL" == node-pool ]]; then
+    # The newest np- release, picked from the list. Never `releases/latest`: that is the old
+    # network's, and node pool releases are pre-releases precisely so it never points at one.
+    local releases rc=0
+    releases="$(curl -fsSL --max-time 30 "$NP_RELEASES_API_URL" 2>/dev/null)" \
+      || { err "could not fetch the release list from $NP_RELEASES_API_URL"; write_status "error" "latest node pool version unresolved"; exit 1; }
+    latest="$(np_latest_tag <<<"$releases")" || rc=$?
+    if [[ $rc -ne 0 || -z "$latest" ]]; then
+      case "$rc" in
+        1) err "no published node pool release (np-v*) at $NP_RELEASES_API_URL" ;;
+        *) err "the release list at $NP_RELEASES_API_URL is not in the expected shape (rc=$rc) — refusing to pick" ;;
+      esac
+      write_status "error" "latest node pool version unresolved"; exit 1
+    fi
+  else
+    # Resolve the latest published release directly from the GitHub releases API
+    # (the same source install.sh auto-tracks). Robust to install.sh's format.
+    latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
+    [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
+    # A node pool release can never be `latest` (it is a pre-release). If one ever is, it is not
+    # for this node: refuse rather than move an old-network node onto the node pool.
+    if [[ "$latest" == np-* ]]; then
+      err "releases/latest is a node pool release ($latest) — not for an old-network node, refusing"
+      write_status "error" "latest release is on the node pool channel" "$latest"; exit 1
+    fi
+    [[ "$latest" == v* ]] || latest="v${latest}"
+  fi
 
   log "installed=$installed latest=$latest"
   if ! is_newer "$installed" "$latest"; then
@@ -2682,9 +2863,16 @@ cat > /opt/ghost/bin/ghost-autoupdate-toggle <<'GHOST_AUTOUPDATE_TOGGLE_EOF'
 #
 # Installed root-owned 0755 at /opt/ghost/bin/ghost-autoupdate-toggle.
 #
+# The toggle never chooses WHAT the updater follows. The release channel lives in its own file,
+# /etc/ghost/release-channel, which only the installer writes and this script never touches, so
+# switching updates on from the dashboard follows the same channel as `--auto-update` at install:
+# a node pool node follows the np- releases, an old-network node `releases/latest`. A marker that
+# says anything but `node-pool` is refused here as it is by the updater (fail closed).
+#
 set -euo pipefail
 
 CONF="${GHOST_AUTOUPDATE_CONF:-/etc/ghost/auto-update.conf}"
+CHANNEL_FILE="${GHOST_RELEASE_CHANNEL_FILE:-/etc/ghost/release-channel}"
 SYSTEMCTL="${GHOST_SYSTEMCTL:-systemctl}"
 
 case "${1:-}" in
@@ -2692,6 +2880,15 @@ case "${1:-}" in
   off) val="false" ;;
   *) echo "usage: ghost-autoupdate-toggle on|off" >&2; exit 2 ;;
 esac
+
+channel="old-network"
+if [[ -e "$CHANNEL_FILE" ]]; then
+  channel="$(grep -vE '^[[:space:]]*(#|$)' "$CHANNEL_FILE" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  if [[ "$channel" != node-pool && "$val" == true ]]; then
+    echo "refusing to turn auto-update on: $CHANNEL_FILE says '${channel}', expected 'node-pool'" >&2
+    exit 1
+  fi
+fi
 
 umask 022
 mkdir -p "$(dirname "$CONF")"
@@ -2713,7 +2910,7 @@ else
   "$SYSTEMCTL" disable --now ghost-auto-update.timer >/dev/null 2>&1 || true
 fi
 
-echo "auto-update set to ${val}"
+echo "auto-update set to ${val} (release channel: ${channel})"
 GHOST_AUTOUPDATE_TOGGLE_EOF
 chmod 755 /opt/ghost/bin/ghost-autoupdate-toggle
 chown root:root /opt/ghost/bin/ghost-autoupdate-toggle
@@ -3451,6 +3648,18 @@ Unit=ghost-auto-update.service
 WantedBy=timers.target
 GHOST_AUTOUPDATE_TIMER_EOF
 
+# The release channel marker. ghost-auto-update.sh follows the np- releases ONLY when this says
+# `node-pool`; without it a node keeps the old network's `releases/latest`. Written before the
+# opt-in and the timer, so the updater can never run on this node without it. Its own file, not a
+# line in auto-update.conf: the dashboard's toggle rewrites that file whole.
+cat > /etc/ghost/release-channel <<'GHOST_RELEASE_CHANNEL_EOF'
+# Bitcoin Ghost release channel. Written by the node pool installer; read by ghost-auto-update.sh.
+# node-pool: follow the np-vX.Y.Z releases only, never the old network's releases/latest.
+node-pool
+GHOST_RELEASE_CHANNEL_EOF
+chmod 644 /etc/ghost/release-channel
+chown root:root /etc/ghost/release-channel
+
 # Opt-in config (world-readable so the dashboard can show the current state;
 # only root, or the scoped toggle via sudo, can write it).
 cat > /etc/ghost/auto-update.conf <<EOF
@@ -3472,7 +3681,7 @@ systemctl daemon-reload >/dev/null 2>&1 || true
 # installed-but-inactive, so the node can never self-upgrade.
 if [[ "$AUTO_UPDATE" == "true" ]]; then
   systemctl enable --now ghost-auto-update.timer >/dev/null 2>&1 || true
-  log "auto-update ENABLED — checking for signed releases every 6h"
+  log "auto-update ENABLED — checking for signed node pool (np-) releases every 6h"
 else
   systemctl disable --now ghost-auto-update.timer >/dev/null 2>&1 || true
   log "auto-update disabled (default) — node will not self-upgrade"

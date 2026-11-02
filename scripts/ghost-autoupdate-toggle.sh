@@ -12,9 +12,16 @@
 #
 # Installed root-owned 0755 at /opt/ghost/bin/ghost-autoupdate-toggle.
 #
+# The toggle never chooses WHAT the updater follows. The release channel lives in its own file,
+# /etc/ghost/release-channel, which only the installer writes and this script never touches, so
+# switching updates on from the dashboard follows the same channel as `--auto-update` at install:
+# a node pool node follows the np- releases, an old-network node `releases/latest`. A marker that
+# says anything but `node-pool` is refused here as it is by the updater (fail closed).
+#
 set -euo pipefail
 
 CONF="${GHOST_AUTOUPDATE_CONF:-/etc/ghost/auto-update.conf}"
+CHANNEL_FILE="${GHOST_RELEASE_CHANNEL_FILE:-/etc/ghost/release-channel}"
 SYSTEMCTL="${GHOST_SYSTEMCTL:-systemctl}"
 
 case "${1:-}" in
@@ -22,6 +29,15 @@ case "${1:-}" in
   off) val="false" ;;
   *) echo "usage: ghost-autoupdate-toggle on|off" >&2; exit 2 ;;
 esac
+
+channel="old-network"
+if [[ -e "$CHANNEL_FILE" ]]; then
+  channel="$(grep -vE '^[[:space:]]*(#|$)' "$CHANNEL_FILE" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  if [[ "$channel" != node-pool && "$val" == true ]]; then
+    echo "refusing to turn auto-update on: $CHANNEL_FILE says '${channel}', expected 'node-pool'" >&2
+    exit 1
+  fi
+fi
 
 umask 022
 mkdir -p "$(dirname "$CONF")"
@@ -43,4 +59,4 @@ else
   "$SYSTEMCTL" disable --now ghost-auto-update.timer >/dev/null 2>&1 || true
 fi
 
-echo "auto-update set to ${val}"
+echo "auto-update set to ${val} (release channel: ${channel})"
