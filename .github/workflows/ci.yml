@@ -299,16 +299,11 @@ jobs:
   # "GHOST-02: 0/8 nodes approved" — which reads like a catastrophic payout bug and was in fact a
   # stale fixture. Nobody saw it because nothing ran it (#580).
   #
-  # That target no longer exists: Stage 6 Release B deleted the BFT payout vote it exercised,
-  # along with `fleet_rehearsal`. `regtest_shard_coinbase_e2e` is the shard's replacement and is
-  # already in the sequence below. The rationale is kept because the failure mode it describes —
-  # a test that nothing runs — is what this job exists to prevent.
-  #
-  # `regtest_mining_modes_e2e` arrived with this same release and was NOT in the sequence, which
-  # is that exact failure mode again: `common::require_regtest()` returns `None` and the test
-  # SKIPS rather than fails whenever `GHOST_REGTEST_REQUIRED` is unset, so a bulk `cargo test`
-  # would have reported it green without ever starting a node. It runs FIRST, on a clean mempool,
-  # because `empty_template_e2e` parks a transaction on purpose.
+  # That target no longer exists, nor do its successors `regtest_shard_coinbase_e2e` and
+  # `regtest_mining_modes_e2e`: the node pool's canonical coinbase (W2.6) replaced the coinbase
+  # they proved. The rationale is kept because the failure mode it describes — a test that
+  # nothing runs — is what this job exists to prevent: `common::require_regtest()` returns `None`
+  # and a test SKIPS rather than fails whenever `GHOST_REGTEST_REQUIRED` is unset.
   #
   # This is a SEPARATE job, not a step on `test`, deliberately: adding it there pushed that job
   # from ~28 min past its 45-minute timeout and it was cancelled mid-run. Here it runs in
@@ -366,10 +361,8 @@ jobs:
       # an unreachable node a FAILURE rather than a skip, so that cannot silently recur.
       #
       # ⚠ Deliberately a SEPARATE step from the bulk `cargo test` above, and the targets run ONE
-      # AT A TIME. cargo runs test binaries in parallel and these share a single chain:
-      # `empty_template_e2e` parks a fee-paying transaction in the mempool on purpose, while
-      # `regtest_shard_coinbase_e2e` requires an empty one and drains it. Run concurrently they
-      # sabotage each other, so the sequencing is load-bearing rather than tidiness.
+      # AT A TIME: they share a single chain, and `empty_template_e2e` parks a fee-paying
+      # transaction in the mempool on purpose.
       #
       # Verified end to end on a blank chain before landing: 4 passed + 1 ignored, 1 passed,
       # 1 passed, including a real `submitblock` accepted by ghostd.
@@ -386,7 +379,7 @@ jobs:
           BITCOIN_RPC_USER: ghost
           BITCOIN_RPC_PASSWORD: ghostpass
         run: |
-          for t in regtest_mining_modes_e2e empty_template_e2e regtest_shard_coinbase_e2e; do
+          for t in empty_template_e2e; do
             echo "::group::$t"
             cargo test -p ghost-mining --test "$t"
             echo "::endgroup::"

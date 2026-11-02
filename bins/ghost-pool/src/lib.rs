@@ -27,8 +27,8 @@
 //!
 //! # Modules
 //!
-//! - [`coinbase_verifier`] - Validates coinbase transactions against approved payouts
-//! - [`payout`] - Payout proposal creation and BFT consensus integration
+//! - [`coinbase_verifier`] - Reading a mined coinbase's scriptSig and outputs
+//! - [`payout`] - The old payout ledger's checkpoint root
 //! - [`reorg`] - Chain reorganization detection and handling
 //! - [`round`] - Mining round management and share tracking
 //! - [`rpc`] - JSON-RPC request parsing for Stratum protocol
@@ -43,18 +43,18 @@ pub mod alert_monitors;
 /// A-2b: cached L1 block-hash oracle seeding the consensus challenger draw.
 pub mod block_hash_oracle;
 
-/// Coinbase transaction verification against payout commitments.
+/// Reading a mined coinbase's scriptSig and outputs.
 pub mod coinbase_verifier;
 
 /// `tracing` layer that feeds ghost-mining's log tail into the dashboard `/logs`
 /// ring buffer.
 pub mod log_ring;
 
-/// Payout proposal creation and consensus coordination.
+/// The old payout ledger's checkpoint root. No coinbase is built from it.
 pub mod payout;
 
-/// Payout-ledger checkpoint finalisation (BFT-agreed snapshot the coinbase is a
-/// pure function of).
+/// Payout-ledger checkpoint finalisation (BFT-agreed snapshot of the old ledger; no coinbase
+/// is built from it any more).
 pub mod payout_checkpoint;
 
 /// Mesh node-list checkpoint finalisation (signed public-mining node set for
@@ -69,7 +69,6 @@ pub mod reorg;
 
 /// Fetching a payout proposal a node needs but never received.
 pub mod binding_recheck;
-pub mod proposal_sync;
 
 /// Settling the ledger from blocks observed on-chain.
 pub mod skeleton_store;
@@ -1577,17 +1576,15 @@ mod tier_gate_tests {
         assert!(binds_difficulty_tier(u64::MAX));
     }
 
-    /// The three halves must name the SAME block. `pool_sv2` carries its own
-    /// `activation_height` in config and the translator carries a bare flag, so nothing at compile
-    /// time forces agreement — this records the value the shipped configs must match, so a change
-    /// to one without the others fails here rather than at the height.
+    /// pool_sv2 runs only the node pool, which always builds per-channel tier-stamped jobs, so
+    /// the shipped pool config must carry `[node_pool]`; the translator carries a bare flag that
+    /// must be on with it.
     #[test]
     fn the_shipped_configs_must_name_this_same_height() {
         let cfg = include_str!("../../../config/sri/pool-config.toml");
         assert!(
-            cfg.contains("activation_height = 962100"),
-            "config/sri/pool-config.toml must arm pool_sv2 at the same height as \
-             SHARE_TIER_BIND_HEIGHT ({SHARE_TIER_BIND_HEIGHT})"
+            cfg.contains("\n[node_pool]\n"),
+            "config/sri/pool-config.toml must configure the node pool, pool_sv2's only mode"
         );
         let tr = include_str!("../../../config/sri/translator-config.toml");
         assert!(

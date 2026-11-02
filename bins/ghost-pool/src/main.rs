@@ -58,9 +58,7 @@ use ghost_consensus::health_handler::HealthPingHandler;
 use ghost_consensus::mesh::{MeshConfig, MeshNetwork};
 use ghost_consensus::message::MessageType;
 use ghost_consensus::verification_handler::VerificationResultHandler;
-use ghost_consensus::vote_handler::{
-    BroadcastFn, ExecuteFn, ProposalStoreFn, VoteHandler, VoteHandlerConfig,
-};
+use ghost_consensus::vote_handler::{BroadcastFn, ExecuteFn, VoteHandler, VoteHandlerConfig};
 use ghost_consensus::voting::VotingManager;
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
@@ -71,14 +69,12 @@ use ghost_verification::{
 };
 
 use ghost_pool::capacity;
-use ghost_pool::payout::{BlockFoundData, PayoutConfig, PayoutHandler, SoloBlockFoundData};
 use ghost_pool::reorg::{ReorgConfig, ReorgHandler};
-use ghost_pool::round::{RoundConfig, RoundEvent, RoundManager};
+use ghost_pool::round::{RoundConfig, RoundManager};
 use ghost_pool::self_check::SelfCheck;
 use ghost_pool::share_handler::ShareProofHandler;
 use ghost_pool::template::{TemplateConfig, TemplateEvent, TemplateProcessor};
 use ghost_pool::template_provider::{TdpConfig, TemplateDistributionServer};
-use ghost_pool::treasury::TreasuryState;
 
 /// Exit code that signals systemd to restart the service
 /// Used when config is updated via API and requires restart to apply
@@ -2260,34 +2256,6 @@ async fn ensure_mpc_params_present(
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The shard's `owed()` balances for the coinbase, or `None` to keep the legacy ledger.
-///
-/// ⛔ Stage 5 step 6. Returns `Some` ONLY when all three hold: the shard is enabled, the operator
-/// set `shard_coinbase`, and **genesis is actually installed**.
-///
-/// That last condition is checked rather than assumed. Without the opening balances the shard owes
-/// nobody the months of work the pool actually owes, so a block would pay only what accrued since
-/// the flag was set — silently, and irreversibly, because a paid block cannot be unpaid. Trusting
-/// an operator to set three flags in the right order is not a safety property.
-fn shard_coinbase_owed(
-    shard: &Option<Arc<ghost_pool::shard::ShardRuntime>>,
-    enabled: bool,
-) -> Option<std::collections::BTreeMap<String, i64>> {
-    if !enabled {
-        return None;
-    }
-    let rt = shard.as_ref()?;
-    if !rt.genesis_installed() {
-        error!(
-            "coinbase: `shard_coinbase` is set but genesis is NOT installed — refusing to pay \
-             from the shard. It would pay only post-flag accrual and omit everything the pool \
-             already owes. Falling back to the legacy ledger."
-        );
-        return None;
-    }
-    Some(rt.owed_snapshot())
-}
-
 // Eight worker threads, not the default.
 //
 // `#[tokio::main]` with no argument sets `worker_threads = num_cpus`, and every node in this
@@ -3101,17 +3069,12 @@ async fn main() -> Result<()> {
         refresh_interval_ms: config.pool.template_refresh_ms(),
         ..Default::default()
     };
-    let template_processor = Arc::new(
-        TemplateProcessor::new(
-            template_config,
-            Arc::clone(&rpc),
-            policy.clone(),
-            reaper_config,
-        )
-        .with_database(Arc::clone(&db)),
-    );
-    // Restore any previously approved payout proposal from database
-    template_processor.restore_from_db();
+    let template_processor = Arc::new(TemplateProcessor::new(
+        template_config,
+        Arc::clone(&rpc),
+        policy.clone(),
+        reaper_config,
+    ));
 
     // Note: Native stratum server removed - using SRI (Stratum Reference Implementation) via TDP
     // SRI pool connects to ghost-mining's TDP server for templates
@@ -3372,7 +3335,6 @@ async fn main() -> Result<()> {
     });
 
     // Create execute callback for consensus decisions
-    let tp_for_execute = Arc::clone(&template_processor);
     let execute_fn: ExecuteFn = Arc::new(move |result: ConsensusResult| {
         match result {
             ConsensusResult::Approved {
@@ -3386,29 +3348,8 @@ async fn main() -> Result<()> {
                     total = total_nodes,
                     "Payout consensus approved - executing"
                 );
-                // Store approved payout for coinbase construction
-                tp_for_execute.set_approved_payout(proposal_hash);
-
-                // NOTE: settling the ledger (mark-paid + treasury) deliberately does NOT
-                // happen here. Approval only ARMS the coinbase — the coins do not exist until a
-                // block carrying this snapshot is actually mined and accepted. Settling on
-                // approval marked a miner's work paid before a satoshi had moved, and if the
-                // pool never won again that work stayed marked paid and never paid.
-                //
-                // The ledger is settled in the block-accepted path, keyed on the winning block's
-                // `payout_snapshot`, via `payout::settle_paid_block`.
-
-                // Refresh template to include approved payout in coinbase
-                // This is the "1 block behind" fix: when consensus approves the payout
-                // from round N, refresh templates so block N+1 has correct outputs
-                let tp = Arc::clone(&tp_for_execute);
-                tokio::spawn(async move {
-                    if let Err(e) = tp.refresh_template().await {
-                        tracing::error!(error = %e, "Failed to refresh template after payout approval");
-                    } else {
-                        tracing::info!("Template refreshed with approved payout outputs");
-                    }
-                });
+                // Nothing to arm: the coinbase is the node pool's canonical one, built per
+                // job by pool_sv2. A payout proposal approved here pays nobody.
             }
             ConsensusResult::Rejected {
                 proposal_hash,
@@ -3499,13 +3440,6 @@ async fn main() -> Result<()> {
         },
         ..VoteHandlerConfig::default()
     };
-    // Create proposal store callback so remote nodes store proposal data
-    // in the template processor when proposals arrive via P2P
-    let tp_for_proposal_store = Arc::clone(&template_processor);
-    let proposal_store_fn: ProposalStoreFn = Arc::new(move |proposal| {
-        tp_for_proposal_store.store_proposal(proposal);
-    });
-
     let vote_handler = Arc::new(
         VoteHandler::with_config(
             Arc::clone(&identity),
@@ -3514,7 +3448,6 @@ async fn main() -> Result<()> {
         )
         .with_broadcaster(broadcast_fn)
         .with_executor(execute_fn)
-        .with_proposal_store(proposal_store_fn)
         .with_ban_manager(Arc::clone(&ban_manager))
         .with_database(Arc::clone(&db))
         .with_rate_limiter_persistence(rate_limiter_path)
@@ -4397,13 +4330,6 @@ async fn main() -> Result<()> {
 
         info!("shard: mesh handler registered (summaries + whole-table sync)");
     }
-
-    // Independent handles for the coinbase source. Made HERE, at top level, because each is
-    // captured by a different `async move` task further down and a single binding would be moved
-    // into whichever spawned first. Cheap: an Option<Arc> clone is a refcount bump.
-    let cb_enabled = config.pool.shard_coinbase;
-    let (shard_cb_a, shard_cb_b, shard_cb_c, shard_cb_d) =
-        (shard.clone(), shard.clone(), shard.clone(), shard.clone());
 
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
@@ -7391,50 +7317,6 @@ async fn main() -> Result<()> {
     // Create shutdown channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // Create payout handler for block found events
-    // This wires BlockFound -> PayoutProposal -> VoteHandler (BFT consensus)
-    //
-    // Convert treasury address from bech32 string to script pubkey bytes
-    let treasury_script = if !config.pool.treasury_address.is_empty() {
-        use bitcoin::address::NetworkUnchecked;
-        use bitcoin::Address;
-        use std::str::FromStr;
-
-        let addr_str = config.pool.treasury_address.address();
-        match Address::<NetworkUnchecked>::from_str(addr_str) {
-            Ok(addr) => addr.assume_checked().script_pubkey().into_bytes(),
-            Err(e) => {
-                warn!(
-                    address = %addr_str,
-                    error = %e,
-                    "Invalid treasury address, using empty (payouts will fail)"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        warn!("No treasury address configured, pool fee payouts will fail");
-        Vec::new()
-    };
-
-    let payout_config = PayoutConfig {
-        dust_threshold_sats: config.pool.min_payout_sats.max(546),
-        max_miner_outputs: 200,
-        max_node_outputs: 100,
-        treasury_address: Some(treasury_script),
-        network: config.bitcoin.network, // M-15/LOW: Enable mainnet-specific security checks
-    };
-
-    // H-MINE-1: PayoutHandler uses the same QualifiedCapabilityProvider as health_handler
-    // This ensures consistent verified capability lookups across the system
-    let payout_handler = Arc::new(PayoutHandler::new(
-        Arc::clone(&identity),
-        payout_config.clone(),
-        Arc::clone(&db),
-        Arc::clone(&template_processor),
-        Arc::clone(&qualification_provider_for_health), // Reuse provider from health_handler
-    )?);
-
     // Stage 6: the GHOST-02 ledger-recompute validator is gone with the payout vote.
     //
     // It only ever judged PAYOUT proposals — recomputing a peer's split from this node's own
@@ -7538,40 +7420,6 @@ async fn main() -> Result<()> {
     // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
     verification_state =
         verification_state.with_block_hash_oracle(Arc::new(block_hash_oracle.clone()));
-    // FEE convergence proof: hash the FEE-armed node-reward split (the adopted checkpoint's
-    // node_shares distributed over a normalised 1-BTC pool) so /api/v1/qualification/scoped-set
-    // can prove the coinbase node-split converges fleet-wide BEFORE arming COINBASE_FEE_SPLIT —
-    // the exact thing that diverged in v1.10.32. Normalised pool → the hash reflects the
-    // adopted distribution + the deterministic split math, independent of block-specific fees.
-    verification_state = verification_state.with_fee_node_split_fn({
-        let db_c = Arc::clone(&db);
-        // Build one proposal creator for the REAL split math (same config as the coinbase path).
-        let creator = ghost_pool::payout::PayoutProposalCreator::new(
-            Arc::clone(&identity),
-            payout_config.clone(),
-            Arc::clone(&db),
-        )
-        .ok()
-        .map(Arc::new);
-        Arc::new(move |height: u64| -> Option<String> {
-            use sha2::{Digest, Sha256};
-            let creator = creator.as_ref()?;
-            let (_miners, node_shares) = ghost_pool::payout::read_adopted_payout(&db_c, height)?;
-            const NORMALIZED_POOL: u64 = 100_000_000;
-            let payouts = creator
-                .calculate_node_payouts(&node_shares, NORMALIZED_POOL)
-                .ok()?;
-            let mut v: Vec<([u8; 32], u64)> =
-                payouts.iter().map(|p| (p.recipient_id, p.amount)).collect();
-            v.sort();
-            let mut h = Sha256::new();
-            for (id, amt) in &v {
-                h.update(id);
-                h.update(amt.to_le_bytes());
-            }
-            Some(hex::encode(h.finalize()))
-        })
-    });
     // ACTIVE_VOTER_SET convergence proof: hash the checkpoint-path voter set consensus WOULD
     // use once the gate is armed — the widened set (active-qualified set floored to a superset
     // of the elders), from the SAME scoped query the consensus resolver uses. Ignores the gate
@@ -8414,13 +8262,11 @@ async fn main() -> Result<()> {
         // Update miner's payout address in database if provided
         // The payout_address is extracted from user_identity (format: <address>.<worker>)
         if let Some(ref payout_address) = share.payout_address {
-            // Node pool (dark until activation): only P2SH, P2WPKH, P2WSH and P2TR are recorded.
+            // Node pool: only P2SH, P2WPKH, P2WSH and P2TR are recorded.
             let payee_refused = if payout_address.is_empty() {
                 None
             } else {
                 ghost_pool::payee_class::accept_payout_address(
-                    rm_for_shares.current_height(),
-                    ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
                     payout_address,
                     network_for_shares.to_bitcoin_network(),
                 )
@@ -8500,40 +8346,22 @@ async fn main() -> Result<()> {
     let alert_slot: Arc<std::sync::OnceLock<Arc<ghost_verification::alerts::AlertDispatcher>>> =
         Arc::new(std::sync::OnceLock::new());
 
-    // Configure block_found callback: triggers payout proposal BEFORE block submission.
-    // This breaks the bootstrap deadlock where:
-    //   1. submitblock requires an approved coinbase commitment
-    //   2. Coinbase commitment requires an approved payout proposal
-    //   3. Payout proposals were only created from block_submitted_rx (AFTER submitblock)
-    // By creating the proposal when a block-difficulty share is found (before submission),
-    // the next template will include the committed coinbase and submitblock will succeed.
+    // Block-difficulty share: fire the operator alert. The block's coinbase is the job's
+    // canonical one (pool_sv2 checks it before submitting); what it paid is settled by the node
+    // pool relay when the block enters the best chain.
     {
         let rm_for_bf = Arc::clone(&round_manager);
-        let tp_for_bf = Arc::clone(&template_processor);
-        let payout_for_bf = Arc::clone(&payout_handler);
-        let identity_for_bf = Arc::clone(&identity);
-        // Cloned per task: the coinbase source is consulted inside several spawned closures, and
-        // a single moved binding would be captured by whichever ran first.
-        let db_for_bf = Arc::clone(&db);
-        let solo_payout_address_for_bf = config.network.solo_payout_address.clone();
-        let metrics_for_bf = Arc::clone(&metrics);
         let alert_slot_for_bf = Arc::clone(&alert_slot);
 
         verification_state = verification_state.with_block_found_callback(move |block_info| {
             let round_id = rm_for_bf.current_round_id();
-            let is_solo_mode = rm_for_bf.is_solo_mode();
-
             info!(
                 round = round_id,
                 share_hash = %block_info.share_hash,
                 miner = %block_info.miner_id,
-                solo_mode = is_solo_mode,
-                "Block-difficulty share found, creating pre-submission payout proposal..."
+                "Block-difficulty share found"
             );
-
-            // Fire the BlockFound operator alert (async, non-blocking — never
-            // holds up the payout-proposal hot path). Enable-flag + delivery are
-            // handled inside the dispatcher. Discrete event: no debounce needed.
+            // Async, non-blocking. Enable-flag + delivery are handled inside the dispatcher.
             if let Some(dispatcher) = alert_slot_for_bf.get() {
                 let dispatcher = Arc::clone(dispatcher);
                 let detail = format!(
@@ -8546,378 +8374,6 @@ async fn main() -> Result<()> {
                         .await;
                 });
             }
-
-            // Use the share hash as block hash — the share met block difficulty,
-            // so this IS the candidate block hash. Can't use [0u8;32] because
-            // PO4-M1 validation rejects zero block hashes.
-            let mut block_hash = [0u8; 32];
-            if let Ok(decoded) = hex::decode(&block_info.share_hash) {
-                let len = decoded.len().min(32);
-                block_hash[..len].copy_from_slice(&decoded[..len]);
-            }
-
-            let node_shares = rm_for_bf.get_node_shares(round_id);
-            let (subsidy, fees, height) = tp_for_bf.get_current_block_info();
-
-            // Load treasury state from database
-            let treasury_state = match db_for_bf.get_treasury_balance() {
-                Ok(balance) => {
-                    let threshold_ts = match db_for_bf.get_treasury_threshold_reached() {
-                        Ok(ts_opt) => ts_opt
-                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                            .map(|dt| dt.with_timezone(&chrono::Utc)),
-                        Err(e) => {
-                            warn!(error = %e, "Failed to load treasury threshold timestamp, using None");
-                            None
-                        }
-                    };
-                    TreasuryState::from_stored(balance, threshold_ts)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to load treasury state, using default");
-                    TreasuryState::new()
-                }
-            };
-
-            let winning_node_id = identity_for_bf.node_id();
-
-            if is_solo_mode {
-                let solo_address = match &solo_payout_address_for_bf {
-                    Some(addr) if !addr.is_empty() => addr.clone(),
-                    _ => {
-                        error!("Solo mode block found but solo_payout_address not configured!");
-                        return;
-                    }
-                };
-
-                let treasury_address_snapshot =
-                    payout_for_bf.get_treasury_address_snapshot();
-
-                let solo_data = SoloBlockFoundData {
-                    round_id,
-                    block_hash,
-                    block_height: height,
-                    block_timestamp: chrono::Utc::now(),
-                    solo_payout_address: solo_address,
-                    subsidy_sats: subsidy,
-                    treasury_address_snapshot,
-                    tx_fees_sats: fees,
-                    node_shares,
-                    treasury_state,
-                };
-
-                match payout_for_bf.handle_solo_block_found(solo_data) {
-                    Ok(proposal_hash) => {
-                        if proposal_hash != [0u8; 32] {
-                            info!(
-                                round = round_id,
-                                hash = %hex::encode(&proposal_hash[..8]),
-                                "Solo pre-submission payout proposal submitted for consensus"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, round = round_id, "Failed to create solo pre-submission payout proposal");
-                    }
-                }
-            } else {
-                // Pool mode: ledger-style proportional distribution.
-                //
-                // Unpaid shares accumulate across rounds on each miner's
-                // ledger. When a block is found we sweep the whole unpaid
-                // ledger up to `cutoff_ts` — top 1000 contributors,
-                // iteratively dust-filtered so every coinbase output is
-                // ≥546 sats — and commit the survivors to the next block's
-                // coinbase. Miners below the dust line (or outside the
-                // 1000 cap) keep their ledger and compete again next block.
-                //
-                // GHOST-02: this MUST go through `select_ledger_miner_work`,
-                // the same function every validator recomputes with. The
-                // cutoff travels on the proposal (as its timestamp) so that
-                // validators reproduce this exact window; a split either side
-                // derives any other way is rejected on exact-equality.
-                //
-                // Shares arriving after this moment belong to the next
-                // block's ledger and aren't swept.
-                // v1.10.32 fix: anchor the split at the fleet-finalised checkpoint
-                // cutoff (converged — every node agrees) instead of now() (gossip-
-                // lagged, so validators would recompute a different split and reject).
-                // Below the activation gate this still resolves to now().
-                let Some(cutoff_ts) =
-                    ghost_pool::payout::resolve_payout_cutoff(&db_for_bf, height)
-                else {
-                    debug!(
-                        height,
-                        "no finalised payout checkpoint yet; skipping split payout this block"
-                    );
-                    return;
-                };
-
-                // Option (c) adopt-CONSUMPTION: at/above the fee gate BOTH the miner and
-                // node lists are the fleet-ratified lists from the finalised checkpoint
-                // (`read_adopted_payout`), NOT a local recompute — every node builds the
-                // byte-identical coinbase the fleet agreed on, so the exact-equality
-                // validators pass. Below the gate: legacy local recompute of the miner
-                // ledger + the round-tracker's claimed node shares (unchanged behaviour).
-                //
-                // No round-tracker fallback for the miner side, deliberately: a validator
-                // has no way to know the proposer fell back, so it would recompute and
-                // reject. An empty list means nobody is owed — `handle_block_found` skips
-                // submission and any merely-late shares are swept by the next block.
-                let (miner_work, node_shares) = if height >= ghost_pool::coinbase_fee_split_height()
-                {
-                    match ghost_pool::payout::read_adopted_payout(&db_for_bf, height) {
-                        Some((m, n)) => (m, n),
-                        None => {
-                            debug!(
-                                height,
-                                "no adopted payout in the finalised checkpoint yet; skipping \
-                                 split payout this block"
-                            );
-                            return;
-                        }
-                    }
-                } else {
-                    let m = match ghost_pool::payout::select_ledger_miner_work(
-                        &db_for_bf, cutoff_ts, height, subsidy,
-                    ) {
-                        Ok(work) => work,
-                        Err(e) => {
-                            error!(
-                                round = round_id,
-                                cutoff_ts,
-                                error = %e,
-                                "Failed to read unpaid ledger at block-found; no miner payout \
-                                 this block — unpaid shares roll forward to the next"
-                            );
-                            Vec::new()
-                        }
-                    };
-                    (m, node_shares)
-                };
-
-                let treasury_address_snapshot =
-                    payout_for_bf.get_treasury_address_snapshot();
-
-                let block_data = BlockFoundData {
-                    shard_owed: shard_coinbase_owed(&shard_cb_a, cb_enabled),
-                    round_id,
-                    ledger_cutoff_ts: cutoff_ts,
-                    block_hash,
-                    block_height: height,
-                    block_timestamp: chrono::Utc::now(),
-                    winning_miner_id: "pool".to_string(),
-                    winning_miner_payout_address: Some(block_info.payout_address.clone()),
-                    treasury_address_snapshot,
-                    winning_node_id,
-                    subsidy_sats: subsidy,
-                    tx_fees_sats: fees,
-                    miner_work,
-                    node_shares,
-                    treasury_state,
-                };
-
-                match payout_for_bf.handle_block_found(block_data) {
-                    Ok(proposal_hash) => {
-                        if proposal_hash != [0u8; 32] {
-                            metrics_for_bf.payouts_total.inc();
-                            info!(
-                                round = round_id,
-                                hash = %hex::encode(&proposal_hash[..8]),
-                                "Pre-submission payout proposal submitted for consensus"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        metrics_for_bf.payout_errors_total.inc();
-                        error!(error = %e, round = round_id, "Failed to create pre-submission payout proposal");
-                    }
-                }
-            }
-        });
-    }
-
-    // Spawn async payout task: triggers payout proposal creation when a block is
-    // submitted to Bitcoin Core via SubmitSolution (channel from TemplateProcessor).
-    // This is the SECONDARY path — the primary path is now the block_found callback above.
-    // This path handles the case where the block was successfully submitted and we need
-    // to create a proposal for the NEXT block's coinbase.
-    {
-        let rm_for_block = Arc::clone(&round_manager);
-        let tp_for_block = Arc::clone(&template_processor);
-        let payout_for_block = Arc::clone(&payout_handler);
-        let identity_for_block = Arc::clone(&identity);
-        let db_for_block = Arc::clone(&db);
-        let solo_payout_address_for_block = config.network.solo_payout_address.clone();
-        let metrics_for_block = Arc::clone(&metrics);
-        let mut block_rx = template_processor
-            .take_block_submitted_rx()
-            .expect("M-02: block_submitted_rx already taken — startup bug");
-        tokio::spawn(async move {
-            while let Some(info) = block_rx.recv().await {
-                let round_id = rm_for_block.current_round_id();
-                let is_solo_mode = rm_for_block.is_solo_mode();
-
-                info!(
-                    round = round_id,
-                    hash = %hex::encode(&info.block_hash[..8]),
-                    height = info.height,
-                    solo_mode = is_solo_mode,
-                    "Block submitted to Ghost Core, creating payout proposal..."
-                );
-
-                // Settlement is the SHARD's, and it happens at COINBASE_MATURITY — not here, and
-                // not at tip. Stage 6 removed the tip-time settler entirely.
-                //
-                // Marking shares paid the moment a block is submitted means settling a payment a
-                // reorg can still undo, which is why the deleted path needed `reverse_settlement`
-                // and a deferred-settlement table to go with it. Settling 100 blocks deep needs
-                // none of that, and `ShareShard::settle_matured` reaches the same conclusion from
-                // the same evidence — the coinbase — on EVERY node rather than only this one.
-                //
-                // The submitting node is not special here any more, and that is the point.
-
-                // Gather data for payout proposal
-                let node_shares = rm_for_block.get_node_shares(round_id);
-                let (subsidy, fees, height) = tp_for_block.get_current_block_info();
-
-                // Load treasury state from database
-                let treasury_state = match db_for_block.get_treasury_balance() {
-                    Ok(balance) => {
-                        let threshold_ts = match db_for_block.get_treasury_threshold_reached() {
-                            Ok(ts_opt) => ts_opt
-                                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                                .map(|dt| dt.with_timezone(&chrono::Utc)),
-                            Err(e) => {
-                                warn!(error = %e, "Failed to load treasury threshold timestamp, using None");
-                                None
-                            }
-                        };
-                        TreasuryState::from_stored(balance, threshold_ts)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to load treasury state, using default");
-                        TreasuryState::new()
-                    }
-                };
-
-                let winning_node_id = identity_for_block.node_id();
-
-                if is_solo_mode {
-                    let solo_address = match &solo_payout_address_for_block {
-                        Some(addr) if !addr.is_empty() => addr.clone(),
-                        _ => {
-                            error!("Solo mode block found but solo_payout_address not configured!");
-                            continue;
-                        }
-                    };
-
-                    let treasury_address_snapshot =
-                        payout_for_block.get_treasury_address_snapshot();
-
-                    let solo_data = SoloBlockFoundData {
-                        round_id,
-                        block_hash: info.block_hash,
-                        block_height: height,
-                        block_timestamp: chrono::Utc::now(),
-                        solo_payout_address: solo_address,
-                        subsidy_sats: subsidy,
-                        treasury_address_snapshot,
-                        tx_fees_sats: fees,
-                        node_shares,
-                        treasury_state,
-                    };
-
-                    match payout_for_block.handle_solo_block_found(solo_data) {
-                        Ok(proposal_hash) => {
-                            if proposal_hash != [0u8; 32] {
-                                info!(
-                                    round = round_id,
-                                    hash = %hex::encode(&proposal_hash[..8]),
-                                    "Solo mode payout proposal submitted for consensus"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!(error = %e, round = round_id, "Failed to create solo mode payout proposal");
-                        }
-                    }
-                } else {
-                    // Pool mode: ledger-style proportional distribution.
-                    //
-                    // GHOST-02: the unpaid ledger, NOT this round's work. Every proposal
-                    // path must derive its split the same way the validators recompute it
-                    // (`select_ledger_miner_work`), or the fleet rejects its own payout.
-                    // v1.10.32 fix: checkpoint cutoff (converged), not now() (lagged).
-                    // Below the activation gate this still resolves to now().
-                    let Some(cutoff_ts) =
-                        ghost_pool::payout::resolve_payout_cutoff(&db_for_block, height)
-                    else {
-                        debug!(
-                            height,
-                            "no finalised payout checkpoint yet; skipping split payout this block"
-                        );
-                        continue;
-                    };
-                    let miner_work = match ghost_pool::payout::select_ledger_miner_work(
-                        &db_for_block,
-                        cutoff_ts,
-                        height,
-                        subsidy,
-                    ) {
-                        Ok(work) => work,
-                        Err(e) => {
-                            error!(
-                                round = round_id,
-                                cutoff_ts,
-                                error = %e,
-                                "Failed to read unpaid ledger at block-found; no miner payout \
-                                 this block — unpaid shares roll forward to the next"
-                            );
-                            Vec::new()
-                        }
-                    };
-
-                    let treasury_address_snapshot =
-                        payout_for_block.get_treasury_address_snapshot();
-
-                    let block_data = BlockFoundData {
-                        shard_owed: shard_coinbase_owed(&shard_cb_b, cb_enabled),
-                        round_id,
-                        ledger_cutoff_ts: cutoff_ts,
-                        block_hash: info.block_hash,
-                        block_height: height,
-                        block_timestamp: chrono::Utc::now(),
-                        winning_miner_id: "pool".to_string(),
-                        winning_miner_payout_address: None,
-                        treasury_address_snapshot,
-                        winning_node_id,
-                        subsidy_sats: subsidy,
-                        tx_fees_sats: fees,
-                        miner_work,
-                        node_shares,
-                        treasury_state,
-                    };
-
-                    match payout_for_block.handle_block_found(block_data) {
-                        Ok(proposal_hash) => {
-                            if proposal_hash != [0u8; 32] {
-                                metrics_for_block.payouts_total.inc();
-                                info!(
-                                    round = round_id,
-                                    hash = %hex::encode(&proposal_hash[..8]),
-                                    "Payout proposal submitted for consensus"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            metrics_for_block.payout_errors_total.inc();
-                            error!(error = %e, round = round_id, "Failed to create payout proposal");
-                        }
-                    }
-                }
-            }
-            warn!("Block submission channel closed, payout task exiting");
         });
     }
 
@@ -10484,63 +9940,6 @@ async fn main() -> Result<()> {
             .with_chain_health(Arc::clone(&verification_state.chain_health))
             .with_height_getter(move || rm_for_reorg.current_height());
         reorg_handler.start(block_events);
-        // Stage 6: the SettlementObserver is DELETED. It settled the LEGACY unpaid ledger from
-        // an observed coinbase at tip, and existed because the seven non-winning nodes would
-        // otherwise still owe work the pool had paid — and, being the majority, would carry that
-        // view into the next BFT proposal and pay it twice.
-        //
-        // Release B removes the vote, so there is no majority view to poison, and the shard is
-        // the only ledger a payout is built from. The shard settles the same way from the same
-        // evidence — `ShareShard::settle_matured`, chain-derived, on every node — but at
-        // COINBASE_MATURITY rather than at tip. That depth is what lets it carry no reversal
-        // machinery at all: the tip-time settler needed `reverse_settlement` for reorgs, and a
-        // block 100 deep is not coming back.
-        //
-        // The 100-block window in which `owed` still counts work already paid is deliberate,
-        // not a gap: `owed` is signed and never clamped, so a second payment inside the window
-        // leaves a residual the next block corrects (SHARE_SHARD.md §4.4, §4.6).
-        //
-        // The proposal-sync handler below OUTLIVES it on purpose. It answers peers as well as
-        // asking, and a node still on a pre-Stage-6 binary needs those answers to settle at all.
-        // Retire it once no fleet binary can ask.
-        {
-            let (psync_tx, mut psync_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-            {
-                let mesh_for_psync = Arc::clone(&mesh);
-                tokio::spawn(async move {
-                    while let Some(bytes) = psync_rx.recv().await {
-                        match mesh_for_psync.create_envelope_raw(
-                            ghost_consensus::MessageType::PayoutProposalSync,
-                            bytes,
-                        ) {
-                            Ok(envelope) => {
-                                if let Err(e) = mesh_for_psync.broadcast(envelope).await {
-                                    debug!(error = %e, "payout-proposal sync broadcast failed");
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "payout-proposal sync envelope failed")
-                            }
-                        }
-                    }
-                });
-            }
-            let psync_send: ghost_pool::proposal_sync::ProposalSyncSendFn =
-                Arc::new(move |bytes| {
-                    psync_tx.try_send(bytes).map_err(|e| {
-                        ghost_common::error::GhostError::P2PMessage(format!(
-                            "proposal-sync channel: {e}"
-                        ))
-                    })
-                });
-            let proposal_sync = Arc::new(
-                ghost_pool::proposal_sync::ProposalSyncHandler::new(Arc::clone(&db))
-                    .with_send(psync_send),
-            );
-            mesh.register_handler(Arc::clone(&proposal_sync)
-                as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-        }
-
         info!("ZMQ block watcher connected to {}", zmq_endpoint);
         if let Some(seq_ep) = sequence_endpoint {
             info!("ZMQ reorg detection connected to {}", seq_ep);
@@ -10564,19 +9963,12 @@ async fn main() -> Result<()> {
     // payout path (block-found), which almost never fires, so every per-window
     // best share reported a null block height.
     let db_for_rounds = Arc::clone(&db);
-    // Tip-change payout proposal: arms the coinbase BEFORE a block is won.
-    let payout_for_tips = Arc::clone(&payout_handler);
-    let identity_for_tips = Arc::clone(&identity);
     // The vote handler validates a payout proposal's block height against the current tip
     // (a +/-1000 block window). It needs to be told the tip advances, or that check runs
     // against height 0 and falls back to a permissive default — see below.
     let vote_handler_for_tips = Arc::clone(&vote_handler);
     let shard_for_rounds = shard.clone();
     tokio::spawn(async move {
-        // The last chain height we proposed a payout for. `NewWork` fires on every template
-        // refresh (~30s), but the tip only moves on a new block, and a payout is per-block.
-        let mut last_proposed_height: u64 = 0;
-
         // `Lagged` is recoverable; only `Closed` is terminal (#984).
         loop {
             let event = match template_events_early.recv().await {
@@ -10697,209 +10089,6 @@ async fn main() -> Result<()> {
                     // handler's height sat at 0 and the window check never constrained anything.
                     vote_handler_for_tips.update_block_height(height);
 
-                    // TIP-CHANGE PAYOUT: propose and ratify the coinbase for the block being
-                    // worked on, BEFORE anyone wins it.
-                    //
-                    // A block's coinbase is fixed when its template is built — the header
-                    // commits to it — so it can only pay a payout that was already approved.
-                    // Proposals were previously created ONLY on block-found, which means the
-                    // approved payout always lagged one win behind. With `approved_payout`
-                    // starting at None and the pool never yet having won, EVERY template carried
-                    // the fallback coinbase: the first block Ghost ever won would have paid its
-                    // entire subsidy to `pool_payout_address` and its miners nothing.
-                    //
-                    // Ratifying at each tip keeps a fresh, mesh-agreed split armed at all times,
-                    // built from the unpaid ledger as of this tip. Safe only because the ledger
-                    // is settled when a block PAYS (see `payout::settle_paid_block`), not when a
-                    // proposal is approved — otherwise this would wipe the ledger every tip while
-                    // paying nobody.
-                    // Gated on COINBASE_FEE_SPLIT_HEIGHT, and it must be: below that gate the
-                    // coinbase still carries a TX-fee output addressed to the block FINDER, and
-                    // at tip change nobody has found the block yet. A pre-gate tip proposal would
-                    // have to name a finder it cannot know, handing that block's fees to whichever
-                    // node's turn it happened to be. Routing fees to the node reward pool is what
-                    // removes the last unknown from the coinbase and makes it ratifiable early.
-                    if height >= ghost_pool::coinbase_fee_split_height()
-                        && height > last_proposed_height
-                    {
-                        last_proposed_height = height;
-
-                        // Deterministic proposer: every node computes the same answer from the
-                        // MPC elder set with no coordination, and the load rotates. Without this,
-                        // all 8 nodes would propose the same payout at every tip.
-                        let mut elders: Vec<[u8; 32]> = db_for_rounds
-                            .get_mpc_elder_node_ids()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .collect();
-                        elders.sort_unstable();
-
-                        let me = identity_for_tips.node_id();
-                        let my_turn =
-                            !elders.is_empty() && elders[(height as usize) % elders.len()] == me;
-
-                        if my_turn {
-                            // The tip we are building on. Every node agrees on it, and
-                            // PO4-M1 rejects a zero block hash — there is no block hash yet
-                            // because the block does not exist, so the tip identifies the
-                            // payout instead.
-                            match rm_notify.current_template_id() {
-                                Some(tip) => {
-                                    // v1.10.32 fix: this is the tip-change path that FAILED
-                                    // live. Anchor at the fleet-finalised checkpoint cutoff
-                                    // (converged) instead of now() (gossip-lagged), so every
-                                    // node recomputes the identical split. Below the gate this
-                                    // still resolves to now().
-                                    let Some(cutoff_ts) = ghost_pool::payout::resolve_payout_cutoff(
-                                        &db_for_rounds,
-                                        height,
-                                    ) else {
-                                        debug!(
-                                            height,
-                                            "no finalised payout checkpoint yet; skipping tip-change payout"
-                                        );
-                                        continue;
-                                    };
-                                    // `None` matches what `validate_block_data` uses to compute
-                                    // the expected subsidy — pass anything else and the proposal
-                                    // fails its own validation.
-                                    let subsidy =
-                                        ghost_common::rpc::calculate_block_subsidy(height, None);
-
-                                    // Option (c) adopt-CONSUMPTION: this tip-change path is
-                                    // entirely above the fee gate, so the coinbase consumes
-                                    // the fleet-ratified miner + node lists from the finalised
-                                    // checkpoint — never a local recompute (which diverges and
-                                    // was rejected every block in v1.10.32).
-                                    match ghost_pool::payout::read_adopted_payout(
-                                        &db_for_rounds,
-                                        height,
-                                    ) {
-                                        Some((miner_work, node_shares))
-                                            if !miner_work.is_empty() =>
-                                        {
-                                            // #601: NOT `get_current_block_info()`. This branch
-                                            // runs off the EMPTY fast-path template published at
-                                            // the tip change, whose total_fees is structurally
-                                            // 0 — so the ratified proposal carried no fees, the
-                                            // 1% was levied on the subsidy alone, and the whole
-                                            // real fee fell to the treasury as drift. Carry the
-                                            // last filled observation instead.
-                                            let (fees, fees_estimated) =
-                                                tp_for_template_events.payout_fee_estimate();
-                                            if fees_estimated {
-                                                info!(
-                                                    height,
-                                                    fees,
-                                                    "Tip-change payout: template not filled yet — \
-                                                     carrying the last filled fee observation (#601)"
-                                                );
-                                            }
-                                            // Audit H-2: this hardcoded `None` while every
-                                            // validator loaded the stored threshold. The decay
-                                            // schedule keys on it, so once the treasury crosses
-                                            // the threshold the proposer would compute a
-                                            // pre-threshold split against validators' decayed
-                                            // one — and GHOST-02 compares for exact equality.
-                                            let treasury_state =
-                                                ghost_pool::treasury::load_treasury_state(
-                                                    &db_for_rounds,
-                                                );
-                                            let treasury_address_snapshot =
-                                                payout_for_tips.get_treasury_address_snapshot();
-
-                                            let data = BlockFoundData {
-                                                shard_owed: shard_coinbase_owed(
-                                                    &shard_cb_c,
-                                                    cb_enabled,
-                                                ),
-                                                round_id,
-                                                ledger_cutoff_ts: cutoff_ts,
-                                                block_hash: tip,
-                                                block_height: height,
-                                                block_timestamp: chrono::Utc::now(),
-                                                winning_miner_id: "pool".to_string(),
-                                                winning_miner_payout_address: None,
-                                                treasury_address_snapshot,
-                                                // Post-gate there is no block-finder fee output,
-                                                // so this identifies the proposer for bookkeeping
-                                                // only — it receives nothing on account of it.
-                                                winning_node_id: me,
-                                                subsidy_sats: subsidy,
-                                                tx_fees_sats: fees,
-                                                miner_work,
-                                                node_shares,
-                                                treasury_state,
-                                            };
-
-                                            match payout_for_tips.handle_block_found(data) {
-                                                Ok(hash) if hash != [0u8; 32] => info!(
-                                                    height,
-                                                    hash = %hex::encode(&hash[..8]),
-                                                    "Tip-change payout proposed: arming the coinbase for this block"
-                                                ),
-                                                // WARN, not debug. This means we were the
-                                                // proposer, we had an adopted checkpoint, and we
-                                                // still armed nothing — the miners get paid nothing
-                                                // for this block. There is no reading of that which
-                                                // is not worth an operator's attention.
-                                                Ok(_) => warn!(
-                                                    height,
-                                                    "Tip-change payout produced no miner outputs — \
-                                                     this block would pay the miners nothing"
-                                                ),
-                                                Err(e) => error!(
-                                                    height,
-                                                    error = %e,
-                                                    "Tip-change payout proposal failed — this block's \
-                                                     coinbase will fall back to the pool address and \
-                                                     pay the miners nothing"
-                                                ),
-                                            }
-                                        }
-                                        // Both of these were `debug!`, which made every
-                                        // NON-arming outcome invisible at the default log level
-                                        // while only success was visible. A pool that had silently
-                                        // stopped arming payouts therefore looked exactly like a
-                                        // pool that simply was not the proposer for those heights —
-                                        // and because only one node proposes per height
-                                        // (round-robin over the elders), "not the proposer" is the
-                                        // common case. That ambiguity cost a long investigation and
-                                        // produced a wrong conclusion: a 25-minute window on two of
-                                        // eight nodes showed nothing, which was read as "payouts
-                                        // have stopped" when it was the expected observation for a
-                                        // perfectly healthy fleet.
-                                        //
-                                        // Whether the pool is paying anyone is the single most
-                                        // important thing about it, so every outcome now states its
-                                        // reason. This runs per tip change, not per share, so the
-                                        // cost is nil.
-                                        Some(_) => warn!(
-                                            height,
-                                            "Adopted checkpoint has an empty miner list at tip \
-                                             change; nothing to arm — miners get nothing for this \
-                                             block"
-                                        ),
-                                        None => warn!(
-                                            height,
-                                            "No finalised checkpoint to adopt at tip change; \
-                                             skipping — miners get nothing for this block"
-                                        ),
-                                    }
-                                }
-                                // Left at debug DELIBERATELY, unlike the branches above. This is
-                                // the one non-arming outcome that is genuinely expected and
-                                // self-resolving: there is no template yet because the node has
-                                // just started. Raising it would add a line to every restart and
-                                // train the operator to ignore the very warnings that matter.
-                                None => debug!(
-                                    height,
-                                    "No template id (tip) yet; cannot arm a payout this tip"
-                                ),
-                            }
-                        }
-                    }
-
                     // Persist the round (round_id → block_height) so the
                     // best-hash per-window join can resolve a share's block
                     // height. INSERT OR IGNORE: the payout path later upserts
@@ -10951,225 +10140,6 @@ async fn main() -> Result<()> {
                 TemplateEvent::FetchFailed { error } => {
                     warn!(error = %error, "Template fetch failed");
                 }
-            }
-        }
-    });
-
-    // Clone refs for the async round event handler
-    let rm_for_events = Arc::clone(&round_manager);
-    let tp_for_events = Arc::clone(&template_processor);
-    let payout_for_events = Arc::clone(&payout_handler);
-    let identity_for_events = Arc::clone(&identity);
-    let db_for_events = Arc::clone(&db);
-    let solo_payout_address_for_events = config.network.solo_payout_address.clone();
-
-    // Subscribe to round events and handle block found
-    //
-    // ⛔ This loop CREATES THE PAYOUT PROPOSAL for a found block, and it must never exit on a
-    // recoverable error. It used to be `while let Ok(event) = ...`, which treats
-    // `RecvError::Lagged` — "you missed n events", a recoverable condition — as terminal. A single
-    // lag ended the task permanently, and nothing restarted it or logged that it was gone, so
-    // every subsequent block would be found and never proposed (#984).
-    //
-    // The overflow is reachable: `RoundEvent::ShareSubmitted` rides this same 1000-slot channel on
-    // every share (~6.6/sec measured on the live fleet, so ~150s of stall fills it), and the
-    // heaviest work in this loop is the `BlockFound` arm below. That makes the FIRST block the pool
-    // ever wins the moment of peak lag risk — the one event the pool exists for.
-    //
-    // `reorg.rs` and `template_provider.rs` already handle `Lagged` correctly; this is that shape.
-    let mut round_events = round_manager.subscribe();
-    tokio::spawn(async move {
-        loop {
-            let event = match round_events.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Recoverable: keep consuming. A skipped BlockFound is serious, but the
-                    // remedy is to stay subscribed for the next one, not to stop listening.
-                    warn!(
-                        skipped,
-                        "Round-event consumer lagged — events were dropped. If a BlockFound was \
-                         among them, that block has no payout proposal; continuing to consume."
-                    );
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Terminal, and only this is: every sender is gone.
-                    warn!("Round-event channel closed — payout-proposal consumer stopping");
-                    break;
-                }
-            };
-            match event {
-                RoundEvent::BlockFound {
-                    round_id,
-                    block_hash,
-                    miner_id,
-                } => {
-                    let is_solo_mode = rm_for_events.is_solo_mode();
-                    info!(
-                        round = round_id,
-                        hash = %hex::encode(&block_hash[..8]),
-                        miner = %miner_id,
-                        solo_mode = is_solo_mode,
-                        "🎉 BLOCK FOUND! Creating payout proposal..."
-                    );
-
-                    // Gather data for payout proposal
-                    let node_shares = rm_for_events.get_node_shares(round_id);
-
-                    // Get block subsidy and fees from template processor
-                    let (subsidy, fees, height) = tp_for_events.get_current_block_info();
-
-                    // Load treasury state from database for decay calculation
-                    // SEC-ERR-4: Log database errors instead of silently ignoring them
-                    let treasury_state = match db_for_events.get_treasury_balance() {
-                        Ok(balance) => {
-                            let threshold_ts = match db_for_events.get_treasury_threshold_reached()
-                            {
-                                Ok(ts_opt) => ts_opt
-                                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to load treasury threshold timestamp, using None");
-                                    None
-                                }
-                            };
-                            TreasuryState::from_stored(balance, threshold_ts)
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to load treasury state, using default");
-                            TreasuryState::new()
-                        }
-                    };
-
-                    // Dispatch based on mining mode
-                    if is_solo_mode {
-                        // Solo mode: 99% subsidy + ALL TX fees to solo_payout_address
-                        let solo_address = match &solo_payout_address_for_events {
-                            Some(addr) if !addr.is_empty() => addr.clone(),
-                            _ => {
-                                error!(
-                                    "Solo mode block found but solo_payout_address not configured!"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // PO4-M2: Capture treasury address snapshot
-                        let treasury_address_snapshot =
-                            payout_for_events.get_treasury_address_snapshot();
-
-                        let solo_data = SoloBlockFoundData {
-                            round_id,
-                            block_hash,
-                            block_height: height,
-                            block_timestamp: chrono::Utc::now(),
-                            solo_payout_address: solo_address,
-                            subsidy_sats: subsidy,
-                            treasury_address_snapshot,
-                            tx_fees_sats: fees,
-                            node_shares,
-                            treasury_state,
-                        };
-
-                        match payout_for_events.handle_solo_block_found(solo_data) {
-                            Ok(proposal_hash) => {
-                                if proposal_hash != [0u8; 32] {
-                                    info!(
-                                        round = round_id,
-                                        hash = %hex::encode(&proposal_hash[..8]),
-                                        "Solo mode payout proposal submitted for consensus"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, round = round_id, "Failed to create solo mode payout proposal");
-                            }
-                        }
-                    } else {
-                        // Pool mode: ledger-style proportional distribution.
-                        // Shares arriving after this moment belong to the next block's ledger.
-                        // v1.10.32 fix: checkpoint cutoff (converged), not now() (lagged).
-                        // Below the activation gate this still resolves to now().
-                        let Some(cutoff_ts) =
-                            ghost_pool::payout::resolve_payout_cutoff(&db_for_events, height)
-                        else {
-                            debug!(
-                                height,
-                                "no finalised payout checkpoint yet; skipping split payout this block"
-                            );
-                            continue;
-                        };
-                        let miner_work = {
-                            // GHOST-02: the unpaid ledger, NOT this round's work. Every
-                            // proposal path must derive its split the same way validators
-                            // recompute it, or the fleet rejects its own payout.
-                            match ghost_pool::payout::select_ledger_miner_work(
-                                &db_for_events,
-                                cutoff_ts,
-                                height,
-                                subsidy,
-                            ) {
-                                Ok(work) => work,
-                                Err(e) => {
-                                    error!(
-                                        round = round_id,
-                                        cutoff_ts,
-                                        error = %e,
-                                        "Failed to read unpaid ledger at block-found; no miner \
-                                         payout this block — unpaid shares roll forward"
-                                    );
-                                    Vec::new()
-                                }
-                            }
-                        };
-                        let winning_node_id = identity_for_events.node_id();
-
-                        // PO4-M2: Capture treasury address snapshot
-                        let treasury_address_snapshot =
-                            payout_for_events.get_treasury_address_snapshot();
-
-                        let block_data = BlockFoundData {
-                            shard_owed: shard_coinbase_owed(&shard_cb_d, cb_enabled),
-                            round_id,
-                            ledger_cutoff_ts: cutoff_ts,
-                            block_hash,
-                            block_height: height,
-                            block_timestamp: chrono::Utc::now(),
-                            winning_miner_id: miner_id.clone(),
-                            winning_miner_payout_address: None, // Address looked up from DB
-                            treasury_address_snapshot,
-                            winning_node_id,
-                            subsidy_sats: subsidy,
-                            tx_fees_sats: fees,
-                            miner_work,
-                            node_shares,
-                            treasury_state,
-                        };
-
-                        match payout_for_events.handle_block_found(block_data) {
-                            Ok(proposal_hash) => {
-                                if proposal_hash != [0u8; 32] {
-                                    info!(
-                                        round = round_id,
-                                        hash = %hex::encode(&proposal_hash[..8]),
-                                        "Payout proposal submitted for consensus"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, round = round_id, "Failed to create payout proposal");
-                            }
-                        }
-                    }
-                }
-                RoundEvent::ShareSubmitted {
-                    round_id: _,
-                    miner_id: _,
-                    work: _,
-                } => {
-                    // Log periodically, not every share
-                }
-                _ => {}
             }
         }
     });
