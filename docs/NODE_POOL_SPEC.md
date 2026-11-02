@@ -14,7 +14,7 @@ Status: draft 11, 2026-11-02, against `main` at `f1cc40519`. Replaces the #608 p
 
 **How the pool agrees who is owed what.** A light share chain. Nodes pass each other the larger shares, and each share proves its own work and its own payee. Roughly every 54 seconds a harder share becomes an anchor that orders the recent ones. The chain with the most work wins. There are no votes, no signatures to trust, no elders and no roster.
 
-**What gets removed.** Node rewards, elders, capabilities, L2, zk, MPC, Wraith and ghostd: about 140,000 lines. About 5,000 are added. 16-22 weeks for one engineer.
+**What gets removed.** Node rewards, elders, capabilities, L2, zk, MPC and Wraith: about 330,000 lines in all. ghostd stays: node pool nodes run on it. About 5,000 are added. 16-22 weeks for one engineer.
 
 **How it gets shipped.** Regtest, then our own signet, then mainnet. Nothing reaches mainnet until every test stage passes.
 
