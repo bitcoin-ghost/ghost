@@ -343,7 +343,7 @@ impl BtcArchive {
         {
             return Err(ArchiveError::Invalid("hash does not meet its bits".into()));
         }
-        if b.height % RETARGET_INTERVAL != 0 {
+        if !b.height.is_multiple_of(RETARGET_INTERVAL) {
             if b.header.bits != parent.header.bits {
                 return Err(ArchiveError::Invalid(
                     "bits differ from the parent's inside a difficulty period".into(),
@@ -405,7 +405,7 @@ impl BtcArchive {
     pub fn facts(&self, hash: &[u8; 32]) -> Option<HeaderFacts> {
         let g = self.lock();
         let b = g.blocks.get(hash)?;
-        let next_bits = if (b.height + 1) % RETARGET_INTERVAL != 0 {
+        let next_bits = if !(b.height + 1).is_multiple_of(RETARGET_INTERVAL) {
             b.header.bits
         } else {
             let c = g.blocks.get(g.main.get(&(b.height + 1))?)?;
@@ -523,4 +523,141 @@ pub fn coinbase_branch(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
         idx /= 2;
     }
     branch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{btc_hash, main_block, make_block, plain_coinbase, BTC_FLOOR};
+
+    /// Regtest's bits: any hash has a fair chance of meeting them.
+    const EASY: u32 = 0x207f_ffff;
+
+    fn mined(prev: &ArchivedBlock, tag: u8, bits: u32) -> ArchivedBlock {
+        let mut b = make_block(
+            prev.hash(),
+            prev.height + 1,
+            plain_coinbase(prev.height + 1, tag),
+        );
+        b.header.bits = bitcoin::CompactTarget::from_consensus(bits);
+        while b.header.validate_pow(b.header.target()).is_err() {
+            b.header.nonce += 1;
+        }
+        b
+    }
+
+    fn easy_root() -> ArchivedBlock {
+        let mut b = make_block([7; 32], 5_000, plain_coinbase(5_000, 0));
+        b.header.bits = bitcoin::CompactTarget::from_consensus(EASY);
+        b
+    }
+
+    #[test]
+    fn a_peer_block_is_checked_before_it_is_kept() {
+        let a = BtcArchive::in_memory();
+        let root = easy_root();
+        a.insert_local(root.clone(), 0).unwrap();
+        let good = mined(&root, 1, EASY);
+        // Work: the same block with mainnet bits does not meet them.
+        let mut weak = good.clone();
+        weak.header.bits = bitcoin::CompactTarget::from_consensus(0x1702_1be5);
+        assert!(matches!(
+            a.insert_from_peer(weak, 0),
+            Err(ArchiveError::Invalid(_))
+        ));
+        // A coinbase that does not fold to the header.
+        let mut swapped = good.clone();
+        swapped.coinbase = Some((plain_coinbase(root.height + 1, 9), vec![]));
+        assert!(matches!(
+            a.insert_from_peer(swapped, 0),
+            Err(ArchiveError::Invalid(_))
+        ));
+        // A height that does not follow the parent's.
+        let mut tall = good.clone();
+        tall.height += 1;
+        assert!(matches!(
+            a.insert_from_peer(tall, 0),
+            Err(ArchiveError::Invalid(_))
+        ));
+        // No coinbase at all.
+        let mut bare = good.clone();
+        bare.coinbase = None;
+        assert!(a.insert_from_peer(bare, 0).is_err());
+        assert_eq!(a.insert_from_peer(good.clone(), 0), Ok(vec![good.hash()]));
+        assert!(a.has_full(&good.hash()));
+        // Bits that change inside a difficulty period.
+        let mut drift = mined(&good, 2, EASY);
+        drift.header.bits = bitcoin::CompactTarget::from_consensus(0x207f_fffe);
+        while drift.header.validate_pow(drift.header.target()).is_err() {
+            drift.header.nonce += 1;
+        }
+        assert!(matches!(
+            a.insert_from_peer(drift, 0),
+            Err(ArchiveError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_block_whose_parent_is_missing_waits_for_it() {
+        let a = BtcArchive::in_memory();
+        let root = easy_root();
+        a.insert_local(root.clone(), 0).unwrap();
+        let b1 = mined(&root, 1, EASY);
+        let b2 = mined(&b1, 1, EASY);
+        assert_eq!(
+            a.insert_from_peer(b2.clone(), 0),
+            Err(ArchiveError::Unlinked(b1.hash()))
+        );
+        assert!(!a.has_full(&b2.hash()));
+        let got = a.insert_from_peer(b1.clone(), 0).unwrap();
+        assert_eq!(
+            got,
+            vec![b1.hash(), b2.hash()],
+            "the waiting child is linked"
+        );
+        assert_eq!(
+            a.pool_blocks_on(&b2.hash(), root.height, b2.height + 1),
+            Ok(vec![])
+        );
+        // An unarchived ancestor is named, so it can be fetched.
+        assert_eq!(
+            a.pool_blocks_on(&b2.hash(), root.height - 1, b2.height + 1),
+            Err(root.prev())
+        );
+    }
+
+    #[test]
+    fn facts_come_from_the_archived_headers() {
+        let a = BtcArchive::in_memory();
+        for h in BTC_FLOOR..=BTC_FLOOR + 20 {
+            a.insert_local(main_block(h), 0).unwrap();
+        }
+        let h = BTC_FLOOR + 20;
+        let f = a.facts(&btc_hash(h)).unwrap();
+        assert_eq!(f.height, h);
+        assert_eq!(f.median_time_past, main_block(h - 5).header.time);
+        assert_eq!(f.next_bits, main_block(h).header.bits);
+        assert!(
+            a.facts(&btc_hash(BTC_FLOOR + 5)).is_none(),
+            "fewer than 11 headers archived below it"
+        );
+    }
+
+    #[test]
+    fn a_persisted_archive_reloads() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let a = BtcArchive::open(db.clone()).unwrap();
+        a.insert_local(main_block(BTC_FLOOR), 0).unwrap();
+        let mut hdr_only = main_block(BTC_FLOOR + 1);
+        hdr_only.coinbase = None;
+        a.insert_local(hdr_only, 0).unwrap();
+        a.insert_local(main_block(BTC_FLOOR + 1), 0).unwrap();
+        let b = BtcArchive::open(db).unwrap();
+        assert_eq!(b.len(), 2);
+        assert!(
+            b.has_full(&btc_hash(BTC_FLOOR + 1)),
+            "the coinbase was added"
+        );
+        assert_eq!(b.get(&btc_hash(BTC_FLOOR)).unwrap().height, BTC_FLOOR);
+    }
 }
