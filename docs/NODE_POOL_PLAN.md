@@ -12,7 +12,7 @@ This branch strips the old system out as it builds the new one. It does not keep
 - **Removal waves**, on this branch, each leaving the workspace building and tested:
   1. Wraith (wallet app, coordinator, protocol), Ghost Tap, ghost-lock and its signer, and anything reachable only from them.
   2. zk, MPC, L2 and glyph, with the zk start gate and the `zk-production` build feature.
-  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables.
+  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables. Code removed 11-02 on `feat/node-pool-rm3` (not merged); the tables stay until migration v64 imports the genesis table. ghost-miner-proxy went with the elder-signed node-list checkpoint it verified; W2.9/W2.10 rebuild the miner-side tool against open listing.
   4. ghostd to stock Bitcoin Core; the dashboard, docs and website overhauls are W2.14-W2.16.
 - Phase 4's Release A / Release B dual running is replaced by this. Phases 3 (regtest, signet) still come before any mainnet use.
 
