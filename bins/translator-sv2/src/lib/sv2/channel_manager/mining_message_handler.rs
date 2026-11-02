@@ -310,9 +310,28 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
-        Err(TproxyError::fallback(
-            TproxyErrorKind::OpenMiningChannelError,
-        ))
+        // One aggregated channel serves every miner: without it nobody can mine, so fall back.
+        if is_aggregated() {
+            return Err(TproxyError::fallback(
+                TproxyErrorKind::OpenMiningChannelError,
+            ));
+        }
+        // A per-miner channel: the refusal is that miner's alone (its request id is its
+        // downstream id). The SV1 server disconnects that one miner; everyone else keeps mining.
+        self.pending_downstream_channels
+            .remove(&(m.request_id as DownstreamId));
+        self.channel_state
+            .sv1_server_sender
+            .send((Mining::OpenMiningChannelError(m.into_static()), None))
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to send OpenMiningChannelError to the SV1 server: {:?}",
+                    e
+                );
+                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+            })?;
+        Ok(())
     }
 
     async fn handle_update_channel_error(
@@ -370,6 +389,16 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
         }
 
+        // The miner on a closed per-miner channel has no work left: the SV1 server disconnects
+        // it (and only it), so it reconnects rather than sit idle.
+        self.channel_state
+            .sv1_server_sender
+            .send((Mining::CloseChannel(m.into_static()), None))
+            .await
+            .map_err(|e| {
+                error!("Failed to send CloseChannel to the SV1 server: {:?}", e);
+                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+            })?;
         Ok(())
     }
 

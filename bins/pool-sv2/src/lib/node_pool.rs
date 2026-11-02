@@ -72,6 +72,7 @@ use ghost_common::{
     slot_class_sensing::{
         clamp_agent, ClassChange, ClassSensor, MinerIdentity, SensingParams, SensingStatus,
         ShareVerdict, Sv2Device, AGENT_TLV_EXTENSION_TYPE, AGENT_TLV_FIELD_TYPE, FULL_CLASS_INDEX,
+        PAYEE_TLV_FIELD_TYPE,
     },
 };
 use ghost_np_relay::net::TableRequest;
@@ -201,6 +202,10 @@ struct State {
     job_anchor: Option<AnchorUpdate>,
     /// Templates no table could be had for in time: no channel got a job on them.
     unserved: VecDeque<u64>,
+    /// Channels the translator opened on `mining.subscribe` under the provisional identity, whose
+    /// payee arrives with the miner's authorize ([`NodePool::await_payee`]). No job is built for
+    /// them until then.
+    awaiting_payee: HashSet<ChannelKey>,
     /// A new tip whose template was not served: its `SetNewPrevHash` waits here, unsent, until
     /// the table arrives ([`NodePool::take_pending_tip`]).
     pending_tip: Option<SetNewPrevHash<'static>>,
@@ -493,6 +498,33 @@ impl NodePool {
         while st.unserved.len() > UNSERVED_KEPT {
             st.unserved.pop_front();
         }
+    }
+
+    /// A channel opened under the provisional identity: it gets no job until its payee is bound
+    /// ([`NodePool::payee_bound`]).
+    pub fn await_payee(&self, key: ChannelKey) {
+        self.lock().awaiting_payee.insert(key);
+    }
+
+    /// Whether a channel still waits for its payee (and so must not be given a job).
+    pub fn awaits_payee(&self, key: ChannelKey) -> bool {
+        self.lock().awaiting_payee.contains(&key)
+    }
+
+    /// The channel's payee is bound (or the channel is gone).
+    pub fn payee_bound(&self, key: ChannelKey) {
+        self.lock().awaiting_payee.remove(&key);
+    }
+
+    /// The payee a provisional channel is bound to: the Ghost payee TLV on an `UpdateChannel`.
+    pub fn payee_from_tlvs(tlvs: Option<&[Tlv]>) -> Option<String> {
+        tlvs?
+            .iter()
+            .find(|t| {
+                t.r#type.extension_type == AGENT_TLV_EXTENSION_TYPE
+                    && t.r#type.field_type == PAYEE_TLV_FIELD_TYPE
+            })
+            .and_then(|t| String::from_utf8(t.value.clone()).ok())
     }
 
     /// `template_id` was served after all (a held tip, once its table arrived).
@@ -943,6 +975,7 @@ impl NodePool {
             .channels
             .keys()
             .chain(st.agents.keys())
+            .chain(st.awaiting_payee.iter())
             .filter(|k| k.0 == downstream_id)
             .copied()
             .collect();
@@ -1121,6 +1154,7 @@ fn register(
 
 fn close(st: &mut State, key: ChannelKey, now: u64) {
     st.agents.remove(&key);
+    st.awaiting_payee.remove(&key);
     let Some(slot) = st.channels.remove(&key) else {
         return;
     };
@@ -1344,6 +1378,37 @@ mod tests {
         assert!(e.contains("no snapshot table"), "{e}");
         np.insert_table([9; 32], H, Arc::new(owed_table(3)));
         assert!(np.canonical_outputs(&[9; 32], 500, &t).is_ok());
+    }
+
+    /// A channel the translator opened on subscribe waits for its payee: no job until the
+    /// payee TLV binds it, and a closed connection forgets it.
+    #[test]
+    fn a_provisional_channel_waits_for_its_payee_tlv() {
+        let np = pool(2);
+        let key = (4, 9);
+        np.await_payee(key);
+        assert!(np.awaits_payee(key));
+        let tlv = Tlv::new(
+            AGENT_TLV_EXTENSION_TYPE,
+            PAYEE_TLV_FIELD_TYPE,
+            format!("{ADDR}.rig").into_bytes(),
+        );
+        let agent = Tlv::new(
+            AGENT_TLV_EXTENSION_TYPE,
+            AGENT_TLV_FIELD_TYPE,
+            b"x".to_vec(),
+        );
+        assert_eq!(
+            NodePool::payee_from_tlvs(Some(&[agent.clone(), tlv])),
+            Some(format!("{ADDR}.rig"))
+        );
+        assert_eq!(NodePool::payee_from_tlvs(Some(&[agent])), None);
+        assert_eq!(NodePool::payee_from_tlvs(None), None);
+        np.payee_bound(key);
+        assert!(!np.awaits_payee(key));
+        np.await_payee(key);
+        np.on_downstream_removed(4);
+        assert!(!np.awaits_payee(key), "forgotten with its connection");
     }
 
     /// A stand-in relay task: answers a table request from `tables` once `ready` says the

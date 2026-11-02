@@ -1474,6 +1474,10 @@ aggregate_channels = false
 # an 8-byte placeholder extranonce while the real prefix is 12, builds a 4-byte-short coinbase,
 # and has EVERY share rejected. \`mining.set_extranonce\` cannot rescue it — that is an optional
 # extension those clients never negotiate.
+# On the node pool a job credits its payee, so pool_sv2 builds none for a channel opened on
+# subscribe until the miner authorises: the translator then binds the channel to the miner's
+# <address>.<worker> (an UpdateChannel carrying the Ghost payee TLV, extension 0x4748, required
+# below). Pipelining miners authorise within the debounce and open on authorize as before.
 open_channel_on_subscribe = true
 
 # Protocol extensions — the Ghost per-miner TLV extension (0x0002), and the Ghost agent extension

@@ -3,10 +3,15 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use stratum_apps::stratum_core::{
-    handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync, parsers_sv2::Mining,
+use stratum_apps::{
+    stratum_core::{
+        handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,
+        mining_sv2::{CloseChannel, SetNewPrevHash},
+        parsers_sv2::Mining,
+    },
+    utils::types::{ChannelId, DownstreamId},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo},
@@ -33,6 +38,142 @@ impl ChannelManager {
         let keys = changed_keys(&self.node_pool.tick());
         if !keys.is_empty() {
             self.node_pool_rebuild(Some(&keys)).await;
+        }
+    }
+
+    /// Bind a channel opened under the provisional identity to its miner's payee (the Ghost payee
+    /// TLV on an `UpdateChannel`, sent by the translator when a miner that waited for its
+    /// subscribe reply authorises), and give it its first job, as a channel opened on authorize
+    /// gets one. A payee the node pool refuses, or no snapshot table to build the job from,
+    /// closes that channel only.
+    pub(crate) async fn node_pool_bind_payee(
+        &self,
+        downstream_id: DownstreamId,
+        channel_id: ChannelId,
+        identity: String,
+    ) {
+        let np = self.node_pool.clone();
+        let key = (downstream_id, channel_id);
+        if !np.awaits_payee(key) {
+            warn!(
+                downstream_id,
+                channel_id, "NODE_POOL: a payee for a channel that is not waiting for one; ignored"
+            );
+            return;
+        }
+        let future = self
+            .channel_manager_data
+            .super_safe_lock(|d| d.last_future_template.clone());
+        let served = match &future {
+            Some(t) => np.prepare_job_basis(t).await,
+            None => false,
+        };
+        let refused = NodePool::payee_for_identity(&identity)
+            .err()
+            .or((!served).then_some("node-pool-no-snapshot-table"));
+        let messages: Vec<RouteMessageTo> = self.channel_manager_data.super_safe_lock(|cm| {
+            let mut out: Vec<RouteMessageTo> = vec![];
+            let tip = cm.last_new_prev_hash.clone();
+            let Some(downstream) = cm.downstream.get_mut(&downstream_id) else {
+                return out;
+            };
+            downstream.downstream_data.super_safe_lock(|data| {
+                if let Some(code) = refused {
+                    error!(
+                        downstream_id,
+                        channel_id,
+                        identity,
+                        code,
+                        "NODE_POOL: payee refused; closing that channel"
+                    );
+                    data.extended_channels.remove(&channel_id);
+                    data.group_channel.remove_channel_id(channel_id);
+                    np.payee_bound(key);
+                    out.push(
+                        (
+                            downstream_id,
+                            Mining::CloseChannel(CloseChannel {
+                                channel_id,
+                                reason_code: code.to_string().try_into().expect("short code"),
+                            }),
+                        )
+                            .into(),
+                    );
+                    return;
+                }
+                let (Some(channel), Some(t)) =
+                    (data.extended_channels.get_mut(&channel_id), future.as_ref())
+                else {
+                    return;
+                };
+                channel.set_user_identity(identity.clone());
+                np.payee_bound(key);
+                let target = *channel.get_target();
+                channel.set_tier_commitment(Some(np.stamp(
+                    key,
+                    ChannelKind::Extended,
+                    &identity,
+                    &target,
+                )));
+                let outputs = match np.job_outputs(key, t) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!(
+                            ?key,
+                            "NODE_POOL: no canonical outputs for a bound channel: {e}"
+                        );
+                        return;
+                    }
+                };
+                if let Err(e) = channel.on_new_template(np.prepare_template(t), outputs) {
+                    error!(?key, ?e, "NODE_POOL: the bound channel's first job failed");
+                    return;
+                }
+                let Some(job_id) = channel.get_future_job_id_from_template_id(t.template_id) else {
+                    return;
+                };
+                np.bind_job(key, job_id);
+                let Some(job) = channel.get_future_job(job_id) else {
+                    return;
+                };
+                out.push(
+                    (
+                        downstream_id,
+                        Mining::NewExtendedMiningJob(job.get_job_message().clone().into_static()),
+                    )
+                        .into(),
+                );
+                // Activated on the current tip, as at an open (#898: only when the cached prev
+                // hash is this template's).
+                if let Some(tip) = tip.filter(|tip| tip.template_id == t.template_id) {
+                    let snph = SetNewPrevHash {
+                        channel_id,
+                        job_id,
+                        prev_hash: tip.prev_hash.clone(),
+                        min_ntime: tip.header_timestamp,
+                        nbits: tip.n_bits,
+                    };
+                    if let Err(e) = channel.on_set_new_prev_hash(tip) {
+                        error!(
+                            ?key,
+                            ?e,
+                            "NODE_POOL: activating the bound channel's job failed"
+                        );
+                        return;
+                    }
+                    out.push((downstream_id, Mining::SetNewPrevHash(snph)).into());
+                }
+                info!(
+                    downstream_id,
+                    channel_id, identity, "NODE_POOL: provisional channel bound to its payee"
+                );
+            });
+            out
+        });
+        for message in messages {
+            if let Err(e) = message.forward(&self.channel_manager_channel).await {
+                error!("Failed to forward message {e:?}");
+            }
         }
     }
 
@@ -102,7 +243,7 @@ impl ChannelManager {
                 downstream.downstream_data.super_safe_lock(|data| {
                     for (channel_id, channel) in data.extended_channels.iter_mut() {
                         let key = (*downstream_id, *channel_id);
-                        if !wanted(&key) {
+                        if !wanted(&key) || np.awaits_payee(key) {
                             continue;
                         }
                         let stamp = np.stamp(

@@ -309,6 +309,12 @@ where
         &self.user_identity
     }
 
+    /// Replaces the user identity: a channel opened under a provisional identity is bound to its
+    /// miner once the miner has authorised (Ghost node pool).
+    pub fn set_user_identity(&mut self, user_identity: String) {
+        self.user_identity = user_identity;
+    }
+
     /// Returns the extranonce prefix bytes for this channel.
     pub fn get_extranonce_prefix(&self) -> &Vec<u8> {
         &self.extranonce_prefix

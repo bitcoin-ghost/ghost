@@ -588,9 +588,22 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                         // NODE_POOL: the channel must credit a payee the ledger accepts. Checked
                         // before the prefix is minted, for the reason given just below.
-                        let refused = crate::node_pool::NodePool::payee_for_identity(&user_identity)
-                            .err()
-                            .or(unserved.then_some("node-pool-no-snapshot-table"));
+                        // A channel the translator opens on `mining.subscribe`, for a miner that
+                        // authorises only once its subscribe is answered, carries the provisional
+                        // identity: accepted from a client that speaks the Ghost extension, which
+                        // binds the payee (`UpdateChannel` with the payee TLV) when the miner
+                        // authorises. It gets no job before then, since a job credits its payee.
+                        let provisional = user_identity == PROVISIONAL_CHANNEL_IDENTITY
+                            && downstream_data
+                                .negotiated_extensions
+                                .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE);
+                        let refused = if provisional {
+                            None
+                        } else {
+                            crate::node_pool::NodePool::payee_for_identity(&user_identity)
+                                .err()
+                                .or(unserved.then_some("node-pool-no-snapshot-table"))
+                        };
                         if let Some(code) = refused {
                             error!("OpenMiningChannelError: {code} (user_identity: '{user_identity}')");
                             let open_extended_mining_channel_error = OpenMiningChannelError {
@@ -736,12 +749,16 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             extended_channel.get_requested_max_target(),
                         );
                         extended_channel.set_target(q);
-                        extended_channel.set_tier_commitment(Some(np.stamp(
-                            (downstream_id, channel_id),
-                            crate::node_pool::ChannelKind::Extended,
-                            &user_identity,
-                            &q,
-                        )));
+                        if provisional {
+                            np.await_payee((downstream_id, channel_id));
+                        } else {
+                            extended_channel.set_tier_commitment(Some(np.stamp(
+                                (downstream_id, channel_id),
+                                crate::node_pool::ChannelKind::Extended,
+                                &user_identity,
+                                &q,
+                            )));
+                        }
 
                         let group_channel_id = downstream_data.group_channel.get_group_channel_id();
 
@@ -770,95 +787,107 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 .into(),
                         );
 
-                        let Some(last_set_new_prev_hash_tdp) =
-                            channel_manager_data.last_new_prev_hash.clone()
-                        else {
-                            return Err(PoolError::disconnect(PoolErrorKind::LastNewPrevhashNotFound, downstream_id));
-                        };
-
-                        let Some(last_future_template) =
-                            channel_manager_data.last_future_template.clone()
-                        else {
-                            return Err(PoolError::disconnect(PoolErrorKind::FutureTemplateNotPresent,downstream_id));
-                        };
-
-                        // The first job: Ghost tags out of the prefix, the share tag back in as
-                        // the factory's extra push, the canonical outputs.
-                        let coinbase_outputs = np
-                            .job_outputs((downstream_id, channel_id), &last_future_template)
-                            .map_err(|e| PoolError::disconnect(PoolErrorKind::Custom(e), downstream_id))?;
-                        let channel_template = np.prepare_template(&last_future_template);
-                        extended_channel.on_new_template(
-                            channel_template,
-                            coinbase_outputs,
-                        ).map_err(|e| PoolError::disconnect(e, downstream_id))?;
-
-                        let future_extended_job_id = extended_channel
-                            .get_future_job_id_from_template_id(last_future_template.template_id)
-                            .expect("future job id must exist");
-                        np.bind_job((downstream_id, channel_id), future_extended_job_id);
-                        let future_extended_job = extended_channel
-                            .get_future_job(future_extended_job_id)
-                            .expect("future job must exist");
-
-                        let future_extended_job_message =
-                            future_extended_job.get_job_message().clone().into_static();
-
-                        // send this future job as new job message
-                        // to be immediately activated with the subsequent SetNewPrevHash
-                        // message
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::NewExtendedMiningJob(future_extended_job_message),
-                            )
-                                .into(),
-                        );
-
-                        // Activate the future job we just seeded — but ONLY when the two
-                        // cached Template Distribution fields actually agree.
-                        //
-                        // `last_future_template` and `last_new_prev_hash` are written by two
-                        // different TP handlers, each taking this lock separately. Between a
-                        // `NewTemplate(N)` and its `SetNewPrevHash(N)` the pair is legitimately
-                        // mismatched: the template is already N while the prev hash still
-                        // refers to N-1. A channel opening in that window would seed job N and
-                        // then ask to activate N-1, which `on_set_new_prev_hash` reports as
-                        // `TemplateIdNotFound` (#898).
-                        //
-                        // Skipping is safe and loses nothing: the channel keeps its future job,
-                        // and the next `SetNewPrevHash` broadcast activates it for every
-                        // downstream. Sending the client a `SetNewPrevHash` built from the
-                        // stale prev hash would be actively wrong, so that is skipped with it.
-                        if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, last_future_template.template_id) {
-                            let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
-                            let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
-                            let n_bits = last_set_new_prev_hash_tdp.n_bits;
-                            let set_new_prev_hash_mining = SetNewPrevHash {
-                                channel_id,
-                                job_id: future_extended_job_id,
-                                prev_hash,
-                                min_ntime: header_timestamp,
-                                nbits: n_bits,
+                        if provisional {
+                            // No job until the payee is bound; the chain tip is set so the job
+                            // built then can be activated on it.
+                            info!(channel_id, "NODE_POOL: provisional channel open; its job waits for the miner's payee");
+                            if let Some(tip) = channel_manager_data.last_new_prev_hash.clone() {
+                                extended_channel
+                                    .on_set_new_prev_hash(tip)
+                                    .map_err(|e| PoolError::disconnect(e, downstream_id))?;
+                            }
+                        } else {
+                            let Some(last_set_new_prev_hash_tdp) =
+                                channel_manager_data.last_new_prev_hash.clone()
+                            else {
+                                return Err(PoolError::disconnect(PoolErrorKind::LastNewPrevhashNotFound, downstream_id));
                             };
 
-                            extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(|e| PoolError::disconnect(e, downstream_id))?;
+                            let Some(last_future_template) =
+                                channel_manager_data.last_future_template.clone()
+                            else {
+                                return Err(PoolError::disconnect(PoolErrorKind::FutureTemplateNotPresent,downstream_id));
+                            };
 
+                            // The first job: Ghost tags out of the prefix, the share tag back in as
+                            // the factory's extra push, the canonical outputs.
+                            let coinbase_outputs = np
+                                .job_outputs((downstream_id, channel_id), &last_future_template)
+                                .map_err(|e| PoolError::disconnect(PoolErrorKind::Custom(e), downstream_id))?;
+                            let channel_template = np.prepare_template(&last_future_template);
+                            extended_channel.on_new_template(
+                                channel_template,
+                                coinbase_outputs,
+                            ).map_err(|e| PoolError::disconnect(e, downstream_id))?;
+
+                            let future_extended_job_id = extended_channel
+                                .get_future_job_id_from_template_id(last_future_template.template_id)
+                                .expect("future job id must exist");
+                            np.bind_job((downstream_id, channel_id), future_extended_job_id);
+                            let future_extended_job = extended_channel
+                                .get_future_job(future_extended_job_id)
+                                .expect("future job must exist");
+
+                            let future_extended_job_message =
+                                future_extended_job.get_job_message().clone().into_static();
+
+                            // send this future job as new job message
+                            // to be immediately activated with the subsequent SetNewPrevHash
+                            // message
                             messages.push(
                                 (
                                     downstream_id,
-                                    Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                                    Mining::NewExtendedMiningJob(future_extended_job_message),
                                 )
                                     .into(),
                             );
-                        } else {
-                            debug!(
-                                channel_id,
-                                template_id = last_future_template.template_id,
-                                prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
-                                "Opened channel between NewTemplate and its SetNewPrevHash — \
-                                 leaving the future job unactivated for the next broadcast"
-                            );
+
+                            // Activate the future job we just seeded — but ONLY when the two
+                            // cached Template Distribution fields actually agree.
+                            //
+                            // `last_future_template` and `last_new_prev_hash` are written by two
+                            // different TP handlers, each taking this lock separately. Between a
+                            // `NewTemplate(N)` and its `SetNewPrevHash(N)` the pair is legitimately
+                            // mismatched: the template is already N while the prev hash still
+                            // refers to N-1. A channel opening in that window would seed job N and
+                            // then ask to activate N-1, which `on_set_new_prev_hash` reports as
+                            // `TemplateIdNotFound` (#898).
+                            //
+                            // Skipping is safe and loses nothing: the channel keeps its future job,
+                            // and the next `SetNewPrevHash` broadcast activates it for every
+                            // downstream. Sending the client a `SetNewPrevHash` built from the
+                            // stale prev hash would be actively wrong, so that is skipped with it.
+                            if may_activate_seeded_job(last_set_new_prev_hash_tdp.template_id, last_future_template.template_id) {
+                                let prev_hash = last_set_new_prev_hash_tdp.prev_hash.clone();
+                                let header_timestamp = last_set_new_prev_hash_tdp.header_timestamp;
+                                let n_bits = last_set_new_prev_hash_tdp.n_bits;
+                                let set_new_prev_hash_mining = SetNewPrevHash {
+                                    channel_id,
+                                    job_id: future_extended_job_id,
+                                    prev_hash,
+                                    min_ntime: header_timestamp,
+                                    nbits: n_bits,
+                                };
+
+                                extended_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp).map_err(|e| PoolError::disconnect(e, downstream_id))?;
+
+                                messages.push(
+                                    (
+                                        downstream_id,
+                                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                                    )
+                                        .into(),
+                                );
+                            } else {
+                                debug!(
+                                    channel_id,
+                                    template_id = last_future_template.template_id,
+                                    prev_hash_template_id = last_set_new_prev_hash_tdp.template_id,
+                                    "Opened channel between NewTemplate and its SetNewPrevHash — \
+                                     leaving the future job unactivated for the next broadcast"
+                                );
+                            }
+
                         }
 
                         let full_extranonce_size = extended_channel.get_full_extranonce_size();
@@ -1551,6 +1580,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+
+        // NODE_POOL: the translator binding a channel it opened on `mining.subscribe` to the
+        // miner that has now authorised.
+        if let Some(identity) = crate::node_pool::NodePool::payee_from_tlvs(_tlv_fields) {
+            self.node_pool_bind_payee(downstream_id, msg.channel_id, identity)
+                .await;
+            return Ok(());
+        }
 
         let messages: Vec<RouteMessageTo> = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
             let Some(downstream) = channel_manager_data.downstream.get(&downstream_id) else {

@@ -79,6 +79,10 @@ pub struct DownstreamData {
     // `<addr>.<addr>.<worker>`, because the pool spliced a full identity onto a channel that
     // already carried the address.
     pub channel_opened_provisionally: bool,
+    // A provisionally opened channel's payee was sent to the pool (an `UpdateChannel` carrying
+    // the Ghost payee TLV) once the miner authorised: the node pool binds the payee then, since
+    // a job credits its payee and none can be built before it is known.
+    pub payee_bound: bool,
     // Whether the client opted in to `subscribe-extranonce` via `mining.configure`.
     //
     // `mining.set_extranonce` is opt-in. Sending it to a client that never asked is a
@@ -151,6 +155,7 @@ impl DownstreamData {
             declared_difficulty_needs_push: false,
             channel_open_requested: false,
             channel_opened_provisionally: false,
+            payee_bound: false,
             pending_share: None,
             upstream_target: None,
             last_job_received_time: None,

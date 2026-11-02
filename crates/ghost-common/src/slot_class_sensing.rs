@@ -59,6 +59,12 @@ pub const AGENT_TLV_EXTENSION_TYPE: u16 = 0x4748;
 /// Field type of the user agent inside [`AGENT_TLV_EXTENSION_TYPE`].
 pub const AGENT_TLV_FIELD_TYPE: u8 = 0x01;
 
+/// Field type of the payee identity inside [`AGENT_TLV_EXTENSION_TYPE`]: on an `UpdateChannel`, the
+/// `<address>.<worker>` a channel the translator opened on `mining.subscribe` (under the
+/// provisional identity, for a miner that authorises only after its subscribe is answered) is
+/// bound to once that miner authorises. pool_sv2 builds no job for such a channel until then.
+pub const PAYEE_TLV_FIELD_TYPE: u8 = 0x02;
+
 /// Longest user agent kept, in bytes. Longer agents are cut at a character boundary.
 pub const MAX_AGENT_LEN: usize = 255;
 

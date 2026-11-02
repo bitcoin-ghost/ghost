@@ -145,6 +145,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                     }
 
                     for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
+                        // A provisional channel gets its first job when its payee is bound.
+                        if np.awaits_payee((*downstream_id, *channel_id)) {
+                            continue;
+                        }
                         let q = np.quantise_target(
                             extended_channel.get_target(),
                             extended_channel.get_requested_max_target(),
@@ -297,6 +301,11 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                             tracing::error!("Error while adding new prev hash to extended channel: {channel_id:?} {e:?}");
                             PoolError::shutdown(e)
                         })?;
+                        // A provisional channel has no job yet: the new tip is recorded, nothing
+                        // is sent.
+                        if self.node_pool.awaits_payee((*downstream_id, *channel_id)) {
+                            continue;
+                        }
 
                         // This channel mines its OWN job, so it gets its own SetNewPrevHash naming
                         // that job.

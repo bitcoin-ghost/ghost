@@ -309,6 +309,11 @@ pub(crate) const GHOST_AGENT_EXTENSION_TYPE: u16 = 0x4748;
 /// (`AGENT_TLV_FIELD_TYPE`).
 pub(crate) const GHOST_AGENT_FIELD_TYPE: u8 = 0x01;
 
+/// Field type of the payee identity inside [`GHOST_AGENT_EXTENSION_TYPE`], on the `UpdateChannel`
+/// that binds a provisionally opened channel to its miner's `<address>.<worker>`. Authority:
+/// `ghost_common::slot_class_sensing::PAYEE_TLV_FIELD_TYPE`.
+pub(crate) const GHOST_PAYEE_FIELD_TYPE: u8 = 0x02;
+
 /// Longest agent forwarded, in bytes. Authority as above (`MAX_AGENT_LEN`).
 const MAX_AGENT_LEN: usize = 255;
 
@@ -332,6 +337,16 @@ fn ghost_agent_tlv(agent: &str) -> stratum_apps::stratum_core::parsers_sv2::Tlv 
         GHOST_AGENT_EXTENSION_TYPE,
         GHOST_AGENT_FIELD_TYPE,
         clamp_agent(agent).as_bytes().to_vec(),
+    )
+}
+
+/// The Ghost payee TLV: the authorised `<address>.<worker>` a provisionally opened channel
+/// credits from now on.
+pub(crate) fn ghost_payee_tlv(identity: &str) -> stratum_apps::stratum_core::parsers_sv2::Tlv {
+    stratum_apps::stratum_core::parsers_sv2::Tlv::new(
+        GHOST_AGENT_EXTENSION_TYPE,
+        GHOST_PAYEE_FIELD_TYPE,
+        identity.as_bytes().to_vec(),
     )
 }
 

@@ -37,7 +37,7 @@ use stratum_apps::{
             Vardiff, VardiffState,
         },
         extensions_sv2::{UserIdentity, PROVISIONAL_CHANNEL_IDENTITY},
-        mining_sv2::{CloseChannel, SetNewPrevHash, SetTarget},
+        mining_sv2::{CloseChannel, SetNewPrevHash, SetTarget, UpdateChannel},
         parsers_sv2::{Mining, Tlv, TlvField},
         stratum_translation::{
             sv1_to_sv2::{
@@ -1697,6 +1697,10 @@ impl Sv1Server {
                         }
                     }
 
+                    // A serialising miner's channel opened on subscribe, under the provisional
+                    // identity: if it authorised while the open was in flight, bind its payee now.
+                    self.bind_provisional_payee(downstream_id);
+
                     // Announce the channel's REAL target, not the global config-derived
                     // `first_target`. The two agree for a miner that accepted the pool default,
                     // but a miner that declared its own size gets a channel sized to that
@@ -1788,6 +1792,49 @@ impl Sv1Server {
                     debug!("Vardiff disabled - forwarding SetTarget to downstreams");
                     self.handle_set_target_without_vardiff(m).await?;
                 }
+            }
+            // The pool refused ONE miner's channel (its username names no payee the pool
+            // accepts, say, or no snapshot table could be had): that miner is disconnected, and
+            // only that miner. It used to trigger the translator's fallback, which dropped
+            // every miner on the translator for one bad username.
+            Mining::OpenMiningChannelError(m) => {
+                let code = m.error_code.as_utf8_or_hex();
+                let Some((_, downstream_id)) =
+                    self.request_id_to_downstream_id.remove(&m.request_id)
+                else {
+                    warn!(
+                        "OpenMiningChannelError {code} for request {} with no downstream waiting",
+                        m.request_id
+                    );
+                    return Ok(());
+                };
+                warn!(
+                    "Down: the pool refused downstream {downstream_id}'s channel ({code}); \
+                     disconnecting that miner only"
+                );
+                self.handle_downstream_disconnect(downstream_id).await;
+            }
+            // The pool closed one miner's channel: that miner is disconnected. The channel is
+            // already gone upstream, so no CloseChannel is sent back for it.
+            Mining::CloseChannel(m) => {
+                let Some(downstream_id) = self
+                    .channel_id_to_downstream_id
+                    .super_safe_lock(|map| map.remove(&m.channel_id))
+                else {
+                    return Ok(());
+                };
+                if let Some(downstream) = self.downstreams.get(&downstream_id) {
+                    downstream
+                        .downstream_data
+                        .super_safe_lock(|d| d.channel_id = None);
+                }
+                warn!(
+                    "Down: the pool closed downstream {downstream_id}'s channel {} ({}); \
+                     disconnecting that miner",
+                    m.channel_id,
+                    m.reason_code.as_utf8_or_hex()
+                );
+                self.handle_downstream_disconnect(downstream_id).await;
             }
             // Guaranteed unreachable: the channel manager only forwards valid,
             // pre-filtered messages, so no other variants can arrive here.
@@ -1991,6 +2038,58 @@ impl Sv1Server {
     ///
     /// # Arguments
     /// * `downstream_id` - The ID of the downstream that disconnected
+    /// Bind a provisionally opened channel to its miner once the miner has authorised and the
+    /// channel is open: an `UpdateChannel` carrying the Ghost payee TLV (`<address>.<worker>`).
+    /// The node pool builds no job for the channel until then, since a job credits its payee.
+    /// From here the channel holds the address, so the per-share TLV carries the worker alone.
+    /// Idempotent; does nothing for a channel opened on authorize.
+    pub(crate) fn bind_provisional_payee(&self, downstream_id: DownstreamId) {
+        let Some(downstream) = self.downstreams.get(&downstream_id) else {
+            return;
+        };
+        let bind = downstream.downstream_data.super_safe_lock(|d| {
+            if !d.channel_opened_provisionally
+                || d.payee_bound
+                || d.authorized_worker_name.is_empty()
+            {
+                return None;
+            }
+            let channel_id = d.channel_id?;
+            d.payee_bound = true;
+            d.channel_opened_provisionally = false;
+            let name = d.authorized_worker_name.clone();
+            d.user_identity = super::tlv_compatible_username(super::extract_worker_name(&name))
+                .unwrap_or_default()
+                .to_string();
+            Some((channel_id, name, d.hashrate, d.target))
+        });
+        let Some((channel_id, name, hashrate, target)) = bind else {
+            return;
+        };
+        let update = UpdateChannel {
+            channel_id,
+            nominal_hash_rate: hashrate.unwrap_or(
+                self.config
+                    .downstream_difficulty_config
+                    .min_individual_miner_hashrate,
+            ),
+            maximum_target: target.to_le_bytes().into(),
+        };
+        info!(
+            "Down: binding downstream {downstream_id}'s provisional channel {channel_id} to {name}"
+        );
+        if let Err(e) = self
+            .sv1_server_channel_state
+            .channel_manager_sender
+            .try_send((
+                Mining::UpdateChannel(update),
+                Some(vec![super::ghost_payee_tlv(&name)]),
+            ))
+        {
+            error!("Down: could not send downstream {downstream_id}'s payee to the pool: {e}");
+        }
+    }
+
     pub async fn handle_downstream_disconnect(&self, downstream_id: DownstreamId) {
         if self.config.downstream_difficulty_config.enable_vardiff {
             // Only remove from vardiff map if vardiff is enabled
