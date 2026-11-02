@@ -12,7 +12,7 @@ This branch strips the old system out as it builds the new one. It does not keep
 - **Removal waves**, on this branch, each leaving the workspace building and tested:
   1. Wraith (wallet app, coordinator, protocol), Ghost Tap, ghost-lock and its signer, and anything reachable only from them.
   2. zk, MPC, L2 and glyph, with the zk start gate and the `zk-production` build feature.
-  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables. Code removed 11-02 on `feat/node-pool-rm3` (not merged); the tables stay until migration v64 imports the genesis table. ghost-miner-proxy went with the elder-signed node-list checkpoint it verified; W2.9/W2.10 rebuild the miner-side tool against open listing.
+  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables. Code removed 11-02 on `feat/node-pool-rm3` (not merged); the tables stay until migration v65 imports the genesis table (v64 is W2.13's sync tables). ghost-miner-proxy went with the elder-signed node-list checkpoint it verified; W2.9/W2.10 rebuild the miner-side tool against open listing.
   4. ghostd to stock Bitcoin Core; the dashboard, docs and website overhauls are W2.14-W2.16.
 - Phase 4's Release A / Release B dual running is replaced by this. Phases 3 (regtest, signet) still come before any mainnet use.
 
@@ -45,7 +45,7 @@ Parallel streams, after W2.1 merges:
 - **W2.10 Open listing:** any node with a valid advert that passes an external probe is listed. DNS and `endpoints.html` become generated output. The shim stops trusting the 8 keys.
 - **W2.11 Visibility:** `/api/v1/ledger/{address}`, fix legacy routes, rewrite `miner.html`, `ghost-node status`.
 - **W2.12 Installer:** remove the treasury prompt and capability flags, add `--fee-address`, preflight, alert webhook prompt.
-- **W2.13 Share-chain sync** (not sized yet, expect 800+): initial sync, batch retention and pruning, stale header and coinbase archive, recoverable checkpoint. An outside node cannot reproduce the root without it.
+- **W2.13 Share-chain sync** (about 1,700 lines with tests): initial sync, batch retention and pruning, stale header and coinbase archive, recoverable checkpoint. An outside node cannot reproduce the root without it. Built 11-02 on `feat/node-pool-w213`, not merged: `GetHeaders`/`Headers` and `GetBtcBlocks`/`BtcBlocks` in `ghost-np-relay`, the Bitcoin block archive (`archive.rs`), checkpoints and pruning (`relay/sync.rs`, `checkpoint.rs`), migration v64. Settlement became deterministic: tables subtract the pool blocks on the share's own Bitcoin ancestry, not the node's best chain (spec 2.2, "Share-chain sync"). Readings in `node-pool-reference/PORTING_NOTES.md`. A fresh node needs one archive peer (`prune` off) for batches older than its peers' windows.
 - **W2.14 Node dashboard overhaul** (user, 11-02): rebuild the operator dashboard for the node pool only. Shows: node status and peers, share-chain tip and anchors, connected miners with their sensed slot class and any firmware warning, per-miner shares and ledger balance, queue position and expected wait, recent pool blocks with their payouts and the treasury change, settlement status. Removes every page for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2.
 - **W2.15 Docs overhaul** (user, 11-02): rewrite operator and miner docs from `NODE_POOL_SPEC.md`: what the pool is, running a node, pointing a miner, the payout rule in plain words, firmware compatibility and the sensing loop, auditing your node with `ghost-audit`, the honest-reading section. Delete docs for removed features.
 - **W2.16 Website overhaul** (user, 11-02): rewrite the website for the node pool: one clear explainer, live pool stats, the miner page (`/api/v1/ledger/{address}`), node list, firmware compatibility table, and the required launch wording from Phase 6. Remove pages for removed features.
@@ -86,7 +86,7 @@ Order of publication: spec, tag A, snapshot table and notice of H, tag B after 8
 - **R6** `payout_checkpoint.rs`, vote handlers, fee drift (~9k).
 - **R7** Challenges, qualification, reverify (~12k). `ghost-verification` keeps API and `fleet_auth`.
 - **R8** Wraith, coordinator, ghost-lock, signer (~38k).
-- **R9** Migration v64 one release later (v63 is the node pool storage added by W2.4), rehearsed on a DB copy. Halts on non-zero rows in `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`.
+- **R9** Migration v65 one release later (v63 is the node pool storage added by W2.4, v64 the sync tables added by W2.13), rehearsed on a DB copy. Halts on non-zero rows in `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`.
 - **R10** ghostd to stock Bitcoin Core over GBT and ZMQ, without sv2-tp, one canary first. Measure `getmempoolfilterstats` first. Haze datadirs need resync; the updater and `release.sh` need changing.
 - **R11** Remaining gates and docs.
 
