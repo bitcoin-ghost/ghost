@@ -16,9 +16,8 @@ STATE_DIR="${HOME}/.ghost-deploy"
 mkdir -p "$STATE_DIR"
 cd "$REPO_ROOT"
 
-# The Tauri GUI crate is excluded exactly as CI excludes it: it needs a sidecar binary
-# that isn't built here, and its absence is not a code failure.
-EXCLUDES="--exclude wraith-wallet-gui"
+# Kept empty: CI excludes nothing from the workspace now that the Tauri crates are gone.
+EXCLUDES=""
 
 [ -z "$(git status --porcelain)" ] || { echo "REFUSED: dirty tree — the record must describe a commit" >&2; exit 1; }
 

@@ -58,12 +58,6 @@ members = [
     "bins/ghost-miner-proxy",
     # Headless setup CLI
     "bins/ghost-setup",
-    # Wraith Wallet (desktop)
-    "apps/wraith-wallet/core",
-    "apps/wraith-wallet/ipc",
-    "apps/wraith-wallet/daemon",
-    "apps/wraith-wallet/cli",
-    "apps/wraith-wallet/gui/src-tauri",
     # SV2 apps (amalgamated from the former sv2-apps submodule)
     "bins/translator-sv2",
     "bins/pool-sv2",
@@ -115,14 +109,8 @@ ghost-zkp = { path = "crates/ghost-zkp" }
 ghost-mpc = { path = "crates/ghost-mpc" }
 ghost-glyph = { path = "crates/ghost-glyph" }
 # GSP crates
-# Wraith Wallet
-wraith-wallet-core = { path = "apps/wraith-wallet/core" }
-wraith-wallet-ipc = { path = "apps/wraith-wallet/ipc" }
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
-# Cross-platform local IPC: Unix-domain sockets on unix, named pipes on Windows,
-# behind one API. Powers the wraithd <-> CLI/GUI transport.
-interprocess = { version = "2.2", features = ["tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -186,10 +174,8 @@ base64 = "0.22"
 
 # Cryptography
 snow = "0.9"
-aes-gcm = "0.10"
 getrandom = "0.2"
 scrypt = "0.11"
-argon2 = "0.5"
 
 # BIP standards
 bip39 = "2.0"
@@ -223,9 +209,6 @@ hyper = { version = "1.0", features = ["full"] }
 
 # Unix-specific
 libc = "0.2"
-
-# Dev dependencies
-proptest = "1.4"
 
 # Encoding
 bech32 = "0.11"

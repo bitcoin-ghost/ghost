@@ -10,19 +10,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The Tauri desktop crate (wraith-wallet-gui) needs a built JS frontend (`dist/`)
-  # before `tauri::generate_context!` will compile, which is a separate Node pipeline
-  # from the Rust workspace. It is excluded from the pure-Rust jobs below and built on
-  # its own; everything else gets full coverage.
-  WORKSPACE_EXCLUDES: --workspace --exclude wraith-wallet-gui
+  WORKSPACE_EXCLUDES: --workspace
   # System packages the Rust workspace needs: Cap'n Proto (bitcoin-core-sv2 build
   # script) and SQLite (ghost-storage).
   LINUX_DEPS: libsqlite3-dev capnproto libcapnp-dev
-  # What the Tauri desktop crates need on top: webkit2gtk is the webview, and `patchelf` is
-  # used by the bundler. A superset of LINUX_DEPS so the one install script covers both.
-  TAURI_DEPS: >-
-    libsqlite3-dev capnproto libcapnp-dev libwebkit2gtk-4.1-dev libgtk-3-dev
-    libayatana-appindicator3-dev librsvg2-dev patchelf
 
 jobs:
   # Format check
@@ -317,8 +308,7 @@ jobs:
   #
   # This is a SEPARATE job, not a step on `test`, deliberately: adding it there pushed that job
   # from ~28 min past its 45-minute timeout and it was cancelled mid-run. Here it runs in
-  # parallel and cannot slow the critical path. Linux only — the same rationale the
-  # wraith-wallet step already documents.
+  # parallel and cannot slow the critical path. Linux only.
   #
   # Exclusions:
   #   ghost-mpc / mpc-xproc-harness  -> `mpc-tests` job; they need a per-package feature that a
@@ -672,19 +662,6 @@ jobs:
       - name: Run unit tests (feature-gated consensus modules)
         run: cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony
 
-      # Run wraith-wallet integration tests (separate from --lib --bins).
-      # These spin up the real wraithd binary against a tempdir socket, plus
-      # in-process mock GSPs — locks the wallet IPC and streaming push-channel
-      # contracts. Linux only: macOS runners can't bind Unix sockets the same
-      # way (shorter sun_path limit) and we don't need cross-platform coverage
-      # here; the unit + lib tests above already do.
-      - name: Run wraith-wallet integration tests
-        if: runner.os == 'Linux'
-        run: |
-          cargo test -p wraith-wallet-ipc
-          cargo test -p wraith-wallet-core --tests
-          cargo test -p wraith-wallet-daemon --tests
-
   # Documentation
   docs:
     name: Documentation
@@ -713,74 +690,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps $WORKSPACE_EXCLUDES --all-features
-
-  # The Tauri desktop crates, which every other job excludes.
-  #
-  # They were excluded because `tauri::generate_context!` will not compile until the JS
-  # frontend has been built into `dist/`, which is a Node pipeline the Rust jobs do not run.
-  # That is a reason to give them their own job, not a reason to leave them untested: the
-  # exclusion let a GUI change ship that did not typecheck, because nothing anywhere checked.
-  #
-  # Ordered cheapest-first on purpose. `tsc --noEmit` needs no system packages and catches the
-  # class of mistake the exclusion was hiding, so it runs before anything downloads webkit.
-  tauri:
-    name: Desktop (Tauri)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/wraith-wallet/gui/package-lock.json
-      - name: Install frontend deps
-        working-directory: apps/wraith-wallet/gui
-        run: npm ci --no-audit --no-fund
-      - name: Typecheck the frontend
-        working-directory: apps/wraith-wallet/gui
-        run: npx tsc --noEmit
-      - name: Build the frontend
-        working-directory: apps/wraith-wallet/gui
-        run: npx vite build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Runner image (apt cache key)
-        id: runner-image
-        # .debs resolved on one runner image are not installable on another: a cache of
-        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
-        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - name: Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: /tmp/apt-debs
-          # Keyed on the install script AND this job's package list, because the list is passed
-          # in through `LINUX_DEPS` rather than living in the script. Sharing the pure-Rust jobs'
-          # key would hand this job a cache holding none of the packages it needs.
-          key: apt-debs-tauri-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}-${{ env.TAURI_DEPS }}
-      - name: Install Linux deps
-        # ⚠ 20, not the 6 the other jobs use, and not the 10 it was. TAURI_DEPS pulls ~212
-        # packages against their ~40, so a COLD apt cache takes far longer here. The cache key
-        # hashes install-linux-deps.sh, so any edit to that script rotates it and forces exactly
-        # that cold path on every job at once — which is how this job timed out at 10 minutes on
-        # 2026-09-30 mid-download, having fetched 212 packages and not finished.
-        timeout-minutes: 20
-        env:
-          LINUX_DEPS: ${{ env.TAURI_DEPS }}
-        run: .github/scripts/install-linux-deps.sh
-      # The GUI bundles `wraithd` as a Tauri sidecar (`externalBin`), and
-      # `tauri-build` fails at build-script time if the binary is not already
-      # sitting at the target-triple path. So the daemon is built first and
-      # placed where the bundler expects it — which also means CI proves the
-      # desktop bundle can actually assemble, not just that its Rust compiles.
-      - name: Build the sidecar daemon
-        run: |
-          cargo build -p wraith-wallet-daemon --bin wraithd
-          triple=$(rustc -vV | awk '/^host:/ {print $2}')
-          mkdir -p apps/wraith-wallet/gui/src-tauri/binaries
-          cp target/debug/wraithd "apps/wraith-wallet/gui/src-tauri/binaries/wraithd-$triple"
-      - name: Build the desktop crate
-        run: cargo build -p wraith-wallet-gui
 
   # Security audit
   audit:
