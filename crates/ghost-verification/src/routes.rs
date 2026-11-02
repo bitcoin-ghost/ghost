@@ -2663,7 +2663,7 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         "version": health.version,
         "block_height": health.block_height,
         "peer_count": health.peer_count,
-        "active_nodes": health.peer_count + 1,
+        "active_nodes": health.peer_count.map(|p| p + 1),
         "miner_count": health.miner_count,
         "active_miners": active_miners,
         "mesh_active_miners": mesh_active_miners,

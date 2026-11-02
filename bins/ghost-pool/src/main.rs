@@ -412,7 +412,7 @@ fn print_local_status(h: &serde_json::Value) {
     println!("Block height:{}", g("block_height"));
     println!("Round:       {}", g("round_id"));
     println!("Miners:      {}", g("miner_count"));
-    println!("Peers:       {}", g("peer_count"));
+    println!("Relay peers: {}", g("peer_count"));
     println!("Uptime (s):  {}", g("uptime_secs"));
     println!(
         "Bitcoin RPC: {}",
@@ -1373,6 +1373,7 @@ async fn main() -> Result<()> {
     // Start WebSocket health broadcast task
     let ws_state = Arc::clone(&verification_state.ws_state);
     let rm_for_ws = Arc::clone(&round_manager);
+    let state_for_ws = Arc::clone(&verification_state);
     let start_time = std::time::Instant::now();
     let mut ws_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -1388,9 +1389,7 @@ async fn main() -> Result<()> {
                         block_height: rm_for_ws.current_height(),
                         round_id: rm_for_ws.current_round_id(),
                         miner_count,
-                        // The old mesh is gone; share-chain relay peers are on
-                        // `/api/v1/node-pool/status`.
-                        peer_count: 0,
+                        peer_count: state_for_ws.relay_peers(),
                         uptime_secs: start_time.elapsed().as_secs(),
                     };
                     ws_state.broadcast(event);
@@ -1399,6 +1398,15 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Relay-peers monitor: reads the share-chain relay's peer count from pool_sv2's node pool
+    // status into `/health` `peer_count`, and fires `PeerCountDrop` when it falls (rate-limited)
+    // and, edge-triggered, when it reaches zero. Replaces the old mesh's peer count.
+    ghost_pool::alert_monitors::spawn_relay_peers_monitor(
+        Arc::clone(&alert_dispatcher),
+        Arc::clone(&verification_state),
+        shutdown_tx.subscribe(),
+    );
 
     // Start the behind-tip monitor. Edge-triggered `BehindTip` alert when this
     // node's local height lags the best header its Bitcoin node has heard of, or

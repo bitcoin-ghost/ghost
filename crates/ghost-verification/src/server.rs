@@ -1300,6 +1300,9 @@ pub struct VerificationState {
     /// against this node's true hardware ceiling. Set via `set_max_capacity`
     /// at startup; 0 = not yet configured.
     max_capacity: AtomicU32,
+    /// Share-chain relay peers from pool_sv2's node pool status, `-1` until it has answered.
+    /// Set by the relay-peers monitor in `bins/ghost-pool`.
+    relay_peers: std::sync::atomic::AtomicI64,
     /// Prometheus metrics (optional - only present when running as ghost-mining)
     pub metrics: Option<Arc<Metrics>>,
     /// Rolling in-memory time-series of pool-wide hashrate + connected miners,
@@ -1488,6 +1491,7 @@ impl VerificationState {
             // L-28: Debug endpoints flag frozen from DashboardConfig
             debug_endpoints_frozen: AtomicBool::new(debug_enabled),
             max_capacity: AtomicU32::new(0),
+            relay_peers: std::sync::atomic::AtomicI64::new(-1),
             metrics: None,
             // 24h of history at the sampler's 30s cadence (2880 samples).
             pool_series: crate::pool_series::PoolSeries::new(2880),
@@ -2139,6 +2143,18 @@ impl VerificationState {
         (self.get_miner_count)()
     }
 
+    /// Share-chain relay peers as pool_sv2 last reported them, or `None` before it has answered
+    /// (or after it stopped answering).
+    pub fn relay_peers(&self) -> Option<u32> {
+        u32::try_from(self.relay_peers.load(Ordering::Relaxed)).ok()
+    }
+
+    /// Record the relay peer count (`None` = pool_sv2 did not answer).
+    pub fn set_relay_peers(&self, peers: Option<u32>) {
+        self.relay_peers
+            .store(peers.map_or(-1, i64::from), Ordering::Relaxed);
+    }
+
     /// Get this node's advertised hardware-derived miner capacity. 0 means
     /// not yet measured (the LB treats us as "unknown" / excluded).
     pub fn max_capacity(&self) -> u32 {
@@ -2349,8 +2365,7 @@ impl VerificationState {
             block_height: (self.get_block_height)(),
             round_id: (self.get_round_id)(),
             miner_count: (self.get_miner_count)(),
-            // The old mesh is gone; share-chain relay peers are on `/api/v1/node-pool/status`.
-            peer_count: 0,
+            peer_count: self.relay_peers(),
             uptime_secs: self.start_time.elapsed().as_secs(),
         }
     }

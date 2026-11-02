@@ -70,9 +70,10 @@ pub struct HealthResponse {
     pub round_id: u64,
     /// Connected miners
     pub miner_count: u32,
-    /// Always 0: the old mesh was removed. Kept so existing readers of `/health` still parse;
-    /// share-chain relay peers are on `/api/v1/node-pool/status`.
-    pub peer_count: u32,
+    /// Share-chain relay peers, as pool_sv2's `/api/v1/node-pool/status` last reported them;
+    /// `null` until it has answered (unknown, not zero). The old mesh this used to count was
+    /// removed.
+    pub peer_count: Option<u32>,
     /// Uptime (seconds)
     pub uptime_secs: u64,
     /// Cumulative `Database::with_connection` usage: `(calls, total_ms_held, slow_calls)` (#537).
@@ -272,7 +273,7 @@ mod tests {
             block_height: 100,
             round_id: 1,
             miner_count: 10,
-            peer_count: 5,
+            peer_count: Some(5),
             uptime_secs: 3600,
         };
 
@@ -305,7 +306,7 @@ mod tests {
             block_height: 0,
             round_id: 0,
             miner_count: 0,
-            peer_count: 0,
+            peer_count: Some(0),
             uptime_secs: 0,
         };
 
