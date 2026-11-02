@@ -254,7 +254,7 @@ is "the alert webhook is optional" "mainnet|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7k
 is "it does not ask for a treasury" 0 "$(printf '%s\n' "$wiz" | $G -ci treasury || true)"
 
 echo "7. validation and re-runs"
-validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&&/^  AUTO_UPDATE="false"$/{getline; print; exit}' "$INSTALLER")"
+validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&&/^POOL_TARBALL=/{exit}' "$INSTALLER")"
 is "the validation step is present" yes "$([ -n "$validate" ] && echo yes)"
 old="$TMP/pool-config.toml"
 eval "$($G '^_trim() ' "$INSTALLER")"
@@ -272,7 +272,7 @@ printf 'coinbase_reward_script = "addr(bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t
 validated_vars() {
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
       FEE_ADDRESS="" NETWORK=mainnet RELAY_PEERS="" RELAY_PORT=8566 GENESIS_ANCHOR="" GENESIS_HEIGHT=""
-      PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false GHOST_VERSION=v9.9.9 AUTO_UPDATE=false
+      PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false
       eval "${validate//\/etc\/ghost\/pool-config.toml/$old}"
       echo "$FEE_ADDRESS|$RELAY_PEERS|$GENESIS_ANCHOR|$GENESIS_HEIGHT" )
 }
@@ -292,13 +292,23 @@ pinned() {
       GENESIS_ANCHOR="" GENESIS_HEIGHT="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
       GHOST_VERSION="$1" AUTO_UPDATE="$2"
       eval "${validate//\/etc\/ghost\/pool-config.toml/$old}"
-      echo "AUTO_UPDATE=$AUTO_UPDATE" ) 2>&1 | tr '\n' ' '
+      echo "AUTO_UPDATE=$AUTO_UPDATE GHOST_VERSION=$GHOST_VERSION TARBALL=$POOL_TARBALL" ) 2>&1 | tr '\n' ' '
 }
-has "an unpinned release is refused (latest is the old network's)" "ERR Pin the node pool release to install" "$(pinned '' false)"
-has "a pinned release proceeds" "AUTO_UPDATE=false" "$(pinned v9.9.9 false)"
-has "--auto-update is turned off, and says so" "not available for node pool nodes yet" "$(pinned v9.9.9 true)"
-has "... and is off" "AUTO_UPDATE=false" "$(pinned v9.9.9 true)"
-is "the installer no longer tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*releases/latest' "$INSTALLER" || true)"
+# The channel itself (np-latest against a release list, the marker, the updater) is
+# scripts/test-release-channel.sh; here, only that the install step uses it.
+has "an unpinned release is refused (latest is the old network's)" "Name the node pool release to install" "$(pinned '' false)"
+has "... and stops the install" "ERR GHOST_VERSION='' refused" "$(pinned '' false)"
+has "an exact node pool tag proceeds" "GHOST_VERSION=np-v9.9.9" "$(pinned np-v9.9.9 false)"
+has "... and names the node pool tarball" "TARBALL=bitcoin-ghost-np-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" "$(pinned np-v9.9.9 false)"
+has "an old-network tag is refused" "ERR GHOST_VERSION='v9.9.9' refused" "$(pinned v9.9.9 false)"
+has "... saying why" "v-tags are the old network's" "$(pinned v9.9.9 false)"
+has "a bare version is refused" "ERR GHOST_VERSION='1.11.46' refused" "$(pinned 1.11.46 false)"
+has "'latest' is refused" "ERR GHOST_VERSION='latest' refused" "$(pinned latest false)"
+has "--auto-update stays on: it follows the np- channel" "AUTO_UPDATE=true" "$(pinned np-v9.9.9 true)"
+hasnt "... with no warning that it is unavailable" "not available for node pool nodes" "$(pinned np-v9.9.9 true)"
+is "the installer never tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*releases/latest' "$INSTALLER" || true)"
+is "the channel marker is written before the updater can be enabled" yes \
+   "$(awk '/^cat > \/etc\/ghost\/release-channel /{m=NR} /systemctl enable --now ghost-auto-update.timer/{if(!t)t=NR} END{print (m && t && m<t)?"yes":"no"}' "$INSTALLER")"
 
 echo "8. isolation from the old network"
 for ip in 83.136.251.162 85.9.198.212 213.163.207.46 95.111.221.169; do

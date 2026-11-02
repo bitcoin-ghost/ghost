@@ -29,6 +29,9 @@ const CONF_PATH = process.env.GHOST_AUTOUPDATE_CONF ?? "/etc/ghost/auto-update.c
 const VERSION_PATH = process.env.GHOST_VERSION_FILE ?? "/etc/ghost/version";
 const STATUS_PATH = process.env.GHOST_AUTOUPDATE_STATUS ?? "/var/lib/ghost/auto-update.status";
 const TOGGLE_BIN = process.env.GHOST_AUTOUPDATE_TOGGLE ?? "/opt/ghost/bin/ghost-autoupdate-toggle";
+// Which releases the updater follows. Written by the node pool installer and never by the toggle,
+// so switching updates on here follows the same channel as `--auto-update` at install.
+const CHANNEL_PATH = process.env.GHOST_RELEASE_CHANNEL_FILE ?? "/etc/ghost/release-channel";
 
 interface AutoUpdateStatus {
   last_run?: string;
@@ -36,10 +39,16 @@ interface AutoUpdateStatus {
   message?: string;
   installed_version?: string;
   latest_version?: string;
+  channel?: string;
 }
+
+// "node-pool": the np- releases only. "old-network": GitHub's latest release (no marker).
+// "invalid": the marker says something else; the updater and the toggle both refuse it.
+type ReleaseChannel = "node-pool" | "old-network" | "invalid";
 
 interface AutoUpdateState {
   enabled: boolean;
+  channel: ReleaseChannel;
   installed_version: string | null;
   latest_version: string | null;
   last_status: AutoUpdateStatus | null;
@@ -55,6 +64,21 @@ async function readEnabled(): Promise<boolean> {
   } catch {
     return false; // missing/unreadable conf => treated as opted-out
   }
+}
+
+// Mirrors the updater's reading of the marker: first line that is not blank or a comment.
+async function readChannel(): Promise<ReleaseChannel> {
+  let raw: string;
+  try {
+    raw = await readFile(CHANNEL_PATH, "utf8");
+  } catch {
+    return "old-network"; // no marker: an install from before the node pool channel
+  }
+  const line = raw
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l !== "" && !l.startsWith("#"));
+  return line === "node-pool" ? "node-pool" : "invalid";
 }
 
 async function readInstalledVersion(): Promise<string | null> {
@@ -75,13 +99,15 @@ async function readStatus(): Promise<AutoUpdateStatus | null> {
 }
 
 async function buildState(): Promise<AutoUpdateState> {
-  const [enabled, installed, status] = await Promise.all([
+  const [enabled, channel, installed, status] = await Promise.all([
     readEnabled(),
+    readChannel(),
     readInstalledVersion(),
     readStatus(),
   ]);
   return {
     enabled,
+    channel,
     installed_version: installed,
     latest_version: status?.latest_version ?? null,
     last_status: status,

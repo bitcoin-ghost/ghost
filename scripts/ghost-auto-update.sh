@@ -12,6 +12,14 @@
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
 # failure.
 #
+# ⛔ Two release channels share one GitHub repository. Which one a node follows is decided by
+# /etc/ghost/release-channel, written by the node pool installer:
+#   * `node-pool`  — the newest published `np-vX.Y.Z` release, picked from the release LIST.
+#                    Node pool releases are pre-releases and never `latest`.
+#   * no marker    — the old network: `releases/latest`, exactly as before the channel existed.
+#                    An install running an `np-` build without the marker is refused.
+#   * anything else — refused.
+#
 # ⛔ The SV2 stratum stack (`pool_sv2` under sri-pool, `translator_sv2` under
 # sri-translator) is swapped in the SAME set as ghost-mining (#1044). Share-batch
 # signing lives in the pool_sv2 binary (#742), so a new ghost-mining against an old
@@ -99,7 +107,8 @@ write_status() {
   "result": "${result}",
   "message": "${message//\"/\'}",
   "installed_version": "${installed}",
-  "latest_version": "${latest}"
+  "latest_version": "${latest}",
+  "channel": "${CHANNEL:-}"
 }
 EOF
   chmod 644 "$STATUS_FILE" 2>/dev/null || true
@@ -107,8 +116,63 @@ EOF
 
 # ─────────────────────────────── helpers ─────────────────────────────────────
 
-# Normalise a version string for comparison: strip a leading 'v'.
-normver() { local v="$1"; echo "${v#v}"; }
+# >>> NP_RELEASE_CHANNEL
+# The node pool release channel. Node pool releases are tagged `np-vMAJOR.MINOR.PATCH` and are
+# published as GitHub PRE-releases, so GitHub can never make one the repository's `latest`: the
+# old network's nodes resolve `releases/latest` and must never be handed a node pool build. A node
+# pool node therefore never asks for `latest`; it lists the releases and picks the newest
+# `np-v` tag itself. The same block is in scripts/install-node.sh, which resolves
+# GHOST_VERSION=np-latest with it; scripts/test-release-channel.sh keeps the copies identical.
+NP_RELEASES_API_URL="${GHOST_NP_RELEASES_API_URL:-https://api.github.com/repos/bitcoin-ghost/ghost/releases?per_page=100}"
+# The marker the node pool installer writes. Present and saying `node-pool`: this node follows the
+# np- channel. Absent: an install from before the channel existed, which keeps the old channel.
+# Anything else is refused, never guessed.
+NP_CHANNEL_FILE="${GHOST_RELEASE_CHANNEL_FILE:-/etc/ghost/release-channel}"
+
+# np_tag_ok TAG — an exact node pool release tag, final or with a suffix (np-v1.2.3-rc1).
+np_tag_ok() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; }
+# np_tag_final TAG — a final node pool release: the only kind np-latest ever picks.
+np_tag_final() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+# np_latest_tag — reads a GitHub "list releases" JSON array on stdin and prints the highest final
+# np- tag of a PUBLISHED release. Drafts, tags of any other shape (the old network's v1.11.x,
+# np-v…-rc1) and anything else are skipped. Exit 1 when there is none, 2 when the JSON does not
+# have the shape this expects (each release carries one tag_name and one draft), so a changed API
+# fails closed instead of picking something. The prerelease flag is not used: every node pool
+# release carries it, which is what keeps them out of `latest`.
+np_latest_tag() {
+  local tok key val tag="" draft="" cands=""
+  while IFS= read -r tok; do
+    key="${tok#\"}"; key="${key%%\"*}"
+    val="${tok#*:}"; val="${val#"${val%%[![:space:]]*}"}"; val="${val//\"/}"
+    case "$key" in
+      tag_name) [[ -z "$tag" ]] || return 2; tag="$val" ;;
+      draft)    [[ -z "$draft" ]] || return 2; draft="$val" ;;
+    esac
+    if [[ -n "$tag" && -n "$draft" ]]; then
+      if [[ "$draft" == false ]] && np_tag_final "$tag"; then cands+="${tag#np-v}"$'\n'; fi
+      tag=""; draft=""
+    fi
+  done < <(grep -oE '"(tag_name|draft)"[[:space:]]*:[[:space:]]*("[^"]*"|true|false)' || true)
+  [[ -z "$tag" && -z "$draft" ]] || return 2
+  [[ -n "$cands" ]] || return 1
+  echo "np-v$(printf '%s' "$cands" | sort -V | tail -1)"
+}
+
+# np_channel — prints this node's release channel: `node-pool` or `old-network`. Fails, printing
+# why on stderr, when the marker exists but says anything else.
+np_channel() {
+  [[ -e "$NP_CHANNEL_FILE" ]] || { echo old-network; return 0; }
+  local v
+  v="$(grep -vE '^[[:space:]]*(#|$)' "$NP_CHANNEL_FILE" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  [[ "$v" == node-pool ]] || { echo "release channel marker $NP_CHANNEL_FILE says '${v}', expected 'node-pool'" >&2; return 1; }
+  echo node-pool
+}
+# <<< NP_RELEASE_CHANNEL
+
+# Normalise a version string for comparison: strip a leading 'np-' (the node pool channel's tag
+# prefix) and then a leading 'v'.
+normver() { local v="${1#np-}"; echo "${v#v}"; }
 
 # Installed version: prefer the file we write on update, fall back to parsing
 # `ghost-mining --version` (clap prints "ghost-mining <semver>").
@@ -313,11 +377,45 @@ main() {
   installed="$(read_installed_version || true)"
   [[ -n "$installed" ]] || { err "could not determine installed version"; write_status "error" "installed version unknown"; exit 1; }
 
-  # Resolve the latest published release directly from the GitHub releases API
-  # (the same source install.sh auto-tracks). Robust to install.sh's format.
-  latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
-  [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
-  [[ "$latest" == v* ]] || latest="v${latest}"
+  # 2a. Which release channel this node follows. The node pool installer writes the marker; an
+  #     install without it is an old-network node and keeps tracking `releases/latest` exactly as
+  #     before. A node running a node pool build with no marker is refused rather than "updated"
+  #     to the old network's latest, which has no node pool in it.
+  CHANNEL="$(np_channel)" || { err "unreadable release channel marker — refusing to pick a channel"; CHANNEL=""; write_status "error" "release channel marker invalid"; exit 1; }
+  if [[ "$CHANNEL" == old-network && "$installed" == np-* ]]; then
+    err "installed $installed is a node pool release but $NP_CHANNEL_FILE is missing — refusing to track the old network's releases"
+    write_status "error" "node pool install without its channel marker"
+    exit 1
+  fi
+  log "release channel: $CHANNEL"
+
+  if [[ "$CHANNEL" == node-pool ]]; then
+    # The newest np- release, picked from the list. Never `releases/latest`: that is the old
+    # network's, and node pool releases are pre-releases precisely so it never points at one.
+    local releases rc=0
+    releases="$(curl -fsSL --max-time 30 "$NP_RELEASES_API_URL" 2>/dev/null)" \
+      || { err "could not fetch the release list from $NP_RELEASES_API_URL"; write_status "error" "latest node pool version unresolved"; exit 1; }
+    latest="$(np_latest_tag <<<"$releases")" || rc=$?
+    if [[ $rc -ne 0 || -z "$latest" ]]; then
+      case "$rc" in
+        1) err "no published node pool release (np-v*) at $NP_RELEASES_API_URL" ;;
+        *) err "the release list at $NP_RELEASES_API_URL is not in the expected shape (rc=$rc) — refusing to pick" ;;
+      esac
+      write_status "error" "latest node pool version unresolved"; exit 1
+    fi
+  else
+    # Resolve the latest published release directly from the GitHub releases API
+    # (the same source install.sh auto-tracks). Robust to install.sh's format.
+    latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
+    [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
+    # A node pool release can never be `latest` (it is a pre-release). If one ever is, it is not
+    # for this node: refuse rather than move an old-network node onto the node pool.
+    if [[ "$latest" == np-* ]]; then
+      err "releases/latest is a node pool release ($latest) — not for an old-network node, refusing"
+      write_status "error" "latest release is on the node pool channel" "$latest"; exit 1
+    fi
+    [[ "$latest" == v* ]] || latest="v${latest}"
+  fi
 
   log "installed=$installed latest=$latest"
   if ! is_newer "$installed" "$latest"; then

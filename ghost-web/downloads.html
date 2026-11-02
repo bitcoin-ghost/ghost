@@ -104,10 +104,15 @@
     </p>
 
     <p class="section-lead">
-      <strong>No node pool release has been published yet.</strong> Every release
-      on GitHub so far belongs to the old network, which keeps running until the
-      handover. The installer refuses to run without <code>GHOST_VERSION</code>
-      naming a node pool release.
+      <strong>No node pool release has been published yet.</strong> The node pool
+      has its own release channel in the same GitHub repository: tags
+      <code>np-v&lt;version&gt;</code>, published as <em>pre-releases</em> titled
+      “Node pool np-v…”. The repository's <em>latest</em> release always belongs to
+      the old network, which keeps running until the handover, and is never a node
+      pool build. The installer refuses to run without <code>GHOST_VERSION</code>:
+      <code>np-latest</code> (the newest node pool release) or an exact
+      <code>np-v…</code> tag. Old-network tags (<code>v1.11.x</code>) are refused, and
+      automatic updates follow the <code>np-</code> channel only.
     </p>
 
     <p class="section-lead">
@@ -123,7 +128,7 @@
       <div class="ct-tile ct-wide">
         <div class="k">one-command install</div>
         <div class="v" style="font-size:15px; line-height:1.7;">
-          <code>curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=&lt;tag&gt; bash -s -- \</code><br>
+          <code>curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=np-latest bash -s -- \</code><br>
           <code>&nbsp;&nbsp;--fee-address bc1q… --alert-webhook https://ntfy.sh</code>
         </div>
         <div class="sub" style="margin-top:14px;">
@@ -137,9 +142,10 @@
         <div class="k">release tarball</div>
         <div class="v accent">Linux x86_64</div>
         <div class="sub">
-          <code>bitcoin-ghost-&lt;version&gt;-x86_64-unknown-linux-gnu.tar.gz</code>
-          from GitHub releases, alongside <code>SHA256SUMS.txt</code> and its
-          signature. Prefer to install by hand? This is the file.
+          <code>bitcoin-ghost-np-v&lt;version&gt;-x86_64-unknown-linux-gnu.tar.gz</code>
+          from a node pool pre-release on GitHub, alongside <code>SHA256SUMS.txt</code>
+          and its signature. Prefer to install by hand? This is the file. A
+          <code>bitcoin-ghost-v…</code> tarball is the old network's.
         </div>
         <div class="hero-actions" style="margin-top:18px;">
           <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Releases <span class="arrow">→</span></a>

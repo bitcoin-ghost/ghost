@@ -1,0 +1,555 @@
+name: Release (node pool)
+
+# The node pool's release channel. The old network (`main`, the eight-node fleet) releases from
+# release.yml on `v*` tags, and its nodes update from GitHub's `releases/latest`. The node pool runs
+# beside it on separate servers and must never be handed by, or hand to, that channel:
+#
+#   * tags are `np-vX.Y.Z` (`np-vX.Y.Z-rcN` for a candidate). GitHub's tag filters are anchored, so
+#     release.yml's `v*` never matches an np- tag and this workflow's `np-v*` never matches a v-tag
+#     (scripts/check-release-workflows.sh asserts both);
+#   * every release is a PRE-release with make_latest=false. GitHub cannot make a pre-release the
+#     repository's latest release, so `releases/latest`, which every old-network node and the old
+#     installer resolve, never moves to a node pool build however the release is later edited;
+#   * release names and assets carry the tag: "Node pool np-v…", bitcoin-ghost-np-v…-<target>.
+#
+# Node pool nodes find their releases by listing them and taking the newest final np- tag
+# (scripts/ghost-auto-update.sh, scripts/install-node.sh GHOST_VERSION=np-latest).
+#
+# The `build` job is release.yml's, unchanged apart from `needs: guard`, so the two channels ship
+# the same artefact set built the same way: ghost-mining, pool_sv2, translator_sv2, ghost-admin,
+# ghost-audit, and ghostd with its RPC client ghost-cli. scripts/check-release-workflows.sh fails
+# when the two drift; fix both or neither.
+
+on:
+  push:
+    tags:
+      - 'np-v*'
+  # Dry run without cutting a tag: everything builds and the artifacts are uploaded, the release
+  # job is skipped (its `if`). Same as release.yml.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A malformed np- tag, or one whose version is not the workspace version the binaries will
+  # report, is refused before anything is built.
+  guard:
+    name: Node pool tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: The tag is a node pool tag at the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "workspace version $ver"
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "not a tag ($GITHUB_REF_NAME): dry run, nothing to check"
+            exit 0
+          fi
+          if ! [[ "$GITHUB_REF_NAME" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not a node pool tag (np-vX.Y.Z or np-vX.Y.Z-suffix)"
+            exit 1
+          fi
+          want="${GITHUB_REF_NAME#np-v}"; want="${want%%-*}"
+          if [ "$want" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME names $want but the workspace is $ver, which is what every binary (ghostd included) will report"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME matches the workspace version"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    # There was no timeout here at all, so the v1.11.23 apt hang was heading for the
+    # 6-hour default. Generous enough for a cold cross-target release build, bounded
+    # enough that a stall is visible the same day.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04, deliberately, NOT ubuntu-latest.
+          #
+          # glibc is backward compatible but not forward compatible: a binary
+          # linked on 24.04 (glibc 2.39) demands >= 2.38 at runtime and will not
+          # start on anything older. The released ghost-mining did exactly that,
+          # excluding Ubuntu 22.04 LTS (2.35, supported to 2027) and Debian 12
+          # (2.36) — and our own fleet is all 24.04, so it was invisible (#540).
+          #
+          # Building on 22.04 lowers the floor to 2.35, which still runs on
+          # 24.04. Nothing is lost by building older; reach is lost by building
+          # newer. Verify with:
+          #   objdump -T ghost-mining | grep GLIBC_ | sed 's/.*GLIBC_//' | sort -V | tail -1
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            suffix: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            suffix: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            suffix: ""
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Install system dependencies (Linux), with the mirrors off the critical path.
+      #
+      # #693 fixed this for `ci.yml` and did NOT reach here, which is how v1.11.23's
+      # release build sat 40+ minutes on `apt-get update` with every later step pending
+      # and no `timeout-minutes` to stop it. Same script, same reasoning — see
+      # `.github/scripts/install-linux-deps.sh` for why caching the .debs is the fix.
+      #
+      # ⚠ The cache key must NOT collide with ci.yml's. This job installs a strictly
+      # larger set (ghostd's C++ build deps as well as the Rust ones), and a shared key
+      # would let one workflow restore the other's .debs and install the wrong set. The
+      # `-release-` segment keeps them apart; hashing this file rotates the key whenever
+      # the package list below changes.
+      - name: Runner image (apt cache key)
+        id: runner-image
+        if: runner.os == 'Linux'
+        # .debs resolved on one runner image are not installable on another: a cache of
+        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Cache apt packages (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apt-debs
+          key: apt-debs-release-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh', '.github/workflows/release.yml') }}
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        env:
+          # ghost-mining (Rust) needs libsqlite3 + capnproto (the SV2
+          # stratum-core dep). The Linux job ALSO builds ghostd (the C++ Bitcoin
+          # Core daemon) below, which needs the standard Core build deps: a
+          # compiler + CMake + pkgconf, libevent, boost, and libzmq. WITH_ZMQ is
+          # ON (see the ghostd build step) because ghost-mining subscribes to
+          # ghostd's ZMQ hashblock/sequence feed, so libzmq3-dev is required; the
+          # capnproto/libsqlite3 packages double as ghostd's IPC
+          # (ENABLE_IPC) and wallet (ENABLE_WALLET) dependencies.
+          LINUX_DEPS: >-
+            libsqlite3-dev capnproto libcapnp-dev
+            build-essential cmake pkgconf python3 libevent-dev libboost-dev libzmq3-dev
+        run: .github/scripts/install-linux-deps.sh
+
+      # Cap'n Proto >= 1.0 from source (Linux only).
+      #
+      # 22.04's apt ships capnproto 0.8.0, and libmultiprocess REFUSES it — CVE-2022-46149. So the
+      # move to 22.04 in #541, which existed to stop the artifact demanding glibc 2.38, made the
+      # Linux build fail outright at CMake configure (#549).
+      #
+      # Building 1.0.2 here rather than passing -DENABLE_IPC=OFF is deliberate: ENABLE_IPC is left ON
+      # on purpose so the released binary matches the fleet's reference binary. Turning it off would
+      # quietly ship an artifact without multiprocess support because of an apt version, which is a
+      # change to what we distribute, not a build detail.
+      #
+      # The apt capnproto above is still installed and still wanted — the Rust SV2 stratum-core dep
+      # uses it, and 0.8.0 is fine for that. This install goes to /usr/local, which pkgconf and CMake
+      # both prefer, so only the C++ ghostd build picks up 1.0.2.
+      - name: Cap'n Proto >= 1.0 for ghostd IPC (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://capnproto.org/capnproto-c++-1.0.2.tar.gz -o capnproto.tar.gz
+          # Pinned digest, verified against the tarball actually published at capnproto.org. No
+          # fallback: an unverified download that builds anyway is worse than no check at all.
+          echo "9057dbc0223366b74bbeca33a05de164a229b0377927f1b7ef3828cdd8cb1d7e  capnproto.tar.gz" \
+            | sha256sum -c -
+          tar xzf capnproto.tar.gz
+          cd capnproto-c++-1.0.2
+          ./configure --prefix=/usr/local
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+          # Assert we actually got >= 1.0, so a silent fallback to apt's 0.8.0 cannot pass.
+          ver=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion capnp)
+          echo "capnp now $ver"
+          case "$ver" in 1.*|2.*) ;; *) echo "capnp is $ver, expected >= 1.0"; exit 1 ;; esac
+
+      # Install system dependencies (macOS) — capnproto for the SV2 stratum-core dep
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+
+      # Build only the binaries this release ships (node + SV2). Building the
+      # whole workspace would pull in the desktop wallet/mobile apps (Tauri GUIs
+      # need webkit, and the wallet daemon may be mid-development) which are not
+      # release artifacts here.
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p ghost-mining -p ghost-cli \
+            -p translator_sv2 -p pool_sv2 \
+            -p ghost-audit
+
+      # Build ghostd (the C++ Bitcoin Core daemon) so the node binaries ship in
+      # ONE signed release at ONE version and can never drift apart. Linux only — the pool/elder fleet is
+      # Linux, and a Bitcoin Core build is neither needed nor attempted on the
+      # macOS targets.
+      #
+      # CMake derives the client version from the workspace Cargo.toml (watch for
+      # the "Ghost client version (from workspace Cargo.toml)" log line), so the
+      # tag's version is baked into ghostd automatically with no extra wiring.
+      #
+      # WITH_ZMQ=ON is REQUIRED, not optional: ghost-mining subscribes to ghostd's
+      # ZMQ hashblock/sequence feed for new-block and reorg detection, so a
+      # non-ZMQ ghostd would silently break the pool. ENABLE_IPC/ENABLE_WALLET
+      # keep their defaults (ON) to match the fleet's reference binary; their
+      # deps (capnproto, libsqlite3) are already installed above.
+      #
+      # `ghost-cli` — the Core RPC client, the `bitcoin-cli` of this fork — is built with it and
+      # ships in the same tarball (#1028). It was not built here at all: the tarball's
+      # `ghost-cli` was the Rust administration tool, which answers `ghost-cli -conf=…
+      # getblockcount` with "unexpected argument '-c'". A fresh install had no RPC client, and an
+      # auto-updating node would have had its working one replaced. The admin tool now ships as
+      # `ghost-admin`. BUILD_CLI is ON by default; do not switch it off.
+      #
+      # We build only the `ghostd` and `ghost-cli` targets and disable tests/bench/gui/tx/util/
+      # wallet-tool to keep the release build tractable (a Core build is ~20-40
+      # min on the 4-core runner). If the runner ever OOMs, cap `-j"$(nproc)"` at
+      # -j2 and/or add -DCMAKE_CXX_FLAGS="--param ggc-min-expand=1 --param
+      # ggc-min-heapsize=32768".
+      - name: Build ghostd (Linux release only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cmake -S ghost-core -B ghost-core/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_ZMQ=ON \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_BENCH=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_FUZZ_BINARY=OFF \
+            -DBUILD_TX=OFF \
+            -DBUILD_UTIL=OFF \
+            -DBUILD_WALLET_TOOL=OFF
+          cmake --build ghost-core/build --target ghostd ghost-cli -j"$(nproc)"
+          # Fail loudly here (not at packaging time) if either did not build.
+          test -x ghost-core/build/bin/ghostd
+          test -x ghost-core/build/bin/ghost-cli
+
+      # Package binaries
+      # Fail the build if the Linux artifact demands a newer glibc than we target.
+      #
+      # This is the check that did not exist: the floor was only discoverable by
+      # downloading a published release and watching it fail to start on an older
+      # distro. Asserting it here means a runner-image bump cannot quietly raise
+      # the requirement again (#540).
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          # Copy binaries (check actual names from target directory)
+          # ghost-audit is the miner's tool (W2.9): it ships in the archive for miners to run and
+          # is never rolled onto a node (scripts/release.sh FLEET_BINARIES).
+          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 ghost-audit ghost-light-wallet ghost-light-wallet-tui; do
+            if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
+              cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
+            fi
+          done
+
+          # The node binary ships under its old name as well (#1024).
+          #
+          # The installer published at get.bitcoinghost.org, and the auto-updater it lays
+          # down, resolve `releases/latest` and then `find . -name ghost-pool -type f`. A
+          # tarball holding only `ghost-mining` makes that print nothing, so the first
+          # release after the rename (#1018) would have broken every fresh install and every
+          # self-updating node the moment it became Latest. With both names present a release
+          # does not depend on when the installer is republished.
+          #
+          # A hard link, so the archive stores the bytes once; it extracts as two regular
+          # files, which is what `find -type f` needs. Drop it once the published installer
+          # and the updaters in the field look for `ghost-mining`.
+          if [ -f "dist/ghost-mining${{ matrix.suffix }}" ] && [ "${{ runner.os }}" != "Windows" ]; then
+            ln "dist/ghost-mining${{ matrix.suffix }}" "dist/ghost-pool${{ matrix.suffix }}"
+          fi
+
+          # ghostd (C++) is built only on the Linux target (step above). Stage it
+          # into the SAME dist/ so it lands inside the linux tarball alongside
+          # ghost-mining and is covered — with zero extra signing logic — by the
+          # existing SHA256SUMS + GPG signature over the tarball.
+          if [ -f "ghost-core/build/bin/ghostd" ]; then
+            cp "ghost-core/build/bin/ghostd" dist/
+            # The Core RPC client, under the name it has on every node (#1028). Nothing built
+            # by cargo is called ghost-cli any more, so this cannot overwrite the admin tool.
+            [ ! -e dist/ghost-cli ] || { echo "::error::dist/ghost-cli already exists — two programs are being shipped under one name again"; exit 1; }
+            cp "ghost-core/build/bin/ghost-cli" dist/
+          fi
+
+          # Create archive only if dist has files
+          #
+          # ⚠ `github.ref_name` is slash-free for a tag (`v1.11.23`) but NOT for a branch,
+          # and this workflow is also dispatchable as a dry run. On `fix/release-apt-hang`
+          # the name became `bitcoin-ghost-fix/release-apt-hang-<target>.tar.gz`, so tar
+          # tried to write into a directory that does not exist and every target failed at
+          # this step. The dry run was added (#540) precisely so the workflow could be
+          # exercised without cutting a tag — and it could not be, on any branch named the
+          # way every branch in this repo is named. Slashes are replaced, so a tag build is
+          # byte-identical to before and a dispatch produces a usable artefact.
+          cd dist
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
+          if [ -n "$(ls -A .)" ]; then
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              7z a "../bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.zip" *
+            else
+              tar czvf "../bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.tar.gz" *
+            fi
+          else
+            echo "No binaries found to package"
+            exit 1
+          fi
+          cd ..
+
+          # Read the ARCHIVE back, not dist/: the claim is about what an installer extracts.
+          # Extracted somewhere empty and looked up exactly as the published installer does.
+          if [ "${{ runner.os }}" != "Windows" ] && [ -f "dist/ghost-mining${{ matrix.suffix }}" ]; then
+            check="$(mktemp -d)"
+            tar -xzf "bitcoin-ghost-${REF_SLUG}-${{ matrix.target }}.tar.gz" -C "$check"
+            for name in ghost-mining ghost-pool; do
+              found="$(cd "$check" && find . -name "$name" -type f | head -1)"
+              [ -n "$found" ] || { echo "::error::the archive does not extract a regular file named $name"; exit 1; }
+              [ -x "$check/$found" ] || { echo "::error::$name extracted without its executable bit"; exit 1; }
+            done
+            cmp "$check/ghost-mining" "$check/ghost-pool" || { echo "::error::ghost-pool is not the same build as ghost-mining"; exit 1; }
+            echo "archive extracts ghost-mining and ghost-pool, identical"
+            # Where ghostd ships, so does its RPC client — and under that name it must BE the
+            # RPC client. Asked of the extracted binary, not inferred from how it was built.
+            if [ -f "$check/ghostd" ]; then
+              # Captured, not piped into `grep -q`: this step runs under pipefail, and a reader
+              # that exits at its first match kills the writer with SIGPIPE.
+              cli_says="$("$check/ghost-cli" -version 2>&1 || true)"     # must say: RPC client
+              admin_says="$("$check/ghost-admin" --help 2>&1 || true)"
+              case "$cli_says" in *"RPC client"*) ;; *) echo "::error::the archive's ghost-cli is not the Ghost Core RPC client: ${cli_says%%$'\n'*}"; exit 1 ;; esac
+              case "$admin_says" in *"administration"*) ;; *) echo "::error::the archive does not carry the admin tool as ghost-admin"; exit 1 ;; esac
+              echo "archive's ghost-cli is the Core RPC client; the admin tool is ghost-admin"
+            fi
+            rm -rf "$check"
+          fi
+
+      # The floor check MUST run here, after Package, and MUST read dist/.
+      #
+      # The previous version scanned target/<target>/release/*, which holds only the RUST
+      # binaries — ghostd is built by CMake to ghost-core/build/bin/ghostd and is staged into
+      # dist/ by the Package step ABOVE. So the guard never once inspected ghostd. It also
+      # grepped 'GLIBC_', which cannot match 'GLIBCXX_' (that is GLIBC + XX_), so libstdc++
+      # floors were invisible even for the binaries it did scan.
+      #
+      # Those compounded: the one binary with a libstdc++ problem was the one binary the guard
+      # could not see. v1.11.21 shipped as Latest and does not start on Ubuntu 22.04 — ghostd
+      # wants GLIBCXX_3.4.32, ghost-mining wants GLIBC_2.39, and only ghost-cli runs (#555).
+      - name: Assert glibc and libstdc++ floors (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_GLIBC=2.35        # Ubuntu 22.04
+          MAX_GLIBCXX=3.4.30    # Ubuntu 22.04 libstdc++6 (GCC 12)
+
+          command -v objdump >/dev/null || { echo "::error::objdump missing — cannot verify floors"; exit 1; }
+
+          inspected=0
+          fail=0
+          for bin in dist/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            # Skip anything that is not an ELF executable (scripts, notes).
+            head -c 4 "$bin" | grep -q $'\x7fELF' || continue
+            inspected=$((inspected + 1))
+
+            syms=$(objdump -T "$bin" 2>/dev/null || true)
+            # `|| true` is REQUIRED on both. Under `set -e` with `pipefail`, a grep that
+            # matches nothing fails the whole substitution and kills the step — and a pure-Rust
+            # binary legitimately has NO GLIBCXX_ symbols at all. Without this the guard died on
+            # the first such binary (the admin tool, then named ghost-cli and alphabetically first in dist/) after 20ms with no
+            # output, which looks identical to a real floor violation.
+            g=$(printf '%s' "$syms"  | grep -oE 'GLIBC_[0-9.]+'   | sed 's/GLIBC_//'   | sort -V | tail -1 || true)
+            gx=$(printf '%s' "$syms" | grep -oE 'GLIBCXX_[0-9.]+' | sed 's/GLIBCXX_//' | sort -V | tail -1 || true)
+            echo "  $(basename "$bin"): glibc=${g:-none} libstdc++=${gx:-none}"
+
+            if [ -n "$g" ] && [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$g" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+              echo "::error::$(basename "$bin") needs glibc $g, above the $MAX_GLIBC floor"
+              fail=1
+            fi
+            if [ -n "$gx" ] && [ "$(printf '%s\n%s\n' "$MAX_GLIBCXX" "$gx" | sort -V | tail -1)" != "$MAX_GLIBCXX" ]; then
+              echo "::error::$(basename "$bin") needs libstdc++ GLIBCXX_$gx, above the $MAX_GLIBCXX floor"
+              fail=1
+            fi
+          done
+
+          # A guard that inspected nothing must FAIL, not pass. The previous one skipped a
+          # binary whenever objdump produced no output and then evaluated an empty "worst",
+          # so a broken or missing objdump would have reported success having checked nothing.
+          if [ "$inspected" -eq 0 ]; then
+            echo "::error::floor guard inspected 0 binaries in dist/ — refusing to certify"
+            exit 1
+          fi
+          echo "inspected $inspected binaries"
+          [ "$fail" -eq 0 ] || exit 1
+
+      # Symbol scanning is what failed for v1.11.21, so prove it by RUNNING the packaged
+      # binaries on the oldest supported distro rather than trusting the scan alone.
+      - name: Smoke-test packaged binaries on Ubuntu 22.04
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/smoke.sh <<'SMOKE'
+          set -u
+          apt-get update -qq >/dev/null 2>&1
+          apt-get install -y -qq libsqlite3-0 libevent-2.1-7 libzmq5 >/dev/null 2>&1 || true
+          rc=0
+          for bin in /dist/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            head -c 4 "$bin" | grep -q $'\x7fELF' || continue
+            out=$("$bin" --version 2>&1 || true)
+            # Only a symbol-version failure is fatal here. A binary may exit non-zero for
+            # its own reasons (missing config, needs a subcommand) and that is not our concern.
+            if printf '%s' "$out" | grep -qE "version \`(GLIBC|GLIBCXX)_[0-9.]+' not found"; then
+              echo "::error::$(basename "$bin") does not run on Ubuntu 22.04:"
+              printf '%s\n' "$out" | head -5
+              rc=1
+            else
+              echo "  $(basename "$bin"): starts OK"
+            fi
+          done
+          exit $rc
+          SMOKE
+          docker run --rm -v "$PWD/dist:/dist:ro" -v /tmp/smoke.sh:/smoke.sh:ro \
+            ubuntu:22.04 bash /smoke.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: bitcoin-ghost-${{ matrix.target }}
+          # Same slash-replacement as the Package step above, or a dispatch uploads nothing.
+          path: bitcoin-ghost-*-${{ matrix.target }}.*
+
+  release:
+    name: Create node pool release
+    needs: build
+    # np- tag pushes only. A dispatch run is for testing the build.
+    if: startsWith(github.ref, 'refs/tags/np-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # What a node pool node installs, asserted on the archive the installer will download rather
+      # than on what the build step meant to put in it.
+      - name: Assert the node pool artefact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(find artifacts -type f -name "bitcoin-ghost-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | head -1)"
+          [ -n "$tarball" ] || { echo "::error::no bitcoin-ghost-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz was built"; exit 1; }
+          check="$(mktemp -d)"
+          tar -xzf "$tarball" -C "$check"
+          rc=0
+          for bin in ghostd ghost-cli ghost-mining pool_sv2 translator_sv2 ghost-admin ghost-audit; do
+            found="$(cd "$check" && find . -name "$bin" -type f | head -1)"
+            if [ -n "$found" ] && [ -x "$check/$found" ]; then
+              echo "  ok  $bin"
+            else
+              echo "::error::the node pool archive does not carry an executable $bin"; rc=1
+            fi
+          done
+          # Every archive is named for the np- tag, so none can be mistaken for an old-network one.
+          while read -r f; do
+            case "$(basename "$f")" in
+              "bitcoin-ghost-${GITHUB_REF_NAME}-"*) ;;
+              *) echo "::error::$(basename "$f") is not named for ${GITHUB_REF_NAME}"; rc=1 ;;
+            esac
+          done < <(find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \))
+          rm -rf "$check"
+          exit $rc
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          # Same manifest as release.yml: flat basenames, so `sha256sum -c` works beside the assets.
+          cd artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) | while read -r f; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"
+          done | sort > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      # The same release key as the old channel (fingerprint in SECURITY.md): the installer and the
+      # updater pin one key, and the channel is told apart by the tag, not by the signer.
+      - name: PGP-sign SHA256SUMS
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+            --armor --detach-sign --output SHA256SUMS.txt.asc SHA256SUMS.txt
+          gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
+
+      # As release.yml: assert the OUTCOME (signed, manifest matches the uploads), whatever the
+      # signing step's condition says. A node pool node refuses an unsigned release anyway; this
+      # stops one being published at all.
+      - name: Verify the release is signed and the checksums match
+        if: startsWith(github.ref, 'refs/tags/np-v')
+        run: |
+          if [ ! -f SHA256SUMS.txt.asc ]; then
+            echo "::error::no SHA256SUMS.txt.asc — this tag would publish UNSIGNED."
+            exit 1
+          fi
+          gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt \
+            || { echo "::error::signature does not verify against the manifest"; exit 1; }
+          rc=0
+          while read -r want name; do
+            [ -n "$name" ] || continue
+            path=$(find artifacts -type f -name "$name" | head -1)
+            if [ -z "$path" ]; then
+              echo "::error::manifest lists $name but no such artifact was built"; rc=1; continue
+            fi
+            got=$(sha256sum "$path" | cut -d" " -f1)
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name checksum mismatch: manifest $want, artifact $got"; rc=1
+            else
+              echo "  ok  $name"
+            fi
+          done < SHA256SUMS.txt
+          [ "$rc" -eq 0 ] || { echo "::error::manifest does not match the artifacts"; exit 1; }
+          echo "signed and checksums verified"
+
+      # A DRAFT, as release.yml makes: scripts/release.sh --node-pool checks the assets and
+      # publishes it. prerelease + make_latest=false are set HERE as well as at publish, so a
+      # draft published by hand from the web page is still a pre-release that cannot be latest.
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: Node pool ${{ github.ref_name }}
+          draft: true
+          prerelease: true
+          make_latest: "false"
+          generate_release_notes: true
+          body: |
+            **Node pool release.** For node pool nodes only, installed with
+            `GHOST_VERSION=${{ github.ref_name }}` or `GHOST_VERSION=np-latest`.
+            Not for the old network: its nodes follow the repository's latest release, which a
+            node pool release never is.
+          files: |
+            artifacts/**/*
+            SHA256SUMS.txt
+            SHA256SUMS.txt.asc

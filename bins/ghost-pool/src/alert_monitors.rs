@@ -103,11 +103,18 @@ pub fn evaluate_behind_tip(
     None
 }
 
-/// Parse a dotted version ("1.10.20", "v1.2", "1.2.3-rc1") into its numeric
-/// components, ignoring any `-prerelease`/`+build` metadata and any non-digit
-/// suffix on a segment. Missing components compare as 0.
+/// Parse a dotted version ("1.10.20", "v1.2", "1.2.3-rc1", "np-v1.2.3") into its
+/// numeric components, ignoring any `-prerelease`/`+build` metadata and any non-digit
+/// suffix on a segment. Missing components compare as 0. `np-` is the node pool
+/// release channel's tag prefix: the updater records `np-v1.2.3` as the latest
+/// version on a node pool node, and without the strip it parsed as 0 and the alert
+/// never fired.
 fn parse_version(v: &str) -> Vec<u64> {
-    let v = v.trim().trim_start_matches(['v', 'V']);
+    let v = v.trim();
+    let v = v
+        .strip_prefix("np-")
+        .unwrap_or(v)
+        .trim_start_matches(['v', 'V']);
     let core = v.split(['-', '+']).next().unwrap_or(v);
     core.split('.')
         .map(|seg| {
@@ -817,6 +824,14 @@ mod tests {
         assert!(version_is_newer("1.11.0-rc1", "1.10.20"));
         // Same numeric core, one prerelease: numeric core equal → not "newer".
         assert!(!version_is_newer("1.10.20-rc1", "1.10.20"));
+    }
+
+    #[test]
+    fn version_newer_reads_node_pool_tags() {
+        assert!(version_is_newer("np-v1.11.47", "1.11.46"));
+        assert!(version_is_newer("np-v1.12.0", "np-v1.11.46"));
+        assert!(!version_is_newer("np-v1.11.46", "1.11.46"));
+        assert!(!version_is_newer("np-v1.11.46-rc1", "1.11.46"));
     }
 
     #[test]

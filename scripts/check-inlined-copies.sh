@@ -51,6 +51,12 @@ PAIRS = {
     "GHOST_AUTOUPDATE_SH_EOF":        "scripts/ghost-auto-update.sh",
     "GHOST_AUTOUPDATE_SERVICE_EOF":   "scripts/systemd/ghost-auto-update.service",
     "GHOST_AUTOUPDATE_TIMER_EOF":     "scripts/systemd/ghost-auto-update.timer",
+    # The dashboard's only privileged helper, and its sudoers scope. The toggle decides nothing
+    # about WHICH releases a node follows (the release channel marker does), and a copy that
+    # started writing the channel into auto-update.conf would move a node pool node back onto
+    # the old network's releases the first time the dashboard switched updates on.
+    "GHOST_AUTOUPDATE_TOGGLE_EOF":    "scripts/ghost-autoupdate-toggle.sh",
+    "GHOST_AUTOUPDATE_SUDOERS_EOF":   "scripts/ghost-autoupdate.sudoers",
     # The optional off-node backup helper (#1016) runs as root from the dashboard. Its input
     # validation IS its security boundary, so a fresh node must not get a looser copy of it.
     "GHOST_BACKUP_OFFSITE_SH_EOF":      "scripts/ghost-backup-offsite.sh",

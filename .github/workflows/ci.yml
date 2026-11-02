@@ -107,12 +107,28 @@ jobs:
       # release, stub binaries and a recording systemctl.
       - name: auto-update swap self-test
         run: ./scripts/test-auto-update-swap.sh
+      # The node pool's release channel: np-latest, the channel marker, the updater following
+      # np- only on a node pool node and behaving exactly as before on a node without the marker
+      # (compared against the updater at ab480563b, fetched here because the checkout is shallow).
+      - name: Release channel self-test
+        run: |
+          git fetch --no-tags --depth=1 origin ab480563b31dcb65026837cebee12de48194a7d5
+          ./scripts/test-release-channel.sh
+      # The old network releases on v* tags and its nodes follow `releases/latest`; node pool
+      # releases are np-v* pre-releases. A trigger that matched both, or a node pool release that
+      # could become latest, would move the old fleet onto a node pool build.
+      - name: Release workflows keep the channels apart
+        run: ./scripts/check-release-workflows.sh
       # release.sh orchestrates the roll, and two of its steps failed silently in v1.11.38: it
       # reported a release "published" that was still a draft (#857), and it rolled genesis FIRST
       # against its own stated rule (#856). Both are the shape a self-test catches and a reader
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # release.sh --node-pool: np- tag, pre-release, make_latest=false, `releases/latest` read back
+      # unchanged, and no phase that rolls the old fleet. Stubbed `gh`, throwaway repos.
+      - name: Node pool release-orchestrator self-test
+        run: ./scripts/test-release-node-pool.sh
       # E-1 forbids key material from a generator other than the OS CSPRNG. `thread_rng()` has
       # been substituted for `OsRng` three times here — once in the wallet seed, once minting the
       # SV2 AUTHORITY keypair while the doc comment claimed OsRng (#705). E-5 rules out catching
