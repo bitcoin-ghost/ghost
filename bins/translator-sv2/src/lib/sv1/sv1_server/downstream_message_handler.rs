@@ -94,6 +94,15 @@ impl IsServer<'static> for Sv1Server {
         info!("Received mining.subscribe from Sv1 downstream");
         debug!("Down: Handling mining.subscribe: {}", request);
 
+        // Keep the agent for the node pool's slot-class sensing. It only leaves this process
+        // when the upstream negotiated the Ghost agent extension; see `ghost_agent_tlv`.
+        if let Some(downstream) = self.downstreams.get(&downstream_id) {
+            let agent = super::clamp_agent(&request.agent_signature).to_string();
+            downstream
+                .downstream_data
+                .super_safe_lock(|data| data.user_agent = Some(agent));
+        }
+
         let set_difficulty_sub = (
             "mining.set_difficulty".to_string(),
             downstream_id.to_string(),

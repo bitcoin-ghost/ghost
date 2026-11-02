@@ -87,6 +87,9 @@ pub struct DownstreamData {
     // reconnects in 24 h on one node). Miners that send no `mining.configure` at all
     // leave this false.
     pub extranonce_subscribe_negotiated: bool,
+    /// The agent the miner named in `mining.subscribe`, cut to 255 bytes. Forwarded to the pool
+    /// in the Ghost agent TLV when the upstream negotiated it (node pool slot-class sensing).
+    pub user_agent: Option<String>,
     // Set when a miner-declared difficulty (`d=` in the authorize password, or
     // `mining.suggest_difficulty`) arrives AFTER the channel is already open, so the
     // channel-open path can no longer size itself from it.
@@ -144,6 +147,7 @@ impl DownstreamData {
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
             extranonce_subscribe_negotiated: false,
+            user_agent: None,
             declared_difficulty_needs_push: false,
             channel_open_requested: false,
             channel_opened_provisionally: false,
