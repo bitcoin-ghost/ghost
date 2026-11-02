@@ -23,8 +23,8 @@
 //! Reading a mined coinbase: its scriptSig and outputs, from this node's own Core.
 //!
 //! The pre-submission check against a voted payout commitment is gone: every job's coinbase is
-//! the node pool's canonical one, and pool_sv2 checks a solved block against the outputs its job
-//! was built with before submitting (`NodePool::check_block`). What remains is used by the share
+//! the node pool's canonical one; pool_sv2 submits a solved block at once and then checks it
+//! against the outputs its job was built with, as an alarm (`NodePool::submit_then_check`). What remains is used by the share
 //! shard's settlement (`shard.rs`).
 
 use bitcoin::address::NetworkUnchecked;

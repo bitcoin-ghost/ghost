@@ -8309,7 +8309,8 @@ async fn main() -> Result<()> {
         Arc::new(std::sync::OnceLock::new());
 
     // Block-difficulty share: fire the operator alert. The block's coinbase is the job's
-    // canonical one (pool_sv2 checks it before submitting); what it paid is settled by the node
+    // canonical one (pool_sv2 submits it at once and checks it after, as an alarm); what it paid
+    // is settled by the node
     // pool relay when the block enters the best chain.
     {
         let rm_for_bf = Arc::clone(&round_manager);

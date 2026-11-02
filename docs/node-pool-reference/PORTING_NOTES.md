@@ -123,8 +123,11 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
 - **The finder** is `[node_pool] fee_address`, required to be one of the four payee classes
   (the spec does not say; share rule 4 accepts any finder script). Chosen so the finder never
   adds sigops or unbounded bytes.
-- **Submit check**: each job records `outputs_digest` of its full canonical output list; a solved
-  coinbase whose outputs digest differs is not sent to the template provider.
+- **Submit check is a post-submit alarm** (user decision, 11-02): a solved block is always sent to
+  the template provider at once. Only then is its outputs digest compared with the one its job
+  recorded; a mismatch is logged and nothing else. A valid Bitcoin block is worth more than any
+  payout mismatch, and settlement on every other node, which retires nothing for a block that does
+  not match, is the enforcement.
 - **Standard channels and custom work**: standard channels carry the full class. Custom-work
   (JDS) connections are not stamped and their coinbases are the declaring client's; they are
   outside this check (next wave).

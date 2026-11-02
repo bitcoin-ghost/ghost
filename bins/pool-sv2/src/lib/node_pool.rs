@@ -25,9 +25,10 @@
 //!
 //! The table is the relay's rule-4 table at `cut(H) = H - 20` for the job's parent anchor and
 //! height ([`NodePool::fetch_table`], answered by the relay task after settlement has caught up
-//! with the Bitcoin tip). Each job remembers the digest of the outputs it was built with, and a
-//! solved block is submitted only if its coinbase pays exactly those
-//! ([`NodePool::check_block`]).
+//! with the Bitcoin tip). Each job remembers the digest of the outputs it was built with. A solved
+//! block is always submitted at once; its coinbase is checked against those outputs only after the
+//! solution is queued, as an alarm ([`NodePool::submit_then_check`]). The real enforcement is
+//! settlement on every other node, which retires nothing for a block that does not match.
 //!
 //! - **Anchors.** `parent_anchor` and `batch_root` come from an [`AnchorDriver`], a watch
 //!   channel the relay (W2.5, `node_pool_relay.rs`) publishes to. Every publish re-stamps every
@@ -468,7 +469,36 @@ impl NodePool {
         self.check_block(key, job_id, &tx)
     }
 
-    /// The submit-time check: a solved block on `job_id` is submitted only if its coinbase pays
+    /// A solved block on `job_id`: `submit` queues it for the template provider first, always,
+    /// whenever there is a template; only then is its coinbase checked against the job's canonical
+    /// outputs ([`NodePool::check_block_bytes`]), and a mismatch is logged and nothing else. A
+    /// valid Bitcoin block is worth more than any payout mismatch; settlement on every other node
+    /// retires nothing for a block that does not match. Returns whether it was submitted.
+    pub fn submit_then_check<E>(
+        &self,
+        key: ChannelKey,
+        job_id: u32,
+        template_id: Option<u64>,
+        coinbase: &[u8],
+        submit: impl FnOnce(u64) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let Some(template_id) = template_id else {
+            return Ok(false);
+        };
+        submit(template_id)?;
+        if let Err(e) = self.check_block_bytes(key, job_id, coinbase) {
+            error!(
+                downstream_id = key.0,
+                channel_id = key.1,
+                job_id,
+                "NODE_POOL: submitted block's coinbase does not match its job's canonical \
+                 outputs: {e}"
+            );
+        }
+        Ok(true)
+    }
+
+    /// The post-submit alarm's check: whether a solved block on `job_id` pays
     /// exactly the canonical outputs that job was built with.
     pub fn check_block(
         &self,
@@ -1148,8 +1178,14 @@ mod tests {
         assert!(NodePool::template_parts(&not_witness).is_err());
     }
 
+    fn swapped_for_submit(outs: &[TxOut]) -> Vec<TxOut> {
+        let mut o = outs.to_vec();
+        o.swap(1, 2);
+        o
+    }
+
     #[test]
-    fn a_solved_block_is_submitted_only_with_its_jobs_canonical_coinbase() {
+    fn a_solved_block_is_always_submitted_and_its_coinbase_checked_after() {
         use stratum_apps::stratum_core::bitcoin::{
             absolute::LockTime, transaction::Version, OutPoint, Sequence, TxIn, Witness,
         };
@@ -1201,6 +1237,32 @@ mod tests {
         assert!(np.check_block(key, 5, &tx(skim)).is_err());
         assert!(np.check_block(key, 6, &good).is_err(), "unknown job");
         assert!(np.check_block_bytes(key, 5, &[1, 2, 3]).is_err());
+        // Submission never waits on the check: a mismatched coinbase is still submitted (and
+        // only logged), a matching one likewise, and a custom job (no template) is not.
+        for (cb, label) in [
+            (tx(swapped_for_submit(&outs)), "mismatched"),
+            (good.clone(), "canonical"),
+        ] {
+            let raw = stratum_apps::stratum_core::bitcoin::consensus::serialize(&cb);
+            let mut queued = Vec::new();
+            let sent = np
+                .submit_then_check(key, 5, Some(77), &raw, |t| {
+                    queued.push(t);
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+            assert!(sent, "{label} block submitted");
+            assert_eq!(
+                queued,
+                vec![77],
+                "{label} block queued for the template provider"
+            );
+        }
+        let raw = stratum_apps::stratum_core::bitcoin::consensus::serialize(&good);
+        let none = np.submit_then_check(key, 5, None, &raw, |_| -> Result<(), ()> {
+            panic!("no template: nothing to submit")
+        });
+        assert_eq!(none, Ok(false));
         // A job bound without outputs (stamped, never built) has nothing to submit against.
         np.stamp(key, ChannelKind::Standard, ADDR, &target());
         np.bind_job(key, 8);

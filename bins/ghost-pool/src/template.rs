@@ -1861,8 +1861,9 @@ impl TemplateProcessor {
             return Err(anyhow::anyhow!("Invalid block version: {}", version));
         }
 
-        // The coinbase's outputs were checked against the job's canonical outputs by pool_sv2
-        // before it sent the solution (`NodePool::check_block`).
+        // No coinbase check holds a block back here. pool_sv2 checks the coinbase against its
+        // job's canonical outputs after sending the solution, as an alarm
+        // (`NodePool::submit_then_check`); settlement on every node is the enforcement.
 
         // Assemble the full block using the ORIGINAL witness coinbase from SRI
         let mut block_data = Vec::new();

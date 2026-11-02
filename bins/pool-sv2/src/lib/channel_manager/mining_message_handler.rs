@@ -984,27 +984,23 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 tier_log2,
                             });
                         }
-                        // if we have a template id (i.e.: this was not a custom job)
-                        // we can propagate the solution to the TP, once its coinbase is checked
-                        // against the canonical outputs its job was built with
-                        let canonical = match template_id {
-                            Some(_) => self.node_pool.check_block_bytes((downstream_id, channel_id), msg.job_id, &coinbase),
-                            None => Ok(()),
-                        };
-                        if let Err(e) = &canonical {
-                            error!(downstream_id, channel_id, job_id = msg.job_id, "NODE_POOL: block NOT submitted: {e}");
-                        }
-                        if let (Some(template_id), Ok(())) = (template_id, canonical) {
+                        // if we have a template id (i.e.: this was not a custom job) the solution
+                        // goes to the TP at once, unconditionally. Its coinbase is checked against
+                        // the canonical outputs its job was built with only after it is queued: a
+                        // mismatch is an alarm, never a reason to hold a valid block back.
+                        let submitted = coinbase.clone();
+                        self.node_pool.submit_then_check((downstream_id, channel_id), msg.job_id, template_id, &coinbase, |template_id| {
                             info!("SubmitSharesStandard: Propagating solution to the Template Provider.");
                             let solution = SubmitSolution {
                                 template_id,
                                 version: msg.version,
                                 header_timestamp: msg.ntime,
                                 header_nonce: msg.nonce,
-                                coinbase_tx: coinbase.try_into().map_err(PoolError::shutdown)?,
+                                coinbase_tx: submitted.try_into().map_err(PoolError::shutdown)?,
                             };
                             messages.push(TemplateDistribution::SubmitSolution(solution).into());
-                        }
+                            Ok::<(), Self::Error>(())
+                        })?;
                         let share_accounting = standard_channel.get_share_accounting();
                         let success = SubmitSharesSuccess {
                             channel_id,
@@ -1398,27 +1394,23 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 tier_log2,
                             });
                         }
-                        // if we have a template id (i.e.: this was not a custom job)
-                        // we can propagate the solution to the TP, once its coinbase is checked
-                        // against the canonical outputs its job was built with
-                        let canonical = match template_id {
-                            Some(_) => self.node_pool.check_block_bytes((downstream_id, channel_id), msg.job_id, &coinbase),
-                            None => Ok(()),
-                        };
-                        if let Err(e) = &canonical {
-                            error!(downstream_id, channel_id, job_id = msg.job_id, "NODE_POOL: block NOT submitted: {e}");
-                        }
-                        if let (Some(template_id), Ok(())) = (template_id, canonical) {
+                        // if we have a template id (i.e.: this was not a custom job) the solution
+                        // goes to the TP at once, unconditionally. Its coinbase is checked against
+                        // the canonical outputs its job was built with only after it is queued: a
+                        // mismatch is an alarm, never a reason to hold a valid block back.
+                        let submitted = coinbase.clone();
+                        self.node_pool.submit_then_check((downstream_id, channel_id), msg.job_id, template_id, &coinbase, |template_id| {
                             info!("SubmitSharesExtended: Propagating solution to the Template Provider.");
                             let solution = SubmitSolution {
                                 template_id,
                                 version: msg.version,
                                 header_timestamp: msg.ntime,
                                 header_nonce: msg.nonce,
-                                coinbase_tx: coinbase.try_into().map_err(PoolError::shutdown)?,
+                                coinbase_tx: submitted.try_into().map_err(PoolError::shutdown)?,
                             };
                             messages.push(TemplateDistribution::SubmitSolution(solution).into());
-                        }
+                            Ok::<(), Self::Error>(())
+                        })?;
                         let share_accounting = extended_channel.get_share_accounting();
                         let success = SubmitSharesSuccess {
                             channel_id,
