@@ -193,7 +193,29 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
 - **Migration v64** holds `np_btc_blocks` and `np_checkpoints`; the plan's genesis-table
   import moves to v65.
 
-## Open, not decided here
+## Network start (W2.8, pool_sv2 `node_pool_relay.rs`, `ghost_common::node_pool_network`)
+- **The network** is `[node_pool.relay] network`; absent means mainnet, the strictest reading, so
+  an unlabelled config cannot put a node on a configured genesis.
+- **Mainnet** runs only on `MAINNET_START`, compiled in and unset. While unset, the installer's
+  `UNSET` is refused by its existing message and a configured genesis by a second one. Once set,
+  a configured genesis must equal it, and `tier_base` may not be set.
+- **The genesis table digest** is the table's `table_root`, the same digest a block commits. A
+  pinned digest is checked before the store opens. The table is empty until migration v65.
+- **Regtest** with `UNSET` uses its default anchor, and then refuses any height but 0.
+
+## Ledger and status API (W2.11, pool_sv2 `node_pool_api.rs`)
+- **Served by pool_sv2**, on the monitoring listener: it owns the store (root, 0600) and the live
+  relay, settlement and channel state. ghost-mining's public routes forward to it.
+- **Queue position** is on the table the next block pays (the relay's `block_table` for the
+  current job anchor and the active template's height), ranked by `canonical_payout::
+  queue_position`, which shares `select`'s orderings; what each slot class would pay is
+  `paid_to`, i.e. `build_outputs`. The balance shown is the materialised ledger (credits to the
+  tip), which is ahead of that table by up to 20 blocks of credits.
+- **Credited shares** are batch memberships whose credit event `(anchor, job height)` is applied,
+  so a share in a losing anchor's batch is not listed.
+- **Settled or provisional** is settlement's in-memory pending set; a restart re-derives it.
+
+
 - **K = 120.** Resolved for the relay above: the duplicate check reaches back to `S(H)`. The spec's
   constants table still lists K; it should be reworded.
 - **Regtest tier base.** At difficulty 1, `T_net` floor 10 needs about 2^42 hashes a share, out of
