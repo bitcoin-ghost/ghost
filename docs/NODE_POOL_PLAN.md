@@ -69,7 +69,7 @@ Order of publication: spec, tag A, snapshot table and notice of H, tag B after 8
 - **R6** `payout_checkpoint.rs`, vote handlers, fee drift (~9k).
 - **R7** Challenges, qualification, reverify (~12k). `ghost-verification` keeps API and `fleet_auth`.
 - **R8** Wraith, coordinator, ghost-lock, signer (~38k).
-- **R9** Migration v63 one release later, rehearsed on a DB copy. Halts on non-zero rows in `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`.
+- **R9** Migration v64 one release later (v63 is the node pool storage added by W2.4), rehearsed on a DB copy. Halts on non-zero rows in `withdrawal_requests`, `ghost_locks`, `l2_*`, `wraith_*`.
 - **R10** ghostd to stock Bitcoin Core over GBT and ZMQ, without sv2-tp, one canary first. Measure `getmempoolfilterstats` first. Haze datadirs need resync; the updater and `release.sh` need changing.
 - **R11** Remaining gates and docs.
 
