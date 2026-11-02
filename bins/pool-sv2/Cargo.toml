@@ -39,3 +39,6 @@ default = ["monitoring"]
 monitoring = ["stratum-apps/monitoring"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+# Test only: GHOST_NP_FAULT makes this pool build hostile coinbases (node_pool_fault.rs), for
+# the regtest harness's hostile node. Never enabled in a release build.
+np-fault-injection = []

@@ -467,6 +467,8 @@ impl NodePool {
             &commitment,
         )
         .map_err(|e| format!("canonical outputs: {e}"))?;
+        #[cfg(feature = "np-fault-injection")]
+        let outs = crate::node_pool_fault::apply(outs, &self.finder_script);
         let digest = outputs_digest(&outs);
         let reward = outs[..outs.len() - 1]
             .iter()

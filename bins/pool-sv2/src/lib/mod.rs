@@ -41,6 +41,8 @@ pub mod miner_stats;
 mod monitoring;
 pub mod node_pool;
 pub mod node_pool_api;
+#[cfg(feature = "np-fault-injection")]
+pub mod node_pool_fault;
 pub mod node_pool_miner_api;
 pub mod node_pool_relay;
 pub mod share_webhook;
