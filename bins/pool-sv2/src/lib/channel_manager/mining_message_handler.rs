@@ -883,6 +883,21 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let res = standard_channel.validate_share(msg.clone());
                 vardiff.increment_shares_since_last_update();
 
+                // NODE_POOL_RELAY: an accepted share goes to the share-chain relay, which keeps it
+                // if it meets T_net. Inert without `[node_pool.relay]`.
+                if let (Some(np), Ok(ShareValidationResult::Valid(_, header80) | ShareValidationResult::BlockFound(_, _, _, header80))) = (&self.node_pool, &res) {
+                    let active = standard_channel.get_active_job().map(|j| j.get_job_id());
+                    if active == Some(msg.job_id) {
+                        if let Some((prefix, suffix, path)) = standard_channel.coinbase_skeleton() {
+                            let mut coinbase = prefix;
+                            coinbase.extend_from_slice(standard_channel.get_extranonce_prefix());
+                            coinbase.extend_from_slice(&suffix);
+                            let path = path.iter().filter_map(|n| n.as_slice().try_into().ok()).collect();
+                            np.offer_share((downstream_id, channel_id), msg.job_id, header80, coinbase, path);
+                        }
+                    }
+                }
+
 
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
@@ -1166,6 +1181,28 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 let res = extended_channel.validate_share(msg.clone());
                 vardiff.increment_shares_since_last_update();
+
+                // NODE_POOL_RELAY: an accepted share goes to the share-chain relay, which keeps it
+                // if it meets T_net. Inert without `[node_pool.relay]`.
+                if let (Some(np), Ok(ShareValidationResult::Valid(_, header80) | ShareValidationResult::BlockFound(_, _, _, header80))) = (&self.node_pool, &res) {
+                    let job = extended_channel
+                        .get_active_job()
+                        .filter(|j| j.get_job_id() == msg.job_id)
+                        .or_else(|| extended_channel.get_past_job(msg.job_id));
+                    if let Some(job) = job {
+                        let mut coinbase = job.get_coinbase_tx_prefix_without_bip141();
+                        coinbase.extend_from_slice(job.get_extranonce_prefix());
+                        coinbase.extend_from_slice(msg.extranonce.inner_as_ref());
+                        coinbase.extend_from_slice(&job.get_coinbase_tx_suffix_without_bip141());
+                        let path = job
+                            .get_merkle_path()
+                            .inner_as_ref()
+                            .iter()
+                            .filter_map(|n| n.to_vec().as_slice().try_into().ok())
+                            .collect();
+                        np.offer_share((downstream_id, channel_id), msg.job_id, header80, coinbase, path);
+                    }
+                }
 
                 // NODE_POOL: every judged share feeds the miner's sensing loop. Inert unless the
                 // channel was registered by an active node pool stamp.

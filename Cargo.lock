@@ -6340,6 +6340,8 @@ dependencies = [
  "config",
  "ghost-build-info",
  "ghost-common",
+ "ghost-np-relay",
+ "ghost-storage",
  "hex",
  "hotpath",
  "jd_server_sv2",

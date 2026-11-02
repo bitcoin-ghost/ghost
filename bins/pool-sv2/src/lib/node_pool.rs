@@ -162,6 +162,14 @@ pub struct NodePool {
     anchor: Arc<watch::Sender<Option<AnchorUpdate>>>,
     epoch: Instant,
     state: Mutex<State>,
+    relay_sink: Mutex<Option<RelaySink>>,
+}
+
+/// Where accepted shares go when `[node_pool.relay]` runs: the relay's local queue, and the tier
+/// base that decides which hashes could be network shares at all.
+struct RelaySink {
+    tx: tokio::sync::mpsc::Sender<ghost_np_relay::wire::NetShare>,
+    tier_base: ghost_common::node_pool_u256::U256,
 }
 
 impl NodePool {
@@ -178,6 +186,7 @@ impl NodePool {
             anchor: Arc::new(watch::channel(None).0),
             epoch: Instant::now(),
             state: Mutex::new(State::default()),
+            relay_sink: Mutex::new(None),
         }
     }
 
@@ -361,6 +370,51 @@ impl NodePool {
             .iter()
             .find(|(id, _)| *id == job_id)
             .map(|(_, p)| p.clone())
+    }
+
+    /// Send accepted shares to the share-chain relay (`[node_pool.relay]`).
+    pub fn set_relay_sink(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ghost_np_relay::wire::NetShare>,
+        tier_base: ghost_common::node_pool_u256::U256,
+    ) {
+        *self.relay_sink.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(RelaySink { tx, tier_base });
+    }
+
+    /// An accepted share on `job_id`: hand it to the relay if its hash meets the lowest network
+    /// tier. `coinbase` is the full serialized coinbase the miner hashed and `merkle_path` the
+    /// branch to the header's merkle root. Never blocks: a full relay queue drops the share.
+    pub fn offer_share(
+        &self,
+        key: ChannelKey,
+        job_id: u32,
+        header80: &[u8],
+        coinbase: Vec<u8>,
+        merkle_path: Vec<[u8; 32]>,
+    ) {
+        let sink = self.relay_sink.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sink) = sink.as_ref() else {
+            return;
+        };
+        let Some(tag) = self.job_preimage(key, job_id) else {
+            return;
+        };
+        let Ok(share) =
+            ghost_np_relay::wire::NetShare::from_parts(header80, coinbase, merkle_path, tag)
+        else {
+            return;
+        };
+        if !ghost_common::share_commit::hash_meets_tier(
+            &share.id(),
+            sink.tier_base,
+            ghost_common::node_pool_constants::T_NET_FLOOR,
+        ) {
+            return;
+        }
+        if sink.tx.try_send(share).is_err() {
+            warn!("NODE_POOL_RELAY: relay queue full; a network share was dropped");
+        }
     }
 
     /// The class a channel's jobs carry now.
@@ -764,6 +818,66 @@ mod tests {
         assert_eq!(push.len(), 46);
         np.bind_job(key, 7);
         assert_eq!(np.job_preimage(key, 7), Some(want));
+    }
+
+    #[test]
+    fn accepted_shares_reach_the_relay_only_from_a_bound_job_at_the_network_floor() {
+        use ghost_common::node_pool_u256::U256;
+        use stratum_apps::stratum_core::bitcoin::{
+            self as btc, block::Header, consensus::serialize, hashes::Hash,
+        };
+        let np = pool(0, 20);
+        let key = (1, 1);
+        np.stamp(key, ChannelKind::Standard, ADDR, &target());
+        np.bind_job(key, 7);
+        let coinbase = serialize(&btc::Transaction {
+            version: btc::transaction::Version::TWO,
+            lock_time: btc::absolute::LockTime::ZERO,
+            input: vec![btc::TxIn {
+                previous_output: btc::OutPoint::null(),
+                script_sig: btc::ScriptBuf::from_bytes(vec![1, 2]),
+                sequence: btc::Sequence::MAX,
+                witness: btc::Witness::new(),
+            }],
+            output: vec![],
+        });
+        let base = U256::from_be_bytes([0xFF; 32]);
+        let mut h = Header {
+            version: btc::block::Version::from_consensus(0x2000_0000),
+            prev_blockhash: btc::BlockHash::all_zeros(),
+            merkle_root: btc::hash_types::TxMerkleNode::all_zeros(),
+            time: 1,
+            bits: btc::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        let meets = |h: &Header| {
+            ghost_common::share_commit::hash_meets_tier(&h.block_hash().to_byte_array(), base, 10)
+        };
+        while !meets(&h) {
+            h.nonce += 1;
+        }
+        let good = serialize(&h);
+        h.nonce += 1;
+        while meets(&h) {
+            h.nonce += 1;
+        }
+        let weak = serialize(&h);
+
+        // No sink: nothing happens.
+        np.offer_share(key, 7, &good, coinbase.clone(), vec![]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        np.set_relay_sink(tx, base);
+        np.offer_share(key, 7, &weak, coinbase.clone(), vec![]);
+        np.offer_share(key, 99, &good, coinbase.clone(), vec![]);
+        assert!(
+            rx.try_recv().is_err(),
+            "below the floor, or from an unknown job"
+        );
+        np.offer_share(key, 7, &good, coinbase.clone(), vec![[3; 32]]);
+        let s = rx.try_recv().expect("offered");
+        assert_eq!(Some(s.tag), np.job_preimage(key, 7));
+        assert_eq!(s.merkle_branch, vec![[3; 32]]);
+        assert_eq!(serialize(&s.header), good);
     }
 
     #[test]

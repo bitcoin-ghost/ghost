@@ -45,6 +45,7 @@ mod io_task;
 #[cfg(feature = "monitoring")]
 mod monitoring;
 pub mod node_pool;
+pub mod node_pool_relay;
 pub mod share_webhook;
 pub mod template_receiver;
 pub mod tier_binding;
