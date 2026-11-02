@@ -1288,26 +1288,18 @@ fn create_new_template(
         return Err(anyhow::anyhow!("Coinbase1 too short"));
     }
 
-    // BIP34 encodes the block height as a 1-byte push opcode + N little-endian
-    // bytes, where N depends on the height's magnitude. This matches the exact
-    // encoding produced by `TemplateProcessor::encode_height`.
+    // The BIP34 height push, as `TemplateProcessor::encode_height` wrote it: `OP_0` or
+    // `OP_1`..`OP_16` (one byte) at heights 0 to 16, else a minimal script-number push.
     let height = work_state.height;
-    let height_push_len: usize = if height <= 0x7f {
-        2 // OP_PUSH1 + 1 byte
-    } else if height <= 0x7fff {
-        3 // OP_PUSH2 + 2 bytes
-    } else if height <= 0x7fffff {
-        4 // OP_PUSH3 + 3 bytes
-    } else {
-        5 // OP_PUSH4 + 4 bytes
-    };
-
     let scriptsig_full = &work_state.coinbase1[SCRIPTSIG_START..];
-    if scriptsig_full.len() < height_push_len {
-        return Err(anyhow::anyhow!(
-            "Coinbase1 scriptSig shorter than expected BIP34 height push"
-        ));
-    }
+    let height_push_len = match ghost_common::coinbase_tags::bip34_height_from(scriptsig_full) {
+        Some((h, len)) if h == height => len,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Coinbase1 scriptSig does not start with the BIP34 push of height {height}"
+            ))
+        }
+    };
     // Carry the two Ghost tag slots through into the prefix: the `GHPP` slot, which pool_sv2
     // fills per job with `parent_anchor[..16]` (how settlement later finds a block's anchor), and
     // the `GHNT` slot its share tag replaces. SRI appends its pool tag and the extranonce AFTER

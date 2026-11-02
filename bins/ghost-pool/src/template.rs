@@ -1291,30 +1291,10 @@ impl TemplateProcessor {
         Ok(out)
     }
 
-    /// Encode block height for coinbase (BIP34)
+    /// Encode block height for coinbase (BIP34): `OP_0`, `OP_1`..`OP_16`, else a minimal script
+    /// number push, exactly as Bitcoin Core writes and checks it.
     fn encode_height(&self, height: u64) -> Vec<u8> {
-        let mut bytes = Vec::new();
-
-        if height == 0 {
-            bytes.push(0x01);
-            bytes.push(0x00);
-        } else if height <= 0x7f {
-            bytes.push(0x01);
-            bytes.push(height as u8);
-        } else if height <= 0x7fff {
-            bytes.push(0x02);
-            bytes.extend_from_slice(&(height as u16).to_le_bytes());
-        } else if height <= 0x7fffff {
-            bytes.push(0x03);
-            bytes.push((height & 0xff) as u8);
-            bytes.push(((height >> 8) & 0xff) as u8);
-            bytes.push(((height >> 16) & 0xff) as u8);
-        } else {
-            bytes.push(0x04);
-            bytes.extend_from_slice(&(height as u32).to_le_bytes());
-        }
-
-        bytes
+        ghost_common::coinbase_tags::bip34_height_push(height)
     }
 
     /// Convert block hash to Stratum V1 prev_hash format
@@ -2041,9 +2021,13 @@ mod tests {
         );
 
         // Test various heights
-        assert_eq!(processor.encode_height(0), vec![0x01, 0x00]);
-        assert_eq!(processor.encode_height(1), vec![0x01, 0x01]);
+        // Consensus wants OP_0 and OP_1..OP_16 below 17: a one-byte push there is `bad-cb-height`.
+        assert_eq!(processor.encode_height(0), vec![0x00]);
+        assert_eq!(processor.encode_height(1), vec![0x51]);
+        assert_eq!(processor.encode_height(16), vec![0x60]);
+        assert_eq!(processor.encode_height(17), vec![0x01, 0x11]);
         assert_eq!(processor.encode_height(127), vec![0x01, 0x7f]);
+        assert_eq!(processor.encode_height(128), vec![0x02, 0x80, 0x00]);
         assert_eq!(processor.encode_height(256), vec![0x02, 0x00, 0x01]);
     }
 

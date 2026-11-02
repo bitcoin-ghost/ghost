@@ -7,8 +7,8 @@
 //! `NodePool::prepare_template`) and the per-channel stamp put back, byte for byte.
 
 use ghost_common::coinbase_tags::{
-    difficulty_to_tier_log2, tier_target_difficulty, NODE_ID_LEN, NODE_TAG_MAGIC, PAYOUT_ID_LEN,
-    PAYOUT_TAG_MAGIC,
+    bip34_height_from, difficulty_to_tier_log2, tier_target_difficulty, NODE_ID_LEN,
+    NODE_TAG_MAGIC, PAYOUT_ID_LEN, PAYOUT_TAG_MAGIC,
 };
 use stratum_apps::stratum_core::{
     bitcoin::Target, channels_sv2::target::tier_target, template_distribution_sv2::NewTemplate,
@@ -176,19 +176,17 @@ pub fn tier_credit(tier_log2: u32) -> f64 {
 
 /// Parse the BIP34 height push at the head of a coinbase scriptSig prefix.
 ///
-/// ghost-mining builds this with `TemplateProcessor::encode_height`: one push opcode (1..=4 here;
-/// 8 allowed for robustness) followed by that many little-endian bytes.
+/// ghost-mining builds it with `TemplateProcessor::encode_height`, which writes what Bitcoin Core
+/// writes ([`ghost_common::coinbase_tags::bip34_height_push`]): `OP_0`, `OP_1`..`OP_16` at heights
+/// 0 to 16, else a minimal script-number push. Any other encoding is refused, since Bitcoin would
+/// refuse a block carrying it.
 pub fn bip34_height(coinbase_prefix: &[u8]) -> Option<u64> {
-    let len = *coinbase_prefix.first()? as usize;
-    if len == 0 || len > 8 {
-        return None;
-    }
-    let bytes = coinbase_prefix.get(1..1 + len)?;
-    let mut height = 0u64;
-    for (i, b) in bytes.iter().enumerate() {
-        height |= (*b as u64) << (8 * i);
-    }
-    Some(height)
+    bip34_height_from(coinbase_prefix).map(|(h, _)| h)
+}
+
+/// Bytes the BIP34 height push at the head of `prefix` takes.
+pub(crate) fn bip34_push_len(prefix: &[u8]) -> Option<usize> {
+    bip34_height_from(prefix).map(|(_, len)| len)
 }
 
 /// One Ghost coinbase tag is one push: `[len][magic][payload]`. Present or absent, never partial.
@@ -218,12 +216,9 @@ pub(crate) fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> u
 pub fn strip_plain_node_tag(template: &NewTemplate<'static>) -> NewTemplate<'static> {
     let prefix = template.coinbase_prefix.inner_as_ref();
 
-    let Some(height_len) = prefix.first().map(|l| 1 + *l as usize) else {
+    let Some(height_len) = bip34_push_len(prefix) else {
         return template.clone();
     };
-    if prefix.len() < height_len {
-        return template.clone();
-    }
     let payout_len = tag_len_at(&prefix[height_len..], PAYOUT_TAG_MAGIC, PAYOUT_ID_LEN);
     let node_at = height_len + payout_len;
     let node_len = tag_len_at(&prefix[node_at..], NODE_TAG_MAGIC, NODE_ID_LEN);
@@ -298,6 +293,11 @@ mod tests {
     fn bip34_height_round_trips_ghost_pools_encodings() {
         // The widths `TemplateProcessor::encode_height` produces.
         assert_eq!(bip34_height(&[0x01, 0x7f]), Some(0x7f));
+        // OP_0 and OP_1..OP_16 below 17, as consensus requires; a one-byte push there is refused.
+        assert_eq!(bip34_height(&[0x00]), Some(0));
+        assert_eq!(bip34_height(&[0x51, 0x05]), Some(1));
+        assert_eq!(bip34_height(&[0x60]), Some(16));
+        assert_eq!(bip34_height(&[0x01, 0x05]), None);
         assert_eq!(bip34_height(&[0x02, 0x39, 0x30]), Some(0x3039));
         assert_eq!(bip34_height(&[0x03, 0x00, 0xa6, 0x0e]), Some(960_000));
         assert_eq!(

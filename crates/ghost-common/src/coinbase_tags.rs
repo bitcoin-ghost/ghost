@@ -69,6 +69,64 @@ pub fn encode_node_tag(node_commitment: &[u8; NODE_ID_LEN]) -> Vec<u8> {
     encode_tag(NODE_TAG_MAGIC, node_commitment)
 }
 
+/// The BIP34 height push that starts a coinbase scriptSig: exactly what Bitcoin Core writes,
+/// `CScript() << nHeight`, and what its consensus check compares against.
+///
+/// Height 0 is `OP_0`, heights 1 to 16 are `OP_1`..`OP_16` (one byte each, no data), and every
+/// other height is a minimal data push of its script number: little-endian, no trailing zero
+/// byte unless the top bit of the last byte is set (a script number's sign bit), so 128 is
+/// `02 80 00` and 32,768 is `03 00 80 00`. A one-byte data push for heights 1 to 16 is not
+/// minimal, and Core refuses the block (`bad-cb-height`).
+pub fn bip34_height_push(height: u64) -> Vec<u8> {
+    match height {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + height as u8],
+        _ => {
+            let mut num = Vec::with_capacity(9);
+            let mut h = height;
+            while h > 0 {
+                num.push((h & 0xff) as u8);
+                h >>= 8;
+            }
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                num.push(0x00);
+            }
+            let mut out = Vec::with_capacity(1 + num.len());
+            out.push(num.len() as u8);
+            out.extend_from_slice(&num);
+            out
+        }
+    }
+}
+
+/// Read the BIP34 height push at the start of a coinbase scriptSig (or a template's
+/// `coinbase_prefix`): `(height, bytes the push takes)`. Only the encoding
+/// [`bip34_height_push`](crate::coinbase_tags::bip34_height_push) writes is accepted, so a
+/// non-minimal or negative push, or one that runs past the end, reads as `None` rather than a
+/// height Bitcoin would not agree with.
+pub fn bip34_height_from(script_sig: &[u8]) -> Option<(u64, usize)> {
+    let first = *script_sig.first()?;
+    let height = match first {
+        0x00 => 0,
+        0x51..=0x60 => u64::from(first - 0x50),
+        1..=8 => {
+            let num = script_sig.get(1..1 + first as usize)?;
+            let mut h = 0u64;
+            for (i, b) in num.iter().enumerate() {
+                h |= u64::from(*b) << (8 * i);
+            }
+            // A negative script number is not a height (the sign bit of the last byte).
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                return None;
+            }
+            h
+        }
+        _ => return None,
+    };
+    let push = bip34_height_push(height);
+    (script_sig.get(..push.len()) == Some(&push[..])).then_some((height, push.len()))
+}
+
 /// Walk a scriptsig as a sequence of data pushes.
 ///
 /// Only the small-push encodings are handled (opcodes 1..=75, plus `OP_PUSHDATA1`), which is all a
@@ -80,6 +138,12 @@ fn pushes(scriptsig: &[u8]) -> Vec<&[u8]> {
     while i < scriptsig.len() {
         let opcode = scriptsig[i];
         let (len, header) = match opcode {
+            // OP_0 and OP_1..OP_16: a number with no data bytes, as the BIP34 height is at
+            // heights 0 to 16. Stepped over, never a tag.
+            0x00 | 0x51..=0x60 => {
+                i += 1;
+                continue;
+            }
             0x01..=0x4b => (opcode as usize, 1usize),
             0x4c => {
                 // OP_PUSHDATA1: next byte is the length.
@@ -427,5 +491,65 @@ mod tests {
             "less margin than the documented ~9 bytes: {} used",
             s.len()
         );
+    }
+
+    /// BIP34 heights 0 to 20 and some large ones, against Bitcoin's own encoding: the `bitcoin`
+    /// crate's `push_int` (Core's `CScript() << n`), and hand-written bytes for the cases Core's
+    /// consensus check is strict about (`OP_1`..`OP_16`, the sign byte at 128 and 32,768).
+    #[test]
+    fn bip34_heights_are_written_and_read_as_bitcoin_does() {
+        for h in (0..=20u64).chain([
+            127,
+            128,
+            255,
+            256,
+            32_767,
+            32_768,
+            65_535,
+            8_388_607,
+            8_388_608,
+            974_500,
+            16_777_215,
+            16_777_216,
+            2_147_483_647,
+            4_294_967_295,
+        ]) {
+            let core = bitcoin::script::Builder::new()
+                .push_int(h as i64)
+                .into_bytes();
+            let ours = bip34_height_push(h);
+            assert_eq!(ours, core, "height {h}");
+            let mut sig = ours.clone();
+            sig.extend_from_slice(&encode_payout_tag(&[7; PAYOUT_ID_LEN]));
+            assert_eq!(bip34_height_from(&sig), Some((h, ours.len())), "height {h}");
+            assert_eq!(
+                extract_payout_tag(&sig),
+                Some([7; PAYOUT_ID_LEN]),
+                "height {h}"
+            );
+        }
+        assert_eq!(bip34_height_push(0), vec![0x00]);
+        assert_eq!(bip34_height_push(1), vec![0x51]);
+        assert_eq!(bip34_height_push(16), vec![0x60]);
+        assert_eq!(bip34_height_push(17), vec![0x01, 0x11]);
+        assert_eq!(bip34_height_push(127), vec![0x01, 0x7f]);
+        assert_eq!(bip34_height_push(128), vec![0x02, 0x80, 0x00]);
+        assert_eq!(bip34_height_push(32_768), vec![0x03, 0x00, 0x80, 0x00]);
+        assert_eq!(bip34_height_push(974_500), vec![0x03, 0xa4, 0xde, 0x0e]);
+        // What ghost-mining used to write at 1..=16, and other encodings Core refuses.
+        assert_eq!(bip34_height_from(&[0x01, 0x05]), None, "non-minimal 5");
+        assert_eq!(bip34_height_from(&[0x01, 0x80]), None, "negative");
+        assert_eq!(
+            bip34_height_from(&[0x02, 0x7f, 0x00]),
+            None,
+            "non-minimal 127"
+        );
+        assert_eq!(
+            bip34_height_from(&[0x03, 0x00, 0x80]),
+            None,
+            "runs past the end"
+        );
+        assert_eq!(bip34_height_from(&[]), None);
+        assert_eq!(bip34_height_from(&[0x4f]), None, "OP_1NEGATE");
     }
 }

@@ -604,7 +604,7 @@ impl NodePool {
     pub fn prepare_template(&self, template: &NewTemplate<'static>) -> NewTemplate<'static> {
         let out = strip_plain_node_tag(template);
         let prefix = out.coinbase_prefix.inner_as_ref();
-        let Some(height_len) = prefix.first().map(|l| 1 + *l as usize) else {
+        let Some(height_len) = crate::tier_binding::bip34_push_len(prefix) else {
             return out;
         };
         let tag = prefix
@@ -1093,6 +1093,26 @@ mod tests {
             NodePool::template_height(&template(1, true, vec![0x09])),
             None
         );
+    }
+
+    /// Heights 1 to 16 are `OP_1`..`OP_16`, one byte: the height reads, and both Ghost tags come
+    /// out of the prefix behind it, leaving the opcode alone.
+    #[test]
+    fn a_small_height_template_reads_and_strips_behind_its_op_n() {
+        for h in 0u8..=16 {
+            let push = ghost_common::coinbase_tags::bip34_height_push(h as u64);
+            let mut p = push.clone();
+            p.extend_from_slice(&encode_payout_tag(&[0xC3; 16]));
+            p.extend_from_slice(&encode_node_tag(&node_commitment_plain(&NODE)));
+            let t = template(1, true, p);
+            assert_eq!(NodePool::template_height(&t), Some(h as u32), "height {h}");
+            let stripped = pool(2).prepare_template(&t);
+            assert_eq!(
+                stripped.coinbase_prefix.inner_as_ref(),
+                &push[..],
+                "height {h}"
+            );
+        }
     }
 
     /// A template as the node pool's template provider sends it: the whole value, the witness
