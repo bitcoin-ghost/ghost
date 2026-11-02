@@ -246,6 +246,8 @@ enum KeyCommands {
 
 #[derive(Subcommand)]
 enum NodeCommands {
+    /// Node pool health: relay tip, peers, settlement, fee address, connected miners' slot classes
+    Status,
     /// Show node info
     Info,
     /// Check health
@@ -765,6 +767,90 @@ async fn cmd_key_verify(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// `node status`: the node pool's health, from `GET /api/v1/node-pool/status` (served by pool_sv2,
+/// forwarded by ghost-mining).
+async fn cmd_node_pool_status(client: &ApiClient, format: OutputFormat) -> Result<()> {
+    let status: serde_json::Value = client.get("/node-pool/status").await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
+        OutputFormat::Text => print!("{}", render_node_pool_status(&status)),
+    }
+    Ok(())
+}
+
+/// The node pool status as plain lines. Missing fields print as `?`, never as a healthy default.
+fn render_node_pool_status(v: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    fn f(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::Null => "?".to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+    let short = |v: &serde_json::Value| {
+        let s = f(v);
+        if s.len() > 16 {
+            format!("{}…", &s[..16])
+        } else {
+            s
+        }
+    };
+    let mut o = String::new();
+    let chain = &v["share_chain"];
+    let st = &v["settlement"];
+    let _ = writeln!(o, "=== Node pool ({}) ===", f(&v["network"]));
+    let _ = writeln!(
+        o,
+        "  relay tip:     {} (anchor height {}, Bitcoin height {}, T_net {})",
+        short(&chain["tip"]),
+        f(&chain["anchor_height"]),
+        f(&chain["btc_height"]),
+        f(&chain["t_net"])
+    );
+    let _ = writeln!(
+        o,
+        "  genesis:       {} at height {} ({})",
+        short(&v["start"]["genesis_anchor"]),
+        f(&v["start"]["genesis_btc_height"]),
+        f(&v["start"]["source"])
+    );
+    let _ = writeln!(o, "  peers:         {}", f(&v["peers"]));
+    let caught_up = match st["caught_up"].as_bool() {
+        Some(true) => "yes".to_string(),
+        Some(false) => "NO".to_string(),
+        None => "?".to_string(),
+    };
+    let provisional = st["provisional"].as_array().map_or(0, Vec::len);
+    let _ = writeln!(
+        o,
+        "  settlement:    caught up {caught_up} (synced {} of Bitcoin tip {}), {provisional} provisional",
+        f(&st["synced_height"]),
+        f(&st["bitcoin_tip"])
+    );
+    let _ = writeln!(o, "  fee address:   {}", f(&v["fee_address"]));
+    let _ = writeln!(o, "  ledger rows:   {}", f(&v["ledger_rows"]));
+    let miners = v["miners"].as_array().cloned().unwrap_or_default();
+    let _ = writeln!(o, "  miners:        {}", miners.len());
+    for m in &miners {
+        let _ = writeln!(
+            o,
+            "    {} {} class {}{}",
+            f(&m["address"]),
+            f(&m["kind"]),
+            f(&m["slot_class"]),
+            m["sensing"]["model"]
+                .as_str()
+                .map(|x| format!(" ({x})"))
+                .unwrap_or_default()
+        );
+        if let Some(w) = m["firmware_warning"].as_str() {
+            let _ = writeln!(o, "      warning: {w}");
+        }
+    }
+    o
+}
+
 async fn cmd_node_health(client: &ApiClient, format: OutputFormat) -> Result<()> {
     #[derive(Debug, Serialize, Deserialize)]
     struct HealthResponse {
@@ -1034,6 +1120,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Node(cmd) => match cmd {
+            NodeCommands::Status => cmd_node_pool_status(&client, cli.format).await?,
             NodeCommands::Info => {
                 let info: serde_json::Value = client.get("/node/info").await?;
                 println!("{}", serde_json::to_string_pretty(&info)?);
@@ -1063,4 +1150,45 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_pool_status_renders_every_health_line() {
+        let v = serde_json::json!({
+            "network": "regtest",
+            "start": {"genesis_anchor": "8d8cd561340ff83e99410e115619d64a", "genesis_btc_height": 0,
+                      "source": "default"},
+            "share_chain": {"tip": "abababababababababab", "anchor_height": 7, "btc_height": 998,
+                            "t_net": 10},
+            "peers": 2,
+            "settlement": {"caught_up": false, "synced_height": 990, "bitcoin_tip": 999,
+                           "provisional": [{"height": 960, "block_hash": "00"}]},
+            "fee_address": "bcrt1qfee",
+            "ledger_rows": 3,
+            "miners": [{"address": "bcrt1qminer", "kind": "extended", "slot_class": 9,
+                        "sensing": {"model": "Stock Antminer"},
+                        "firmware_warning": "Stock Antminer firmware is limited to slot class 9"}]
+        });
+        let out = render_node_pool_status(&v);
+        for want in [
+            "Node pool (regtest)",
+            "relay tip:     abababababababab… (anchor height 7, Bitcoin height 998, T_net 10)",
+            "peers:         2",
+            "caught up NO (synced 990 of Bitcoin tip 999), 1 provisional",
+            "fee address:   bcrt1qfee",
+            "bcrt1qminer extended class 9 (Stock Antminer)",
+            "warning: Stock Antminer firmware is limited to slot class 9",
+        ] {
+            assert!(out.contains(want), "{want:?} missing from:\n{out}");
+        }
+        let empty = render_node_pool_status(&serde_json::json!({}));
+        assert!(
+            empty.contains("caught up ?"),
+            "unknown is not healthy: {empty}"
+        );
+    }
 }
