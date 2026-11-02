@@ -16,7 +16,6 @@ export interface NodeInfo {
   peer_count?: number;
   miner_count?: number;
   archive_mode?: boolean;
-  public_mining?: boolean;
   reaper?: boolean;
   mempool_profile?: string;
   template_profile?: string;
@@ -39,7 +38,6 @@ export interface NodeStatus {
   tor_mode?: boolean;
   onion_address?: string;
   archive_mode?: boolean;
-  public_mining?: boolean;
   reaper?: boolean;
 }
 
@@ -70,7 +68,6 @@ export interface NodeConfig {
   ghost_mode_local_egress?: boolean;
   archive_mode?: boolean;
   reaper?: boolean;
-  public_mining?: boolean;
 }
 
 // Pruning configuration — the VW/OW/AW three-window model. Pruning is
@@ -185,7 +182,6 @@ export interface MiningStatus {
   best_hash?: string | null;
   // Dashboard-compatible aliases (added to backend)
   enabled?: boolean;
-  public_mining?: boolean;
   hashrate_th?: number;
   local_hashrate_th?: number;
   local_connected_miners?: number;
