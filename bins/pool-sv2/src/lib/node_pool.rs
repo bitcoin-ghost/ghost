@@ -19,8 +19,9 @@
 //! in through the factory's budget-guarded extra push, so the scriptSig length does not move.
 //!
 //! - **Anchors.** `parent_anchor` and `batch_root` come from an [`AnchorDriver`], a watch
-//!   channel the relay layer (W2.5) will publish to. Every publish re-stamps every channel and
-//!   pushes a fresh job against the active template. Until the first publish both are zero.
+//!   channel the relay (W2.5, `node_pool_relay.rs`) publishes to. Every publish re-stamps every
+//!   channel and pushes a fresh job against the active template. Until the first publish both are
+//!   zero.
 //! - **Standard channels** always carry the full class (500 outputs): the miner receives only a
 //!   header, so the coinbase size never reaches its firmware (spec 2.1).
 //! - **Extended channels** carry the class their miner's [`ClassSensor`] serves.
@@ -48,7 +49,8 @@
 //! - The zero-value 31-byte output added to each channel's FIRST job on the open paths
 //!   (`payout_mode.coinbase_outputs` with `coinbase_tx_value_remaining == 0`,
 //!   `mining_message_handler.rs` standard and extended open) is left alone; W2.6 removes it.
-//! - Relaying shares and anchors is W2.5; [`NodePool::job_preimage`] is its lookup.
+//! - Relaying shares and anchors is `ghost-np-relay`, started by `[node_pool.relay]`
+//!   (`node_pool_relay.rs`); accepted shares reach it through [`NodePool::offer_share`].
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
