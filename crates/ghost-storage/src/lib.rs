@@ -42,6 +42,7 @@ pub mod encryption;
 pub mod migrations;
 pub mod models;
 pub mod node_pool_store;
+pub mod node_pool_views;
 pub mod queries;
 pub mod snapshot;
 
