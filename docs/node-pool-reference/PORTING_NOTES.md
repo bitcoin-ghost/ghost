@@ -212,6 +212,16 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   queue_position`, which shares `select`'s orderings; what each slot class would pay is
   `paid_to`, i.e. `build_outputs`. The balance shown is the materialised ledger (credits to the
   tip), which is ahead of that table by up to 20 blocks of credits.
+- **Genesis balances.** `np_ledger` holds only what the share chain changed and starts empty;
+  settlement folds it onto the imported genesis table. So every balance the API shows (ledger,
+  miner page, wait estimate, balance history) is the payee's `np_genesis` row with its applied
+  credits and retirements folded on in applied order by `apply_credits`/`apply_block`
+  (`Database::np_payee_balance`); `queue_since` needs that fold, since a carried-over balance
+  can cross the floor with a credit the share chain's own row never would. Journalled
+  `prior_owed` values get the genesis amount added (owed is additive). The ledger answer carries
+  the carried-over row as `genesis`, the history opens with it at the export height
+  (`carried_over`, not a credit) when the window reaches back to it, and `ledger_rows` counts
+  payees in either table once.
 - **Credited shares** are batch memberships whose credit event `(anchor, job height)` is applied,
   so a share in a losing anchor's batch is not listed.
 - **Settled or provisional** is settlement's in-memory pending set; a restart re-derives it.
