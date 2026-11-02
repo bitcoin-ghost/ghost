@@ -10,7 +10,7 @@
 use ghost_common::{
     coinbase_tags::{encode_node_tag, encode_payout_tag, extract_node_tag, extract_payout_tag},
     share_commit::ShareTagPreimage,
-    slot_class_sensing::ShareVerdict,
+    slot_class_sensing::{MinerIdentity, ShareVerdict},
 };
 use pool_sv2::node_pool::{AnchorUpdate, ChannelKey, ChannelKind, NodePool};
 use stratum_apps::stratum_core::{
@@ -140,7 +140,7 @@ fn the_miner_is_handed_the_tag_of_its_jobs_preimage() {
 
     // Open: the translator's agent arrives, the channel is stamped and its future job built.
     let mut channel = extended();
-    np.note_agent(KEY, Some("Avalon Nano 3s".into()));
+    np.note_identity(KEY, Some(MinerIdentity::Agent("Avalon Nano 3s".into())));
     let stamp = np.stamp(
         KEY,
         ChannelKind::Extended,

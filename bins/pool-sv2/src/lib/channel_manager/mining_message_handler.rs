@@ -654,13 +654,18 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         // SHARE_TIER_BIND: as for standard channels — quantise the target to
                         // its tier and arm the commitment BEFORE the success message, so the
                         // target the client is told is the tier target it will be credited at.
-                        // NODE_POOL: the translator's agent TLV seeds the sensing loop; the
-                        // stamp registers the channel at the smallest class its model allows.
+                        // NODE_POOL: the translator's agent TLV, else a native SV2 miner's
+                        // SetupConnection fields, seed the sensing loop; the stamp registers the
+                        // channel at the smallest class its model allows.
                         if let Some(ref tb) = tiering {
-                            if let (crate::node_pool::PerChannelMode::NodePool(np), Some(agent)) =
-                                (tb, crate::node_pool::agent_from_tlvs(tlv_fields))
-                            {
-                                np.note_agent((downstream_id, channel_id), Some(agent));
+                            if let crate::node_pool::PerChannelMode::NodePool(np) = tb {
+                                np.note_identity(
+                                    (downstream_id, channel_id),
+                                    crate::node_pool::NodePool::identity_for_open(
+                                        tlv_fields,
+                                        downstream_data.setup_device.as_ref(),
+                                    ),
+                                );
                             }
                             let q = tb.quantise_target(
                                 extended_channel.get_target(),

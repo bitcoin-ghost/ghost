@@ -69,6 +69,9 @@ pub struct DownstreamData {
     pub negotiated_extensions: Vec<u16>,
     /// Payout mode derived from user_identity (None until channel is opened)
     pub payout_mode: Option<PayoutMode>,
+    /// The client's `SetupConnection` vendor, hardware_version and firmware, when any is set.
+    /// Read only by the node pool layer, to look a native SV2 miner up in its firmware table.
+    pub setup_device: Option<ghost_common::slot_class_sensing::Sv2Device>,
 }
 
 /// Communication layer for a downstream connection.
@@ -161,6 +164,7 @@ impl Downstream {
             tiered_template_ids: std::collections::HashSet::new(),
             negotiated_extensions: vec![],
             payout_mode: None,
+            setup_device: None,
         }));
 
         Downstream {

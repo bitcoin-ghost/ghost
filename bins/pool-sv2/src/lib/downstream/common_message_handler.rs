@@ -68,6 +68,15 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
             ));
         }
 
+        // Kept for the node pool's sensing loop (native SV2 miners have no SV1 agent).
+        let setup_device = ghost_common::slot_class_sensing::Sv2Device::new(
+            &msg.vendor.as_utf8_or_hex(),
+            &msg.hardware_version.as_utf8_or_hex(),
+            &msg.firmware.as_utf8_or_hex(),
+        );
+        self.downstream_data
+            .super_safe_lock(|data| data.setup_device = setup_device);
+
         self.requires_custom_work
             .store(has_work_selection(msg.flags), Ordering::SeqCst);
         self.requires_standard_jobs

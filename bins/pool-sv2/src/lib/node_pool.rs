@@ -36,7 +36,9 @@
 //! sends it once, at channel open, in a Ghost TLV (`AGENT_TLV_EXTENSION_TYPE`).
 //!
 //! Sessions are keyed by the channel's user identity and live in memory for the process
-//! lifetime: a reconnecting miner keeps its failed classes. Nothing persists; W2.4 owns storage
+//! lifetime: a reconnecting miner keeps its failed classes, and a settled miner its class; a
+//! drop fails a class only while it is being tested. A native SV2 miner with no agent TLV is
+//! looked up by its `SetupConnection` vendor, hardware_version and firmware. Nothing persists; W2.4 owns storage
 //! through `ghost_common::slot_class_sensing::SensingStore`.
 //!
 //! ## Not here yet
@@ -60,8 +62,8 @@ use ghost_common::{
     sanitize_for_log,
     share_commit::{payee_script_class, ShareTagPreimage},
     slot_class_sensing::{
-        clamp_agent, ClassChange, ClassSensor, SensingParams, SensingStatus, ShareVerdict,
-        AGENT_TLV_EXTENSION_TYPE, AGENT_TLV_FIELD_TYPE, FULL_CLASS_INDEX,
+        clamp_agent, ClassChange, ClassSensor, MinerIdentity, SensingParams, SensingStatus,
+        ShareVerdict, Sv2Device, AGENT_TLV_EXTENSION_TYPE, AGENT_TLV_FIELD_TYPE, FULL_CLASS_INDEX,
     },
 };
 use stratum_apps::{
@@ -147,7 +149,7 @@ struct ChannelSlot {
 #[derive(Default)]
 struct State {
     channels: HashMap<ChannelKey, ChannelSlot>,
-    agents: HashMap<ChannelKey, String>,
+    agents: HashMap<ChannelKey, MinerIdentity>,
     sessions: HashMap<String, ClassSensor>,
     future_templates: VecDeque<NewTemplate<'static>>,
     active_template: Option<NewTemplate<'static>>,
@@ -281,11 +283,23 @@ impl NodePool {
         Ok(script)
     }
 
-    /// Remember the user agent a channel opened with, until the channel is first stamped.
-    pub fn note_agent(&self, key: ChannelKey, agent: Option<String>) {
-        if let Some(agent) = agent {
-            self.lock().agents.insert(key, agent);
+    /// Remember who a channel's miner says it is (the SV1 agent from the translator, else a
+    /// native SV2 miner's `SetupConnection`), until the channel is first stamped.
+    pub fn note_identity(&self, key: ChannelKey, identity: Option<MinerIdentity>) {
+        if let Some(identity) = identity {
+            self.lock().agents.insert(key, identity);
         }
+    }
+
+    /// The identity a channel open carries: the agent TLV when present, else the connection's
+    /// SV2 `SetupConnection` fields.
+    pub fn identity_for_open(
+        tlvs: Option<&[Tlv]>,
+        setup: Option<&Sv2Device>,
+    ) -> Option<MinerIdentity> {
+        agent_from_tlvs(tlvs)
+            .map(MinerIdentity::Agent)
+            .or_else(|| setup.cloned().map(MinerIdentity::Sv2))
     }
 
     /// The stamp for a channel's next job: `(tier, GHPP push || GHNT push)`. Registers the
@@ -523,7 +537,7 @@ fn register(
         match st.sessions.get_mut(&name) {
             Some(sensor) if !sensor.is_connected() => sensor.on_reconnect(now),
             _ => {
-                let sensor = ClassSensor::new(agent.as_deref(), params, now);
+                let sensor = ClassSensor::for_identity(agent.as_ref(), params, now);
                 let status = sensor.status();
                 match &status.warning {
                     Some(w) => warn!(
@@ -538,7 +552,10 @@ fn register(
                         channel_id = key.1,
                         model = status.model,
                         ceiling_class = status.ceiling_class,
-                        agent = agent.as_deref().map(sanitize_for_log).unwrap_or_default(),
+                        agent = agent
+                            .as_ref()
+                            .map(|a| sanitize_for_log(a.display()))
+                            .unwrap_or_default(),
                         "NODE_POOL: sensing slot class"
                     ),
                 }
@@ -569,8 +586,9 @@ fn close(st: &mut State, key: ChannelKey, now: u64) {
     };
     if let Some(session) = slot.session {
         if let Some(sensor) = st.sessions.get_mut(&session) {
+            // Fails the class only if it was still being tested; a settled miner keeps it.
             let change = sensor.on_disconnect(now);
-            log_change(key, &session, Some(change));
+            log_change(key, &session, change);
         }
     }
 }
@@ -660,7 +678,7 @@ mod tests {
     use super::*;
     use ghost_common::{
         coinbase_tags::{extract_node_tag, extract_payout_tag, node_commitment_plain},
-        slot_class_sensing::ChangeCause,
+        slot_class_sensing::{ChangeCause, FailureKind},
     };
     use stratum_apps::stratum_core::channels_sv2::target::hash_rate_to_target;
 
@@ -808,13 +826,16 @@ mod tests {
     fn extended_channels_are_sensed_from_their_agent() {
         let np = pool(0, 2);
         let key = (3, 1);
-        np.note_agent(
+        np.note_identity(
             key,
-            agent_from_tlvs(Some(&[Tlv::new(
-                AGENT_TLV_EXTENSION_TYPE,
-                AGENT_TLV_FIELD_TYPE,
-                b"Avalon Nano 3s".to_vec(),
-            )])),
+            NodePool::identity_for_open(
+                Some(&[Tlv::new(
+                    AGENT_TLV_EXTENSION_TYPE,
+                    AGENT_TLV_FIELD_TYPE,
+                    b"Avalon Nano 3s".to_vec(),
+                )]),
+                None,
+            ),
         );
         np.stamp(key, ChannelKind::Extended, ADDR, &target());
         np.bind_job(key, 1);
@@ -849,7 +870,9 @@ mod tests {
         assert_eq!(np.slot_class((1, 1)), None);
         np.stamp((2, 1), ChannelKind::Extended, ADDR, &target());
         let st = np.channel_status().remove(0).sensing.unwrap();
-        assert_eq!(st.failed.len(), 1, "the disconnect failure carries over");
+        assert_eq!(st.failed, vec![], "a settled class survives the drop");
+        assert_eq!(st.serving_class, 3);
+        assert!(st.settled);
         assert_eq!(st.valid_shares, 1);
         // A second live channel under the same identity senses on its own.
         np.stamp((2, 2), ChannelKind::Extended, ADDR, &target());
@@ -861,6 +884,74 @@ mod tests {
                 .valid_shares,
             0
         );
+    }
+
+    #[test]
+    fn a_native_sv2_miner_is_sensed_from_its_setup_connection() {
+        let np = pool(0, 2);
+        let device = Sv2Device::new("Bitmain", "S21", "1.0");
+        // No agent TLV: the SetupConnection fields decide.
+        np.note_identity((4, 1), NodePool::identity_for_open(None, device.as_ref()));
+        np.stamp((4, 1), ChannelKind::Extended, ADDR, &target());
+        let st = np.channel_status().remove(0).sensing.unwrap();
+        assert_eq!(st.model, "Antminer S21");
+        assert_eq!(st.warning.unwrap().limited_to_class, 44);
+        // An agent TLV, when present, wins over the connection's fields.
+        let tlv = [Tlv::new(
+            AGENT_TLV_EXTENSION_TYPE,
+            AGENT_TLV_FIELD_TYPE,
+            b"Avalon".to_vec(),
+        )];
+        assert_eq!(
+            NodePool::identity_for_open(Some(&tlv), device.as_ref()),
+            Some(MinerIdentity::Agent("Avalon".into()))
+        );
+        assert_eq!(NodePool::identity_for_open(None, None), None);
+    }
+
+    #[test]
+    fn a_settled_miner_keeps_its_class_across_reconnects_but_a_probe_fails() {
+        let np = pool(0, 1);
+        // Avalon: ceiling 44. One valid share passes a class at min_shares 1.
+        let agent = || Some(MinerIdentity::Agent("Avalon".into()));
+        let mut job = 0;
+        let mut open = |ds: usize, np: &NodePool| {
+            np.note_identity((ds, 1), agent());
+            np.stamp((ds, 1), ChannelKind::Extended, ADDR, &target());
+            job += 1;
+            np.bind_job((ds, 1), job);
+            job
+        };
+        let j = open(1, &np);
+        np.on_share((1, 1), j, ShareVerdict::Valid); // 3 -> 9
+        let j = open(1, &np);
+        np.on_share((1, 1), j, ShareVerdict::Valid); // 9 -> 44
+        let j = open(1, &np);
+        np.on_share((1, 1), j, ShareVerdict::Valid); // 44 passes: settled at the ceiling
+        assert_eq!(np.slot_class((1, 1)), Some(44));
+        for ds in 2..6 {
+            np.on_downstream_removed(ds - 1);
+            open(ds, &np);
+            assert_eq!(np.slot_class((ds, 1)), Some(44), "settled class resumes");
+        }
+        // A fresh miner mid-probe at 9 loses 9 on a drop.
+        let other = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        np.note_identity((9, 1), agent());
+        np.stamp((9, 1), ChannelKind::Extended, other, &target());
+        np.bind_job((9, 1), 100);
+        np.on_share((9, 1), 100, ShareVerdict::Valid); // probing 9
+        assert_eq!(np.slot_class((9, 1)), Some(9));
+        np.on_downstream_removed(9);
+        np.stamp((10, 1), ChannelKind::Extended, other, &target());
+        let st = np
+            .channel_status()
+            .into_iter()
+            .find(|s| s.key == (10, 1))
+            .unwrap()
+            .sensing
+            .unwrap();
+        assert_eq!(st.serving_class, 3);
+        assert_eq!(st.failed, vec![(9, FailureKind::Disconnect)]);
     }
 
     #[test]
