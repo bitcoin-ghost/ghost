@@ -310,6 +310,15 @@ is "the installer never tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*r
 is "the channel marker is written before the updater can be enabled" yes \
    "$(awk '/^cat > \/etc\/ghost\/release-channel /{m=NR} /systemctl enable --now ghost-auto-update.timer/{if(!t)t=NR} END{print (m && t && m<t)?"yes":"no"}' "$INSTALLER")"
 
+echo "7b. slot-class sensing reaches pool_sv2"
+# The translator must negotiate the Ghost agent extension, or pool_sv2 never sees an SV1 miner's
+# user agent and serves every one the smallest class (Phase 3 harness finding D).
+tr_ext="$(awk '/^cat > .*translator.*toml/{t=1} t && /^required_extensions = /{print; exit}' "$INSTALLER")"
+has "the translator requires the agent extension 0x4748" "0x4748" "$tr_ext"
+has "and still the per-miner TLV 0x0002" "0x0002" "$tr_ext"
+pool_ext="$($G -m1 -E '^supported_extensions = \[0x0002' "$INSTALLER" || true)"
+has "pool_sv2's config supports 0x4748" "0x4748" "$pool_ext"
+
 echo "8. isolation from the old network"
 for ip in 83.136.251.162 85.9.198.212 213.163.207.46 95.111.221.169; do
     is "no old fleet address $ip" 0 "$($G -cF "$ip" "$INSTALLER" || true)"

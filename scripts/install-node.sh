@@ -400,9 +400,10 @@ pool_signature = "- G H O S T -"
 shares_per_minute = 6.0
 share_batch_size = 1
 
-# Protocol extensions — support the Ghost per-miner TLV extension (0x0002). pool_sv2 adds the
-# agent extension (0x4748) the slot-class sensing loop reads by itself.
-supported_extensions = [0x0002]
+# Protocol extensions — support the Ghost per-miner TLV extension (0x0002) and the Ghost agent
+# extension (0x4748) the translator requires for slot-class sensing. (pool_sv2 also adds 0x4748
+# by itself; it is listed so the pairing is visible and checked.)
+supported_extensions = [0x0002, 0x4748]
 required_extensions = []
 
 # Monitoring endpoint (localhost; the translator readiness gate polls it).
@@ -1475,9 +1476,11 @@ aggregate_channels = false
 # extension those clients never negotiate.
 open_channel_on_subscribe = true
 
-# Protocol extensions — negotiate the Ghost per-miner TLV extension (0x0002).
+# Protocol extensions — the Ghost per-miner TLV extension (0x0002), and the Ghost agent extension
+# (0x4748), which carries each SV1 miner's user agent to pool_sv2's slot-class sensing loop.
+# Without 0x4748 every SV1 miner is sensed as an unknown agent and served the smallest class.
 supported_extensions = []
-required_extensions = [0x0002]
+required_extensions = [0x0002, 0x4748]
 
 # Monitoring endpoint
 monitoring_address = "0.0.0.0:9092"

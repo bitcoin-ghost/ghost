@@ -60,8 +60,10 @@ open_channel_on_subscribe = true
 # must list it under `supported_extensions` — check-stratum-config-agreement.sh enforces that
 # pairing, because a translator requiring an extension the pool does not support fails the
 # handshake, and the reverse silently drops attribution.
+# The Ghost agent extension (0x4748) carries each SV1 miner's user agent to pool_sv2's slot-class
+# sensing loop; without it every SV1 miner is sensed as an unknown agent (smallest class).
 supported_extensions = []
-required_extensions = [0x0002]
+required_extensions = [0x0002, 0x4748]
 
 # Monitoring endpoint
 monitoring_address = "0.0.0.0:9092"

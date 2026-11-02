@@ -92,7 +92,8 @@ share_batch_size = 1
 
 # Protocol extensions
 # Must SUPPORT what the translator REQUIRES (0x0002, worker-specific hashrate tracking).
-supported_extensions = [0x0002]
+# And the Ghost agent extension (0x4748) the translator requires for slot-class sensing.
+supported_extensions = [0x0002, 0x4748]
 required_extensions = []
 
 # Monitoring endpoint
