@@ -79,8 +79,11 @@ pub fn clamp_agent(agent: &str) -> &str {
 pub struct CeilingRule {
     /// Model name, used in logs and the low-limit warning.
     pub label: &'static str,
-    /// Matches the lower-cased user agent.
+    /// Matches the lower-cased SV1 user agent.
     matches: fn(&str) -> bool,
+    /// Matches a native SV2 miner's lower-cased `SetupConnection` fields, used when there is no
+    /// SV1 agent.
+    matches_sv2: fn(&Sv2Device) -> bool,
     /// The row applies only to agents whose first dotted version is at or below this.
     pub max_version: Option<(u32, u32)>,
     /// Known-safe coinbase ceiling in bytes: the most the loop may try. NOT a measurement unless
@@ -96,9 +99,15 @@ pub struct CeilingRule {
 impl CeilingRule {
     /// Whether this row matches `agent` (any case), given its parsed version.
     fn applies(&self, lower: &str, version: Option<(u32, u32)>) -> bool {
-        if !(self.matches)(lower) {
-            return false;
-        }
+        (self.matches)(lower) && self.version_ok(version)
+    }
+
+    /// Whether this row matches a native SV2 miner, given its firmware's parsed version.
+    fn applies_sv2(&self, device: &Sv2Device, version: Option<(u32, u32)>) -> bool {
+        (self.matches_sv2)(device) && self.version_ok(version)
+    }
+
+    fn version_ok(&self, version: Option<(u32, u32)>) -> bool {
         match self.max_version {
             None => true,
             Some(max) => version.is_some_and(|v| v <= max),
@@ -170,6 +179,108 @@ fn m_never(_: &str) -> bool {
     false
 }
 
+/// A native SV2 miner's identity, from its `SetupConnection`: `vendor`, `hardware_version` and
+/// `firmware`. Stored lower-cased and cut to [`MAX_AGENT_LEN`] each; `display` keeps the case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sv2Device {
+    vendor: String,
+    hardware: String,
+    firmware: String,
+    firmware_raw: String,
+    display: String,
+}
+
+impl Sv2Device {
+    /// From the three `SetupConnection` fields. `None` when all three are empty.
+    pub fn new(vendor: &str, hardware_version: &str, firmware: &str) -> Option<Self> {
+        let (v, h, f) = (
+            clamp_agent(vendor.trim()),
+            clamp_agent(hardware_version.trim()),
+            clamp_agent(firmware.trim()),
+        );
+        if v.is_empty() && h.is_empty() && f.is_empty() {
+            return None;
+        }
+        Some(Self {
+            vendor: v.to_ascii_lowercase(),
+            hardware: h.to_ascii_lowercase(),
+            firmware: f.to_ascii_lowercase(),
+            firmware_raw: f.to_string(),
+            display: format!("{v}/{h}/{f}"),
+        })
+    }
+
+    /// `vendor/hardware_version/firmware`, as received.
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// The firmware field, as received.
+    fn firmware_raw(&self) -> &str {
+        &self.firmware_raw
+    }
+
+    /// Vendor and firmware, the fields that name the firmware rather than the machine.
+    fn software(&self) -> String {
+        format!("{}/{}", self.vendor, self.firmware)
+    }
+
+    fn all(&self) -> String {
+        format!("{}/{}/{}", self.vendor, self.hardware, self.firmware)
+    }
+}
+
+/// Firmware that replaces the maker's: its own row decides, not the machine it runs on.
+fn third_party_firmware(d: &Sv2Device) -> bool {
+    let s = d.software();
+    m_nicehash(&s) || m_nerdqaxe(&s) || m_esp_miner(&s) || m_epic(&s) || m_braiins(&s)
+}
+
+/// Stock firmware on a machine named by `hardware_version`, from a maker named anywhere.
+fn stock(d: &Sv2Device, maker: fn(&str) -> bool) -> bool {
+    !third_party_firmware(d) && maker(&d.all())
+}
+
+fn s_nicehash(d: &Sv2Device) -> bool {
+    m_nicehash(&d.software())
+}
+fn s_nerdqaxe(d: &Sv2Device) -> bool {
+    m_nerdqaxe(&d.all())
+}
+fn s_esp_miner(d: &Sv2Device) -> bool {
+    m_esp_miner(&d.all())
+}
+fn s_s21(d: &Sv2Device) -> bool {
+    stock(d, m_antminer) && matches!(d.hardware.as_str(), "s21" | "antminer s21")
+}
+fn s_s19xp(d: &Sv2Device) -> bool {
+    stock(d, m_antminer) && any_of(&d.hardware, &["s19xp", "s19 xp"])
+}
+fn s_s9_family(d: &Sv2Device) -> bool {
+    stock(d, m_antminer)
+        && ["s9", "s11", "s17", "t17"]
+            .iter()
+            .any(|n| has_word(&d.hardware, n, true))
+}
+fn s_antminer(d: &Sv2Device) -> bool {
+    stock(d, m_antminer)
+}
+fn s_avalon(d: &Sv2Device) -> bool {
+    stock(d, m_avalon)
+}
+fn s_whatsminer(d: &Sv2Device) -> bool {
+    stock(d, m_whatsminer)
+}
+fn s_epic(d: &Sv2Device) -> bool {
+    m_epic(&d.software())
+}
+fn s_braiins(d: &Sv2Device) -> bool {
+    m_braiins(&d.software())
+}
+fn s_never(_: &Sv2Device) -> bool {
+    false
+}
+
 /// Known-safe coinbase ceilings by user agent (the first parameter of `mining.subscribe`). First
 /// matching row wins, so specific rows sit above generic ones. Ported row for row, evidence
 /// included, from the prototype's `CEILINGS`. The agent patterns are partly guesses: only the
@@ -178,6 +289,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "NiceHash",
         matches: m_nicehash,
+        matches_sv2: s_nicehash,
         max_version: None,
         ceiling_bytes: 500,
         proven_bytes: None,
@@ -186,6 +298,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "NerdQAxe",
         matches: m_nerdqaxe,
+        matches_sv2: s_nerdqaxe,
         max_version: None,
         ceiling_bytes: 7_600,
         proven_bytes: None,
@@ -195,6 +308,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Bitaxe ESP-Miner <= v2.15",
         matches: m_esp_miner,
+        matches_sv2: s_esp_miner,
         max_version: Some((2, 15)),
         ceiling_bytes: 22_000,
         proven_bytes: None,
@@ -204,6 +318,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Bitaxe ESP-Miner main / newer / no version",
         matches: m_esp_miner,
+        matches_sv2: s_esp_miner,
         max_version: None,
         ceiling_bytes: 7_600,
         proven_bytes: None,
@@ -213,6 +328,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Antminer S21",
         matches: m_s21,
+        matches_sv2: s_s21,
         max_version: None,
         ceiling_bytes: 2_250,
         proven_bytes: None,
@@ -221,6 +337,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Antminer S19 XP",
         matches: m_s19xp,
+        matches_sv2: s_s19xp,
         max_version: None,
         ceiling_bytes: 2_048,
         proven_bytes: None,
@@ -230,6 +347,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Antminer S9/S11/S17/T17",
         matches: m_s9_family,
+        matches_sv2: s_s9_family,
         max_version: None,
         ceiling_bytes: 7_650,
         proven_bytes: None,
@@ -239,6 +357,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Stock Antminer (default)",
         matches: m_antminer,
+        matches_sv2: s_antminer,
         max_version: None,
         ceiling_bytes: 730,
         proven_bytes: None,
@@ -248,6 +367,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Avalon",
         matches: m_avalon,
+        matches_sv2: s_avalon,
         max_version: None,
         ceiling_bytes: 6_144,
         proven_bytes: None,
@@ -256,6 +376,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Whatsminer",
         matches: m_whatsminer,
+        matches_sv2: s_whatsminer,
         max_version: None,
         ceiling_bytes: 6_500,
         proven_bytes: None,
@@ -264,6 +385,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "ePIC PowerPlay-BM",
         matches: m_epic,
+        matches_sv2: s_epic,
         max_version: None,
         ceiling_bytes: 16_000,
         proven_bytes: None,
@@ -272,6 +394,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
     CeilingRule {
         label: "Braiins bosminer",
         matches: m_braiins,
+        matches_sv2: s_braiins,
         max_version: None,
         ceiling_bytes: 16_000,
         proven_bytes: None,
@@ -283,6 +406,7 @@ pub static CEILINGS: [CeilingRule; 12] = [
 pub static UNKNOWN_AGENT: CeilingRule = CeilingRule {
     label: "unknown agent",
     matches: m_never,
+    matches_sv2: s_never,
     max_version: None,
     ceiling_bytes: SLOT_CLASS_COINBASE_BYTES[0],
     proven_bytes: None,
@@ -356,6 +480,45 @@ pub fn lookup_ceiling(agent: Option<&str>) -> (&'static CeilingRule, Option<Stri
         .find(|r| r.applies(&lower, version))
         .unwrap_or(&UNKNOWN_AGENT);
     (rule, firmware)
+}
+
+/// The ceiling row for a native SV2 miner, matched on its `SetupConnection` fields, and the
+/// firmware token parsed from its firmware field.
+pub fn lookup_ceiling_sv2(device: &Sv2Device) -> (&'static CeilingRule, Option<String>) {
+    let (firmware, version) = parse_firmware(device.firmware_raw());
+    let rule = CEILINGS
+        .iter()
+        .find(|r| r.applies_sv2(device, version))
+        .unwrap_or(&UNKNOWN_AGENT);
+    (rule, firmware)
+}
+
+/// Who a miner says it is: an SV1 `mining.subscribe` agent, or a native SV2 miner's
+/// `SetupConnection` fields. The agent wins when both exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MinerIdentity {
+    /// The SV1 agent, forwarded by the translator.
+    Agent(String),
+    /// A native SV2 miner's `SetupConnection`.
+    Sv2(Sv2Device),
+}
+
+impl MinerIdentity {
+    /// The ceiling row and parsed firmware token for this identity.
+    pub fn lookup(&self) -> (&'static CeilingRule, Option<String>) {
+        match self {
+            MinerIdentity::Agent(a) => lookup_ceiling(Some(a)),
+            MinerIdentity::Sv2(d) => lookup_ceiling_sv2(d),
+        }
+    }
+
+    /// The identity as shown in logs and status.
+    pub fn display(&self) -> &str {
+        match self {
+            MinerIdentity::Agent(a) => a,
+            MinerIdentity::Sv2(d) => d.display(),
+        }
+    }
 }
 
 /// Index of the largest class whose coinbase fits `bytes`. The smallest class is always served,
@@ -618,6 +781,28 @@ impl ClassSensor {
         Self::with_rule(rule, agent.map(str::to_string), firmware, params, now_ms)
     }
 
+    /// Start sensing a miner known by an SV1 agent or its SV2 `SetupConnection`, or by nothing.
+    pub fn for_identity(
+        identity: Option<&MinerIdentity>,
+        params: SensingParams,
+        now_ms: u64,
+    ) -> Self {
+        match identity {
+            Some(MinerIdentity::Agent(a)) => Self::new(Some(a), params, now_ms),
+            Some(id @ MinerIdentity::Sv2(d)) => {
+                let (rule, firmware) = id.lookup();
+                Self::with_rule(
+                    rule,
+                    Some(d.display().to_string()),
+                    firmware,
+                    params,
+                    now_ms,
+                )
+            }
+            None => Self::new(None, params, now_ms),
+        }
+    }
+
     fn with_rule(
         rule: &'static CeilingRule,
         agent: Option<String>,
@@ -757,13 +942,16 @@ impl ClassSensor {
         }
     }
 
-    /// The miner's connection dropped: the class served fails.
-    pub fn on_disconnect(&mut self, now_ms: u64) -> ClassChange {
+    /// The miner's connection dropped. A class still being tested (its step-up dwell) fails:
+    /// the drop may be the firmware choking on it. A settled miner keeps its class and resumes
+    /// there on reconnect; classes that failed earlier stay failed.
+    pub fn on_disconnect(&mut self, now_ms: u64) -> Option<ClassChange> {
         self.connected = false;
-        self.fail(FailureKind::Disconnect, now_ms)
+        (self.role == Role::Trial).then(|| self.fail(FailureKind::Disconnect, now_ms))
     }
 
-    /// The miner came back. The no-share clock does not run while it was away.
+    /// The miner came back. The no-share clock does not run while it was away, and a settled
+    /// class resumes where it was.
     pub fn on_reconnect(&mut self, now_ms: u64) {
         self.connected = true;
         self.att.last_progress_ms = now_ms;
@@ -1034,19 +1222,59 @@ mod tests {
     }
 
     #[test]
-    fn a_disconnect_fails_the_class_served() {
+    fn a_disconnect_mid_probe_fails_that_probe() {
         let mut now = 0;
         let mut s = ClassSensor::new(Some("Avalon"), params(), now);
         feed(&mut s, 3, &mut now);
-        assert_eq!(s.serving_class(), 9);
-        let c = s.on_disconnect(now);
+        assert_eq!(s.serving_class(), 9, "probing 9");
+        let c = s.on_disconnect(now).unwrap();
         assert_eq!((c.from, c.to), (9, 3));
+        assert_eq!(c.cause, ChangeCause::Failed(FailureKind::Disconnect));
         assert_eq!(s.tick(now + 1_000_000), None, "no clock while away");
         s.on_reconnect(now + 1_000_000);
         now += 1_000_000;
         assert!(s.tick(now + 1_000).is_none());
         assert_eq!(s.serving_class(), 3);
         assert!(feed(&mut s, 10, &mut now).is_empty(), "9 is not retried");
+    }
+
+    #[test]
+    fn a_flapping_settled_bitaxe_keeps_its_class() {
+        let mut now = 0;
+        let mut s = ClassSensor::new(Some("bitaxe/BM1366/v2.4.0"), params(), now);
+        // Passes 3, 9, 44 and 143, fails 364 on a corrupt share, settles back at 143.
+        feed(&mut s, 12, &mut now);
+        assert_eq!(s.serving_class(), 364);
+        now += 1_000;
+        s.on_share(364, ShareVerdict::Corrupt, now).unwrap();
+        assert_eq!(s.serving_class(), 143);
+        assert!(s.status().settled);
+        for _ in 0..5 {
+            now += 1_000;
+            assert_eq!(
+                s.on_disconnect(now),
+                None,
+                "a settled class survives a drop"
+            );
+            assert!(!s.is_connected());
+            now += 60_000;
+            s.on_reconnect(now);
+            assert_eq!(s.serving_class(), 143);
+            assert!(s.tick(now + 1_000).is_none());
+            feed(&mut s, 2, &mut now);
+        }
+        let st = s.status();
+        assert!(st.settled);
+        assert_eq!(st.highest_passed, Some(143));
+        assert_eq!(
+            st.failed,
+            vec![(364, FailureKind::Corrupt)],
+            "364 stays failed"
+        );
+        assert!(
+            feed(&mut s, 20, &mut now).is_empty(),
+            "and is never retried"
+        );
     }
 
     #[test]
@@ -1135,6 +1363,7 @@ mod tests {
         static PROVEN: CeilingRule = CeilingRule {
             label: "test",
             matches: m_never,
+            matches_sv2: s_never,
             max_version: None,
             ceiling_bytes: 16_000,
             proven_bytes: Some(2_250),
@@ -1156,5 +1385,71 @@ mod tests {
         let p = SensingParams::for_shares_per_minute(f32::NAN, 0);
         assert_eq!(p.min_shares, 1);
         assert_eq!(p.expected_share_interval_ms, 3_000);
+    }
+
+    fn sv2(vendor: &str, hw: &str, fw: &str) -> &'static str {
+        lookup_ceiling_sv2(&Sv2Device::new(vendor, hw, fw).unwrap())
+            .0
+            .label
+    }
+
+    #[test]
+    fn native_sv2_miners_match_on_their_setup_connection() {
+        let cases = [
+            (
+                "Braiins",
+                "Antminer S19j Pro",
+                "bosminer-plus 23.03",
+                "Braiins bosminer",
+            ),
+            (
+                "Braiins",
+                "Antminer S21",
+                "Braiins OS 24.02",
+                "Braiins bosminer",
+            ),
+            ("Bitmain", "S21", "1.0", "Antminer S21"),
+            (
+                "Bitmain",
+                "Antminer S21 Pro",
+                "1.0",
+                "Stock Antminer (default)",
+            ),
+            ("Bitmain", "S19 XP", "", "Antminer S19 XP"),
+            ("Bitmain", "Antminer S9", "", "Antminer S9/S11/S17/T17"),
+            ("Bitmain", "S95", "", "Stock Antminer (default)"),
+            ("ePIC", "S19j Pro", "PowerPlay-BM 1.2", "ePIC PowerPlay-BM"),
+            ("Canaan", "A1566", "", "Avalon"),
+            ("MicroBT", "M50S", "", "Whatsminer"),
+            ("bitaxe", "BM1366", "v2.4.0", "Bitaxe ESP-Miner <= v2.15"),
+            (
+                "bitaxe",
+                "BM1370",
+                "v2.16.1",
+                "Bitaxe ESP-Miner main / newer / no version",
+            ),
+            ("NiceHash", "", "", "NiceHash"),
+            ("SRI", "", "", "unknown agent"),
+            ("", "", "proxy 1.0", "unknown agent"),
+        ];
+        for (v, h, f, want) in cases {
+            assert_eq!(sv2(v, h, f), want, "{v}/{h}/{f}");
+        }
+        assert_eq!(Sv2Device::new("", " ", ""), None);
+    }
+
+    #[test]
+    fn an_sv2_identity_seeds_the_sensor_and_its_warning() {
+        let id = MinerIdentity::Sv2(Sv2Device::new("Bitmain", "S21", "x").unwrap());
+        let s = ClassSensor::for_identity(Some(&id), params(), 0);
+        let st = s.status();
+        assert_eq!(st.model, "Antminer S21");
+        assert_eq!(st.agent.as_deref(), Some("Bitmain/S21/x"));
+        assert_eq!(st.warning.unwrap().limited_to_class, 44);
+        let agent = MinerIdentity::Agent("Avalon Nano 3s".into());
+        assert_eq!(agent.lookup().0.label, "Avalon");
+        assert_eq!(agent.display(), "Avalon Nano 3s");
+        let none = ClassSensor::for_identity(None, params(), 0);
+        assert_eq!(none.rule().label, "unknown agent");
     }
 }
