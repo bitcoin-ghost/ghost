@@ -2,6 +2,20 @@
 
 Companion to `NODE_POOL_SPEC.md`. Simulations, the firmware research and the hardware test kit live outside the repo for now; paths starting `sims/` or `hardware-test/` are relative to that working folder.
 
+## Approach change, 11-02: rip out, flag-day cutover
+
+This branch strips the old system out as it builds the new one. It does not keep old code dark beside new code.
+
+- **Cutover is a flag day.** At an agreed block every node switches to the new binary. Before it, the current release exports the miners' ledger balances (one small export command added to main), and the new binary imports them as its genesis table, pinned by digest. The new binary contains none of the old payout, checkpoint, elder or capability code.
+- **Old tables are dropped** by the migration that imports the genesis table.
+- **Activation gates** (`u64::MAX`) added in W2.1-W2.4 become network configuration for regtest and signet, and are removed for mainnet once the flag day is set.
+- **Removal waves**, on this branch, each leaving the workspace building and tested:
+  1. Wraith (wallet app, coordinator, protocol), Ghost Tap, ghost-lock and its signer, and anything reachable only from them.
+  2. zk, MPC, L2 and glyph, with the zk start gate and the `zk-production` build feature.
+  3. With W2.6/W2.7: the old payout ledger, checkpoints and votes, elders, capabilities and challenges, fee drift, solo and private modes, old tables.
+  4. ghostd to stock Bitcoin Core, and the dashboard and website rewrite.
+- Phase 4's Release A / Release B dual running is replaced by this. Phases 3 (regtest, signet) still come before any mainnet use.
+
 ## 3. Work plan
 
 Sizes assume one engineer. Workers run in isolated worktrees. Every merge, roll and height is the user's call.
