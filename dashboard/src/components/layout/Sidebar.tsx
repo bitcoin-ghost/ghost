@@ -8,6 +8,8 @@ import {
   RefreshCw,
   Gauge,
   Boxes,
+  Users,
+  Link2,
   Blocks,
   Network as NetworkIcon,
   Eye,
@@ -17,7 +19,6 @@ import {
   Layers,
   SlidersHorizontal,
   Globe,
-  MapPin,
   HeartPulse,
   ScrollText,
   Smartphone,
@@ -64,17 +65,27 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "overview",
+    label: "node pool",
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
+      { href: "/miners", label: "Miners", icon: <Users {...ICON} /> },
+      { href: "/blocks", label: "Pool Blocks", icon: <Boxes {...ICON} /> },
+      { href: "/share-chain", label: "Share Chain", icon: <Link2 {...ICON} /> },
+      { href: "/mining", label: "Connect Miners", icon: <Pickaxe {...ICON} /> },
+    ],
+  },
+  {
+    label: "bitcoin node",
+    items: [
       { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
-      { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
+      { href: "/block-template", label: "Block Template", icon: <Blocks {...ICON} /> },
+      { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
+      { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
     ],
   },
   {
     label: "privacy",
     items: [
-      { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
       { href: "/shroud", label: "Shroud", icon: <Eye {...ICON} /> },
       { href: "/ghost-mode", label: "Ghost Mode", icon: <Ghost {...ICON} /> },
     ],
@@ -97,21 +108,10 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "ghost pool",
-    items: [
-      { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
-      { href: "/block-template", label: "Block Template", icon: <Blocks {...ICON} /> },
-      { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
-      { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
-      { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
-    ],
-  },
-  {
     label: "system",
     items: [
       { href: "/system", label: "System", icon: <Cpu {...ICON} /> },
       { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
-      { href: "/peers", label: "Peers", icon: <NetworkIcon {...ICON} /> },
       { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/watchdog", label: "Watchdog", icon: <HeartPulse {...ICON} /> },
       { href: "/logs", label: "Logs", icon: <ScrollText {...ICON} /> },
