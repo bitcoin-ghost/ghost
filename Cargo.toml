@@ -33,6 +33,7 @@ members = [
     "crates/ghost-consensus",
     "crates/ghost-accounting",
     "crates/ghost-verification",
+    "crates/ghost-np-relay",
     # Ghost Pay L2
     "crates/ghost-keys",
     "crates/ghost-lock",
@@ -107,6 +108,7 @@ ghost-consensus = { path = "crates/ghost-consensus" }
 ghost-accounting = { path = "crates/ghost-accounting" }
 ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
+ghost-np-relay = { path = "crates/ghost-np-relay" }
 # Ghost Pay L2 crates
 ghost-keys = { path = "crates/ghost-keys" }
 ghost-entropy = { path = "crates/ghost-entropy" }

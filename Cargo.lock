@@ -3553,6 +3553,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-np-relay"
+version = "1.11.46"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "ghost-common",
+ "ghost-storage",
+ "hex",
+ "rand 0.8.6",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ghost-policy"
 version = "1.11.46"
 dependencies = [
