@@ -613,7 +613,23 @@ impl Settlement {
             .input
             .first()
             .map_or(&[][..], |i| i.script_sig.as_bytes());
-        let (Some(root), Some(tag)) = (ledger_root_of(&outs), extract_payout_tag(sig)) else {
+        let Some(tag) = extract_payout_tag(sig) else {
+            return Ok(Outcome::NotPool);
+        };
+        let Some(root) = ledger_root_of(&outs) else {
+            // Built on one of our anchors but committing no table: it pays no ledger, so it
+            // retires nothing (the deterministic rule reads it as no pool block at all), and it
+            // is named, as any other block that does not pay its anchor's outputs is.
+            if !relay.anchors_with_prefix(&tag).is_empty() {
+                self.stats.mismatched += 1;
+                warn!(
+                    height = h,
+                    block = %display_hex(&hash),
+                    "NP_SETTLE: pool block does not pay its anchor's canonical outputs; nothing \
+                     retired (it carries no GHNP ledger commitment)"
+                );
+                return Ok(Outcome::Mismatch);
+            }
             return Ok(Outcome::NotPool);
         };
         let candidates = relay.anchors_with_prefix(&tag);
@@ -898,18 +914,26 @@ mod tests {
         let swapped = on_main(h, swapped);
         archive(r, &swapped);
         assert_eq!(st[0].settle(r, &swapped).unwrap(), Outcome::Mismatch);
+        // The ledger commitment left out: named and counted, nothing retired.
+        let mut rootless = pool_coinbase(job, &table, tip);
+        let at = rootless.output.len() - 2;
+        rootless.output.remove(at);
+        let rootless = on_main(h, rootless);
+        archive(r, &rootless);
+        assert_eq!(st[0].settle(r, &rootless).unwrap(), Outcome::Mismatch);
         // Another table altogether (a balance inflated).
         table.values_mut().next().unwrap().owed *= 2;
         let inflated = on_main(h, pool_coinbase(job, &table, tip));
         archive(r, &inflated);
         assert_eq!(st[0].settle(r, &inflated).unwrap(), Outcome::Mismatch);
         assert_eq!(r.db().np_applied_blocks().unwrap(), vec![]);
-        assert_eq!(st[0].stats().mismatched, 2);
+        assert_eq!(st[0].stats().mismatched, 3);
         // The deterministic rule agrees: a table on top of either subtracts nothing.
         archive(r, &main_block(h));
         let plain = owed(r, &job, h + 1, &btc_hash(h));
         assert_eq!(owed(r, &job, h + 1, &swapped.hash()), plain);
         assert_eq!(owed(r, &job, h + 1, &inflated.hash()), plain);
+        assert_eq!(owed(r, &job, h + 1, &rootless.hash()), plain);
         // Not a pool block, and below genesis: ignored.
         assert_eq!(
             st[0].settle(r, &on_main(h, plain_coinbase(h, 3))).unwrap(),
