@@ -1,4 +1,4 @@
-# Porting notes: W2.1 pure core
+# Porting notes: W2.1 pure core and W2.5 relay
 
 Readings chosen where the spec leaves a detail open. Each one follows the Python reference
 (`refimpl_v3.py`) for the payout rule, or the simulator in the design folder
@@ -63,12 +63,52 @@ Code: `crates/ghost-common/src/{canonical_payout,share_commit,anchor_chain,node_
 - Batches: `attach_batch` refuses a share listed twice or already on the ancestry. Checking each
   share, and that the list matches the committed `batch_root`, belongs to the caller (W2.5).
 
+## Relay (`crates/ghost-np-relay`, W2.5)
+Readings chosen where the spec leaves a detail open. Each is a pure function of the including
+anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches the same verdict.
+
+- **`batch_root`** (`share_commit::batch_root`): `sha256("GhostBatch/v1" || n u32 LE || M)`, `M`
+  the RFC 6962 merkle tree over the share ids (header hashes, internal byte order) in batch order;
+  empty tree is 32 zero bytes. Python vectors in the test. `batch_proof` / `verify_batch_proof` give
+  inclusion proofs for `ghost-audit` (W2.9).
+- **`T_net` of a share** is the tier its own job required: its `parent_anchor`'s retarget state at
+  `max(job btc height, parent btc_height)`. It does not depend on the includer, so a share earns the
+  same credit on every fork that can include it. Credit tier is `max(T_net, committed tier)`.
+- **An anchor's own share** is checked with the anchor as its includer: it must pay `S(H)` from the
+  anchor's own ancestry, and its job height must be `btc_height + 1` (the header's `prev_hash`
+  height; the message carries `btc_height` so the header can be placed before the batch arrives). A
+  failure makes the anchor invalid. The share is credited only when a later anchor includes it.
+- **Header time** has no upper bound for validity (`max_time = u32::MAX`): a bound on a local clock
+  would let viewers disagree. Two hours ahead of the local clock is relay policy for loose shares.
+- **Duplicates (K).** The duplicate check covers the whole including-anchor ancestry, as
+  `AnchorChain` already does. That is the same as stopping at `S(H)`: a carrier at or below `S(H)`
+  would have to commit to a share that commits (through its parent anchor) to `S(H)`, which commits
+  to the carrier, a hash cycle. So the check is bounded by `S(H)`, about 32 Bitcoin blocks of
+  anchors, and pruning below the snapshot cannot change it. `K = 120` is not used as a depth bound:
+  a share of job height `H` may sit in a carrier stamped `H - 1` and be re-included by an anchor
+  stamped `H + 12`, about 144 anchors later at target spacing, so a 120-anchor lookback would let it
+  be credited twice. `REINCLUSION_DEPTH_K` stays defined and unused; the spec's K row should be
+  read as "the duplicate check reaches back to `S(H)`".
+- **Snapshot table for rule 4**: the genesis table, plus the credits of every batch on `S(H)`'s
+  ancestry folded by job height through `table_for` (so job heights above `cut(H)` drop out), minus
+  the retirements of blocks below `H` from the `Retirements` hook (W2.7; none until then).
+- **Ledger events**: one credit event per `(anchor, job height)`, keyed
+  `sha256("GhostNP/credit/v1" || anchor || H u32 LE)`, applied in chain order and job height
+  ascending, undone in reverse on a reorg. Block events above them are undone and re-applied after
+  the move. The payout table is `np_table_for_block` (a fold of the journals by height), not the
+  materialised `np_ledger`, whose `queue_since` follows application order.
+- **A share whose job saw an older Bitcoin tip than its parent anchor** is priced at the parent's
+  height rather than refused.
+- **Waiting is not invalid.** A share whose Bitcoin header or parent anchor this node lacks makes
+  its batch wait (and the anchor or header is fetched); it never makes the anchor invalid.
+- **Relay policy only, never validity**: anchors more than 6 Bitcoin blocks behind the local tip on
+  receipt are kept but not relayed (correction 3); loose shares that fail rule 4, 5 or 6 against
+  this node's view are dropped without penalty; a producer batches only shares still includable 2
+  blocks ahead, ordered by job height then id (any order is valid: the root commits it).
+
 ## Open, not decided here
-- **K = 120.** The spec's constants table lists K, and the simulator's re-inclusion rule measured
-  the 12-block window against the first anchor that carried a share, if within K anchors of the
-  includer. Rule 5's text measures against the including anchor, and "first carrier on any fork"
-  depends on what a node has seen. The code follows rule 5's text; `REINCLUSION_DEPTH_K` is defined
-  and unused. Needs a decision before W2.5.
+- **K = 120.** Resolved for the relay above: the duplicate check reaches back to `S(H)`. The spec's
+  constants table still lists K; it should be reworded.
 - **Regtest tier base.** At difficulty 1, `T_net` floor 10 needs about 2^42 hashes a share, out of
   reach on regtest. The PoW base is a parameter so Phase 3 can choose; `share_face` keeps the
   reference's difficulty-1 constant.
