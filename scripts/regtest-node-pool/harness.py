@@ -525,6 +525,7 @@ class Harness:
         self.peak_rss = 0
         self.export_dir = self.export_digest = None
         self.genesis = {}  # script hex -> sats owed at genesis
+        self.genesis_addr = {}  # script hex -> address
         if args.genesis_rows:
             self.make_export(args.genesis_rows)
 
@@ -535,8 +536,9 @@ class Harness:
         table = {}
         for i in range(rows):
             sats = 400 if i >= rows - 40 else 1_000 + (i * 7_919) % 99_000
-            _, script = payee(f"genesis/{i}", taproot=i % 2 == 1)
+            addr, script = payee(f"genesis/{i}", taproot=i % 2 == 1)
             table[script] = sats
+            self.genesis_addr[script] = addr
         self.genesis = table
         ordered = sorted(table.items(), key=lambda kv: bytes.fromhex(kv[0]))
         net = b"regtest"

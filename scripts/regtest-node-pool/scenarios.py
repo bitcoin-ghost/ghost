@@ -9,6 +9,15 @@ import time
 from harness import (logged, RPC_PASS, RPC_USER, SLOT_CLASSES, TREASURY_SCRIPT as TREASURY, check_coinbase,
                      payee, regtest_subsidy, result, say, subsidy, wait_for)
 
+def genesis_args(h):
+    """ghost-audit starts from the same genesis table the nodes imported, and refuses any other."""
+    if not h.export_dir:
+        return []
+    root = getattr(h.nodes[0], "genesis_root", None)
+    return (["--genesis-export", h.export_dir, "--export-digest", h.export_digest]
+            + (["--genesis-table-digest", root] if root else []))
+
+
 def settled_in(log, bh):
     """The block was settled against its anchor: directly, or provisionally and then confirmed."""
     return logged(log, bh, "NP_SETTLE: pool block settled") or (
@@ -156,6 +165,19 @@ def blocks_settle(h):
         full = sum(1 for sc, v in paid.items() if v == h.genesis[sc])
         below = [sc for sc in paid if h.genesis[sc] < 1000]
         ok &= not over and not below
+        # The ledger API serves imported balances: owed now = genesis - paid, on every node.
+        sample = sorted(h.genesis)[:: max(1, len(h.genesis) // 12)]
+        wrong = []
+        for n in h.honest():
+            for sc in sample:
+                led = n.ledger(h.genesis_addr[sc])
+                want = (h.genesis[sc] - paid.get(sc, 0)) << 32
+                got = int(led.get("balance", {}).get("units", -1))
+                if got != want:
+                    wrong.append(f"node{n.i} {h.genesis_addr[sc][:14]}.. {got} != {want}")
+        ok &= not wrong
+        ev.append(f"/api/v1/node-pool/ledger on {len(h.honest())} nodes, {len(sample)} genesis payees: balance = "
+                  f"imported - paid, to the face unit: {'all' if not wrong else 'NO: ' + '; '.join(wrong[:4])}")
         ev.append(f"genesis rows: {full} paid in full, exactly; {len(paid) - full} partly; "
                   f"{len(h.genesis) - len(paid)} not yet; overpaid {len(over)}; below-floor rows paid "
                   f"{len(below)}; {sum(paid.values())} of {sum(h.genesis.values())} sats owed at genesis paid")
@@ -251,8 +273,25 @@ def bitcoin_reorg(h):
     disc0 = {n.i: n.status()["settlement"]["disconnected"] for n in h.nodes}
     ev = [f"invalidateblock h{height} {bh[:16]}.. (pays {len(vouts) - 3} outputs) on every Bitcoin node;"
           f" tip was {tip}"]
-    for n in h.nodes:
+    nodes = h.honest()
+    invalidated = [bh]
+    for n in nodes:
         n.rpc("invalidateblock", bh)
+    # A node holding a stale sibling at that height reorgs onto it instead of stepping back;
+    # invalidate those too, everywhere, so every node lands on the same tip below the block.
+    for _ in range(6):
+        above = {n.rpc("getblockhash", height) for n in nodes if n.rpc("getblockcount") >= height}
+        if not above:
+            break
+        for x in above:
+            invalidated.append(x)
+            for n in nodes:
+                try:
+                    n.rpc("invalidateblock", x)
+                except RuntimeError:
+                    pass  # a node that never saw this sibling
+    if len(invalidated) > 1:
+        ev.append(f"also invalidated {len(invalidated) - 1} stale sibling(s) at h{height} some node had")
     ok = True
     try:
         mid_q = h.quiesce(180)
@@ -273,7 +312,8 @@ def bitcoin_reorg(h):
             ev.append("store digests DIFFER across nodes after the undo")
         else:
             ev.append(f"store digests equal on every node after the undo: {mid[0]}")
-        for n in h.nodes:
+        # Only the block itself: its stale siblings stay invalid, so no node can tie-break onto one.
+        for n in nodes:
             n.rpc("reconsiderblock", bh)
         log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         end_q = h.quiesce(180)
@@ -331,8 +371,8 @@ def audit(h):
     argv = [exe, "audit", "--network", "regtest", "--relay-peer", f"127.0.0.1:{peer.relay}",
             "--data-dir", data, "--rpc-port", str(target.rpc_port), "--rpc-user", RPC_USER,
             "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{target.sv1}",
-            "--node-relay", f"127.0.0.1:{target.relay}", "--address", addr, "--jobs",
-            str(h.args.audit_jobs), "--json", "--wait", "180", "--timeout", "120"]
+            "--node-relay", f"127.0.0.1:{target.relay}", "--address", addr, "--username", f"{addr}.audit", "--jobs",
+            str(h.args.audit_jobs), "--json", "--wait", "180", "--timeout", "120"] + genesis_args(h)
     # New jobs come with new blocks: let the miners go slowly while the auditor listens.
     tr_mark = len(target.read_log("translator"))
     for n in h.nodes:
@@ -503,8 +543,8 @@ def hostile(h):
         argv = [exe, "audit", "--network", "regtest", "--relay-peer", f"127.0.0.1:{honest[0].relay}",
                 "--data-dir", os.path.join(h.work, f"audit-{fault}"), "--rpc-port", str(honest[0].rpc_port),
                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{bad.sv1}",
-                "--node-relay", f"127.0.0.1:{bad.relay}", "--address", addr, "--jobs", "1", "--json",
-                "--wait", "120", "--timeout", "120"]
+                "--node-relay", f"127.0.0.1:{bad.relay}", "--address", addr, "--username", f"{addr}.audit", "--jobs", "1", "--json",
+                "--wait", "120", "--timeout", "120"] + genesis_args(h)
         out = subprocess.run(argv, capture_output=True, text=True, timeout=400)
         with open(os.path.join(h.work, f"audit-{fault}.log"), "w") as f:
             f.write(out.stdout + "\n--- stderr\n" + out.stderr)
