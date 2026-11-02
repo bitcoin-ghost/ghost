@@ -488,7 +488,10 @@ fn check_coinbase(
     let bip34 = bitcoin::script::Builder::new()
         .push_int(height as i64)
         .into_bytes();
-    if !cb.input[0].script_sig.as_bytes().starts_with(&bip34) {
+    // The genesis block predates BIP34 and carries no height. Settlement archives the blocks
+    // at and below a genesis anchor for median time past, so one near height 0 (regtest's is
+    // at 0) reaches it, and refusing it stopped settlement for good.
+    if height > 0 && !cb.input[0].script_sig.as_bytes().starts_with(&bip34) {
         return Err(ArchiveError::Invalid("BIP34 height mismatch".into()));
     }
     Ok(())
@@ -547,6 +550,25 @@ mod tests {
         let mut b = make_block([7; 32], 5_000, plain_coinbase(5_000, 0));
         b.header.bits = bitcoin::CompactTarget::from_consensus(EASY);
         b
+    }
+
+    /// Bitcoin's own genesis block (no BIP34 height) is archived at height 0; a block at any
+    /// other height still needs its height.
+    #[test]
+    fn the_genesis_block_is_archived_without_a_bip34_height() {
+        let g = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let txids = [g.txdata[0].compute_txid().to_byte_array()];
+        let block = |height| ArchivedBlock {
+            header: g.header,
+            height,
+            coinbase: Some((g.txdata[0].clone(), coinbase_branch(&txids))),
+        };
+        let a = BtcArchive::in_memory();
+        assert!(a.insert_local(block(0), 0).is_ok());
+        let b = BtcArchive::in_memory();
+        assert!(
+            matches!(b.insert_local(block(1), 0), Err(ArchiveError::Invalid(m)) if m.contains("BIP34"))
+        );
     }
 
     #[test]
