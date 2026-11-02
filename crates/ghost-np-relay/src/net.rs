@@ -51,7 +51,7 @@ use ghost_common::canonical_payout::Table;
 use crate::headers::HeaderOracle;
 use crate::peers::{penalty, AddrBook, AddrSource, PeerState};
 use crate::relay::{JobAnchor, Out, PeerId, Relay, RelayStatus};
-use crate::settlement::{BlockSource, Settlement};
+use crate::settlement::{BlockSource, Settlement, SettlementStatus};
 use crate::wire::{
     Hello, Message, NetShare, WireError, FRAME_HEADER_LEN, MAX_ADDRS, PROTOCOL_VERSION,
 };
@@ -120,6 +120,8 @@ pub struct RelayHandle {
     pub tables: mpsc::Sender<TableRequest>,
     /// The core's status after every event.
     pub status: watch::Receiver<RelayStatus>,
+    /// Settlement's progress after every sync (the default, all unknown, without settlement).
+    pub settlement: watch::Receiver<SettlementStatus>,
     /// The bound listen address, if listening.
     pub listen_addr: Option<SocketAddr>,
     /// The driving task.
@@ -219,6 +221,7 @@ pub async fn spawn_with_settlement(
     let (local_tx, local_rx) = mpsc::channel(LOCAL_QUEUE);
     let (tables_tx, tables_rx) = mpsc::channel(TABLE_QUEUE);
     let (status_tx, status_rx) = watch::channel(relay.status());
+    let (settlement_tx, settlement_rx) = watch::channel(SettlementStatus::default());
     let mut book = AddrBook::default();
     for p in &cfg.peers {
         book.add(*p, AddrSource::Configured);
@@ -237,6 +240,7 @@ pub async fn spawn_with_settlement(
         nonce: rand::random(),
         ev_tx,
         status_tx,
+        settlement_tx,
         settlement,
     };
     let task = tokio::spawn(node.run(ev_rx, local_rx, tables_rx));
@@ -244,6 +248,7 @@ pub async fn spawn_with_settlement(
         local: local_tx,
         tables: tables_tx,
         status: status_rx,
+        settlement: settlement_rx,
         listen_addr,
         task,
     })
@@ -263,6 +268,7 @@ struct Node {
     nonce: u64,
     ev_tx: mpsc::Sender<Event>,
     status_tx: watch::Sender<RelayStatus>,
+    settlement_tx: watch::Sender<SettlementStatus>,
     settlement: Option<SettlementParts>,
 }
 
@@ -336,6 +342,7 @@ impl Node {
             if let Err(e) = s.sync(&mut self.relay, src.as_ref()).await {
                 warn!("NP_SETTLE: sync failed: {e}");
             }
+            self.settlement_tx.send_replace(s.status());
         }
     }
 
@@ -346,6 +353,7 @@ impl Node {
                 if let Err(e) = s.reconcile(&mut self.relay) {
                     warn!("NP_SETTLE: reconcile failed: {e}");
                 }
+                self.settlement_tx.send_replace(s.status());
             }
         }
     }

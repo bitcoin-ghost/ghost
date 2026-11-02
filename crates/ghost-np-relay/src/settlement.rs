@@ -309,6 +309,26 @@ pub struct SettlementStats {
     pub disconnected: u64,
 }
 
+/// Settlement's progress, for the status API (W2.11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettlementStatus {
+    /// The highest best-chain height settlement has looked at, if it has run.
+    pub synced_height: Option<u32>,
+    /// The local Bitcoin node's tip at the last sync, if it answered.
+    pub bitcoin_tip: Option<u32>,
+    /// Blocks retired provisionally, waiting for their anchor: `(height, block hash)`.
+    pub provisional: Vec<(u32, [u8; 32])>,
+    /// Counters.
+    pub stats: SettlementStats,
+}
+
+impl SettlementStatus {
+    /// Settlement has looked at every block up to the Bitcoin tip it last saw.
+    pub fn caught_up(&self) -> bool {
+        matches!((self.synced_height, self.bitcoin_tip), (Some(s), Some(t)) if s >= t)
+    }
+}
+
 struct Pending {
     height: u32,
     tag: [u8; PAYOUT_ID_LEN],
@@ -325,6 +345,8 @@ pub struct Settlement {
     pending: HashMap<[u8; 32], Pending>,
     started: bool,
     stats: SettlementStats,
+    synced: Option<u32>,
+    last_tip: Option<u32>,
 }
 
 fn outputs_of(tx: &Transaction) -> Vec<CoinbaseOutput> {
@@ -352,6 +374,21 @@ impl Settlement {
             pending: HashMap::new(),
             started: false,
             stats: SettlementStats::default(),
+            synced: None,
+            last_tip: None,
+        }
+    }
+
+    /// Progress: how far settlement has looked, the tip it saw, and what is provisional.
+    pub fn status(&self) -> SettlementStatus {
+        let mut provisional: Vec<(u32, [u8; 32])> =
+            self.pending.iter().map(|(h, p)| (p.height, *h)).collect();
+        provisional.sort_unstable();
+        SettlementStatus {
+            synced_height: self.synced,
+            bitcoin_tip: self.last_tip,
+            provisional,
+            stats: self.stats,
         }
     }
 
@@ -373,6 +410,7 @@ impl Settlement {
         let Some(tip) = src.tip().await else {
             return Ok(());
         };
+        self.last_tip = Some(tip);
         if !self.started {
             for (h, hash) in self.view.blocks() {
                 if src.hash_at(h).await != Some(hash) {
@@ -448,6 +486,14 @@ impl Settlement {
         while self.recent.len() > RECENT_KEPT {
             self.recent.pop_first();
         }
+        // Everything below `start` was settled by an earlier sync (or is at or below genesis).
+        self.synced = Some(
+            self.recent
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(start.saturating_sub(1)),
+        );
         Ok(())
     }
 
@@ -791,6 +837,10 @@ mod tests {
             Outcome::Provisional
         );
         assert_eq!(st[1].pending(), 2);
+        assert_eq!(
+            st[1].status().provisional,
+            vec![(h, hash(h, 1)), (h + 1, hash(h + 1, 1))]
+        );
         let applied = r1.db().np_applied_blocks().unwrap();
         assert_eq!(applied.len(), 2, "both retire from their coinbase alone");
         let provisional = r1.db().np_block_retirements(&hash(h, 1)).unwrap().unwrap();
@@ -808,6 +858,7 @@ mod tests {
         assert!(r1.has_batch(&job.parent_anchor));
         st[1].reconcile(r1).unwrap();
         assert_eq!(st[1].pending(), 0);
+        assert!(st[1].status().provisional.is_empty());
         assert_eq!(st[1].stats().confirmed, 1);
         assert_eq!(st[1].stats().mismatched, 1);
         assert_eq!(
@@ -844,8 +895,12 @@ mod tests {
         chain.set(h, hash(h, 1), pool_coinbase(job, &table, tip));
         chain.set(h + 1, hash(h + 1, 0), plain_coinbase(h + 1));
 
+        assert!(!st[0].status().caught_up(), "nothing synced yet");
         st[0].sync(r, &chain).await.unwrap();
         assert_eq!(r.db().np_applied_blocks().unwrap(), vec![(h, hash(h, 1))]);
+        let s = st[0].status();
+        assert_eq!((s.synced_height, s.bitcoin_tip), (Some(h + 1), Some(h + 1)));
+        assert!(s.caught_up() && s.provisional.is_empty());
         let settled_owed = owed(r, &job, h + 2);
         st[0].sync(r, &chain).await.unwrap();
         assert_eq!(
