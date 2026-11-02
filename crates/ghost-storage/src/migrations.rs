@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 62;
+const SCHEMA_VERSION: u32 = 63;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -139,6 +139,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (60, migrate_v60),
         (61, migrate_v61),
         (62, migrate_v62),
+        (63, migrate_v63),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2705,6 +2706,182 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v63: node pool storage (W2.4): the anchor chain, batches and their shares, the face-unit
+/// ledger with its credit and retirement journals, pinned snapshot roots and per-miner sensing.
+///
+/// Additive only: new `np_*` tables, nothing existing is touched, and an older binary opens the
+/// newer database and ignores them. Dark: nothing in the running node reads or writes them yet;
+/// the typed API is `node_pool_store`.
+///
+/// Every face-unit amount is a 32-byte two's complement big-endian BLOB, the encoding
+/// `canonical_payout::table_root` hashes. Balances are `i128` face units (`2^-32` sat) and may be
+/// negative, so an SQLite INTEGER (`i64`) would cap a balance at about 21.47 BTC.
+///
+/// Payee scripts are stored as plain bytes: they are already public in every share's coinbase,
+/// and the ledger keys on script bytes, never on address strings.
+fn migrate_v63(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v63: node pool tables");
+    conn.execute_batch(NODE_POOL_V63_DDL)
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v63: created the node pool tables (np_*, dormant)");
+    Ok(())
+}
+
+/// The v63 schema. `IF NOT EXISTS` throughout, so a replay is a no-op.
+const NODE_POOL_V63_DDL: &str = "
+    -- One row per anchor header. `parent` is NULL only for the genesis anchor. `t_net` is the
+    -- tier in force for the anchor (it met t_net + 8); `cum_work` is the cumulative anchor work,
+    -- genesis to here, as a 32-byte big-endian integer.
+    CREATE TABLE IF NOT EXISTS np_anchors (
+        hash         BLOB    PRIMARY KEY CHECK (typeof(hash) = 'blob' AND length(hash) = 32),
+        parent       BLOB    CHECK (parent IS NULL
+                                    OR (typeof(parent) = 'blob' AND length(parent) = 32)),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        t_net        INTEGER NOT NULL CHECK (t_net BETWEEN 0 AND 255),
+        btc_height   INTEGER NOT NULL CHECK (btc_height >= 0),
+        cum_work     BLOB    NOT NULL CHECK (typeof(cum_work) = 'blob' AND length(cum_work) = 32),
+        batch_root   BLOB    NOT NULL CHECK (typeof(batch_root) = 'blob'
+                                             AND length(batch_root) = 32),
+        received_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_anchors_parent ON np_anchors(parent);
+    CREATE INDEX IF NOT EXISTS idx_np_anchors_btc_height ON np_anchors(btc_height);
+
+    -- An anchor's batch, once held. `btc_height` is the anchor's, copied so retention can prune
+    -- by it without a join.
+    CREATE TABLE IF NOT EXISTS np_batches (
+        anchor_hash  BLOB    PRIMARY KEY REFERENCES np_anchors(hash),
+        batch_root   BLOB    NOT NULL CHECK (typeof(batch_root) = 'blob'
+                                             AND length(batch_root) = 32),
+        share_count  INTEGER NOT NULL CHECK (share_count >= 0),
+        btc_height   INTEGER NOT NULL CHECK (btc_height >= 0),
+        received_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_batches_btc_height ON np_batches(btc_height);
+
+    -- One row per share, whatever number of batches carry it (a losing anchor's shares are
+    -- re-included on the winning fork). Everything `share_commit::verify_share` reads from the
+    -- share itself: the 80-byte header, the raw coinbase, the merkle branch (concatenated
+    -- 32-byte hashes) and the tag preimage. `job_height` is the caller's resolution of the
+    -- header's prev_hash, plus one. `share_id` is sha256d(header).
+    CREATE TABLE IF NOT EXISTS np_shares (
+        share_id       BLOB    PRIMARY KEY CHECK (typeof(share_id) = 'blob'
+                                                  AND length(share_id) = 32),
+        header         BLOB    NOT NULL CHECK (typeof(header) = 'blob' AND length(header) = 80),
+        coinbase       BLOB    NOT NULL CHECK (typeof(coinbase) = 'blob'),
+        merkle_branch  BLOB    NOT NULL CHECK (typeof(merkle_branch) = 'blob'
+                                               AND length(merkle_branch) % 32 = 0),
+        node_id        BLOB    NOT NULL CHECK (typeof(node_id) = 'blob' AND length(node_id) = 32),
+        tier           INTEGER NOT NULL CHECK (tier BETWEEN 0 AND 255),
+        slot_class     INTEGER NOT NULL CHECK (slot_class BETWEEN 0 AND 65535),
+        payee_script   BLOB    NOT NULL CHECK (typeof(payee_script) = 'blob'),
+        parent_anchor  BLOB    NOT NULL CHECK (typeof(parent_anchor) = 'blob'
+                                               AND length(parent_anchor) = 32),
+        batch_root     BLOB    NOT NULL CHECK (typeof(batch_root) = 'blob'
+                                               AND length(batch_root) = 32),
+        job_height     INTEGER NOT NULL CHECK (job_height >= 0)
+    );
+
+    -- A batch's shares in batch order, with what each earned under its including anchor:
+    -- the credited tier is max(T_net, committed tier), so it belongs to the inclusion, not to
+    -- the share. `face` is face units, 32-byte two's complement big-endian.
+    CREATE TABLE IF NOT EXISTS np_batch_shares (
+        anchor_hash    BLOB    NOT NULL REFERENCES np_batches(anchor_hash) ON DELETE CASCADE,
+        position       INTEGER NOT NULL CHECK (position >= 0),
+        share_id       BLOB    NOT NULL REFERENCES np_shares(share_id),
+        credited_tier  INTEGER NOT NULL CHECK (credited_tier BETWEEN 0 AND 255),
+        face           BLOB    NOT NULL CHECK (typeof(face) = 'blob' AND length(face) = 32),
+        PRIMARY KEY (anchor_hash, position),
+        UNIQUE (anchor_hash, share_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_batch_shares_share ON np_batch_shares(share_id);
+
+    -- The materialised balance table: one row per payee script. `owed` is face units
+    -- (2^-32 sat), 32-byte two's complement big-endian, and may be negative. `queue_since` is
+    -- NULL below the 1,000-sat floor.
+    CREATE TABLE IF NOT EXISTS np_ledger (
+        script       BLOB    PRIMARY KEY CHECK (typeof(script) = 'blob'),
+        owed         BLOB    NOT NULL CHECK (typeof(owed) = 'blob' AND length(owed) = 32),
+        queue_since  INTEGER CHECK (queue_since IS NULL OR queue_since >= 0)
+    );
+
+    -- Every change to np_ledger, in order. Undo is strictly last-in first-out, which is what
+    -- makes it exact. kind 0 = a credit event keyed by its anchor, kind 1 = a block keyed by its
+    -- hash. At most one block per Bitcoin height is applied at a time.
+    CREATE TABLE IF NOT EXISTS np_ledger_events (
+        seq          INTEGER PRIMARY KEY,
+        kind         INTEGER NOT NULL CHECK (kind IN (0, 1)),
+        event_key    BLOB    NOT NULL CHECK (typeof(event_key) = 'blob'
+                                             AND length(event_key) = 32),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        applied_at   INTEGER NOT NULL,
+        UNIQUE (kind, event_key)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_np_ledger_events_block_height
+        ON np_ledger_events(height) WHERE kind = 1;
+
+    -- Credits applied by a credit event, with the row each replaced (prior_present = 0 means
+    -- the script had no row).
+    CREATE TABLE IF NOT EXISTS np_credits (
+        event_key          BLOB    NOT NULL CHECK (typeof(event_key) = 'blob'
+                                                   AND length(event_key) = 32),
+        position           INTEGER NOT NULL CHECK (position >= 0),
+        credit_height      INTEGER NOT NULL CHECK (credit_height >= 0),
+        script             BLOB    NOT NULL CHECK (typeof(script) = 'blob'),
+        amount             BLOB    NOT NULL CHECK (typeof(amount) = 'blob' AND length(amount) = 32),
+        prior_present      INTEGER NOT NULL CHECK (prior_present IN (0, 1)),
+        prior_owed         BLOB    CHECK (prior_owed IS NULL
+                                          OR (typeof(prior_owed) = 'blob'
+                                              AND length(prior_owed) = 32)),
+        prior_queue_since  INTEGER,
+        PRIMARY KEY (event_key, position)
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_credits_height ON np_credits(credit_height);
+
+    -- Retirements per block, in coinbase pay order, with the row each replaced, for reorg undo.
+    CREATE TABLE IF NOT EXISTS np_retirements (
+        block_hash         BLOB    NOT NULL CHECK (typeof(block_hash) = 'blob'
+                                                   AND length(block_hash) = 32),
+        position           INTEGER NOT NULL CHECK (position >= 0),
+        height             INTEGER NOT NULL CHECK (height >= 0),
+        script             BLOB    NOT NULL CHECK (typeof(script) = 'blob'),
+        amount             BLOB    NOT NULL CHECK (typeof(amount) = 'blob' AND length(amount) = 32),
+        prior_present      INTEGER NOT NULL CHECK (prior_present IN (0, 1)),
+        prior_owed         BLOB    CHECK (prior_owed IS NULL
+                                          OR (typeof(prior_owed) = 'blob'
+                                              AND length(prior_owed) = 32)),
+        prior_queue_since  INTEGER,
+        PRIMARY KEY (block_hash, position)
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_retirements_height ON np_retirements(height);
+
+    -- Snapshot table roots pinned per cut height, per snapshot anchor (forks may disagree on
+    -- S(H) before they heal).
+    CREATE TABLE IF NOT EXISTS np_snapshot_roots (
+        cut_height   INTEGER NOT NULL CHECK (cut_height >= 0),
+        anchor_hash  BLOB    NOT NULL CHECK (typeof(anchor_hash) = 'blob'
+                                             AND length(anchor_hash) = 32),
+        table_root   BLOB    NOT NULL CHECK (typeof(table_root) = 'blob'
+                                             AND length(table_root) = 32),
+        row_count    INTEGER NOT NULL CHECK (row_count >= 0),
+        pinned_at    INTEGER NOT NULL,
+        PRIMARY KEY (cut_height, anchor_hash)
+    );
+
+    -- The latest sensing result per miner payee script and user agent: the highest slot class
+    -- that passed, the class that failed (if any), and when.
+    CREATE TABLE IF NOT EXISTS np_miner_sensing (
+        miner_script        BLOB    NOT NULL CHECK (typeof(miner_script) = 'blob'),
+        user_agent          TEXT    NOT NULL,
+        highest_pass_class  INTEGER CHECK (highest_pass_class IS NULL
+                                           OR highest_pass_class BETWEEN 0 AND 65535),
+        failed_class        INTEGER CHECK (failed_class IS NULL
+                                           OR failed_class BETWEEN 0 AND 65535),
+        sensed_at           INTEGER NOT NULL,
+        PRIMARY KEY (miner_script, user_agent)
+    );
+";
+
 /// v62 (#1034): make the per-target ledger index covering.
 ///
 /// `ledger_voterset_challenger_rows` reads one target+capability over the seven-day window, once
@@ -3861,6 +4038,82 @@ mod tests {
             .expect("count");
         assert_eq!(count, 1, "the duplicate spelling must be deleted");
         assert_eq!(work, 1.0, "the work must be counted once, not twice");
+    }
+
+    /// The `np_*` tables and their indexes, as SQLite records them.
+    fn np_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master WHERE tbl_name LIKE 'np\\_%' \
+                 ESCAPE '\\' ORDER BY type, name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Everything else in the schema, which v63 must not touch.
+    fn other_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master WHERE tbl_name NOT LIKE 'np\\_%' \
+                 ESCAPE '\\' ORDER BY type, name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// v63 from a v62 database: only the np_* objects appear, the rest of the schema is
+    /// byte-identical, and the result equals a fresh database's.
+    #[test]
+    fn v63_migrates_a_v62_database_additively() {
+        let fresh = Connection::open_in_memory().unwrap();
+        run_migrations(&fresh).unwrap();
+        let fresh_np = np_schema(&fresh);
+        assert_eq!(
+            fresh_np.iter().filter(|o| o.0 == "table").count(),
+            10,
+            "{fresh_np:?}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for (kind, name, _) in np_schema(&conn) {
+            if kind == "table" {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name};"))
+                    .unwrap();
+            }
+        }
+        set_schema_version(&conn, 62).unwrap();
+        assert!(
+            np_schema(&conn).is_empty(),
+            "a v62 database has no np_ objects"
+        );
+        let before = other_schema(&conn);
+
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 63);
+        assert_eq!(
+            other_schema(&conn),
+            before,
+            "v63 touched an existing object"
+        );
+        assert_eq!(np_schema(&conn), fresh_np);
+    }
+
+    /// v63 replays over its own tables without error or change.
+    #[test]
+    fn v63_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let once = np_schema(&conn);
+        migrate_v63(&conn).unwrap();
+        assert_eq!(np_schema(&conn), once);
     }
 
     #[test]
