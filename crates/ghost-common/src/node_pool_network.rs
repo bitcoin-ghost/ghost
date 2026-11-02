@@ -43,7 +43,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::canonical_payout::{table_root, Table};
+use crate::canonical_payout::{table_root, Halving, Table};
 
 /// The networks a node pool share chain runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,6 +84,15 @@ impl NodePoolNetwork {
             Self::Mainnet => bitcoin::Network::Bitcoin,
             Self::Signet => bitcoin::Network::Signet,
             Self::Regtest => bitcoin::Network::Regtest,
+        }
+    }
+
+    /// The network's subsidy schedule: regtest halves every 150 blocks, mainnet and signet every
+    /// 210,000.
+    pub fn halving(self) -> Halving {
+        match self {
+            Self::Mainnet | Self::Signet => Halving::MAINNET,
+            Self::Regtest => Halving::REGTEST,
         }
     }
 }
@@ -217,6 +226,23 @@ mod tests {
             NodePoolNetwork::Signet.bitcoin_network(),
             bitcoin::Network::Signet
         );
+    }
+
+    /// Core's `nSubsidyHalvingInterval`: 210,000 on mainnet and signet, 150 on regtest. The
+    /// subsidy of a regtest block above 149 is half of 50 BTC, as the template carries it.
+    #[test]
+    fn each_network_halves_on_its_own_schedule() {
+        use crate::canonical_payout::subsidy;
+        assert_eq!(NodePoolNetwork::Mainnet.halving().interval(), 210_000);
+        assert_eq!(NodePoolNetwork::Signet.halving().interval(), 210_000);
+        let regtest = NodePoolNetwork::Regtest.halving();
+        assert_eq!(regtest.interval(), 150);
+        assert_eq!(subsidy(149, regtest), 5_000_000_000);
+        assert_eq!(subsidy(150, regtest), 2_500_000_000);
+        assert_eq!(subsidy(300, regtest), 1_250_000_000);
+        assert_eq!(subsidy(150 * 64, regtest), 0);
+        assert_eq!(subsidy(150, Halving::MAINNET), 5_000_000_000);
+        assert_eq!(subsidy(974_500, Halving::MAINNET), 312_500_000);
     }
 
     #[test]

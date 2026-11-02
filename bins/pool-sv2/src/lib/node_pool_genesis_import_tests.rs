@@ -322,7 +322,8 @@ async fn the_relay_starts_on_the_imported_table_and_checks_the_pin() {
         .unwrap()
         .export
         .table_root;
-    let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20);
+    let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20)
+        .with_halving(ghost_common::canonical_payout::Halving::REGTEST);
 
     let mut wrong = cfg.clone();
     wrong.genesis_table_digest = Some(hex::encode([5u8; 32]));

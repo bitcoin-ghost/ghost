@@ -618,7 +618,7 @@ impl Settlement {
         };
         let candidates = relay.anchors_with_prefix(&tag);
         if candidates.is_empty() {
-            let Some(retired) = provisional_retirements(h, &outs) else {
+            let Some(retired) = provisional_retirements(h, relay.halving(), &outs) else {
                 warn!(
                     height = h,
                     block = %display_hex(&hash),
@@ -685,7 +685,7 @@ impl Settlement {
         if table_root(&table) != *root {
             return None;
         }
-        settle_outputs(cb, &table, h)
+        settle_outputs(cb, &table, h, relay.halving())
     }
 
     /// Check provisional blocks whose anchor has arrived: keep a match, undo anything else.
@@ -1090,7 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn shares_to_anchor_to_block_to_settlement_to_balances() {
         use crate::testkit::{p2tr, BITS};
-        use ghost_common::canonical_payout::{share_face, Balance};
+        use ghost_common::canonical_payout::{share_face, Balance, Halving};
         use ghost_common::node_pool_constants::{FACE_PER_SAT, PAYOUT_FLOOR_FACE};
 
         // The miner starts just under the floor, so its credited shares make it eligible.
@@ -1139,7 +1139,7 @@ mod tests {
         let t_net = r
             .required_tier(&crate::testkit::genesis_hash(), job_height - 1)
             .unwrap();
-        let face = share_face(t_net as u32, BITS, job_height).unwrap() as i128;
+        let face = share_face(t_net as u32, BITS, job_height, Halving::MAINNET).unwrap() as i128;
         assert_eq!(credits, 2 * face, "each share credits its face at T_net");
         assert_eq!(
             r.db().np_balance(&miner).unwrap().map(|b| b.owed),
@@ -1194,7 +1194,7 @@ mod tests {
         let miners: u64 = retired.iter().map(|x| (x.1 / FACE_PER_SAT) as u64).sum();
         assert_eq!(
             treasury + miners,
-            ghost_common::canonical_payout::subsidy(h),
+            ghost_common::canonical_payout::subsidy(h, Halving::MAINNET),
             "treasury plus miners is the subsidy exactly"
         );
     }

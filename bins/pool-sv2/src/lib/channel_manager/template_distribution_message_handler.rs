@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo},
     error::{self, PoolError, PoolErrorKind},
-    node_pool::{ChannelKind, NodePool},
+    node_pool::ChannelKind,
 };
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -36,7 +36,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         // The template provider hands over the whole coinbase value and the witness commitment
         // as its only output; anything else cannot carry a canonical coinbase. That is a
         // misconfigured template provider, not a bad block: refuse to mine on it.
-        if let Err(e) = NodePool::template_parts(&msg) {
+        if let Err(e) = np.template_parts(&msg) {
             error!(
                 template_id = msg.template_id,
                 "NODE_POOL: the template cannot carry a canonical coinbase: {e}"

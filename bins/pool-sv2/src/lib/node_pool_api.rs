@@ -29,7 +29,7 @@ use std::{collections::HashSet, future::Future, pin::Pin, str::FromStr, sync::Ar
 
 use ghost_common::{
     canonical_payout::{
-        eligible_count, paid_to, queue_position, split, split_slots, subsidy, Table,
+        eligible_count, paid_to, queue_position, split, split_slots, subsidy, Halving, Table,
     },
     node_pool_constants::{FACE_PER_SAT, MIN_PAYOUT_SATS, SLOT_CLASSES, SNAPSHOT_CUT_LAG},
     node_pool_network::NodePoolNetwork,
@@ -533,6 +533,11 @@ fn sats_of(units: i128) -> i64 {
 }
 
 impl NodePoolApi {
+    /// The subsidy schedule of the relay's network.
+    pub(crate) fn halving(&self) -> Halving {
+        self.parts.start.network.halving()
+    }
+
     /// An API over `parts`, with the job layer `live`.
     pub fn new(parts: RelayParts, fee_address: String, live: Arc<dyn LiveView>) -> NodePoolApi {
         NodePoolApi {
@@ -724,7 +729,7 @@ impl NodePoolApi {
                 in_oldest: pos
                     .and_then(|p| p.age_rank)
                     .is_some_and(|r| r <= oldest_slots),
-                sats: paid_to(next.height, t, slots, script)
+                sats: paid_to(next.height, self.halving(), t, slots, script)
                     .map_err(|e| format!("payout arithmetic: {e}"))?,
             });
         }
@@ -753,7 +758,7 @@ impl NodePoolApi {
             .map_err(internal)?
             .into_iter()
             .map(|b| {
-                let (base, rm) = split(b.height);
+                let (base, rm) = split(b.height, self.halving());
                 let paid: i64 = b.retirements.iter().map(|(_, a)| sats_of(*a)).sum();
                 let change = i64::try_from(rm).unwrap_or(i64::MAX) - paid;
                 BlockView {
@@ -764,7 +769,7 @@ impl NodePoolApi {
                     } else {
                         "settled"
                     },
-                    subsidy_sats: subsidy(b.height),
+                    subsidy_sats: subsidy(b.height, self.halving()),
                     treasury_base_sats: base,
                     miners_paid_sats: paid,
                     treasury_change_sats: change,

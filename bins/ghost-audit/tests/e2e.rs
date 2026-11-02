@@ -334,9 +334,17 @@ fn job_parts(
         batch_root: stamp.batch_root,
     };
     let outs = |t: &Table, c: u16| {
-        coinbase_outputs(H, t, c as usize, &p2tr("finder"), fees, &[7; 32])
-            .unwrap()
-            .0
+        coinbase_outputs(
+            H,
+            NodePoolNetwork::Regtest.halving(),
+            t,
+            c as usize,
+            &p2tr("finder"),
+            fees,
+            &[7; 32],
+        )
+        .unwrap()
+        .0
     };
     let mut o = outs(&table, class);
     let finder = o.len() - 3;
@@ -1017,7 +1025,10 @@ fn template(k: u64) -> NewTemplate<'static> {
         coinbase_tx_version: 2,
         coinbase_prefix: prefix.try_into().unwrap(),
         coinbase_tx_input_sequence: u32::MAX,
-        coinbase_tx_value_remaining: ghost_common::canonical_payout::subsidy(H) + fees_of(k),
+        coinbase_tx_value_remaining: ghost_common::canonical_payout::subsidy(
+            H,
+            NodePoolNetwork::Regtest.halving(),
+        ) + fees_of(k),
         coinbase_tx_outputs_count: 1,
         coinbase_tx_outputs: bitcoin::consensus::serialize(&witness).try_into().unwrap(),
         coinbase_tx_locktime: 0,

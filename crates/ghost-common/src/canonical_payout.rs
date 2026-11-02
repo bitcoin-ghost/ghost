@@ -54,7 +54,8 @@ use sha2::{Digest, Sha256};
 
 use crate::node_pool_constants::{
     FACE_PER_SAT, HALVING_INTERVAL, INITIAL_SUBSIDY_SATS, LEDGER_COMMITMENT_MAGIC, MIN_PAYOUT_SATS,
-    PAYOUT_FLOOR_FACE, SNAPSHOT_CUT_LAG, TREASURY_DIVISOR, TREASURY_SCRIPT_PLACEHOLDER,
+    PAYOUT_FLOOR_FACE, REGTEST_HALVING_INTERVAL, SNAPSHOT_CUT_LAG, TREASURY_DIVISOR,
+    TREASURY_SCRIPT_PLACEHOLDER,
 };
 use crate::node_pool_u256::U256;
 
@@ -119,9 +120,35 @@ pub struct Payout {
     pub top_partial: bool,
 }
 
-/// Bitcoin block subsidy at height `h`, in sats.
-pub fn subsidy(h: u32) -> u64 {
-    let n = h / HALVING_INTERVAL;
+/// The subsidy schedule of the Bitcoin network a share chain runs on: blocks between halvings.
+///
+/// Mainnet, signet and testnet halve every 210,000 blocks; regtest halves every 150
+/// (`nSubsidyHalvingInterval` in Core's chain parameters). Every height-to-subsidy reading in the
+/// payout rule takes it, so a regtest node prices shares and builds coinbases on regtest's
+/// schedule, and the era guard (share rule 5) splits at regtest's halvings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Halving(u32);
+
+impl Halving {
+    /// Mainnet, signet and testnet: every 210,000 blocks.
+    pub const MAINNET: Halving = Halving(HALVING_INTERVAL);
+    /// Regtest: every 150 blocks.
+    pub const REGTEST: Halving = Halving(REGTEST_HALVING_INTERVAL);
+
+    /// Blocks between halvings.
+    pub fn interval(self) -> u32 {
+        self.0
+    }
+
+    /// The subsidy era of height `h`: how many halvings have happened by it.
+    pub fn era(self, h: u32) -> u32 {
+        h / self.0
+    }
+}
+
+/// Bitcoin block subsidy at height `h` on schedule `halving`, in sats.
+pub fn subsidy(h: u32, halving: Halving) -> u64 {
+    let n = halving.era(h);
     if n >= 64 {
         0
     } else {
@@ -130,8 +157,8 @@ pub fn subsidy(h: u32) -> u64 {
 }
 
 /// `(treasury base, miner pool Rm)` at height `h`.
-pub fn split(h: u32) -> (u64, u64) {
-    let s = subsidy(h);
+pub fn split(h: u32, halving: Halving) -> (u64, u64) {
+    let s = subsidy(h, halving);
     let t = s / TREASURY_DIVISOR;
     (t, s - t)
 }
@@ -152,8 +179,13 @@ pub fn split_slots(n: usize) -> (usize, usize) {
 /// `T` is decoded from the share's own header `nbits` exactly as the reference does (mantissa
 /// `nbits & 0x007FFFFF`, the sign bit ignored); `h` is the share's job height. The product is
 /// carried in 256 bits; a result that leaves 256 bits, or does not fit a balance, is an error.
-pub fn share_face(tier_log2: u32, nbits: u32, h: u32) -> Result<u128, PayoutError> {
-    let (_, rm) = split(h);
+pub fn share_face(
+    tier_log2: u32,
+    nbits: u32,
+    h: u32,
+    halving: Halving,
+) -> Result<u128, PayoutError> {
+    let (_, rm) = split(h, halving);
     let exp = (nbits >> 24) as i64;
     let mant = (nbits & 0x007F_FFFF) as u128;
     let num = U256::mul_u128(rm as u128, mant)
@@ -300,8 +332,14 @@ pub fn queue_position(table: &Table, script: &[u8]) -> Result<Option<QueuePositi
 
 /// What block `h` built on `table` with `slots` miner outputs pays `script`, in sats (0 if it is
 /// not paid). [`build_outputs`]' own answer.
-pub fn paid_to(h: u32, table: &Table, slots: usize, script: &[u8]) -> Result<u64, PayoutError> {
-    Ok(build_outputs(h, table, slots)?
+pub fn paid_to(
+    h: u32,
+    halving: Halving,
+    table: &Table,
+    slots: usize,
+    script: &[u8],
+) -> Result<u64, PayoutError> {
+    Ok(build_outputs(h, halving, table, slots)?
         .outputs
         .iter()
         .find(|(a, _)| a.as_slice() == script)
@@ -309,8 +347,13 @@ pub fn paid_to(h: u32, table: &Table, slots: usize, script: &[u8]) -> Result<u64
 }
 
 /// What block `h` pays from `table` with `slots` miner outputs. Reads nothing but its arguments.
-pub fn build_outputs(h: u32, table: &Table, slots: usize) -> Result<Payout, PayoutError> {
-    let (tre, rm) = split(h);
+pub fn build_outputs(
+    h: u32,
+    halving: Halving,
+    table: &Table,
+    slots: usize,
+) -> Result<Payout, PayoutError> {
+    let (tre, rm) = split(h, halving);
     let (old, big) = select(table, slots)?;
     let mut left = rm;
     let mut outputs: Vec<(Script, u64)> = Vec::new();
@@ -504,13 +547,14 @@ pub fn witness_script(wtxid_commitment: &[u8; 32]) -> Script {
 /// nothing. Returns `(value, script)` pairs and the retirements.
 pub fn coinbase_outputs(
     h: u32,
+    halving: Halving,
     table: &Table,
     slots: usize,
     finder_script: &[u8],
     finder_value: u64,
     witness_commitment: &[u8; 32],
 ) -> Result<(Vec<CoinbaseOutput>, Vec<Retirement>), PayoutError> {
-    let pay = build_outputs(h, table, slots)?;
+    let pay = build_outputs(h, halving, table, slots)?;
     let mut o = Vec::with_capacity(pay.outputs.len() + 4);
     o.push((pay.treasury, TREASURY_SCRIPT_PLACEHOLDER.to_vec()));
     o.extend(pay.outputs.into_iter().map(|(a, p)| (p, a)));
@@ -540,14 +584,18 @@ pub fn ledger_root_of(outputs: &[CoinbaseOutput]) -> Option<[u8; 32]> {
 /// 1,000 sats, so the miners are the unique run after the treasury that brings the sum to the
 /// subsidy; at most one output (the finder) may follow before the commitment. Each miner output
 /// retires its value exactly. `None` if the outputs do not have that shape.
-pub fn provisional_retirements(h: u32, outputs: &[CoinbaseOutput]) -> Option<Vec<Retirement>> {
+pub fn provisional_retirements(
+    h: u32,
+    halving: Halving,
+    outputs: &[CoinbaseOutput],
+) -> Option<Vec<Retirement>> {
     ledger_root_of(outputs)?;
     let body = &outputs[..outputs.len() - 2];
     let (treasury, rest) = body.split_first()?;
     if treasury.1 != TREASURY_SCRIPT_PLACEHOLDER {
         return None;
     }
-    let s = subsidy(h);
+    let s = subsidy(h, halving);
     let mut sum = treasury.0;
     let mut miners = 0;
     while sum < s {
@@ -697,13 +745,16 @@ mod tests {
                     let (old_n, _) = select(&t, slots).unwrap();
                     let in_old = old_n.iter().any(|x| x.0 == script);
                     assert_eq!(in_old, p.age_rank.is_some_and(|r| r <= o), "{seed} {class}");
-                    let out = build_outputs(H, &t, slots).unwrap();
+                    let out = build_outputs(H, Halving::MAINNET, &t, slots).unwrap();
                     let want = out
                         .outputs
                         .iter()
                         .find(|(a, _)| a == script)
                         .map_or(0, |x| x.1);
-                    assert_eq!(paid_to(H, &t, slots, script).unwrap(), want);
+                    assert_eq!(
+                        paid_to(H, Halving::MAINNET, &t, slots, script).unwrap(),
+                        want
+                    );
                 }
             }
             assert_eq!(queue_position(&t, &p2tr("absent")).unwrap(), None);
@@ -776,7 +827,7 @@ mod tests {
 
     /// Port of the reference's `check_invariants`.
     fn check_invariants(h: u32, table: &Table, res: &Payout, slots: usize) {
-        let (t, rm) = split(h);
+        let (t, rm) = split(h, Halving::MAINNET);
         let outs = &res.outputs;
         let paid: u64 = outs.iter().map(|(_, p)| p).sum();
         assert_eq!(res.treasury + paid, t + rm, "treasury + miners != subsidy");
@@ -924,7 +975,7 @@ mod tests {
                 "see main(): snap" => snap(),
                 "snap after block 1" => {
                     let mut s = snap();
-                    let r1 = build_outputs(H, &s, 500).unwrap();
+                    let r1 = build_outputs(H, Halving::MAINNET, &s, 500).unwrap();
                     apply_block(&mut s, &r1.retired).unwrap();
                     s
                 }
@@ -966,7 +1017,7 @@ mod tests {
             let slots = v["slots"].as_u64().unwrap() as usize;
             let table = input_for(v);
             assert_eq!(table.len() as u64, v["n_input"].as_u64().unwrap(), "{name}");
-            let p = build_outputs(h, &table, slots).unwrap();
+            let p = build_outputs(h, Halving::MAINNET, &table, slots).unwrap();
             check_invariants(h, &table, &p, slots);
             let miner_total: u64 = p.outputs.iter().map(|(_, x)| x).sum();
             assert_eq!(p.treasury, v["treasury"].as_u64().unwrap(), "{name}");
@@ -1002,11 +1053,22 @@ mod tests {
                         123_456
                     },
                 );
-                let (o, ret) =
-                    coinbase_outputs(h, &table, slots, &sf("finder"), finder, &[0; 32]).unwrap();
+                let (o, ret) = coinbase_outputs(
+                    h,
+                    Halving::MAINNET,
+                    &table,
+                    slots,
+                    &sf("finder"),
+                    finder,
+                    &[0; 32],
+                )
+                .unwrap();
                 assert_eq!(o.len() as u64, n.as_u64().unwrap(), "{name}");
                 assert_eq!(ret, p.retired);
-                assert_eq!(o.iter().map(|x| x.0).sum::<u64>(), subsidy(h) + finder);
+                assert_eq!(
+                    o.iter().map(|x| x.0).sum::<u64>(),
+                    subsidy(h, Halving::MAINNET) + finder
+                );
                 let bytes = v["output_section_bytes"].as_u64().unwrap();
                 assert_eq!(outputs_bytes(&o) as u64, bytes);
                 let d = v["output_digest"].as_str().unwrap();
@@ -1018,7 +1080,7 @@ mod tests {
             if let Some(r) = v.get("root_before") {
                 let mut pre = reorg_pre();
                 assert_eq!(hex::encode(table_root(&pre)), r.as_str().unwrap());
-                let a = build_outputs(H, &pre, 500).unwrap();
+                let a = build_outputs(H, Halving::MAINNET, &pre, 500).unwrap();
                 let undo = apply_block(&mut pre, &a.retired).unwrap();
                 let ra = v["root_after_A"].as_str().unwrap();
                 assert_eq!(hex::encode(table_root(&pre)), ra);
@@ -1055,7 +1117,10 @@ mod tests {
         }
         let t_h = table_for(H, &credits, &BTreeMap::new()).unwrap();
         assert_eq!(t_h, parse_table(first["input"].as_object().unwrap()));
-        let blocks = BTreeMap::from([(H, build_outputs(H, &t_h, 9).unwrap().retired)]);
+        let blocks = BTreeMap::from([(
+            H,
+            build_outputs(H, Halving::MAINNET, &t_h, 9).unwrap().retired,
+        )]);
         let t_h1 = table_for(H + 1, &credits, &blocks).unwrap();
         assert_eq!(t_h1, parse_table(second["input"].as_object().unwrap()));
         assert_eq!(
@@ -1082,28 +1147,37 @@ mod tests {
         assert_eq!(f["nbits"].as_str(), Some("0x17021be5"));
         let s = |x: u128| x.to_string();
         assert_eq!(
-            s(share_face(10, nb, H).unwrap()),
+            s(share_face(10, nb, H, Halving::MAINNET).unwrap()),
             f["face"].as_str().unwrap()
         );
-        assert_eq!(s(share_face(10, nb, H).unwrap()), "10246338");
         assert_eq!(
-            s(share_face(40, nb, H).unwrap()),
+            s(share_face(10, nb, H, Halving::MAINNET).unwrap()),
+            "10246338"
+        );
+        assert_eq!(
+            s(share_face(40, nb, H, Halving::MAINNET).unwrap()),
             f["tier40"].as_str().unwrap()
         );
-        let after = share_face(10, nb, 1_050_000).unwrap();
+        let after = share_face(10, nb, 1_050_000, Halving::MAINNET).unwrap();
         assert_eq!(s(after), f["after_halving"].as_str().unwrap());
-        assert_eq!(share_face(10, nb, 1_049_999).unwrap(), 2 * after);
+        assert_eq!(
+            share_face(10, nb, 1_049_999, Halving::MAINNET).unwrap(),
+            2 * after
+        );
         // A product that leaves 256 bits is refused, not wrapped.
-        assert_eq!(share_face(250, 0x2000_ffff, H), Err(PayoutError::Overflow));
+        assert_eq!(
+            share_face(250, 0x2000_ffff, H, Halving::MAINNET),
+            Err(PayoutError::Overflow)
+        );
     }
 
     #[test]
     fn reference_arithmetic_constants() {
-        assert_eq!(split(H), (1_562_500, 310_937_500));
-        assert_eq!(split(1_050_000), (781_250, 155_468_750));
+        assert_eq!(split(H, Halving::MAINNET), (1_562_500, 310_937_500));
+        assert_eq!(split(1_050_000, Halving::MAINNET), (781_250, 155_468_750));
         assert_eq!(cut(H), Some(H - 20));
         assert_eq!(cut(19), None);
-        assert_eq!(subsidy(64 * HALVING_INTERVAL), 0);
+        assert_eq!(subsidy(64 * HALVING_INTERVAL, Halving::MAINNET), 0);
         let mut want = p2tr("placeholder treasury, compiled constant, see plan section 5");
         assert_eq!(
             TREASURY_SCRIPT_PLACEHOLDER.to_vec(),
@@ -1151,7 +1225,7 @@ mod tests {
         let refs: Vec<(&str, i128, u32)> =
             rows.iter().map(|(a, o, q)| (a.as_str(), *o, *q)).collect();
         let mid = st(&refs);
-        let res = build_outputs(H, &mid, 9).unwrap();
+        let res = build_outputs(H, Halving::MAINNET, &mid, 9).unwrap();
         let paid: Vec<u64> = res.outputs.iter().map(|x| x.1).collect();
         assert_eq!(
             paid,
@@ -1177,7 +1251,7 @@ mod tests {
 
         // The sub-sat remainder of a fully paid balance stays owed and its queue clears.
         let mut frac = st(&[("f", 7_777 * ONE + ONE - 1, 3)]);
-        let res = build_outputs(H, &frac, 9).unwrap();
+        let res = build_outputs(H, Halving::MAINNET, &frac, 9).unwrap();
         apply_block(&mut frac, &res.retired).unwrap();
         assert_eq!(res.outputs, vec![(p2tr("f"), 7_777)]);
         assert_eq!(
@@ -1206,8 +1280,26 @@ mod tests {
             };
             s.insert(p2tr(&format!("feetop{i}")), b);
         }
-        let (a, _) = coinbase_outputs(H, &s, 500, &p2tr("nodeA"), 1_000_000, &[1; 32]).unwrap();
-        let (b, _) = coinbase_outputs(H, &s, 500, &p2tr("nodeB"), 40_000_000, &[2; 32]).unwrap();
+        let (a, _) = coinbase_outputs(
+            H,
+            Halving::MAINNET,
+            &s,
+            500,
+            &p2tr("nodeA"),
+            1_000_000,
+            &[1; 32],
+        )
+        .unwrap();
+        let (b, _) = coinbase_outputs(
+            H,
+            Halving::MAINNET,
+            &s,
+            500,
+            &p2tr("nodeB"),
+            40_000_000,
+            &[2; 32],
+        )
+        .unwrap();
         assert_eq!(a.len(), 504);
         assert_eq!(a[..501], b[..501]);
         assert_eq!(a[502], b[502]);
@@ -1230,7 +1322,16 @@ mod tests {
                 },
             ),
         ]);
-        let (o, ret) = coinbase_outputs(H, &sf, 500, &p2tr("nodeA"), 9_999, &[0; 32]).unwrap();
+        let (o, ret) = coinbase_outputs(
+            H,
+            Halving::MAINNET,
+            &sf,
+            500,
+            &p2tr("nodeA"),
+            9_999,
+            &[0; 32],
+        )
+        .unwrap();
         assert_eq!(o.iter().filter(|x| x.1 == p2tr("nodeA")).count(), 2);
         assert_eq!(ret.iter().filter(|x| x.0 == p2tr("nodeA")).count(), 1);
     }
@@ -1259,7 +1360,7 @@ mod tests {
             let mut h = H;
             for blk in 0..25usize {
                 let sl = SLOT_CLASSES[(seed as usize + blk) % 6] as usize;
-                let res = build_outputs(h, &o, sl).unwrap();
+                let res = build_outputs(h, Halving::MAINNET, &o, sl).unwrap();
                 check_invariants(h, &o, &res, sl);
                 apply_block(&mut o, &res.retired).unwrap();
                 assert!(o.values().all(|b| b.owed >= 0), "negative balance");
@@ -1301,7 +1402,7 @@ mod tests {
                     hist.push((true, b.into_iter().collect(), h));
                 } else if !live.is_empty() {
                     let sl = SLOT_CLASSES[r.below(6) as usize] as usize;
-                    let res = build_outputs(h, &live, sl).unwrap();
+                    let res = build_outputs(h, Halving::MAINNET, &live, sl).unwrap();
                     check_invariants(h, &live, &res, sl);
                     undos.push(apply_block(&mut live, &res.retired).unwrap());
                     hist.push((false, res.retired, h));

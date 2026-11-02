@@ -54,7 +54,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use ghost_common::canonical_payout::{table_root, Table};
+use ghost_common::canonical_payout::{table_root, Halving, Table};
 use ghost_common::node_pool_genesis_export::read_export;
 use ghost_common::node_pool_network::NodePoolNetwork;
 use ghost_common::node_pool_u256::U256;
@@ -121,6 +121,7 @@ pub struct ChainConfig {
 
 /// Share-chain data from a running relay node.
 pub struct RelayChain {
+    halving: Halving,
     tables: mpsc::Sender<TableRequest>,
     status: watch::Receiver<RelayStatus>,
     blocks: Arc<dyn BlockSource>,
@@ -129,8 +130,13 @@ pub struct RelayChain {
 
 impl RelayChain {
     /// Wrap a running relay and the Bitcoin source its settlement reads.
-    pub fn from_handle(handle: RelayHandle, blocks: Arc<dyn BlockSource>) -> RelayChain {
+    pub fn from_handle(
+        handle: RelayHandle,
+        blocks: Arc<dyn BlockSource>,
+        halving: Halving,
+    ) -> RelayChain {
         RelayChain {
+            halving,
             tables: handle.tables,
             status: handle.status,
             blocks,
@@ -168,6 +174,10 @@ impl ShareChainData for RelayChain {
             .await
             .ok()?;
         tokio::time::timeout(TABLE_TIMEOUT, rx).await.ok()?.ok()?
+    }
+
+    fn halving(&self) -> Halving {
+        self.halving
     }
 }
 
@@ -306,12 +316,10 @@ pub async fn start_share_chain_on(
         table,
     };
     let view = SettledView::load(&db).map_err(|e| format!("settlement view: {e}"))?;
-    let relay = Relay::open(
-        RelayParams::new(genesis, cfg.tier_base),
-        db.clone(),
-        archive,
-    )
-    .map_err(|e| format!("relay: {e}"))?;
+    let halving = cfg.genesis_table.network.halving();
+    let mut params = RelayParams::new(genesis, cfg.tier_base);
+    params.halving = halving;
+    let relay = Relay::open(params, db.clone(), archive).map_err(|e| format!("relay: {e}"))?;
     let settlement = Settlement::new(db, view, cfg.genesis_height);
     let net = NetConfig {
         listen: None,
@@ -330,7 +338,7 @@ pub async fn start_share_chain_on(
     )
     .await
     .map_err(|e| format!("relay: {e}"))?;
-    Ok(RelayChain::from_handle(handle, blocks))
+    Ok(RelayChain::from_handle(handle, blocks, halving))
 }
 
 #[cfg(test)]

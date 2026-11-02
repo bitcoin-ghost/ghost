@@ -60,8 +60,11 @@ pub const MAX_MINER_OUTPUTS: u16 = 500;
 /// Bitcoin subsidy before the first halving, in sats.
 pub const INITIAL_SUBSIDY_SATS: u64 = 5_000_000_000;
 
-/// Blocks per subsidy era.
+/// Blocks per subsidy era on mainnet, signet and testnet.
 pub const HALVING_INTERVAL: u32 = 210_000;
+
+/// Regtest's halving interval (Core's regtest `nSubsidyHalvingInterval`).
+pub const REGTEST_HALVING_INTERVAL: u32 = 150;
 
 /// PLACEHOLDER treasury output script. NOT the real treasury: the user supplies the address later
 /// (plan section 5, item 1), and this constant must be replaced before any network uses it.

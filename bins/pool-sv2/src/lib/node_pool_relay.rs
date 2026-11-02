@@ -407,6 +407,16 @@ pub async fn start_with_parts(
         params.checkpoint_depth = d;
     }
     params.prune = cfg.prune;
+    params.halving = net_start.network.halving();
+    if np.halving() != params.halving {
+        return Err(format!(
+            "the job layer is on a {}-block halving schedule but the relay's network {} halves \
+             every {} blocks",
+            np.halving().interval(),
+            net_start.network,
+            params.halving.interval()
+        ));
+    }
     let (checkpoint_depth, prune) = (params.checkpoint_depth, params.prune);
     let relay = Relay::open(params, db.clone(), archive).map_err(|e| format!("relay: {e}"))?;
     let rpc = || {
@@ -530,7 +540,13 @@ mod tests {
             .unwrap()
             .relay
             .unwrap();
-        let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20);
+        // A job layer on mainnet's halvings under a regtest relay is refused: its coinbases
+        // would pay the wrong subsidy above height 149.
+        let mainnet = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20);
+        let e = start(&cfg, &mainnet).await.err().expect("refused");
+        assert!(e.contains("halves every 150 blocks"), "{e}");
+        let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20)
+            .with_halving(NodePoolNetwork::Regtest.halving());
         let mut bad = cfg.clone();
         bad.genesis_anchor = "zz".into();
         assert!(start(&bad, &np).await.is_err());
@@ -704,7 +720,8 @@ mod tests {
             .unwrap()
             .relay
             .unwrap();
-        let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20);
+        let np = NodePool::from_parts([0x7A; 32], vec![0x51, 0x20], 60.0, 20)
+            .with_halving(NodePoolNetwork::Regtest.halving());
         cfg.genesis_table_digest = Some("12".repeat(32));
         let Err(e) = start(&cfg, &np).await else {
             panic!("a mismatched digest must refuse")

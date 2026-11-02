@@ -79,12 +79,12 @@ use ghost_common::anchor_chain::{
     AncestryError, AnchorChain, AnchorError, AnchorHash, AnchorHeader, ShareId,
 };
 use ghost_common::canonical_payout::{
-    cut, provisional_retirements, table_for_from, table_root, Retirement, Script, Table,
+    cut, provisional_retirements, table_for_from, table_root, Halving, Retirement, Script, Table,
 };
 use ghost_common::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::node_pool_constants::{
-    ANCHOR_TIER_OFFSET, HALVING_INTERVAL, PARENT_ANCHOR_TAG_LEN, SHARE_HEIGHT_WINDOW,
+    ANCHOR_TIER_OFFSET, PARENT_ANCHOR_TAG_LEN, SHARE_HEIGHT_WINDOW,
 };
 use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::{
@@ -187,6 +187,10 @@ pub struct RelayParams {
     pub prune: bool,
     /// Batches requested at once while syncing.
     pub sync_inflight: usize,
+    /// The Bitcoin network's subsidy schedule (`NodePoolNetwork::halving`): what shares are priced
+    /// at, what coinbases pay, and where the era guard splits. Mainnet's by default; a regtest
+    /// relay must set regtest's.
+    pub halving: Halving,
 }
 
 impl RelayParams {
@@ -206,6 +210,7 @@ impl RelayParams {
             checkpoint_interval: sync::DEFAULT_CHECKPOINT_INTERVAL,
             prune: false,
             sync_inflight: 32,
+            halving: Halving::MAINNET,
         }
     }
 }
@@ -800,6 +805,11 @@ impl Relay {
             .ok()
     }
 
+    /// The subsidy schedule shares and coinbases are judged on.
+    pub fn halving(&self) -> Halving {
+        self.p.halving
+    }
+
     /// The archive share checks read Bitcoin blocks from.
     pub fn archive(&self) -> &Arc<BtcArchive> {
         &self.archive
@@ -1295,6 +1305,7 @@ impl Relay {
             // Validity cannot depend on a local clock; the future bound is relay policy.
             max_time: u32::MAX,
             table: &table,
+            halving: self.p.halving,
         };
         let sub = ShareSubmission {
             header: &s.header,
@@ -1441,6 +1452,7 @@ impl Relay {
             .into_iter()
             .filter(|a| self.chain.is_ancestor(a, inc))
             .collect();
+        let halving = self.p.halving;
         let paid = || {
             let (cb, _) = b.coinbase.as_ref().expect("a pool block has its coinbase");
             let outs: Vec<(u64, Script)> = cb
@@ -1448,7 +1460,7 @@ impl Relay {
                 .iter()
                 .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
                 .collect();
-            provisional_retirements(b.height, &outs)
+            provisional_retirements(b.height, halving, &outs)
         };
         if cands.is_empty() {
             return Ok(paid());
@@ -1488,7 +1500,9 @@ impl Relay {
             return Ok(None);
         };
         let r = match self.table_for_job(a, b.height, &b.prev()) {
-            Ok(t) if table_root(&t) == root => settle_outputs(cb, &t, b.height).map(|(_, r)| r),
+            Ok(t) if table_root(&t) == root => {
+                settle_outputs(cb, &t, b.height, self.p.halving).map(|(_, r)| r)
+            }
             Ok(_) | Err(TableErr::Arith(_)) => None,
             Err(e) => return Err(e),
         };
@@ -2137,12 +2151,13 @@ impl Relay {
             .expect("best")
             .btc_height
             .max(self.btc_tip);
-        let era = (b + 1) / HALVING_INTERVAL;
+        let halving = self.p.halving;
+        let era = halving.era(b + 1);
         let mut cands: Vec<(u32, ShareId)> = self
             .loose
             .iter()
             .filter(|(_, l)| l.job_height + SHARE_HEIGHT_WINDOW >= b + BATCH_MARGIN)
-            .filter(|(_, l)| l.job_height / HALVING_INTERVAL == era)
+            .filter(|(_, l)| halving.era(l.job_height) == era)
             .map(|(i, l)| (l.job_height, *i))
             .collect();
         cands.sort_unstable();

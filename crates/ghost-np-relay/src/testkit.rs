@@ -40,7 +40,7 @@ use bitcoin::{
 use sha2::{Digest, Sha256};
 
 use ghost_common::anchor_chain::AnchorHash;
-use ghost_common::canonical_payout::{coinbase_outputs, Balance, Script, Table};
+use ghost_common::canonical_payout::{coinbase_outputs, Balance, Halving, Script, Table};
 use ghost_common::coinbase_tags::{encode_node_tag, encode_payout_tag};
 use ghost_common::node_pool_constants::{ANCHOR_TIER_OFFSET, FACE_PER_SAT};
 use ghost_common::node_pool_u256::U256;
@@ -346,9 +346,16 @@ impl Miner {
             parent_anchor: job.parent_anchor,
             batch_root: job.batch_root,
         };
-        let (outs, _) =
-            coinbase_outputs(h, table, SLOTS as usize, &p2tr("finder"), 25_000, &[9; 32])
-                .expect("outputs");
+        let (outs, _) = coinbase_outputs(
+            h,
+            Halving::MAINNET,
+            table,
+            SLOTS as usize,
+            &p2tr("finder"),
+            25_000,
+            &[9; 32],
+        )
+        .expect("outputs");
         let mut sig = bitcoin::script::Builder::new()
             .push_int(h as i64)
             .into_bytes();

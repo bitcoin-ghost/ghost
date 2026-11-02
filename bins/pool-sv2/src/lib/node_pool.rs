@@ -63,7 +63,7 @@ use std::{
 };
 
 use ghost_common::{
-    canonical_payout::{coinbase_outputs, outputs_digest, subsidy, CoinbaseOutput, Table},
+    canonical_payout::{coinbase_outputs, outputs_digest, subsidy, CoinbaseOutput, Halving, Table},
     coinbase_tags::{encode_node_tag, encode_payout_tag, PAYOUT_ID_LEN, PAYOUT_TAG_MAGIC},
     node_pool_constants::SLOT_CLASSES,
     sanitize_for_log,
@@ -203,6 +203,7 @@ pub struct NodePool {
     finder_script: Vec<u8>,
     table_source: Mutex<Option<mpsc::Sender<TableRequest>>>,
     stats: Arc<MinerStats>,
+    halving: Halving,
 }
 
 /// Where accepted shares go when `[node_pool.relay]` runs: the relay's local queue, and the tier
@@ -231,7 +232,20 @@ impl NodePool {
             finder_script,
             table_source: Mutex::new(None),
             stats: Arc::new(MinerStats::in_memory(now_secs())),
+            halving: Halving::MAINNET,
         }
+    }
+
+    /// The same job layer on the subsidy schedule of `halving` (the relay's network). Mainnet's
+    /// by default.
+    pub fn with_halving(mut self, halving: Halving) -> Self {
+        self.halving = halving;
+        self
+    }
+
+    /// The subsidy schedule jobs are built on.
+    pub fn halving(&self) -> Halving {
+        self.halving
     }
 
     /// The same job layer recording shares into `stats` (W2.17).
@@ -276,12 +290,15 @@ impl NodePool {
         let min_shares = cfg
             .sensing_min_shares
             .unwrap_or(SensingParams::default().min_shares);
-        Ok(Self::from_parts(
-            *tb.node_id(),
-            finder_script,
-            shares_per_minute,
-            min_shares,
-        ))
+        // The subsidy follows the relay's network: regtest halves every 150 blocks.
+        let halving = match &cfg.relay {
+            Some(r) => r.network()?.halving(),
+            None => Halving::MAINNET,
+        };
+        Ok(
+            Self::from_parts(*tb.node_id(), finder_script, shares_per_minute, min_shares)
+                .with_halving(halving),
+        )
     }
 
     /// The finder script for a fee address: one of the four payee classes, like any payee.
@@ -398,7 +415,10 @@ impl NodePool {
     /// What a template gives the coinbase: its height, its witness commitment (its only output)
     /// and its fees (the value above the subsidy). A template that does not have that shape
     /// comes from a template provider that is not running the node pool.
-    pub fn template_parts(template: &NewTemplate<'_>) -> Result<(u32, [u8; 32], u64), String> {
+    pub fn template_parts(
+        &self,
+        template: &NewTemplate<'_>,
+    ) -> Result<(u32, [u8; 32], u64), String> {
         let h = Self::template_height(template).ok_or("template has no BIP34 height")?;
         let template_outputs = deserialize_template_outputs(
             template.coinbase_tx_outputs.to_vec(),
@@ -423,12 +443,12 @@ impl NodePool {
         }
         let fees = template
             .coinbase_tx_value_remaining
-            .checked_sub(subsidy(h))
+            .checked_sub(subsidy(h, self.halving))
             .ok_or_else(|| {
                 format!(
                     "template value {} is below the subsidy {} at height {h}",
                     template.coinbase_tx_value_remaining,
-                    subsidy(h)
+                    subsidy(h, self.halving)
                 )
             })?;
         Ok((h, commitment, fees))
@@ -448,7 +468,7 @@ impl NodePool {
         slot_class: u16,
         template: &NewTemplate<'_>,
     ) -> Result<(Vec<TxOut>, [u8; 32]), String> {
-        let (h, commitment, fees) = Self::template_parts(template)?;
+        let (h, commitment, fees) = self.template_parts(template)?;
         let table = self.cached_table(parent, h).unwrap_or_else(|| {
             error!(
                 height = h,
@@ -460,6 +480,7 @@ impl NodePool {
         });
         let (outs, _) = coinbase_outputs(
             h,
+            self.halving,
             &table,
             slot_class as usize,
             &self.finder_script,
@@ -1165,11 +1186,12 @@ mod tests {
         let table = owed_table(600);
         np.insert_table(parent, H, Arc::new(table.clone()));
         let fees = 4_321;
-        let t = np_template(subsidy(H) + fees);
+        let t = np_template(subsidy(H, Halving::MAINNET) + fees);
         for class in SLOT_CLASSES {
             let (reward, digest) = np.canonical_outputs(&parent, class, &t).unwrap();
             let (want, _) = coinbase_outputs(
                 H,
+                Halving::MAINNET,
                 &table,
                 class as usize,
                 np.finder_script(),
@@ -1196,13 +1218,13 @@ mod tests {
         let np = pool(1);
         np.insert_table([1; 32], H, Arc::new(owed_table(5)));
         let (reward, _) = np
-            .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H)))
+            .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H, Halving::MAINNET)))
             .unwrap();
         let got = full(&reward);
         assert_eq!(got.len(), 1 + 5 + 2, "treasury, 5 miners, GHNP, witness");
         assert!(got.iter().all(|o| o.1 != np.finder_script()));
         let (reward, _) = np
-            .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H) + 1))
+            .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H, Halving::MAINNET) + 1))
             .unwrap();
         assert_eq!(full(&reward)[6], (1, np.finder_script().to_vec()));
     }
@@ -1211,11 +1233,15 @@ mod tests {
     fn a_job_without_its_table_pays_the_subsidy_to_the_treasury() {
         let np = pool(1);
         let (reward, _) = np
-            .canonical_outputs(&[9; 32], 500, &np_template(subsidy(H) + 7))
+            .canonical_outputs(
+                &[9; 32],
+                500,
+                &np_template(subsidy(H, Halving::MAINNET) + 7),
+            )
             .unwrap();
         let got = full(&reward);
         assert_eq!(got.len(), 4, "treasury, finder, GHNP, witness");
-        assert_eq!(got[0].0, subsidy(H));
+        assert_eq!(got[0].0, subsidy(H, Halving::MAINNET));
         assert_eq!(
             got[2].1,
             ghost_common::canonical_payout::commitment_script(
@@ -1225,16 +1251,44 @@ mod tests {
     }
 
     #[test]
+    fn a_regtest_template_past_the_halving_carries_a_canonical_coinbase() {
+        // Regtest's block 150 is worth 25 BTC: the job layer on regtest's schedule takes it and
+        // pays treasury plus miners that much; on mainnet's it would read as short.
+        let mut t = np_template(2_500_000_000 + 7);
+        let push = ghost_common::coinbase_tags::bip34_height_push(150);
+        let mut p = push.clone();
+        p.extend_from_slice(&encode_payout_tag(&[0xC3; 16]));
+        p.extend_from_slice(&encode_node_tag(&node_commitment_plain(&NODE)));
+        t.coinbase_prefix = p.try_into().unwrap();
+        assert!(pool(2)
+            .template_parts(&t)
+            .unwrap_err()
+            .contains("below the subsidy 5000000000 at height 150"));
+        let np = pool(2).with_halving(Halving::REGTEST);
+        assert_eq!(np.template_parts(&t).unwrap().2, 7, "the fees");
+        np.insert_table([3; 32], 150, Arc::new(owed_table(40)));
+        let (outs, _) = np.canonical_outputs(&[3; 32], 9, &t).unwrap();
+        let total: u64 = outs.iter().map(|o| o.value.to_sat()).sum();
+        assert_eq!(
+            total,
+            2_500_000_000 + 7,
+            "treasury and miners, then the finder's fees"
+        );
+        assert!(outs.len() > 3, "the owed balances are paid");
+    }
+
+    #[test]
     fn a_template_that_cannot_carry_a_canonical_coinbase_is_refused() {
-        let ok = np_template(subsidy(H));
-        assert!(NodePool::template_parts(&ok).is_ok());
-        let low = np_template(subsidy(H) - 1);
-        assert!(NodePool::template_parts(&low)
+        let ok = np_template(subsidy(H, Halving::MAINNET));
+        assert!(pool(2).template_parts(&ok).is_ok());
+        let low = np_template(subsidy(H, Halving::MAINNET) - 1);
+        assert!(pool(2)
+            .template_parts(&low)
             .unwrap_err()
             .contains("below the subsidy"));
         let mut no_height = ok.clone();
         no_height.coinbase_prefix = vec![0x09].try_into().unwrap();
-        assert!(NodePool::template_parts(&no_height).is_err());
+        assert!(pool(2).template_parts(&no_height).is_err());
         // The old template provider's shape: every output built, nothing left to the pool.
         let mut old = ok.clone();
         let mut outs = vec![];
@@ -1246,7 +1300,8 @@ mod tests {
         old.coinbase_tx_outputs_count = 2;
         old.coinbase_tx_outputs = outs.try_into().unwrap();
         old.coinbase_tx_value_remaining = 0;
-        assert!(NodePool::template_parts(&old)
+        assert!(pool(2)
+            .template_parts(&old)
             .unwrap_err()
             .contains("2 outputs"));
         let mut not_witness = ok.clone();
@@ -1254,7 +1309,7 @@ mod tests {
         o.push(34);
         o.extend(NodePool::fee_script(FEE).unwrap());
         not_witness.coinbase_tx_outputs = o.try_into().unwrap();
-        assert!(NodePool::template_parts(&not_witness).is_err());
+        assert!(pool(2).template_parts(&not_witness).is_err());
     }
 
     fn swapped_for_submit(outs: &[TxOut]) -> Vec<TxOut> {
@@ -1275,7 +1330,7 @@ mod tests {
             batch_root: [0xBB; 32],
         });
         np.insert_table([0xAA; 32], H, Arc::new(owed_table(50)));
-        let t = np_template(subsidy(H) + 99);
+        let t = np_template(subsidy(H, Halving::MAINNET) + 99);
         np.stamp(key, ChannelKind::Standard, ADDR, &target());
         let reward = np.job_outputs(key, &t).unwrap();
         np.bind_job(key, 5);

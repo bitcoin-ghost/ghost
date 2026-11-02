@@ -991,7 +991,7 @@ impl NodePoolApi {
                 input.age_rank = pos.and_then(|p| p.age_rank);
                 input.eligible_count = count;
                 input.paid_next_at_typical = typical_outputs(&block_outputs)
-                    .and_then(|n| paid_to(next.height, t, n, script).ok());
+                    .and_then(|n| paid_to(next.height, self.halving(), t, n, script).ok());
             }
         }
         input.block_outputs = block_outputs;

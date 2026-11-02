@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use ghost_common::{
     canonical_payout::{
-        coinbase_outputs, outputs_bytes, outputs_digest, subsidy, Balance, CoinbaseOutput, Table,
+        coinbase_outputs, outputs_bytes, outputs_digest, subsidy, Balance, CoinbaseOutput, Halving,
+        Table,
     },
     coinbase_tags::{encode_node_tag, encode_payout_tag, extract_node_tag, extract_payout_tag},
     node_pool_constants::{FACE_PER_SAT, SLOT_CLASSES},
@@ -385,7 +386,7 @@ fn a_full_class_job_pays_the_reference_goldens() {
             parent_anchor: [0xA1; 32],
             batch_root: [0xB2; 32],
         });
-        let template = template_at(9, true, h, subsidy(h) + fees, [0; 32]);
+        let template = template_at(9, true, h, subsidy(h, Halving::MAINNET) + fees, [0; 32]);
         np.on_new_template(&template);
         np.insert_table([0xA1; 32], h, Arc::new(table.clone()));
 
@@ -418,7 +419,16 @@ fn a_full_class_job_pays_the_reference_goldens() {
             v["output_section_bytes"].as_u64().unwrap(),
             "{name}"
         );
-        let (want, _) = coinbase_outputs(h, &table, 500, &finder_script, fees, &[0; 32]).unwrap();
+        let (want, _) = coinbase_outputs(
+            h,
+            Halving::MAINNET,
+            &table,
+            500,
+            &finder_script,
+            fees,
+            &[0; 32],
+        )
+        .unwrap();
         assert_eq!(got, want, "{name}");
         assert_eq!(
             got.iter().filter(|o| o.0 == 0).count(),
@@ -427,7 +437,7 @@ fn a_full_class_job_pays_the_reference_goldens() {
         );
         assert_eq!(
             got.iter().map(|o| o.0).sum::<u64>(),
-            subsidy(h) + fees,
+            subsidy(h, Halving::MAINNET) + fees,
             "{name}"
         );
         assert_eq!(np.check_block(key, id, &tx), Ok(()), "{name}");
@@ -449,7 +459,7 @@ fn every_slot_class_job_pays_its_canonical_outputs() {
             parent_anchor: [0xA1; 32],
             batch_root: [0xB2; 32],
         });
-        let template = template_at(1, false, h, subsidy(h) + fees, [0x11; 32]);
+        let template = template_at(1, false, h, subsidy(h, Halving::MAINNET) + fees, [0x11; 32]);
         np.on_new_template(&template);
         np.insert_table([0xA1; 32], h, Arc::new(table.clone()));
         let mut channel = extended();
@@ -458,7 +468,7 @@ fn every_slot_class_job_pays_its_canonical_outputs() {
         let stamp = np.stamp(KEY, ChannelKind::Extended, ADDR, channel.get_target());
         channel.set_tier_commitment(Some(stamp));
         let (reward, _) = np.canonical_outputs(&[0xA1; 32], class, &template).unwrap();
-        let future = template_at(2, true, h, subsidy(h) + fees, [0x11; 32]);
+        let future = template_at(2, true, h, subsidy(h, Halving::MAINNET) + fees, [0x11; 32]);
         channel
             .on_new_template(np.prepare_template(&future), reward)
             .unwrap();
@@ -467,6 +477,7 @@ fn every_slot_class_job_pays_its_canonical_outputs() {
         let got = outputs_of(&coinbase(&channel, &job));
         let (want, _) = coinbase_outputs(
             h,
+            Halving::MAINNET,
             &table,
             class as usize,
             &p2tr("finder"),

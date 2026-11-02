@@ -52,7 +52,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use ghost_common::canonical_payout::{
-    build_outputs, ledger_root_of, subsidy, table_root, CoinbaseOutput, Table,
+    build_outputs, ledger_root_of, subsidy, table_root, CoinbaseOutput, Halving, Table,
 };
 use ghost_common::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use ghost_common::node_pool_constants::{
@@ -72,6 +72,8 @@ pub trait ShareChainData: Send + Sync {
     /// The table a job of height `h` on Bitcoin block `prev`, built on anchor `parent`, must pay.
     /// `None` while the parent anchor or a Bitcoin block on the way is not held.
     async fn table(&self, parent: &[u8; 32], h: u32, prev: &[u8; 32]) -> Option<Arc<Table>>;
+    /// The network's subsidy schedule, which every coinbase is judged on.
+    fn halving(&self) -> Halving;
 }
 
 /// The overall verdict on one job.
@@ -245,6 +247,7 @@ pub fn classify_outputs(
     coinbase: &Transaction,
     table: &Table,
     h: u32,
+    halving: Halving,
     slot_class: u16,
 ) -> Result<(), (FailReason, String)> {
     let actual: Vec<CoinbaseOutput> = coinbase
@@ -275,13 +278,12 @@ pub fn classify_outputs(
             ),
         ));
     }
-    if check_outputs(coinbase, table, h, slot_class as usize).is_ok() {
+    if check_outputs(coinbase, table, h, halving, slot_class as usize).is_ok() {
         return Ok(());
     }
-    if let Some(c) = SLOT_CLASSES
-        .iter()
-        .find(|c| **c != slot_class && check_outputs(coinbase, table, h, **c as usize).is_ok())
-    {
+    if let Some(c) = SLOT_CLASSES.iter().find(|c| {
+        **c != slot_class && check_outputs(coinbase, table, h, halving, **c as usize).is_ok()
+    }) {
         return Err((
             FailReason::WrongSlotClass,
             format!(
@@ -289,7 +291,7 @@ pub fn classify_outputs(
             ),
         ));
     }
-    let pay = build_outputs(h, table, slot_class as usize)
+    let pay = build_outputs(h, halving, table, slot_class as usize)
         .map_err(|e| (FailReason::OutputsNotCanonical, format!("payout rule: {e}")))?;
     let body = &actual[1..n - 2];
     // The finder is laid out last. An unowed script there is read as the finder, so a payee
@@ -357,7 +359,7 @@ pub fn classify_outputs(
             format!("pays {} {a} sats; canonical is {w}", short(s)),
         ));
     }
-    let s = subsidy(h);
+    let s = subsidy(h, halving);
     let core = actual[0].0 + miners.iter().map(|(v, _)| *v).sum::<u64>();
     if core < s {
         let to = finder.map_or("nowhere in the outputs".to_string(), |f| short(&f.1));
@@ -541,7 +543,7 @@ pub async fn audit_job(
         );
         return r;
     };
-    match classify_outputs(cb, &table, h, open.slot_class) {
+    match classify_outputs(cb, &table, h, data.halving(), open.slot_class) {
         Ok(()) => {
             r.verdict = Verdict::Pass;
             r.detail = format!(
@@ -600,6 +602,9 @@ pub(crate) mod tests {
         async fn table(&self, _: &[u8; 32], _: u32, _: &[u8; 32]) -> Option<Arc<Table>> {
             self.table.clone()
         }
+        fn halving(&self) -> Halving {
+            Halving::MAINNET
+        }
     }
 
     /// A job being built; tests change one field.
@@ -656,6 +661,7 @@ pub(crate) mod tests {
         fn outputs_on(&self, t: &Table, class: u16) -> Vec<CoinbaseOutput> {
             coinbase_outputs(
                 H,
+                Halving::MAINNET,
                 t,
                 class as usize,
                 &p2tr("finder"),

@@ -1438,7 +1438,12 @@ impl TemplateProcessor {
         let w = self.current_work.read();
         let w = w.as_ref()?;
         let h = u32::try_from(w.height).ok()?;
-        let (treasury_base_sat, miner_pool_sat) = ghost_common::canonical_payout::split(h);
+        use ghost_common::canonical_payout::{split, Halving};
+        let halving = match self.config.network {
+            BitcoinNetwork::Regtest => Halving::REGTEST,
+            _ => Halving::MAINNET,
+        };
+        let (treasury_base_sat, miner_pool_sat) = split(h, halving);
         Some(serde_json::json!({
             "height": w.height,
             "subsidy_sat": w.subsidy,

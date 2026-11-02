@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use ghost_common::{
-    canonical_payout::{build_outputs, select, split_slots, Balance},
+    canonical_payout::{build_outputs, select, split_slots, Balance, Halving},
     node_pool_network::{NetworkStart, StartSource},
     node_pool_u256::U256,
     share_commit::ShareTagPreimage,
@@ -319,7 +319,7 @@ async fn the_queue_position_is_canonical_payouts_on_the_same_table() {
             let (oldest, largest) = select(t, slots).unwrap();
             assert_eq!(c.oldest_slots, split_slots(slots).0);
             assert_eq!(c.in_oldest, oldest.iter().any(|x| *x.0 == script));
-            let paid = build_outputs(NEXT, t, slots)
+            let paid = build_outputs(NEXT, Halving::MAINNET, t, slots)
                 .unwrap()
                 .outputs
                 .into_iter()
@@ -446,8 +446,10 @@ async fn the_status_has_its_documented_shape() {
     assert_eq!(s.recent_blocks.len(), 2);
     let b = &s.recent_blocks[0];
     assert_eq!((b.height, b.status), (960, "provisional"));
-    let (base, rm) = split(960);
-    assert_eq!(b.subsidy_sats, subsidy(960));
+    // A regtest relay: block 960 is in regtest era 6 (150-block halvings), not mainnet era 0.
+    let (base, rm) = split(960, Halving::REGTEST);
+    assert_eq!(b.subsidy_sats, subsidy(960, Halving::REGTEST));
+    assert_eq!(b.subsidy_sats, 5_000_000_000 >> 6);
     assert_eq!(b.treasury_base_sats, base);
     assert_eq!(b.miners_paid_sats, 1_000);
     assert_eq!(b.treasury_change_sats, rm as i64 - 1_000);

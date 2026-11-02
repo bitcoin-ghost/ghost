@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use bitcoin::hashes::Hash;
 use ghost_common::anchor_chain::AnchorHash;
-use ghost_common::canonical_payout::{share_face, Script, Table};
+use ghost_common::canonical_payout::{share_face, Halving, Script, Table};
 use ghost_common::share_commit::batch_root;
 use ghost_storage::Database;
 
@@ -85,7 +85,7 @@ fn mine_only(s: &mut Sim, i: usize) -> crate::wire::NetShare {
 }
 
 fn face() -> i128 {
-    share_face(10, BITS, START_TIP + 1).unwrap() as i128
+    share_face(10, BITS, START_TIP + 1, Halving::MAINNET).unwrap() as i128
 }
 
 #[test]

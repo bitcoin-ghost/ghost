@@ -346,11 +346,12 @@ async fn rebuild(
         stamps.recent.len(),
     );
     let tables = Arc::new(tables);
+    let halving = data.halving();
     let n_ext = on_prev.len();
     let found = tokio::task::spawn_blocking(move || {
         on_prev
             .iter()
-            .find_map(|e| rebuild_standard(&job, e, &payee_v, &node_id, &tables, h))
+            .find_map(|e| rebuild_standard(&job, e, &payee_v, &node_id, &tables, h, halving))
     })
     .await
     .ok()

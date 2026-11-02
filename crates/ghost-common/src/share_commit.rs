@@ -43,12 +43,11 @@ use bitcoin::{CompactTarget, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::canonical_payout::{
-    build_outputs, coinbase_outputs, share_face, PayoutError, Retirement, Table,
+    build_outputs, coinbase_outputs, share_face, Halving, PayoutError, Retirement, Table,
 };
 use crate::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use crate::node_pool_constants::{
-    HALVING_INTERVAL, PARENT_ANCHOR_TAG_LEN, SHARE_HEIGHT_WINDOW, SHARE_TAG_DOMAIN, SHARE_TAG_LEN,
-    SLOT_CLASSES,
+    PARENT_ANCHOR_TAG_LEN, SHARE_HEIGHT_WINDOW, SHARE_TAG_DOMAIN, SHARE_TAG_LEN, SLOT_CLASSES,
 };
 use crate::node_pool_u256::U256;
 
@@ -313,6 +312,8 @@ pub struct ShareContext<'a> {
     pub max_time: u32,
     /// The snapshot `S(H)` with retirements through `H - 1` applied: what the coinbase must pay.
     pub table: &'a Table,
+    /// The network's subsidy schedule.
+    pub halving: Halving,
 }
 
 /// A share that passed rules 1 to 5.
@@ -391,8 +392,8 @@ impl From<PayoutError> for ShareError {
 
 /// Era of the including anchor: its job height is `btc_height + 1`, since `btc_height` is the
 /// Bitcoin tip its job saw.
-fn same_era(job_height: u32, anchor_btc_height: u32) -> bool {
-    job_height / HALVING_INTERVAL == anchor_btc_height.saturating_add(1) / HALVING_INTERVAL
+fn same_era(job_height: u32, anchor_btc_height: u32, halving: Halving) -> bool {
+    halving.era(job_height) == halving.era(anchor_btc_height.saturating_add(1))
 }
 
 /// Rules 1 to 5 of spec 2.1, in that order. Returns the credit the share earns.
@@ -441,7 +442,13 @@ pub fn verify_share(
     }
 
     // 4. Outputs are the canonical outputs plus finder and commitments.
-    let retired = check_outputs(coinbase, ctx.table, job_height, tag.slot_class as usize)?;
+    let retired = check_outputs(
+        coinbase,
+        ctx.table,
+        job_height,
+        ctx.halving,
+        tag.slot_class as usize,
+    )?;
 
     // 5. BIP34 height, layout tag, bits, time, and the job height window.
     let bip34 = bitcoin::script::Builder::new()
@@ -465,11 +472,16 @@ pub fn verify_share(
             anchor: ctx.anchor_btc_height,
         });
     }
-    if !same_era(job_height, ctx.anchor_btc_height) {
+    if !same_era(job_height, ctx.anchor_btc_height, ctx.halving) {
         return Err(ShareError::Era);
     }
 
-    let face = share_face(credited_tier as u32, header.bits.to_consensus(), job_height)?;
+    let face = share_face(
+        credited_tier as u32,
+        header.bits.to_consensus(),
+        job_height,
+        ctx.halving,
+    )?;
     Ok(VerifiedShare {
         job_height,
         credited_tier,
@@ -484,6 +496,7 @@ pub fn check_outputs(
     coinbase: &Transaction,
     table: &Table,
     job_height: u32,
+    halving: Halving,
     slots: usize,
 ) -> Result<Vec<Retirement>, ShareError> {
     let actual: Vec<(u64, Vec<u8>)> = coinbase
@@ -491,7 +504,9 @@ pub fn check_outputs(
         .iter()
         .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
         .collect();
-    let canonical = 1 + build_outputs(job_height, table, slots)?.outputs.len();
+    let canonical = 1 + build_outputs(job_height, halving, table, slots)?
+        .outputs
+        .len();
     let finder = match actual.len().checked_sub(canonical + 2) {
         Some(0) => None,
         Some(1) => Some(&actual[canonical]),
@@ -509,6 +524,7 @@ pub fn check_outputs(
     let (finder_script, finder_value) = finder.map_or((&[][..], 0), |f| (&f.1[..], f.0));
     let (want, retired) = coinbase_outputs(
         job_height,
+        halving,
         table,
         slots,
         finder_script,
@@ -530,9 +546,10 @@ pub fn settle_outputs(
     coinbase: &Transaction,
     table: &Table,
     job_height: u32,
+    halving: Halving,
 ) -> Option<(u16, Vec<Retirement>)> {
     SLOT_CLASSES.iter().find_map(|c| {
-        check_outputs(coinbase, table, job_height, *c as usize)
+        check_outputs(coinbase, table, job_height, halving, *c as usize)
             .ok()
             .map(|r| (*c, r))
     })
@@ -581,6 +598,7 @@ mod tests {
         parent_tag: [u8; 16],
         outputs: Option<Vec<(u64, Vec<u8>)>>,
         bip34_height: u32,
+        halving: Halving,
     }
 
     impl Fixture {
@@ -603,6 +621,7 @@ mod tests {
                 script_sig_tag: None,
                 outputs: None,
                 bip34_height: height,
+                halving: Halving::MAINNET,
             }
         }
 
@@ -611,6 +630,7 @@ mod tests {
                 let slots = self.tag.slot_class as usize;
                 let (o, _) = coinbase_outputs(
                     self.height,
+                    self.halving,
                     &self.table,
                     slots,
                     &p2tr("finder"),
@@ -675,6 +695,7 @@ mod tests {
                 median_time_past: 1_799_999_000,
                 max_time: 1_800_007_200,
                 table: &self.table,
+                halving: self.halving,
             }
         }
 
@@ -795,8 +816,10 @@ mod tests {
         let v = f.verify().unwrap();
         assert_eq!(v.job_height, H);
         assert_eq!(v.credited_tier, 3, "max(T_net 3, committed 2)");
-        assert_eq!(v.face, share_face(3, BITS, H).unwrap());
-        let want = build_outputs(H, &f.table, 9).unwrap().retired;
+        assert_eq!(v.face, share_face(3, BITS, H, Halving::MAINNET).unwrap());
+        let want = build_outputs(H, Halving::MAINNET, &f.table, 9)
+            .unwrap()
+            .retired;
         assert_eq!(v.retired, want);
         // Without a finder output too.
         let mut f = Fixture::new(H);
@@ -949,6 +972,44 @@ mod tests {
         assert_eq!(f.verify_with(&header, &tx, &ctx), Err(ShareError::Era));
     }
 
+    /// Regtest halves every 150 blocks: a share's face and coinbase follow regtest's subsidy, and
+    /// the era guard splits at 150, not 210,000.
+    #[test]
+    fn regtest_shares_price_and_split_eras_on_regtest_halvings() {
+        let mut f = Fixture::new(149);
+        f.halving = Halving::REGTEST;
+        let (header, tx) = f.mine();
+        let mut ctx = f.ctx();
+        ctx.anchor_btc_height = 147;
+        let v = f.verify_with(&header, &tx, &ctx).expect("same regtest era");
+        assert_eq!(v.face, share_face(3, BITS, 149, Halving::REGTEST).unwrap());
+        ctx.anchor_btc_height = 149;
+        assert_eq!(f.verify_with(&header, &tx, &ctx), Err(ShareError::Era));
+
+        // At 150 the coinbase pays regtest's 25 BTC; one paying mainnet's 50 is not canonical.
+        let mut f = Fixture::new(150);
+        f.halving = Halving::REGTEST;
+        let (header, tx) = f.mine();
+        let mut ctx = f.ctx();
+        ctx.anchor_btc_height = 150;
+        let v = f.verify_with(&header, &tx, &ctx).expect("regtest era 1");
+        assert_eq!(
+            v.face * 2,
+            share_face(3, BITS, 149, Halving::REGTEST).unwrap()
+        );
+        let paid: u64 = tx.output[..tx.output.len() - 3]
+            .iter()
+            .map(|o| o.value.to_sat())
+            .sum();
+        assert_eq!(paid, 2_500_000_000, "treasury plus miners");
+        let mainnet = Fixture::new(150);
+        let (header, tx) = mainnet.mine();
+        assert_eq!(
+            mainnet.verify_with(&header, &tx, &ctx),
+            Err(ShareError::OutputsMismatch)
+        );
+    }
+
     #[test]
     fn settlement_matches_any_class_and_reads_provisional_retirements() {
         use crate::canonical_payout::{ledger_root_of, provisional_retirements, table_root};
@@ -962,21 +1023,22 @@ mod tests {
                 .iter()
                 .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
                 .collect();
-            let (got_class, retired) = settle_outputs(&tx, &f.table, H).expect("canonical");
+            let (got_class, retired) =
+                settle_outputs(&tx, &f.table, H, Halving::MAINNET).expect("canonical");
             // Classes are tried smallest first; 30 balances make 3, 9 and 44 all differ.
-            let want = check_outputs(&tx, &f.table, H, class as usize).unwrap();
+            let want = check_outputs(&tx, &f.table, H, Halving::MAINNET, class as usize).unwrap();
             assert_eq!(retired, want, "class {class}");
             assert_eq!(got_class, class);
             assert_eq!(ledger_root_of(&outs), Some(table_root(&f.table)));
             assert_eq!(
-                provisional_retirements(H, &outs),
+                provisional_retirements(H, Halving::MAINNET, &outs),
                 Some(want),
                 "class {class}"
             );
             // Another table: no class matches.
             let mut other = f.table.clone();
             other.pop_first();
-            assert_eq!(settle_outputs(&tx, &other, H), None);
+            assert_eq!(settle_outputs(&tx, &other, H, Halving::MAINNET), None);
         }
     }
 
@@ -988,28 +1050,40 @@ mod tests {
         let good = f.outputs();
         let mut no_commitment = good.clone();
         no_commitment.remove(no_commitment.len() - 2);
-        assert_eq!(provisional_retirements(H, &no_commitment), None);
+        assert_eq!(
+            provisional_retirements(H, Halving::MAINNET, &no_commitment),
+            None
+        );
         let mut wrong_treasury = good.clone();
         wrong_treasury[0].1 = p2tr("someone");
-        assert_eq!(provisional_retirements(H, &wrong_treasury), None);
+        assert_eq!(
+            provisional_retirements(H, Halving::MAINNET, &wrong_treasury),
+            None
+        );
         let mut two_finders = good.clone();
         two_finders.insert(good.len() - 2, (5, p2tr("x")));
-        assert_eq!(provisional_retirements(H, &two_finders), None);
+        assert_eq!(
+            provisional_retirements(H, Halving::MAINNET, &two_finders),
+            None
+        );
         let mut short = good.clone();
         short[1].0 -= 1;
         assert_eq!(
-            provisional_retirements(H, &short),
+            provisional_retirements(H, Halving::MAINNET, &short),
             None,
             "does not sum to the subsidy"
         );
         let treasury_only = vec![
             (
-                crate::canonical_payout::subsidy(H),
+                crate::canonical_payout::subsidy(H, Halving::MAINNET),
                 TREASURY_SCRIPT_PLACEHOLDER.to_vec(),
             ),
             good[good.len() - 2].clone(),
             good[good.len() - 1].clone(),
         ];
-        assert_eq!(provisional_retirements(H, &treasury_only), Some(vec![]));
+        assert_eq!(
+            provisional_retirements(H, Halving::MAINNET, &treasury_only),
+            Some(vec![])
+        );
     }
 }

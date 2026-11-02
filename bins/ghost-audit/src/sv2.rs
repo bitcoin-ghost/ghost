@@ -56,7 +56,7 @@ use stratum_apps::stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining
 use stratum_apps::utils::protocol_message_type::{protocol_message_type, MessageType};
 use tokio::net::TcpStream;
 
-use ghost_common::canonical_payout::{coinbase_outputs, ledger_root_of, subsidy, Table};
+use ghost_common::canonical_payout::{coinbase_outputs, ledger_root_of, subsidy, Halving, Table};
 use ghost_common::coinbase_tags::{
     encode_node_tag, encode_payout_tag, extract_node_tag, extract_payout_tag,
     MAX_DIFFICULTY_TIER_LOG2, MIN_DIFFICULTY_TIER_LOG2,
@@ -742,6 +742,7 @@ pub fn rebuild_standard(
     node_id: &[u8; 32],
     tables: &[(JobAnchor, std::sync::Arc<Table>)],
     h: u32,
+    halving: Halving,
 ) -> Option<Job> {
     let cb = &ext.job.coinbase;
     let input = cb.input.first()?;
@@ -769,7 +770,7 @@ pub fn rebuild_standard(
     let g = outs.len() - 2;
     let template_tail = &outs[g + 1..];
     let total = outs.iter().try_fold(0u64, |a, (v, _)| a.checked_add(*v))?;
-    let fees = total.checked_sub(subsidy(h))?;
+    let fees = total.checked_sub(subsidy(h, halving))?;
     let finder: Vec<u8> = if fees > 0 {
         outs.get(g.checked_sub(1)?)?.1.clone()
     } else {
@@ -787,7 +788,7 @@ pub fn rebuild_standard(
         // The full class first: pool_sv2 serves it to every standard channel.
         for class in SLOT_CLASSES.into_iter().rev() {
             let Ok((canon, _)) =
-                coinbase_outputs(h, table, class as usize, &finder, fees, &[0; 32])
+                coinbase_outputs(h, halving, table, class as usize, &finder, fees, &[0; 32])
             else {
                 continue;
             };
