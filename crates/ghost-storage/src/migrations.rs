@@ -30,14 +30,14 @@ use ghost_common::error::{GhostError, GhostResult};
 /// Current schema version
 const SCHEMA_VERSION: u32 = 65;
 
-/// [`SCHEMA_VERSION`], for code outside this module (tests, tools).
+/// The schema version this binary migrates to, for code outside this module (tests, tools).
 pub const LATEST_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 
 /// The first schema version stored negated in `PRAGMA user_version` (v65, the node pool cutover).
 ///
 /// Every binary from before v65 reads `user_version` as a `u32` when it opens the database, and a
 /// negative value fails that read, so an old binary refuses a v65 database at open instead of
-/// running against the tables v65 dropped ([`crate::migration_v65`]). Versions below this one
+/// running against the tables v65 dropped (`migration_v65.rs`). Versions below this one
 /// are stored as they always were.
 pub const FIRST_NEGATED_SCHEMA_VERSION: u32 = 65;
 
