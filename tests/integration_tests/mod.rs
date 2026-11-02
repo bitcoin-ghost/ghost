@@ -21,7 +21,6 @@
 pub mod buds_classification;
 pub mod config_validation;
 pub mod cryptography;
-pub mod discovery_security;
 pub mod e2e;
 pub mod edge_cases;
 pub mod helpers;

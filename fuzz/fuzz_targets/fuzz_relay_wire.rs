@@ -17,40 +17,31 @@
 //| REPO: https://github.com/bitcoin-ghost                                                                               |
 //| WEB: https://bitcoinghost.org/                                                                                       |
 //| LICENSE: MIT                                                                                                         |
-//| FILE: lib.rs                                                                                                         |
+//| FILE: fuzz_relay_wire.rs                                                                                             |
 //|======================================================================================================================|
 
-//! Ghost Consensus - P2P Mesh and BFT Voting
+//! Fuzz target for the node pool share-chain relay's wire decoder.
 //!
-//! This crate provides the consensus layer for Bitcoin Ghost:
-//!
-//! - **P2P Mesh**: ZMQ PUB/SUB for discovery/health, Noise-encrypted TCP for point-to-point traffic
-//! - **Peer Discovery**: Gossip-based peer discovery
-//! - **Health Monitoring**: Peer health pings and liveness
-//!
-//! Votes, payout checkpoints and share gossip are gone: miners' balances are the node pool
-//! relay's, which has its own transport.
+//! Every byte a relay peer sends goes through `Message::read_header` and
+//! `Message::decode_payload` before anything else looks at it, so neither may panic on any
+//! input. A frame that decodes must also re-encode to a frame that decodes to the same message.
 
-#![deny(unreachable_pub)]
+#![no_main]
 
-pub mod ban_manager;
-pub mod broadcast;
-pub mod discovery_handler;
-pub mod health_handler;
-pub mod mesh;
-pub mod message;
-pub mod message_validator;
-pub mod noise;
-pub mod noise_fragment;
-pub mod noise_pool;
-pub mod peer;
+use ghost_np_relay::wire::{FrameHead, Message, FRAME_HEADER_LEN};
+use libfuzzer_sys::fuzz_target;
 
-pub use ban_manager::*;
-pub use discovery_handler::*;
-pub use health_handler::*;
-pub use mesh::*;
-pub use message::*;
-pub use message_validator::*;
-pub use noise::*;
-pub use noise_pool::*;
-pub use peer::*;
+fuzz_target!(|data: &[u8]| {
+    if let Some(h) = data
+        .get(..FRAME_HEADER_LEN)
+        .and_then(|h| <&[u8; FRAME_HEADER_LEN]>::try_from(h).ok())
+    {
+        if let Ok(FrameHead::Known(t, _)) = Message::read_header(h) {
+            let _ = Message::decode_payload(t, &data[FRAME_HEADER_LEN..]);
+        }
+    }
+    if let Ok(m) = Message::decode(data) {
+        let again = Message::decode(&m.encode()).expect("a decoded message re-encodes");
+        assert_eq!(again, m, "re-encoding changed the message");
+    }
+});

@@ -57,7 +57,7 @@ USER ghost
 WORKDIR /var/lib/ghost
 
 # Expose ports
-EXPOSE 34255 3333 8080 8555-8562
+EXPOSE 34255 3333 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

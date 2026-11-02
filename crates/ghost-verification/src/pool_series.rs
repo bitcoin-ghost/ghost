@@ -20,11 +20,12 @@ use std::collections::VecDeque;
 pub struct PoolSample {
     /// Unix timestamp (seconds) the sample was taken.
     pub t: i64,
-    /// Mesh-wide pool hashrate (TH/s) — sum of every node's realized hashrate.
+    /// Kept under its old name for the dashboard: this node's hashrate (TH/s), as
+    /// `local_hashrate_th`. The old mesh that summed it across nodes was removed.
     pub mesh_hashrate_th: f64,
     /// This node's own realized hashrate (TH/s).
     pub local_hashrate_th: f64,
-    /// Mesh-wide deduplicated connected-miner count.
+    /// Miners active on this node in the shared active-miner window.
     pub miners: u32,
     /// Local ghostd mempool transaction count at sample time (`getmempoolinfo.size`).
     /// `#[serde(default)]` so samples serialised before this field deserialise as 0.

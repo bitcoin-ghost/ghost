@@ -25,7 +25,6 @@
 //! Main entry point for the Ghost Pool node:
 //!
 //! - BUDS-filtered block templates served to the co-located pool_sv2 over TDP
-//! - the P2P mesh (health pings and peer discovery)
 //! - round statistics and the operator API
 //!
 //! Miners' balances and every coinbase are the node pool's, in pool_sv2.
@@ -44,15 +43,11 @@ use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::prelude::*;
 
 use ghost_common::config::{NodeConfig, ReaperSettings};
-use ghost_common::constants::ACTIVE_MINER_WINDOW_SECS;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::signer::SignerConfig;
 use ghost_common::zmq::{ZmqConfig, ZmqSubscriber};
-use ghost_consensus::ban_manager::BanManager;
-use ghost_consensus::health_handler::HealthPingHandler;
-use ghost_consensus::mesh::{MeshConfig, MeshNetwork};
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
 use ghost_storage::Database;
@@ -68,48 +63,9 @@ use ghost_pool::template_provider::{TdpConfig, TemplateDistributionServer};
 /// Used when config is updated via API and requires restart to apply
 const EXIT_CODE_RESTART: i32 = 100;
 
-/// Trailing window for the per-node realized hashrate gossiped in health pings
-/// and summed into the mesh-wide pool total. 10 minutes smooths small-miner
-/// share variance while still tracking real changes within a few minutes.
-const MESH_HASHRATE_WINDOW_SECS: i64 = 600;
-
-/// Records windows gossiped in health pings: `(name, cutoff_secs)`. MUST match
-/// the windows the `/api/v1/pool/records` endpoint serves so the gossiped best
-/// merges 1:1 with the local DB best per window.
-const RECORD_WINDOWS: [(&str, i64); 4] = [
-    ("block", 600),
-    ("day", 86_400),
-    ("week", 604_800),
-    ("month", 2_592_000),
-];
-
-/// Build this node's best (rarest) valid share per records window from the
-/// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
-/// miner_id, achieved difficulty from the hash). Gossiped in health pings so
-/// the mesh converges on the pool-wide rarest record per window. Windows with
-/// no local share are omitted (a receiving node just won't get a term from us).
-fn build_local_best_records(
-    db: &ghost_storage::Database,
-) -> Vec<ghost_common::types::WindowBestRecord> {
-    let now_s = chrono::Utc::now().timestamp();
-    let mut out = Vec::with_capacity(RECORD_WINDOWS.len());
-    for (window, cutoff) in RECORD_WINDOWS {
-        if let Ok(Some(best)) = db.get_best_share_since(now_s - cutoff) {
-            out.push(ghost_common::types::WindowBestRecord {
-                window: window.to_string(),
-                // `best.share_hash` is INTERNAL order: feed it to the difficulty
-                // fn as-is, but gossip the DISPLAY form so receiving nodes rank
-                // it by rarity (string `<`) and serve it consistently with their
-                // own display-order endpoint output.
-                difficulty: ghost_verification::share_difficulty_from_hash_hex(&best.share_hash),
-                miner_id_redacted: ghost_verification::redact_miner_id(&best.miner_id),
-                share_hash: ghost_verification::internal_hex_to_display_hex(&best.share_hash),
-                timestamp: best.timestamp,
-            });
-        }
-    }
-    out
-}
+/// Trailing window for this node's realized hashrate. 10 minutes smooths small-miner share
+/// variance while still tracking real changes within a few minutes.
+const LOCAL_HASHRATE_WINDOW_SECS: i64 = 600;
 
 /// H-8 SECURITY: Static storage for ZMQ subscriber to prevent memory leak.
 /// Previously used std::mem::forget which intentionally leaked memory.
@@ -219,10 +175,9 @@ impl GspHandler for CachedGspHandler {
 
 /// What a node should report as its own hashrate, given a query outcome.
 ///
-/// Pure so the failure path can actually be tested — the failure path is the whole point. Both the
-/// mesh gossip and the HTTP route used to call `.unwrap_or(0.0)` here, so a node whose database was
-/// too slow to answer announced ZERO hashes to the entire mesh. That is indistinguishable from
-/// having no miners and logged nothing. It hid 94 TH/s on ghost-vm5 (88% of the pool) behind a
+/// Pure so the failure path can actually be tested — the failure path is the whole point. The
+/// HTTP route used to call `.unwrap_or(0.0)` here, so a node whose database was too slow to answer
+/// reported ZERO hashes. That is indistinguishable from having no miners and logged nothing. It hid 94 TH/s on ghost-vm5 (88% of the pool) behind a
 /// database stalled by #554, and the public site reported 13.8 TH/s against a real ~107 TH/s.
 ///
 /// `query` is `None` when the database could not answer. A genuine idle node returns `Some(0.0)`
@@ -457,7 +412,7 @@ fn print_local_status(h: &serde_json::Value) {
     println!("Block height:{}", g("block_height"));
     println!("Round:       {}", g("round_id"));
     println!("Miners:      {}", g("miner_count"));
-    println!("Peers:       {}", g("peer_count"));
+    println!("Relay peers: {}", g("peer_count"));
     println!("Uptime (s):  {}", g("uptime_secs"));
     println!(
         "Bitcoin RPC: {}",
@@ -814,7 +769,7 @@ async fn main() -> Result<()> {
         reaper_config.reject_legacy_data_stuffing,
     );
 
-    // Register this node in the database (peer tracking and discovery).
+    // Register this node in the database (its own row: uptime and the swarm page).
     let node_id_hex = identity.node_id_hex();
     if let Err(e) = db.register_node(
         &node_id_hex,
@@ -830,52 +785,11 @@ async fn main() -> Result<()> {
     // Prometheus metrics
     let metrics = Metrics::default_metrics();
 
-    // #913: publish the reassembly budget, and say what it is once at startup.
-    //
-    // The budget defends memory correctly and almost invisibly: a refusal or eviction drops the
-    // message and never tells the sender, because erroring would tear the connection down. The
-    // visible consequence surfaces elsewhere as checkpoint tree-sync churn, with nothing
-    // connecting it back. The only other signal is a warn rate-limited to one line per 10s, which
-    // makes a sustained eviction storm and a single eviction look nearly identical in the journal.
-    //
-    // The startup line matters on its own: GHOST_REASSEMBLY_BUDGET_BYTES appears in no config,
-    // unit or deploy script, so without this there is no way to tell from a running node what
-    // budget it is actually enforcing — the override could be set, ignored, or absent.
-    {
-        let (limit, per_conn) = ghost_consensus::noise_fragment::global_budget().limits();
-        info!(
-            limit_bytes = limit,
-            per_conn_bytes = per_conn,
-            limit_mib = limit / (1024 * 1024),
-            per_conn_mib = per_conn / (1024 * 1024),
-            "Noise fragment reassembly budget"
-        );
-
-        // Sampled rather than pushed from the hot path: the budget's counters are the source of
-        // truth and this mirrors them, so a missed tick cannot make the totals drift the way
-        // accumulating deltas would. 10s matches the eviction-log interval and sits under a
-        // typical scrape.
-        let budget_metrics = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            let budget = ghost_consensus::noise_fragment::global_budget();
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                let (held, evictions, rejections) = budget.stats();
-                budget_metrics.reassembly_held_bytes.set(held as i64);
-                budget_metrics.reassembly_evictions.set(evictions as i64);
-                budget_metrics.reassembly_rejections.set(rejections as i64);
-            }
-        });
-    }
-
     // Rounds, for statistics: one per template.
-    let is_mainnet_round = config.bitcoin.network == ghost_common::config::BitcoinNetwork::Mainnet;
     let round_manager = Arc::new(RoundManager::new(RoundConfig::default()));
 
-    // Seed the chain height so `/health` and the health pings report a real height before the
-    // first template arrives. A failure here is not fatal: the first template still sets it.
+    // Seed the chain height so `/health` reports a real height before the first template
+    // arrives. A failure here is not fatal: the first template still sets it.
     match rpc.get_block_count().await {
         Ok(h) => {
             round_manager.seed_height(h);
@@ -959,78 +873,13 @@ async fn main() -> Result<()> {
     // SRI pool connects to ghost-mining's TDP server for templates
     // SRI translator handles SV1 miners on port 3333
 
-    // Initialize the P2P mesh (health pings and discovery)
-    // C-1: Enable Noise Protocol encryption for sensitive P2P traffic
-    let noise_keypair_path = data_dir.join("noise.key");
-    let mesh_config = MeshConfig {
-        public_address: config
-            .network
-            .public_address
-            .clone()
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
-        ports: config.network.p2p.clone(),
-        // SV1 tier listeners, so peers can route by tier (#495). Every node is a pool node.
-        //
-        // The farm port is `None` unless the operator configured one. A node that advertises a
-        // farm port it does not listen on turns a routing decision into a dropped connection,
-        // so the safe direction is to say nothing.
-        advertised_hobby_port: Some(config.network.sv1_port),
-        advertised_farm_port: config.network.farm_port,
-        // C-1: Noise Protocol configuration for encrypted P2P
-        // Read from config (mainnet validation ensures this is true on mainnet)
-        noise_enabled: config.network.noise_enabled,
-        noise_port: ghost_consensus::mesh::DEFAULT_NOISE_PORT,
-        noise_keypair_path: Some(noise_keypair_path),
-        noise_required: true,
-        // Persist the outbound mesh sequence so a restart resumes above its
-        // prior value instead of resetting to 0 (which peers reject as replays).
-        sequence_persist_path: Some(data_dir.join("mesh_sequence")),
-        // Persist the INBOUND per-sender high-water marks so a restart does not reopen the
-        // replay window that the dedup cache's 300-second eviction leaves behind (H-11).
-        peer_sequence_persist_path: Some(data_dir.join("mesh_peer_sequences.json")),
-        ..Default::default()
-    };
-    // M-2: Use try_new() to properly handle Noise initialization failures
-    let mut mesh_inner = MeshNetwork::try_new(Arc::clone(&identity), mesh_config)?;
-
-    // Provide real miner count for health pings (replaces peer_count placeholder).
-    // The round_manager tracks per-round miner stats from share submissions.
-    let rm_for_miner_count = Arc::clone(&round_manager);
-    mesh_inner.set_miner_count_provider(Arc::new(move || {
-        rm_for_miner_count
-            .round_stats(rm_for_miner_count.current_round_id())
-            .map(|s| s.miner_count as u32)
-            .unwrap_or(0)
-    }));
-
-    // Gossip the local active miner_id hashes (5-min window) so peers can
-    // compute a deduplicated mesh-wide active count. Hashes are SHA-256
-    // truncated to 16 bytes — privacy-preserving and small (~16 KB per ping
-    // at 1k miners; negligible at our scale).
-    let db_for_active_hashes = Arc::clone(&db);
-    mesh_inner.set_active_miner_hashes_provider(Arc::new(move || {
-        db_for_active_hashes
-            .active_miner_id_hashes(ACTIVE_MINER_WINDOW_SECS)
-            .unwrap_or_default()
-    }));
-
-    // Gossip THIS node's own realized hashrate (10-min trailing window) so
-    // peers can sum one term per node into a pool-wide total that's stable
-    // under load-balancer migration. Scoped by `received_by = hex(node_id[..8])`
-    // so only shares this node received directly count — replicated peer
-    // share-proofs are excluded, which is what keeps the mesh sum from
-    // double-counting (each share counted once, by its origin node).
+    // This node's own realized hashrate (10-min trailing window). Scoped by
+    // `received_by = hex(node_id[..8])` so only shares this node received count.
     let self_received_by = hex::encode(&identity.node_id()[..8]);
 
-    // ONE provider, shared by the mesh gossip and the HTTP route, because both used to swallow
-    // the same error in the same way and the two paths must never disagree about this node's
-    // own hashrate.
-    //
-    // Both sites read `.unwrap_or(0.0)`. A node whose database is too slow to answer therefore
-    // told the entire mesh it was doing ZERO hashes — indistinguishable from having no miners,
-    // with no error logged anywhere. On 2026-08-09 that hid 94 TH/s: ghost-vm5 carried 88% of
-    // the pool's hashrate behind a database stalled by #554, so the pool-wide total read 13.8
-    // TH/s against a real ~107 TH/s, and the public site reported the wrong figure all day.
+    // A database too slow to answer used to read as ZERO hashes, indistinguishable from having
+    // no miners, with no error logged. On 2026-08-09 that hid 94 TH/s on ghost-vm5 behind a
+    // database stalled by #554.
     //
     // A genuine zero still passes through untouched — an idle node's query SUCCEEDS with 0.0.
     // Only a FAILED query takes the fallback, and the fallback is the last value this node
@@ -1043,7 +892,7 @@ async fn main() -> Result<()> {
         let last_good: Arc<parking_lot::Mutex<Option<(f64, std::time::Instant)>>> =
             Arc::new(parking_lot::Mutex::new(None));
         Arc::new(move || {
-            let outcome = db_for_local_hr.local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx);
+            let outcome = db_for_local_hr.local_hashrate_th(LOCAL_HASHRATE_WINDOW_SECS, &self_rx);
             let err = outcome.as_ref().err().map(|e| e.to_string());
             let cached = last_good
                 .lock()
@@ -1071,112 +920,10 @@ async fn main() -> Result<()> {
         })
     };
 
-    mesh_inner.set_local_hashrate_provider(Arc::clone(&local_hashrate_provider));
-
-    // Gossip THIS node's best (rarest) valid share per records window so every
-    // node converges on the pool-wide rarest record per window. Without this,
-    // the record lives on whichever node received it and the website's fan-out
-    // flickers when that node is momentarily unreachable. Each entry mirrors the
-    // shape the `/api/v1/pool/records` endpoint returns (redacted miner_id,
-    // achieved difficulty) so a receiving node can serve it verbatim.
-    let db_for_best_records = Arc::clone(&db);
-    mesh_inner.set_best_records_provider(Arc::new(move || {
-        build_local_best_records(&db_for_best_records)
-    }));
-
-    // Swarm-page telemetry gossiped so peers render each node's real state
-    // instead of a dash. These mirror exactly what the swarm SELF row reports.
-
-    // L1 (Bitcoin) block height — the same value the /health block_height uses.
-    let rm_for_l1_height = Arc::clone(&round_manager);
-    mesh_inner.set_l1_height_provider(Arc::new(move || rm_for_l1_height.current_height()));
-
-    // This node's own trailing-7-day uptime %, the qualification gatekeeper
-    // metric — the exact figure `get_uptime_percent` returns (GHOST-10
-    // time-based denominator), keyed by our own hex node id and converted to a
-    // percentage. `None` (→ "—") when there are no samples yet, never fabricated.
-    let db_for_uptime = Arc::clone(&db);
-    let uptime_node_id_hex = identity.node_id_hex();
-    mesh_inner.set_uptime_percent_provider(Arc::new(move || {
-        let since = chrono::Utc::now().timestamp()
-            - (ghost_common::constants::UPTIME_WINDOW_DAYS as i64 * 86_400);
-        db_for_uptime
-            .get_uptime_percent(&uptime_node_id_hex, since)
-            .ok()
-            .map(|ratio| ratio * 100.0)
-    }));
-
-    // Gossip whether our own Ghost Core is reachable, so peers can route around us when it is
-    // not (#778). Same probe and same staleness bound the `/health` endpoint uses — two missed
-    // template refreshes, floored at 120s — so the two can never disagree about this node.
-    //
-    // Before this, the mesh had no way to express it: a node whose `ghostd` was dead kept
-    // gossiping normally (vm8 reported `peer_count: 7` for 2h15m on 2026-08-24 through 260
-    // ghostd crash-loops), so peers kept sending it miners while it could serve none.
-    {
-        let rpc_for_ping = Arc::clone(&rpc);
-        let stale_after = (config.pool.template_refresh_ms() / 1000)
-            .saturating_mul(2)
-            .max(120);
-        mesh_inner
-            .set_core_healthy_provider(Arc::new(move || rpc_for_ping.core_liveness(stale_after).0));
-    }
-
-    let mesh = Arc::new(mesh_inner);
-
     // Hardware-derived miner capacity. Operator's `network.max_miners` is the
-    // ceiling — `measure()` returns `min(calculated, declared)`. The mesh
-    // broadcasts this in health pings so peers' load balancers can route by
-    // utilisation % of declared capacity.
+    // ceiling — `measure()` returns `min(calculated, declared)`.
     let cap_breakdown = capacity::measure(Some(config.network.max_miners));
-    mesh.set_max_capacity(cap_breakdown.effective_max);
     let effective_max_capacity = cap_breakdown.effective_max;
-
-    // Create shared ban manager for cross-handler enforcement (C1 security fix)
-    let ban_manager = Arc::new(BanManager::new());
-    info!("Shared BanManager created for cross-handler ban enforcement");
-
-    // Health ping handler: peer tracking for the mesh (hashrate, miner counts, routing).
-    let health_handler = Arc::new(HealthPingHandler::new(
-        Arc::clone(mesh.peers()),
-        Some(Arc::clone(&db)),
-        Arc::clone(&ban_manager),
-    ));
-    mesh.register_handler(
-        Arc::clone(&health_handler) as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>
-    );
-
-    // Create and register discovery handler for peer gossip
-    // This enables nodes to discover peers beyond just seed nodes
-    let public_address = config
-        .network
-        .public_address
-        .clone()
-        .unwrap_or_else(|| "".to_string());
-    let mesh_for_connect = Arc::clone(&mesh);
-    let connect_callback: ghost_consensus::discovery_handler::ConnectCallback = Arc::new(
-        move |addr| {
-            let mesh_clone = Arc::clone(&mesh_for_connect);
-            tokio::spawn(async move {
-                if let Err(e) = mesh_clone.connect_peer(&addr).await {
-                    tracing::debug!(addr = %addr, error = %e, "Failed to connect to discovered peer");
-                }
-            });
-        },
-    );
-    let discovery_handler = Arc::new(
-        ghost_consensus::DiscoveryHandler::new(
-            identity.node_id(),
-            public_address.clone(),
-            Arc::clone(mesh.peers()),
-        )
-        .with_connect_callback(connect_callback)
-        // Mainnet keeps the SSRF/hijack guard (rejects private/loopback peers);
-        // test networks allow them so a local/containerised cluster can mesh.
-        .with_private_peers_allowed(!is_mainnet_round),
-    );
-    mesh.register_handler(Arc::clone(&discovery_handler)
-        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
     // Create shutdown channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -1186,7 +933,6 @@ async fn main() -> Result<()> {
     let rm_for_round = Arc::clone(&round_manager);
     let rm_for_miners = Arc::clone(&round_manager);
     let rm_for_elapsed = Arc::clone(&round_manager);
-    let mesh_for_verification = Arc::clone(&mesh);
 
     let mut verification_state = VerificationState::new(
         identity.node_id_hex(),
@@ -1225,126 +971,14 @@ async fn main() -> Result<()> {
                 .map(|s| s.miner_count as u32)
                 .unwrap_or(0)
         },
-        move || mesh_for_verification.peers().unique_peer_count() as u32,
     );
 
-    // Wire pool-peers callback for the translator load-balancer endpoint.
-    // `deduped_miner_count` is the per-node share of the mesh-wide active-miner
-    // total (attributed over the same active-miner window as `mesh_active_miners`), so
-    // the Capacity page's per-node rows sum to the deduped grand total instead
-    // of over-counting miners that fail over between nodes. The raw
-    // `miner_count` is left untouched for the LB's utilisation routing.
-    let mesh_for_pool_peers = Arc::clone(&mesh);
-    verification_state = verification_state.with_pool_peers(move || {
-        use ghost_verification::PoolPeerInfo;
-        let deduped = mesh_for_pool_peers.deduped_miner_counts(ACTIVE_MINER_WINDOW_SECS as u64);
-        mesh_for_pool_peers
-            .peers()
-            .get_connected_peers(30)
-            .into_iter()
-            // Every node is a pool node; a peer with no known address cannot be routed to.
-            .filter(|p| !p.public_address.is_empty())
-            .map(|p| PoolPeerInfo {
-                public_address: p.public_address.clone(),
-                miner_count: p.miner_count,
-                last_seen: p.last_seen,
-                max_capacity: p.max_capacity,
-                deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
-                // Passed through verbatim INCLUDING None (#778): the translator has to be able
-                // to tell "never reported" from "reported unhealthy", or a rolling deploy in
-                // which one node leads the others black-holes routing.
-                core_healthy: p.core_healthy,
-                // Gossiped SV1 tier listeners (#495). Passed through verbatim, including None:
-                // the translator must be able to tell "no farm tier" from "farm tier on 4444",
-                // and only absence keeps a peer out of farm routing.
-                hobby_port: p.hobby_port,
-                farm_port: p.farm_port,
-            })
-            .collect()
-    });
-
-    // Live mesh node list for the public /api/v1/pool/mesh-nodes endpoint.
-    // Maps every connected peer to MeshNodeInfo using only already-gossiped,
-    // public fields (hashrate, miner count). 120s freshness:
-    // wide enough to tolerate a few missed ~10s health pings, narrow enough
-    // that a genuinely gone node ages out. Self is added by the handler from
-    // local state, so this returns peers only. No network calls.
-    let mesh_for_node_list = Arc::clone(&mesh);
-    verification_state = verification_state.with_mesh_nodes(move || {
-        use ghost_verification::MeshNodeInfo;
-        // Deduped per-node counts over the shared active-miner window (matching
-        // the mesh grand total) so the mesh-nodes list sums consistently.
-        let deduped = mesh_for_node_list.deduped_miner_counts(ACTIVE_MINER_WINDOW_SECS as u64);
-        mesh_for_node_list
-            .peers()
-            .get_connected_peers(120)
-            .into_iter()
-            .map(|p| MeshNodeInfo {
-                node_id: p.node_id_hex(),
-                address: p.public_address.clone(),
-                hashrate_th: p.local_hashrate_th,
-                miner_count: p.miner_count,
-                deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
-                // Peer's gossiped hardware capacity ceiling (0 until reported),
-                // so the Capacity page can show utilisation for every mesh node
-                // — not just the public-mining peers the pool-nodes path lists.
-                max_capacity: p.max_capacity,
-                // get_connected_peers already filtered to Connected + fresh.
-                healthy: true,
-                // Swarm-page telemetry gossiped by each peer. L1 height 0 means
-                // "not reported" (older build) → None so the page shows "—"
-                // rather than a misleading 0; uptime/peer_count/L2 are already
-                // Option (None = not reported / not applicable).
-                l1_height: (p.block_height != 0).then_some(p.block_height),
-                uptime_percent: p.uptime_percent,
-                peer_count: p.peer_count,
-            })
-            .collect()
-    });
-
-    // Mesh-wide deduplicated active miner count. Unions local active miner_id
-    // hashes with the most-recent set from each connected peer.
-    //
-    // The freshness window must match the shared miner-activity window the local
-    // and gossiped sets are computed over (`ACTIVE_MINER_WINDOW_SECS`), NOT a
-    // tight 60s. At 60s a peer that simply missed a few ~10s health pings (jitter,
-    // GC, momentary load) was excluded entirely, dropping ALL of its active miners
-    // from the union — so a node would report e.g. 4 of 5 miners, and since the
-    // figure is gossip-derived the whole mesh could undercount at once. Dedup is by
-    // miner_id hash, so a wider window cannot double-count, and a disconnected miner
-    // still ages out at the source node's 300s `last_seen`, so the count stays
-    // honest while becoming robust to transient ping loss.
-    let mesh_for_active = Arc::clone(&mesh);
-    verification_state = verification_state.with_mesh_active_miners(move || {
-        mesh_for_active.mesh_active_miner_count(ACTIVE_MINER_WINDOW_SECS as u64) as u32
-    });
-
-    // This node's (self) deduped share of that mesh-wide total, from the same
-    // attribution that fills each peer's `deduped_miner_count`. Surfaced on the
-    // self/`this_node` entries so `self + peers` sum to `mesh_active_miners`.
-    let mesh_for_self_deduped = Arc::clone(&mesh);
-    verification_state = verification_state.with_self_deduped_miner_count(move || {
-        let counts = mesh_for_self_deduped.deduped_miner_counts(ACTIVE_MINER_WINDOW_SECS as u64);
-        counts
-            .get(&mesh_for_self_deduped.peers().our_node_id())
-            .copied()
-            .unwrap_or(0)
-    });
-
-    // Mesh-wide pool hashrate (TH/s) — sum of every node's own realized
-    // hashrate (60s peer freshness). One term per node, scoped by received_by
-    // at source, so it can't double-count and is identical on every node.
-    let mesh_for_hashrate = Arc::clone(&mesh);
-    verification_state = verification_state
-        .with_mesh_total_hashrate(move || mesh_for_hashrate.mesh_total_hashrate(60));
-
-    // This node's own contribution to that total, surfaced as `local_hashrate_th`
-    // so the per-node and mesh figures reconcile (same windowed value it gossips).
+    // This node's own realized hashrate, surfaced as `local_hashrate_th`.
     let local_hr_for_route = Arc::clone(&local_hashrate_provider);
     verification_state = verification_state.with_local_hashrate(move || local_hr_for_route());
     // Scope the operator/peer detailed miner list to this node's own miners
     // (shares stored under our `received_by`), so "This Node's Miners" and the
-    // /miners/full peer feed are local — not the mesh-wide gossiped set.
+    // /miners/full feed are local.
     verification_state = verification_state.with_local_received_by(self_received_by.clone());
     // Live handle to the template refresh cadence so the dashboard can retune it
     // (10–60s) without restarting the pool.
@@ -1366,16 +1000,6 @@ async fn main() -> Result<()> {
     // dashboard's round-progress readout reflects real round timing.
     verification_state = verification_state
         .with_round_elapsed_secs(move || rm_for_elapsed.current_round_elapsed_secs());
-
-    // Mesh-wide best records per window — every connected peer's gossiped best,
-    // reduced to one winner per window. The records endpoint merges this with
-    // the local DB best so the pool-wide rarest record survives the
-    // record-holding node being momentarily unreachable. 300s peer freshness
-    // (matches the active-miner window) so a couple of missed ~10s pings don't
-    // drop a peer's record from the merge.
-    let mesh_for_best_records = Arc::clone(&mesh);
-    verification_state = verification_state
-        .with_mesh_best_records(move || mesh_for_best_records.mesh_best_records(300));
 
     // Advertise this node's hardware-derived capacity via /api/internal/pool-nodes
     // so the colocated translator's load balancer routes by utilisation %.
@@ -1633,28 +1257,6 @@ async fn main() -> Result<()> {
             verification_state.with_core_health(move || rpc_for_health.core_liveness(stale_after));
     }
 
-    // #591: surface the mesh validation counters on /health. They were incremented on every
-    // rejected message and read by nobody, so an oversized- or malformed-message storm produced no
-    // observable output at all — the failure mode that let #558 and #583 run for weeks.
-    {
-        let mesh_for_health = Arc::clone(&mesh);
-        verification_state = verification_state.with_mesh_validation(move || {
-            let s = mesh_for_health.validation_stats();
-            ghost_verification::challenge::MeshValidationStats {
-                total: s.total,
-                valid: s.valid,
-                too_small: s.too_small,
-                too_large: s.too_large,
-                bad_version: s.bad_version,
-                bad_type: s.bad_type,
-                bad_signature: s.bad_signature,
-                bad_timestamp: s.bad_timestamp,
-                other_errors: s.other_errors,
-                memory_limit_exceeded: s.memory_limit_exceeded,
-            }
-        });
-    }
-
     // Wire Prometheus metrics to verification state
     verification_state = verification_state.with_metrics(Arc::clone(&metrics));
 
@@ -1771,15 +1373,11 @@ async fn main() -> Result<()> {
     // Start WebSocket health broadcast task
     let ws_state = Arc::clone(&verification_state.ws_state);
     let rm_for_ws = Arc::clone(&round_manager);
-    let mesh_for_ws = Arc::clone(&mesh);
+    let state_for_ws = Arc::clone(&verification_state);
     let start_time = std::time::Instant::now();
     let mut ws_shutdown = shutdown_tx.subscribe();
-    let alert_dispatcher_for_ws = Arc::clone(&alert_dispatcher);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        // Track the previous peer count so we can alert on a DROP (a decrease),
-        // not on every tick. `None` until the first observation.
-        let mut last_peer_count: Option<u32> = None;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1787,64 +1385,60 @@ async fn main() -> Result<()> {
                         .round_stats(rm_for_ws.current_round_id())
                         .map(|s| s.miner_count as u32)
                         .unwrap_or(0);
-                    let peer_count = mesh_for_ws.peers().unique_peer_count() as u32;
                     let event = ghost_verification::WsEvent::HealthUpdate {
                         block_height: rm_for_ws.current_height(),
                         round_id: rm_for_ws.current_round_id(),
                         miner_count,
-                        peer_count,
+                        peer_count: state_for_ws.relay_peers(),
                         uptime_secs: start_time.elapsed().as_secs(),
                     };
                     ws_state.broadcast(event);
-
-                    // PeerCountDrop alert: fire when the connected-peer count
-                    // decreases. Rate-limited (at most once per 5 min) so a
-                    // flapping mesh doesn't spam the operator; delivery + the
-                    // enable flag are handled inside the dispatcher.
-                    if let Some(prev) = last_peer_count {
-                        if peer_count < prev {
-                            let detail = format!(
-                                "Connected peer count dropped from {prev} to {peer_count}."
-                            );
-                            alert_dispatcher_for_ws
-                                .fire_rate_limited(
-                                    ghost_verification::alerts::AlertEvent::PeerCountDrop,
-                                    std::time::Duration::from_secs(300),
-                                    &detail,
-                                )
-                                .await;
-                        }
-                    }
-                    last_peer_count = Some(peer_count);
                 }
                 _ = ws_shutdown.recv() => break,
             }
         }
     });
 
+    // Relay-peers monitor: reads the share-chain relay's peer count from pool_sv2's node pool
+    // status into `/health` `peer_count`, and fires `PeerCountDrop` when it falls (rate-limited)
+    // and, edge-triggered, when it reaches zero. Replaces the old mesh's peer count.
+    ghost_pool::alert_monitors::spawn_relay_peers_monitor(
+        Arc::clone(&alert_dispatcher),
+        Arc::clone(&verification_state),
+        shutdown_tx.subscribe(),
+    );
+
     // Start the behind-tip monitor. Edge-triggered `BehindTip` alert when this
-    // node's local height lags the best connected peer, or the tip stalls while
-    // a peer is ahead. Uses the same height/peer plumbing the /health + swarm
-    // views read; delivery + the enable flag are handled inside the dispatcher.
+    // node's local height lags the best header its Bitcoin node has heard of, or
+    // the tip stalls while the headers are ahead. Core's `headers` is the
+    // network's view as its Bitcoin peers announce it; sampled every 30 s so the
+    // monitor's callback stays synchronous (0 until the first answer → silent).
     {
+        let best_headers = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let headers_for_sampler = Arc::clone(&best_headers);
+        let rpc_for_headers = Arc::clone(&rpc);
+        let mut headers_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Ok(info) = rpc_for_headers.get_blockchain_info().await {
+                            headers_for_sampler
+                                .store(info.headers, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    _ = headers_shutdown.recv() => break,
+                }
+            }
+        });
         let rm_for_tip = Arc::clone(&round_manager);
-        let mesh_for_tip = Arc::clone(&mesh);
         let alerts_for_tip = Arc::clone(&alert_dispatcher);
         ghost_pool::alert_monitors::spawn_behind_tip_monitor(
             alerts_for_tip,
             Arc::clone(&verification_state.chain_health),
             move || rm_for_tip.current_height(),
-            move || {
-                // Highest L1 height reported by a fresh, connected mesh peer
-                // (0 when none is known → the monitor stays silent).
-                mesh_for_tip
-                    .peers()
-                    .get_connected_peers(120)
-                    .iter()
-                    .map(|p| p.block_height)
-                    .max()
-                    .unwrap_or(0)
-            },
+            move || best_headers.load(std::sync::atomic::Ordering::Relaxed),
             shutdown_tx.subscribe(),
         );
     }
@@ -1878,7 +1472,7 @@ async fn main() -> Result<()> {
     );
 
     // Start pool time-series sampler task.
-    // Snapshots the mesh-wide pool hashrate + connected-miner count (the same
+    // Snapshots this node's hashrate + active-miner count (the same
     // accessors the /api/v1/mining/status handler reads) into the bounded
     // in-memory ring on VerificationState every 30s, so /api/v1/pool/series can
     // serve real server-side history instead of a client-side session buffer.
@@ -1892,10 +1486,8 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let mesh_hashrate_th = state_for_series
-                            .mesh_total_hashrate()
-                            .or_else(|| state_for_series.local_hashrate())
-                            .unwrap_or(0.0);
+                        let local_hashrate_th =
+                            state_for_series.local_hashrate().unwrap_or(0.0);
                         // Local ghostd mempool tx count via the shared RPC client
                         // (0 if the RPC is briefly unavailable).
                         let mempool_txs = rpc_for_series
@@ -1911,9 +1503,9 @@ async fn main() -> Result<()> {
                             .unwrap_or(0);
                         let sample = ghost_verification::pool_series::PoolSample {
                             t: chrono::Utc::now().timestamp(),
-                            mesh_hashrate_th,
-                            local_hashrate_th: state_for_series.local_hashrate().unwrap_or(0.0),
-                            miners: state_for_series.mesh_active_miners().unwrap_or(0),
+                            mesh_hashrate_th: local_hashrate_th,
+                            local_hashrate_th,
+                            miners: state_for_series.local_active_miners(),
                             mempool_txs,
                             block_txs,
                         };
@@ -1926,8 +1518,7 @@ async fn main() -> Result<()> {
         info!("Pool time-series sampler started (30s interval, 24h retention)");
     }
 
-    // Self-uptime recording: the uptime % this node gossips and shows on the swarm page.
-    // Peers' rows are refreshed by their pings; ours by this.
+    // Self-uptime recording: the uptime % this node shows on the swarm page.
     let db_for_uptime = Arc::clone(&db);
     let node_id_for_uptime = identity.node_id_hex();
     let mut uptime_shutdown = shutdown_tx.subscribe();
@@ -1938,8 +1529,7 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = interval.tick() => {
                     let now = chrono::Utc::now().timestamp();
-                    // Also refreshes our own `nodes.last_seen`: peers' rows are refreshed by
-                    // their pings, ours by nothing else (#1004).
+                    // Also refreshes our own `nodes.last_seen` (#1004).
                     match db_for_uptime.record_self_liveness(&node_id_for_uptime, now) {
                         Ok(_) => {
                             sample_count += 1;
@@ -1977,29 +1567,6 @@ async fn main() -> Result<()> {
         "Self-uptime recording task started"
     );
 
-    // Start ban manager cleanup task (C1 security fix)
-    // Periodically cleans up expired bans to prevent memory growth
-    let ban_manager_for_cleanup = Arc::clone(&ban_manager);
-    let mut ban_cleanup_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let removed = ban_manager_for_cleanup.cleanup_expired();
-                    if removed > 0 {
-                        tracing::debug!(removed, "Cleaned up expired bans");
-                    }
-                }
-                _ = ban_cleanup_shutdown.recv() => {
-                    tracing::info!("Ban manager cleanup task shutting down");
-                    break;
-                }
-            }
-        }
-    });
-    info!("Ban manager cleanup task started (60s interval)");
-
     // M-MINE-2: Start rate limit cleanup task for RoundManager
     // Periodically cleans up old rate limit entries to prevent memory growth
     let rm_for_cleanup = Arc::clone(&round_manager);
@@ -2019,46 +1586,6 @@ async fn main() -> Result<()> {
         }
     });
     info!("Rate limit cleanup task started (60s interval)");
-
-    // Dedup cache cleanup — evict expired seen messages every 60s
-    let mesh_for_dedup_cleanup = Arc::clone(&mesh);
-    let mut dedup_cleanup_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    mesh_for_dedup_cleanup.cleanup_seen_messages(300);
-                }
-                _ = dedup_cleanup_shutdown.recv() => {
-                    tracing::info!("Dedup cache cleanup task shutting down");
-                    break;
-                }
-            }
-        }
-    });
-    info!("Dedup cache cleanup task started (60s interval, 5min TTL)");
-
-    // Noise connection pool cleanup — evict stale connections every 60s
-    if let Some(noise_pool) = mesh.noise_pool() {
-        let pool_for_cleanup = Arc::clone(noise_pool);
-        let mut noise_cleanup_shutdown = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        pool_for_cleanup.cleanup_stale();
-                    }
-                    _ = noise_cleanup_shutdown.recv() => {
-                        tracing::info!("Noise pool cleanup task shutting down");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("Noise pool cleanup task started (60s interval)");
-    }
 
     // Periodic share pruning — delete shares older than 24 hours, run every hour
     let db_for_pruning = Arc::clone(&db);
@@ -2501,159 +2028,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Start P2P mesh
-    let m = Arc::clone(&mesh);
-    tokio::spawn(async move {
-        if let Err(e) = m.start().await {
-            error!(error = %e, "Mesh network error");
-        }
-    });
-    info!("P2P mesh network started");
-
-    // C-1: Start the Noise Protocol RECEIVE listener for encrypted P2P.
-    // The accept/handshake/dispatch loop now lives in MeshNetwork
-    // (`run_noise_listener`) so the receive side of the Noise plane is owned and
-    // tested alongside the send side, instead of being hand-rolled here.
-    if mesh.noise_pool().is_some() {
-        let mesh_for_noise = Arc::clone(&mesh);
-        let noise_shutdown = shutdown_tx.subscribe();
-        let noise_is_mainnet = is_mainnet_round;
-        tokio::spawn(async move {
-            mesh_for_noise
-                .run_noise_listener(noise_is_mainnet, noise_shutdown)
-                .await;
-        });
-    } else {
-        warn!("Noise Protocol DISABLED - P2P traffic is unencrypted");
-    }
-
-    // Bootstrap peer connections from seed nodes
-    if !config.network.seed_nodes.is_empty() {
-        let mesh_bootstrap = Arc::clone(&mesh);
-        let seed_nodes = config.network.seed_nodes.clone();
-        let discovery_for_bootstrap = Arc::clone(&discovery_handler);
-        tokio::spawn(async move {
-            // Wait a moment for mesh to fully start
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            for seed in &seed_nodes {
-                info!(seed = %seed, "Connecting to seed node");
-                // Add seed to discovery handler's known peers
-                discovery_for_bootstrap.add_known_peer([0u8; 32], seed.clone());
-                if let Err(e) = mesh_bootstrap.connect_peer(seed).await {
-                    warn!(seed = %seed, error = %e, "Failed to connect to seed node");
-                }
-            }
-        });
-    }
-
-    // Start periodic discovery broadcast task
-    // This gossips our known peers to other nodes every 30 seconds
-    //
-    // L-15 SECURITY NOTE: Discovery broadcasts are intentionally unauthenticated
-    //
-    // Discovery messages are sent over ZMQ PUB/SUB without encryption because:
-    //
-    // 1. **Bootstrap Problem**: Nodes need to discover peers before they can
-    //    establish authenticated connections. Requiring authentication for
-    //    discovery would create a chicken-and-egg problem.
-    //
-    // 2. **Defense in Depth via Noise Authentication**: After discovering a peer,
-    //    all sensitive communication (shares, blocks, votes, payouts) is sent
-    //    over Noise Protocol encrypted channels (port 8563). An attacker who
-    //    injects false discovery messages cannot:
-    //    - Receive shares or blocks (encrypted to real node's Noise key)
-    //    - Cast votes (requires cryptographic identity proof)
-    //    - Modify payouts (BFT consensus with signed votes)
-    //
-    // 3. **Address Validation**: Discovery handler validates that advertised
-    //    addresses are valid IPs (not domains), non-reserved, and haven't been
-    //    claimed by another node (H-P2P-4 address hijacking protection).
-    //
-    // 4. **Rate Limiting**: Discovery messages are rate-limited per sender to
-    //    prevent flooding attacks (M-8).
-    //
-    // 5. **Signature Verification**: While broadcast is unauthenticated,
-    //    discovery messages include the sender's signature. The handler verifies
-    //    this signature before processing (M-3 defense-in-depth).
-    //
-    // The worst case for a discovery attacker is wasting CPU on connection
-    // attempts to non-existent or malicious endpoints, which is mitigated by
-    // the Noise handshake timeout and connection backoff.
-    let mesh_for_discovery = Arc::clone(&mesh);
-    let discovery_for_broadcast = Arc::clone(&discovery_handler);
-    let mut discovery_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        // Wait for mesh to establish connections
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Get the discovery message with our known peers
-                    let discovery_msg = discovery_for_broadcast.get_discovery_message();
-
-                    // Broadcast it
-                    match mesh_for_discovery
-                        .broadcast_message(ghost_consensus::MessageType::Discovery, &discovery_msg)
-                        .await
-                    {
-                        Ok(sent) => {
-                            if sent > 0 {
-                                tracing::debug!(
-                                    sent = sent,
-                                    known_peers = discovery_msg.known_peers.len(),
-                                    "Broadcast discovery message"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "Failed to broadcast discovery");
-                        }
-                    }
-                }
-                _ = discovery_shutdown.recv() => {
-                    tracing::info!("Discovery broadcast task shutting down");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Onboarding fan-out: proactively warm a Noise handshake to every known peer.
-    // The handshake makes the CALLEE reverse-subscribe to us, which is the only
-    // way an established fleet learns about a JOINING node (ZMQ PUB/SUB is
-    // one-directional — a late joiner can pull the fleet but can't push its own
-    // existence). Aggressive at first (a joiner needs symmetric visibility fast),
-    // tapering to a slow keep-alive as the mesh settles. Pure transport topology:
-    // no consensus effect, no wire change, no height gate.
-    let mesh_for_fanout = Arc::clone(&mesh);
-    let mut fanout_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        // Let discovery populate an initial peer set before the first pass.
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-        let mut delay = std::time::Duration::from_secs(30);
-        let max = std::time::Duration::from_secs(300);
-        loop {
-            let warmed = mesh_for_fanout.bootstrap_fanout().await;
-            if warmed > 0 {
-                tracing::debug!(
-                    warmed = warmed,
-                    "Onboarding fan-out: warmed Noise handshakes (fleet reverse-subscribes)"
-                );
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {
-                    delay = (delay * 2).min(max); // 30s → 60 → 120 → 240 → 300 → 300…
-                }
-                _ = fanout_shutdown.recv() => {
-                    tracing::info!("Onboarding fan-out task shutting down");
-                    break;
-                }
-            }
-        }
-    });
-
     // Start ZMQ block watcher with reorg detection (if configured)
     if let Some(ref zmq_endpoint) = config.bitcoin.zmq_hashblock {
         let rm = Arc::clone(&round_manager);
@@ -2901,7 +2275,6 @@ async fn main() -> Result<()> {
 
     // Cleanup
     template_processor.stop();
-    mesh.stop().await?;
 
     // Checkpoint WAL and clean up database files
     if let Err(e) = db.shutdown() {

@@ -69,7 +69,8 @@ interface Vitals {
   // reports no height yet — so we never assert "Synced · 100%" on no data.
   synced: boolean;
   syncPct: number;
-  peers: number;
+  // Share-chain relay peers; null when the node has not had them from pool_sv2.
+  peers: number | null;
   miners: number;
   nodeHashrateHs: number; // this node's hashrate (miners on this node), in H/s
   uptimeSecs: number;
@@ -247,7 +248,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       : synced
         ? 100
         : 0,
-    peers: status?.peer_count ?? 0,
+    peers: status?.peer_count ?? null,
     miners: mining?.local_connected_miners ?? mining?.connected_miners ?? 0,
     // This node's own hashrate — the combined hashrate of miners connected to
     // this node's stratum port (not the mesh-wide total). Never fabricated.
@@ -751,7 +752,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
           }
         />
         <Stat label="Miners" value={hasStatus ? String(v.miners) : '—'} />
-        <Stat label="Peers" value={hasStatus ? String(v.peers) : '—'} />
+        <Stat label="Relay peers" value={hasStatus && v.peers !== null ? String(v.peers) : '—'} />
         <Stat label="Uptime" value={v.uptimeSecs > 0 ? formatDuration(v.uptimeSecs) : hasStatus ? '0m' : '—'} />
         <Stat label="Best Share" value={fmtCompact(v.bestDifficulty)} accent />
       </div>

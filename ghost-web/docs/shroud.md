@@ -82,14 +82,14 @@ Set in `ghost.conf`:
 shroud=0
 ```
 
-**ghost-mining (P2P mesh forwarding):**
+**ghost-mining (dashboard setting):**
 
 ```toml
 [network]
 shroud_enabled = false   # default — opt-in
 ```
 
-Independent of the ghost-core flag — the pool's mesh has its own forwarding path, so the toggle exists separately. Most operators leave both on.
+This records the choice the dashboard shows; it is ghost-core's `-shroud` flag that delays relay, so a change takes effect when ghost-core restarts with it.
 
 :::info Why is it on by default?
 The cost of Shroud is at most 5 seconds of additional latency before peers learn about your transaction. The benefit is meaningful protection against the most common form of de-anonymisation. The asymmetry makes the default obvious.

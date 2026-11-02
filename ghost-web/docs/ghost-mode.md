@@ -87,7 +87,7 @@ GET  /api/v1/config/ghost_mode      → returns current state
 POST /api/v1/config/ghost_mode      → toggle (admin auth required)
 ```
 
-**ghost-mining (mesh forwarding):**
+**ghost-mining (dashboard setting):**
 
 ```toml
 [network]
@@ -96,7 +96,7 @@ ghost_mode = false   # default
 
 Note this is the network config field on the pool side, separate from ghost-core's flag. It's persisted in the node config file and re-applied on restart. The dashboard exposes it as a runtime toggle backed by an authenticated POST handler.
 
-The two layers can be set independently. Most operators who want the privacy posture turn both on; the pool layer's toggle exists because pool-internal mesh forwarding has its own decision logic.
+ghost-mining has no relay of its own for transactions: this setting records the choice and is checked against ghost-core's flag, which is what changes relay behaviour.
 
 ## What Ghost Mode protects against
 

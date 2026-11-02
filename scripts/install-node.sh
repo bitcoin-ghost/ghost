@@ -5,7 +5,7 @@
 #   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --fee-address bc1q...
 #
 # Stands up a full Ghost node (ghostd + ghost-mining + the SV2 stratum stack) on Ubuntu as a node
-# pool node and joins the mesh. The node pool is the only mode: there are no mining modes,
+# pool node and joins the share chain. The node pool is the only mode: there are no mining modes,
 # treasury prompts or capability flags. Mirrors the proven production setup; every
 # per-node secret is generated fresh on this machine and never leaves it.
 #
@@ -32,10 +32,11 @@ POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
-# ⛔ No mesh seed nodes. The old network's eight nodes keep running `main` beside node pool nodes,
-# and the two must never talk: this list used to name the old fleet, so every install dialled its
-# mesh. A node pool node agrees on its ledger over the share-chain relay (`[node_pool.relay]`,
-# `--relay-peer`), so it writes `seed_nodes = []` and keeps the old mesh ports closed (below).
+# ⛔ No old-network peers. The old network's eight nodes keep running `main` beside node pool
+# nodes, and the two must never talk: a seed list here used to name the old fleet, so every install
+# dialled its mesh. A node pool node agrees on its ledger over the share-chain relay
+# (`[node_pool.relay]`, `--relay-peer`); ghost-mining no longer runs the old mesh at all, and the
+# old mesh ports stay closed (below).
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
 ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
@@ -109,10 +110,10 @@ Strongly recommended:
   --alert-topic <name>        Push topic                        (default: ghost-node)
 
 Options:
-  --nickname <name>           Display name in the mesh        (default: ghost-node)
+  --nickname <name>           Display name of this node       (default: ghost-node)
   --pool-name <name>          Custom pool name shown in the block coinbase as
                                 '- G H O S T - <name>' on explorers. ASCII only,
-                                max 30 chars. Distinct from --nickname (the mesh
+                                max 30 chars. Distinct from --nickname (the node's
                                 display name). Default tag: "GHOST PublicPool".
   --sync <mode>               ibd | haze                      (default: ibd)
                                 ibd  — full trustless sync + prune (recommended)
@@ -641,7 +642,7 @@ run_wizard() {
   echo
   log "Bitcoin Ghost — guided node setup"
   echo "This installs a full Ghost node (ghostd + ghost-mining + the SV2 stratum stack) as a"
-  echo "node pool node and joins the mesh. Press Enter to accept each [default]."
+  echo "node pool node and joins the share chain. Press Enter to accept each [default]."
   echo
 
   # Network.
@@ -759,7 +760,7 @@ run_wizard() {
   # Nickname.
   echo
   local nn
-  read -rp "Node nickname shown in the mesh [ghost-node]: " nn || true
+  read -rp "Node nickname [ghost-node]: " nn || true
   NICKNAME="${nn:-ghost-node}"
 
   # Summary + final confirmation before anything destructive happens.
@@ -1019,7 +1020,7 @@ if [[ -n "$admin_bin" ]]; then
 fi
 # The miner-facing SV2 stratum stack ships in the SAME signed tarball. Without
 # these two binaries a node has ghost-mining's Template Distribution Protocol
-# running but nothing for miners to connect to, so it can join the mesh yet never
+# running but nothing for miners to connect to, so it can run yet never
 # serve a single hasher. translator_sv2 accepts Stratum V1 miners (e.g. BitAxe)
 # and translates to SV2; pool_sv2 is the SV2 pool that bridges those miners to
 # ghost-mining's TDP. Both are ALWAYS installed (a v1 node download must be a
@@ -1201,25 +1202,12 @@ zmq_hashtx = "tcp://127.0.0.1:28333"
 internal_api_secret = "${APISECRET}"
 signing_key = "${SIGNKEY}"
 public_address = "${PUBIP}"
-noise_enabled = true
 sv2_port = 34255
 sv1_port = 3333
 http_port = 8080
 max_miners = 1000
 farm_port = 4444
-# No mesh seeds, on purpose: see the note at the top of install-node.sh. Share-chain peers are in
-# /etc/ghost/pool-config.toml, [node_pool.relay] peers.
-seed_nodes = []
-
-[network.p2p]
-share_propagation = 8555
-block_announcement = 8556
-consensus_voting = 8557
-health_monitoring = 8558
-discovery = 8559
-elder_management = 8560
-payout_proposal = 8561
-payout_transaction = 8562
+# No mesh: share-chain peers are in /etc/ghost/pool-config.toml, [node_pool.relay] peers.
 
 [policy]
 profile = "full_open"
@@ -1754,8 +1742,8 @@ ufw allow "${RELAY_PORT}/tcp" >/dev/null 2>&1   # node pool share-chain relay
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 # The old mesh (8555-8562 ZMQ, 8563 Noise) and verification HTTPS (8443) stay CLOSED. ghost-mining
-# still listens on them, but a node pool node has no mesh seeds and must not be reachable by the
-# old fleet's mesh, which keeps running `main`. A rule left by an older install is removed.
+# no longer listens on them, and a node pool node must never be reachable by the old fleet's
+# mesh, which keeps running `main`. A rule left by an older install is removed.
 ufw delete allow 8555:8562/tcp >/dev/null 2>&1 || true
 ufw delete allow 8563/tcp      >/dev/null 2>&1 || true
 ufw delete allow 8443/tcp      >/dev/null 2>&1 || true
@@ -3973,7 +3961,7 @@ cat <<EOF
      sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — started by the gate; serves miners on port 3333)
 
   "inactive" is expected for the last three until ghostd finishes syncing. The gate
-  then starts ghost-mining AUTOMATICALLY — your node joins the mesh — followed by the
+  then starts ghost-mining AUTOMATICALLY, followed by the
   SV2 stratum stack (sri-pool + sri-translator), which serves miners on Stratum port
   3333 (SV1) / 34255 (SV2). ${MINER_POINTER}
   Watch the gate:    sudo journalctl -u ghost-mining-gate -f

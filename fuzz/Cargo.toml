@@ -33,24 +33,15 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 
 # Local crates to fuzz
-ghost-consensus = { path = "../crates/ghost-consensus" }
-serde_json = "1"
+ghost-np-relay = { path = "../crates/ghost-np-relay" }
 
 [workspace]
 members = ["."]
 
 # Fuzz targets - each is a separate binary
 [[bin]]
-name = "fuzz_message_envelope"
-path = "fuzz_targets/fuzz_message_envelope.rs"
+name = "fuzz_relay_wire"
+path = "fuzz_targets/fuzz_relay_wire.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "fuzz_p2p_payloads"
-path = "fuzz_targets/fuzz_p2p_payloads.rs"
-test = false
-doc = false
-bench = false
-

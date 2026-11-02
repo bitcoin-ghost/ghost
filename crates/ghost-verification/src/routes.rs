@@ -39,7 +39,7 @@ use ghost_common::constants::{ACTIVE_MINER_WINDOW_SECS, SV1_STRATUM_PORT, SV2_ST
 use ghost_common::rpc::MempoolFilterStats;
 
 use crate::auth::{verify_internal_auth, InternalAuth};
-use crate::server::{MeshNodeInfo, ShareBatch, ShareNotification, VerificationState};
+use crate::server::{ShareBatch, ShareNotification, VerificationState};
 use crate::websocket::{ws_handler, WsAuthQuery};
 use ghost_common::error::GhostError;
 
@@ -236,11 +236,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/pool/mesh-leaderboard",
             get(api_pool_mesh_leaderboard_handler),
         )
-        // Aggregate node metrics for the Core page. Returns pool-wide
-        // counts only — no per-node data, no clearnet/tor breakdown,
-        // no identifiers. Tor operators are counted as part of the
-        // aggregate and cannot be singled out.
-        .route("/api/v1/mesh/node_stats", get(api_mesh_node_stats_handler))
         // M-14: /api/v1/miners/stats moved to internal routes (requires HMAC auth)
         // Exposes individual miner work values, hashrates, and share history
         .route("/api/v1/network/peers", get(peers_handler))
@@ -1267,20 +1262,16 @@ async fn api_mining_status_handler(
 
     // Stable count of miners active in the last 5 minutes — survives round
     // rotations that reset the round-scoped miner_count to zero. This is the
-    // local view; mesh_active_miners below is the deduplicated pool-wide count.
+    // This node's own view; the old mesh's pool-wide figures are gone with it.
     let active_miners = state
         .database
         .as_ref()
         .and_then(|db| db.count_active_miners(ACTIVE_MINER_WINDOW_SECS).ok())
         .unwrap_or(0);
-    let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
-    // Pool-wide hashrate (sum of every node's own realized hashrate) is the
-    // figure operators expect: it stays put when the load balancer migrates a
-    // miner between nodes. Falls back to the node-local sum on older deploys
-    // without the mesh provider. `local_hashrate_th` shows this node's own
-    // contribution (the same windowed value it gossips), so the per-node and
-    // mesh figures reconcile.
-    let mesh_hashrate_th = state.mesh_total_hashrate().unwrap_or(total_hashrate_th);
+    // The `mesh_*` keys below keep their names for existing readers and carry this node's own
+    // figures: the old mesh that summed them across nodes was removed.
+    let mesh_active_miners = active_miners;
+    let mesh_hashrate_th = total_hashrate_th;
     let local_hashrate_th = state.local_hashrate().unwrap_or(total_hashrate_th);
 
     // SV2/Noise miners must pin the pool's authority public key to connect, and
@@ -1730,30 +1721,6 @@ async fn api_miner_lookup_handler(
     Json(result)
 }
 
-/// Aggregate node metrics for the Core page. Returns only pool-wide
-/// counts and a median — never per-node data — so Tor operators (and
-/// everyone else) remain individually invisible. No clearnet/tor
-/// breakdown exists on purpose; operators who run Tor nodes chose a
-/// privacy setting and we honour it by not publishing the split.
-async fn api_mesh_node_stats_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let Some(ref db) = state.database else {
-        return Json(serde_json::json!({
-            "error": "Database not available",
-        }));
-    };
-
-    let (total, active_7d, new_7d, median_uptime) = db.get_node_stats().unwrap_or((0, 0, 0, None));
-
-    Json(serde_json::json!({
-        "total_nodes": total,
-        "active_7d": active_7d,
-        "new_7d": new_7d,
-        "median_uptime_pct": median_uptime,
-    }))
-}
-
 /// Tail of recent valid shares for the quasar visualisation. Each
 /// share becomes one particle on the client; quality is normalised
 /// from the share hash's leading zero bits so common pool shares land
@@ -1831,45 +1798,11 @@ async fn api_pool_recent_shares_handler(
     }))
 }
 
-/// Shape one connected peer (`MeshNodeInfo`) into the public mesh-node JSON
-/// object. Self is shaped inline by the handler from local state, so this
-/// helper always renders a peer (`is_self = false`). Pulled out as a free
-/// function so the JSON contract is unit-testable without a live server.
+/// This node, in the shape of the old mesh node list (`nodes`, `total`).
 ///
-fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
-    serde_json::json!({
-        "node_id": node.node_id,
-        "address": node.address,
-        "hashrate_th": node.hashrate_th,
-        "miner_count": node.miner_count,
-        "deduped_miner_count": node.deduped_miner_count,
-        // Peer's hardware-derived capacity ceiling (0 = not yet gossiped →
-        // the Capacity page renders it as "unknown", not a real ceiling).
-        "max_capacity": node.max_capacity,
-        // Swarm-page telemetry gossiped per peer. `None` serialises to JSON null,
-        // which the frontend renders as "—" (never a misleading 0).
-        "l1_height": node.l1_height,
-        "uptime_percent": node.uptime_percent,
-        "peer_count": node.peer_count,
-        "healthy": node.healthy,
-        "is_self": false,
-    })
-}
-
-/// Live mesh node list = this node (self) + every connected peer.
-///
-/// PUBLIC, no auth (same exposure level as `recent_shares`): every field
-/// returned is already gossiped openly in health pings. The website polls
-/// this on one bootstrap node and renders the whole mesh, so newly-joined
-/// nodes appear automatically without a hard-coded VM list or a per-node
-/// nginx proxy block.
-///
-/// Self is built from this node's local state (the same sources
-/// `/api/v1/mining/status` uses); peers come from the in-memory
-/// `PeerManager` via the `mesh_nodes` callback (no network calls). Results
-/// are deduplicated by `node_id` with self always included exactly once;
-/// a missing field on any one peer degrades to a default (`0`/`false`)
-/// rather than failing the whole response.
+/// PUBLIC, no auth (same exposure level as `recent_shares`). The old mesh that
+/// supplied the peers was removed, so the list holds this node only; the
+/// dashboard pages that read it are rebuilt for the node pool in W2.14.
 async fn api_pool_mesh_nodes_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
@@ -1892,13 +1825,11 @@ async fn api_pool_mesh_nodes_handler(
     let self_node = serde_json::json!({
         "node_id": health.node_id,
         "address": self_address,
-        // This node's own realized hashrate (same windowed value it gossips);
-        // 0.0 on deploys without the local-hashrate provider wired.
+        // This node's own realized hashrate; 0.0 on deploys without the
+        // local-hashrate provider wired.
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
         "miner_count": health.miner_count,
-        // Deduped share attributed to this node (see `deduped_miner_counts`);
-        // self + peers sum to the deduped mesh-wide active-miner total.
-        "deduped_miner_count": state.self_deduped_miner_count(),
+        "deduped_miner_count": state.local_active_miners(),
         // This node's own hardware-derived capacity ceiling, so the Capacity
         // page can render self's utilisation from the same field it uses for
         // every peer.
@@ -1908,22 +1839,9 @@ async fn api_pool_mesh_nodes_handler(
         "is_self": true,
     });
 
-    let mut nodes = vec![self_node];
-    // Dedup by node_id; self is already in, so skip any peer that re-reports
-    // this node's id (e.g. a same-host placeholder).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(health.node_id.clone());
-
-    for peer in state.mesh_nodes() {
-        if seen.insert(peer.node_id.clone()) {
-            nodes.push(mesh_node_to_json(&peer));
-        }
-    }
-
-    let total = nodes.len();
     Json(serde_json::json!({
-        "nodes": nodes,
-        "total": total,
+        "nodes": [self_node],
+        "total": 1,
     }))
 }
 
@@ -2258,56 +2176,17 @@ async fn api_pool_records_handler(
         }
     };
 
-    // Candidate winner so far: the rarest `share_hash` seen, held in DISPLAY
-    // order (zeros at the front) so string `<` matches numeric order (smaller =
-    // rarer) — the local DB hash is INTERNAL order and is converted on ingest;
-    // peers already gossip DISPLAY order. `assigned_diff` is Some only for the
-    // local share.
-    let mut winning_hash: Option<String> = None;
-    let mut winning_redacted = String::new();
-    let mut winning_timestamp: i64 = 0;
-    let mut winning_assigned_diff: Option<f64> = None;
-
-    if let Some(best) = local_best {
-        winning_hash = Some(internal_hex_to_display_hex(&best.share_hash));
-        winning_redacted = redact_miner_id(&best.miner_id);
-        winning_timestamp = best.timestamp;
-        winning_assigned_diff = Some(best.difficulty);
-    }
-
-    // Mesh term: every connected peer's gossiped best for THIS window. The
-    // miner_id is already redacted at the source. A peer record beats the
-    // current winner only when its hash is strictly smaller (rarer).
-    if let Some(peer_records) = state.mesh_best_records() {
-        for rec in peer_records {
-            if rec.window != window_name || rec.share_hash.is_empty() {
-                continue;
-            }
-            let beats = winning_hash
-                .as_ref()
-                .map(|w| rec.share_hash < *w)
-                .unwrap_or(true);
-            if beats {
-                winning_hash = Some(rec.share_hash);
-                winning_redacted = rec.miner_id_redacted;
-                winning_timestamp = rec.timestamp;
-                // A peer's record carries no stored vardiff target.
-                winning_assigned_diff = None;
-            }
-        }
-    }
-
-    let Some(share_hash) = winning_hash else {
+    let Some(best) = local_best else {
         return Json(serde_json::json!({
             "window": window_name,
             "since_ts": since_ts,
             "found": false,
         }));
     };
+    // DISPLAY order (zeros at the front); the database holds INTERNAL order.
+    let share_hash = internal_hex_to_display_hex(&best.share_hash);
 
-    // Recompute the leading-zero presentation from the WINNING hash. `share_hash`
-    // is already DISPLAY order (zeros at the front) here, so counting leading '0'
-    // chars is correct. Each leading '0' hex char = 4 binary leading zeros — a
+    // Leading-zero presentation from the DISPLAY hash (zeros at the front). Each leading '0' hex char = 4 binary leading zeros — a
     // coarse signal; the hash itself is the definitive record but reads worse in
     // tiles.
     let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
@@ -2321,25 +2200,22 @@ async fn api_pool_records_handler(
             "share_hash": share_hash,
             "leading_zero_bits": leading_zero_bits,
             "leading_hex_zeros": leading_hex_zeros,
-            "miner_id_redacted": winning_redacted,
-            "timestamp": winning_timestamp,
+            "miner_id_redacted": redact_miner_id(&best.miner_id),
+            "timestamp": best.timestamp,
             // Achieved difficulty from the hash (the score), NOT the stored
-            // vardiff target. `share_hash` is DISPLAY order here, but
-            // `share_difficulty_from_hash_hex` expects INTERNAL order, so reverse
-            // it back. `assigned_difficulty` keeps the stored value for any
-            // consumer that wants the share's pool-credit work — null when a
-            // peer's record wins (peers don't gossip their vardiff target).
-            "difficulty": share_difficulty_from_hash_hex(&internal_hex_to_display_hex(&share_hash)),
-            "assigned_difficulty": winning_assigned_diff,
+            // vardiff target. `assigned_difficulty` keeps the stored value for any
+            // consumer that wants the share's pool-credit work.
+            "difficulty": share_difficulty_from_hash_hex(&best.share_hash),
+            "assigned_difficulty": best.difficulty,
         }
     }))
 }
 
 /// Rolling server-side time-series of pool hashrate + connected miners.
 ///
-/// The sampler task in `bins/ghost-pool` snapshots the same mesh accessors the
-/// mining-status endpoint uses (`mesh_total_hashrate` / `local_hashrate` /
-/// `mesh_active_miners`) every 30s into a bounded in-memory ring. This endpoint
+/// The sampler task in `bins/ghost-pool` snapshots this node's hashrate
+/// (`local_hashrate`) and active miners (`local_active_miners`) every 30s into
+/// a bounded in-memory ring. This endpoint
 /// returns the samples within the requested `window` (`1h` or `24h`, default
 /// `1h`), oldest first. Empty until the first sample lands after startup — the
 /// dashboard keeps its client-side session buffer as a fallback in that case.
@@ -2389,23 +2265,12 @@ async fn api_chain_health_handler(
     }))
 }
 
-/// Mesh-wide leaderboard for the pool page — aggregated across the whole mesh
-/// WITHOUT any new gossip, from data every node already holds:
+/// Leaderboard for the pool page, in the shape of the old mesh-wide one:
 ///
-/// * `nodes` — every mesh node (self + connected peers) ranked by realized
-///   hashrate. This is the mesh-wide replacement for the pool page's old
-///   this-node-only miner list.
-/// * `records` — the mesh-wide best (rarest) share per window (block/day/week/
-///   month), merging this node's local DB best with peers' gossiped
-///   `best_records` (already reduced to one winner per window), each attributed
-///   to its redacted miner id.
-///
-/// LIMIT: a true mesh-wide *per-miner top-N* leaderboard (every miner on every
-/// node ranked by hashrate or shares) is NOT computable from a single node
-/// without new gossip — peers gossip per-node aggregates and one best-share
-/// record per window, never their full per-miner tables. The public website
-/// builds that by fanning out to every node and merging client-side. `records`
-/// is the widest mesh-wide per-miner surface available server-side here.
+/// * `nodes` — this node, with its realized hashrate and active miners. The old
+///   mesh that supplied every other node was removed.
+/// * `records` — this node's best (rarest) share per window (block/day/week/
+///   month), attributed to its redacted miner id.
 async fn api_pool_mesh_leaderboard_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
@@ -2425,46 +2290,20 @@ async fn api_pool_mesh_leaderboard_handler(
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| mesh_node_name(&addr, &health.node_id))
     };
-    let mut nodes = vec![serde_json::json!({
+    let nodes = vec![serde_json::json!({
         "node_id": health.node_id.clone(),
         "name": self_name,
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
-        // Deduped real-miner count (matches Capacity/Swarm/overview), not the
-        // raw share-ledger miner_count which double-counts (issue #281).
-        "miner_count": state.self_deduped_miner_count(),
+        // Active miners in the shared window, not the raw share-ledger
+        // miner_count which double-counts (issue #281).
+        "miner_count": state.local_active_miners(),
         "healthy": health.healthy,
         "is_self": true,
     })];
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(health.node_id.clone());
-    for peer in state.mesh_nodes() {
-        if !seen.insert(peer.node_id.clone()) {
-            continue;
-        }
-        nodes.push(serde_json::json!({
-            "node_id": peer.node_id,
-            "name": mesh_node_name(&peer.address, &peer.node_id),
-            "hashrate_th": peer.hashrate_th,
-            // Deduped real-miner count, consistent with the self row (issue #281).
-            "miner_count": peer.deduped_miner_count,
-            "healthy": peer.healthy,
-            "is_self": false,
-        }));
-    }
-    // Rank by realized hashrate, highest first.
-    nodes.sort_by(|a, b| {
-        let ha = a.get("hashrate_th").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let hb = b.get("hashrate_th").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        hb.partial_cmp(&ha).unwrap_or(std::cmp::Ordering::Equal)
-    });
     let node_count = nodes.len();
 
-    // --- Mesh-wide best-share records per window ---
-    // Merge this node's local DB best with the peers' gossiped winners (already
-    // one per window). Same rarity rule as /api/v1/pool/records: fixed-width
-    // zero-padded hex, so string `<` matches numeric order (smaller = rarer).
+    // --- Best-share records per window ---
     let now_s = chrono::Utc::now().timestamp();
-    let mesh_records = state.mesh_best_records();
     let mut records = Vec::new();
     for (window_name, window_secs) in [
         ("block", 600i64),
@@ -2473,49 +2312,23 @@ async fn api_pool_mesh_leaderboard_handler(
         ("month", 2_592_000),
     ] {
         let since_ts = now_s - window_secs;
-        let mut winning_hash: Option<String> = None;
-        let mut winning_redacted = String::new();
-        let mut winning_timestamp: i64 = 0;
-
-        if let Some(ref db) = state.database {
-            if let Ok(Some(best)) = db.get_best_share_since(since_ts) {
-                // Local DB hash is INTERNAL order; hold the winner in DISPLAY
-                // order so `<` ranks by rarity and peers (already DISPLAY) merge.
-                winning_hash = Some(internal_hex_to_display_hex(&best.share_hash));
-                winning_redacted = redact_miner_id(&best.miner_id);
-                winning_timestamp = best.timestamp;
-            }
-        }
-        if let Some(ref recs) = mesh_records {
-            for rec in recs {
-                if rec.window != window_name || rec.share_hash.is_empty() {
-                    continue;
-                }
-                let beats = winning_hash
-                    .as_ref()
-                    .map(|w| rec.share_hash < *w)
-                    .unwrap_or(true);
-                if beats {
-                    winning_hash = Some(rec.share_hash.clone());
-                    winning_redacted = rec.miner_id_redacted.clone();
-                    winning_timestamp = rec.timestamp;
-                }
-            }
-        }
-
-        if let Some(share_hash) = winning_hash {
-            // `share_hash` is DISPLAY order (zeros at front): count is correct,
-            // and it is returned as-is for the website. Difficulty needs the
-            // INTERNAL form, so reverse it back.
+        let best = state
+            .database
+            .as_ref()
+            .and_then(|db| db.get_best_share_since(since_ts).ok().flatten());
+        if let Some(best) = best {
+            // The database holds INTERNAL order; the website gets DISPLAY order
+            // (zeros at the front), where the leading-zero count is read.
+            let share_hash = internal_hex_to_display_hex(&best.share_hash);
             let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
             records.push(serde_json::json!({
                 "window": window_name,
-                "share_hash": share_hash.clone(),
+                "share_hash": share_hash,
                 "leading_zero_bits": leading_hex_zeros * 4,
                 "leading_hex_zeros": leading_hex_zeros,
-                "miner_id_redacted": winning_redacted,
-                "timestamp": winning_timestamp,
-                "difficulty": share_difficulty_from_hash_hex(&internal_hex_to_display_hex(&share_hash)),
+                "miner_id_redacted": redact_miner_id(&best.miner_id),
+                "timestamp": best.timestamp,
+                "difficulty": share_difficulty_from_hash_hex(&best.share_hash),
             }));
         }
     }
@@ -2524,10 +2337,9 @@ async fn api_pool_mesh_leaderboard_handler(
         "nodes": nodes,
         "node_count": node_count,
         "records": records,
-        "limit_note": "Node-ranked leaderboard + mesh-wide best-share records \
-            per window, aggregated from existing mesh data (no new gossip). A \
-            per-miner top-N hashrate/shares leaderboard across the whole mesh \
-            requires client-side fan-out to every node.",
+        "limit_note": "This node only: the old mesh that aggregated every node was \
+            removed. A per-miner leaderboard across nodes requires client-side \
+            fan-out to every node.",
     }))
 }
 
@@ -2817,22 +2629,21 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         .as_ref()
         .and_then(|db| db.count_active_miners(ACTIVE_MINER_WINDOW_SECS).ok())
         .unwrap_or(0);
-    let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
+    // `mesh_active_miners` keeps its name for existing readers; the old mesh that summed it
+    // across nodes was removed, so it is this node's count.
+    let mesh_active_miners = active_miners;
 
     // Seconds elapsed working the current template (round manager provides it;
     // None on older deploys without the callback wired).
     let current_round_duration_secs = state.round_elapsed_secs();
 
     // Expected time for THIS pool to find a block at its current aggregate
-    // hashrate. Pool hashrate is the deduplicated mesh-wide figure (TH/s),
-    // falling back to this node's own realized rate; converted to hashes/sec
+    // hashrate, this node's own realized rate (TH/s); converted to hashes/sec
     // for the estimator. Network difficulty comes straight from Ghost Core
     // (getmininginfo) — the round manager's copy is a static default, so we
     // read the live value here, mirroring the network-hashrate field on the
     // mining-status endpoint. `null` when either input is unavailable.
-    let pool_hashrate_th = state
-        .mesh_total_hashrate()
-        .or_else(|| state.local_hashrate());
+    let pool_hashrate_th = state.local_hashrate();
     let network_difficulty = if let Some(ref rpc) = state.rpc {
         tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_mining_info())
             .await
@@ -2852,7 +2663,7 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         "version": health.version,
         "block_height": health.block_height,
         "peer_count": health.peer_count,
-        "active_nodes": health.peer_count + 1,
+        "active_nodes": health.peer_count.map(|p| p + 1),
         "miner_count": health.miner_count,
         "active_miners": active_miners,
         "mesh_active_miners": mesh_active_miners,
@@ -2958,12 +2769,9 @@ async fn api_resources_handler(State(state): State<Arc<VerificationState>>) -> i
         "disk_total_gb": disk_total_gb,
         "uptime_seconds": health.uptime_secs,
         "uptime_secs": health.uptime_secs,
-        // Deduplicated mesh-wide active-miner count (same source as
-        // /api/v1/network/pool), NOT the raw `miner_count` — the raw value is a
-        // load-balancer routing view that double-counts miners failing over
-        // between nodes, so the Watchdog was showing an inflated figure that
-        // could exceed the real distinct total. Falls back to raw if unavailable.
-        "connected_miners": state.mesh_active_miners().unwrap_or(health.miner_count),
+        // Active miners in the shared window (same source as
+        // /api/v1/network/pool), NOT the raw round `miner_count`.
+        "connected_miners": state.local_active_miners(),
         "estimated_capacity": 1000,
         "status": status,
         "last_redirect_count": 0,
@@ -3009,19 +2817,8 @@ fn mesh_node_name(address: &str, node_id: &str) -> String {
 
 /// API v1 Swarm handler — the fleet view consumed by the dashboard Swarm page.
 ///
-/// Auto-discovered mesh peers are reported with their REAL, health-ping-gossiped
-/// state (online/capabilities/hashrate/miner count) that this node already holds
-/// in the in-memory `PeerManager` — the exact source `/api/v1/pool/mesh-nodes`
-/// uses. Previously this handler returned each peer stripped down to its mesh
-/// address (`:8555`) with no `online` flag, so the dashboard rendered every mesh
-/// peer as "Offline" with zeroed stats even though the mesh reports them healthy.
-///
-/// Fields that are NOT gossiped per peer (uptime %, mesh peer count, L1/L2 chain
-/// heights, node balance) are deliberately OMITTED rather than sent as `0`, so
-/// the dashboard can render them as "—" instead of a misleading zero. Each node
-/// carries `"source": "mesh"` so the frontend can distinguish auto-discovered
-/// peers (never poll-able from here, so never "offline" just because their
-/// loopback dashboard API is unreachable) from any manually-added swarm node.
+/// The old mesh that listed every peer was removed, so this reports this node
+/// only, in the same shape; the dashboard is rebuilt for the node pool in W2.14.
 async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
 
@@ -3069,46 +2866,14 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         "version": health.version.clone(),
         "hashrate_th": self_hashrate,
         "miner_count": health.miner_count,
-        // Locally-known stats the mesh doesn't gossip (fixes the self row's "—").
         "peer_count": health.peer_count,
         "l1_height": health.block_height,
         "uptime_percent": self_uptime_percent,
     });
 
-    let mut nodes = vec![self_node];
-    // Dedup by node_id; self is already in, so skip any peer that re-reports
-    // this node's id (e.g. a same-host placeholder).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(health.node_id.clone());
-
-    let mut online_nodes: u32 = if health.healthy { 1 } else { 0 };
-    let mut combined_hashrate = self_hashrate;
-
-    for peer in state.mesh_nodes() {
-        if !seen.insert(peer.node_id.clone()) {
-            continue;
-        }
-        if peer.healthy {
-            online_nodes += 1;
-        }
-        combined_hashrate += peer.hashrate_th;
-        nodes.push(serde_json::json!({
-            "node_id": peer.node_id,
-            "name": mesh_node_name(&peer.address, &peer.node_id),
-            "address": peer.address,
-            "online": peer.healthy,
-            "is_self": false,
-            "source": "mesh",
-            "hashrate_th": peer.hashrate_th,
-            "miner_count": peer.miner_count,
-            // Gossiped Swarm telemetry — `None` → JSON null → "—" on the page,
-            // so a peer running an older build (that doesn't gossip these) shows
-            // a dash rather than a fabricated 0 until the fleet is updated.
-            "uptime_percent": peer.uptime_percent,
-            "peer_count": peer.peer_count,
-            "l1_height": peer.l1_height,
-        }));
-    }
+    let nodes = vec![self_node];
+    let online_nodes: u32 = if health.healthy { 1 } else { 0 };
+    let combined_hashrate = self_hashrate;
 
     let total_nodes = nodes.len() as u32;
 
@@ -8855,12 +8620,12 @@ async fn pool_nodes_handler(State(state): State<Arc<VerificationState>>) -> impl
         "this_node": {
             "miner_count": state.miner_count(),
             "max_capacity": state.max_capacity(),
-            // Deduped share attributed to this node; `this_node` + every peer's
-            // `deduped_miner_count` sum to the deduped `mesh_active_miners`.
-            "deduped_miner_count": state.self_deduped_miner_count(),
+            "deduped_miner_count": state.local_active_miners(),
             "core_healthy": core_healthy,
         },
-        "peers": state.pool_peers(),
+        // Always empty: the peers came from the old mesh, which was removed, so the
+        // translator's balancer keeps every miner on this node.
+        "peers": [],
     }))
 }
 
@@ -11033,7 +10798,7 @@ mod tests {
             crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
                 .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
                 .with_share_recorder(|_| Ok(()))
-                .with_callbacks(|| 960_000, || 1, || 1, || 1)
+                .with_callbacks(|| 960_000, || 1, || 1)
                 .with_share_pow_verify_height(959_030),
         );
 
@@ -11318,69 +11083,6 @@ mod tests {
     fn test_safe_proc_path_traversal() {
         let allowed = vec!["/proc/meminfo".to_string(), "/proc/cpuinfo".to_string()];
         assert!(!is_safe_proc_path("/proc/../etc/passwd", &allowed));
-    }
-
-    #[test]
-    fn test_mesh_node_to_json_shape() {
-        let node = MeshNodeInfo {
-            node_id: "deadbeef".to_string(),
-            address: "1.2.3.4:8080".to_string(),
-            hashrate_th: 12.5,
-            miner_count: 3,
-            deduped_miner_count: 2,
-            max_capacity: 500,
-            healthy: true,
-            l1_height: Some(912_345),
-            uptime_percent: Some(99.7),
-            peer_count: Some(3),
-        };
-
-        let v = mesh_node_to_json(&node);
-        assert_eq!(v["node_id"], "deadbeef");
-        assert_eq!(v["address"], "1.2.3.4:8080");
-        assert_eq!(v["hashrate_th"], 12.5);
-        assert_eq!(v["miner_count"], 3);
-        assert_eq!(v["deduped_miner_count"], 2);
-        assert_eq!(v["max_capacity"], 500);
-        assert_eq!(v["healthy"], true);
-        // Gossiped Swarm telemetry surfaces on the peer JSON.
-        assert_eq!(v["l1_height"], 912_345);
-        assert_eq!(v["uptime_percent"], 99.7);
-        assert_eq!(v["peer_count"], 3);
-        // Peers are never self.
-        assert_eq!(v["is_self"], false);
-    }
-
-    #[test]
-    fn test_mesh_node_to_json_defaults_for_bare_peer() {
-        // A peer that has only just been discovered (no gossiped metrics yet)
-        // must still serialize to a complete object with safe defaults rather
-        // than dropping fields or failing.
-        let node = MeshNodeInfo {
-            node_id: "00ff".to_string(),
-            address: String::new(),
-            hashrate_th: 0.0,
-            miner_count: 0,
-            deduped_miner_count: 0,
-            max_capacity: 0,
-            healthy: false,
-            l1_height: None,
-            uptime_percent: None,
-            peer_count: None,
-        };
-
-        let v = mesh_node_to_json(&node);
-        assert_eq!(v["address"], "");
-        assert_eq!(v["hashrate_th"], 0.0);
-        assert_eq!(v["miner_count"], 0);
-        assert_eq!(v["deduped_miner_count"], 0);
-        assert_eq!(v["max_capacity"], 0);
-        assert_eq!(v["healthy"], false);
-        // Unreported telemetry serialises to JSON null → "—" on the page, never
-        // a fabricated 0.
-        assert!(v["l1_height"].is_null());
-        assert!(v["uptime_percent"].is_null());
-        assert!(v["peer_count"].is_null());
     }
 
     #[test]

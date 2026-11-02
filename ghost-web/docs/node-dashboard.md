@@ -212,10 +212,10 @@ so the target, the action and the parameters cannot be changed after signing.
 they are refused (`400 unsigned_fields`).
 
 **Settable keys** — nothing else: `alerts.enabled`, every
-`alerts.events.<event>` toggle (`node_offline`, `capability_drift`, `low_disk`,
-`restart_needed`, `peer_count_drop`, `block_found`, `reorg_detected`,
-`behind_tip`, `update_available`, `mempool_congestion`, `fee_spike`,
-`failed_login`, `service_restart_loop`), `network.max_miners` (1 to 4294967295)
+`alerts.events.<event>` toggle (`low_disk`, `restart_needed`,
+`peer_count_drop` (share-chain relay peers dropped, or none), `block_found`,
+`reorg_detected`, `behind_tip`, `update_available`, `mempool_congestion`,
+`fee_spike`, `failed_login`, `service_restart_loop`), `network.max_miners` (1 to 4294967295)
 and `identity.display_name` (1-64 printable characters, no quotes).
 
 Anything else is `403 refused_by_design`, with a `category` saying why:

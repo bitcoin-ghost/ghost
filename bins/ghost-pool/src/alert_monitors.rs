@@ -22,6 +22,11 @@
 //!   baseline. Rate-limited to `FEE_SPIKE_ALERT_MIN_INTERVAL` so sustained
 //!   high fees don't spam.
 //!
+//! * **Relay peers** — the share-chain relay's peer count, read from pool_sv2's
+//!   `/api/v1/node-pool/status` every `RELAY_PEERS_CHECK_INTERVAL` and published as
+//!   `/health` `peer_count`. `PeerCountDrop` fires, rate-limited, when the count
+//!   falls, and edge-triggered when it reaches zero (a node with no relay peers
+//!   neither hears shares nor has its own relayed).
 //! * **Low-disk** — free space on the data partition falls below
 //!   `LOW_DISK_MIN_FREE_BYTES`, with a second, independent edge at
 //!   `CRITICAL_DISK_MIN_FREE_BYTES`. Edge-triggered.
@@ -628,8 +633,105 @@ fn free_bytes(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
+/// Cadence of the relay-peers check.
+pub const RELAY_PEERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum interval between relay-peer-drop alerts.
+pub const RELAY_PEERS_DROP_MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// What a relay peer reading means for the alerts: `(none_active, drop_detail)`.
+///
+/// `none_active` drives the edge-triggered "no relay peers" alert and is only judged on a real
+/// reading: an unanswered status (`now = None`) is unknown, not zero. `drop_detail` is set when a
+/// reading is lower than the previous real one.
+pub fn relay_peer_alerts(prev: Option<u32>, now: Option<u32>) -> (Option<bool>, Option<String>) {
+    let Some(n) = now else {
+        return (None, None);
+    };
+    let drop = match prev {
+        Some(p) if n < p => Some(format!("Share-chain relay peers dropped from {p} to {n}.")),
+        _ => None,
+    };
+    (Some(n == 0), drop)
+}
+
+/// Read `peers` from pool_sv2's node pool status, `None` if it does not answer with one.
+async fn fetch_relay_peers(client: &reqwest::Client, base: &str) -> Option<u32> {
+    let url = format!("{}/api/v1/node-pool/status", base.trim_end_matches('/'));
+    let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    v.get("peers")?.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+/// Spawn the relay-peers monitor (see the module docs). Runs until `shutdown` fires.
+pub fn spawn_relay_peers_monitor(
+    alerts: Arc<AlertDispatcher>,
+    state: Arc<ghost_verification::VerificationState>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let mut interval = tokio::time::interval(RELAY_PEERS_CHECK_INTERVAL);
+        let mut last: Option<u32> = None;
+        info!("Relay-peers monitor started");
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let now = fetch_relay_peers(&client, &state.node_pool_api).await;
+                    state.set_relay_peers(now);
+                    let (none, drop) = relay_peer_alerts(last, now);
+                    if let Some(detail) = drop {
+                        alerts
+                            .fire_rate_limited(
+                                AlertEvent::PeerCountDrop,
+                                RELAY_PEERS_DROP_MIN_INTERVAL,
+                                &detail,
+                            )
+                            .await;
+                    }
+                    if let Some(active) = none {
+                        alerts
+                            .fire_edge(
+                                AlertEvent::PeerCountDrop,
+                                "no-relay-peers",
+                                active,
+                                "This node has no share-chain relay peers: it neither hears \
+                                 other nodes' shares nor has its own relayed.",
+                            )
+                            .await;
+                    }
+                    if now.is_some() {
+                        last = now;
+                    }
+                }
+                _ = shutdown.recv() => break,
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_peer_alerts_judge_only_real_readings() {
+        // Unanswered is unknown: no alert either way.
+        assert_eq!(relay_peer_alerts(Some(3), None), (None, None));
+        // First reading of zero: the none-alert is active, nothing to drop from.
+        assert_eq!(relay_peer_alerts(None, Some(0)), (Some(true), None));
+        // A fall is a drop; a fall to zero is both.
+        let (none, drop) = relay_peer_alerts(Some(3), Some(1));
+        assert_eq!(none, Some(false));
+        assert!(drop.unwrap().contains("from 3 to 1"));
+        let (none, drop) = relay_peer_alerts(Some(2), Some(0));
+        assert_eq!(none, Some(true));
+        assert!(drop.is_some());
+        // Steady or rising: no drop, and the none-alert re-arms.
+        assert_eq!(relay_peer_alerts(Some(2), Some(2)), (Some(false), None));
+        assert_eq!(relay_peer_alerts(Some(0), Some(4)), (Some(false), None));
+    }
+
     use super::*;
 
     #[test]

@@ -33,7 +33,7 @@ docker-compose --profile sv1 --profile monitoring up -d
 │  │  bitcoind   │  │  ghost-pool │  │    prometheus       │ │
 │  │  :8332 RPC  │──│  :8080 API  │──│    :9090           │ │
 │  │  :28332 ZMQ │  │  :34255 SV2 │  └─────────┬───────────┘ │
-│  └─────────────┘  │  :8555-8562 │            │             │
+│  └─────────────┘  │             │            │             │
 │                   └──────┬──────┘            │             │
 │                          │                    │             │
 │  ┌─────────────┐         │           ┌─────────┴───────────┐ │
@@ -82,7 +82,6 @@ See `.env.example` for all available variables.
 | 8080 | Ghost Pool API | HTTP |
 | 9090 | Prometheus | HTTP |
 | 34255 | Ghost Pool | Stratum V2 |
-| 8555-8562 | Ghost Pool P2P | TCP |
 
 ## Building
 

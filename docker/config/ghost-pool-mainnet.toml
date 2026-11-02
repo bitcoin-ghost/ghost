@@ -30,29 +30,6 @@ public_mining = true
 # H-13: REQUIRED for mainnet - generate with: openssl rand -hex 32
 internal_api_secret = "${INTERNAL_API_SECRET}"
 
-# H-13: REQUIRED for mainnet - must be true for encrypted P2P communication
-noise_enabled = true
-noise_required = true
-
-[network.p2p]
-share_propagation = 8555
-block_announcement = 8556
-consensus_voting = 8557
-health_monitoring = 8558
-discovery = 8559
-elder_management = 8560
-payout_proposal = 8561
-payout_transaction = 8562
-
-# Bootstrap seed nodes for peer discovery
-# IMPORTANT: Add at least 2-3 seed nodes before mainnet launch
-seed_nodes = [
-    # Add mainnet seed nodes here, e.g.:
-    # "seed1.bitcoinghost.org:8559",
-    # "seed2.bitcoinghost.org:8559",
-    # "seed3.bitcoinghost.org:8559",
-]
-
 [policy]
 # Bitcoin Pure - only financial transactions (T0-T1)
 profile = "bitcoin_pure"

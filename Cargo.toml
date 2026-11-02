@@ -30,7 +30,6 @@ members = [
     "crates/ghost-reaper",
     "crates/ghost-policy",
     "crates/ghost-storage",
-    "crates/ghost-consensus",
     "crates/ghost-accounting",
     "crates/ghost-verification",
     "crates/ghost-np-relay",
@@ -76,7 +75,6 @@ ghost-buds = { path = "crates/ghost-buds" }
 ghost-reaper = { path = "crates/ghost-reaper" }
 ghost-policy = { path = "crates/ghost-policy" }
 ghost-storage = { path = "crates/ghost-storage" }
-ghost-consensus = { path = "crates/ghost-consensus" }
 ghost-accounting = { path = "crates/ghost-accounting" }
 ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
@@ -142,7 +140,6 @@ futures = "0.3"
 base64 = "0.22"
 
 # Cryptography
-snow = "0.9"
 getrandom = "0.2"
 
 # JWT
@@ -163,7 +160,6 @@ crossterm = "0.29"
 # Additional crypto
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 secrecy = "0.8"
 
 # HTTP
@@ -193,7 +189,6 @@ ignored = ["ghost-mining"]
 ghost-common = { workspace = true }
 ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
-ghost-consensus = { workspace = true, features = ["test-utils"] }
 ghost-mining = { workspace = true }
 ghost-storage = { workspace = true }
 

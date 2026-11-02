@@ -161,47 +161,6 @@ fn test_098_valid_signing_key_accepted() {
         .any(|e| e.field == "network.signing_key" && e.message.contains("REQUIRED")));
 }
 
-#[test]
-fn test_100_seed_nodes_http_remote_rejected() {
-    let mut config = NodeConfig::default();
-    config.network.seed_nodes = vec!["http://192.168.1.100:8080".to_string()];
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field.contains("seed_nodes") && e.message.contains("Insecure HTTP")));
-}
-
-#[test]
-fn test_101_seed_nodes_https_accepted() {
-    let mut config = NodeConfig::default();
-    config.network.seed_nodes = vec!["https://seed.example.com:8080".to_string()];
-
-    let result = config.validate();
-    // Should not have seed_nodes error for HTTPS
-    assert!(!result
-        .errors
-        .iter()
-        .any(|e| e.field.contains("seed_nodes") && e.message.contains("Insecure HTTP")));
-}
-
-#[test]
-fn test_102_seed_nodes_localhost_http_warning() {
-    let mut config = NodeConfig::default();
-    config.network.seed_nodes = vec!["http://127.0.0.1:8080".to_string()];
-
-    let result = config.validate();
-    // Should be a warning, not an error
-    assert!(result
-        .warnings
-        .iter()
-        .any(|e| e.field.contains("seed_nodes") && e.message.contains("localhost")));
-    // Should NOT be an error
-    assert!(!result.errors.iter().any(|e| e.field.contains("seed_nodes")));
-}
-
 // =============================================================================
 // BITCOIN RPC CONFIG TESTS (Tests 103-112)
 // =============================================================================
