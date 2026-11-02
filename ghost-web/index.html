@@ -4,27 +4,28 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bitcoin Ghost · infrastructure for Bitcoin, with incentives for running it</title>
-  <meta name="description" content="Decentralized mining pool, instant payments, and privacy tools for Bitcoin. Open source. Running on mainnet today.">
+  <title>Bitcoin Ghost · a mining pool with no operator</title>
+  <meta name="description" content="Bitcoin Ghost node pool: anyone runs a node, a share chain keeps the ledger, miners are paid from the coinbase. Not ready: no block found, no payout made.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Bitcoin Ghost">
-  <meta property="og:description" content="Incentivised Bitcoin nodes. Decentralised mining pool. Shielded L2 payments. Open source, self-custodial, ossifying.">
+  <meta property="og:title" content="Bitcoin Ghost · a mining pool with no operator">
+  <meta property="og:description" content="Bitcoin Ghost node pool: anyone runs a node, a share chain keeps the ledger, miners are paid from the coinbase. Not ready: no block found, no payout made.">
   <meta property="og:url" content="https://bitcoinghost.org/">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
-  <meta name="twitter:title" content="Bitcoin Ghost">
-  <meta name="twitter:description" content="Incentivised Bitcoin nodes. Decentralised mining pool. Shielded L2 payments. Open source, self-custodial, ossifying.">
+  <meta name="twitter:title" content="Bitcoin Ghost · a mining pool with no operator">
+  <meta name="twitter:description" content="Bitcoin Ghost node pool: anyone runs a node, a share chain keeps the ledger, miners are paid from the coinbase. Not ready: no block found, no payout made.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260422">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
       var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', saved || system);
     })();
@@ -35,7 +36,6 @@
 <header class="site-header">
   <div class="container">
     <a href="/" class="brand bare">
-      <!-- Lucide `ghost` icon, stroke in accent colour -->
       <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M9 10h.01"/>
         <path d="M15 10h.01"/>
@@ -60,89 +60,110 @@
           <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
         </svg>
       </a>
-      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme">
-        <!-- filled at runtime with sun or moon SVG -->
-      </button>
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme"></button>
     </div>
   </div>
 </header>
 
-<section class="hero">
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
   <div class="container">
-    <span class="eyebrow">mainnet · testing</span>
-    <h1>Infrastructure for Bitcoin,<br>with <span class="accent">incentives</span> for running it.</h1>
-    <p class="lead">
-      A bitcoin node stack built on three layers. Incentivised node. Decentralised mining. Private payments. Open source, running on mainnet today.
-    </p>
-    <div class="hero-actions">
-      <a href="/nodes.html" class="btn btn-primary">Run a node <span class="arrow">→</span></a>
-      <a href="/docs/" class="btn btn-ghost">Read the docs</a>
-    </div>
-  </div>
-</section>
-
-<section class="metrics">
-  <div class="container">
-    <div class="metric">
-      <div class="label">pool hashrate</div>
-      <div class="value" id="live-hashrate">—</div>
-    </div>
-    <div class="metric">
-      <div class="label">active miners</div>
-      <div class="value" id="live-miners">—</div>
-    </div>
-    <div class="metric">
-      <div class="label">active nodes</div>
-      <div class="value" id="live-nodes">—</div>
-    </div>
-    <div class="metric">
-      <div class="label">network block</div>
-      <div class="value" id="live-height">—</div>
-    </div>
-  </div>
-</section>
-
-<div class="rl-notice-wrap">
-  <div class="container">
-    <div class="rl-notice" id="rl-notice" role="status" aria-live="polite">
-      <span class="rl-dot"></span>
-      <span class="rl-text">Statistics API is exceeding rate limits. Limits will reset soon.</span>
-    </div>
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
   </div>
 </div>
 
+<section class="hero">
+  <div class="container">
+    <span class="eyebrow">node pool · not ready</span>
+    <h1>A mining pool with <span class="accent">no operator.</span></h1>
+    <p class="lead">
+      Anyone can run a node, or point a miner at someone else's. A light share chain decides who is owed what,
+      and every block the pool finds pays miners straight from its coinbase. Nobody holds miners' money.
+    </p>
+    <div class="hero-actions">
+      <a href="#how" class="btn btn-primary">How it works <span class="arrow">→</span></a>
+      <a href="/docs/#honest-reading" class="btn btn-ghost">Before you mine</a>
+    </div>
+  </div>
+</section>
+
+<section class="metrics" data-np-status data-status-url="/api/v1/node-pool/status">
+  <div class="container">
+    <div class="metric">
+      <div class="label">share-chain tip</div>
+      <div class="value" data-np-field="tip_height">—</div>
+    </div>
+    <div class="metric">
+      <div class="label">pool hashrate</div>
+      <div class="value" data-np-field="hashrate">—</div>
+    </div>
+    <div class="metric">
+      <div class="label">connected miners</div>
+      <div class="value" data-np-field="miners">—</div>
+    </div>
+    <div class="metric">
+      <div class="label">blocks found</div>
+      <div class="value" data-np-field="blocks_found">—</div>
+    </div>
+  </div>
+  <div class="container"><p class="np-status-note" data-np-updated>Loading live status…</p></div>
+</section>
+
 <section class="block">
   <div class="container">
-    <div class="section-label">What Ghost is</div>
-    <h2 class="section-title">Three ideas. One stack. No protocol changes.</h2>
+    <div class="section-label">Read this first</div>
+    <h2 class="section-title">It is not ready, and it may not pay you for a long time.</h2>
+    <ul class="np-honest">
+      <li><strong>No block has ever been found</strong> by the node pool.</li>
+      <li><strong>No payout has ever been made.</strong></li>
+      <li><strong>Your balance may stay unpaid for a long time.</strong></li>
+      <li><strong>An unaudited node can cheat you.</strong> The tool to audit one, <code>ghost-audit</code>, is not built yet.</li>
+      <li><strong>If you need steady income, use an established pool.</strong></li>
+    </ul>
+    <div class="np-prose">
+      <p>Nothing has run on signet or mainnet yet. Before anything reaches mainnet it must pass multi-node tests on regtest,
+      a hostile-node test, several nodes on our own signet with real block wins, and real mining hardware on signet.</p>
+      <p>Even if every miner could carry large coinbases, a 100 TH/s miner on a pool at 1% of the network would wait about
+      4.5 months for a first payment. The pool is about 100,000 times short of 1% of the network.
+      <a href="/docs/#honest-reading">The full reading →</a></p>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <div class="section-label">What it is</div>
+    <h2 class="section-title">Run a node, or just point a miner.</h2>
 
     <div class="three-col">
       <div>
         <svg class="logo-ghost pillar pink" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
+          <path d="M9 10h.01"/><path d="M15 10h.01"/>
           <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
-        <h3>Ghost Core</h3>
-        <p>We are incentivising node operators. Every node earns from the infrastructure it provides. A shared node reward pool, funded by mining fees and L2 transaction fees, pays out based on verified capabilities — archive storage (+5 shares), payment service (+4 shares), public mining (+3 shares), clean policy (+2 shares), elder status (+1 share). No operator, no admin keys, no trust assumption.</p>
+        <h3>Anyone runs a node</h3>
+        <p>No approval, no roster, no signed list. A node runs a Bitcoin node and a Stratum pool, picks its own
+        transactions, and takes the transaction fees of every block its own miners find.
+        <a href="/nodes.html">Run a node →</a></p>
       </div>
       <div>
         <svg class="logo-ghost pillar cyan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
+          <path d="M9 10h.01"/><path d="M15 10h.01"/>
           <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
-        <h3>Ghost Pool</h3>
-        <p>Every node chooses its own mempool and block policy. Each node runs its own mini pool, which is part of the Ghost Pool. Every node that enables mining decentralises the network. Multiple operation modes — PublicPool, PrivateSolo and PrivatePool. Miners connect with standard Stratum V1 or V2. No central operator controls block construction or reward distribution. A BFT quorum of nodes agrees on payouts before each block lands. 1% pool fee.</p>
+        <h3>A share chain keeps the books</h3>
+        <p>Nodes pass each other the larger shares. Each share proves its own work and its own payee. About every
+        54 seconds a harder share becomes an anchor that orders the recent ones, and the chain with the most work wins.
+        No votes, no signatures to trust, no elders.</p>
       </div>
       <div>
         <svg class="logo-ghost pillar green" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
+          <path d="M9 10h.01"/><path d="M15 10h.01"/>
           <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
-        <h3>Ghost Pay</h3>
-        <p>A payment layer built into the nodes that enable private and near instant payments. Ghost Pay settles between 1 and 10 seconds using shielded notes and zero-knowledge proofs. No payment channels, no liquidity management. All in Bitcoin. No tokens. No swaps. We're bringing Silent Payments for stealth receiving and introducing Wraith, a decentralised (CoinJoin) mixing service for privacy and unlinkability. Balances reconcile back to L1.</p>
+        <h3>Paid from the coinbase</h3>
+        <p>Every block the pool finds pays owed ledger balances directly in its coinbase, exactly what is owed and
+        never more. There is no pool wallet and no withdrawal. <a href="/miners.html">Point a miner →</a></p>
       </div>
     </div>
   </div>
@@ -150,299 +171,131 @@
 
 <section class="block">
   <div class="container">
-    <div class="section-label">Architecture</div>
-    <h2 class="section-title">The full stack in one binary.</h2>
-    <p class="section-lead">
-      A single Ghost node runs Ghost Core, Ghost Pool, and Ghost Pay from one process. Nodes coordinate over a ZMQ mesh, reaching BFT consensus on shares, coinbase outputs, and node payouts before every block. Operators and users interact with their node through a small family of clients.
-    </p>
-
-    <div class="arch-diagram">
-
-      <!-- Node A -->
-      <div class="arch-node">
-        <div class="arch-node-label">one ghost node</div>
-        <div class="arch-pillars">
-          <div class="arch-pillar pink">
-            <div class="arch-pillar-name">Ghost Core</div>
-            <div class="arch-pillar-sub">full Bitcoin node</div>
-          </div>
-          <div class="arch-pillar cyan">
-            <div class="arch-pillar-name">Ghost Pool</div>
-            <div class="arch-pillar-sub">SV1 / SV2 mining pool</div>
-          </div>
-          <div class="arch-pillar green">
-            <div class="arch-pillar-name">Ghost Pay</div>
-            <div class="arch-pillar-sub">L2 private payments</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- BFT mesh connector -->
-      <div class="arch-mesh">
-        <div class="arch-mesh-arrows">↑ ↓</div>
-        <div class="arch-mesh-label">BFT mesh via ZMQ — nodes vote on shares, coinbase outputs, and node payouts</div>
-        <div class="arch-mesh-arrows">↑ ↓</div>
-      </div>
-
-      <!-- Node B -->
-      <div class="arch-node">
-        <div class="arch-node-label">another ghost node</div>
-        <div class="arch-pillars">
-          <div class="arch-pillar pink">
-            <div class="arch-pillar-name">Ghost Core</div>
-            <div class="arch-pillar-sub">full Bitcoin node</div>
-          </div>
-          <div class="arch-pillar cyan">
-            <div class="arch-pillar-name">Ghost Pool</div>
-            <div class="arch-pillar-sub">SV1 / SV2 mining pool</div>
-          </div>
-          <div class="arch-pillar green">
-            <div class="arch-pillar-name">Ghost Pay</div>
-            <div class="arch-pillar-sub">L2 private payments</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Frontend clients tier -->
-      <div class="arch-clients-header">Frontend clients</div>
-      <div class="arch-clients">
-        <div class="arch-client">
-          <div class="arch-client-name">Node Dashboard</div>
-          <div class="arch-client-sub">Next.js · localhost</div>
-        </div>
-        <div class="arch-client">
-          <div class="arch-client-name">Node TUI</div>
-          <div class="arch-client-sub">terminal UI</div>
-        </div>
-        <div class="arch-client">
-          <div class="arch-client-name">Ghost CLI</div>
-          <div class="arch-client-sub">light wallet</div>
-        </div>
-        <div class="arch-client">
-          <div class="arch-client-name">Ghost Pay Desktop</div>
-          <div class="arch-client-sub">Wraith + Tap · Win / Mac / Linux</div>
-        </div>
-        <div class="arch-client">
-          <div class="arch-client-name">Ghost Tap</div>
-          <div class="arch-client-sub">Android · merchant + wallet</div>
-        </div>
-      </div>
-
-    </div>
-  </div>
-</section>
-
-<section class="block">
-  <div class="container">
-    <div class="section-label">Economics</div>
-    <h2 class="section-title">Run a node, own the revenue.</h2>
-    <p class="section-lead">
-      Bitcoin Ghost is designed so rewards flow to the people running the infrastructure. Miners keep 99% of every block subsidy. The node that miner is connected to keeps 100% of that block's transaction fees. Connect your own ASIC to your own node and you capture the full block — connect to someone else's node and you're handing your fees to them.
-    </p>
+    <div class="section-label">How money moves</div>
+    <h2 class="section-title">Where a block's reward goes.</h2>
 
     <div class="econ-diagram">
-
-      <!-- Block subsidy track -->
       <div class="econ-track">
         <div class="econ-track-label">Block subsidy</div>
         <div class="econ-row-2">
           <div class="econ-card econ-primary">
-            <div class="econ-pct">99%</div>
-            <div class="econ-name">Miner</div>
+            <div class="econ-pct">99.5%</div>
+            <div class="econ-name">Miners' ledger balances, paid exactly</div>
           </div>
           <div class="econ-card">
-            <div class="econ-pct">1%</div>
-            <div class="econ-name">Pool fee</div>
-            <div class="econ-split">
-              <div class="econ-sub">
-                <div class="econ-sub-pct">0.5%</div>
-                <div class="econ-sub-name">Node reward pool</div>
-              </div>
-              <div class="econ-sub">
-                <div class="econ-sub-pct">0.5%</div>
-                <div class="econ-sub-name">Treasury <span class="econ-asterisk">*</span></div>
-              </div>
-            </div>
+            <div class="econ-pct">0.5%</div>
+            <div class="econ-name">Treasury <span class="econ-asterisk">*</span></div>
           </div>
         </div>
       </div>
-
-      <!-- Transaction fees track -->
       <div class="econ-track">
         <div class="econ-track-label">Transaction fees</div>
         <div class="econ-card econ-primary">
           <div class="econ-pct">100%</div>
-          <div class="econ-name">Winning node</div>
-        </div>
-      </div>
-
-    </div>
-    <div class="econ-footnote">* Treasury hard-capped at 21 BTC. A 5-year linear decay begins once the cap is reached, after which the full 1% flows to the node reward pool forever.</div>
-
-    <div class="feature-group">
-      <div class="features">
-        <div class="feature">
-          <div class="name">Miner cut — 99% of subsidy</div>
-          <div class="desc">Pool fee is a flat 1% of the whole block reward — subsidy and transaction fees. Miners keep the other 99%.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Node rewards — 5-4-3-2-1 shares</div>
-          <div class="desc">Half of the 1% funds a shared node reward pool, distributed by verified capabilities: Archive +5, Ghost Pay +4, Public Mining +3, Reaper +2, Elder +1. Max 15 shares, 95% uptime over 7 days required.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Treasury — capped, then decays to zero</div>
-          <div class="desc">The other 0.5% funds the treasury, hard-capped at 21 BTC. On reaching the cap a 5-year linear decay begins: 0.5 → 0.4 → 0.3 → 0.2 → 0.1 → 0. After that, the full 1% flows to the node reward pool forever. No governance, no votes, no future discretion.</div>
+          <div class="econ-name">The node whose miner found the block</div>
         </div>
       </div>
     </div>
+    <div class="econ-footnote">* Plus any part of the miners' 99.5% that a block cannot pay out, for example when few miners are owed much.
+    That change can be large: on a pool of mostly stock Antminers, simulation sends 20-33% of the miners' reward to the treasury.
+    The treasury address is a fixed protocol constant and has not been published yet.</div>
+
+    <div class="np-prose">
+      <p>At today's subsidy of 312,500,000 sats, a block sends 1,562,500 to the treasury and 310,937,500 to miners.
+      At current fees miners keep about 98.95% of total block value.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="how">
+  <div class="container">
+    <div class="section-label">How it works</div>
+    <h2 class="section-title">Start to finish.</h2>
+
+    <ol class="quickstart-steps">
+      <li><div class="qs-n">1</div><div><div class="qs-title">Connect</div><div class="qs-desc">A miner connects to any listed node, or its own. Its username is its payout address: P2SH, P2WPKH, P2WSH or P2TR only.</div></div></li>
+      <li><div class="qs-n">2</div><div><div class="qs-title">Get a job</div><div class="qs-desc">The node builds a coinbase every other node can recompute: treasury, the owed miners in a fixed order, the finder, the commitments. The node picks the transactions; it cannot pick the miner payouts.</div></div></li>
+      <li><div class="qs-n">3</div><div><div class="qs-title">Mine</div><div class="qs-desc">The miner hashes as it would on any pool. Its firmware sees ordinary coinbase bytes.</div></div></li>
+      <li><div class="qs-n">4</div><div><div class="qs-title">Share</div><div class="qs-desc">A share above the network tier goes to every node. Any node checks it alone: the work, the coinbase, the tag and the payouts. A share with wrong payouts earns nothing.</div></div></li>
+      <li><div class="qs-n">5</div><div><div class="qs-title">Anchor</div><div class="qs-desc">About every 54 seconds a share 256 times harder becomes an anchor and locks in a batch of recent shares. If two compete, the one with the most work wins.</div></div></li>
+      <li><div class="qs-n">6</div><div><div class="qs-title">Credit</div><div class="qs-desc">Each share credits sats at once, from its own difficulty. Every node reaches the same balance by running the same arithmetic on the same chain.</div></div></li>
+      <li><div class="qs-n">7</div><div><div class="qs-title">Block found</div><div class="qs-desc">The block pays from the balance table as it stood 20 blocks earlier, so a share-chain reorg can't change what it should pay.</div></div></li>
+      <li><div class="qs-n">8</div><div><div class="qs-title">Settle</div><div class="qs-desc">Nodes see the block and retire exactly what it paid. Coinbase outputs spend after 100 confirmations, as usual.</div></div></li>
+      <li><div class="qs-n">9</div><div><div class="qs-title">Verify</div><div class="qs-desc"><code>ghost-audit</code> will let a miner check that their node really credited them. It is not built yet; until it is, a miner trusts the node it mines on.</div></div></li>
+    </ol>
   </div>
 </section>
 
 <section class="block">
   <div class="container">
-    <div class="section-label">Features</div>
-    <h2 class="section-title">What's in the box.</h2>
+    <div class="section-label">The payout rule</div>
+    <h2 class="section-title">Exact pay. Nobody overpaid.</h2>
 
-    <!-- Ghost Core -->
-    <div class="feature-group product pink">
-      <div class="product-title">
-        <svg class="logo-ghost pillar pink mini" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-        </svg>
-        <span>Ghost Core</span>
-      </div>
+    <div class="feature-group">
       <div class="features">
         <div class="feature">
-          <div class="name">BUDS</div>
-          <div class="desc">Tier-based local policy dial. Operators accept or reject transactions by class — T0 financial, T1 data, T2 content, T3 abusive — without forking or recompiling.</div>
+          <div class="name">Credited at share time</div>
+          <div class="desc">Your balance grows as each share is accepted, by an amount worked out from the share's own difficulty.</div>
         </div>
         <div class="feature">
-          <div class="name">Reaper</div>
-          <div class="desc">Consensus-safe dead-code filter. Rejects inscription envelopes, runestones, drop stuffing, fake multisig, P2TR annex abuse and oversized OP_RETURNs.</div>
+          <div class="name">Snapshot at H − 20</div>
+          <div class="desc">A block at height H pays from the balances as they stood at H − 20, less what blocks up to H − 1 already paid.</div>
         </div>
         <div class="feature">
-          <div class="name">Shroud</div>
-          <div class="desc">Randomised relay delays defeating timing correlation attacks.</div>
+          <div class="name">Slot classes</div>
+          <div class="desc">A block pays 3, 9, 44, 143, 364 or 500 balances, depending on what the finder's firmware can safely carry.</div>
         </div>
         <div class="feature">
-          <div class="name">Ghost Mode</div>
-          <div class="desc">Blocks-only relay preventing origin-address leakage from mempool analysis.</div>
+          <div class="name">Oldest half, largest half</div>
+          <div class="desc">Half the slots go to the balances waiting longest, half to the largest. The single largest is paid last and takes any partial payment.</div>
         </div>
         <div class="feature">
-          <div class="name">Exorcism</div>
-          <div class="desc">Defensive block storage. Blocks are validated in RAM, then hazeable fields — witness, scriptSig, OP_RETURN, coinbase data — are stripped before disk. Harmful bytes never persist.</div>
+          <div class="name">1,000 sat minimum</div>
+          <div class="desc">Balances under 1,000 sats wait. A balance only ever falls by exactly what was paid.</div>
         </div>
         <div class="feature">
-          <div class="name">Tor or Clearnet</div>
-          <div class="desc">Embedded Tor subprocess or clean clearnet P2P routing, configurable per node.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Decentralised voting</div>
-          <div class="desc">67% Byzantine Fault Tolerant quorum on payouts and consensus actions, gossiped over a ZMQ mesh.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Incentivised share system</div>
-          <div class="desc">Capabilities earn a share of the 0.5% node reward pool: Archive +5, Ghost Pay +4, Public Mining +3, Reaper +2, Elder +1. Max 15 shares. Requires 95% uptime over a trailing 7 days.</div>
+          <div class="name">Change to the treasury</div>
+          <div class="desc">Whatever a block's slots can't use goes to the treasury with its 0.5%. Fees go to the finder node.</div>
         </div>
       </div>
     </div>
-
-    <!-- Ghost Pool -->
-    <div class="feature-group product cyan">
-      <div class="product-title">
-        <svg class="logo-ghost pillar cyan mini" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-        </svg>
-        <span>Ghost Pool</span>
-      </div>
-      <div class="features">
-        <div class="feature">
-          <div class="name">Per-node pool</div>
-          <div class="desc">Each node constructs its own block templates. The pool is the federation of every node that opts in.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Stratum V1 &amp; V2</div>
-          <div class="desc">Any ASIC connects immediately; SV2 speaks natively to the upstream pool.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Public mining</div>
-          <div class="desc">Accept external miners via Stratum; verified by port accessibility probes.</div>
-        </div>
-        <div class="feature">
-          <div class="name">BFT payout consensus</div>
-          <div class="desc">67% supermajority agreement on reward distribution before block inclusion.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Operation modes</div>
-          <div class="desc">PublicPool, PrivateSolo, PrivatePool — operators choose who connects to their node.</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Ghost Pay -->
-    <div class="feature-group product green">
-      <div class="product-title">
-        <svg class="logo-ghost pillar green mini" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-        </svg>
-        <span>Ghost Pay</span>
-      </div>
-      <div class="features">
-        <div class="feature">
-          <div class="name">Instant settlement</div>
-          <div class="desc">1–10 second L2 settlement using shielded notes and zero-knowledge proofs. No payment channels, no liquidity management.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Ghost Pay capability</div>
-          <div class="desc">Node runs the L2 payment service; verified by L2 block lookup challenges.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Silent Payments</div>
-          <div class="desc">BIP-352 stealth addresses. One static address, unique one-time outputs.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Wraith</div>
-          <div class="desc">Decentralised CoinJoin mixing with blind signing for transaction unlinkability. Every node can coordinate rounds and earn fees.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Ghost Locks</div>
-          <div class="desc">Timelocked P2TR outputs with key rotation and L1 settlement.</div>
-        </div>
-        <div class="feature">
-          <div class="name">Ghost ID</div>
-          <div class="desc">Silent Payment identity for receiving L2 payments without being online.</div>
-        </div>
-      </div>
+    <div class="hero-actions">
+      <a href="/docs/#payouts" class="btn btn-ghost">The payout rule in full <span class="arrow">→</span></a>
+      <a href="/miners.html#firmware" class="btn btn-ghost">Firmware compatibility</a>
     </div>
   </div>
 </section>
 
 <section class="block" style="border-bottom: none;">
   <div class="container">
-    <div class="section-label">Roadmap</div>
-    <h2 class="section-title">Path to mainnet launch.</h2>
+    <div class="section-label">Status</div>
+    <h2 class="section-title">The road to launch.</h2>
 
     <div class="roadmap">
       <div class="row">
-        <div class="cell phase completed">completed</div>
-        <div class="cell title">Core build</div>
-        <div class="cell desc">ghost-core, ghost-mining, ghost-pay, wallets, verification system, ZK circuits, MPC ceremony.</div>
+        <div class="cell phase completed">done</div>
+        <div class="cell title">Specification</div>
+        <div class="cell desc">The share chain, the payout rule and the firmware limits, with simulations. Old node rewards, elders, capabilities, votes, the L2, Ghost Pay and Wraith are removed.</div>
       </div>
       <div class="row">
         <div class="cell phase now">now</div>
-        <div class="cell title">Mainnet testing</div>
-        <div class="cell desc">Observe-only deployment across a growing production mesh. Hardening the checkpoint pipeline and consensus. Soak tests running continuously.</div>
+        <div class="cell title">Build</div>
+        <div class="cell desc">The node pool is being built. Share-chain sync, <code>ghost-audit</code> and open node listing are not finished.</div>
       </div>
       <div class="row">
-        <div class="cell phase">target</div>
-        <div class="cell title">Mainnet launch</div>
-        <div class="cell desc">Full production with open elder registration, mining, and Ghost Pay active. Follows completion of the observe-mode soak.</div>
+        <div class="cell phase">next</div>
+        <div class="cell title">Prove it</div>
+        <div class="cell desc">Regtest, then our own signet, with real hardware. Nothing reaches mainnet until every stage passes.</div>
+      </div>
+      <div class="row">
+        <div class="cell phase">then</div>
+        <div class="cell title">Handover</div>
+        <div class="cell desc">The old 8-node network keeps running until an agreed height. Its balances are exported, published and imported as the node pool's starting ledger. The height has not been set.</div>
+      </div>
+      <div class="row">
+        <div class="cell phase">last</div>
+        <div class="cell title">Public launch</div>
+        <div class="cell desc">The NOT READY banner comes off only after the proving and handover stages pass.</div>
       </div>
     </div>
   </div>
@@ -453,30 +306,46 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-
     <div>
-      <h4>Core</h4>
-      <ul></ul>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+      </ul>
     </div>
     <div>
-      <h4>Pool</h4>
-      <ul></ul>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
     </div>
     <div>
-      <h4>Pay</h4>
-      <ul></ul>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
     </div>
     <div>
-      <h4>Products</h4>
-      <ul></ul>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
     </div>
     <div>
       <h4>Project</h4>
@@ -491,220 +360,23 @@
 </footer>
 
 <script>
-  // Theme toggle with sun/moon icons
   (function () {
     var html = document.documentElement;
     var btn = document.getElementById('theme-toggle');
     var sun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
     var moon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-    function render() {
-      btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon;
-    }
+    function render() { btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon; }
     render();
     btn.addEventListener('click', function () {
       var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
       html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
+      try { localStorage.setItem('ghost-theme', next); } catch (e) {}
       render();
     });
   })();
-
-  // Live metrics
-  (function () {
-    // ─── Sliding-window smoothers ──────────────────────────────────────────
-    // Damp poll-cycle jitter on numeric metrics. Each `smooth(key, raw)` call
-    // appends `raw` to the named ring buffer (default 8 samples ≈ 4 min at
-    // 30s polls) and returns a smoothed value:
-    //   • mode 'ema' (default)    — exponential moving average, alpha=0.35
-    //   • mode 'median'           — middle of the buffer, ideal for discrete
-    //                               counts where fractional EMAs look silly
-    // Drop-in: replace `raw` with `smooth('hashrate', raw)` at render time.
-    // The buffers live only in-memory — page refresh resets them, which keeps
-    // the smoothing honest after a real outage.
-    var __smoothers = {};
-    function smooth(key, raw, opts) {
-      opts = opts || {};
-      var maxN = opts.window || 8;
-      var mode = opts.mode || 'ema';
-      var alpha = opts.alpha != null ? opts.alpha : 0.35;
-      var s = __smoothers[key] || (__smoothers[key] = []);
-      if (raw != null && isFinite(raw)) s.push(raw);
-      while (s.length > maxN) s.shift();
-      if (!s.length) return null;
-      if (mode === 'median') {
-        var sorted = s.slice().sort(function (a, b) { return a - b; });
-        var mid = Math.floor(sorted.length / 2);
-        return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-      }
-      var v = s[0];
-      for (var i = 1; i < s.length; i++) v = alpha * s[i] + (1 - alpha) * v;
-      return v;
-    }
-    // Smooth a stored history series of [t, v] points into a new EMA series
-    // for charting. Same alpha as point-wise smoother so headline tile and
-    // chart line agree visually.
-    function smoothSeries(series, alpha) {
-      if (!series || !series.length) return [];
-      alpha = alpha != null ? alpha : 0.35;
-      var out = [series[0].slice()];
-      for (var i = 1; i < series.length; i++) {
-        out.push([series[i][0], alpha * series[i][1] + (1 - alpha) * out[i - 1][1]]);
-      }
-      return out;
-    }
-
-    // Bootstrap seeds = the nodes that have a per-node proxy on this site
-    // (/api/pool/vmN/). Any one of them is enough: /api/v1/pool/mesh-nodes
-    // returns the WHOLE mesh (self + every connected peer) from that single
-    // node, so a node with no proxy here still appears. All eight fleet nodes
-    // have a proxy; listing all eight only adds fallbacks.
-    var VMS = ['vm1', 'vm2', 'vm3', 'vm4', 'vm5', 'vm6', 'vm7', 'vm8'];
-
-    // Try each seed in order; the first that answers returns the live mesh
-    // node list. Returns null if every seed is unreachable so the caller can
-    // fall back gracefully.
-    async function fetchMeshNodes() {
-      for (var i = 0; i < VMS.length; i++) {
-        try {
-          var ctl = new AbortController();
-          var t = setTimeout(function () { ctl.abort(); }, 5000);
-          var r = await fetch('/api/pool/' + VMS[i] + '/api/v1/pool/mesh-nodes', { signal: ctl.signal });
-          clearTimeout(t);
-          if (r.ok) {
-            var d = await r.json();
-            if (d && Array.isArray(d.nodes) && d.nodes.length) return d.nodes;
-          }
-        } catch (e) { /* try the next seed */ }
-      }
-      return null;
-    }
-
-    // Always render with a unit suffix so a 0-hashrate moment looks
-    // "loaded but quiet" rather than "broken / not populated".
-    function formatHashrate(ths) {
-      if (!isFinite(ths) || ths <= 0) return '0<span class="unit">TH/s</span>';
-      if (ths < 0.001) return (ths * 1e6).toFixed(1) + '<span class="unit">MH/s</span>';
-      if (ths < 1)     return (ths * 1000).toFixed(1) + '<span class="unit">GH/s</span>';
-      if (ths < 1000)  return ths.toFixed(2) + '<span class="unit">TH/s</span>';
-      if (ths < 1e6)   return (ths / 1000).toFixed(2) + '<span class="unit">PH/s</span>';
-      return (ths / 1e6).toFixed(2) + '<span class="unit">EH/s</span>';
-    }
-    // Rate-limit notice: shown when the pool API throttles us (HTTP 429) and a
-    // poll returns no fresh data; cleared the moment any seed answers cleanly.
-    var rlNotice = document.getElementById('rl-notice');
-    function setRateLimited(on) {
-      if (rlNotice) rlNotice.classList.toggle('show', !!on);
-    }
-
-    async function refresh() {
-      try {
-        // Kick off the whole-mesh node fetch in parallel with the per-seed
-        // status polls so the headline metrics aren't gated on it.
-        var meshNodesPromise = fetchMeshNodes();
-        var results = await Promise.all(VMS.map(function (vm) {
-          var ctl = new AbortController();
-          var t = setTimeout(function () { ctl.abort(); }, 5000);
-          return fetch('/api/pool/' + vm + '/api/v1/mining/status', { signal: ctl.signal })
-            .then(function (r) { clearTimeout(t); if (r.status === 429) return { __rl: true }; return r.ok ? r.json() : null; })
-            .catch(function () { clearTimeout(t); return null; });
-        }));
-        // A 429 poll returns { __rl: true }; keep only real data in `good`.
-        var rateLimited = results.some(function (r) { return r && r.__rl; });
-        var good = results.filter(function (r) { return r && !r.__rl; });
-        // Clear the notice as soon as any seed answers cleanly; raise it when
-        // this tick was throttled with nothing fresh to show. The tiles below
-        // keep their last-known values either way.
-        if (good.length > 0) setRateLimited(false);
-        else if (rateLimited) setRateLimited(true);
-        var online = 0, hash = 0, meshHash = null, sumLocal = 0, height = 0, mesh = null, maxActive = 0;
-        good.forEach(function (r) {
-          if (!r) return;
-          online++;
-          // Pool hashrate: prefer the mesh-wide `total_hashrate` (the SAME pool
-          // total on every post-PR#27 node) via MAX across responders — NOT the
-          // sum. Summing 4 equal mesh values ~4x's it; the mesh figure from any
-          // ONE responding node is the correct total, so a dropped fetch no longer
-          // swings the headline (the old per-node `local_hashrate_th` SUM needed
-          // all 4, and one dominant miner made a single miss crater it). `sumLocal`
-          // is a pre-PR#27 fallback only.
-          if (typeof r.total_hashrate === 'number') {
-            if (meshHash === null || r.total_hashrate > meshHash) meshHash = r.total_hashrate;
-          }
-          if (typeof r.local_hashrate_th === 'number') sumLocal += r.local_hashrate_th;
-          if (r.block_height && r.block_height > height) height = r.block_height;
-          var a = r.active_miners || 0;
-          if (a > maxActive) maxActive = a;
-          // Take the MAX across nodes (matches pool.html): mesh_active_miners is
-          // the deduped pool-wide count, so the highest reporting node is the most
-          // complete view — a node briefly mid-gossip undercounts. Overwriting with
-          // each node's value showed whichever node was last, e.g. a transient 1.
-          if (typeof r.mesh_active_miners === 'number') {
-            if (mesh === null || r.mesh_active_miners > mesh) mesh = r.mesh_active_miners;
-          }
-        });
-        // Mesh-wide total from any single responder; per-node sum only as a
-        // pre-PR#27 fallback. Robust to partial fetch failures.
-        hash = (meshHash !== null) ? meshHash : sumLocal;
-        // Don't blank tiles if every fetch failed AND we already had good
-        // data — a single 4-VM rate-limit burst shouldn't reset the view.
-        var allFailed = (online === 0);
-        var hashSmoothed = smooth('hashrate', allFailed ? null : hash);
-        var rawMiners = mesh !== null ? mesh : maxActive;
-        var minersSmoothed = smooth('miners', allFailed ? null : rawMiners, { mode: 'median' });
-        var hashEl = document.getElementById('live-hashrate');
-        var minersEl = document.getElementById('live-miners');
-        var nodesEl = document.getElementById('live-nodes');
-        var heightEl = document.getElementById('live-height');
-        if (hashEl)   hashEl.innerHTML = formatHashrate(hashSmoothed != null ? hashSmoothed : hash);
-        if (minersEl) minersEl.textContent = Math.round(minersSmoothed != null ? minersSmoothed : rawMiners).toString();
-        // Active nodes: the live mesh count (self + connected peers) from one
-        // seed, so new nodes show up automatically. Falls back to "online / 4"
-        // — the count of reachable seeds — when the mesh endpoint is briefly
-        // unavailable, so the tile never blanks or breaks.
-        var meshNodes = await meshNodesPromise;
-        // Count DISTINCT hosts, not raw entries: during a node restart the mesh
-        // briefly reports stale same-IP session duplicates that age out within
-        // ~2 min, which would otherwise inflate this tile.
-        var meshCount = null;
-        if (meshNodes && meshNodes.length) {
-          var hosts = {};
-          meshNodes.forEach(function (n) {
-            var s = String((n && n.address) || ''); var i = s.lastIndexOf(':');
-            hosts[(i > 0 ? s.slice(0, i) : s) || ('id:' + ((n && n.node_id) || ''))] = 1;
-          });
-          meshCount = Object.keys(hosts).length;
-          // Persist the last good reading so a transient all-seed failure never
-          // reverts the tile to a misleading fixed number.
-          try { localStorage.setItem('ghost-mesh-count-v1', String(meshCount)); } catch (e) {}
-        }
-        if (nodesEl) {
-          // The live mesh size (self + connected peers from any one seed,
-          // deduped by host) — it grows automatically as nodes join and is
-          // NEVER a hard-coded figure. If every seed is briefly unreachable,
-          // fall back to the last count we saw; only show "—" if we've never
-          // had a reading. We deliberately do NOT render "reachable / 4" here:
-          // the mesh is not four nodes, and the seed list is only an entry
-          // point, not the network size.
-          if (meshCount != null) {
-            nodesEl.textContent = String(meshCount);
-          } else {
-            var cachedMesh = null;
-            try { cachedMesh = localStorage.getItem('ghost-mesh-count-v1'); } catch (e) {}
-            nodesEl.textContent = (cachedMesh != null) ? cachedMesh : '—';
-          }
-        }
-        if (heightEl) heightEl.textContent = height ? height.toLocaleString() : '—';
-        console.debug('[index] refresh ok · ' + online + '/' + VMS.length + ' seeds · ' + (meshCount != null ? meshCount + ' mesh nodes · ' : '') + hash.toFixed(2) + ' TH/s · ' + rawMiners + ' miners');
-      } catch (err) {
-        // Don't let a transient error stop the 30s polling cadence — log
-        // and let the next tick try again.
-        console.error('[index] refresh failed:', err);
-      }
-    }
-    refresh();
-    setInterval(refresh, 30000);
-  })();
 </script>
+
+<script src="/node-pool.js"></script>
 
 </body>
 </html>
