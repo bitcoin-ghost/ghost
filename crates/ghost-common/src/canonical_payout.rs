@@ -431,6 +431,53 @@ pub fn coinbase_outputs(
     Ok((o, pay.retired))
 }
 
+/// The ledger commitment root a coinbase carries: the second-to-last output, `OP_RETURN PUSH36
+/// "GHNP" || root`. `None` if the coinbase is not laid out as a node pool block.
+pub fn ledger_root_of(outputs: &[CoinbaseOutput]) -> Option<[u8; 32]> {
+    let n = outputs.len();
+    let s = &outputs.get(n.checked_sub(2)?)?.1;
+    let rest = s.strip_prefix(&[0x6a, 0x24][..])?;
+    let root = rest.strip_prefix(&LEDGER_COMMITMENT_MAGIC[..])?;
+    root.try_into().ok()
+}
+
+/// What a mined node pool coinbase retires, read from its outputs alone: settlement's
+/// provisional retirement for a block whose anchor this node does not hold yet (spec 2.3).
+///
+/// The layout is fixed: treasury, miners, an optional finder, the ledger commitment, the witness
+/// commitment. Treasury plus miners is exactly the subsidy, and every miner output is at least
+/// 1,000 sats, so the miners are the unique run after the treasury that brings the sum to the
+/// subsidy; at most one output (the finder) may follow before the commitment. Each miner output
+/// retires its value exactly. `None` if the outputs do not have that shape.
+pub fn provisional_retirements(h: u32, outputs: &[CoinbaseOutput]) -> Option<Vec<Retirement>> {
+    ledger_root_of(outputs)?;
+    let body = &outputs[..outputs.len() - 2];
+    let (treasury, rest) = body.split_first()?;
+    if treasury.1 != TREASURY_SCRIPT_PLACEHOLDER {
+        return None;
+    }
+    let s = subsidy(h);
+    let mut sum = treasury.0;
+    let mut miners = 0;
+    while sum < s {
+        let (v, _) = rest.get(miners)?;
+        if *v < MIN_PAYOUT_SATS {
+            return None;
+        }
+        sum = sum.checked_add(*v)?;
+        miners += 1;
+    }
+    if sum != s || rest.len() - miners > 1 {
+        return None;
+    }
+    Some(
+        rest[..miners]
+            .iter()
+            .map(|(v, a)| (a.clone(), *v as i128 * FACE_PER_SAT))
+            .collect(),
+    )
+}
+
 fn varint_len(n: usize) -> usize {
     match n {
         0..=0xfc => 1,

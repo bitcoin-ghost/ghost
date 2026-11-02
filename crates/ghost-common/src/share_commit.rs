@@ -521,6 +521,23 @@ pub fn check_outputs(
     Ok(retired)
 }
 
+/// Settlement's match (spec 2.3): whether a mined coinbase at height `job_height` pays the
+/// canonical outputs of `table` for any slot class. The class is committed only inside the share
+/// tag's hash, which the chain alone cannot open, so every class is tried; outputs that are
+/// canonical for some class retire exactly what they paid, whichever class it was. Returns the
+/// class and the retirements of the first class that matches.
+pub fn settle_outputs(
+    coinbase: &Transaction,
+    table: &Table,
+    job_height: u32,
+) -> Option<(u16, Vec<Retirement>)> {
+    SLOT_CLASSES.iter().find_map(|c| {
+        check_outputs(coinbase, table, job_height, *c as usize)
+            .ok()
+            .map(|r| (*c, r))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +947,69 @@ mod tests {
         assert!(f.verify_with(&header, &tx, &ctx).is_ok());
         ctx.anchor_btc_height = last;
         assert_eq!(f.verify_with(&header, &tx, &ctx), Err(ShareError::Era));
+    }
+
+    #[test]
+    fn settlement_matches_any_class_and_reads_provisional_retirements() {
+        use crate::canonical_payout::{ledger_root_of, provisional_retirements, table_root};
+        for (class, finder) in [(9u16, 50_000u64), (44, 0), (3, 1)] {
+            let mut f = Fixture::new(H);
+            f.tag.slot_class = class;
+            f.finder_value = finder;
+            let (_, tx) = f.mine();
+            let outs: Vec<(u64, Vec<u8>)> = tx
+                .output
+                .iter()
+                .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
+                .collect();
+            let (got_class, retired) = settle_outputs(&tx, &f.table, H).expect("canonical");
+            // Classes are tried smallest first; 30 balances make 3, 9 and 44 all differ.
+            let want = check_outputs(&tx, &f.table, H, class as usize).unwrap();
+            assert_eq!(retired, want, "class {class}");
+            assert_eq!(got_class, class);
+            assert_eq!(ledger_root_of(&outs), Some(table_root(&f.table)));
+            assert_eq!(
+                provisional_retirements(H, &outs),
+                Some(want),
+                "class {class}"
+            );
+            // Another table: no class matches.
+            let mut other = f.table.clone();
+            other.pop_first();
+            assert_eq!(settle_outputs(&tx, &other, H), None);
+        }
+    }
+
+    #[test]
+    fn provisional_retirements_refuse_a_coinbase_of_another_shape() {
+        use crate::canonical_payout::provisional_retirements;
+        use crate::node_pool_constants::TREASURY_SCRIPT_PLACEHOLDER;
+        let f = Fixture::new(H);
+        let good = f.outputs();
+        let mut no_commitment = good.clone();
+        no_commitment.remove(no_commitment.len() - 2);
+        assert_eq!(provisional_retirements(H, &no_commitment), None);
+        let mut wrong_treasury = good.clone();
+        wrong_treasury[0].1 = p2tr("someone");
+        assert_eq!(provisional_retirements(H, &wrong_treasury), None);
+        let mut two_finders = good.clone();
+        two_finders.insert(good.len() - 2, (5, p2tr("x")));
+        assert_eq!(provisional_retirements(H, &two_finders), None);
+        let mut short = good.clone();
+        short[1].0 -= 1;
+        assert_eq!(
+            provisional_retirements(H, &short),
+            None,
+            "does not sum to the subsidy"
+        );
+        let treasury_only = vec![
+            (
+                crate::canonical_payout::subsidy(H),
+                TREASURY_SCRIPT_PLACEHOLDER.to_vec(),
+            ),
+            good[good.len() - 2].clone(),
+            good[good.len() - 1].clone(),
+        ];
+        assert_eq!(provisional_retirements(H, &treasury_only), Some(vec![]));
     }
 }
