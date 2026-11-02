@@ -61,6 +61,15 @@ export function AutoUpdateSection() {
           swapped, and the node rolls back on a failed health check. Checked every 6h.
           Off by default.
         </p>
+        {autoUpdate?.channel && (
+          <p className="text-xs text-[color:var(--fainter)] mt-1">
+            {autoUpdate.channel === "node-pool"
+              ? "Follows node pool releases (np-v…) only, never the old network's."
+              : autoUpdate.channel === "old-network"
+                ? "Follows the old network's releases (no node pool channel marker on this node)."
+                : "The release channel marker is not valid: updates are refused until it is fixed."}
+          </p>
+        )}
         {autoUpdate?.last_status?.result && (
           <p className="text-xs text-[color:var(--fainter)] mt-1">
             Last check: {autoUpdate.last_status.result}
