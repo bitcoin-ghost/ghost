@@ -22,22 +22,23 @@
 
 //! The checks: does this job pay the canonical coinbase, and does its tag credit this miner?
 //!
-//! A job passes when all of these hold, in this order (the first that fails names the verdict):
+//! A job passes when all of these hold, in this order (the first that fails names the verdict;
+//! the names are [`crate::check::FailReason`]'s):
 //!
 //! 1. The coinbase is a coinbase with a scriptSig of 2 to 100 bytes, and its BIP34 height is one
-//!    above its `prev_hash`'s ([`FailReason::MalformedCoinbase`], [`FailReason::WrongHeight`]).
+//!    above its `prev_hash`'s (`MalformedCoinbase`, `WrongHeight`).
 //! 2. Its `GHNT` tag opens to this miner's payout script: some stamp the node discloses
 //!    (`node_id`, `parent_anchor`, `batch_root`), with some tier and slot class, hashes to the tag
 //!    together with the miner's own script, and the `GHPP` slot carries that stamp's
-//!    `parent_anchor[..16]` ([`FailReason::TagNotBinding`]). The tag is a 20-byte hash, so a node
-//!    cannot find a stamp that opens it to the miner unless the job really credits the miner.
+//!    `parent_anchor[..16]` (`TagNotBinding`). The tag is a 20-byte hash, so a node cannot find
+//!    a stamp that opens it to the miner unless the job really credits the miner.
 //! 3. The committed tier is one the miner's shares meet at the difficulty the node set
-//!    ([`FailReason::TierAboveDifficulty`]); a tier above it voids the miner's network shares.
+//!    (`TierAboveDifficulty`); a tier above it voids the miner's network shares.
 //! 4. The outputs are exactly the canonical outputs for that height, parent anchor and slot class
 //!    on the share chain the auditor synced itself (`share_commit::check_outputs`). When they are
-//!    not, the difference is named: [`FailReason::WrongTreasury`], [`FailReason::WrongSlotClass`],
-//!    [`FailReason::RelabelledPayee`], [`FailReason::InflatedBalance`], [`FailReason::FeeSkim`],
-//!    [`FailReason::WrongLedgerRoot`], or [`FailReason::OutputsNotCanonical`] for anything else.
+//!    not, the difference is named: `WrongTreasury`, `WrongSlotClass`, `RelabelledPayee`,
+//!    `InflatedBalance`, `FeeSkim`, `WrongLedgerRoot`, or `OutputsNotCanonical` for anything
+//!    else.
 //!
 //! A job the auditor cannot judge (its `prev_hash` or parent anchor is not known yet) is
 //! UNCHECKED, never PASS.

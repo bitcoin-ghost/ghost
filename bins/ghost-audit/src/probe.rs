@@ -23,8 +23,9 @@
 //! The public prober: does a node advertise correctly and serve canonical jobs?
 //!
 //! Open listing (W2.10) lists any node with a valid advert that passes an outside probe. This is
-//! that probe, as a library call ([`probe`]) and a CLI command (`ghost-audit probe`), with a
-//! verdict in JSON ([`ProbeReport`]). It checks, from outside:
+//! that probe, as a library call ([`probe`](crate::probe::probe)) and a CLI command
+//! (`ghost-audit probe`), with a verdict in JSON ([`ProbeReport`](crate::probe::ProbeReport)).
+//! It checks, from outside:
 //!
 //! - **the advert**: the node's relay port answers `Hello` on this share chain's genesis and
 //!   protocol version, and discloses its job stamps;

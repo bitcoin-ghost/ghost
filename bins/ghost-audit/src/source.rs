@@ -22,14 +22,14 @@
 
 //! Where the auditor's share-chain data comes from: its own relay node, never the audited node.
 //!
-//! [`start_share_chain`] opens a store in the auditor's data directory and runs a
-//! `ghost-np-relay` node exactly as pool_sv2 runs one, minus the pool: it dials the relay peers
-//! the miner names, syncs anchors, batches and shares from them (W2.13: `GetHeaders`,
-//! `GetBatch`, `GetShares`, `GetBtcBlocks`), checks every share against its including anchor's
-//! ancestry, and settles pool blocks from the miner's own Bitcoin node. It trusts nothing a peer
-//! says: a peer that lies is refused like any other node refuses it. The tables a job is
-//! judged against are then [`ghost_np_relay::relay::Relay::block_table_on`] on this relay, for
-//! the job's own `prev_hash`.
+//! [`start_share_chain`](crate::source::start_share_chain) opens a store in the auditor's data
+//! directory and runs a `ghost-np-relay` node exactly as pool_sv2 runs one, minus the pool: it
+//! dials the relay peers the miner names, syncs anchors, batches and shares from them (W2.13:
+//! `GetHeaders`, `GetBatch`, `GetShares`, `GetBtcBlocks`), checks every share against its
+//! including anchor's ancestry, and settles pool blocks from the miner's own Bitcoin node. It
+//! trusts nothing a peer says: a peer that lies is refused like any other node refuses it. The
+//! tables a job is judged against are then
+//! [`ghost_np_relay::relay::Relay::block_table_on`] on this relay, for the job's own `prev_hash`.
 //!
 //! Why not ask the audited node, or a node named as trusted, for the table? The audited node is
 //! the party being checked, and a table from it proves nothing. A trusted node would move the
