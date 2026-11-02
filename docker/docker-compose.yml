@@ -67,7 +67,6 @@ services:
       - "34255:34255"    # Stratum V2
       - "3333:3333"      # Stratum V1 (via translator)
       - "8080:8080"      # HTTP API
-      - "8555-8562:8555-8562"  # P2P consensus mesh
     networks:
       - ghost-network
     environment:

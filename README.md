@@ -24,7 +24,7 @@ No separate token, no altcoin — it settles in Bitcoin.
 | Component | Path | Description |
 |-----------|------|-------------|
 | `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
-| `ghost-mining` | `bins/ghost-pool/` | Pool node: block templates for pool_sv2, the P2P mesh (health and discovery), round statistics and the operator API. |
+| `ghost-mining` | `bins/ghost-pool/` | Pool node: block templates for pool_sv2, round statistics and the operator API. |
 | Light wallet | `bins/ghost-cli/`, `crates/ghost-light-wallet/` | CLI/TUI wallet with BIP-352 Silent Payments. |
 | SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. pool_sv2 builds every job's canonical coinbase and runs the node pool share-chain relay. |
 
@@ -36,9 +36,8 @@ website for the full crate map, or browse the source directly.
 
 ```
                        ┌────────────────────────────────┐
-                       │       P2P MESH NETWORK          │
-                       │      health · discovery         │
-                       │  (+ node pool share-chain relay)│
+                       │  NODE POOL SHARE-CHAIN RELAY   │
+                       │  shares · anchors · sync (8566)│
                        └────────────────────────────────┘
                         ▲              ▲              ▲
                   ┌─────┴─────┐  ┌─────┴─────┐  ┌─────┴─────┐
@@ -64,7 +63,6 @@ mempool policy.
 | 34255 | Stratum V2 — via SRI pool |
 | 8566 | Node pool share-chain relay |
 | 8080 | REST API |
-| 8555–8562 | P2P mesh of the old network (closed on node pool nodes) |
 | 8900 | GSP WebSocket (light-wallet backend) |
 
 ## Running a node
@@ -123,7 +121,7 @@ Common development commands:
 EXCLUDES="--workspace"
 
 cargo test $EXCLUDES --lib --bins             # test suite, as CI runs it
-cargo test -p ghost-consensus                 # a single crate
+cargo test -p ghost-np-relay                  # a single crate
 cargo clippy $EXCLUDES --all-targets --all-features -- -D warnings
 cargo fmt --all                               # format
 cargo audit                                   # dependency advisory check

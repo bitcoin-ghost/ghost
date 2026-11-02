@@ -14,9 +14,8 @@ Four services on one machine, all installed by `scripts/install-node.sh`:
                    └────────┬────────┘
                             │ RPC + ZMQ (localhost)
                    ┌────────▼────────┐
-                   │  ghost-mining   │   decentralised pool node
-                   │  mesh 8555-8563 │   mesh, HTTP API, Template
-                   │  HTTP 8080      │   Distribution (TDP)
+                   │  ghost-mining   │   block templates, HTTP API,
+                   │  HTTP 8080      │   Template Distribution (TDP)
                    │  TDP 8442       │
                    └────────┬────────┘
                             │ TDP
@@ -78,7 +77,7 @@ That gives you the defaults: mainnet, full trustless sync with pruning, the node
 curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=<node pool release tag> bash -s -- --fee-address ...
 ```
 
-**No contact with the old network.** A node pool node writes no mesh seed nodes (`seed_nodes = []` in `pool.toml`) and keeps the old mesh ports (8555–8563) and 8443 closed, so it neither dials nor accepts the old fleet's mesh. Its peers are share-chain relay peers only (`--relay-peer`). Automatic updates are off and `--auto-update` is ignored with a warning: the updater tracks the latest GitHub release, which is the old network's.
+**No contact with the old network.** A node pool node runs no part of the old mesh: ghost-mining has no mesh, and the installer keeps the old mesh ports (8555–8563) and 8443 closed, so the node neither dials nor accepts the old fleet's mesh. Its peers are share-chain relay peers only (`--relay-peer`). Automatic updates are off and `--auto-update` is ignored with a warning: the updater tracks the latest GitHub release, which is the old network's.
 
 **Reading it first.** The installer is one self-contained shell script. To read it before it runs as root, download it and run the file:
 
@@ -119,7 +118,7 @@ On a fresh install there is no Bitcoin node yet; ghostd is installed, and the in
 | `--preflight-only` | | Run the preflight and exit. |
 | `--alert-webhook <url>` | none | Push endpoint for node alerts. Without it, `[alerts]` is written with `enabled = false`. |
 | `--alert-topic <name>` | `ghost-node` | Push topic. |
-| `--nickname <name>` | `ghost-node` | Display name in the mesh. |
+| `--nickname <name>` | `ghost-node` | Display name of this node. |
 | `--pool-name <name>` | `GHOST PublicPool` | Custom coinbase tag, shown on explorers as `- G H O S T - <name>`. Printable ASCII, at most 30 characters. |
 | `--sync <ibd\|haze>` | `ibd` | How ghostd stores the chain. See *Sync mode*, below. |
 | `--no-reaper` | Reaper on | Don't run the mempool Reaper. |
@@ -193,7 +192,7 @@ With `UNSET` the install completes, the preflight warns, the config carries a ma
 
 `--tor` installs Tor, adds `ControlPort 9051` with cookie authentication to `/etc/tor/torrc`, adds the `ghost` user to `debian-tor`, and gives ghostd `listenonion=1`, `torcontrol=127.0.0.1:9051` and `proxy=127.0.0.1:9050`. `--tor-only` adds `onlynet=onion` and removes the `8333/tcp` firewall rule.
 
-Tor applies to ghostd's Bitcoin P2P only. ghost-mining's mesh, its HTTP API and the Stratum ports stay on clearnet, and `pool.toml` still records the machine's public IP.
+Tor applies to ghostd's Bitcoin P2P only. ghost-mining's HTTP API, the share-chain relay and the Stratum ports stay on clearnet, and `pool.toml` still records the machine's public IP.
 
 ## What the installer does
 
@@ -247,7 +246,7 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 
 `ghost-mining`, `sri-pool` and `sri-translator` are **disabled at boot on purpose**. `ghost-mining-gate` runs `/opt/ghost/bin/wait-for-ghostd-sync.sh`, which asks ghostd's RPC for `getblockchaininfo` every 30 seconds. Once `initialblockdownload` is `false` it starts `ghost-mining`, then `sri-pool`, then `sri-translator`. On a fresh install that is hours away; on a normal reboot ghostd is already synced and the gate returns almost at once.
 
-The gate is what keeps an unsynced node off the mesh. Don't `systemctl enable` the three gated units yourself.
+The gate is what keeps an unsynced node from serving miners. Don't `systemctl enable` the three gated units yourself.
 
 ### Firewall and ports
 
@@ -261,7 +260,7 @@ The installer enables `ufw` and allows:
 | 8080/tcp | ghost-mining HTTP API | |
 | 8442/tcp | ghost-mining TDP | |
 
-8555–8562 (the old mesh), 8563 (Noise mesh) and 8443 (verification HTTPS) are **not** opened, and a rule an older install left is deleted: ghost-mining still listens on them, but a node pool node has no mesh seeds and must not be reachable by the old network's mesh.
+8555–8562 (the old mesh), 8563 (Noise mesh) and 8443 (verification HTTPS) are **not** opened, and a rule an older install left is deleted: ghost-mining no longer runs the old mesh, and a node pool node must never be reachable by the old network's mesh.
 
 Three more ports are always open: 3333/tcp (SV1), 34255/tcp (SV2) and 4444/tcp (farm tier). `ghost-mining-firewall.path` re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever `pool.toml` changes, so a rule removed by hand, or closed by an older private or solo install, is put back.
 
@@ -295,7 +294,7 @@ sudo journalctl -u ghostd -f
 sudo journalctl -u ghost-mining-gate -f
 ```
 
-When the gate logs `ghostd synced — starting ghost-mining`, the node joins the mesh. Then:
+When the gate logs `ghostd synced — starting ghost-mining`, the node starts serving templates. Then:
 
 ```bash
 sudo journalctl -u ghost-mining -f
@@ -400,7 +399,7 @@ systemd restarts a crashing service for ever and reports it `active` between cra
 | ghost-mining, sri-pool, sri-translator all `inactive` | Expected until ghostd is synced. `sudo journalctl -u ghost-mining-gate -f` — it logs `waiting for ghostd to finish initial sync...` until then. |
 | ghostd not syncing | `sudo journalctl -u ghostd -n 100`; `sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo` |
 | ghost-mining exits at startup | `sudo journalctl -u ghost-mining -n 100` — most config errors are explicit |
-| `peer_count` stays at 0 | Inbound 8555–8563 or 8443 blocked upstream of `ufw` (a provider firewall or security group) |
+| No share-chain relay peers (`ghost-admin node status`) | Inbound 8566 (or your `--relay-port`) blocked upstream of `ufw` (a provider firewall or security group), or no `--relay-peer` given |
 | Miners can't connect | `sudo journalctl -u sri-pool -u sri-translator -n 100`; `sudo ufw status` should show 3333, 4444 and 34255. |
 | A service keeps restarting, or is up but serving nothing | `sudo /opt/ghost/bin/ghost-restart-watch.sh --check` |
 | An automatic update rolled back | `cat /var/lib/ghost/auto-update.status`; `sudo journalctl -u ghost-auto-update -n 100` |

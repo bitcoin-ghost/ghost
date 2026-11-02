@@ -304,7 +304,7 @@ echo "8. isolation from the old network"
 for ip in 83.136.251.162 85.9.198.212 213.163.207.46 95.111.221.169; do
     is "no old fleet address $ip" 0 "$($G -cF "$ip" "$INSTALLER" || true)"
 done
-is "pool.toml is written with no mesh seeds" 1 "$($G -cx 'seed_nodes = \[\]' "$INSTALLER" || true)"
+is "pool.toml carries no mesh keys" 0 "$($G -cE '^(seed_nodes|noise_enabled) =|^\[network\.p2p\]' "$INSTALLER" || true)"
 is "no SEED_NODES list is left" 0 "$($G -c 'SEED_NODES' "$INSTALLER" || true)"
 is "the old mesh ports are not opened" 0 "$($G -cE '^ufw allow (8555|8563|8443)' "$INSTALLER" || true)"
 is "they are closed on a re-run" 3 "$($G -cE '^ufw delete allow (8555:8562|8563|8443)/tcp' "$INSTALLER" || true)"
