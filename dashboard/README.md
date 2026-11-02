@@ -17,13 +17,20 @@ report to its keeper (the node operator). Built with Next.js and React.
 
 ## Overview
 
-The dashboard provides:
-- **Node Status** - Sync height, peer count, uptime, and service health
-- **Mining** - Stratum connections, hashrate, shares, blocks found
-- **Rewards** - Share breakdown (5-4-3-2-1 model), payout history, earnings projections
-- **Ghost Pay (L2)** - Block height, epoch, settlement status
-- **Mesh Network** - Consensus status, peer connections, verification challenges
-- **Swarm Management** - Multi-node fleet monitoring and alerts
+The dashboard is the operator's view of a node pool node (W2.14). It provides:
+- **Overview** - node pool health (service answering, relay peers, settlement, provisional
+  blocks, share-chain sync), the Bitcoin node's sync, share-chain tip, fee address, and the
+  share chain's start values (genesis anchor, height, tier, table digest)
+- **Miners** - connected channels with their slot class, sensing state and firmware warnings;
+  per payout address its shares, hashrate, ledger balance, queue position and expected wait,
+  linking to a per-address page with workers, payouts and credited shares
+- **Pool Blocks** - recent pool blocks, what each paid, the treasury base and change, and
+  settlement (matched, provisional, mismatched, undone by a reorg)
+- **Share Chain** - tip, sync, relay counters, checkpoints and pruning
+- Bitcoin node, privacy, filtering, storage and system pages for the node itself
+
+A value the node does not report is shown as unknown, and a failed call as unavailable; neither
+is ever shown as healthy or zero.
 
 ## Architecture
 
@@ -35,10 +42,11 @@ The dashboard provides:
 +------------------+     +------------------+     +------------------+
 ```
 
-The dashboard queries the ghost-node REST API, which in turn:
-- Reads node configuration and status directly
-- Queries the ghost-mining SQLite database for challenge stats and payouts
-- Aggregates data from configured swarm nodes
+The dashboard queries the node backend's REST API through its own `/api/proxy` route (which
+signs requests with `INTERNAL_AUTH_KEY`). The node pool pages read `GET /api/v1/node-pool/status`,
+`GET /api/v1/ledger/{address}` and `GET /api/v1/miner/{address}`, which the backend forwards to
+pool_sv2's loopback monitoring listener; their JSON is documented in
+`bins/pool-sv2/src/lib/node_pool_api.rs` and `node_pool_miner_api.rs`.
 
 ## Development
 
@@ -129,49 +137,19 @@ and is out of scope for this dashboard change.
 
 | Route | Description |
 |-------|-------------|
-| `/` | Overview with key metrics |
-| `/mining` | Stratum mining status and connected miners |
-| `/rewards` | Share breakdown, earnings, payout history |
-| `/operator/mesh` | BFT consensus and verification challenges |
-| `/operator/rewards` | Detailed share contributions and network stats |
-| `/operator/swarm` | Multi-node fleet management |
-| `/network` | Pool-wide statistics and payout transparency |
-| `/settings` | Node configuration |
+| `/` | Node pool health, Bitcoin sync, share-chain tip, settlement, fee address, start values |
+| `/miners` | Connected miners: slot class, sensing, firmware warnings, shares, balance, queue, wait |
+| `/miners/{address}` | One payout address: workers, ledger, next-block payout by class, payouts, shares |
+| `/blocks` | Recent pool blocks, payouts, treasury base and change, settlement |
+| `/share-chain` | Tip, sync, relay counters, checkpoints and pruning |
+| `/mining` | Stratum endpoints and the username rule |
+| `/settings` | Identity, node pool settings (read-only), alerts and node configuration |
 
-## Share Model (5-4-3-2-1)
+## Tests
 
-Nodes earn shares based on verified capabilities:
-
-| Feature | Shares | Verification |
-|---------|--------|--------------|
-| Archive Mode | +5 | Random historical block challenges (95% pass rate) |
-| Ghost Pay | +4 | L2 block challenges (90% pass rate) |
-| Public Mining | +3 | Stratum port accessibility checks (95% pass rate) |
-| Bitcoin Pure | +2 | Policy compliance challenges (95% pass rate) |
-| Elder Status | +1 | First 101 registered nodes |
-
-**Maximum: 15 shares per node**
-
-## API Integration
-
-The dashboard uses React Query for data fetching with automatic refresh:
-
-```typescript
-// Example: Fetch mesh status
-const { data, isLoading } = useMeshStatus();
-// Refreshes every 30 seconds
-
-// Example: Fetch rewards with custom interval
-const { data } = useRewards({ refetchInterval: 60_000 });
-```
-
-### Key API Endpoints
-
-- `GET /api/v1/status` - Node status
-- `GET /api/v1/mesh/status` - Consensus and challenge stats
-- `GET /api/v1/rewards/full` - Complete rewards breakdown
-- `GET /api/v1/rewards/node-history` - Payout history for this node
-- `GET /api/v1/swarm` - Fleet node status
+`npm test` renders the node pool pages from sample JSON shaped as pool_sv2 serves it
+(`tests/fixtures/`, checked field by field against the Rust structs) and from a failed API, with
+the real components compiled by `tests/helpers/tsx.js`.
 
 ## Deployment
 
