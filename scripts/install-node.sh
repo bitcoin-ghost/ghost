@@ -103,6 +103,11 @@ TOR_MODE="hybrid"
 # updater verifies the GPG release signature before applying anything.
 AUTO_UPDATE="false"
 BACKUPS="true"
+# Node pool block reserve. OFF by default: nothing changes for a node that does not ask.
+# --node-pool writes blockreservedweight=90000 into bitcoin.conf, so getblocktemplate leaves room
+# for the node pool's coinbase (up to 22 KB). ghostd's default 8,000 WU lost a block at a 2.25 KB
+# coinbase on a full template. Until the node pool activates it only costs block space (about 2%).
+NODE_POOL="false"
 
 usage() {
   cat <<EOF
@@ -168,6 +173,10 @@ Options:
                                 kept 7 days in /var/backups/ghost/db   (default)
   --no-backups                No nightly backups. They can be switched on later:
                                 sudo systemctl enable --now ghost-backup.timer
+  --node-pool                 Reserve room in every block template for the node pool's
+                                large coinbase (blockreservedweight=90000 in
+                                bitcoin.conf). Off by default; costs about 2% of
+                                block space until the node pool activates.
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
@@ -215,6 +224,7 @@ while [[ $# -gt 0 ]]; do
     --no-auto-update) AUTO_UPDATE="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --backups)        BACKUPS="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-backups)     BACKUPS="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --node-pool)      NODE_POOL="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -756,6 +766,13 @@ fallbackfee=0.00001
 assumevalid=${ASSUMEVALID}
 EOF
 } > /etc/bitcoin/bitcoin.conf
+
+# Node pool block reserve (--node-pool). Must match NODE_POOL_BLOCK_RESERVED_WEIGHT in
+# crates/ghost-common/src/node_pool_constants.rs. Appended after the truncating write above, so a
+# re-run never duplicates it.
+if [[ "$NODE_POOL" == "true" ]]; then
+  echo "blockreservedweight=90000" >> /etc/bitcoin/bitcoin.conf
+fi
 
 # Tor wiring. `listen=1` is already written above; here we add the onion service
 # (listenonion), the control-port endpoint ghostd uses to create/rotate it
