@@ -514,6 +514,21 @@ fn a_pruned_node_serves_within_its_window() {
     s.link(1, fresh);
     settle_sync(&mut s, 40);
     assert_same(&mut s, &[0, 1, fresh]);
+    // A reorg inside the window: the pruned node follows it.
+    for (a, b) in [(0, 1), (0, behind), (0, fresh)] {
+        s.unlink(a, b);
+    }
+    let reorgs = s.nodes[0].relay.status().stats.reorgs;
+    s.mine(0, false);
+    s.mine(0, true);
+    for _ in 0..2 {
+        s.mine(1, false);
+        s.mine(1, true);
+    }
+    s.link(0, 1);
+    settle_sync(&mut s, 10);
+    assert_eq!(s.nodes[0].relay.status().stats.reorgs, reorgs + 1);
+    assert_same(&mut s, &[0, 1]);
     for n in &s.nodes {
         assert!(n.penalties.is_empty(), "{:?}", n.penalties);
     }
