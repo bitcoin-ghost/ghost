@@ -245,11 +245,6 @@ impl NodePool {
         &self.stats
     }
 
-    /// This node's identity.
-    pub fn node_id(&self) -> &[u8; 32] {
-        self.tiers.node_id()
-    }
-
     /// Record a judged share for the miner pages: credited to the channel's payee, counted under
     /// the worker named in `identity` (the channel's own, or a proxy's per-miner identity).
     pub fn record_share(&self, key: ChannelKey, identity: &str, outcome: Outcome) {

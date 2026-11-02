@@ -84,7 +84,7 @@ impl LiveView for NodePool {
     }
 
     fn node_id(&self) -> Option<[u8; 32]> {
-        Some(*NodePool::node_id(self))
+        Some(NodePool::node_id(self))
     }
 
     fn next_table(&self) -> NextTableFuture<'_> {
