@@ -949,20 +949,8 @@ async fn handle_submit_solution(
         .submit_block_with_coinbase(coinbase_tx, &coinbase_non_witness, &header, &work_state)
         .await?;
 
-    // Notify the payout task that this block has been submitted to Bitcoin Core.
-    // block_hash from double_sha256 is in internal byte order; reverse to display order.
-    let mut block_hash_display = block_hash;
-    block_hash_display.reverse();
-    template_processor.notify_block_submitted(crate::template::BlockSubmittedInfo {
-        block_hash: block_hash_display,
-        height: work_state.height,
-        // The payout this block's coinbase actually pays — the snapshot the template was built
-        // against, not whatever happens to be approved by the time the notification lands.
-        payout_snapshot: work_state.payout_snapshot,
-        // #601: the coinbase as mined, so settlement credits the fee-adjusted amounts the chain
-        // actually paid rather than the ratified proposal's.
-        coinbase: coinbase_non_witness,
-    });
+    // Settlement is the node pool relay's: it sees the block enter the best chain and retires
+    // what its coinbase paid (`ghost_np_relay::settlement`).
 
     info!(
         "Block at height {} submitted successfully!",
@@ -1320,16 +1308,12 @@ fn create_new_template(
             "Coinbase1 scriptSig shorter than expected BIP34 height push"
         ));
     }
-    // Carry the payout tag through into the prefix.
-    //
-    // SRI appends its pool tag and the extranonce AFTER `coinbase_prefix`, so anything left out
-    // here never reaches the mined coinbase. The pool tag is deliberately excluded (SRI stamps its
-    // own, and including it too is the double-stamp described above), but the payout commitment
-    // must survive — it is how a node later recognises a won block as one it can settle.
-    //
-    // Detected rather than assumed: the tag is one push immediately after the height, so its
-    // presence is checkable. A treasury-only coinbase carries none, and then the prefix is
-    // height-only exactly as before.
+    // Carry the two Ghost tag slots through into the prefix: the `GHPP` slot, which pool_sv2
+    // fills per job with `parent_anchor[..16]` (how settlement later finds a block's anchor), and
+    // the `GHNT` slot its share tag replaces. SRI appends its pool tag and the extranonce AFTER
+    // `coinbase_prefix`, so anything left out here never reaches the mined coinbase; the pool tag
+    // is deliberately excluded (SRI stamps its own, and including it too is the double-stamp
+    // described above). Detected rather than assumed: each tag is one push after the height.
     /// A tag is one push: `[len][magic][payload]`. Present or absent, never partial.
     fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> usize {
         let total = 1 + 4 + payload_len;
@@ -1380,8 +1364,9 @@ fn create_new_template(
 
     let merkle_path_seq: Seq0255<'static, U256<'static>> = merkle_path.into();
 
-    // Use Ghost's pre-built coinbase outputs instead of letting SRI Pool add its own
-    // This gives Ghost full control over payouts (BFT consensus, treasury, etc.)
+    // The node pool's template: the witness commitment is the only output, and the whole
+    // coinbase value (subsidy + the kept transactions' fees) is left to pool_sv2, which builds
+    // each job's canonical outputs for its slot class (`ghost_common::canonical_payout`).
     let coinbase_outputs: B064K<'static> = work_state
         .coinbase_outputs_serialized
         .clone()
@@ -1401,11 +1386,9 @@ fn create_new_template(
         coinbase_tx_version: 2, // Standard coinbase version
         coinbase_prefix,
         coinbase_tx_input_sequence: 0xffffffff,
-        // Ghost-pool provides ALL coinbase outputs (payouts, treasury, OP_RETURN).
-        // Set value_remaining to 0 so SRI does not add its own payout outputs.
-        coinbase_tx_value_remaining: 0,
+        coinbase_tx_value_remaining: work_state.subsidy + work_state.total_fees,
         coinbase_tx_outputs_count: work_state.coinbase_outputs_count,
-        coinbase_tx_outputs: coinbase_outputs, // Ghost's outputs (BFT payouts, treasury)
+        coinbase_tx_outputs: coinbase_outputs, // the witness commitment
         coinbase_tx_locktime: 0,
         merkle_path: merkle_path_seq,
     })

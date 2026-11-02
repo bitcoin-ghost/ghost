@@ -22,52 +22,30 @@
 
 //! Template processor for block template management
 //!
-//! Fetches templates from Bitcoin Core, applies BUDS filtering,
-//! and manages coinbase construction for the pool.
+//! Fetches templates from Bitcoin Core, applies BUDS filtering, and serves them to pool_sv2 over
+//! the Template Distribution Protocol. The node pool owns the coinbase: a template carries the
+//! whole coinbase value (subsidy plus fees) and the witness commitment as its only output, and
+//! pool_sv2 builds each job's canonical outputs (`ghost_common::canonical_payout`) on it.
 //!
 //! # Lock Ordering (M-16 / HIGH-POOL-4)
 //!
-//! This module uses multiple RwLocks. To prevent deadlocks, always acquire
-//! locks in this order:
-//!
-//! 1. `approved_payout` (`RwLock<Option<[u8; 32]>>`) - Shortest hold time
-//! 2. `current_work` (`RwLock<Option<WorkState>>`)
-//! 3. `work_states` (`RwLock<HashMap<...>>`)
-//! 4. `payout_proposals` (`RwLock<HashMap<...>>`) - Longest hold time
-//!
-//! Never acquire a lock that comes earlier in this list while holding
-//! a lock that comes later.
-//!
-//! ## HIGH-POOL-4: Lock Ordering Enforcement
-//!
-//! This ordering is enforced by convention. All methods that acquire multiple
-//! locks MUST follow this order. The key patterns are:
-//!
-//! - Read `approved_payout` BEFORE reading `payout_proposals` (for proposal lookup)
-//! - Release locks before calling methods that acquire other locks
-//! - Use snapshot values (captured before lock release) for subsequent operations
-//!
-//! All public methods have been audited to follow this ordering.
+//! Always acquire `current_work` (`RwLock<Option<WorkState>>`) before `work_states`
+//! (`RwLock<HashMap<...>>`), and never the reverse.
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use bitcoin::consensus::deserialize;
-use ghost_accounting::CoinbaseBuilder;
 use ghost_buds::{BudsClassifier, BudsTier};
 use ghost_common::config::{BitcoinNetwork, BlockPriority, MiningMode};
 use ghost_common::rpc::{BitcoinRpc, BlockTemplate, TemplateTransaction};
-use ghost_common::types::{PayoutProposal, PayoutType, TreasuryAddress};
+use ghost_common::types::TreasuryAddress;
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
-use ghost_storage::{Database, PayoutRecord, PayoutStatus, RecipientType, RoundRecord};
-
-// M-28: Import CoinbaseVerifier for pre-submission verification
-use crate::coinbase_verifier::{CoinbaseCommitment, CoinbaseOutput, CoinbaseVerifier};
 
 /// Errors that can occur during template processing
 #[derive(Debug, Error)]
@@ -93,550 +71,9 @@ pub enum TemplateError {
     BlockAssemblyError(String),
 }
 
-/// Information about a block successfully submitted to Bitcoin Core.
-/// Sent via channel from `handle_submit_solution()` to the payout task in main.rs.
-#[derive(Debug, Clone)]
-pub struct BlockSubmittedInfo {
-    /// Block hash in display byte order
-    pub block_hash: [u8; 32],
-    /// Block height
-    pub height: u64,
-    /// The approved payout whose outputs this block's coinbase actually carries, captured from
-    /// the WorkState the block was mined against.
-    ///
-    /// This is the ONLY safe trigger for settling the ledger. A payout is settled when the coins
-    /// exist — not when consensus approved it, because approval merely arms the coinbase of some
-    /// FUTURE block. `None` means this block paid the fallback coinbase and settles nothing.
-    pub payout_snapshot: Option<[u8; 32]>,
-    /// The actually-mined coinbase transaction (non-witness serialisation), exactly as submitted.
-    ///
-    /// #601: settlement must credit what the chain PAID, not what the fleet ratified — the mined
-    /// coinbase carries this node's fee-drift adjustment, so its treasury and node outputs differ
-    /// from the stored proposal's. The submitter parses these bytes and settles from them, the
-    /// same way every observing node settles from the coinbase it reads off the chain.
-    pub coinbase: Vec<u8>,
-}
-
-/// Type alias for coinbase build result:
-/// (coinbase1, coinbase2, witness_data, outputs_serialized, outputs_count)
-type CoinbaseBuildResult = (
-    Vec<u8>,
-    Vec<u8>,
-    WitnessData,
-    Vec<u8>,
-    u32,
-    Option<CoinbaseCommitment>,
-);
-
-/// Deterministically adjust a ratified payout proposal to the fees actually available in a
-/// template (`total_value` = subsidy + available fees).
-///
-/// The BFT-approved proposal baked in `tx_fees` at creation time, but template filtering
-/// (Reaper/BUDS/mempool changes) and RBF change available fees before any coinbase is built, and
-/// they change them DIFFERENTLY on every node. The mined coinbase must still spend exactly
-/// subsidy + the winner's own available fees, so the winner's coinbase pays these ADJUSTED
-/// amounts — not the ratified ones.
-///
-/// One caller since Stage 6 Release B (#750): the coinbase builder
-/// (`build_coinbase_parts_with_payout_snapshot`) applies it before emitting outputs, and the
-/// M-28 commitment is computed from the result.
-///
-/// It was extracted for #601 because there were TWO callers — the builder and tip-time
-/// settlement (`payout::apply_settlement`) — and if the two ever diverged, every node would
-/// settle a treasury amount the chain never paid. Release B deleted tip-time settlement; the
-/// shard now settles at maturity against the mined outputs and does not re-derive the split.
-/// The extraction still earns its keep: keep this a pure function of its arguments, because a
-/// second caller reading node-local state would reintroduce exactly that defect.
-///
-/// `None` means the drift cannot be absorbed and the builder must fall back to a fallback
-/// coinbase.
-///
-/// Post-gate (`prop.block_height >= coinbase_fee_split_height()`):
-/// surplus fees go to the treasury, capped at the treasury's own RATIFIED allocation (drift can
-/// at most double what the decay schedule granted it); overflow above the cap — including the
-/// whole surplus once the decay schedule has driven the ratified treasury to zero — is shared
-/// into the node pool pro rata to the ratified node amounts, remainder to the top entry, the
-/// same shape `calculate_node_payouts` gives the pool itself. A shortfall comes out of the
-/// treasury first, then the node pool largest-entry-first (ties broken by address, so every node
-/// reduces the same entries in the same order). Miner entries are NEVER touched in either
-/// direction.
-/// Canonical ordering for drift distribution: largest amount first, ties broken by address.
-///
-/// Every node must add to — and subtract from — the same entries in the same order, or two nodes
-/// holding the identical proposal would build different coinbases. This is the same comparator
-/// the shortfall path and `calculate_node_payouts` already use for their own dust and remainder.
-fn sort_for_drift(entries: &mut [ghost_common::types::PayoutEntry]) {
-    entries.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.address.cmp(&b.address)));
-}
-
-/// Add `amount` across `entries` pro rata to their ratified amounts, remainder to the first entry.
-///
-/// `entries` must already be sorted by [`sort_for_drift`]. Returns the amount actually allocated,
-/// which is `amount` whenever `entries` is non-empty and their total is non-zero.
-fn add_pro_rata(entries: &mut [ghost_common::types::PayoutEntry], amount: u64) -> u64 {
-    if amount == 0 || entries.is_empty() {
-        return 0;
-    }
-    let total: u64 = entries
-        .iter()
-        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-    if total == 0 {
-        // Nothing to be proportional TO. Put it all on the first entry rather than lose it;
-        // the ordering above makes "first" the same entry on every node.
-        entries[0].amount = entries[0].amount.saturating_add(amount);
-        return amount;
-    }
-    let mut allocated: u64 = 0;
-    for entry in entries.iter_mut() {
-        let add = ((amount as u128).saturating_mul(entry.amount as u128) / total as u128) as u64;
-        entry.amount = entry.amount.saturating_add(add);
-        allocated = allocated.saturating_add(add);
-    }
-    let remainder = amount.saturating_sub(allocated);
-    if remainder > 0 {
-        entries[0].amount = entries[0].amount.saturating_add(remainder);
-        allocated = allocated.saturating_add(remainder);
-    }
-    allocated
-}
-
-/// Take `amount` from `entries` pro rata, flooring each entry at zero, then sweeping any residual
-/// largest-first. Returns what could NOT be taken because the entries ran out of value.
-///
-/// `entries` must already be sorted by [`sort_for_drift`].
-fn take_pro_rata(entries: &mut [ghost_common::types::PayoutEntry], amount: u64) -> u64 {
-    if amount == 0 || entries.is_empty() {
-        return amount;
-    }
-    let total: u64 = entries
-        .iter()
-        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-    if total == 0 {
-        return amount;
-    }
-    let mut taken: u64 = 0;
-    for entry in entries.iter_mut() {
-        let want = ((amount as u128).saturating_mul(entry.amount as u128) / total as u128) as u64;
-        let take = want.min(entry.amount);
-        entry.amount -= take;
-        taken = taken.saturating_add(take);
-    }
-    // Integer division under-takes; sweep the residual largest-first so the result is still a
-    // pure function of the proposal.
-    let mut residual = amount.saturating_sub(taken);
-    if residual > 0 {
-        for entry in entries.iter_mut() {
-            if residual == 0 {
-                break;
-            }
-            let take = residual.min(entry.amount);
-            entry.amount -= take;
-            residual -= take;
-        }
-    }
-    residual
-}
-
-/// Share fee drift in the ratified proposal's OWN proportions — 99% to the miners, 1% split
-/// treasury/node — instead of landing the whole of it on the treasury and node pool.
-///
-/// See [`crate::FEE_DRIFT_MINER_SHARE_HEIGHT`] for why this exists. In short: the tip-change
-/// proposal records an ESTIMATE of the block's fees, that estimate is a per-node per-block
-/// lottery, and the legacy adjustment corrects it only in the treasury and node buckets — so the
-/// lottery, not the fees actually collected, decides what the miners are paid.
-///
-/// This is a pure function of `(prop, available_fees)`. It reads no node-local state — notably not
-/// `TreasuryState`, which would fork the coinbase across nodes — so every node holding the same
-/// ratified proposal builds byte-identical outputs from it.
-///
-/// `None` means the drift could not be absorbed even after draining every bucket, and the caller
-/// must fall back rather than build a coinbase the network would reject.
-fn share_fee_drift_pro_rata(
-    mut prop: PayoutProposal,
-    available_fees: u64,
-    height: u64,
-) -> Option<PayoutProposal> {
-    let original_fees = prop.tx_fees;
-
-    // Sort once, before anything moves, so both buckets are visited in the canonical order.
-    sort_for_drift(&mut prop.miner_payouts);
-    sort_for_drift(&mut prop.node_payouts);
-
-    if available_fees >= original_fees {
-        let delta = available_fees - original_fees;
-
-        // The SAME levy the ratified split used (`FeeDistribution::calculate_at_height`), so drift
-        // is shaped exactly like the reward it is drifting against: 1% pool fee, 99% to miners.
-        let pool_fee_delta =
-            ((delta as u128) * crate::treasury::POOL_FEE_BASIS_POINTS as u128 / 10_000) as u64;
-        let miner_delta = delta - pool_fee_delta;
-
-        // Split the 1% between treasury and node pool in the proportion the checkpoint ratified,
-        // rather than a fresh decay-schedule read — `prop.treasury_amount` IS that schedule's
-        // output for this block, and it is part of the ratified object every node holds.
-        let node_total: u64 = prop
-            .node_payouts
-            .iter()
-            .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-        let fee_base = prop.treasury_amount.saturating_add(node_total);
-        let to_treasury = if fee_base == 0 {
-            0
-        } else {
-            ((pool_fee_delta as u128).saturating_mul(prop.treasury_amount as u128)
-                / fee_base as u128) as u64
-        };
-        let to_nodes = pool_fee_delta - to_treasury;
-
-        prop.treasury_amount = prop.treasury_amount.saturating_add(to_treasury);
-        let nodes_allocated = add_pro_rata(&mut prop.node_payouts, to_nodes);
-        // No node entries to receive the share (or none ratified): it belongs to the miners
-        // rather than to nobody — the decay schedule's end state, one bucket earlier.
-        let miner_delta = miner_delta.saturating_add(to_nodes - nodes_allocated);
-        let miners_allocated = add_pro_rata(&mut prop.miner_payouts, miner_delta);
-        // Symmetrically: with no miner entries at all, the surplus falls back to the treasury,
-        // which is the only bucket that always exists.
-        prop.treasury_amount = prop
-            .treasury_amount
-            .saturating_add(miner_delta - miners_allocated);
-    } else {
-        let delta = original_fees - available_fees;
-        let pool_fee_delta =
-            ((delta as u128) * crate::treasury::POOL_FEE_BASIS_POINTS as u128 / 10_000) as u64;
-        let miner_delta = delta - pool_fee_delta;
-
-        let node_total: u64 = prop
-            .node_payouts
-            .iter()
-            .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-        let fee_base = prop.treasury_amount.saturating_add(node_total);
-        let from_treasury = if fee_base == 0 {
-            0
-        } else {
-            ((pool_fee_delta as u128).saturating_mul(prop.treasury_amount as u128)
-                / fee_base as u128) as u64
-        };
-        let from_treasury = from_treasury.min(prop.treasury_amount);
-        let from_nodes = pool_fee_delta - from_treasury;
-
-        prop.treasury_amount -= from_treasury;
-        let mut shortfall = take_pro_rata(&mut prop.node_payouts, from_nodes);
-        shortfall = shortfall.saturating_add(take_pro_rata(&mut prop.miner_payouts, miner_delta));
-
-        // Whatever no bucket could absorb in its own share is swept across the others, in a fixed
-        // order, before giving up: treasury, then nodes, then miners.
-        if shortfall > 0 {
-            let take = shortfall.min(prop.treasury_amount);
-            prop.treasury_amount -= take;
-            shortfall -= take;
-        }
-        if shortfall > 0 {
-            shortfall = take_pro_rata(&mut prop.node_payouts, shortfall);
-        }
-        if shortfall > 0 {
-            shortfall = take_pro_rata(&mut prop.miner_payouts, shortfall);
-        }
-        if shortfall > 0 {
-            warn!(
-                shortfall,
-                height, "Fee drift exceeds the whole ratified payout — using fallback coinbase"
-            );
-            return None;
-        }
-    }
-
-    // An entry driven to zero must not become a zero-value output.
-    prop.miner_payouts.retain(|e| e.amount > 0);
-    prop.node_payouts.retain(|e| e.amount > 0);
-
-    prop.tx_fees = available_fees;
-
-    // Conservation, checked rather than assumed: this is the exact identity GHOST-02 enforces,
-    // and a coinbase that misses it is rejected by the network. Falling back is always available;
-    // shipping an unbalanced coinbase is not.
-    let miner_sum: u64 = prop
-        .miner_payouts
-        .iter()
-        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-    let node_sum: u64 = prop
-        .node_payouts
-        .iter()
-        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-    let allocated = miner_sum
-        .saturating_add(node_sum)
-        .saturating_add(prop.treasury_amount);
-    let expected = prop.subsidy.saturating_add(available_fees);
-    if allocated != expected {
-        error!(
-            allocated,
-            expected,
-            original_fees,
-            available_fees,
-            height,
-            "Fee-drift redistribution did not conserve value — using fallback coinbase"
-        );
-        return None;
-    }
-
-    info!(
-        original_fees,
-        available_fees,
-        miner_sum,
-        node_sum,
-        treasury = prop.treasury_amount,
-        height,
-        "Adjusted payout: fee drift shared with the miners in the ratified proportions"
-    );
-    Some(prop)
-}
-
-/// Pre-gate: the legacy block-finder adjustment with the H-04 2x cap.
-pub(crate) fn adjust_proposal_for_available_fees(
-    mut prop: PayoutProposal,
-    total_value: u64,
-    height: u64,
-) -> Option<PayoutProposal> {
-    let available_fees = total_value.saturating_sub(prop.subsidy);
-    let original_fees = prop.tx_fees;
-
-    if available_fees != original_fees {
-        // POST-GATE: there is no block finder. The fees were already shared into the
-        // node reward pool when the mesh ratified this payout at tip change — that is
-        // precisely what makes the coinbase determinable before the block is won.
-        //
-        // What remains is DRIFT: the gap between the fees the mesh ratified and the fees
-        // actually available in THIS node's template. The mempool moves, RBF replaces
-        // transactions, and each node's Reaper/BUDS filtering drops a different set — so
-        // every node sees slightly different fees, and the coinbase must still spend
-        // exactly subsidy + its own available fees.
-        //
-        // The drift lands on the TREASURY (GHOST-13 precedent: tx-fee dust already goes
-        // there), which keeps the miner split and the node split untouched.
-        if prop.block_height >= crate::coinbase_fee_split_height() {
-            // The estimate the tip-change proposal recorded is a per-node, per-block lottery, and
-            // the legacy path below corrects it only in the treasury and node buckets — so that
-            // lottery, not the fees actually collected, decides the miners' share. At and above
-            // this gate the drift is shared in the ratified proportions instead.
-            // See `crate::FEE_DRIFT_MINER_SHARE_HEIGHT`.
-            if prop.block_height >= crate::fee_drift_miner_share_height() {
-                return share_fee_drift_pro_rata(prop, available_fees, height);
-            }
-
-            if available_fees > original_fees {
-                let extra = available_fees - original_fees;
-
-                // #601 DRIFT CAP: the treasury's take is bounded by its own RATIFIED
-                // allocation — drift can at most DOUBLE what the decay schedule granted
-                // the treasury for this block. The cap must not be a multiple of
-                // `original_fees` (H-04's mistake: post-#652 the ratified fees can
-                // legitimately be small, and pre-#652 they were zero, making 2x a
-                // useless bound), and it cannot be read from `TreasuryState` (node-local
-                // DB state, not part of the ratified checkpoint — using it would fork
-                // the coinbase across nodes). `prop.treasury_amount` is itself the
-                // decay-schedule split of the ratified checkpoint, so the cap is a pure
-                // function of the checkpoint, scales with halvings and fee levels, and
-                // goes to ZERO exactly when the decay schedule retires the treasury —
-                // which is precisely when the operator wants every drift satoshi in the
-                // node pool instead.
-                let to_treasury = extra.min(prop.treasury_amount);
-                prop.treasury_amount = prop.treasury_amount.saturating_add(to_treasury);
-
-                // Overflow above the cap is shared into the NODE POOL, mirroring the
-                // shortfall path's fallback in the opposite direction and the decay
-                // schedule's end state (node pool inherits what the treasury no longer
-                // takes). Pro rata to the RATIFIED amounts — the same proportions
-                // `calculate_node_payouts` derived from capability shares — with the
-                // integer-division remainder going to the top entry (largest amount,
-                // ties broken by address), exactly where `calculate_node_payouts` sends
-                // its own dust and rounding remainder. Sorted first so every node adds
-                // to the same entries in the same order.
-                let overflow = extra - to_treasury;
-                if overflow > 0 {
-                    let node_total: u64 = prop
-                        .node_payouts
-                        .iter()
-                        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
-                    if node_total == 0 {
-                        warn!(
-                            overflow,
-                            height,
-                            "Fee-drift surplus exceeds the treasury cap and there is no \
-                             node pool to absorb it — using fallback coinbase"
-                        );
-                        return None;
-                    }
-
-                    prop.node_payouts
-                        .sort_by(|a, b| b.amount.cmp(&a.amount).then(a.address.cmp(&b.address)));
-                    let ratified: Vec<u64> = prop.node_payouts.iter().map(|e| e.amount).collect();
-                    let mut allocated: u64 = 0;
-                    for (entry, base) in prop.node_payouts.iter_mut().zip(ratified) {
-                        let add = ((overflow as u128).saturating_mul(base as u128)
-                            / node_total as u128) as u64;
-                        entry.amount = entry.amount.saturating_add(add);
-                        allocated = allocated.saturating_add(add);
-                    }
-                    let remainder = overflow.saturating_sub(allocated);
-                    if remainder > 0 {
-                        if let Some(top) = prop.node_payouts.first_mut() {
-                            top.amount = top.amount.saturating_add(remainder);
-                        }
-                    }
-                    info!(
-                        extra,
-                        to_treasury,
-                        overflow,
-                        height,
-                        "Fee-drift surplus exceeded the treasury cap — overflow shared \
-                         into the node pool pro rata"
-                    );
-                }
-            } else {
-                let mut shortfall = original_fees - available_fees;
-
-                // 1) Treasury absorbs what it can.
-                let from_treasury = shortfall.min(prop.treasury_amount);
-                prop.treasury_amount -= from_treasury;
-                shortfall -= from_treasury;
-
-                // 2) Under the decay schedule the treasury's share eventually reaches
-                //    ZERO, so it cannot be relied on to cover a shortfall. Fall back to
-                //    the node pool — largest entry first, ties broken by address, so
-                //    every node reduces the same entries in the same order.
-                if shortfall > 0 {
-                    prop.node_payouts
-                        .sort_by(|a, b| b.amount.cmp(&a.amount).then(a.address.cmp(&b.address)));
-                    for entry in &mut prop.node_payouts {
-                        if shortfall == 0 {
-                            break;
-                        }
-                        let take = shortfall.min(entry.amount);
-                        entry.amount -= take;
-                        shortfall -= take;
-                    }
-                    prop.node_payouts.retain(|e| e.amount > 0);
-                }
-
-                // 3) Still short: the coinbase cannot balance. Fall back rather than
-                //    build a block the network would reject.
-                if shortfall > 0 {
-                    warn!(
-                        shortfall,
-                        height, "Fee drift exceeds treasury + node pool — using fallback coinbase"
-                    );
-                    return None;
-                }
-            }
-
-            prop.tx_fees = available_fees;
-            info!(
-                original_fees,
-                available_fees,
-                height,
-                "Adjusted payout: fee drift absorbed by the treasury (no block finder)"
-            );
-            return Some(prop);
-        }
-
-        if available_fees < original_fees {
-            // FEES DECREASED: reduce block finder's fee portion
-            let excess = original_fees - available_fees;
-            let mut remaining = excess;
-
-            // Step 1: Reduce TxFees-type entries
-            for entry in &mut prop.node_payouts {
-                if remaining == 0 {
-                    break;
-                }
-                if entry.payout_type == PayoutType::TxFees {
-                    let reduction = remaining.min(entry.amount);
-                    entry.amount -= reduction;
-                    remaining -= reduction;
-                }
-            }
-
-            // Step 2: Reduce proposer's entry (fees merged into NodeReward)
-            if remaining > 0 {
-                for entry in &mut prop.node_payouts {
-                    if remaining == 0 {
-                        break;
-                    }
-                    if entry.recipient_id == prop.proposer {
-                        let reduction = remaining.min(entry.amount);
-                        entry.amount -= reduction;
-                        remaining -= reduction;
-                    }
-                }
-            }
-
-            // Step 3: Fallback if can't absorb
-            if remaining > 0 {
-                warn!(
-                    remaining,
-                    height, "Could not absorb fee decrease — using fallback"
-                );
-                return None;
-            }
-
-            info!(
-                original_fees,
-                available_fees,
-                reduction = excess,
-                height,
-                "Adjusted payout: fees decreased"
-            );
-        } else {
-            // FEES INCREASED (RBF): add extra to block finder
-            // H-04: Cap fee increase at 2x original to prevent disproportionate allocation
-            let raw_extra = available_fees - original_fees;
-            let max_extra = original_fees; // Cap at 2x total (original + original)
-            let extra = raw_extra.min(max_extra);
-            if raw_extra > max_extra {
-                warn!(
-                    raw_extra,
-                    max_extra,
-                    height,
-                    "H-04: Fee increase exceeds 2x cap — capping extra allocation"
-                );
-            }
-            let mut allocated = false;
-
-            for entry in &mut prop.node_payouts {
-                if entry.payout_type == PayoutType::TxFees || entry.recipient_id == prop.proposer {
-                    entry.amount = entry.amount.saturating_add(extra);
-                    allocated = true;
-                    break;
-                }
-            }
-
-            if !allocated {
-                debug!(
-                    extra,
-                    height, "Extra fees unclaimed — no block finder entry"
-                );
-            } else {
-                info!(
-                    original_fees,
-                    available_fees, extra, height, "Adjusted payout: fees increased (RBF)"
-                );
-            }
-        }
-    }
-
-    // Final sanity: must not exceed available value
-    let adjusted_total: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum::<u64>()
-        + prop.node_payouts.iter().map(|e| e.amount).sum::<u64>()
-        + prop.treasury_amount;
-
-    if adjusted_total > total_value {
-        error!(
-            adjusted_total,
-            total_value, height, "CRITICAL: Adjusted proposal exceeds available — using fallback"
-        );
-        return None;
-    }
-
-    Some(prop)
-}
+/// Coinbase parts for one template: `(coinbase1, coinbase2, witness_data, outputs_serialized,
+/// outputs_count)`. The outputs are the witness commitment alone.
+type CoinbaseBuildResult = (Vec<u8>, Vec<u8>, WitnessData, Vec<u8>, u32);
 
 /// The encoded node tag for one coinbase build: which of the two commitment forms is stamped.
 ///
@@ -872,31 +309,11 @@ pub struct WorkState {
     pub total_weight: u64,
     /// Original template (for block submission)
     pub template: BlockTemplate,
-    /// Serialized coinbase outputs (Bitcoin consensus format for TDP)
-    /// This is the raw TxOut data that SRI Pool should use
+    /// Serialized coinbase outputs (Bitcoin consensus format for TDP): the witness commitment
+    /// alone. pool_sv2 builds every other output.
     pub coinbase_outputs_serialized: Vec<u8>,
-    /// Number of coinbase outputs
+    /// Number of coinbase outputs in `coinbase_outputs_serialized`
     pub coinbase_outputs_count: u32,
-    /// H-MINE-2: Snapshot of approved payout hash at template creation time
-    /// This prevents TOCTOU race conditions where the approved payout could change
-    /// between template creation and coinbase building.
-    pub payout_snapshot: Option<[u8; 32]>,
-    /// M-28: Coinbase commitment snapshot at template creation time.
-    /// Used for per-template verification instead of the global CoinbaseVerifier,
-    /// which can be overwritten by newer payout proposals before the block is found.
-    pub commitment_snapshot: Option<CoinbaseCommitment>,
-}
-
-/// The #601 fee-selection rule, kept pure so it is testable without a `WorkState` fixture:
-/// the current template's fees when it has any, otherwise the most recent filled observation
-/// (`estimated = true`). A template with zero fees is indistinguishable from the empty fast-path
-/// template here, and falling back is correct for both — an ancient stale estimate cannot stick,
-/// because every FULL refresh overwrites the observation, zero included.
-fn resolve_payout_fees(current_template_fees: Option<u64>, last_filled_fees: u64) -> (u64, bool) {
-    match current_template_fees {
-        Some(fees) if fees > 0 => (fees, false),
-        _ => (last_filled_fees, true),
-    }
 }
 
 /// Witness data for SegWit coinbase transaction
@@ -942,12 +359,6 @@ pub struct TemplateProcessor {
     reaper_stats: Arc<crate::reaper_stats::ReaperStats>,
     /// Current work state
     current_work: RwLock<Option<WorkState>>,
-    /// TX fees of the most recent FILLED template (#601). The tip-change fast path publishes an
-    /// EMPTY template so miners get new work instantly, and the payout proposal for the new
-    /// height is armed off that very template — so it read `total_fees = 0` and the ratified
-    /// proposal carried no fees at all. This remembers the last real fee observation across the
-    /// tip change so the proposal can carry an estimate instead of a structural zero.
-    last_filled_fees: std::sync::atomic::AtomicU64,
     /// What the SV2 pool said it adds to each coinbase (`CoinbaseOutputConstraints`).
     coinbase_output_reserve: crate::block_limits::CoinbaseOutputReserve,
     /// Work states by template_id (for SubmitSolution lookup)
@@ -961,19 +372,6 @@ pub struct TemplateProcessor {
     /// Live refresh cadence (ms), read each `start()` loop iteration so the
     /// dashboard can retune it without restarting the pool. Clamped to [10s,60s].
     refresh_interval_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// Approved payout proposal hash (from consensus)
-    approved_payout: RwLock<Option<[u8; 32]>>,
-    /// Cached payout proposals (hash -> proposal)
-    payout_proposals: RwLock<HashMap<[u8; 32], PayoutProposal>>,
-    /// M-28: Coinbase verifier for pre-submission verification
-    coinbase_verifier: CoinbaseVerifier,
-    /// Database for persisting payout proposals across restarts
-    db: Option<Arc<Database>>,
-    /// Channel sender: fires when a block is successfully submitted to Bitcoin Core.
-    /// Used by template_provider.rs to notify the payout task in main.rs.
-    block_submitted_tx: mpsc::UnboundedSender<BlockSubmittedInfo>,
-    /// Channel receiver: taken once by main.rs at startup to spawn the payout task.
-    block_submitted_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<BlockSubmittedInfo>>>,
 }
 
 impl TemplateProcessor {
@@ -991,7 +389,6 @@ impl TemplateProcessor {
         reaper_config: ReaperConfig,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(100);
-        let (block_submitted_tx, block_submitted_rx) = mpsc::unbounded_channel();
         let init_refresh_ms = config.refresh_interval_ms.clamp(10_000, 60_000);
 
         Self {
@@ -1002,1059 +399,64 @@ impl TemplateProcessor {
             reaper_config,
             reaper_stats: crate::reaper_stats::ReaperStats::new(),
             current_work: RwLock::new(None),
-            last_filled_fees: std::sync::atomic::AtomicU64::new(0),
             coinbase_output_reserve: Default::default(),
             work_states: RwLock::new(HashMap::new()),
             job_counter: RwLock::new(0),
             event_tx,
             running: RwLock::new(false),
             refresh_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_refresh_ms)),
-            approved_payout: RwLock::new(None),
-            payout_proposals: RwLock::new(HashMap::new()),
-            coinbase_verifier: CoinbaseVerifier::new(),
-            db: None,
-            block_submitted_tx,
-            block_submitted_rx: parking_lot::Mutex::new(Some(block_submitted_rx)),
         }
     }
 
-    /// Set the database for persisting payout proposals across restarts
-    pub fn with_database(mut self, db: Arc<Database>) -> Self {
-        self.db = Some(db);
-        self
-    }
-
-    /// Restore approved payout proposal from database on startup
+    /// Build the coinbase parts for a template: the scriptSig (BIP34 height, the `GHPP` slot the
+    /// node pool stamps `parent_anchor[..16]` into, the plain `GHNT` node tag the per-channel share
+    /// tag replaces, the pool tag) and the witness commitment as the only output.
     ///
-    /// Called after construction to reload any previously approved payout
-    /// so that the next block uses the correct coinbase outputs.
-    pub fn restore_from_db(&self) {
-        let Some(ref db) = self.db else { return };
-
-        match db.get_approved_payout_proposal() {
-            Ok(Some((hash, json))) => {
-                match serde_json::from_str::<PayoutProposal>(&json) {
-                    Ok(proposal) => {
-                        // Skip stale proposals: if the proposal timestamp is more than
-                        // 120 seconds old, it's from a previous run and will fail M-07's
-                        // height check anyway. Skipping avoids H-04 fee cap warnings.
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if proposal.timestamp > 0 && now > proposal.timestamp + 120 {
-                            info!(
-                                proposal_age_secs = now - proposal.timestamp,
-                                proposal_height = proposal.block_height,
-                                "Skipping stale payout proposal from database (>120s old)"
-                            );
-                            db.clear_approved_payout().ok();
-                            return;
-                        }
-
-                        // Restore into in-memory cache
-                        let proposal_hash = proposal.proposal_hash;
-
-                        // M-28: Reconstruct coinbase commitment so templates created
-                        // after restart carry a valid commitment_snapshot for verification
-                        let treasury_addr = self.effective_treasury_address(&proposal);
-                        let commitment =
-                            CoinbaseCommitment::from_proposal(&proposal, &treasury_addr);
-                        self.coinbase_verifier.set_commitment(commitment);
-
-                        self.payout_proposals
-                            .write()
-                            .insert(proposal_hash, proposal);
-
-                        if hash.len() == 32 {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&hash);
-                            *self.approved_payout.write() = Some(arr);
-                            info!(
-                                hash = %hex::encode(&arr[..8]),
-                                "Restored approved payout from database"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to deserialize approved payout proposal from database");
-                    }
-                }
-            }
-            Ok(None) => {
-                debug!("No approved payout proposal in database");
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to query approved payout proposal from database");
-            }
-        }
-    }
-
-    /// Notify that a block has been successfully submitted to Bitcoin Core.
-    /// Sends the block info to the payout task via the mpsc channel.
-    pub fn notify_block_submitted(&self, info: BlockSubmittedInfo) {
-        if let Err(e) = self.block_submitted_tx.send(info) {
-            warn!(error = %e, "Block submitted channel closed, payout task may have stopped");
-        }
-    }
-
-    /// Take the block submission receiver (can only be called once).
-    /// Called by main.rs at startup to spawn the payout task.
-    pub fn take_block_submitted_rx(&self) -> Option<mpsc::UnboundedReceiver<BlockSubmittedInfo>> {
-        self.block_submitted_rx.lock().take()
-    }
-
-    /// The treasury address this proposal's coinbase actually pays.
-    ///
-    /// H-MINE-3 snapshots the address into the proposal, but older proposals carry an empty field
-    /// and fall back to config. This selection was duplicated at every site that builds a coinbase
-    /// commitment — and every copy has to agree, because the commitment is a hash: pick the other
-    /// branch and the hash changes, the pre-submission check fails, and (since settlement now looks
-    /// proposals up by that hash) a won block stops being recognisable as ours.
-    fn effective_treasury_address(&self, proposal: &PayoutProposal) -> Vec<u8> {
-        if !proposal.treasury_address.is_empty() {
-            proposal.treasury_address.clone()
-        } else {
-            self.config.treasury_address.address().as_bytes().to_vec()
-        }
-    }
-
-    /// Store a payout proposal (called when proposal is received)
-    pub fn store_proposal(&self, proposal: PayoutProposal) {
-        let hash = proposal.proposal_hash;
-        let miners = proposal.miner_payouts.len();
-        let nodes = proposal.node_payouts.len();
-
-        // Persist to database if available
-        if let Some(ref db) = self.db {
-            match serde_json::to_string(&proposal) {
-                Ok(json) => {
-                    if let Err(e) = db.store_payout_proposal(
-                        &hash,
-                        proposal.round_id,
-                        proposal.block_height,
-                        &json,
-                    ) {
-                        warn!(
-                            hash = %hex::encode(&hash[..8]),
-                            error = %e,
-                            "Failed to persist payout proposal to database"
-                        );
-                    } else {
-                        // Tag it with the hash of the coinbase outputs it will pay. This is how a
-                        // node later recognises a won block as its own: it hashes the coinbase it
-                        // sees on-chain and looks the proposal up by that hash. Computed here,
-                        // where the same treasury-address selection the commitment uses is in
-                        // scope — computing it anywhere else risks the two disagreeing.
-                        let treasury_addr = self.effective_treasury_address(&proposal);
-                        let outputs_hash =
-                            CoinbaseCommitment::from_proposal(&proposal, &treasury_addr)
-                                .output_hash;
-                        if let Err(e) = db.set_proposal_outputs_hash(&hash, &outputs_hash) {
-                            warn!(
-                                hash = %hex::encode(&hash[..8]),
-                                error = %e,
-                                "Failed to record the proposal's coinbase outputs hash — a block \
-                                 paying this proposal will not be recognised as ours"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        hash = %hex::encode(&hash[..8]),
-                        error = %e,
-                        "Failed to serialize payout proposal for database persistence"
-                    );
-                }
-            }
-        }
-
-        // Lock ordering: approved_payout before payout_proposals
-        let approved_hash = *self.approved_payout.read();
-
-        let mut proposals = self.payout_proposals.write();
-        proposals.insert(hash, proposal);
-
-        // Evict old proposals: keep approved + most recent 10 by round_id
-        if proposals.len() > 10 {
-            let mut entries: Vec<([u8; 32], u64)> =
-                proposals.iter().map(|(k, v)| (*k, v.round_id)).collect();
-            entries.sort_by_key(|(_, round)| std::cmp::Reverse(*round));
-            let keep: HashSet<[u8; 32]> = entries
-                .iter()
-                .take(10)
-                .map(|(k, _)| *k)
-                .chain(approved_hash.iter().copied())
-                .collect();
-            let before = proposals.len();
-            proposals.retain(|k, _| keep.contains(k));
-            let evicted = before - proposals.len();
-            if evicted > 0 {
-                debug!(
-                    evicted,
-                    remaining = proposals.len(),
-                    "Evicted old payout proposals"
-                );
-            }
-        }
-        drop(proposals);
-
-        info!(
-            hash = %hex::encode(&hash[..8]),
-            miners = miners,
-            nodes = nodes,
-            "Stored payout proposal in template processor"
-        );
-    }
-
-    /// Get a stored proposal by hash
-    pub fn get_proposal(&self, hash: &[u8; 32]) -> Option<PayoutProposal> {
-        self.payout_proposals.read().get(hash).cloned()
-    }
-
-    /// Set the approved payout proposal hash (from consensus)
-    ///
-    /// This is called when consensus approves a payout proposal.
-    /// The template processor uses this to include proper payout
-    /// outputs in the coinbase transaction.
-    ///
-    /// M-28: Also sets the coinbase commitment for pre-submission verification.
-    pub fn set_approved_payout(&self, proposal_hash: [u8; 32]) {
-        // MED-POOL-6: Only set approved payout if proposal data exists in cache.
-        // After a restart, stale votes can re-approve old proposals whose data
-        // was lost (in-memory cache cleared). Setting the hash without data
-        // causes every template refresh to fail.
-        let proposal = match self.get_proposal(&proposal_hash) {
-            Some(p) => p,
-            None => {
-                warn!(
-                    hash = %hex::encode(&proposal_hash[..8]),
-                    "MED-POOL-6: Ignoring approved payout - proposal data not in cache (likely stale after restart)"
-                );
-                return;
-            }
-        };
-
-        // M-28: Create and store coinbase commitment for verification
-        let treasury_addr = self.effective_treasury_address(&proposal);
-        let commitment = CoinbaseCommitment::from_proposal(&proposal, &treasury_addr);
-        self.coinbase_verifier.set_commitment(commitment);
-
-        // Persist approval to database
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.mark_payout_approved(&proposal_hash) {
-                warn!(
-                    hash = %hex::encode(&proposal_hash[..8]),
-                    error = %e,
-                    "Failed to persist payout approval to database"
-                );
-            }
-
-            // Record individual payout entries for history/dashboard
-            self.record_payout_entries(db, &proposal);
-        }
-
-        *self.approved_payout.write() = Some(proposal_hash);
-        info!(
-            hash = %hex::encode(&proposal_hash[..8]),
-            "Set approved payout for coinbase"
-        );
-    }
-
-    /// Stage 6 step 3: commit to a payout this node constructed itself, with no vote in the path.
-    ///
-    /// Used at and above `payout_from_shard_height()`. The proposal is already built from this
-    /// node's own shard view (`BlockFoundData::shard_owed`), so there is nothing to ratify — per
-    /// `SHARE_SHARD.md` §8, "no consensus on the ledger; each node pays from its own view".
-    ///
-    /// Deliberately identical to [`Self::set_approved_payout`] in EVERY step that touches money:
-    /// the same `CoinbaseCommitment::from_proposal` over the same `effective_treasury_address`,
-    /// the same persistence, the same `approved_payout` handle the coinbase builder reads. This
-    /// is a change of ROUTE, not of AMOUNT, and `local_commitment_matches_the_voted_one` pins
-    /// that byte-for-byte.
-    ///
-    /// The one difference is the MED-POOL-6 cache lookup, which is absent because it cannot apply.
-    /// That guard exists because a stale VOTE can arrive after a restart for a proposal whose
-    /// in-memory data is gone; a proposal this node just built is in hand by construction, so
-    /// looking it up to check it exists would be a check that cannot fail.
-    pub fn set_local_payout(&self, proposal: PayoutProposal) {
-        let proposal_hash = proposal.proposal_hash;
-
-        // Cache it first: the coinbase builder resolves `approved_payout` back through
-        // `get_proposal`, so publishing the handle before the data would race a template refresh.
-        self.store_proposal(proposal.clone());
-
-        // M-28: same commitment constructor the voted path uses.
-        let treasury_addr = self.effective_treasury_address(&proposal);
-        let commitment = CoinbaseCommitment::from_proposal(&proposal, &treasury_addr);
-        self.coinbase_verifier.set_commitment(commitment);
-
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.mark_payout_approved(&proposal_hash) {
-                warn!(
-                    hash = %hex::encode(&proposal_hash[..8]),
-                    error = %e,
-                    "Failed to persist local payout to database"
-                );
-            }
-            self.record_payout_entries(db, &proposal);
-        }
-
-        *self.approved_payout.write() = Some(proposal_hash);
-        info!(
-            hash = %hex::encode(&proposal_hash[..8]),
-            "Set locally-constructed payout for coinbase (no vote)"
-        );
-    }
-
-    /// Record individual payout entries to the database for history tracking.
-    ///
-    /// Converts each `PayoutEntry` from the proposal into a `PayoutRecord`
-    /// and inserts it into the `payouts` table. Also records treasury and
-    /// tx_fees entries so the dashboard can display complete payout breakdowns.
-    fn record_payout_entries(&self, db: &Database, proposal: &PayoutProposal) {
-        let created_at = proposal.timestamp as i64;
-        let round_id = proposal.round_id;
-
-        // Ensure round exists before inserting payout entries (FK constraint).
-        // The round row may already have been persisted at round start (with
-        // only its block height), so `upsert_round` fills in the block-outcome
-        // columns on conflict rather than skipping like INSERT OR IGNORE would.
-        let round_record = RoundRecord {
-            round_id,
-            block_height: proposal.block_height,
-            block_hash: Some(hex::encode(proposal.block_hash)),
-            start_time: created_at,
-            end_time: None,
-            total_shares: 0,
-            total_work: 0.0,
-            winning_miner: None,
-            found_by_node: Some(hex::encode(proposal.proposer)),
-            payout_status: PayoutStatus::Approved,
-            subsidy_sats: Some(proposal.subsidy),
-            tx_fees_sats: Some(proposal.tx_fees),
-        };
-        if let Err(e) = db.upsert_round(&round_record) {
-            warn!(round_id = round_id, error = %e, "Failed to persist round record");
-            return;
-        }
-
-        let mut recorded = 0u32;
-
-        // Miner payouts
-        for entry in &proposal.miner_payouts {
-            let record = PayoutRecord {
-                id: None,
-                round_id,
-                recipient_id: hex::encode(entry.recipient_id),
-                recipient_type: RecipientType::Miner,
-                address: hex::encode(&entry.address),
-                amount_sats: entry.amount,
-                txid: None,
-                vout: None,
-                status: PayoutStatus::Approved,
-                created_at,
-                confirmed_at: None,
-            };
-            if let Err(e) = db.insert_payout(&record) {
-                warn!(error = %e, "Failed to record miner payout entry");
-            } else {
-                recorded += 1;
-            }
-        }
-
-        // Node payouts
-        for entry in &proposal.node_payouts {
-            let record = PayoutRecord {
-                id: None,
-                round_id,
-                recipient_id: hex::encode(entry.recipient_id),
-                recipient_type: RecipientType::Node,
-                address: hex::encode(&entry.address),
-                amount_sats: entry.amount,
-                txid: None,
-                vout: None,
-                status: PayoutStatus::Approved,
-                created_at,
-                confirmed_at: None,
-            };
-            if let Err(e) = db.insert_payout(&record) {
-                warn!(error = %e, "Failed to record node payout entry");
-            } else {
-                recorded += 1;
-            }
-        }
-
-        // Treasury
-        if proposal.treasury_amount > 0 {
-            let record = PayoutRecord {
-                id: None,
-                round_id,
-                recipient_id: "treasury".to_string(),
-                recipient_type: RecipientType::Treasury,
-                address: hex::encode(&proposal.treasury_address),
-                amount_sats: proposal.treasury_amount,
-                txid: None,
-                vout: None,
-                status: PayoutStatus::Approved,
-                created_at,
-                confirmed_at: None,
-            };
-            if let Err(e) = db.insert_payout(&record) {
-                warn!(error = %e, "Failed to record treasury payout entry");
-            } else {
-                recorded += 1;
-            }
-        }
-
-        // TX fees
-        if proposal.tx_fees > 0 {
-            let record = PayoutRecord {
-                id: None,
-                round_id,
-                recipient_id: hex::encode(proposal.proposer),
-                recipient_type: RecipientType::TxFees,
-                address: String::new(),
-                amount_sats: proposal.tx_fees,
-                txid: None,
-                vout: None,
-                status: PayoutStatus::Approved,
-                created_at,
-                confirmed_at: None,
-            };
-            if let Err(e) = db.insert_payout(&record) {
-                warn!(error = %e, "Failed to record tx_fees payout entry");
-            } else {
-                recorded += 1;
-            }
-        }
-
-        info!(
-            round_id = round_id,
-            count = recorded,
-            "Recorded payout entries to database"
-        );
-    }
-
-    /// Clear the approved payout (after block is found)
-    pub fn clear_approved_payout(&self) {
-        // Clear in database
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.clear_approved_payout() {
-                warn!(error = %e, "Failed to clear approved payout in database");
-            }
-        }
-
-        *self.approved_payout.write() = None;
-        // M-28: Clear coinbase commitment when payout is cleared
-        self.coinbase_verifier.clear_commitment();
-    }
-
-    /// Get the current approved payout hash
-    pub fn approved_payout(&self) -> Option<[u8; 32]> {
-        *self.approved_payout.read()
-    }
-
-    /// Build a complete coinbase transaction using the approved payout
-    ///
-    /// This is used for final block assembly when we have an approved
-    /// payout proposal from consensus.
-    ///
-    /// H-MINE-2: This method reads from the live approved_payout lock.
-    /// For TOCTOU-safe operation when reconstructing from a template,
-    /// use build_approved_coinbase_from_snapshot() with the WorkState's payout_snapshot.
-    pub fn build_approved_coinbase(
+    /// pool_sv2 builds every other output, per job, from the canonical payout of the job's slot
+    /// class; this template hands it the whole coinbase value. `coinbase1`/`coinbase2` use
+    /// NON-WITNESS serialization (TXID); witness data is returned separately for block assembly.
+    fn build_coinbase_parts(
         &self,
         height: u64,
-        witness_commitment: &Option<String>,
-    ) -> Option<bitcoin::Transaction> {
-        // H-MINE-2: Capture hash once, atomically
-        let payout_hash = (*self.approved_payout.read())?;
-        self.build_approved_coinbase_from_snapshot(height, witness_commitment, payout_hash)
-    }
-
-    /// H-MINE-2: Build coinbase using a pre-captured payout hash snapshot
-    ///
-    /// This is the TOCTOU-safe version that uses a snapshot of the approved payout
-    /// hash captured at template creation time (stored in WorkState.payout_snapshot).
-    pub fn build_approved_coinbase_from_snapshot(
-        &self,
-        height: u64,
-        witness_commitment: &Option<String>,
-        payout_hash: [u8; 32],
-    ) -> Option<bitcoin::Transaction> {
-        // Look up the proposal using the snapshot hash
-        let proposal = self.get_proposal(&payout_hash)?;
-
-        // Build using CoinbaseBuilder
-        let builder = CoinbaseBuilder::new(height)
-            .with_pool_tag(self.config.coinbase_extra.as_bytes())
-            .with_extra_nonce_size(8);
-
-        // Combine all payout entries
-        let mut entries = Vec::new();
-        entries.extend(proposal.miner_payouts.iter().cloned());
-        entries.extend(proposal.node_payouts.iter().cloned());
-
-        // H-MINE-3: Add treasury output using address from proposal (snapshot), not live config
-        // H-BTC-4: No silent fallbacks - require explicit treasury address
-        if proposal.treasury_amount > 0 {
-            let treasury_addr = if !proposal.treasury_address.is_empty() {
-                // H-MINE-3: Use the snapshot address from the proposal
-                proposal.treasury_address.clone()
-            } else if !self.config.treasury_address.is_empty() {
-                // Fallback to config if proposal has no address (legacy proposals)
-                // This is allowed but logged as it shouldn't happen with new proposals
-                warn!("Using treasury address from config (proposal has no snapshot)");
-                self.config.treasury_address.address().as_bytes().to_vec()
-            } else {
-                // H-BTC-4: This is an ERROR, not a warning. Cannot create coinbase without treasury address.
-                error!(
-                    treasury_amount = proposal.treasury_amount,
-                    "H-BTC-4 SECURITY: Treasury amount specified ({} sats) but no treasury address. \
-                     This would create an unspendable output! Rejecting coinbase build.",
-                    proposal.treasury_amount
-                );
-                return None;
-            };
-
-            // H-BTC-4: Double-check address is not empty (defensive)
-            if treasury_addr.is_empty() {
-                error!("H-BTC-4 SECURITY: Treasury address resolved to empty. Rejecting coinbase build.");
-                return None;
-            }
-
-            entries.push(ghost_common::types::PayoutEntry {
-                address: treasury_addr,
-                amount: proposal.treasury_amount,
-                recipient_id: [0u8; 32],
-                payout_type: PayoutType::Treasury,
-            });
-        }
-
-        match builder.build_from_entries(&entries) {
-            Ok(mut tx) => {
-                // Add witness commitment output if present
-                if let Some(commitment) = witness_commitment {
-                    match hex::decode(commitment) {
-                        Ok(commitment_bytes) => {
-                            if validate_witness_commitment_script(&commitment_bytes) {
-                                tx.output.push(bitcoin::TxOut {
-                                    value: bitcoin::Amount::ZERO,
-                                    script_pubkey: bitcoin::ScriptBuf::from(commitment_bytes),
-                                });
-                            } else {
-                                error!(
-                                    commitment = %commitment,
-                                    "Invalid witness commitment script structure, skipping"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                commitment = %commitment,
-                                error = %e,
-                                "Failed to decode witness commitment hex, skipping"
-                            );
-                        }
-                    }
-                }
-
-                info!(
-                    height = height,
-                    outputs = tx.output.len(),
-                    miner_payouts = proposal.miner_payouts.len(),
-                    node_payouts = proposal.node_payouts.len(),
-                    "Built approved coinbase"
-                );
-
-                Some(tx)
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to build approved coinbase");
-                None
-            }
-        }
-    }
-
-    /// Build coinbase for stratum (split into coinbase1/coinbase2)
-    ///
-    /// IMPORTANT: coinbase1/coinbase2 use NON-WITNESS serialization so miners
-    /// compute the correct TXID (not WTXID) for the merkle root.
-    /// Witness data is returned separately for block assembly.
-    ///
-    /// When there's an approved payout, this includes all payout outputs.
-    /// Otherwise falls back to placeholder single output.
-    ///
-    /// H-MINE-2: This method reads from the live approved_payout lock.
-    /// For TOCTOU-safe operation, use build_coinbase_parts_with_payout_snapshot() instead.
-    ///
-    /// Returns: (coinbase1, coinbase2, witness_data, outputs_serialized, outputs_count)
-    #[allow(dead_code)]
-    fn build_coinbase_parts_with_payout(
-        &self,
-        height: u64,
-        total_value: u64,
-        witness_commitment: &Option<String>,
+        witness_commitment: &str,
     ) -> Result<CoinbaseBuildResult, TemplateError> {
-        // Check for approved payout - reads live lock (TOCTOU-vulnerable path)
-        let payout_hash = *self.approved_payout.read();
-        self.build_coinbase_parts_with_payout_snapshot(
-            height,
-            total_value,
-            witness_commitment,
-            payout_hash,
-        )
-    }
-
-    /// H-MINE-2: Build coinbase using a pre-captured payout snapshot
-    ///
-    /// This is the TOCTOU-safe version that uses a snapshot of the approved payout
-    /// hash captured at template creation time.
-    ///
-    /// IMPORTANT: coinbase1/coinbase2 use NON-WITNESS serialization so miners
-    /// compute the correct TXID (not WTXID) for the merkle root.
-    /// Witness data is returned separately for block assembly.
-    ///
-    /// When there's an approved payout, this includes all payout outputs.
-    /// Otherwise falls back to placeholder single output.
-    ///
-    /// CRIT-10: Returns an error if any address in the payout is invalid.
-    /// This prevents creating blocks with unspendable outputs.
-    ///
-    /// Returns: (coinbase1, coinbase2, witness_data, outputs_serialized, outputs_count)
-    #[allow(clippy::type_complexity)]
-    fn build_coinbase_parts_with_payout_snapshot(
-        &self,
-        height: u64,
-        total_value: u64,
-        witness_commitment: &Option<String>,
-        payout_snapshot: Option<[u8; 32]>,
-    ) -> Result<CoinbaseBuildResult, TemplateError> {
-        // H-MINE-2: Use the snapshot instead of reading from the lock
-        // MED-POOL-6: If we have a snapshot hash but can't find the proposal, this is an ERROR.
-        // Do NOT silently fall back to placeholder - that would lose all payout data.
-        let proposal = match payout_snapshot {
-            Some(hash) => {
-                let prop = self.get_proposal(&hash);
-                if prop.is_none() {
-                    // MED-POOL-6: Proposal was approved but data is missing - critical error
-                    error!(
-                        proposal_hash = %hex::encode(&hash[..8]),
-                        "MED-POOL-6: Approved payout proposal not found in cache! \
-                         Cannot build coinbase without payout data."
-                    );
-                    return Err(TemplateError::BlockAssemblyError(format!(
-                        "MED-POOL-6: Payout proposal {} not found. \
-                         Store proposal before setting approved hash.",
-                        hex::encode(&hash[..8])
-                    )));
-                }
-                prop
-            }
-            None => None, // No approved payout, use fallback
-        };
-
-        // Stale proposal detection: if the proposal's subsidy exceeds the current
-        // coinbase value, the proposal is from a different halving epoch (e.g. loaded
-        // from DB after restart at a different height). Clear it to break the deadlock
-        // where stale proposals prevent new blocks → prevent new proposals.
-        let proposal = proposal.and_then(|prop| {
-            if prop.subsidy > total_value {
-                error!(
-                    proposal_subsidy = prop.subsidy,
-                    total_value,
-                    proposal_height = prop.block_height,
-                    "Stale payout proposal: subsidy exceeds coinbase value — clearing approved payout"
-                );
-                self.clear_approved_payout();
-                return None;
-            }
-            // M-07: Reject proposals with stale block heights
-            let height_diff = prop.block_height.abs_diff(height);
-            if height_diff > 10 {
-                error!(
-                    proposal_height = prop.block_height,
-                    template_height = height,
-                    diff = height_diff,
-                    "M-07: Stale payout proposal: height mismatch exceeds 10 blocks — clearing"
-                );
-                self.clear_approved_payout();
-                return None;
-            }
-            Some(prop)
-        });
-
-        // Bidirectional fee adjustment: the BFT-approved proposal baked in tx_fees at
-        // creation time, but template filtering (Reaper/BUDS/mempool changes) and RBF can
-        // change available fees before the coinbase is built. Adjust the block finder's fee
-        // portion to match actual available fees — no BFT re-proposal needed.
-        //
-        // #601: this adjustment is PER NODE — every node's coinbase differs from the ratified
-        // proposal by its own fee drift. It used to be reconstructed a second time by tip-time
-        // settlement, and the two computations had to agree or every node would credit a
-        // treasury amount the chain never paid. Stage 6 Release B (#750) deleted that second
-        // caller: the shard settles at maturity against the mined outputs instead of
-        // re-deriving the split, so this is now the only place the adjustment is computed.
-        let proposal =
-            proposal.and_then(|prop| adjust_proposal_for_available_fees(prop, total_value, height));
-
-        // Build coinbase1 - NON-WITNESS format (no marker/flag)
-        // Format: version | input_count | prev_txhash | prev_outindex | scriptsig_len | scriptsig_data
+        // coinbase1: version | input count | prev tx | prev index | scriptSig length | scriptSig
         let mut coinbase1 = Vec::new();
-
-        // Version (4 bytes, little-endian)
         coinbase1.extend_from_slice(&2u32.to_le_bytes()); // Version 2 for BIP68
-
-        // NO marker/flag here - those are only for witness serialization (wtxid)
-        // Input count (for txid computation, this comes right after version)
         coinbase1.push(0x01);
-
-        // Previous tx hash (all zeros for coinbase)
         coinbase1.extend_from_slice(&[0u8; 32]);
-
-        // Previous output index (0xffffffff for coinbase)
         coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
-
-        // Script sig: height, the payout commitment, then the pool tag. See coinbase_scriptsig.
-        // No tier: this coinbase is built once per TEMPLATE and serves every difficulty; the
-        // tier-bound tag can only be stamped where the per-job tier is known (the SRI layer).
-        //
-        // #601: the tag names the payout THIS coinbase pays, so it is stamped only if the
-        // proposal survived resolution above (stale/M-07/fee-drift fallback all clear it).
-        // Stamping the snapshot regardless — as this used to — put a payout tag on a FALLBACK
-        // coinbase that pays nobody in the proposal, and a won block like that would be
-        // false-settled by every observing node: shares marked paid by a block that paid the
-        // pool fallback address only. (Today M-28/H-11 block such a submission, but the tag
-        // must not lie on-chain regardless of which safety net catches it first.)
-        let effective_snapshot = if proposal.is_some() {
-            payout_snapshot
-        } else {
-            None
-        };
-        let scriptsig = self.coinbase_scriptsig(height, effective_snapshot, 8, None)?;
+        // The GHPP slot holds zeros here; pool_sv2 replaces it per job with the parent anchor.
+        let scriptsig = self.coinbase_scriptsig(height, Some([0u8; 32]), 8, None)?;
         coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
         coinbase1.extend_from_slice(&scriptsig);
 
-        // Coinbase2: extranonce end + sequence + outputs + locktime
-        // NO witness data here - that's separate for block assembly
+        let commitment_bytes = hex::decode(witness_commitment).map_err(|e| {
+            TemplateError::BlockAssemblyError(format!("Invalid witness commitment hex: {}", e))
+        })?;
+        // BIP 141: OP_RETURN OP_PUSH(36) <0xaa21a9ed> <32-byte commitment>
+        if !validate_witness_commitment_script(&commitment_bytes) {
+            return Err(TemplateError::BlockAssemblyError(
+                "Invalid witness commitment script structure".to_string(),
+            ));
+        }
+        let mut output = Vec::with_capacity(9 + commitment_bytes.len());
+        output.extend_from_slice(&0u64.to_le_bytes());
+        output.push(commitment_bytes.len() as u8);
+        output.extend_from_slice(&commitment_bytes);
+
+        // coinbase2: sequence | output count | outputs | locktime
         let mut coinbase2 = Vec::new();
-
-        // Sequence
         coinbase2.extend_from_slice(&0xffffffffu32.to_le_bytes());
-
-        // Track witness commitment for WitnessData
-        let mut witness_data = WitnessData::default();
-
-        // Track serialized outputs for TDP (Bitcoin consensus format: Vec<TxOut>)
-        // This is sent to SRI Pool so it uses Ghost's coinbase outputs
-        let mut outputs_serialized = Vec::new();
-        let outputs_count: u32;
-
-        // Build outputs based on whether we have an approved payout
-        // Note: witness commitment output is NOT included in txid outputs
-        // It goes in the witness serialization only
-        if let Some(ref prop) = proposal {
-            // Build outputs from approved payout
-            // Count only non-zero value entries
-            let miner_output_count = prop.miner_payouts.iter().filter(|e| e.amount > 0).count();
-            let node_output_count = prop.node_payouts.iter().filter(|e| e.amount > 0).count();
-            let treasury_output_count = if prop.treasury_amount > 0 { 1 } else { 0 };
-            let base_output_count = miner_output_count + node_output_count + treasury_output_count;
-
-            // Add 1 for witness commitment if present (it IS part of outputs, just 0-value)
-            let output_count = base_output_count + if witness_commitment.is_some() { 1 } else { 0 };
-            outputs_count = output_count as u32;
-
-            self.encode_varint(&mut coinbase2, output_count);
-
-            // Miner payouts (skip 0-value entries)
-            // CRIT-10 / LOW-POOL-3: Validate each address and fail if any are invalid
-            // Error context includes miner recipient_id for debugging
-            for (idx, entry) in prop.miner_payouts.iter().enumerate() {
-                if entry.amount == 0 {
-                    continue;
-                }
-                // LOW-POOL-3: Include recipient_id in error context for debugging
-                let miner_id_short = hex::encode(&entry.recipient_id[..8]);
-                coinbase2.extend_from_slice(&entry.amount.to_le_bytes());
-                self.encode_script(
-                    &mut coinbase2,
-                    &entry.address,
-                    &format!("miner_payout[{}]:id={}", idx, miner_id_short),
-                )?;
-                // Also add to outputs_serialized for TDP
-                outputs_serialized.extend_from_slice(&entry.amount.to_le_bytes());
-                self.encode_script(
-                    &mut outputs_serialized,
-                    &entry.address,
-                    &format!("miner_payout_tdp[{}]:id={}", idx, miner_id_short),
-                )?;
-            }
-
-            // Node payouts (skip 0-value entries)
-            // CRIT-10 / LOW-POOL-3: Validate each address and fail if any are invalid
-            // Error context includes node recipient_id for debugging
-            for (idx, entry) in prop.node_payouts.iter().enumerate() {
-                if entry.amount == 0 {
-                    continue; // Skip 0-value outputs
-                }
-                // LOW-POOL-3: Include recipient_id in error context for debugging
-                let node_id_short = hex::encode(&entry.recipient_id[..8]);
-                coinbase2.extend_from_slice(&entry.amount.to_le_bytes());
-                self.encode_script(
-                    &mut coinbase2,
-                    &entry.address,
-                    &format!("node_payout[{}]:id={}", idx, node_id_short),
-                )?;
-                // Also add to outputs_serialized for TDP
-                outputs_serialized.extend_from_slice(&entry.amount.to_le_bytes());
-                self.encode_script(
-                    &mut outputs_serialized,
-                    &entry.address,
-                    &format!("node_payout_tdp[{}]:id={}", idx, node_id_short),
-                )?;
-            }
-
-            // Treasury
-            // H-MINE-3: Use treasury_address from proposal (snapshot) instead of live config
-            // CRIT-10: Treasury address is stored as script pubkey bytes (Vec<u8>),
-            // use encode_script() which handles raw bytes (same as miner/node payouts)
-            // H-BTC-4: No silent fallbacks - require valid treasury address
-            if prop.treasury_amount > 0 {
-                let treasury_script: &[u8] = if !prop.treasury_address.is_empty() {
-                    &prop.treasury_address
-                } else if !self.config.treasury_address.is_empty() {
-                    warn!("Using treasury address from config (proposal has no snapshot)");
-                    self.config.treasury_address.address().as_bytes()
-                } else {
-                    error!(
-                        treasury_amount = prop.treasury_amount,
-                        "H-BTC-4 SECURITY: Treasury amount specified ({} sats) but no treasury address available. \
-                         Proposal has no address AND config has no address. This would create an unspendable output!",
-                        prop.treasury_amount
-                    );
-                    return Err(TemplateError::ConfigError(format!(
-                        "H-BTC-4: Treasury amount {} sats specified but no valid treasury address. \
-                         Both proposal and config have empty treasury addresses.",
-                        prop.treasury_amount
-                    )));
-                };
-
-                // Now safe to add amount and encode script
-                coinbase2.extend_from_slice(&prop.treasury_amount.to_le_bytes());
-                self.encode_script(&mut coinbase2, treasury_script, "treasury")?;
-                outputs_serialized.extend_from_slice(&prop.treasury_amount.to_le_bytes());
-                self.encode_script(&mut outputs_serialized, treasury_script, "treasury_tdp")?;
-            }
-
-            info!(
-                height = height,
-                miners = prop.miner_payouts.len(),
-                nodes = prop.node_payouts.len(),
-                treasury = prop.treasury_amount,
-                "Built coinbase with approved payout outputs"
-            );
-        } else {
-            // Fallback: single output with total value (plus witness commitment if present)
-            // CRIT-10: Validate pool_payout_address and fail if invalid
-            // H-BTC-4: No silent fallbacks - require valid pool_payout_address
-            if self.config.pool_payout_address.is_empty() {
-                error!(
-                    total_value = total_value,
-                    "H-BTC-4 SECURITY: No approved payout proposal and pool_payout_address is empty. \
-                     Cannot create fallback coinbase output!"
-                );
-                return Err(TemplateError::ConfigError(
-                    "H-BTC-4: pool_payout_address is empty and no approved payout proposal available".to_string(),
-                ));
-            }
-
-            let output_count = if witness_commitment.is_some() { 2 } else { 1 };
-            outputs_count = output_count as u32;
-            coinbase2.push(output_count as u8);
-
-            // Single pool reward output
-            coinbase2.extend_from_slice(&total_value.to_le_bytes());
-            self.encode_address_script(
-                &mut coinbase2,
-                &self.config.pool_payout_address,
-                "pool_payout",
-            )?;
-            // Also add to outputs_serialized for TDP
-            outputs_serialized.extend_from_slice(&total_value.to_le_bytes());
-            self.encode_address_script(
-                &mut outputs_serialized,
-                &self.config.pool_payout_address,
-                "pool_payout_tdp",
-            )?;
-        }
-
-        // Witness commitment output (0-value OP_RETURN with commitment)
-        // This IS included in the txid serialization (it's a regular output)
-        if let Some(commitment) = witness_commitment {
-            let commitment_bytes = hex::decode(commitment).map_err(|e| {
-                TemplateError::BlockAssemblyError(format!("Invalid witness commitment hex: {}", e))
-            })?;
-
-            // Validate the commitment script structure
-            // BIP 141 witness commitment format: OP_RETURN OP_PUSH(36) <4-byte magic> <32-byte commitment>
-            if !validate_witness_commitment_script(&commitment_bytes) {
-                return Err(TemplateError::BlockAssemblyError(
-                    "Invalid witness commitment script structure".to_string(),
-                ));
-            }
-
-            coinbase2.extend_from_slice(&0u64.to_le_bytes()); // 0 value
-                                                              // L-10: Validate commitment length before casting to u8
-            if commitment_bytes.len() > 255 {
-                return Err(TemplateError::BlockAssemblyError(format!(
-                    "L-10: Witness commitment script too long: {} bytes (max 255)",
-                    commitment_bytes.len()
-                )));
-            }
-            coinbase2.push(commitment_bytes.len() as u8);
-            coinbase2.extend_from_slice(&commitment_bytes);
-            witness_data.commitment_script = Some(commitment_bytes.clone());
-
-            // Also add to outputs_serialized for TDP
-            outputs_serialized.extend_from_slice(&0u64.to_le_bytes());
-            outputs_serialized.push(commitment_bytes.len() as u8);
-            outputs_serialized.extend_from_slice(&commitment_bytes);
-        }
-
-        // Locktime (end of non-witness serialization)
+        coinbase2.push(0x01);
+        coinbase2.extend_from_slice(&output);
         coinbase2.extend_from_slice(&0u32.to_le_bytes());
 
-        // Witness data is stored separately - NOT appended to coinbase2
-        // This ensures hash(coinbase1 + extranonce + coinbase2) = TXID (not WTXID)
-        // The witness nonce is all zeros per BIP141 default
-        witness_data.nonce = [0u8; 32];
-
-        // Compute commitment from the ADJUSTED proposal (post fee adjustment).
-        // The global coinbase_verifier commitment is stale — it was set from the
-        // original BFT-approved proposal before bidirectional fee adjustment.
-        let adjusted_commitment = proposal.as_ref().map(|prop| {
-            let treasury_addr = if !prop.treasury_address.is_empty() {
-                prop.treasury_address.clone()
-            } else {
-                self.config.treasury_address.address().as_bytes().to_vec()
-            };
-            CoinbaseCommitment::from_proposal(prop, &treasury_addr)
-        });
-
-        Ok((
-            coinbase1,
-            coinbase2,
-            witness_data,
-            outputs_serialized,
-            outputs_count,
-            adjusted_commitment,
-        ))
-    }
-
-    /// Encode a varint
-    fn encode_varint(&self, buf: &mut Vec<u8>, value: usize) {
-        if value < 0xfd {
-            buf.push(value as u8);
-        } else if value <= 0xffff {
-            buf.push(0xfd);
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
-        } else {
-            buf.push(0xfe);
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-    }
-
-    /// Encode a script (address bytes with length prefix)
-    ///
-    /// CRIT-10: Returns an error if the address cannot be parsed.
-    /// Never creates placeholder/all-zeros outputs that would be unspendable.
-    fn encode_script(
-        &self,
-        buf: &mut Vec<u8>,
-        address: &[u8],
-        context: &str,
-    ) -> Result<(), TemplateError> {
-        // Try to parse as address string and get script pubkey
-        if let Ok(addr_str) = std::str::from_utf8(address) {
-            if let Ok(addr) =
-                addr_str.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
-            {
-                let script = addr.assume_checked().script_pubkey();
-                let script_bytes = script.as_bytes();
-                self.encode_varint(buf, script_bytes.len());
-                buf.extend_from_slice(script_bytes);
-                return Ok(());
-            }
-        }
-
-        // CRIT-10: Check if this is already a valid raw script (for backwards compatibility)
-        if is_valid_script_bytes(address) {
-            self.encode_varint(buf, address.len());
-            buf.extend_from_slice(address);
-            return Ok(());
-        }
-
-        // CRIT-10: NEVER create placeholder outputs - return an error instead
-        let addr_display = std::str::from_utf8(address)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| format!("0x{}", hex::encode(address)));
-
-        Err(TemplateError::InvalidAddress {
-            address: addr_display,
-            context: context.to_string(),
-            reason: "failed to parse as Bitcoin address or valid script".to_string(),
-        })
-    }
-
-    /// Parse a bech32 address to script pubkey bytes
-    ///
-    /// Returns the raw script pubkey bytes for the given address.
-    /// Returns an error if the address is empty or invalid.
-    fn address_to_script(&self, address: &str, context: &str) -> Result<Vec<u8>, TemplateError> {
-        if address.is_empty() {
-            return Err(TemplateError::InvalidAddress {
-                address: address.to_string(),
-                context: context.to_string(),
-                reason: "address is empty".to_string(),
-            });
-        }
-
-        address
-            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
-            .map(|addr| addr.assume_checked().script_pubkey().into_bytes())
-            .map_err(|e| TemplateError::InvalidAddress {
-                address: address.to_string(),
-                context: context.to_string(),
-                reason: format!("failed to parse: {}", e),
-            })
-    }
-
-    /// Encode a script pubkey directly to the buffer
-    ///
-    /// CRIT-10: Returns an error if the address is invalid.
-    /// NEVER creates placeholder/all-zeros outputs that would be unspendable.
-    /// L-11: Validates script length before casting to u8.
-    fn encode_address_script(
-        &self,
-        buf: &mut Vec<u8>,
-        address: &str,
-        context: &str,
-    ) -> Result<(), TemplateError> {
-        let script_bytes = self.address_to_script(address, context)?;
-        // L-11: Validate script length before casting to u8
-        if script_bytes.len() > 255 {
-            return Err(TemplateError::BlockAssemblyError(format!(
-                "L-11: Script too long for coinbase: {} bytes (max 255) in {}",
-                script_bytes.len(),
-                context
-            )));
-        }
-        buf.push(script_bytes.len() as u8);
-        buf.extend_from_slice(&script_bytes);
-        Ok(())
+        let witness_data = WitnessData {
+            commitment_script: Some(commitment_bytes),
+            nonce: [0u8; 32],
+        };
+        Ok((coinbase1, coinbase2, witness_data, output, 1))
     }
 
     /// Subscribe to template events
@@ -2195,11 +597,10 @@ impl TemplateProcessor {
             }
         }
 
-        // Node pool (dark until activation): leave room for the largest coinbase.
+        // Leave room for the largest coinbase the node pool builds on this template.
         let mut filtered_txs = filtered_txs;
         crate::block_limits::make_room_for_coinbase(
             template.height,
-            ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
             &template,
             self.config.target_weight,
             &self.coinbase_output_reserve,
@@ -2209,16 +610,6 @@ impl TemplateProcessor {
         // Calculate total fees and weight
         let total_fees: u64 = filtered_txs.iter().map(|tx| tx.fee).sum();
         let total_weight: u64 = filtered_txs.iter().map(|tx| tx.weight).sum();
-
-        // #601: remember the last REAL fee observation. Only a filled template is one — the empty
-        // fast-path template says nothing about the mempool, and it is exactly the template the
-        // tip-change payout proposal is armed against. A genuinely empty mempool still updates
-        // this on the next full refresh (filtered_txs empty, fees 0), so the estimate tracks
-        // reality rather than sticking at an ancient value.
-        if !empty {
-            self.last_filled_fees
-                .store(total_fees, std::sync::atomic::Ordering::Relaxed);
-        }
 
         // Generate new job ID
         let job_id = {
@@ -2230,55 +621,33 @@ impl TemplateProcessor {
         // Build merkle tree
         let merkle_branches = self.build_merkle_branches(&filtered_txs);
 
-        // H-MINE-2: Capture payout snapshot ATOMICALLY at template creation time
-        // This prevents TOCTOU race conditions where the approved payout could change
-        // between template creation and coinbase building
-        let payout_snapshot = *self.approved_payout.read();
-
-        // Build coinbase transaction parts (uses approved payout if available)
-        // Returns NON-WITNESS serialization for TXID computation + separate witness data
-        // Also returns serialized outputs for TDP to send to SRI Pool
-        //
-        // Derive subsidy from Bitcoin Core's authoritative coinbasevalue.
-        // coinbasevalue = subsidy + all_template_fees (before filtering).
-        // We need subsidy + filtered_fees for the coinbase we're building.
+        // coinbasevalue = subsidy + all_template_fees (before filtering); the coinbase built on
+        // this template may spend subsidy + the fees of the transactions actually kept.
         let all_template_fees: u64 = template.transactions.iter().map(|tx| tx.fee).sum();
         let subsidy = template.coinbasevalue.saturating_sub(all_template_fees);
-        let coinbase_value = subsidy + total_fees;
 
-        // Always recompute witness commitment from filtered transactions (BIP141).
-        // Bitcoin Core's default_witness_commitment assumes the original transaction
-        // order from getblocktemplate, but filter_transactions() reorders by fee rate
-        // (sort_by_package_fee_rate), making the original commitment invalid.
-        // Must always include commitment — signet requires it for block signatures
-        // even when there are no non-coinbase transactions.
-        let witness_commitment = Some(self.compute_witness_commitment(&filtered_txs));
+        // Always recompute the witness commitment from the filtered transactions (BIP141):
+        // filter_transactions() reorders by fee rate, so Bitcoin Core's
+        // default_witness_commitment no longer matches. Always included: signet requires it even
+        // with no other transactions, and the node pool's canonical layout ends with it.
+        let witness_commitment = self.compute_witness_commitment(&filtered_txs);
 
-        // H-MINE-2: Pass snapshot to coinbase builder to use consistent payout data
-        // CRIT-10: This will fail if any payout address is invalid, preventing bad blocks
         let (
             coinbase1,
             coinbase2,
             witness_data,
             coinbase_outputs_serialized,
             coinbase_outputs_count,
-            adjusted_commitment,
         ) = self
-            .build_coinbase_parts_with_payout_snapshot(
-                template.height,
-                coinbase_value,
-                &witness_commitment,
-                payout_snapshot,
-            )
+            .build_coinbase_parts(template.height, &witness_commitment)
             .map_err(|e| {
-                error!(error = %e, "CRIT-10: Invalid address in payout - refusing to create block template");
-                anyhow::anyhow!("Address validation failed: {}", e)
+                error!(error = %e, "Refusing to create block template");
+                anyhow::anyhow!("Coinbase build failed: {}", e)
             })?;
 
-        // Block limits: warns below node pool activation, refuses the job at and above it.
+        // Block limits: a job whose block would not fit is refused.
         crate::block_limits::check_built_coinbase(
             template.height,
-            ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
             &template,
             self.config.target_weight,
             &self.coinbase_output_reserve,
@@ -2319,9 +688,6 @@ impl TemplateProcessor {
             template: filtered_template,
             coinbase_outputs_serialized,
             coinbase_outputs_count,
-            payout_snapshot, // H-MINE-2: Store snapshot for consistent coinbase reconstruction
-            commitment_snapshot: adjusted_commitment
-                .or_else(|| self.coinbase_verifier.get_commitment()), // Use fee-adjusted commitment, fall back to global
         };
 
         *self.current_work.write() = Some(work);
@@ -2952,105 +1318,6 @@ impl TemplateProcessor {
         hex::encode(script)
     }
 
-    /// Build coinbase transaction parts
-    ///
-    /// Legacy method kept for Stratum V1 compatibility.
-    /// Uses NON-WITNESS serialization for TXID computation.
-    ///
-    /// CRIT-10: Returns an error if pool_payout_address is invalid.
-    #[allow(dead_code)]
-    fn build_coinbase_parts(
-        &self,
-        height: u64,
-        value: u64,
-        witness_commitment: &Option<String>,
-    ) -> Result<(Vec<u8>, Vec<u8>, WitnessData), TemplateError> {
-        // Coinbase1: version + input count + prev tx + prev index + script length + height push
-        // NON-WITNESS format (no marker/flag) for correct TXID computation
-        let mut coinbase1 = Vec::new();
-
-        // Version (4 bytes, little-endian)
-        coinbase1.extend_from_slice(&2u32.to_le_bytes()); // Version 2 for BIP68
-
-        // NO marker/flag - those are only for witness serialization
-        // Input count
-        coinbase1.push(0x01);
-
-        // Previous tx hash (all zeros for coinbase)
-        coinbase1.extend_from_slice(&[0u8; 32]);
-
-        // Previous output index (0xffffffff for coinbase)
-        coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
-
-        // Script sig: height then the pool tag. No payout commitment — this path builds no
-        // settleable payout. See coinbase_scriptsig.
-        // No tier for the same reason as the primary builder: template-level, difficulty-blind.
-        let scriptsig = self.coinbase_scriptsig(height, None, 8, None)?;
-        coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
-        coinbase1.extend_from_slice(&scriptsig);
-
-        // Coinbase2: extranonce end + sequence + outputs + locktime
-        // NO witness data - that's tracked separately
-        let mut coinbase2 = Vec::new();
-
-        // Sequence
-        coinbase2.extend_from_slice(&0xffffffffu32.to_le_bytes());
-
-        // Output count (will be 1 or 2 depending on witness commitment)
-        let output_count = if witness_commitment.is_some() { 2 } else { 1 };
-        coinbase2.push(output_count);
-
-        // Main output (pool reward)
-        // H-BTC-4: Validate address BEFORE adding value to buffer
-        if self.config.pool_payout_address.is_empty() {
-            error!(
-                value = value,
-                "H-BTC-4 SECURITY: pool_payout_address is empty in legacy coinbase build. \
-                 Cannot create coinbase output!"
-            );
-            return Err(TemplateError::ConfigError(
-                "H-BTC-4: pool_payout_address is empty".to_string(),
-            ));
-        }
-
-        coinbase2.extend_from_slice(&value.to_le_bytes());
-
-        // Pool payout script
-        // CRIT-10: Validate and fail if invalid
-        self.encode_address_script(
-            &mut coinbase2,
-            &self.config.pool_payout_address,
-            "pool_payout_legacy",
-        )?;
-
-        // Witness commitment output (if present) - this IS part of txid serialization
-        let mut witness_data = WitnessData::default();
-        if let Some(commitment) = witness_commitment {
-            let commitment_bytes = hex::decode(commitment).map_err(|e| {
-                TemplateError::BlockAssemblyError(format!("Invalid witness commitment hex: {}", e))
-            })?;
-
-            if !validate_witness_commitment_script(&commitment_bytes) {
-                return Err(TemplateError::BlockAssemblyError(
-                    "Invalid witness commitment script structure".to_string(),
-                ));
-            }
-
-            coinbase2.extend_from_slice(&0u64.to_le_bytes()); // 0 value
-            coinbase2.push(commitment_bytes.len() as u8);
-            coinbase2.extend_from_slice(&commitment_bytes);
-            witness_data.commitment_script = Some(commitment_bytes);
-        }
-
-        // Locktime (end of non-witness serialization)
-        coinbase2.extend_from_slice(&0u32.to_le_bytes());
-
-        // Witness data stored separately - NOT in coinbase2
-        witness_data.nonce = [0u8; 32];
-
-        Ok((coinbase1, coinbase2, witness_data))
-    }
-
     /// Assemble the coinbase scriptSig content, excluding the extranonce the miner fills in.
     ///
     /// One implementation because there were three, byte-identical, in three coinbase builders.
@@ -3298,65 +1565,23 @@ impl TemplateProcessor {
         })
     }
 
-    /// Categorised breakdown of the coinbase for the block currently being
-    /// built, derived from the approved payout proposal: the miner pool, the
-    /// node reward pool, the treasury allocation, and the tx fees routed to the
-    /// block finder, plus the per-recipient entries behind the two pools.
-    ///
-    /// Returns `None` until a payout has been agreed for the current round —
-    /// early in a round no proposal is approved yet and the coinbase is
-    /// subsidy-only. Addresses are included raw (as their human-readable string,
-    /// which is how `PayoutEntry::address` is stored); the API handler redacts
-    /// them for non-operator callers.
+    /// What the block currently being built splits, for the dashboard: the subsidy, the
+    /// treasury's base `S/200`, the miners' pool `Rm`, and the fees, which all go to the finder.
+    /// Which miners a block pays depends on the job's slot class and is decided per job in
+    /// pool_sv2 (`ghost_common::canonical_payout`); the change that `Rm` cannot pay goes to the
+    /// treasury on top of its base.
     pub fn current_coinbase_breakdown(&self) -> Option<serde_json::Value> {
-        let hash = (*self.approved_payout.read())?;
-        let proposals = self.payout_proposals.read();
-        let proposal = proposals.get(&hash)?;
-
-        let miner_pool_sat: u64 = proposal.miner_payouts.iter().map(|e| e.amount).sum();
-        let node_reward_pool_sat: u64 = proposal.node_payouts.iter().map(|e| e.amount).sum();
-        let treasury_sat = proposal.treasury_amount;
-        let tx_fees_to_finder_sat = proposal.tx_fees;
-        let total_coinbase_sat = miner_pool_sat
-            .saturating_add(node_reward_pool_sat)
-            .saturating_add(treasury_sat)
-            .saturating_add(tx_fees_to_finder_sat);
-
-        let miners: Vec<serde_json::Value> = proposal
-            .miner_payouts
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "address": String::from_utf8_lossy(&e.address),
-                    "amount_sat": e.amount,
-                })
-            })
-            .collect();
-        let nodes: Vec<serde_json::Value> = proposal
-            .node_payouts
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "node_id": hex::encode(&e.recipient_id[..4]),
-                    "address": String::from_utf8_lossy(&e.address),
-                    "amount_sat": e.amount,
-                })
-            })
-            .collect();
-
+        let w = self.current_work.read();
+        let w = w.as_ref()?;
+        let h = u32::try_from(w.height).ok()?;
+        let (treasury_base_sat, miner_pool_sat) = ghost_common::canonical_payout::split(h);
         Some(serde_json::json!({
-            "height": proposal.block_height,
-            "round_id": proposal.round_id,
-            "subsidy_sat": proposal.subsidy,
-            "tx_fees_to_finder_sat": tx_fees_to_finder_sat,
-            "treasury_sat": treasury_sat,
+            "height": w.height,
+            "subsidy_sat": w.subsidy,
+            "treasury_base_sat": treasury_base_sat,
             "miner_pool_sat": miner_pool_sat,
-            "node_reward_pool_sat": node_reward_pool_sat,
-            "total_coinbase_sat": total_coinbase_sat,
-            "miner_count": proposal.miner_payouts.len(),
-            "node_count": proposal.node_payouts.len(),
-            "miners": miners,
-            "nodes": nodes,
+            "tx_fees_to_finder_sat": w.total_fees,
+            "total_coinbase_sat": w.subsidy.saturating_add(w.total_fees),
         }))
     }
 
@@ -3392,38 +1617,6 @@ impl TemplateProcessor {
             Some(w) => (w.subsidy, w.total_fees, w.height),
             None => (0, 0, 0),
         }
-    }
-
-    /// TX fees to record in a payout proposal armed at a tip change (#601).
-    ///
-    /// Returns `(fees, estimated)`. The tip-change proposal fires off the EMPTY fast-path
-    /// template (`publish_empty_template` on the new-block ZMQ event), whose `total_fees` is
-    /// structurally 0 — measured on vm5: 197 of 243 ratified proposals carried
-    /// `original_fees=0` while a live mid-block template held 4.6M sats. With `tx_fees=0` the
-    /// 1% levy is computed on the subsidy alone and the ENTIRE real fee lands on the treasury
-    /// as post-gate drift, instead of 99% of it reaching the miners.
-    ///
-    /// So: the current template's fees when it has any, otherwise the most recent FILLED
-    /// observation — normally the last template of the previous height, seconds old at the tip
-    /// change, which is the closest available estimate of what this block will actually collect.
-    ///
-    /// Determinism: the value is read ONCE by the proposer and recorded in the proposal, which
-    /// is what the mesh ratifies and every validator recomputes the split from — validators
-    /// never re-read fees at verification time (they only sanity-bound them, MED-POOL-2). The
-    /// gap between this estimate and the fees actually available when a coinbase is built is
-    /// absorbed deterministically by `adjust_proposal_for_available_fees`, exactly as it is
-    /// today — only the size of that drift changes, from "all of the fees" to the mempool
-    /// movement within one block interval.
-    pub fn payout_fee_estimate(&self) -> (u64, bool) {
-        let current = {
-            let work = self.current_work.read();
-            work.as_ref().map(|w| w.total_fees)
-        };
-        resolve_payout_fees(
-            current,
-            self.last_filled_fees
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
     }
 
     /// Submit a solved block
@@ -3668,28 +1861,8 @@ impl TemplateProcessor {
             return Err(anyhow::anyhow!("Invalid block version: {}", version));
         }
 
-        // M-28: Verify coinbase matches the payout commitment that was active when
-        // this template was created. Uses the per-template snapshot instead of the
-        // global CoinbaseVerifier, which may have been overwritten by a newer payout.
-        match &work.commitment_snapshot {
-            Some(commitment) => {
-                let outputs = CoinbaseOutput::parse_from_coinbase(coinbase_witness)
-                    .map_err(|e| anyhow::anyhow!("M-28: Failed to parse coinbase outputs: {e}"))?;
-                if let Err(e) = commitment.verify(&outputs) {
-                    error!(error = %e, "COINBASE VERIFICATION FAILED - block submission blocked");
-                    return Err(anyhow::anyhow!(
-                        "M-28: Coinbase verification failed - block submission blocked. \
-                         Coinbase outputs do not match the BFT-approved payout proposal: {e}"
-                    ));
-                }
-            }
-            None => {
-                // H-11: Require coinbase commitment for block submission
-                return Err(anyhow::anyhow!(
-                    "H-11: Cannot submit block without verified coinbase commitment"
-                ));
-            }
-        }
+        // The coinbase's outputs were checked against the job's canonical outputs by pool_sv2
+        // before it sent the solution (`NodePool::check_block`).
 
         // Assemble the full block using the ORIGINAL witness coinbase from SRI
         let mut block_data = Vec::new();
@@ -3860,52 +2033,6 @@ fn validate_witness_commitment_script(script: &[u8]) -> bool {
     true
 }
 
-/// CRIT-10: Check if bytes represent a valid Bitcoin script
-///
-/// This is used to validate raw script bytes that may come from payout entries.
-/// We accept standard script types that have known valid formats.
-/// HIGH-10: Uses bounds-checked access patterns for all script validation
-fn is_valid_script_bytes(script: &[u8]) -> bool {
-    if script.is_empty() {
-        return false;
-    }
-
-    // CRIT-10: Reject all-zeros scripts - these are unspendable
-    if script.iter().all(|&b| b == 0) {
-        return false;
-    }
-
-    // Helper to safely get a byte at an index
-    let get = |idx: usize| script.get(idx).copied();
-
-    match script.len() {
-        // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG (25 bytes)
-        25 => {
-            get(0) == Some(0x76)
-                && get(1) == Some(0xa9)
-                && get(2) == Some(0x14)
-                && get(23) == Some(0x88)
-                && get(24) == Some(0xac)
-        }
-
-        // P2SH: OP_HASH160 <20 bytes> OP_EQUAL (23 bytes)
-        23 => get(0) == Some(0xa9) && get(1) == Some(0x14) && get(22) == Some(0x87),
-
-        // P2WPKH: OP_0 <20 bytes> (22 bytes)
-        22 => get(0) == Some(0x00) && get(1) == Some(0x14),
-
-        // P2WSH or P2TR: 34 bytes
-        34 => {
-            // P2WSH: OP_0 <32 bytes>
-            // P2TR: OP_1 <32 bytes>
-            (get(0) == Some(0x00) && get(1) == Some(0x20))
-                || (get(0) == Some(0x51) && get(1) == Some(0x20))
-        }
-
-        _ => false,
-    }
-}
-
 /// Enforce the finer per-field policy knobs against a candidate transaction.
 ///
 /// Mirrors the field checks in `ghost_policy::PolicyEngine::evaluate`, minus the
@@ -4011,128 +2138,12 @@ struct FilterStats {
 
 #[cfg(test)]
 mod tests {
+    /// A witness commitment output script with a zero commitment.
+    const WITNESS: &str =
+        "6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000";
     use super::*;
 
     // ── Stage 6 step 3: paying from this node's own shard view ──────────────────────────────
-
-    fn stage6_processor() -> TemplateProcessor {
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        TemplateProcessor::new(
-            TemplateConfig::default(),
-            rpc,
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        )
-    }
-
-    fn stage6_proposal() -> PayoutProposal {
-        use ghost_common::types::PayoutEntry;
-        PayoutProposal {
-            proposal_hash: [7u8; 32],
-            round_id: 4242,
-            block_hash: [2u8; 32],
-            block_height: 963_500,
-            proposer: [3u8; 32],
-            miner_payouts: vec![
-                PayoutEntry {
-                    address: b"bc1qminer1".to_vec(),
-                    amount: 100_000_000,
-                    recipient_id: [10u8; 32],
-                    payout_type: PayoutType::Mining,
-                },
-                PayoutEntry {
-                    address: b"bc1qminer2".to_vec(),
-                    amount: 50_000_000,
-                    recipient_id: [11u8; 32],
-                    payout_type: PayoutType::Mining,
-                },
-            ],
-            node_payouts: vec![PayoutEntry {
-                address: b"bc1qnode1".to_vec(),
-                amount: 25_000_000,
-                recipient_id: [20u8; 32],
-                payout_type: PayoutType::NodeReward,
-            }],
-            treasury_amount: 12_500_000,
-            treasury_address: b"bc1qtreasury".to_vec(),
-            tx_fees: 1_000_000,
-            subsidy: 312_500_000,
-            timestamp: 1_700_000_000,
-            tx_fees_unallocated: 0,
-        }
-    }
-
-    /// **The test this change rests on.** Removing the vote must change the ROUTE a payout takes,
-    /// never the AMOUNT it pays. Both paths are driven with the same proposal and the resulting
-    /// M-28 commitments are compared field by field — a divergence here would mean the fleet
-    /// commits to different coinbase outputs either side of the gate, which is the one outcome
-    /// that cannot be allowed to reach a block.
-    #[test]
-    fn local_commitment_is_byte_identical_to_the_voted_one() {
-        let proposal = stage6_proposal();
-
-        let voted = stage6_processor();
-        voted.store_proposal(proposal.clone());
-        voted.set_approved_payout(proposal.proposal_hash);
-        let voted_commitment = voted
-            .coinbase_verifier
-            .get_commitment()
-            .expect("voted path must set a commitment");
-
-        let local = stage6_processor();
-        local.set_local_payout(proposal.clone());
-        let local_commitment = local
-            .coinbase_verifier
-            .get_commitment()
-            .expect("local path must set a commitment");
-
-        assert_eq!(
-            local_commitment.output_hash, voted_commitment.output_hash,
-            "output hash differs — the two paths would commit to different coinbase outputs"
-        );
-        assert_eq!(local_commitment.total_value, voted_commitment.total_value);
-        assert_eq!(local_commitment.output_count, voted_commitment.output_count);
-        assert_eq!(local_commitment.round_id, voted_commitment.round_id);
-        assert_eq!(local_commitment.block_height, voted_commitment.block_height);
-        assert_eq!(
-            local_commitment.proposal_hash, voted_commitment.proposal_hash,
-            "commitment must be bound to the same proposal"
-        );
-    }
-
-    /// The coinbase builder resolves `approved_payout` back through `get_proposal`, so publishing
-    /// the handle before the data would let a template refresh land on a hash whose proposal is
-    /// not in the cache — the MED-POOL-6 failure, reached by a different route.
-    #[test]
-    fn set_local_payout_caches_the_proposal_it_publishes() {
-        let proposal = stage6_proposal();
-        let processor = stage6_processor();
-
-        processor.set_local_payout(proposal.clone());
-
-        let approved = *processor.approved_payout.read();
-        assert_eq!(approved, Some(proposal.proposal_hash));
-        assert!(
-            processor.get_proposal(&proposal.proposal_hash).is_some(),
-            "the proposal the approved handle names must be retrievable"
-        );
-    }
-
-    /// `set_approved_payout` refuses a hash it has no data for. `set_local_payout` takes the
-    /// proposal by value and therefore cannot be in that position — this pins the distinction so
-    /// nobody "tidies" the two into one signature and reintroduces the lookup.
-    #[test]
-    fn the_voted_path_still_refuses_a_hash_it_has_no_data_for() {
-        let processor = stage6_processor();
-
-        processor.set_approved_payout([99u8; 32]);
-
-        assert!(
-            processor.approved_payout.read().is_none(),
-            "a hash with no cached proposal must not become the approved payout"
-        );
-        assert!(processor.coinbase_verifier.get_commitment().is_none());
-    }
 
     #[test]
     fn test_height_encoding() {
@@ -4250,13 +2261,12 @@ mod tests {
             ReaperConfig::default(),
         );
 
-        let (coinbase1, coinbase2, _witness_data) = processor
-            .build_coinbase_parts(
-                800_000,
-                312_500_000, // 3.125 BTC
-                &None,
-            )
-            .expect("Valid address should not fail");
+        let (coinbase1, coinbase2, _witness_data, outputs, count) = processor
+            .build_coinbase_parts(800_000, WITNESS)
+            .expect("a template coinbase builds");
+        assert_eq!(count, 1, "the witness commitment is the only output");
+        assert_eq!(&outputs[..8], &[0u8; 8]);
+        assert!(coinbase2.ends_with(&[&outputs[..], &[0u8; 4]].concat()));
 
         // coinbase1 should start with version (4 bytes), then input_count (NOT marker/flag)
         // Version 2 = 0x02000000 in little-endian
@@ -4267,92 +2277,6 @@ mod tests {
         // coinbase2 should end with locktime (4 bytes), NOT witness data
         let len = coinbase2.len();
         assert_eq!(&coinbase2[len - 4..], &[0x00, 0x00, 0x00, 0x00]); // locktime = 0
-    }
-
-    /// #592: a solo node has no mesh, cannot reach `min_voters_for_bft`, and so approves its own
-    /// payout proposal locally instead of submitting it to BFT.
-    ///
-    /// This pins the property that made deleting `build_coinbase_solo_mode` safe: the ordinary
-    /// proposal-driven coinbase path serves a solo proposal with no solo-specific branch, and
-    /// produces the M-28 coinbase commitment. The deleted builder returned `None` for that
-    /// commitment — which is exactly why `submitblock` refused solo blocks.
-    #[test]
-    fn solo_proposal_builds_a_coinbase_through_the_shared_path() {
-        use ghost_common::types::PayoutEntry;
-
-        const SOLO_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address: SOLO_ADDR.to_string(),
-                mining_mode: MiningMode::PrivateSolo,
-                solo_payout_address: Some(SOLO_ADDR.to_string()),
-                ..Default::default()
-            },
-            rpc,
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        // Shaped exactly as `create_solo_proposal` builds one: a single Mining entry to the solo
-        // address, plus the 1% split into treasury and node pool.
-        let subsidy: u64 = 312_500_000;
-        let fees: u64 = 1_500_000;
-        let pool_fee = (subsidy + fees) / 100;
-        let solo_amount = (subsidy + fees) - pool_fee;
-        let treasury_amount = pool_fee / 2;
-        let node_amount = pool_fee - treasury_amount;
-
-        let proposal_hash = [0x5Au8; 32];
-        let proposal = PayoutProposal {
-            proposal_hash,
-            round_id: 1,
-            block_hash: [0xAB; 32],
-            block_height: 800_000,
-            proposer: [0x11; 32],
-            miner_payouts: vec![PayoutEntry {
-                address: SOLO_ADDR.as_bytes().to_vec(),
-                amount: solo_amount,
-                recipient_id: [0x22; 32],
-                payout_type: PayoutType::Mining,
-            }],
-            node_payouts: vec![PayoutEntry {
-                address: SOLO_ADDR.as_bytes().to_vec(),
-                amount: node_amount,
-                recipient_id: [0x33; 32],
-                payout_type: PayoutType::NodeReward,
-            }],
-            treasury_amount,
-            treasury_address: SOLO_ADDR.as_bytes().to_vec(),
-            tx_fees: fees,
-            subsidy,
-            timestamp: 0,
-            tx_fees_unallocated: 0,
-        };
-
-        // The solo path stores then approves locally — no vote handler involved.
-        processor.store_proposal(proposal);
-        processor.set_approved_payout(proposal_hash);
-
-        let (_c1, _c2, _witness, _outputs, outputs_count, commitment) = processor
-            .build_coinbase_parts_with_payout_snapshot(
-                800_000,
-                subsidy + fees,
-                &None,
-                Some(proposal_hash),
-            )
-            .expect("solo proposal must build a coinbase through the shared path");
-
-        assert!(
-            commitment.is_some(),
-            "solo must produce the M-28 coinbase commitment that submitblock requires — \
-             the deleted solo builder returned None here"
-        );
-        assert!(
-            outputs_count >= 2,
-            "expected at least the solo miner and treasury outputs, got {outputs_count}"
-        );
     }
 
     /// SEC-BLOCK-TEST-1: Test that header validation correctly rejects short headers
@@ -4422,92 +2346,6 @@ mod tests {
         );
     }
 
-    /// CRIT-10-TEST-1: Test that invalid addresses cause block production to fail
-    ///
-    /// This tests the fix for unvalidated address parsing creating unspendable outputs.
-    /// An invalid address must cause an error, NOT create a placeholder all-zeros output.
-    #[test]
-    fn test_invalid_address_fails_coinbase_building() {
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-
-        // Test with empty pool_payout_address
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address: "".to_string(), // Empty - invalid
-                ..Default::default()
-            },
-            rpc.clone(),
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        let result = processor.build_coinbase_parts(800_000, 312_500_000, &None);
-        assert!(
-            result.is_err(),
-            "Empty address should cause coinbase building to fail"
-        );
-
-        // Test with gibberish address
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address: "not-a-valid-address".to_string(),
-                ..Default::default()
-            },
-            rpc.clone(),
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        let result = processor.build_coinbase_parts(800_000, 312_500_000, &None);
-        assert!(
-            result.is_err(),
-            "Invalid address should cause coinbase building to fail"
-        );
-    }
-
-    /// CRIT-10-TEST-2: Test that valid addresses work correctly
-    #[test]
-    fn test_valid_addresses_succeed() {
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-
-        // Test with valid mainnet P2WPKH address
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                ..Default::default()
-            },
-            rpc.clone(),
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        let result = processor.build_coinbase_parts(800_000, 312_500_000, &None);
-        assert!(
-            result.is_ok(),
-            "Valid P2WPKH address should succeed: {:?}",
-            result.err()
-        );
-
-        // Test with valid mainnet P2WSH address
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address:
-                    "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3".to_string(),
-                ..Default::default()
-            },
-            rpc.clone(),
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        let result = processor.build_coinbase_parts(800_000, 312_500_000, &None);
-        assert!(
-            result.is_ok(),
-            "Valid P2WSH address should succeed: {:?}",
-            result.err()
-        );
-    }
-
     /// CRIT-10-TEST-3: Test config validation catches invalid addresses at startup
     #[test]
     fn test_config_validation() {
@@ -4566,44 +2404,6 @@ mod tests {
         assert!(
             config.validate().is_ok(),
             "Valid solo config should pass validation"
-        );
-    }
-
-    /// CRIT-10-TEST-4: Test that is_valid_script_bytes rejects all-zeros
-    #[test]
-    fn test_is_valid_script_bytes_rejects_zeros() {
-        // All zeros should be rejected (unspendable)
-        assert!(
-            !is_valid_script_bytes(&[0u8; 22]),
-            "All-zeros P2WPKH-sized script should be rejected"
-        );
-        assert!(
-            !is_valid_script_bytes(&[0u8; 34]),
-            "All-zeros P2WSH-sized script should be rejected"
-        );
-
-        // Valid P2WPKH script (OP_0 <20 bytes hash>)
-        let mut valid_p2wpkh = vec![0x00, 0x14]; // OP_0, PUSH20
-        valid_p2wpkh.extend_from_slice(&[0xab; 20]); // non-zero hash
-        assert!(
-            is_valid_script_bytes(&valid_p2wpkh),
-            "Valid P2WPKH script should be accepted"
-        );
-
-        // Valid P2WSH script (OP_0 <32 bytes hash>)
-        let mut valid_p2wsh = vec![0x00, 0x20]; // OP_0, PUSH32
-        valid_p2wsh.extend_from_slice(&[0xcd; 32]); // non-zero hash
-        assert!(
-            is_valid_script_bytes(&valid_p2wsh),
-            "Valid P2WSH script should be accepted"
-        );
-
-        // Valid P2TR script (OP_1 <32 bytes>)
-        let mut valid_p2tr = vec![0x51, 0x20]; // OP_1, PUSH32
-        valid_p2tr.extend_from_slice(&[0xef; 32]); // non-zero key
-        assert!(
-            is_valid_script_bytes(&valid_p2tr),
-            "Valid P2TR script should be accepted"
         );
     }
 
@@ -4892,52 +2692,6 @@ mod tests {
             sigops: 0,
             weight,
         }
-    }
-
-    /// #601: the tip-change payout proposal must never bake in the empty fast-path template's
-    /// structural zero when a real fee observation exists.
-    #[test]
-    fn payout_fees_carry_the_last_filled_observation_across_the_tip_change() {
-        // The tip-change shape: the current template is the EMPTY fast-path one (fees 0), the
-        // last FILLED template of the previous height saw a real mempool.
-        assert_eq!(
-            resolve_payout_fees(Some(0), 4_605_029),
-            (4_605_029, true),
-            "an empty tip-change template must fall back to the last filled observation"
-        );
-        // Mid-block, filled template: use its own fees, no estimation.
-        assert_eq!(
-            resolve_payout_fees(Some(1_605_164), 4_605_029),
-            (1_605_164, false)
-        );
-        // No template at all (restart window): the observation is all there is.
-        assert_eq!(resolve_payout_fees(None, 1_000), (1_000, true));
-        // Fresh process, nothing observed yet: zero, exactly as before this change.
-        assert_eq!(resolve_payout_fees(None, 0), (0, true));
-        // A genuinely empty mempool zeroes the observation on the next full refresh, so the
-        // estimate follows reality rather than sticking at an ancient value.
-        assert_eq!(resolve_payout_fees(Some(0), 0), (0, true));
-    }
-
-    /// The processor-level wiring of the rule above: a fresh processor estimates zero, and the
-    /// estimate becomes the recorded observation once one exists.
-    #[test]
-    fn payout_fee_estimate_reads_the_recorded_observation() {
-        let processor = test_processor();
-        assert_eq!(
-            processor.payout_fee_estimate(),
-            (0, true),
-            "nothing observed yet — same value the old code sampled, now labelled an estimate"
-        );
-
-        processor
-            .last_filled_fees
-            .store(4_605_029, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            processor.payout_fee_estimate(),
-            (4_605_029, true),
-            "with no current work the last filled observation is the estimate"
-        );
     }
 
     /// Helper to create a TemplateProcessor for sorting tests
@@ -5545,14 +3299,14 @@ mod tests {
         // A realistic tag builds fine.
         assert!(
             make("GHOST PublicPool")
-                .build_coinbase_parts(800_000, 312_500_000, &None)
+                .build_coinbase_parts(800_000, WITNESS)
                 .is_ok(),
             "the shipped tag must build"
         );
 
         // One that would breach the consensus limit must be refused at build time, not mined.
         let err = make(&"A".repeat(200))
-            .build_coinbase_parts(800_000, 312_500_000, &None)
+            .build_coinbase_parts(800_000, WITNESS)
             .expect_err("a 212-byte scriptSig must be refused");
         assert!(
             format!("{err}").contains("consensus limit"),
@@ -6678,671 +4432,11 @@ mod tests {
     // CoinbaseBuilder output ordering and P2TR rejection tests
     // =========================================================================
 
-    /// Test that CoinbaseBuilder preserves output ordering from input entries.
-    /// Output order: miners -> nodes -> treasury (matching input order).
-    #[test]
-    fn test_coinbase_output_ordering_from_entries() {
-        use ghost_common::types::{PayoutEntry, PayoutType};
-
-        let builder = CoinbaseBuilder::new(850_000);
-
-        // 2 miners, 1 node, 1 treasury — order should be preserved in output
-        let entries = vec![
-            PayoutEntry {
-                address: b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec(),
-                amount: 50_000,
-                recipient_id: [1u8; 32],
-                payout_type: PayoutType::Mining,
-            },
-            PayoutEntry {
-                address: b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec(),
-                amount: 30_000,
-                recipient_id: [2u8; 32],
-                payout_type: PayoutType::Mining,
-            },
-            PayoutEntry {
-                address: b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec(),
-                amount: 100_000,
-                recipient_id: [3u8; 32],
-                payout_type: PayoutType::NodeReward,
-            },
-            PayoutEntry {
-                address: b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec(),
-                amount: 20_000,
-                recipient_id: [4u8; 32],
-                payout_type: PayoutType::Treasury,
-            },
-        ];
-
-        let tx = builder
-            .build_from_entries(&entries)
-            .expect("Valid P2WPKH entries should build successfully");
-
-        // Verify output count matches entry count
-        assert_eq!(
-            tx.output.len(),
-            4,
-            "Should have exactly 4 outputs (2 miners + 1 node + 1 treasury)"
-        );
-
-        // Verify output values match input order
-        assert_eq!(tx.output[0].value.to_sat(), 50_000, "First miner output");
-        assert_eq!(tx.output[1].value.to_sat(), 30_000, "Second miner output");
-        assert_eq!(tx.output[2].value.to_sat(), 100_000, "Node reward output");
-        assert_eq!(tx.output[3].value.to_sat(), 20_000, "Treasury output");
-
-        // Verify all outputs have the same script (same address)
-        for (i, output) in tx.output.iter().enumerate() {
-            assert!(
-                !output.script_pubkey.is_empty(),
-                "Output {} should have a non-empty script pubkey",
-                i
-            );
-        }
-    }
-
-    /// Test that P2WSH treasury address produces correct 34-byte script_pubkey
-    #[test]
-    fn test_treasury_p2wsh_multisig_encoding() {
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        let p2wsh_address = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                ..Default::default()
-            },
-            rpc,
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        let script = processor
-            .address_to_script(p2wsh_address, "treasury_test")
-            .unwrap();
-
-        // P2WSH script: OP_0 (0x00) + PUSH32 (0x20) + 32-byte hash = 34 bytes
-        assert_eq!(script.len(), 34, "P2WSH script should be 34 bytes");
-        assert_eq!(script[0], 0x00, "P2WSH starts with OP_0");
-        assert_eq!(script[1], 0x20, "P2WSH has 32-byte push");
-    }
-
-    /// Test coinbase weight calculation with many outputs doesn't overflow
-    #[test]
-    fn test_coinbase_weight_calculation() {
-        use ghost_common::types::{PayoutEntry, PayoutType};
-
-        let builder = CoinbaseBuilder::new(850_000);
-
-        // Build coinbase with 200 outputs
-        let entries: Vec<PayoutEntry> = (0..200)
-            .map(|i| PayoutEntry {
-                address: b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec(),
-                amount: 1000 + i as u64,
-                recipient_id: {
-                    let mut id = [0u8; 32];
-                    id[0] = (i & 0xFF) as u8;
-                    id[1] = ((i >> 8) & 0xFF) as u8;
-                    id
-                },
-                payout_type: PayoutType::Mining,
-            })
-            .collect();
-
-        let tx = builder
-            .build_from_entries(&entries)
-            .expect("200-output coinbase should build");
-
-        assert_eq!(tx.output.len(), 200);
-
-        // Compute weight: (non-witness * 4) + witness
-        let non_witness_size = bitcoin::consensus::encode::serialize(&tx).len();
-        // Weight should be well under 4M units (just outputs + 1 coinbase input)
-        let weight = tx.weight().to_wu();
-        assert!(
-            weight < 4_000_000,
-            "Coinbase weight {} should be under 4M WU",
-            weight
-        );
-        assert!(non_witness_size > 0, "Serialized size should be positive");
-    }
-
-    /// Test that treasury amount > 0 but empty address returns error
-    #[test]
-    fn test_treasury_amount_without_address_errors() {
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                mining_mode: MiningMode::PrivateSolo,
-                solo_payout_address: Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string()),
-                // treasury_address defaults to empty
-                ..Default::default()
-            },
-            rpc,
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
-        );
-
-        // Build solo coinbase where treasury portion > 0 but address is empty
-        // The build_solo_coinbase_parts method takes a PayoutProposal
-        // For this test, we directly call address_to_script with empty string
-        let result = processor.address_to_script("", "treasury");
-        assert!(
-            result.is_err(),
-            "Empty treasury address should cause error, not silent fallback"
-        );
-        assert!(
-            result.unwrap_err().to_string().contains("address is empty"),
-            "Error should indicate empty address"
-        );
-    }
-
-    /// Test that CoinbaseBuilder rejects P2TR (bc1p...) addresses with QuantumUnsafe error.
-    #[test]
-    fn test_coinbase_rejects_p2tr_address() {
-        use ghost_common::types::{PayoutEntry, PayoutType};
-
-        let builder = CoinbaseBuilder::new(850_000);
-
-        // Use a valid-format P2TR address (bc1p...)
-        let entries = vec![PayoutEntry {
-            address: b"bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0".to_vec(),
-            amount: 100_000,
-            recipient_id: [1u8; 32],
-            payout_type: PayoutType::Mining,
-        }];
-
-        let result = builder.build_from_entries(&entries);
-        assert!(
-            result.is_err(),
-            "P2TR address should be rejected for quantum safety"
-        );
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("quantum") || err_msg.contains("Quantum"),
-            "Error should mention quantum vulnerability, got: {}",
-            err_msg
-        );
-    }
-
     // ---- #601: the shared fee-drift adjustment, and the tag on a fallback coinbase ----
-
-    const ADJ_MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADJ_TREASURY: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
-
-    fn adj_proposal(
-        subsidy: u64,
-        tx_fees: u64,
-        treasury: u64,
-    ) -> ghost_common::types::PayoutProposal {
-        ghost_common::types::PayoutProposal {
-            proposal_hash: [0x61; 32],
-            round_id: 1,
-            block_hash: [0u8; 32],
-            block_height: 960_000, // post COINBASE_FEE_SPLIT_HEIGHT
-            proposer: [1u8; 32],
-            miner_payouts: vec![ghost_common::types::PayoutEntry {
-                address: ADJ_MINER.as_bytes().to_vec(),
-                amount: 300_000_000,
-                recipient_id: [2u8; 32],
-                payout_type: ghost_common::types::PayoutType::Mining,
-            }],
-            node_payouts: vec![ghost_common::types::PayoutEntry {
-                address: ADJ_MINER.as_bytes().to_vec(),
-                amount: 12_000_000,
-                recipient_id: [3u8; 32],
-                payout_type: ghost_common::types::PayoutType::NodeReward,
-            }],
-            treasury_amount: treasury,
-            treasury_address: ADJ_TREASURY.as_bytes().to_vec(),
-            tx_fees,
-            subsidy,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            tx_fees_unallocated: 0,
-        }
-    }
-
-    /// Sum of every output the adjusted proposal would emit — must equal `total_value` exactly
-    /// for the coinbase to balance.
-    fn adj_total(prop: &ghost_common::types::PayoutProposal) -> u64 {
-        prop.miner_payouts.iter().map(|e| e.amount).sum::<u64>()
-            + prop.node_payouts.iter().map(|e| e.amount).sum::<u64>()
-            + prop.treasury_amount
-    }
-
-    /// Post-gate surplus UNDER the drift cap lands on the treasury; the miner and node splits are
-    /// untouched. This is the function settlement re-applies to reconstruct a winner's coinbase
-    /// (#601), so its determinism is a money property, not a style one.
-    #[test]
-    fn post_gate_surplus_lands_on_the_treasury_and_touches_nothing_else() {
-        let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
-        let total_value = 312_500_000 + 800_000;
-        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
-            .expect("surplus must be absorbable");
-        assert_eq!(adjusted.treasury_amount, 1_300_000);
-        assert_eq!(
-            adjusted.miner_payouts[0].amount, 300_000_000,
-            "miners untouched"
-        );
-        assert_eq!(
-            adjusted.node_payouts[0].amount, 12_000_000,
-            "nodes untouched"
-        );
-        assert_eq!(adjusted.tx_fees, 800_000);
-        assert_eq!(
-            adj_total(&adjusted),
-            total_value,
-            "outputs must balance exactly to subsidy + available fees"
-        );
-    }
-
-    /// #601 drift cap: the treasury's take is bounded by its own ratified allocation (it can at
-    /// most double); the overflow above the cap is shared into the node pool, and the outputs
-    /// still balance exactly.
-    #[test]
-    fn a_surplus_above_the_cap_overflows_into_the_node_pool() {
-        // Ratified: treasury 1_000_000, one node entry 12_000_000. Extra = 1_700_000: the cap
-        // admits 1_000_000 (treasury doubles), the remaining 700_000 belongs to the node pool.
-        let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
-        let total_value = 312_500_000 + 2_200_000;
-        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
-            .expect("surplus must be absorbable");
-        assert_eq!(adjusted.treasury_amount, 2_000_000, "capped at 2x ratified");
-        assert_eq!(
-            adjusted.node_payouts[0].amount, 12_700_000,
-            "overflow lands on the node pool"
-        );
-        assert_eq!(
-            adjusted.miner_payouts[0].amount, 300_000_000,
-            "miners untouched"
-        );
-        assert_eq!(
-            adj_total(&adjusted),
-            total_value,
-            "outputs must balance exactly at and beyond the cap"
-        );
-    }
-
-    /// Exactly AT the cap boundary the treasury takes the whole surplus, the node pool is
-    /// untouched, and the sum still balances exactly.
-    #[test]
-    fn at_the_cap_boundary_the_sum_still_balances_exactly() {
-        let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
-        let total_value = 312_500_000 + 1_500_000; // extra == ratified treasury == the cap
-        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
-            .expect("surplus must be absorbable");
-        assert_eq!(adjusted.treasury_amount, 2_000_000);
-        assert_eq!(
-            adjusted.node_payouts[0].amount, 12_000_000,
-            "nothing overflows at the boundary"
-        );
-        assert_eq!(adj_total(&adjusted), total_value);
-    }
-
-    /// Once the decay schedule has driven the ratified treasury to ZERO it cannot be relied on:
-    /// the cap is zero, so the WHOLE surplus is shared into the node pool and no treasury output
-    /// is resurrected.
-    #[test]
-    fn a_decayed_zero_treasury_sends_the_whole_surplus_to_the_node_pool() {
-        // Balanced ratified split with no treasury: 300M miner + 12M node == 311.5M + 500k fees.
-        let prop = adj_proposal(311_500_000, 500_000, 0);
-        let total_value = 311_500_000 + 1_300_000;
-        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
-            .expect("surplus must be absorbable");
-        assert_eq!(
-            adjusted.treasury_amount, 0,
-            "a decayed treasury must not be resurrected by drift"
-        );
-        assert_eq!(
-            adjusted.node_payouts[0].amount, 12_800_000,
-            "the node pool takes every surplus satoshi"
-        );
-        assert_eq!(adj_total(&adjusted), total_value);
-    }
-
-    /// Overflow above the cap is shared pro rata to the RATIFIED node amounts — deterministic
-    /// order (amount descending, address ascending) with the integer-division remainder on the
-    /// top entry, so every node builds a byte-identical coinbase from the same checkpoint.
-    #[test]
-    fn overflow_is_shared_pro_rata_with_the_remainder_on_the_top_entry() {
-        let mk = |addr: &str, amount: u64, id: u8| ghost_common::types::PayoutEntry {
-            address: addr.as_bytes().to_vec(),
-            amount,
-            recipient_id: [id; 32],
-            payout_type: ghost_common::types::PayoutType::NodeReward,
-        };
-        let mut prop = adj_proposal(312_500_000, 500_000, 1_000_000);
-        // 300M miner + (6M + 3M + 3M) nodes + 1M treasury == 312.5M subsidy + 500k fees.
-        prop.node_payouts = vec![
-            mk("bc1q-node-c", 3_000_000, 5),
-            mk("bc1q-node-a", 6_000_000, 3),
-            mk("bc1q-node-b", 3_000_000, 4),
-        ];
-
-        // Extra = 2_000_003: the cap admits 1_000_000, overflow = 1_000_003.
-        // Pro rata on 12M: a (6M) +500_001, b (3M) +250_000, c (3M) +250_000; the remainder of 2
-        // goes to the top entry (a).
-        let total_value = 312_500_000 + 2_500_003;
-        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
-            .expect("surplus must be absorbable");
-
-        assert_eq!(adjusted.treasury_amount, 2_000_000);
-        let by_addr: Vec<(&str, u64)> = adjusted
-            .node_payouts
-            .iter()
-            .map(|e| (std::str::from_utf8(&e.address).unwrap(), e.amount))
-            .collect();
-        assert_eq!(
-            by_addr,
-            vec![
-                ("bc1q-node-a", 6_500_003),
-                ("bc1q-node-b", 3_250_000),
-                ("bc1q-node-c", 3_250_000),
-            ],
-            "pro-rata shares, remainder on the top entry, ties broken by address"
-        );
-        assert_eq!(adj_total(&adjusted), total_value);
-    }
 
     // ---- fee drift shared with the miners (FEE_DRIFT_MINER_SHARE_HEIGHT) ----
     //
     // These call `share_fee_drift_pro_rata` directly. The gate is a process-wide `OnceLock`, so a
     // test cannot arm it without arming it for every other test in the binary — and the dormancy
     // test below depends on it staying at `u64::MAX`.
-
-    /// Two miners in 3:1, so a pro-rata claim is falsifiable rather than "the only entry got it".
-    fn drift_proposal(
-        subsidy: u64,
-        tx_fees: u64,
-        treasury: u64,
-    ) -> ghost_common::types::PayoutProposal {
-        let mut prop = adj_proposal(subsidy, tx_fees, treasury);
-        prop.miner_payouts = vec![
-            ghost_common::types::PayoutEntry {
-                address: b"bc1qminer_big".to_vec(),
-                amount: 225_000_000,
-                recipient_id: [8u8; 32],
-                payout_type: ghost_common::types::PayoutType::Mining,
-            },
-            ghost_common::types::PayoutEntry {
-                address: b"bc1qminer_small".to_vec(),
-                amount: 75_000_000,
-                recipient_id: [9u8; 32],
-                payout_type: ghost_common::types::PayoutType::Mining,
-            },
-        ];
-        prop
-    }
-
-    fn miner_by(prop: &ghost_common::types::PayoutProposal, addr: &[u8]) -> u64 {
-        prop.miner_payouts
-            .iter()
-            .find(|e| e.address == addr)
-            .map(|e| e.amount)
-            .unwrap_or(0)
-    }
-
-    /// THE REGRESSION. vm1's real numbers, 2026-08-26: it recorded an estimate of 25,030 sats
-    /// against ~2.8M actually available, and the legacy path handed the miners NONE of the
-    /// difference — 2,806,260 sats of drift went to the treasury and node pool while the miner
-    /// entries stayed exactly as ratified. Post-gate the miners take 99% of it.
-    #[test]
-    fn the_vm1_lottery_no_longer_decides_what_the_miners_are_paid() {
-        let subsidy = 312_500_000;
-        let prop = drift_proposal(subsidy, 25_030, 525_030);
-        let ratified_miner_total: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum();
-
-        // What the LEGACY path does with the same drift: miners untouched.
-        let legacy = adjust_proposal_for_available_fees(prop.clone(), subsidy + 2_806_260, 964_176)
-            .expect("legacy must absorb it");
-        assert_eq!(
-            legacy.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
-            ratified_miner_total,
-            "legacy path leaves the miners on the estimate — this is the defect"
-        );
-
-        let shared =
-            share_fee_drift_pro_rata(prop, 2_806_260, 964_176).expect("shared path must absorb it");
-        let delta = 2_806_260 - 25_030;
-        let pool_fee_delta = delta / 100;
-        let miner_delta = delta - pool_fee_delta;
-        assert_eq!(
-            shared.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
-            ratified_miner_total + miner_delta,
-            "miners must receive 99% of the drift"
-        );
-        assert_eq!(
-            adj_total(&shared),
-            subsidy + 2_806_260,
-            "the coinbase must still spend exactly subsidy + available fees"
-        );
-    }
-
-    /// The 99% is split BETWEEN miners in their ratified proportions, not handed to the largest.
-    #[test]
-    fn a_shared_surplus_is_pro_rata_between_miners() {
-        let subsidy = 312_500_000;
-        let prop = drift_proposal(subsidy, 500_000, 1_000_000);
-        let shared = share_fee_drift_pro_rata(prop, 1_500_000, 960_000).expect("absorbable");
-
-        let delta = 1_000_000u64;
-        let miner_delta = delta - delta / 100;
-        // Ratified 225M : 75M is 3:1, so the split of `miner_delta` is too.
-        assert_eq!(
-            miner_by(&shared, b"bc1qminer_big"),
-            225_000_000 + miner_delta * 3 / 4
-        );
-        assert_eq!(
-            miner_by(&shared, b"bc1qminer_small"),
-            75_000_000 + miner_delta / 4
-        );
-        assert_eq!(adj_total(&shared), subsidy + 1_500_000);
-    }
-
-    /// A shortfall comes out of the miners too — the correction has to be symmetric, or the
-    /// estimate still decides the outcome whenever it guessed high.
-    #[test]
-    fn a_shared_shortfall_reduces_every_bucket_and_conserves() {
-        let subsidy = 312_500_000;
-        let prop = drift_proposal(subsidy, 2_000_000, 2_500_000);
-        let shared = share_fee_drift_pro_rata(prop, 500_000, 960_000).expect("absorbable");
-
-        assert!(
-            shared.miner_payouts.iter().map(|e| e.amount).sum::<u64>() < 300_000_000,
-            "miners must absorb their share of a shortfall"
-        );
-        assert!(
-            shared.treasury_amount < 2_500_000,
-            "treasury takes its share"
-        );
-        assert_eq!(
-            adj_total(&shared),
-            subsidy + 500_000,
-            "conservation holds in the shortfall direction too"
-        );
-    }
-
-    /// Determinism is a money property here: settlement re-runs this function against the mined
-    /// block and must reconstruct the winner's outputs exactly. Entry order must not matter.
-    #[test]
-    fn shared_drift_is_independent_of_the_input_entry_order() {
-        let subsidy = 312_500_000;
-        let forward = share_fee_drift_pro_rata(
-            drift_proposal(subsidy, 500_000, 1_000_000),
-            1_500_000,
-            960_000,
-        )
-        .expect("absorbable");
-
-        let mut reversed_in = drift_proposal(subsidy, 500_000, 1_000_000);
-        reversed_in.miner_payouts.reverse();
-        let reversed =
-            share_fee_drift_pro_rata(reversed_in, 1_500_000, 960_000).expect("absorbable");
-
-        assert_eq!(
-            miner_by(&forward, b"bc1qminer_big"),
-            miner_by(&reversed, b"bc1qminer_big")
-        );
-        assert_eq!(
-            miner_by(&forward, b"bc1qminer_small"),
-            miner_by(&reversed, b"bc1qminer_small")
-        );
-        assert_eq!(forward.treasury_amount, reversed.treasury_amount);
-    }
-
-    /// Drift larger than the entire ratified payout cannot be absorbed by anything: fall back
-    /// rather than emit a coinbase that does not balance.
-    #[test]
-    fn a_shared_shortfall_bigger_than_the_whole_payout_falls_back() {
-        let prop = drift_proposal(312_500_000, 320_000_000, 1_000_000);
-        assert!(
-            share_fee_drift_pro_rata(prop, 0, 960_000).is_none(),
-            "a shortfall exceeding every bucket must fall back"
-        );
-    }
-
-    /// The gate is ARMED at 964_805, and the switch happens at exactly that height.
-    ///
-    /// ⚠ This replaces `the_miner_share_gate_ships_dormant`, which asserted the constant was
-    /// `u64::MAX` and then "checked" a live height by passing 964_176 as the `height`
-    /// ARGUMENT. The gate reads `prop.block_height`, which `adj_proposal` pins at 960_000 —
-    /// so that half of the test never exercised the gate at all and would have passed
-    /// whatever the constant said. Both sides are driven here by setting `block_height`.
-    #[test]
-    fn the_miner_share_gate_switches_at_its_armed_height() {
-        assert_eq!(crate::FEE_DRIFT_MINER_SHARE_HEIGHT, 964_805);
-        assert_eq!(crate::fee_drift_miner_share_height(), 964_805);
-
-        let subsidy = 312_500_000;
-        let available = subsidy + 2_806_260;
-
-        // One block BELOW the gate: the legacy path, miners exactly where it leaves them.
-        let mut below = drift_proposal(subsidy, 25_030, 525_030);
-        below.block_height = 964_804;
-        let ratified: u64 = below.miner_payouts.iter().map(|e| e.amount).sum();
-        let adjusted =
-            adjust_proposal_for_available_fees(below, available, 964_804).expect("absorbable");
-        assert_eq!(
-            adjusted.miner_payouts.iter().map(|e| e.amount).sum::<u64>(),
-            ratified,
-            "one block below the gate the miners must stay on the legacy path"
-        );
-
-        // AT the gate: the drift is shared, so the miners must come out strictly ahead.
-        let mut at = drift_proposal(subsidy, 25_030, 525_030);
-        at.block_height = 964_805;
-        let ratified_at: u64 = at.miner_payouts.iter().map(|e| e.amount).sum();
-        let shared =
-            adjust_proposal_for_available_fees(at, available, 964_805).expect("absorbable");
-        let after: u64 = shared.miner_payouts.iter().map(|e| e.amount).sum();
-        assert!(
-            after > ratified_at,
-            "at the gate the miners must share the drift — got {after}, ratified {ratified_at}"
-        );
-    }
-
-    /// A surplus beyond the cap with NO node pool to absorb it cannot be placed: fail closed
-    /// (fallback coinbase) rather than breach the cap or build an unbalanced coinbase.
-    #[test]
-    fn a_capped_surplus_with_no_node_pool_fails_closed() {
-        let mut prop = adj_proposal(312_500_000, 500_000, 1_000_000);
-        prop.node_payouts.clear();
-        assert!(
-            adjust_proposal_for_available_fees(prop, 312_500_000 + 2_500_000, 960_000).is_none(),
-            "2M of drift against a 1M cap with no node pool must fall back"
-        );
-    }
-
-    /// Post-gate shortfall drains the treasury first, then the node pool largest-first; miners
-    /// are never reduced.
-    #[test]
-    fn post_gate_shortfall_drains_treasury_then_nodes_never_miners() {
-        // Winner saw zero fees against ratified 2_000_000: treasury 1_000_000 empties, the node
-        // entry covers the remaining 1_000_000.
-        let prop = adj_proposal(312_500_000, 2_000_000, 1_000_000);
-        let adjusted =
-            adjust_proposal_for_available_fees(prop, 312_500_000, 960_000).expect("absorbable");
-        assert_eq!(adjusted.treasury_amount, 0);
-        assert_eq!(adjusted.node_payouts[0].amount, 11_000_000);
-        assert_eq!(
-            adjusted.miner_payouts[0].amount, 300_000_000,
-            "miners untouched"
-        );
-    }
-
-    /// A shortfall beyond treasury + node pool cannot balance: the caller must fall back.
-    #[test]
-    fn an_unabsorbable_shortfall_returns_none() {
-        let prop = adj_proposal(312_500_000, 20_000_000, 1_000_000);
-        assert!(
-            adjust_proposal_for_available_fees(prop, 312_500_000, 960_000).is_none(),
-            "13M of drift cannot come out of 1M treasury + 12M nodes and the miner split"
-        );
-    }
-
-    /// **The tag must not lie on-chain.** When the proposal cannot be used — here a stale one
-    /// whose subsidy exceeds the coinbase value — the builder falls back to the single-output
-    /// coinbase, and the scriptSig must NOT name the payout: a tagged fallback block would be
-    /// false-settled by every observing node (#601), marking shares paid by a block that paid
-    /// only the pool fallback address.
-    #[test]
-    fn a_fallback_coinbase_carries_no_payout_tag() {
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc"));
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                coinbase_extra: "GHOST PublicPool".to_string(),
-                pool_payout_address: ADJ_MINER.to_string(),
-                ..Default::default()
-            },
-            rpc,
-            ghost_policy::PolicyProfile::permissive(),
-            Default::default(),
-        );
-
-        let scriptsig_of = |coinbase1: &[u8]| -> Vec<u8> {
-            // version(4) + input_count(1) + prevhash(32) + previndex(4) + len(1) = 42
-            coinbase1[42..].to_vec()
-        };
-
-        // Control: a usable proposal stamps the tag.
-        let healthy = adj_proposal(312_500_000, 0, 0);
-        let healthy_hash = healthy.proposal_hash;
-        processor.store_proposal(healthy);
-        let (coinbase1, ..) = processor
-            .build_coinbase_parts_with_payout_snapshot(
-                960_000,
-                312_500_000,
-                &None,
-                Some(healthy_hash),
-            )
-            .expect("build with a healthy proposal");
-        let tag = ghost_common::coinbase_tags::extract_payout_tag(&scriptsig_of(&coinbase1));
-        assert_eq!(
-            tag.as_ref().map(|t| &t[..]),
-            Some(&healthy_hash[..16]),
-            "a coinbase that pays the proposal must name it"
-        );
-
-        // Stale: subsidy exceeds the coinbase value, the proposal is cleared, the outputs are
-        // the fallback — and the tag must be absent.
-        let mut stale = adj_proposal(5_000_000_000, 0, 0);
-        stale.proposal_hash = [0x62; 32];
-        stale.miner_payouts[0].amount = 100_000_000;
-        let stale_hash = stale.proposal_hash;
-        processor.store_proposal(stale);
-        let (coinbase1, ..) = processor
-            .build_coinbase_parts_with_payout_snapshot(
-                960_000,
-                312_500_000,
-                &None,
-                Some(stale_hash),
-            )
-            .expect("fallback build must still succeed");
-        assert_eq!(
-            ghost_common::coinbase_tags::extract_payout_tag(&scriptsig_of(&coinbase1)),
-            None,
-            "a FALLBACK coinbase pays nobody in the proposal and must not carry its name"
-        );
-    }
 }

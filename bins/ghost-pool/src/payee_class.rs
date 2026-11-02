@@ -7,8 +7,7 @@
 //!
 //! The class itself is `ghost_common::share_commit::payee_script_class`, the same function a
 //! peer runs when it checks a share. This module turns an address into its script and applies
-//! the class rule from `NODE_POOL_ACTIVATION_HEIGHT`; below it every address the live pool
-//! accepts is still accepted.
+//! the class rule.
 
 use ghost_common::share_commit::{payee_script_class, PayeeScriptClass};
 use std::str::FromStr;
@@ -39,17 +38,8 @@ pub fn node_pool_payee_script(
     Ok((script, class))
 }
 
-/// Whether a miner's payout address may be recorded at `height`. Below `activation` this always
-/// accepts, so the live pool is unchanged; from it, only the four node pool classes pass.
-pub fn accept_payout_address(
-    height: u64,
-    activation: u64,
-    address: &str,
-    network: bitcoin::Network,
-) -> Result<(), PayeeRefusal> {
-    if height < activation {
-        return Ok(());
-    }
+/// Whether a miner's payout address may be recorded: only the four node pool classes pass.
+pub fn accept_payout_address(address: &str, network: bitcoin::Network) -> Result<(), PayeeRefusal> {
     node_pool_payee_script(address, network).map(|_| ())
 }
 
@@ -111,16 +101,15 @@ mod tests {
     }
 
     #[test]
-    fn gated_at_activation() {
-        assert_eq!(accept_payout_address(99, 100, P2PKH, Bitcoin), Ok(()));
-        assert_eq!(accept_payout_address(99, 100, "junk", Bitcoin), Ok(()));
+    fn only_the_four_classes_are_recorded() {
         assert_eq!(
-            accept_payout_address(100, 100, P2PKH, Bitcoin),
+            accept_payout_address(P2PKH, Bitcoin),
             Err(PayeeRefusal::Class)
         );
-        assert_eq!(accept_payout_address(100, 100, P2TR, Bitcoin), Ok(()));
-        // As shipped, the gate is out of reach.
-        let dark = ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT;
-        assert_eq!(accept_payout_address(974_500, dark, P2PKH, Bitcoin), Ok(()));
+        assert_eq!(
+            accept_payout_address("junk", Bitcoin),
+            Err(PayeeRefusal::Unparseable)
+        );
+        assert_eq!(accept_payout_address(P2TR, Bitcoin), Ok(()));
     }
 }

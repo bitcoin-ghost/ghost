@@ -9,9 +9,9 @@
 //!   Used by the submit paths. LIVE: it can only refuse a block ghostd would reject anyway.
 //! - [`assess`](crate::block_limits::assess) / [`trim_to_fit`](crate::block_limits::trim_to_fit) / [`check_built_coinbase`](crate::block_limits::check_built_coinbase): the template-time checks, against
 //!   the template's own limits, the operator's `target_weight` and what the SV2 pool said it adds
-//!   to the coinbase (`CoinbaseOutputConstraints`). Below `NODE_POOL_ACTIVATION_HEIGHT` they only
-//!   warn; at and above it a template is trimmed to leave room for the largest coinbase, and a
-//!   job that still does not fit, or whose coinbase is above `MAX_COINBASE_BYTES`, is refused.
+//!   to the coinbase (`CoinbaseOutputConstraints`). Every template is trimmed to leave room for
+//!   the largest coinbase the node pool builds, and a job that still does not fit, or whose
+//!   coinbase is above `MAX_COINBASE_BYTES`, is refused.
 
 use ghost_common::node_pool_constants::MAX_COINBASE_BYTES;
 use ghost_common::rpc::{BlockTemplate, TemplateTransaction};
@@ -278,19 +278,15 @@ pub fn trim_to_fit(
     removed
 }
 
-/// At and above activation, trim `txs` so the largest coinbase the node pool can build still
-/// fits. Below it, does nothing. Returns how many transactions were dropped.
+/// Trim `txs` so the largest coinbase the node pool can build still fits. Returns how many
+/// transactions were dropped.
 pub fn make_room_for_coinbase(
     height: u64,
-    activation: u64,
     template: &BlockTemplate,
     target_weight: u64,
     reserve: &CoinbaseOutputReserve,
     txs: &mut Vec<TemplateTransaction>,
 ) -> usize {
-    if height < activation {
-        return 0;
-    }
     let limits = BlockLimits::for_template(template, target_weight);
     let removed = trim_to_fit(limits, CoinbaseFootprint::ceiling(reserve), txs);
     if removed > 0 {
@@ -305,13 +301,11 @@ pub fn make_room_for_coinbase(
     removed
 }
 
-/// Check a built coinbase against the template's limits and the coinbase ceiling. Below
-/// `activation` a breach is logged and the job goes out as before; at and above it the job is
-/// refused.
+/// Check a built coinbase against the template's limits and the coinbase ceiling; a job that
+/// breaches them is refused.
 #[allow(clippy::too_many_arguments)]
 pub fn check_built_coinbase(
     height: u64,
-    activation: u64,
     template: &BlockTemplate,
     target_weight: u64,
     reserve: &CoinbaseOutputReserve,
@@ -339,10 +333,6 @@ pub fn check_built_coinbase(
     let Some(problem) = problem else {
         return Ok(());
     };
-    if height < activation {
-        tracing::warn!(height, %problem, "built block would exceed its limits");
-        return Ok(());
-    }
     tracing::error!(height, %problem, "refusing a job whose block would exceed its limits");
     Err(anyhow::anyhow!("block limits exceeded: {problem}"))
 }
@@ -647,56 +637,36 @@ mod tests {
     }
 
     #[test]
-    fn built_coinbase_warns_below_activation_and_refuses_at_it() {
+    fn a_built_coinbase_that_does_not_fit_is_refused() {
         let t = template(MAX_BLOCK_WEIGHT, MAX_BLOCK_SIGOPS_COST);
         let r = CoinbaseOutputReserve::default();
         let full = vec![tx(MAX_BLOCK_WEIGHT - 8_000, 0)];
-        let check = |height, outputs: usize, txs: &[TemplateTransaction]| {
+        let check = |outputs: usize, txs: &[TemplateTransaction]| {
             let (c1, c2, outs) = built(outputs);
-            check_built_coinbase(height, 100, &t, MAX_BLOCK_WEIGHT, &r, &c1, &c2, &outs, txs)
+            check_built_coinbase(100, &t, MAX_BLOCK_WEIGHT, &r, &c1, &c2, &outs, txs)
         };
-        // Small coinbase on a full template: fine either side.
-        assert!(check(99, 3, &full).is_ok());
-        assert!(check(100, 3, &full).is_ok());
+        // Small coinbase on a full template: fine.
+        assert!(check(3, &full).is_ok());
         // 44 outputs on a full template under the default reserve: over weight.
-        assert!(
-            check(99, 44, &full).is_ok(),
-            "below activation it only warns"
-        );
-        assert!(check(100, 44, &full).is_err(), "at activation it refuses");
+        assert!(check(44, &full).is_err());
         // 600 outputs is above the 22 KB ceiling even on an empty template.
-        assert!(check(99, 600, &[]).is_ok());
-        let e = check(100, 600, &[]).unwrap_err().to_string();
+        let e = check(600, &[]).unwrap_err().to_string();
         assert!(e.contains("coinbase"), "{e}");
-        // Unparseable outputs are refused at activation.
+        // Unparseable outputs are refused.
         let (c1, c2, _) = built(1);
-        assert!(check_built_coinbase(100, 100, &t, 0, &r, &c1, &c2, &[1, 2, 3], &[]).is_err());
+        assert!(check_built_coinbase(100, &t, 0, &r, &c1, &c2, &[1, 2, 3], &[]).is_err());
     }
 
     #[test]
-    fn make_room_only_at_activation() {
+    fn every_template_makes_room_for_the_largest_coinbase() {
         let t = template(MAX_BLOCK_WEIGHT, MAX_BLOCK_SIGOPS_COST);
         let r = CoinbaseOutputReserve::default();
-        let full: Vec<_> = (0..100)
+        let mut full: Vec<_> = (0..100)
             .map(|_| tx((MAX_BLOCK_WEIGHT - 8_000) / 100, 0))
             .collect();
-        let mut below = full.clone();
-        assert_eq!(make_room_for_coinbase(99, 100, &t, 0, &r, &mut below), 0);
-        assert_eq!(below.len(), 100);
-        let mut at = full;
-        let removed = make_room_for_coinbase(100, 100, &t, 0, &r, &mut at);
+        let removed = make_room_for_coinbase(100, &t, 0, &r, &mut full);
         assert!(removed > 0);
         let limits = BlockLimits::for_template(&t, 0);
-        assert!(assess(limits, CoinbaseFootprint::ceiling(&r), &at).ok());
-    }
-
-    /// The template path passes this constant as `activation`; until a release arms it, every
-    /// gated branch above stays unreachable on a real chain.
-    #[test]
-    fn node_pool_is_dark() {
-        assert_eq!(
-            ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT,
-            u64::MAX
-        );
+        assert!(assess(limits, CoinbaseFootprint::ceiling(&r), &full).ok());
     }
 }

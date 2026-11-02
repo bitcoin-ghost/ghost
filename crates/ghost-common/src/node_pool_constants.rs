@@ -22,20 +22,14 @@
 
 //! Node pool protocol constants, in one place.
 //!
-//! Every value here belongs to the node pool (`docs/NODE_POOL_SPEC.md`) and is NEW: nothing in this
-//! module replaces or changes a constant in [`crate::constants`], and nothing in the running node
-//! reads these yet. They live in their own module, not in `constants.rs`, because that module is
-//! glob-re-exported from the crate root and short names such as `MIN_PAYOUT_SATS` would collide
-//! with, or be mistaken for, the live payout constants.
+//! Every value here belongs to the node pool (`docs/NODE_POOL_SPEC.md`), the only mode. Where the
+//! share chain starts is network configuration (`[node_pool.relay]` genesis), not a height here.
+//! They live in their own module, not in `constants.rs`, because that module is glob-re-exported
+//! from the crate root and short names such as `MIN_PAYOUT_SATS` would collide with, or be
+//! mistaken for, the old payout constants.
 //!
 //! The payout values must agree with `docs/node-pool-reference/refimpl_v3.py`, the normative
 //! reference; the vector test in `canonical_payout` pins them against `test_vectors_v3.json`.
-
-/// Bitcoin height at which the node pool's job layer switches on: share tags in the
-/// `GhostShare/v2` format, per-channel slot classes and the sensing loop. `u64::MAX` keeps it
-/// dark: no template can reach it, so nothing changes for a running node. Set to a real height
-/// only in a release that arms the whole pool (plan, Phase 4).
-pub const NODE_POOL_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
 /// One face unit is `2^-32` sat; a balance of `x` sats is `x << 32` face units.
 pub const FACE_UNIT_SHIFT: u32 = 32;
