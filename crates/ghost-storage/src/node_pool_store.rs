@@ -229,6 +229,41 @@ pub struct NpMinerSensing {
     pub sensed_at: i64,
 }
 
+/// An archived Bitcoin block (W2.13): its header and, above the archive floor, its coinbase with
+/// the merkle branch that binds it to the header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpBtcBlock {
+    /// `sha256d(header)`, internal byte order.
+    pub hash: [u8; 32],
+    /// The block's height.
+    pub height: u32,
+    /// The 80-byte header. Its bytes 4..36 are the parent's hash.
+    pub header: [u8; 80],
+    /// The coinbase, non-witness serialization, and the merkle branch from its txid to the
+    /// header's merkle root, if held.
+    pub coinbase: Option<(Vec<u8>, Vec<[u8; 32]>)>,
+    /// When this node archived it, unix seconds.
+    pub received_at: i64,
+}
+
+/// A stored ledger checkpoint (W2.13). The payload is the relay's encoding; `digest` is what it
+/// must hash to, so corruption is detected rather than trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpCheckpoint {
+    /// The anchor the state is folded at.
+    pub anchor_hash: AnchorHash,
+    /// Its anchor height.
+    pub height: u32,
+    /// Its `btc_height`.
+    pub btc_height: u32,
+    /// The encoded state.
+    pub payload: Vec<u8>,
+    /// The digest the payload must have.
+    pub digest: [u8; 32],
+    /// When it was written, unix seconds.
+    pub created_at: i64,
+}
+
 fn db_err(e: rusqlite::Error) -> GhostError {
     GhostError::Database(e.to_string())
 }
@@ -849,6 +884,69 @@ fn undo_event_conn(conn: &Connection, kind: NpLedgerEventKind, key: &[u8; 32]) -
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bitcoin block archive
+// ---------------------------------------------------------------------------------------------
+
+struct RawBtcBlock {
+    hash: Vec<u8>,
+    height: i64,
+    header: Vec<u8>,
+    coinbase: Option<Vec<u8>>,
+    branch: Option<Vec<u8>>,
+    received_at: i64,
+}
+
+fn btc_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawBtcBlock> {
+    Ok(RawBtcBlock {
+        hash: r.get(0)?,
+        height: r.get(1)?,
+        header: r.get(2)?,
+        coinbase: r.get(3)?,
+        branch: r.get(4)?,
+        received_at: r.get(5)?,
+    })
+}
+
+impl RawBtcBlock {
+    fn decode(self) -> GhostResult<NpBtcBlock> {
+        let header: [u8; 80] = self
+            .header
+            .as_slice()
+            .try_into()
+            .map_err(|_| GhostError::Database("np btc header is not 80 bytes".to_string()))?;
+        let coinbase = match (self.coinbase, self.branch) {
+            (Some(c), Some(b)) => Some((c, branch_from_blob(&b)?)),
+            (None, None) => None,
+            _ => {
+                return Err(GhostError::Database(
+                    "np btc block holds a coinbase without its branch".to_string(),
+                ))
+            }
+        };
+        Ok(NpBtcBlock {
+            hash: blob32(self.hash, "np btc hash")?,
+            height: u32_col(self.height, "np btc height")?,
+            header,
+            coinbase,
+            received_at: self.received_at,
+        })
+    }
+}
+
+fn get_btc_block_conn(conn: &Connection, hash: &[u8; 32]) -> GhostResult<Option<NpBtcBlock>> {
+    conn.query_row(
+        "SELECT hash, height, header, coinbase, branch, received_at FROM np_btc_blocks \
+         WHERE hash = ?1",
+        params![hash.to_vec()],
+        btc_row,
+    )
+    .optional()
+    .map_err(db_err)?
+    .map(RawBtcBlock::decode)
+    .transpose()
 }
 
 impl Database {
@@ -1489,6 +1587,177 @@ impl Database {
                     })
                 })
                 .collect()
+        })
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Bitcoin block archive (W2.13)
+    // -----------------------------------------------------------------------------------------
+
+    /// Archive a Bitcoin block. The header must hash to `hash`. Idempotent; a block already held
+    /// without its coinbase gains it; a different header or coinbase under the same hash is an
+    /// error. Checking the header's work and the coinbase's merkle branch is the caller's.
+    pub fn np_put_btc_block(&self, b: &NpBtcBlock) -> GhostResult<InsertOutcome> {
+        if sha256d(&b.header) != b.hash {
+            return Err(GhostError::Database(format!(
+                "np btc block {} is not sha256d of its header",
+                hex::encode(b.hash)
+            )));
+        }
+        let (cb, br) = match &b.coinbase {
+            Some((c, br)) => (Some(c.clone()), Some(branch_to_blob(br))),
+            None => (None, None),
+        };
+        self.transaction(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO np_btc_blocks (hash, prev, height, header, coinbase, \
+                 branch, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    b.hash.to_vec(),
+                    b.header[4..36].to_vec(),
+                    b.height as i64,
+                    b.header.to_vec(),
+                    cb,
+                    br,
+                    b.received_at
+                ],
+            )
+            .map_err(db_err)?;
+            if wrote(tx) {
+                return Ok(InsertOutcome::Inserted);
+            }
+            let held = get_btc_block_conn(tx, &b.hash)?.ok_or_else(|| {
+                GhostError::Database(format!(
+                    "np btc block {} was not stored (insert ignored, no row present)",
+                    hex::encode(b.hash)
+                ))
+            })?;
+            if held.header != b.header || held.height != b.height {
+                return Err(GhostError::Database(format!(
+                    "np btc block {} is already held with a different header",
+                    hex::encode(b.hash)
+                )));
+            }
+            match (&held.coinbase, &b.coinbase) {
+                (Some(h), Some(n)) if h != n => Err(GhostError::Database(format!(
+                    "np btc block {} is already held with a different coinbase",
+                    hex::encode(b.hash)
+                ))),
+                (None, Some(_)) => {
+                    tx.execute(
+                        "UPDATE np_btc_blocks SET coinbase = ?2, branch = ?3 WHERE hash = ?1",
+                        params![b.hash.to_vec(), cb, br],
+                    )
+                    .map_err(db_err)?;
+                    Ok(InsertOutcome::Inserted)
+                }
+                _ => Ok(InsertOutcome::AlreadyPresent),
+            }
+        })
+    }
+
+    /// One archived block, if held.
+    pub fn np_get_btc_block(&self, hash: &[u8; 32]) -> GhostResult<Option<NpBtcBlock>> {
+        self.with_connection(|conn| get_btc_block_conn(conn, hash))
+    }
+
+    /// Every archived block, by height.
+    pub fn np_load_btc_blocks(&self) -> GhostResult<Vec<NpBtcBlock>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT hash, height, header, coinbase, branch, received_at FROM \
+                     np_btc_blocks ORDER BY height, hash",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], btc_row)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter().map(RawBtcBlock::decode).collect()
+        })
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Checkpoints (W2.13)
+    // -----------------------------------------------------------------------------------------
+
+    /// Store a checkpoint, replacing any at the same anchor.
+    pub fn np_put_checkpoint(&self, c: &NpCheckpoint) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO np_checkpoints (anchor_hash, height, btc_height, payload, digest, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(anchor_hash) DO UPDATE \
+                 SET height = excluded.height, btc_height = excluded.btc_height, \
+                 payload = excluded.payload, digest = excluded.digest, \
+                 created_at = excluded.created_at",
+                params![
+                    c.anchor_hash.to_vec(),
+                    c.height as i64,
+                    c.btc_height as i64,
+                    c.payload,
+                    c.digest.to_vec(),
+                    c.created_at
+                ],
+            )
+            .map_err(db_err)?;
+            if !wrote(conn) {
+                return Err(GhostError::Database(
+                    "np checkpoint was not stored".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Every stored checkpoint, newest (highest anchor) first.
+    pub fn np_load_checkpoints(&self) -> GhostResult<Vec<NpCheckpoint>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT anchor_hash, height, btc_height, payload, digest, created_at FROM \
+                     np_checkpoints ORDER BY height DESC, anchor_hash",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, Vec<u8>>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .map(|(a, h, b, payload, d, at)| {
+                    Ok(NpCheckpoint {
+                        anchor_hash: blob32(a, "np checkpoint anchor")?,
+                        height: u32_col(h, "np checkpoint height")?,
+                        btc_height: u32_col(b, "np checkpoint btc_height")?,
+                        payload,
+                        digest: blob32(d, "np checkpoint digest")?,
+                        created_at: at,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Remove the checkpoint at `anchor_hash`, if any.
+    pub fn np_delete_checkpoint(&self, anchor_hash: &AnchorHash) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM np_checkpoints WHERE anchor_hash = ?1",
+                params![anchor_hash.to_vec()],
+            )
+            .map_err(db_err)?;
+            Ok(())
         })
     }
 
@@ -2242,7 +2511,11 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .unwrap()
         };
-        assert_eq!(names.len(), 10, "v63 creates ten tables: {names:?}");
+        assert_eq!(
+            names.len(),
+            12,
+            "v63 and v64 create twelve tables: {names:?}"
+        );
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         for n in names {
             conn.execute_batch(&format!("DROP TABLE {n};")).unwrap();
@@ -2293,7 +2566,7 @@ mod tests {
                 ))
             })
             .unwrap();
-        assert_eq!(v, 63);
+        assert_eq!(v, 64);
         assert_eq!(mode, "wal");
         let kept: (i64, i64) = db
             .with_connection(|c| {
@@ -2340,11 +2613,75 @@ mod tests {
                     .map_err(db_err)
             })
             .unwrap();
-        assert_eq!(v, 63);
+        assert_eq!(v, 64);
         db.np_apply_block(&h(0xA0), 121, &[(script(1), BIG)], 0)
             .unwrap();
         assert_eq!(db.np_balance(&script(1)).unwrap().expect("row").owed, -BIG);
         drop(db);
         remove_db_files(&path);
+    }
+
+    /// The archive keeps a block's header and coinbase, upgrades a header-only row, and refuses
+    /// a different block under the same hash.
+    #[test]
+    fn btc_blocks_round_trip_and_upgrade() {
+        let db = db();
+        let mut header = [7u8; 80];
+        header[4..36].copy_from_slice(&[9; 32]);
+        let hash = sha256d(&header);
+        let bare = NpBtcBlock {
+            hash,
+            height: 1_001,
+            header,
+            coinbase: None,
+            received_at: 5,
+        };
+        assert_eq!(db.np_put_btc_block(&bare).unwrap(), InsertOutcome::Inserted);
+        assert_eq!(
+            db.np_put_btc_block(&bare).unwrap(),
+            InsertOutcome::AlreadyPresent
+        );
+        let full = NpBtcBlock {
+            coinbase: Some((vec![1, 2, 3], vec![[4; 32]])),
+            ..bare.clone()
+        };
+        assert_eq!(db.np_put_btc_block(&full).unwrap(), InsertOutcome::Inserted);
+        assert_eq!(db.np_get_btc_block(&hash).unwrap(), Some(full.clone()));
+        assert_eq!(
+            db.np_put_btc_block(&bare).unwrap(),
+            InsertOutcome::AlreadyPresent,
+            "a header-only copy never strips a held coinbase"
+        );
+        let other = NpBtcBlock {
+            coinbase: Some((vec![1, 2], vec![])),
+            ..bare.clone()
+        };
+        assert!(db.np_put_btc_block(&other).is_err());
+        let mut forged = bare.clone();
+        forged.hash = [0; 32];
+        assert!(db.np_put_btc_block(&forged).is_err(), "hash must match");
+        assert_eq!(db.np_load_btc_blocks().unwrap(), vec![full]);
+    }
+
+    /// Checkpoints are stored newest first, replaced at the same anchor, and deleted on request.
+    #[test]
+    fn checkpoints_round_trip() {
+        let db = db();
+        let c = |a: u8, height: u32| NpCheckpoint {
+            anchor_hash: h(a),
+            height,
+            btc_height: 1_000 + height,
+            payload: vec![a; 3],
+            digest: h(a ^ 0xFF),
+            created_at: 1,
+        };
+        db.np_put_checkpoint(&c(1, 10)).unwrap();
+        db.np_put_checkpoint(&c(2, 20)).unwrap();
+        let mut again = c(1, 10);
+        again.payload = vec![0];
+        db.np_put_checkpoint(&again).unwrap();
+        assert_eq!(db.np_load_checkpoints().unwrap(), vec![c(2, 20), again]);
+        db.np_delete_checkpoint(&h(2)).unwrap();
+        assert_eq!(db.np_load_checkpoints().unwrap().len(), 1);
     }
 }
