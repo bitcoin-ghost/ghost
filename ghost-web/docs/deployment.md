@@ -58,7 +58,7 @@ The installer does not check any of these — they are guidance, not gates. Disk
 - a **payout address**, where this node's reward share is paid; and
 - a **treasury address**, where this node's pool fee accumulates. There is deliberately no default — the installer refuses to run without one.
 
-They can be the same address or different ones. A third, a fresh taproot address (`bc1p…`), is needed only if you run a Wraith coordinator (below).
+They can be the same address or different ones.
 
 **An alert endpoint** (for example `https://ntfy.sh`). It is optional in the sense that the install completes without it, but then alerts are disabled and every detector — low disk, node offline, behind tip, restart loop — fires into nothing.
 
@@ -73,7 +73,7 @@ curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \
   --alert-webhook https://ntfy.sh
 ```
 
-That gives you the defaults: full trustless sync with pruning, Public Pool mining, the mempool Reaper on, no archive, no Wraith coordinator, no Tor, no automatic updates.
+That gives you the defaults: full trustless sync with pruning, Public Pool mining, the mempool Reaper on, no archive, no Tor, no automatic updates.
 
 The installer always installs the latest published GitHub release. To pin one, set `GHOST_VERSION` — after `sudo`, so it survives into the root shell:
 
@@ -91,7 +91,7 @@ less install-node.sh
 sudo bash install-node.sh --payout-address bc1q... --treasury-address bc1q... --alert-webhook https://ntfy.sh
 ```
 
-Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the same choices as the flags below (payout and treasury addresses, sync mode, mining mode, pool name, Reaper, archive, Wraith, Tor, auto-update, nightly backups, nickname), shows a summary and asks before it changes anything. The wizard does not ask for an alert endpoint, so a wizard install has alerts disabled until you add one. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
+Run from a file like this, with **no** flags at all, on a terminal, the installer starts a guided setup wizard instead. It asks for the same choices as the flags below (payout and treasury addresses, sync mode, mining mode, pool name, Reaper, archive, Tor, auto-update, nightly backups, nickname), shows a summary and asks before it changes anything. The wizard does not ask for an alert endpoint, so a wizard install has alerts disabled until you add one. Piped through `curl`, the wizard never runs; `--non-interactive` also turns it off.
 
 ### Flags
 
@@ -108,9 +108,6 @@ Run from a file like this, with **no** flags at all, on a terminal, the installe
 | `--no-public-mining` | | Older alias for `--mining-mode solo`. If both are given, the last one wins. |
 | `--no-reaper` | Reaper on | Don't run the mempool Reaper. |
 | `--archive` | off | Full archive node (~720 GB). |
-| `--wraith` | off | Run a Wraith mixing coordinator. Requires `--coordinator-fee-address`. |
-| `--coordinator-fee-address <bc1p…>` | — | Where the coordinator's per-round fee lands. Must be taproot and must not be the payout address. |
-| `--no-wraith` | | Never run a coordinator (the default). |
 | `--tor` | off | Hybrid Tor: ghostd peers via Tor and publishes an onion, still reachable on clearnet 8333. |
 | `--tor-only` | off | ghostd uses Tor only (`onlynet=onion`) and 8333 is closed. Implies `--tor`. |
 | `--no-tor` | | Never use Tor (the default). |
@@ -155,14 +152,11 @@ Nodes split the network's node rewards by capability shares, 5-4-3-2-1:
 | Shares | Capability | How a node gets there |
 |---|---|---|
 | +5 | Archive | `--archive`, so the node holds the full chain. |
-| +4 | Wraith coordinator | Once activated, earned by running a Wraith coordinator that peers can reach: `--wraith --coordinator-fee-address bc1p…`. See [Wraith](#wraith). |
 | +3 | Public Mining | `--mining-mode public` (the default). The private modes do not earn it. |
 | +2 | Reaper | On by default; `--no-reaper` gives it up. See [Reaper](#reaper). |
 | +1 | Elder | The first 101 nodes. See [Elder system](#elder-system). |
 
-A flag does not award a share. Shares are earned by passing challenges that peers send to the node; a flag only puts the node in a position to pass them. A public-mining node whose Stratum port peers can't reach, or a coordinator whose port 9100 they can't dial, doesn't qualify.
-
-A Wraith coordinator also needs its own fee address. The installer refuses `--wraith` without `--coordinator-fee-address`, refuses one that isn't taproot (`bc1p…`), and refuses the payout address: that address is public, so a round paying it would be identifiable and attributable to this node.
+A flag does not award a share. Shares are earned by passing challenges that peers send to the node; a flag only puts the node in a position to pass them. A public-mining node whose Stratum port peers can't reach doesn't qualify.
 
 ### Tor
 
@@ -237,13 +231,12 @@ The installer enables `ufw` and allows:
 | 8555–8562/tcp | Mesh consensus | Share propagation, blocks, voting, health, discovery, Elder management, payouts |
 | 8563/tcp | Noise mesh | Verifications and MPC exchange |
 
-Four more ports follow `pool.toml`. `ghost-mining-firewall.path` watches the file and re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever it changes, so changing the mining mode later updates the firewall without a manual `ufw` step:
+Three more ports follow `pool.toml`. `ghost-mining-firewall.path` watches the file and re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever it changes, so changing the mining mode later updates the firewall without a manual `ufw` step:
 
 | Port | Open when |
 |---|---|
 | 3333/tcp (SV1), 34255/tcp (SV2) | `mining_mode` is `public_pool` or `private_pool` |
 | 4444/tcp (farm tier) | `mining_mode` is `public_pool` |
-| 9100/tcp (Wraith coordinator) | `[coordinator] coordinator_role_enabled = true` |
 
 RPC (8332), ZMQ (28332–28334) and pool_sv2's monitoring endpoint (9090) are bound to `127.0.0.1`.
 
@@ -295,11 +288,9 @@ The installer writes `/etc/ghost/pool.toml` in full. The flags land here:
 | `--mining-mode` | `[network] mining_mode` |
 | `--archive` | `[storage] archive_mode` |
 | `--no-reaper` | `[reaper] enabled` |
-| `--wraith` | `[coordinator] coordinator_enabled`, `coordinator_role_enabled`, and `[ghost_pay] wraith_enabled` |
-| `--coordinator-fee-address` | `[coordinator] coordinator_fee_address` |
 | `--alert-webhook`, `--alert-topic` | `[alerts]`, `[alerts.channels.push] webhook_url`, `topic` |
 
-The `[ghost_pay]` section name is historical: Ghost Pay is retired and `enabled` is always `false`; the section survives only because `wraith_enabled` is still read from it. The `[coordinator]` block is written on every node, switched off unless you passed `--wraith`, so the option is visible.
+The `[ghost_pay]` section is historical: Ghost Pay is retired and `enabled` is always `false`. Older installs may still carry `[ghost_pay] wraith_enabled` and a `[coordinator]` block with Wraith election and role keys; those keys are read and ignored, and the installer no longer writes them.
 
 The installer does not install the node dashboard. It writes `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf` so that a dashboard installed later signs its requests with the same `internal_api_secret`. See [Node dashboard](#node-dashboard).
 

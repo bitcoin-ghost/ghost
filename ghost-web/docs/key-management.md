@@ -277,7 +277,7 @@ The treasury seed is the disaster-recovery scenario you really care about. If ev
 - **Multisig orchestration software.** If you run a 3-of-5 treasury with hardware wallets across operators, the coordination tooling (Specter, Sparrow, Caravan) is whatever your team already uses. Ghost-pool just consumes the resulting bech32m address.
 - **HSM vendor specifics.** Each HSM has its own initialisation, backup, and audit story. The PKCS#11 layer is the standard interface; what's behind it varies.
 - **Per-jurisdiction compliance.** Some operators have to file specific paperwork around HSM custody. That's outside this doc's scope.
-- **Wallet seed management.** This is operator-side ghost-mining keys, not user-side wallet keys. Wallets (Ghost Tap, Light Wallet) have their own backup model — see [Wallets](#wallets).
+- **Wallet seed management.** This is operator-side ghost-mining keys, not user-side wallet keys. Wallets (Ghost Tap, Light Wallet) have their own backup model.
 
 ## Source
 

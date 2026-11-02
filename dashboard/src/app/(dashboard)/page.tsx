@@ -24,14 +24,12 @@ const TOOLTIPS = {
   network_hashrate: "Estimated total hashrate of the Bitcoin network, derived from current difficulty. This is the global network, not just Ghost.",
   l2_height: "The current block height of the Ghost Pay L2 network. Format: era:block. During IBD, shows syncing state.",
   l2_peers: "Number of Ghost Pay L2 peers your node is connected to.",
-  l2_wraith: "Wraith privacy mixing is available when Ghost Pay is running. Any L2 participant can initiate a mixing session.",
   shares: "Your node's share count determines your portion of the node reward pool. Based on the 5-4-3-2-1 system.",
   health: "Overall health of the services running on your node.",
   ghost_mode: "Ghost Mode isolates your node — stops relaying transactions and messages to peers (except block propagation). Useful for privacy.",
   privacy_tor: "Tor Mode routes all P2P connections through the Tor network, hiding your node's IP address from peers.",
   privacy_haze: "Ghost Haze strips privacy-sensitive data (signatures, witness data, inscriptions) from stored blocks.",
   privacy_shroud: "Ghost Shroud adds random delays before relaying transactions, protecting against timing analysis.",
-  privacy_wraith: "Wraith Protocol enables CoinJoin mixing on the L2 network, breaking transaction linkability.",
 };
 
 const SHARE_TIERS = [
@@ -143,12 +141,6 @@ function L2Card() {
   const isSyncing = isRunning && gp?.sync_state !== "synced";
   const height = gp ? `${gp.l2_era ?? 1}:${(gp.virtual_block ?? gp.block_height ?? 0).toLocaleString()}` : "--";
 
-  // Wraith is an optional mixing feature layered on L2. Distinguish the three
-  // real states so the tile never reads a bare "Inactive" (which looks like a
-  // fault) when L2 itself is healthy and only mixing is simply not enabled.
-  const wraithActive = !!(isRunning && gp?.wraith_enabled);
-  const wraithLabel = isLoading ? "..." : wraithActive ? "Active" : isRunning ? "Not enabled" : "Offline";
-
   return (
     <Card>
       <CardHeader
@@ -182,14 +174,6 @@ function L2Card() {
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> L2 Peers</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : `${gp?.peer_count ?? 0} connected`}
-            </div>
-          </div>
-        </Tooltip>
-        <Tooltip content={TOOLTIPS.l2_wraith}>
-          <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Wraith</div>
-            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-              {isLoading ? "..." : wraithLabel}
             </div>
           </div>
         </Tooltip>
@@ -323,7 +307,6 @@ function PrivacySection() {
   const { data: status } = useNodeStatus();
   const { data: haze } = useHazeStatus();
   const { data: shroud } = useShroudStatus();
-  const { data: gp } = useGhostPayStatus();
 
   // Any non-standard haze storage mode (stripping "hazed" or "full_archive")
   // counts as Active; "standard" (default node) is Off. Kept as a clean binary
@@ -336,13 +319,11 @@ function PrivacySection() {
 
   const ghostModeActive = status?.ghost_mode ?? false;
   const torActive = status?.tor_mode ?? false;
-  const gpRunning = gp && gp.sync_state !== "disabled" && gp.sync_state !== "unavailable";
-  const wraithActive = gpRunning && gp?.wraith_enabled;
 
   return (
     <Card>
       <CardHeader title="Privacy Status" />
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <Tooltip content={TOOLTIPS.ghost_mode}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Ghost Mode</div>
@@ -388,18 +369,6 @@ function PrivacySection() {
                 size="sm"
               />
               <span className="text-sm text-[color:var(--fg)]">{shroudLabel}</span>
-            </div>
-          </div>
-        </Tooltip>
-        <Tooltip content={TOOLTIPS.privacy_wraith}>
-          <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Wraith</div>
-            <div className="flex items-center gap-2">
-              <StatusDot
-                status={wraithActive ? "online" : "offline"}
-                size="sm"
-              />
-              <span className="text-sm text-[color:var(--fg)]">{wraithActive ? "Active" : "Off"}</span>
             </div>
           </div>
         </Tooltip>

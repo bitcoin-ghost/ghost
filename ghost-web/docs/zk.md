@@ -197,7 +197,6 @@ The full ceremony details live in [MPC Ceremony](#mpc). Short version: 101 contr
 | Network | [Ghost Mode](#ghost-mode), Tor | Origin IP, mempool exposure |
 | Relay timing | [Shroud](#shroud) | When you broadcast |
 | Address | [Keys](#keys) | Who you're paying / who's paying you |
-| Transaction graph | [Wraith](#wraith) | Input → output mapping |
 | **Amount + ownership** | **ZK proofs** | **What's being spent, by whom, how much** |
 | Custody | [Locks](#locks) | Recovery path on L1 |
 

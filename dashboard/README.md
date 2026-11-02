@@ -21,7 +21,7 @@ The dashboard provides:
 - **Node Status** - Sync height, peer count, uptime, and service health
 - **Mining** - Stratum connections, hashrate, shares, blocks found
 - **Rewards** - Share breakdown (5-4-3-2-1 model), payout history, earnings projections
-- **Ghost Pay (L2)** - Block height, epoch, wraith sessions, settlement status
+- **Ghost Pay (L2)** - Block height, epoch, settlement status
 - **Mesh Network** - Consensus status, peer connections, verification challenges
 - **Swarm Management** - Multi-node fleet monitoring and alerts
 
@@ -133,7 +133,7 @@ and is out of scope for this dashboard change.
 | `/` | Overview with key metrics |
 | `/mining` | Stratum mining status and connected miners |
 | `/rewards` | Share breakdown, earnings, payout history |
-| `/ghost-pay` | L2 network status, wraith sessions |
+| `/ghost-pay` | L2 network status |
 | `/operator/mesh` | BFT consensus and verification challenges |
 | `/operator/rewards` | Detailed share contributions and network stats |
 | `/operator/swarm` | Multi-node fleet management |

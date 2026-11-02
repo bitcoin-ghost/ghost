@@ -2,8 +2,6 @@
 import { fetchApi, fetchWithTimeout } from './client';
 import type {
   GhostPayStatus,
-  WraithSessionsResponse,
-  WraithStats,
   GhostLock,
   PaymentsResponse,
   SettlementResponse,
@@ -105,11 +103,6 @@ export async function getGhostPayStatus(): Promise<GhostPayStatus> {
   return fetchApi<GhostPayStatus>('/api/v1/ghostpay/status');
 }
 
-// Wraith
-export async function getWraithSessions(): Promise<WraithSessionsResponse> {
-  return fetchApi<WraithSessionsResponse>('/api/v1/wraith/sessions');
-}
-
 // Ghost Locks
 export async function getGhostLock(lockId: string): Promise<GhostLock> {
   return fetchApi<GhostLock>(`/api/v1/locks/${lockId}`);
@@ -129,31 +122,6 @@ export async function getSettlement(): Promise<SettlementResponse> {
   return fetchApi<SettlementResponse>('/api/v1/settlement/status');
 }
 
-// Wraith Stats (node-level aggregate mixing stats, not wallet-specific).
-// The backend returns the aggregate counts at the TOP LEVEL of the response
-// (total_sessions, active_sessions, sessions_completed, …); prefer those real
-// fields, then a nested `stats` object, then a count derived from the live
-// session list as a last resort.
-export async function getWraithStats(): Promise<WraithStats> {
-  // Let fetch errors propagate so React Query exposes `isError`. Swallowing them
-  // into all-zeros here makes a backend outage indistinguishable from genuine
-  // "no activity"; the consuming page renders an explicit "unavailable" state.
-  const sessions = await fetchApi<WraithSessionsResponse>('/api/v1/wraith/sessions');
-  const list = sessions.sessions ?? [];
-  return {
-    total_sessions: sessions.total_sessions ?? sessions.total ?? sessions.stats?.total_sessions ?? list.length,
-    active_sessions: sessions.active_sessions ?? sessions.active ?? sessions.stats?.active_sessions ?? list.filter(s => s.status === 'Filling' || s.status === 'Full').length,
-    sessions_completed: sessions.sessions_completed ?? sessions.stats?.sessions_completed ?? list.filter(s => s.status === 'Complete').length,
-    sessions_expired: sessions.sessions_expired ?? sessions.stats?.sessions_expired ?? list.filter(s => s.status === 'Expired').length,
-    total_participants: sessions.total_participants ?? sessions.stats?.total_participants ?? list.reduce((sum, s) => sum + (s.participant_count ?? 0), 0),
-    avg_fill_rate: list.length > 0
-      ? list.reduce((sum, s) => sum + (s.fill_percentage ?? 0), 0) / list.length / 100
-      : 0,
-    your_participations: sessions.stats?.your_participations ?? 0,
-    your_completed: sessions.stats?.your_completed ?? 0,
-  };
-}
-
 // Settlement Status (node-level settlement service status).
 //
 // The live `/settlement/status` endpoint returns a FLAT shape:
@@ -163,7 +131,7 @@ export async function getWraithStats(): Promise<WraithStats> {
 // flat fields directly. The previous nested-shape mapping silently produced
 // all-zeros against the real backend (Settlement Quick-Stats always showed 0).
 export async function getSettlementStatus(): Promise<SettlementStatus> {
-  // Let fetch errors propagate (see getWraithStats) rather than masking a
+  // Let fetch errors propagate so React Query exposes `isError`, rather than masking a
   // backend outage as an all-zeros "idle" status.
   const settlement = await fetchApi<SettlementResponse>('/api/v1/settlement/status');
   return {

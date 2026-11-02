@@ -1,8 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import {
   getGhostPayStatus,
-  getWraithSessions,
-  getWraithStats,
   getPayments,
   getSettlement,
   getSettlementStatus,
@@ -15,8 +13,6 @@ import type { PayoutHistoryTimeFilter } from '@/types/api';
 export const ghostPayKeys = {
   all: ['ghostpay'] as const,
   status: () => [...ghostPayKeys.all, 'status'] as const,
-  wraith: () => [...ghostPayKeys.all, 'wraith'] as const,
-  wraithStats: () => [...ghostPayKeys.all, 'wraith-stats'] as const,
   locks: () => [...ghostPayKeys.all, 'locks'] as const,
   payments: (params?: { limit?: number; offset?: number }) =>
     [...ghostPayKeys.all, 'payments', params] as const,
@@ -33,14 +29,6 @@ export function useGhostPayStatus(options?: { refetchInterval?: number }) {
     queryKey: ghostPayKeys.status(),
     queryFn: getGhostPayStatus,
     refetchInterval: options?.refetchInterval ?? 10_000,
-  });
-}
-
-export function useWraithSessions(options?: { refetchInterval?: number }) {
-  return useQuery({
-    queryKey: ghostPayKeys.wraith(),
-    queryFn: getWraithSessions,
-    refetchInterval: options?.refetchInterval ?? 5_000,
   });
 }
 
@@ -61,14 +49,6 @@ export function useSettlement(options?: { refetchInterval?: number }) {
 }
 
 // New node-focused queries
-
-export function useWraithStats(options?: { refetchInterval?: number }) {
-  return useQuery({
-    queryKey: ghostPayKeys.wraithStats(),
-    queryFn: getWraithStats,
-    refetchInterval: options?.refetchInterval ?? 10_000,
-  });
-}
 
 export function useSettlementStatus(options?: { refetchInterval?: number }) {
   return useQuery({

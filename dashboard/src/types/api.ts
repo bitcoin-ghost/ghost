@@ -579,7 +579,6 @@ export interface GhostPayStatus {
   peer_count?: number;
   uptime_secs?: number;
   sync_state?: string;
-  wraith_enabled?: boolean;
   ghostpay_hosts_mixing?: boolean;
   total_balances?: number;
 }
@@ -638,55 +637,6 @@ export interface LogUnit {
 export interface LogUnitsResponse {
   units: LogUnit[];
   default: string;
-}
-
-// Wraith types
-export type WraithTier = "Test" | "Dev" | "Express" | "Quick" | "Small" | "Medium" | "Standard" | "Large" | "Whale" | string;
-export type WraithDenomination = "Tiny" | "Small" | "Medium" | "Large" | string;
-export type WraithSessionStatus = "Filling" | "Full" | "Signing" | "Complete" | "Expired" | "Failed" | string;
-
-export interface WraithSession {
-  // Backend fields
-  round_id?: string;
-  denomination?: string;
-  amount_sats?: number;
-  participant_count?: number;
-  phase?: string | number;
-  registration_deadline?: number;
-  // Dashboard fields
-  session_id?: string;
-  tier?: WraithTier;
-  status?: WraithSessionStatus;
-  min_participants?: number;
-  your_index?: number | null;
-  fill_percentage?: number;
-  expires_at?: number;
-  action_required?: string | null;
-}
-
-export interface WraithStats {
-  total_sessions?: number;
-  active_sessions?: number;
-  sessions_completed?: number;
-  sessions_expired?: number;
-  total_participants?: number;
-  avg_fill_rate?: number;
-  your_participations?: number;
-  your_completed?: number;
-}
-
-export interface WraithSessionsResponse {
-  sessions: WraithSession[];
-  // Backend puts stats at top level
-  total?: number;
-  active?: number;
-  active_sessions?: number;
-  sessions_completed?: number;
-  total_sessions?: number;
-  sessions_expired?: number;
-  total_participants?: number;
-  // Dashboard expects nested stats
-  stats?: WraithStats;
 }
 
 // Ghost Lock types

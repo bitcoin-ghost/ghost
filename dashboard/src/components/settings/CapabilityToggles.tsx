@@ -24,12 +24,6 @@ interface CapabilityTogglesProps {
    */
   ghostPayControl?: "status" | "toggle";
   /**
-   * Extra content rendered immediately after the Ghost Pay row — used by
-   * Onboarding to slot in its Wraith mixing toggle without duplicating the
-   * five canonical capability rows.
-   */
-  afterGhostPay?: React.ReactNode;
-  /**
    * When provided, a cross-link to detector-level Reaper configuration is
    * rendered beneath the Reaper toggle (Settings › Capabilities points at
    * `/filtering/advanced`).
@@ -52,7 +46,6 @@ interface CapabilityTogglesProps {
  */
 export function CapabilityToggles({
   ghostPayControl = "status",
-  afterGhostPay,
   reaperConfigHref,
 }: CapabilityTogglesProps) {
   const { data: status } = useNodeStatus();
@@ -166,8 +159,6 @@ export function CapabilityToggles({
           }
         />
       )}
-
-      {afterGhostPay}
 
       <ToggleRow
         label="Public Mining"

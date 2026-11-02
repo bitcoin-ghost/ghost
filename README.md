@@ -13,8 +13,7 @@ Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
 (`ghostd`) and a decentralised mining pool (`ghost-mining`). Nodes form a
 peer-to-peer mesh, reach BFT consensus on payouts, and are rewarded for the
 infrastructure they actually provide — full-node storage, mining, and mempool
-filtering — through a verified-capability share system. It also includes a
-self-custody wallet with Ghost Locks and a CoinJoin privacy protocol (Wraith).
+filtering — through a verified-capability share system.
 No separate token, no altcoin — it settles in Bitcoin.
 
 - **Website:** <https://bitcoinghost.org>
@@ -27,9 +26,6 @@ No separate token, no altcoin — it settles in Bitcoin.
 |-----------|------|-------------|
 | `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
 | `ghost-mining` | `bins/ghost-pool/` | Decentralised mining pool node. Runs the P2P consensus mesh, tracks shares, and computes coinbase payouts. |
-| Ghost Lock | `crates/ghost-lock/` | Four-lane Taproot accounts with escape, inheritance and quorum co-signing. |
-| Wraith wallet | `apps/wraith-wallet/` | Self-custody wallet — daemon, CLI and desktop app — talking to your own node. |
-| Wraith | `crates/wraith-protocol/` | Blind-signature CoinJoin mixing. |
 | Light wallet | `bins/ghost-cli/`, `crates/ghost-light-wallet/` | CLI/TUI wallet with BIP-352 Silent Payments. |
 | SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. |
 
@@ -100,7 +96,7 @@ should be paid to:
 curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
 ```
 
-Run `sudo bash -s -- --help` to see options such as `--archive`, `--wraith`,
+Run `sudo bash -s -- --help` to see options such as `--archive`,
 `--mining-mode`, and `--sync`. Full setup guidance is at
 <https://bitcoinghost.org/docs/>.
 
@@ -141,9 +137,7 @@ cargo build --release            # builds the Rust workspace (ghost-mining, wall
 Common development commands:
 
 ```sh
-# The Tauri desktop crates need a built JS frontend before `tauri::generate_context!`
-# will compile, so the pure-Rust commands exclude them — exactly as CI does.
-EXCLUDES="--workspace --exclude wraith-wallet-gui --exclude ghost-tap-desktop"
+EXCLUDES="--workspace"
 
 cargo test $EXCLUDES --lib --bins             # test suite, as CI runs it
 cargo test -p ghost-consensus                 # a single crate
@@ -170,7 +164,6 @@ own:
 
 | Feature | What it does |
 |---------|--------------|
-| Wraith Protocol | Single-round, coordinator-blinded atomic CoinJoin mixing at L2 entry using blind Schnorr signatures. |
 | Ghost Keys (BIP-352) | Silent Payments — a fresh on-chain address per payment from one static identifier. |
 | Ghost Pay L2 | Off-chain transfers proven with zero-knowledge proofs. |
 | Ghost Mode | Incognito node mode — the node stops accepting and advertising transactions to peers, so its mempool is never exposed to surveillance. Pairs with Tor. |
@@ -181,7 +174,7 @@ own:
 
 Protocol and operator documentation is published at
 <https://bitcoinghost.org/docs/>, covering the consensus protocol, the
-node-capability system, economics, Ghost Keys, Ghost Pay, the Wraith Protocol,
+node-capability system, economics, Ghost Keys, Ghost Pay,
 Ghost Haze, the Reaper, and deployment.
 
 ## Contributing

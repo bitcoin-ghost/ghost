@@ -67,7 +67,7 @@ Glyphs aren't free, and they're permanent. The registration flow:
 
     `commitment` binds the design to the specific Ghost ID. `bitmap_hash` is identity-free and used to enforce global uniqueness — no two Ghost IDs can share a pixel pattern.
 
-4. **Wraith deposit.** Registration is funded via a Wraith mixing session. The funding transaction is what makes the registration real on chain. (See [Wraith](#wraith) for the deposit flow.) Until the deposit confirms, the glyph is in a "pending" state — `registered_at` is `None`.
+4. **Wraith deposit.** Registration is funded via a Wraith mixing session. The funding transaction is what makes the registration real on chain. Until the deposit confirms, the glyph is in a "pending" state — `registered_at` is `None`.
 5. **Confirmation.** When the Wraith deposit confirms, the registry checks `bitmap_hash` against existing registrations. If it's already taken, registration fails with `DuplicateBitmap`. Otherwise the glyph is permanently bound; `registered_at` and `funding_txid` are populated.
 6. **Permanence.** A Ghost ID that already has a registered glyph cannot register another (`AlreadyRegistered`). Cannot be changed, cannot be transferred, cannot be replaced — the Glyph is part of the Ghost ID's identity for life.
 
