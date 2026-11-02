@@ -232,6 +232,13 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   `prev_hash`: `TableRequest` gained `prev` (pool_sv2 passes `None`, unchanged); with `prev`, the
   answer is `None` unless `prev` is archived at `H - 1`. The audited node is never asked for a
   table. A Bitcoin node is required: a fresh archive has no base without one (see Open).
+- **Genesis table**: the auditor's relay starts from the network's, read from the published
+  export (`--genesis-export DIR --export-digest HEX`) by `ghost_common::node_pool_genesis_export`,
+  the checks pool_sv2's import runs (moved there from pool_sv2 so the two cannot differ), and
+  imported into the auditor's store on first use (later runs read the store). Its `table_root`
+  must equal `--genesis-table-digest` (or mainnet's compiled pin), or `audit`, `probe` and `list`
+  refuse to start; only regtest may run unpinned. A store that already holds another export's
+  table, or has run on another table, is refused rather than mixed.
 - **Height** is `height(prev_hash) + 1` from the miner's Bitcoin node, and the scriptSig must
   start with its BIP34 push.
 - **Tier check**: a committed tier above `floor(log2(difficulty))` (with 1e-9 slack for a float

@@ -42,10 +42,12 @@ use ghost_audit::discover::Limits;
 use ghost_audit::lister::{now_secs, run_round, write_atomic, LiveProber, RoundConfig};
 use ghost_audit::listing::{render_dns, render_node_list, DnsConfig, ListMeta, ListState, Policy};
 use ghost_audit::probe::{probe, ProbeConfig, ProbeVerdict};
-use ghost_audit::source::{start_share_chain, ChainConfig};
+use ghost_audit::source::{start_share_chain, ChainConfig, ExportSource, GenesisSource};
 use ghost_audit::sv1::Sv1Config;
 use ghost_audit::{audit_jobs, AuditTarget, RelayStamps};
 use ghost_common::node_pool_constants::T_NET_FLOOR;
+use ghost_common::node_pool_genesis_export::hex32;
+use ghost_common::node_pool_network::{NodePoolNetwork, MAINNET_START};
 use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::{diff1_target, payee_script_class};
 
@@ -112,6 +114,14 @@ impl Network {
             Network::Regtest => "regtest",
         }
     }
+
+    fn node_pool(self) -> NodePoolNetwork {
+        match self {
+            Network::Mainnet => NodePoolNetwork::Mainnet,
+            Network::Signet => NodePoolNetwork::Signet,
+            Network::Regtest => NodePoolNetwork::Regtest,
+        }
+    }
 }
 
 /// The share chain and the Bitcoin node the auditor judges against.
@@ -130,6 +140,20 @@ struct ChainArgs {
     /// `T_net` at genesis.
     #[arg(long, default_value_t = T_NET_FLOOR)]
     genesis_tier: u8,
+    /// The network's published ledger export: a directory holding ledger-export.bin and
+    /// ledger-export.json. Its genesis table (the balances carried over at the cutover) is what
+    /// every table folds onto. Checked as pool_sv2's import checks it and kept in the auditor's
+    /// store, so later runs need not pass it again.
+    #[arg(long, requires = "export_digest")]
+    genesis_export: Option<PathBuf>,
+    /// The published sha256 of ledger-export.bin, 64 hex characters.
+    #[arg(long, requires = "genesis_export")]
+    export_digest: Option<String>,
+    /// The network's pinned genesis table digest (the table_root nodes pin), 64 hex characters.
+    /// Nothing is audited unless the auditor's genesis table hashes to it. Required except on
+    /// regtest; on mainnet it must equal the compiled one once that is set.
+    #[arg(long)]
+    genesis_table_digest: Option<String>,
     /// Tier 0 target, 64 hex characters, big-endian. Defaults to difficulty 1 (regtest: its
     /// proof-of-work limit).
     #[arg(long)]
@@ -292,13 +316,6 @@ struct ListArgs {
     dns_max: usize,
 }
 
-fn hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
-    hex::decode(s.trim())
-        .map_err(|e| format!("{what}: {e}"))?
-        .try_into()
-        .map_err(|_| format!("{what}: not 32 bytes"))
-}
-
 async fn resolve(s: &str) -> Result<SocketAddr, String> {
     tokio::net::lookup_host(s)
         .await
@@ -355,8 +372,39 @@ impl ChainArgs {
                 .join(".ghost-audit")
                 .join(self.network.name()),
         };
+        let export = match (&self.genesis_export, &self.export_digest) {
+            (Some(dir), Some(d)) => Some(ExportSource {
+                dir: dir.clone(),
+                digest: hex32(d, "--export-digest")?,
+            }),
+            _ => None,
+        };
+        let flag = self
+            .genesis_table_digest
+            .as_deref()
+            .map(|d| hex32(d, "--genesis-table-digest"))
+            .transpose()?;
+        let compiled = match self.network {
+            Network::Mainnet => MAINNET_START.and_then(|s| s.genesis_table_digest),
+            _ => None,
+        };
+        let pinned = match (flag, compiled) {
+            (Some(f), Some(c)) if f != c => {
+                return Err(format!(
+                    "--genesis-table-digest {} is not mainnet's compiled {}",
+                    hex::encode(f),
+                    hex::encode(c)
+                ))
+            }
+            (f, c) => f.or(c),
+        };
         Ok(ChainConfig {
             data_dir,
+            genesis_table: GenesisSource {
+                network: self.network.node_pool(),
+                export,
+                pinned,
+            },
             genesis_anchor,
             genesis_height,
             genesis_tier: self.genesis_tier,
