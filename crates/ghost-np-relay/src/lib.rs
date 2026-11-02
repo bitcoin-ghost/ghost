@@ -31,6 +31,7 @@
 //! - [`peers`]: rate limits, ban scores, the address book.
 //! - [`headers`]: the Bitcoin header facts share checks need.
 //! - [`net`]: the TCP transport that drives the core.
+//! - [`settlement`]: retiring what pool blocks paid, and the snapshot hook that subtracts it.
 //!
 //! Left for W2.13 (share-chain sync): initial sync of a fresh node from genesis (here a node
 //! fetches missing ancestors one by one through a bounded orphan pool), batch retention and
@@ -44,6 +45,7 @@ pub mod headers;
 pub mod net;
 pub mod peers;
 pub mod relay;
+pub mod settlement;
 pub mod wire;
 
 #[cfg(test)]

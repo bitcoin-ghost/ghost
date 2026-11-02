@@ -330,6 +330,11 @@ pub struct Sim {
 impl Sim {
     /// `n` nodes, no links.
     pub fn new(n: usize) -> Sim {
+        Sim::with_relays(n, |_| relay())
+    }
+
+    /// `n` nodes on relays from `make`, no links.
+    pub fn with_relays(n: usize, make: impl Fn(usize) -> Relay) -> Sim {
         let btc = Btc::new(START_TIP);
         let mut s = Sim {
             nodes: Vec::new(),
@@ -341,7 +346,7 @@ impl Sim {
             delivered: 0,
         };
         for i in 0..n {
-            let mut r = relay();
+            let mut r = make(i);
             r.set_btc_tip(START_TIP);
             s.nodes.push(SimNode {
                 relay: r,

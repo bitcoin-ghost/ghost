@@ -68,7 +68,7 @@ use ghost_common::canonical_payout::{cut, table_for_from, Retirement, Script, Ta
 use ghost_common::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::node_pool_constants::{
-    ANCHOR_TIER_OFFSET, HALVING_INTERVAL, SHARE_HEIGHT_WINDOW,
+    ANCHOR_TIER_OFFSET, HALVING_INTERVAL, PARENT_ANCHOR_TAG_LEN, SHARE_HEIGHT_WINDOW,
 };
 use ghost_common::node_pool_u256::U256;
 use ghost_common::share_commit::{
@@ -194,7 +194,8 @@ pub trait Retirements: Send {
     }
 }
 
-/// No retirements: until settlement (W2.7) is wired, and in tests without blocks.
+/// No retirements: tests without blocks. A running node uses settlement's
+/// [`crate::settlement::SettledView`].
 pub struct NoRetirements;
 
 impl Retirements for NoRetirements {
@@ -657,6 +658,37 @@ impl Relay {
     pub fn job_table(&mut self, parent: &AnchorHash, h: u32) -> Option<Arc<Table>> {
         let s = self.chain.last_below(parent, cut(h)?)?;
         self.table_at(s, h, parent).ok()
+    }
+
+    /// The table a block (or a job) at height `h` built on `parent` must pay: [`Relay::job_table`],
+    /// or, in the first 20 Bitcoin blocks after genesis where no anchor sits below the cut, the
+    /// genesis table with the settled retirements folded. `None` if `parent` is not a held anchor
+    /// with its batch, or the arithmetic refuses.
+    pub fn block_table(&mut self, parent: &AnchorHash, h: u32) -> Option<Arc<Table>> {
+        if *parent != self.p.genesis.hash && !self.credits.contains_key(parent) {
+            return None;
+        }
+        if let Some(s) = cut(h).and_then(|c| self.chain.last_below(parent, c)) {
+            return self.table_at(s, h, parent).ok();
+        }
+        let blocks = self.retirements.blocks_below(&self.chain, parent, h);
+        table_for_from(self.p.genesis.table.clone(), h, &BTreeMap::new(), &blocks)
+            .ok()
+            .map(Arc::new)
+    }
+
+    /// Held anchors (batch attached, or genesis) whose hash starts with `prefix`: the anchors a
+    /// block's `GHPP` slot can name.
+    pub fn anchors_with_prefix(&self, prefix: &[u8; PARENT_ANCHOR_TAG_LEN]) -> Vec<AnchorHash> {
+        let mut v: Vec<AnchorHash> = self
+            .credits
+            .keys()
+            .chain(std::iter::once(&self.p.genesis.hash))
+            .filter(|a| a[..PARENT_ANCHOR_TAG_LEN] == prefix[..])
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     /// Bitcoin headers the core needed and did not have since the last call.

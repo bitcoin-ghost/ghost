@@ -45,9 +45,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use ghost_common::anchor_chain::AnchorHash;
+use ghost_common::canonical_payout::Table;
+
 use crate::headers::HeaderOracle;
 use crate::peers::{penalty, AddrBook, AddrSource, PeerState};
 use crate::relay::{JobAnchor, Out, PeerId, Relay, RelayStatus};
+use crate::settlement::{BlockSource, Settlement};
 use crate::wire::{
     Hello, Message, NetShare, WireError, FRAME_HEADER_LEN, MAX_ADDRS, PROTOCOL_VERSION,
 };
@@ -94,10 +98,26 @@ impl Default for NetConfig {
 /// Where new job anchors go: pool_sv2's `AnchorDriver::publish`.
 pub type Publisher = Arc<dyn Fn(JobAnchor) + Send + Sync>;
 
+/// pool_sv2 asking for the table a job must pay: [`Relay::block_table`] after settlement has
+/// caught up with the Bitcoin tip.
+pub struct TableRequest {
+    /// The anchor the job builds on.
+    pub parent: AnchorHash,
+    /// The job's height.
+    pub height: u32,
+    /// Where the answer goes; `None` if the anchor is not held.
+    pub reply: tokio::sync::oneshot::Sender<Option<Arc<Table>>>,
+}
+
+/// Settlement and where it reads the Bitcoin best chain from.
+pub type SettlementParts = (Settlement, Arc<dyn BlockSource>);
+
 /// A running relay.
 pub struct RelayHandle {
     /// Local shares from pool_sv2.
     pub local: mpsc::Sender<NetShare>,
+    /// Table requests from pool_sv2's coinbase builder.
+    pub tables: mpsc::Sender<TableRequest>,
     /// The core's status after every event.
     pub status: watch::Receiver<RelayStatus>,
     /// The bound listen address, if listening.
@@ -114,6 +134,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Local shares queued from pool_sv2.
 const LOCAL_QUEUE: usize = 4_096;
+/// Table requests queued from pool_sv2.
+const TABLE_QUEUE: usize = 256;
 
 enum Event {
     Inbound(TcpStream, SocketAddr),
@@ -158,6 +180,18 @@ pub async fn spawn(
     oracle: Arc<dyn HeaderOracle>,
     publish: Publisher,
 ) -> std::io::Result<RelayHandle> {
+    spawn_with_settlement(relay, cfg, oracle, publish, None).await
+}
+
+/// [`spawn`], with settlement following the Bitcoin best chain in the same task, so every table
+/// the relay checks or serves subtracts what settled blocks paid.
+pub async fn spawn_with_settlement(
+    relay: Relay,
+    cfg: NetConfig,
+    oracle: Arc<dyn HeaderOracle>,
+    publish: Publisher,
+    settlement: Option<SettlementParts>,
+) -> std::io::Result<RelayHandle> {
     let listener = match cfg.listen {
         Some(a) => Some(TcpListener::bind(a).await?),
         None => None,
@@ -183,6 +217,7 @@ pub async fn spawn(
         });
     }
     let (local_tx, local_rx) = mpsc::channel(LOCAL_QUEUE);
+    let (tables_tx, tables_rx) = mpsc::channel(TABLE_QUEUE);
     let (status_tx, status_rx) = watch::channel(relay.status());
     let mut book = AddrBook::default();
     for p in &cfg.peers {
@@ -202,10 +237,12 @@ pub async fn spawn(
         nonce: rand::random(),
         ev_tx,
         status_tx,
+        settlement,
     };
-    let task = tokio::spawn(node.run(ev_rx, local_rx));
+    let task = tokio::spawn(node.run(ev_rx, local_rx, tables_rx));
     Ok(RelayHandle {
         local: local_tx,
+        tables: tables_tx,
         status: status_rx,
         listen_addr,
         task,
@@ -226,6 +263,7 @@ struct Node {
     nonce: u64,
     ev_tx: mpsc::Sender<Event>,
     status_tx: watch::Sender<RelayStatus>,
+    settlement: Option<SettlementParts>,
 }
 
 impl Node {
@@ -233,6 +271,7 @@ impl Node {
         mut self,
         mut ev_rx: mpsc::Receiver<Event>,
         mut local_rx: mpsc::Receiver<NetShare>,
+        mut tables_rx: mpsc::Receiver<TableRequest>,
     ) {
         let mut tick = tokio::time::interval(Duration::from_millis(self.cfg.tick_ms.max(10)));
         let mut ticks: u64 = 0;
@@ -249,6 +288,11 @@ impl Node {
                     }
                     self.flush_out();
                 }
+                Some(req) = tables_rx.recv() => {
+                    self.settle().await;
+                    let t = self.relay.block_table(&req.parent, req.height);
+                    let _ = req.reply.send(t);
+                }
                 _ = tick.tick() => {
                     ticks += 1;
                     let per_sec = (1_000 / self.cfg.tick_ms.max(10)).max(1);
@@ -256,7 +300,9 @@ impl Node {
                         if let Some(h) = self.oracle.tip_height().await {
                             self.relay.set_btc_tip(h);
                         }
+                        self.settle().await;
                     }
+                    self.reconcile();
                     let need = self.relay.take_needed_headers();
                     if !need.is_empty() {
                         self.oracle.prefetch(&need).await;
@@ -281,6 +327,26 @@ impl Node {
                 }
             }
             self.status_tx.send_replace(self.relay.status());
+        }
+    }
+
+    /// Settlement catches up with the Bitcoin best chain.
+    async fn settle(&mut self) {
+        if let Some((s, src)) = self.settlement.as_mut() {
+            if let Err(e) = s.sync(&mut self.relay, src.as_ref()).await {
+                warn!("NP_SETTLE: sync failed: {e}");
+            }
+        }
+    }
+
+    /// Provisional blocks whose anchor arrived are checked.
+    fn reconcile(&mut self) {
+        if let Some((s, _)) = self.settlement.as_mut() {
+            if s.pending() > 0 {
+                if let Err(e) = s.reconcile(&mut self.relay) {
+                    warn!("NP_SETTLE: reconcile failed: {e}");
+                }
+            }
         }
     }
 
